@@ -25,12 +25,14 @@
             openssl
             protobuf
             nixpkgs-fmt
+            curl
+            gnutar
           ];
 
           shellHook = ''
             echo "syncpeer dev shell"
             echo "node: $(node --version)"
-            echo "npm:  $(npm --version)"
+            echo "npm: $(npm --version)"
           '';
         };
 

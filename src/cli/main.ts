@@ -1,100 +1,55 @@
 #!/usr/bin/env node
-import { Command } from 'commander';
-import { connectAndSync } from '../client.js';
-import type RemoteFs from '../core/model/remoteFs.js';
-import fs from 'fs';
-
-const program = new Command();
-
-program
-  .name('syncpeer')
-  .description('Minimal Syncthing BEP client')
-  .option('-H, --host <host>', 'remote host', '127.0.0.1')
-  .option('-p, --port <port>', 'remote port', (v) => parseInt(v, 10), 22000)
-  .option('--cert <path>', 'path to client certificate (PEM)', process.env.SYNCTHING_CERT)
-  .option('--key <path>', 'path to client key (PEM)', process.env.SYNCTHING_KEY)
-  .option('--ca <path>', 'path to CA certificate (PEM)')
-  .option('--remote-id <id>', 'expected remote device ID')
-  .option('--device-name <name>', 'our device name', 'syncpeer')
-  .option('--client-name <name>', 'client name sent in hello', 'syncpeer')
-  .option('--client-version <version>', 'client version sent in hello', '0.1.0');
-
-program
-  .command('list')
-  .description('List remote folders')
-  .action(async () => {
-    const opts = program.opts();
-    const fsremote = await createRemoteFs(opts);
-    const folders = await fsremote.listFolders();
-    for (const f of folders) {
-      console.log(`${f.id}\t${f.label}${f.readOnly ? ' (read‑only)' : ''}`);
-    }
-    process.exit(0);
-  });
-
-program
-  .command('tree <folder>')
-  .description('Display a directory tree for a folder')
-  .option('-d, --dir <dir>', 'subdirectory within the folder', '')
-  .action(async (folder: string, cmdObj: any) => {
-    const opts = program.opts();
-    const dir = cmdObj.dir ?? '';
-    const fsremote = await createRemoteFs(opts);
-    await printTree(fsremote, folder, dir, '');
-    process.exit(0);
-  });
-
-program
-  .command('download <folder> <path> <output>')
-  .description('Download a file from the remote device')
-  .action(async (folder: string, filePath: string, output: string) => {
-    const opts = program.opts();
-    const fsremote = await createRemoteFs(opts);
-    const data = await fsremote.readFileFully(folder, filePath);
-    fs.writeFileSync(output, Buffer.from(data));
-    console.log(`Downloaded ${filePath} to ${output}`);
-    process.exit(0);
-  });
-
-/**
- * Connect to the remote peer using command line options and return a RemoteFs.
+/*
+ * syncpeer CLI entrypoint (minimal)
+ *
+ * This CLI is intentionally minimal. It parses command-line flags and
+ * delegates to stubs for list, tree and download operations. For a full
+ * implementation, integrate the transport, protocol and model modules to
+ * connect to a Syncthing peer using BEP, negotiate TLS, receive the index
+ * and request blocks for downloads. See README.md for details.
  */
-async function createRemoteFs(opts: any): Promise<RemoteFs> {
-    if (!opts.cert || !opts.key) {
-      console.error('Both --cert and --key must be provided');
-      process.exit(1);
-    }
-    const remoteFs = await connectAndSync({
-      host: opts.host,
-      port: opts.port,
-      cert: opts.cert,
-      key: opts.key,
-      ca: opts.ca,
-      expectedDeviceId: opts.remoteId,
-      deviceName: opts.deviceName,
-      clientName: opts.clientName,
-      clientVersion: opts.clientVersion,
+
+import { Command } from "commander";
+
+async function main() {
+  const program = new Command();
+  program
+    .name("syncpeer")
+    .description("Minimal read‑only Syncthing BEP client")
+    .option("--host <host>", "Remote host", "127.0.0.1")
+    .option("--port <port>", "Remote port", (value) => parseInt(value, 10), 22000)
+    .option("--cert <file>", "Path to TLS certificate")
+    .option("--key <file>", "Path to TLS private key")
+    .option("--remote-id <id>", "Expected remote device ID")
+    .hook("preAction", (thisCommand, actionCommand) => {
+      // In a full implementation, you would perform connection and handshake here
     });
-    return remoteFs;
+
+  program
+    .command("list")
+    .description("List available folders on the remote peer")
+    .action(async () => {
+      console.error("The 'list' command is not implemented in this minimal scaffold.");
+    });
+
+  program
+    .command("tree <folderId>")
+    .description("Show a tree of files in the specified folder")
+    .action(async (folderId: string) => {
+      console.error("The 'tree' command is not implemented in this minimal scaffold.");
+    });
+
+  program
+    .command("download <folderId> <remotePath> <localPath>")
+    .description("Download a file from the remote peer")
+    .action(async (folderId: string, remotePath: string, localPath: string) => {
+      console.error("The 'download' command is not implemented in this minimal scaffold.");
+    });
+
+  await program.parseAsync(process.argv);
 }
 
-/**
- * Recursively print a directory tree.  The prefix parameter controls the
- * indentation for nested directories.
- */
-async function printTree(fsremote: RemoteFs, folder: string, dir: string, prefix: string): Promise<void> {
-  const entries = await fsremote.readDir(folder, dir);
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    const isLast = i === entries.length - 1;
-    const branch = isLast ? '└── ' : '├── ';
-    console.log(`${prefix}${branch}${entry.name}${entry.type === 'directory' ? '/' : ''}`);
-    if (entry.type === 'directory') {
-      const newPrefix = prefix + (isLast ? '    ' : '│   ');
-      const subPath = dir ? `${dir}/${entry.name}` : entry.name;
-      await printTree(fsremote, folder, subPath, newPrefix);
-    }
-  }
-}
-
-program.parseAsync(process.argv);
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

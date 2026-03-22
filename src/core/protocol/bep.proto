@@ -1,7 +1,5 @@
 syntax = "proto3";
 
-// Syncthing Block Exchange Protocol messages needed for a read‑only client.
-
 message Hello {
   string device_name    = 1;
   string client_name    = 2;
@@ -34,25 +32,20 @@ message ClusterConfig {
 }
 
 message Folder {
-  string id                 = 1;
-  string label              = 2;
-  bool   read_only          = 3;
-  bool   ignore_permissions = 4;
-  bool   ignore_delete      = 5;
+  string id                   = 1;
+  string label                = 2;
+  bool   read_only            = 3;
+  bool   ignore_permissions   = 4;
+  bool   ignore_delete        = 5;
   bool   disable_temp_indexes = 6;
-  bool   paused             = 7;
-  repeated Device devices   = 16;
+  bool   paused               = 7;
+  repeated Device devices     = 16;
 }
 
 message Device {
   bytes           id                         = 1;
   string          name                       = 2;
   repeated string addresses                  = 3;
-  enum Compression {
-    METADATA = 0;
-    NEVER    = 1;
-    ALWAYS   = 2;
-  }
   Compression     compression                = 4;
   string          cert_name                  = 5;
   int64           max_sequence               = 6;
@@ -60,6 +53,12 @@ message Device {
   uint64          index_id                   = 8;
   bool            skip_introduction_removals = 9;
   bytes           encryption_password_token  = 10;
+}
+
+enum Compression {
+  METADATA = 0;
+  NEVER    = 1;
+  ALWAYS   = 2;
 }
 
 message Index {
@@ -99,10 +98,10 @@ enum FileInfoType {
 }
 
 message BlockInfo {
-  int64  offset     = 1;
-  int32  size       = 2;
-  bytes  hash       = 3;
-  uint32 weak_hash  = 4;
+  int64  offset    = 1;
+  int32  size      = 2;
+  bytes  hash      = 3;
+  uint32 weak_hash = 4;
 }
 
 message Vector {
@@ -125,10 +124,10 @@ message Request {
 }
 
 enum ErrorCode {
-  NONE           = 0;
-  UNKNOWN        = 1;
-  NOT_FOUND      = 2;
-  BLOCK_SIZE_MISMATCH = 3;
+  NO_ERROR            = 0;
+  GENERIC             = 1;
+  NO_SUCH_FILE        = 2;
+  INVALID_FILE        = 3;
 }
 
 message Response {

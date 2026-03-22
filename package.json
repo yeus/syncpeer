@@ -1,21 +1,24 @@
 {
   "name": "syncpeer",
   "version": "0.1.0",
-  "description": "Minimal BEP client for Syncthing (read‑only)",
-  "main": "dist/index.js",
+  "description": "Minimal BEP client for Syncthing (read-only)",
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/cli/main.js",
-    "generate": "pbjs -t static-module -w esm -o src/core/protocol/bep_gen.js src/core/protocol/bep.proto && pbts -o src/core/protocol/bep_gen.d.ts src/core/protocol/bep_gen.js"
+    "dev": "tsx src/cli/main.ts",
+    "test": "npm run test:cli",
+    "test:cli": "npm run build && node dist/cli/main.js --help",
+    "download:syncthing": "node scripts/download-syncthing.mjs",
+    "test:local": "tsx scripts/test-local.ts",
+    "test:local:keep": "tsx scripts/test-local.ts --keep"
   },
   "dependencies": {
-    "commander": "^11.0.0",
-    "protobufjs": "^7.2.4"
+    "commander": "^14.0.3",
+    "protobufjs": "^8.0.0"
   },
   "devDependencies": {
-    "tsx": "^4.5.0",
-    "typescript": "^5.2.2",
-    "@types/node": "^20.7.0"
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   }
 }

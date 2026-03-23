@@ -2,16 +2,14 @@ import * as tls from 'tls';
 import { connectTLS, NodeTransportOptions } from './core/transport/node.js';
 import {
   encodeHelloFrame,
-  encodeFrame,
+  encodeMessageFrame,
   FrameParser,
   MessageTypeValues,
   Hello,
   ClusterConfig,
-  Index,
   Request,
-  Response,
 } from './core/protocol/bep.js';
-import RemoteFs, { FolderInfo, FileEntry } from './core/model/remoteFs.js';
+import { RemoteFs } from './core/model/remoteFs.js';
 
 /**
  * Internal representation of a folder received from the peer.  Contains
@@ -140,9 +138,7 @@ class BepSession {
    * empty list and request no compression.
    */
   sendClusterConfig(): void {
-    const cfg = ClusterConfig.create({ folders: [] });
-    const msg = ClusterConfig.encode(cfg).finish();
-    const frame = encodeFrame(MessageTypeValues.CLUSTER_CONFIG, cfg, 0);
+    const frame = encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, { folders: [] }, 0);
     this.sendFrame(frame);
   }
   /**
@@ -155,8 +151,15 @@ class BepSession {
       return Promise.reject(new Error('Connection closed'));
     }
     const id = this.nextId++;
-    const req = Request.create({ id, folder, name, offset, size, hash: new Uint8Array(0), from_temporary: false });
-    const frame = encodeFrame(MessageTypeValues.REQUEST, req, 0);
+    const frame = encodeMessageFrame(MessageTypeValues.REQUEST, Request, {
+      id,
+      folder,
+      name,
+      offset,
+      size,
+      hash: new Uint8Array(0),
+      from_temporary: false,
+    }, 0);
     return new Promise<Uint8Array>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {

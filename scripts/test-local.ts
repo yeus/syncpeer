@@ -235,6 +235,31 @@ async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForCliDownload(
+  tsxPath: string,
+  args: string[],
+  outPath: string,
+  expectedContent: string,
+  timeoutMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = null;
+  while (Date.now() < deadline) {
+    try {
+      execFileSync(tsxPath, args, { stdio: 'inherit' });
+      const actual = fs.readFileSync(outPath, 'utf8');
+      if (actual === expectedContent) {
+        return;
+      }
+      lastErr = new Error(`Downloaded content mismatch. Expected "${expectedContent}", got "${actual}"`);
+    } catch (err) {
+      lastErr = err;
+    }
+    await sleep(1500);
+  }
+  throw new Error(`Timed out waiting for CLI download to match expected content: ${String(lastErr)}`);
+}
+
 async function main() {
   if (!fs.existsSync(syncthingBin)) {
     console.error(`Missing Syncthing binary: ${syncthingBin}`);
@@ -376,6 +401,59 @@ async function main() {
     }
     console.log('Download check passed.');
     console.log('Persisted cli-node ID check passed.');
+
+    const filesOutput = execFileSync(tsxBin, [
+      'src/cli/main.ts',
+      'files-local',
+      bShareDir,
+    ], {
+      encoding: 'utf8',
+    });
+    if (!filesOutput.includes('\tblob.bin') || !filesOutput.includes('\ta.txt') || !filesOutput.includes('\tsubdir/')) {
+      throw new Error(`CLI files output missing expected entries:\n${filesOutput}`);
+    }
+    console.log('Peer folder file listing check passed.');
+
+    const uploadedRelPath = 'cli-upload/smoke.txt';
+    const uploadedExpected = 'hello from cli upload test\n';
+    execFileSync(tsxBin, [
+      'src/cli/main.ts',
+      'upload-test',
+      bShareDir,
+      uploadedRelPath,
+      uploadedExpected,
+    ], {
+      stdio: 'inherit',
+    });
+    const uploadedLocalPath = path.join(bShareDir, uploadedRelPath);
+    if (!fs.existsSync(uploadedLocalPath)) {
+      throw new Error(`Uploaded local test file missing at ${uploadedLocalPath}`);
+    }
+    if (fs.readFileSync(uploadedLocalPath, 'utf8') !== uploadedExpected) {
+      throw new Error(`Uploaded local test file contents mismatch at ${uploadedLocalPath}`);
+    }
+
+    const uploadedDownloadPath = path.join(root, 'downloaded-upload-smoke.txt');
+    await waitForCliDownload(
+      tsxBin,
+      [
+        'src/cli/main.ts',
+        '--host', '127.0.0.1',
+        '--port', '58301',
+        '--cert', path.join(cliNodeHome, 'cert.pem'),
+        '--key', path.join(cliNodeHome, 'key.pem'),
+        '--remote-id', bId,
+        '--timeout-ms', '20000',
+        'download',
+        folderId,
+        uploadedRelPath,
+        uploadedDownloadPath,
+      ],
+      uploadedDownloadPath,
+      uploadedExpected,
+      90_000,
+    );
+    console.log('CLI upload test file check passed.');
 
     console.log('');
     console.log('=== Automated local integration test passed ===');

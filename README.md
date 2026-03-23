@@ -49,7 +49,10 @@ Use `npm run test:local:keep` to keep processes and temp files for debugging.
 ```bash
 npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem list
 npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem tree <folder-id>
+npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem files <folder-id> [dir]
+npx tsx src/cli/main.ts files-local /path/to/peer-folder [dir]
 npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem download <folder-id> some/file.txt ./out.txt
+npx tsx src/cli/main.ts upload-test /path/to/peer-folder smoke.txt "hello from cli upload test"
 npx tsx src/cli/main.ts local-id
 ```
 

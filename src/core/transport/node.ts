@@ -46,6 +46,7 @@ export async function connectTLS(opts: NodeTransportOptions): Promise<tls.TLSSoc
   const socket = tls.connect({
     host: opts.host,
     port: opts.port,
+    ALPNProtocols: ["bep/1.0"],
     cert: typeof opts.cert === "string" ? fs.readFileSync(opts.cert) : opts.cert,
     key: typeof opts.key === "string" ? fs.readFileSync(opts.key) : opts.key,
     ca: opts.ca ? (typeof opts.ca === "string" ? fs.readFileSync(opts.ca) : opts.ca) : undefined,

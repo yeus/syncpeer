@@ -34,7 +34,14 @@ Start two isolated local Syncthing instances and prepare a shared test folder:
 npm run test:local
 ```
 
-That script prints the exact next steps and the exact CLI commands to run.
+This is fully automated (no GUI steps). It:
+
+- creates two Syncthing homes
+- configures peers + shared folder
+- waits for sync to complete
+- runs the TypeScript BEP client check against the second instance
+
+Use `npm run test:local:keep` to keep processes and temp files for debugging.
 
 ## CLI usage
 

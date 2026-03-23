@@ -85,7 +85,7 @@ class BepSession {
       const state: FolderState = {
         id: folder.id,
         label: folder.label || folder.id,
-        readOnly: !!folder.read_only,
+        readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
         files: new Map(),
       };
       this.folders.set(folder.id, state);

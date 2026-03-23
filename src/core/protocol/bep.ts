@@ -1,25 +1,64 @@
 import fs from "node:fs";
 import protobuf from "protobufjs";
+import { decompressBlock } from "lz4js";
 
 const schemaText = fs.readFileSync(new URL("./bep.proto", import.meta.url), "utf8");
 const root = protobuf.parse(schemaText, { keepCase: true }).root;
 
-export const Hello = root.lookupType("Hello");
-export const Header = root.lookupType("Header");
-export const ClusterConfig = root.lookupType("ClusterConfig");
-export const Index = root.lookupType("Index");
-export const IndexUpdate = root.lookupType("IndexUpdate");
-export const Request = root.lookupType("Request");
-export const Response = root.lookupType("Response");
+function lookupTypeAny(...names: string[]) {
+  for (const name of names) {
+    try {
+      return root.lookupType(name);
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`Type not found in BEP schema: ${names.join(", ")}`);
+}
 
-export const MessageTypeEnum = root.lookupEnum("MessageType");
-export const MessageCompressionEnum = root.lookupEnum("MessageCompression");
+function lookupEnumAny(...names: string[]) {
+  for (const name of names) {
+    try {
+      return root.lookupEnum(name);
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`Enum not found in BEP schema: ${names.join(", ")}`);
+}
+
+export const Hello = lookupTypeAny("Hello", "bep.Hello");
+export const Header = lookupTypeAny("Header", "bep.Header");
+export const ClusterConfig = lookupTypeAny("ClusterConfig", "bep.ClusterConfig");
+export const Index = lookupTypeAny("Index", "bep.Index");
+export const IndexUpdate = lookupTypeAny("IndexUpdate", "bep.IndexUpdate");
+export const Request = lookupTypeAny("Request", "bep.Request");
+export const Response = lookupTypeAny("Response", "bep.Response");
+
+export const MessageTypeEnum = lookupEnumAny("MessageType", "bep.MessageType");
+export const MessageCompressionEnum = lookupEnumAny("MessageCompression", "bep.MessageCompression");
 
 export type MessageType = number;
 export type MessageCompression = number;
 
-export const MessageTypeValues = MessageTypeEnum.values as Record<string, number>;
-export const MessageCompressionValues = MessageCompressionEnum.values as Record<string, number>;
+const rawMessageTypeValues = MessageTypeEnum.values as Record<string, number>;
+const rawCompressionValues = MessageCompressionEnum.values as Record<string, number>;
+
+export const MessageTypeValues = {
+  CLUSTER_CONFIG: rawMessageTypeValues.CLUSTER_CONFIG ?? rawMessageTypeValues.MESSAGE_TYPE_CLUSTER_CONFIG,
+  INDEX: rawMessageTypeValues.INDEX ?? rawMessageTypeValues.MESSAGE_TYPE_INDEX,
+  INDEX_UPDATE: rawMessageTypeValues.INDEX_UPDATE ?? rawMessageTypeValues.MESSAGE_TYPE_INDEX_UPDATE,
+  REQUEST: rawMessageTypeValues.REQUEST ?? rawMessageTypeValues.MESSAGE_TYPE_REQUEST,
+  RESPONSE: rawMessageTypeValues.RESPONSE ?? rawMessageTypeValues.MESSAGE_TYPE_RESPONSE,
+  DOWNLOAD_PROGRESS: rawMessageTypeValues.DOWNLOAD_PROGRESS ?? rawMessageTypeValues.MESSAGE_TYPE_DOWNLOAD_PROGRESS,
+  PING: rawMessageTypeValues.PING ?? rawMessageTypeValues.MESSAGE_TYPE_PING,
+  CLOSE: rawMessageTypeValues.CLOSE ?? rawMessageTypeValues.MESSAGE_TYPE_CLOSE,
+} as const;
+
+export const MessageCompressionValues = {
+  NONE: rawCompressionValues.NONE ?? rawCompressionValues.MESSAGE_COMPRESSION_NONE,
+  LZ4: rawCompressionValues.LZ4 ?? rawCompressionValues.MESSAGE_COMPRESSION_LZ4,
+} as const;
 
 export interface DecodedHeader {
   type: MessageType;
@@ -71,7 +110,26 @@ export class FrameParser {
       const headerBuf = this.buffer.subarray(2, 2 + headerLen);
       const header = Header.decode(headerBuf) as unknown as DecodedHeader;
 
-      const messageBuf = this.buffer.subarray(msgLenOffset + 4, totalLen);
+      let messageBuf = this.buffer.subarray(msgLenOffset + 4, totalLen);
+      const compression = Number((header as any).compression ?? MessageCompressionValues.NONE);
+      if (compression === MessageCompressionValues.LZ4) {
+        if (messageBuf.length < 4) {
+          throw new Error(`LZ4 message too short (${messageBuf.length})`);
+        }
+        const view = new DataView(messageBuf.buffer, messageBuf.byteOffset, messageBuf.byteLength);
+        const decompressedSize = view.getUint32(0, false);
+        const decompressed = new Uint8Array(decompressedSize);
+        const written = decompressBlock(
+          messageBuf,
+          decompressed,
+          4,
+          messageBuf.length - 4,
+          0,
+        );
+        messageBuf = decompressed.subarray(0, written);
+      } else if (compression !== MessageCompressionValues.NONE) {
+        throw new Error(`Unsupported message compression: ${compression}`);
+      }
 
       let message: unknown;
       switch (header.type) {

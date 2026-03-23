@@ -39,8 +39,8 @@ function toEntry(path: string, file: any): FileEntry {
     type,
     size: Number(file.size ?? 0),
     modifiedMs: Number(file.modified_s ?? 0) * 1000 + Math.floor(Number(file.modified_ns ?? 0) / 1e6),
-    blocks: Array.isArray(file.Blocks)
-      ? file.Blocks.map((b: any) => ({
+    blocks: Array.isArray(file.blocks ?? file.Blocks)
+      ? (file.blocks ?? file.Blocks).map((b: any) => ({
           offset: Number(b.offset ?? 0),
           size: Number(b.size ?? 0),
           hash: b.hash instanceof Uint8Array ? b.hash : new Uint8Array(b.hash ?? []),

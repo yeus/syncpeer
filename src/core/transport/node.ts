@@ -37,6 +37,22 @@ function normalizeDeviceId(id: string): string {
   return id.replace(/[^A-Z2-7]/gi, "").toUpperCase();
 }
 
+function canonicalDeviceId(id: string): string {
+  const normalized = normalizeDeviceId(id);
+  // Syncthing display IDs are 56 chars with one check character every 13 chars.
+  // Our computed raw cert hash is 52 chars. Remove check characters for comparison.
+  if (normalized.length !== 56) {
+    return normalized;
+  }
+  let out = "";
+  for (let i = 0; i < normalized.length; i++) {
+    const pos = i + 1;
+    if (pos % 14 === 0) continue;
+    out += normalized[i];
+  }
+  return out;
+}
+
 export function computeDeviceId(rawCert: Buffer): string {
   const digest = crypto.createHash("sha256").update(rawCert).digest();
   return base32NoPadding(digest);
@@ -65,8 +81,8 @@ export async function connectTLS(opts: NodeTransportOptions): Promise<tls.TLSSoc
   }
 
   if (opts.expectedDeviceId) {
-    const got = normalizeDeviceId(computeDeviceId(peer.raw));
-    const want = normalizeDeviceId(opts.expectedDeviceId);
+    const got = canonicalDeviceId(computeDeviceId(peer.raw));
+    const want = canonicalDeviceId(opts.expectedDeviceId);
     if (got != want) {
       socket.destroy();
       throw new Error(`Remote device ID mismatch: expected ${opts.expectedDeviceId}, got ${got}`);

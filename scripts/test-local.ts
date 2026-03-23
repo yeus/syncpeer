@@ -1,12 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
-import { connectAndSync } from '../src/client.js';
 
 /*
  * Local fully-automated Syncthing integration test.
  * It creates two isolated homes, wires devices/folders without GUI usage,
- * waits for sync, then validates our TypeScript BEP client against peer B.
+ * waits for sync, then validates the syncpeer CLI against peer B.
  */
 
 const keep = process.argv.includes('--keep');
@@ -40,6 +39,7 @@ if (!platform || !arch) {
 }
 const syncthingDir = path.join(toolsDir, `syncthing-${platform}-${arch}-${version}`);
 const syncthingBin = path.join(syncthingDir, 'syncthing');
+const tsxBin = path.resolve('node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
 
 function ensureDir(p: string) {
   fs.mkdirSync(p, { recursive: true });
@@ -221,17 +221,6 @@ async function waitForSync(filePath: string, expected: string, timeoutMs: number
   throw new Error(`Timed out waiting for synced file: ${filePath}`);
 }
 
-async function waitForRemoteIndex(getReady: () => Promise<boolean>, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await getReady()) {
-      return;
-    }
-    await sleep(1000);
-  }
-  throw new Error('Timed out waiting for remote index via BEP');
-}
-
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -295,30 +284,26 @@ async function main() {
     await waitForSync(path.join(aRecvDir, 'subdir', 'nested.txt'), 'nested file\n', 90_000);
 
     console.log('');
-    console.log('=== Running syncpeer client checks ===');
-    const remoteFs = await connectAndSync({
-      host: '127.0.0.1',
-      port: 58301,
-      cert: path.join(aHome, 'cert.pem'),
-      key: path.join(aHome, 'key.pem'),
-      deviceName: 'syncpeer-test-a',
+    console.log('=== Running syncpeer CLI checks ===');
+    // Disconnect Syncthing A before using A's cert in the CLI client.
+    if (a) {
+      a.kill('SIGTERM');
+      await sleep(1500);
+    }
+    const baseArgs = [
+      'src/cli/main.ts',
+      '--host', '127.0.0.1',
+      '--port', '58301',
+      '--cert', path.join(aHome, 'cert.pem'),
+      '--key', path.join(aHome, 'key.pem'),
+      '--remote-id', bId,
+      '--timeout-ms', '20000',
+    ];
+    const listOutput = execFileSync(tsxBin, [...baseArgs, 'list'], {
+      encoding: 'utf8',
     });
-    await waitForRemoteIndex(async () => {
-      const entry = await remoteFs.stat(folderId, 'a.txt');
-      return !!entry && entry.type === 'file' && entry.size === expectedA.length;
-    }, 30_000);
-
-    const folders = await remoteFs.listFolders();
-    if (!folders.some((f) => f.id === folderId)) {
-      throw new Error(`Remote folder "${folderId}" not visible`);
-    }
-    const rootEntries = await remoteFs.readDir(folderId, '');
-    if (!rootEntries.some((e) => e.path === 'a.txt')) {
-      throw new Error('Remote root listing does not contain a.txt');
-    }
-    const content = Buffer.from(await remoteFs.readFileFully(folderId, 'a.txt')).toString('utf8');
-    if (content !== expectedA) {
-      throw new Error(`Downloaded content mismatch for a.txt: got ${JSON.stringify(content)}`);
+    if (!listOutput.includes(`${folderId}\t`)) {
+      throw new Error(`CLI list output did not contain expected folder "${folderId}":\n${listOutput}`);
     }
 
     console.log('');

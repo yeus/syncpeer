@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import fs from "node:fs";
+import path from "node:path";
 import { connectAndSync } from "../client.js";
 import { ensureCliNodeIdentity } from "./identity.js";
 
@@ -12,6 +13,41 @@ interface CliOptions {
   remoteId?: string;
   deviceName: string;
   timeoutMs: number;
+}
+
+function normalizeRelativePath(input: string): string {
+  const normalized = input.replaceAll("\\", "/").replace(/^\/+/, "");
+  const parts = normalized.split("/").filter((part) => part.length > 0);
+  if (parts.some((part) => part === "." || part === "..")) {
+    throw new Error(`Invalid relative path: ${input}`);
+  }
+  return parts.join("/");
+}
+
+function listLocalDir(baseDir: string, dir: string): Array<{ type: string; path: string }> {
+  const relative = normalizeRelativePath(dir);
+  const rootPath = fs.realpathSync(baseDir);
+  const targetPath = path.resolve(rootPath, relative);
+  const relativeToRoot = path.relative(rootPath, targetPath);
+  if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
+    throw new Error(`Directory escapes peerFolderPath: ${dir}`);
+  }
+  if (!fs.existsSync(targetPath)) {
+    throw new Error(`Directory does not exist: ${targetPath}`);
+  }
+  const entries = fs.readdirSync(targetPath, { withFileTypes: true });
+  const out = entries.map((entry) => {
+    const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
+    return {
+      type: entry.isDirectory() ? "directory" : entry.isSymbolicLink() ? "symlink" : "file",
+      path: entryRelative.replaceAll("\\", "/"),
+    };
+  });
+  out.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+    return a.path.localeCompare(b.path);
+  });
+  return out;
 }
 
 function requiredPath(name: string, value: string | undefined): string {
@@ -114,6 +150,20 @@ async function main() {
     });
 
   program
+    .command("files <folderId> [dir]")
+    .description("List files from a peer folder directory")
+    .action(async (folderId: string, dir = "") => {
+      const opts = program.opts<CliOptions>();
+      const remoteFs = await openRemoteFs(opts);
+      const entries = await remoteFs.readDir(folderId, dir);
+      for (const entry of entries) {
+        const suffix = entry.type === "directory" ? "/" : "";
+        const type = entry.type.padEnd(9, " ");
+        console.log(`${type}\t${entry.path}${suffix}`);
+      }
+    });
+
+  program
     .command("download <folderId> <remotePath> <localPath>")
     .description("Download a file from the remote peer")
     .action(async (folderId: string, remotePath: string, localPath: string) => {
@@ -122,6 +172,38 @@ async function main() {
       const bytes = await remoteFs.readFileFully(folderId, remotePath);
       fs.writeFileSync(localPath, Buffer.from(bytes));
       console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
+    });
+
+  program
+    .command("upload-test <peerFolderPath> <remotePath> [content]")
+    .description("Write a small test file directly into a local peer folder path")
+    .action((peerFolderPath: string, remotePath: string, content?: string) => {
+      const relative = normalizeRelativePath(remotePath);
+      if (!relative) {
+        throw new Error("remotePath must not be empty");
+      }
+      const targetPath = fs.realpathSync(peerFolderPath);
+      const outPath = path.resolve(targetPath, relative);
+      const relativeToRoot = path.relative(targetPath, outPath);
+      if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
+        throw new Error(`remotePath escapes peerFolderPath: ${remotePath}`);
+      }
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      const payload = content ?? "small upload from syncpeer cli\n";
+      fs.writeFileSync(outPath, payload, "utf8");
+      console.log(`Wrote ${Buffer.byteLength(payload, "utf8")} bytes to ${outPath}`);
+    });
+
+  program
+    .command("files-local <peerFolderPath> [dir]")
+    .description("List files from a local peer folder path")
+    .action((peerFolderPath: string, dir = "") => {
+      const entries = listLocalDir(peerFolderPath, dir);
+      for (const entry of entries) {
+        const suffix = entry.type === "directory" ? "/" : "";
+        const type = entry.type.padEnd(9, " ");
+        console.log(`${type}\t${entry.path}${suffix}`);
+      }
     });
 
   program

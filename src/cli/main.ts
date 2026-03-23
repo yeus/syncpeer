@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import fs from "node:fs";
 import { connectAndSync } from "../client.js";
+import { ensureCliNodeIdentity } from "./identity.js";
 
 interface CliOptions {
   host: string;
@@ -21,8 +22,18 @@ function requiredPath(name: string, value: string | undefined): string {
 }
 
 async function openRemoteFs(opts: CliOptions) {
-  const cert = requiredPath("cert", opts.cert);
-  const key = requiredPath("key", opts.key);
+  let cert: string;
+  let key: string;
+
+  if (opts.cert || opts.key) {
+    cert = requiredPath("cert", opts.cert);
+    key = requiredPath("key", opts.key);
+  } else {
+    const identity = ensureCliNodeIdentity();
+    cert = identity.cert;
+    key = identity.key;
+  }
+
   const connectPromise = connectAndSync({
     host: opts.host,
     port: opts.port,
@@ -66,8 +77,8 @@ async function main() {
     .description("Read-only Syncthing BEP client")
     .option("--host <host>", "Remote host", "127.0.0.1")
     .option("--port <port>", "Remote port", (value) => parseInt(value, 10), 22000)
-    .option("--cert <file>", "Path to TLS certificate")
-    .option("--key <file>", "Path to TLS private key")
+    .option("--cert <file>", "Path to TLS certificate (defaults to persisted cli-node identity)")
+    .option("--key <file>", "Path to TLS private key (defaults to persisted cli-node identity)")
     .option("--remote-id <id>", "Expected remote device ID")
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option("--timeout-ms <ms>", "Connection timeout in milliseconds", (value) => parseInt(value, 10), 15000);
@@ -111,6 +122,21 @@ async function main() {
       const bytes = await remoteFs.readFileFully(folderId, remotePath);
       fs.writeFileSync(localPath, Buffer.from(bytes));
       console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
+    });
+
+  program
+    .command("local-id")
+    .description("Show the persisted local cli-node identity information")
+    .action(() => {
+      const identity = ensureCliNodeIdentity();
+      console.log(`configDir\t${identity.configDir}`);
+      console.log(`cert\t${identity.cert}`);
+      console.log(`key\t${identity.key}`);
+      if (identity.deviceId) {
+        console.log(`deviceId\t${identity.deviceId}`);
+      } else {
+        console.log("deviceId\t(unavailable - Syncthing binary not found to resolve it)");
+      }
     });
 
   await program.parseAsync(process.argv);

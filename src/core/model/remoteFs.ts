@@ -26,6 +26,10 @@ interface FolderState {
   files: Map<string, any>;
 }
 
+function normalizePath(p: string): string {
+  return p.replace(/^\/+|\/+$/g, "");
+}
+
 function toEntry(path: string, file: any): FileEntry {
   const typeValue = Number(file.type ?? 0);
   const type =
@@ -67,16 +71,19 @@ export class RemoteFs {
     const folder = this.folders.get(folderId);
     if (!folder) return null;
 
-    const normalized = path.replace(/^\/+|\/+$/g, "");
-    const file = folder.files.get(normalized);
-    if (file) {
-      return toEntry(normalized, file);
+    const normalized = normalizePath(path);
+    for (const [key, value] of folder.files) {
+      const keyPath = normalizePath(key);
+      if (keyPath === normalized) {
+        return toEntry(keyPath, value);
+      }
     }
 
     const prefix = normalized ? normalized + "/" : "";
     for (const key of folder.files.keys()) {
+      const keyPath = normalizePath(key);
       // When the requested path is a prefix of some file key, treat it as a directory
-      if (!prefix || key.startsWith(prefix)) {
+      if (!prefix || keyPath.startsWith(prefix)) {
         return {
           name: normalized.split("/").filter(Boolean).at(-1) ?? "",
           path: normalized,
@@ -94,24 +101,25 @@ export class RemoteFs {
     const folder = this.folders.get(folderId);
     if (!folder) return [];
 
-    const normalized = path.replace(/^\/+|\/+$/g, "");
+    const normalized = normalizePath(path);
     const prefix = normalized ? normalized + "/" : "";
     const out = new Map<string, FileEntry>();
 
     for (const [key, value] of folder.files) {
+      const keyPath = normalizePath(key);
       if (normalized) {
         // Skip entries that are not under the requested directory
-        if (!key.startsWith(prefix)) continue;
+        if (!keyPath.startsWith(prefix)) continue;
       }
 
       // Strip the prefix to see what's left under this directory
-      const rest = normalized ? key.slice(prefix.length) : key;
+      const rest = normalized ? keyPath.slice(prefix.length) : keyPath;
       if (!rest) continue;
 
       const firstSlash = rest.indexOf("/");
       if (firstSlash === -1) {
         // It's a file directly under the directory
-        out.set(rest, toEntry(key, value));
+        out.set(rest, toEntry(keyPath, value));
       } else {
         // It's a sub-directory entry
         const childName = rest.slice(0, firstSlash);
@@ -140,8 +148,16 @@ export class RemoteFs {
   }
 
   async readFileFully(folderId: string, path: string): Promise<Uint8Array> {
-    const entry = await this.stat(folderId, path);
-    if (!entry || entry.type != "file") {
+    let entry = await this.stat(folderId, path);
+    const waitUntil = Date.now() + 5000;
+    while (!entry && Date.now() < waitUntil) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      entry = await this.stat(folderId, path);
+    }
+    if (!entry) {
+      return this.readFileByProbing(folderId, path);
+    }
+    if (entry.type === "directory") {
       throw new Error(`Not a file: ${path}`);
     }
 
@@ -165,5 +181,18 @@ export class RemoteFs {
       pos += chunk.length;
     }
     return out;
+  }
+
+  private async readFileByProbing(folderId: string, path: string): Promise<Uint8Array> {
+    const maxProbeSize = 16 * 1024 * 1024;
+    const chunk = await this.requestBlock(folderId, path, 0, maxProbeSize);
+    if (chunk.length === 0) {
+      throw new Error(`Not a file: ${path}`);
+    }
+    let end = chunk.length;
+    while (end > 0 && chunk[end - 1] === 0) {
+      end--;
+    }
+    return chunk.slice(0, end);
   }
 }

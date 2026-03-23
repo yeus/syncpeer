@@ -15,6 +15,8 @@ const bHome = path.join(root, 'st-b');
 const folderId = 'syncpeer-test';
 const bShareDir = path.join(root, 'share-b');
 const aRecvDir = path.join(root, 'share-a');
+const cliConfigHome = path.join(root, 'xdg-config');
+const cliNodeHome = path.join(cliConfigHome, 'syncpeer', 'cli-node');
 const toolsDir = path.resolve('.tools');
 const version = process.env.SYNCTHING_VERSION ?? 'v1.27.8';
 const A_SYNC_ADDR = 'tcp://127.0.0.1:58300';
@@ -134,18 +136,26 @@ function addTopLevelDevice(xml: string, deviceId: string, name: string, address:
   return xml.replace(/(\s*<gui\b[\s\S]*$)/, `${block}$1`);
 }
 
-function addFolder(xml: string, id: string, label: string, folderPath: string, type: 'sendreceive' | 'sendonly', localDeviceId: string, remoteDeviceId: string): string {
+function addFolder(
+  xml: string,
+  id: string,
+  label: string,
+  folderPath: string,
+  type: 'sendreceive' | 'sendonly',
+  deviceIds: string[],
+): string {
   if (xml.includes(`<folder id="${id}"`)) {
     return xml;
   }
+  const uniqueDeviceIds = [...new Set(deviceIds)];
+  const deviceBlocks = uniqueDeviceIds
+    .map((deviceId) => `        <device id="${escapeXml(deviceId)}" introducedBy="">
+            <encryptionPassword></encryptionPassword>
+        </device>`)
+    .join('\n');
   const block = `    <folder id="${escapeXml(id)}" label="${escapeXml(label)}" path="${escapeXml(folderPath)}" type="${escapeXml(type)}" rescanIntervalS="30" fsWatcherEnabled="false" fsWatcherDelayS="10" fsWatcherTimeoutS="0" ignorePerms="false" autoNormalize="true">
         <filesystemType>basic</filesystemType>
-        <device id="${escapeXml(localDeviceId)}" introducedBy="">
-            <encryptionPassword></encryptionPassword>
-        </device>
-        <device id="${escapeXml(remoteDeviceId)}" introducedBy="">
-            <encryptionPassword></encryptionPassword>
-        </device>
+${deviceBlocks}
         <minDiskFree unit="%">1</minDiskFree>
         <versioning>
             <cleanupIntervalS>3600</cleanupIntervalS>
@@ -190,20 +200,20 @@ function configureHome(
   opts: {
     guiAddress: string;
     listenAddress: string;
-    localDeviceId: string;
-    remoteDeviceId: string;
-    remoteName: string;
-    remoteAddress: string;
+    remoteDevices: Array<{ id: string; name: string; address: string }>;
     folderPath: string;
     folderType: 'sendreceive' | 'sendonly';
+    folderDeviceIds: string[];
   },
 ) {
   const configPath = path.join(home, 'config.xml');
   let xml = fs.readFileSync(configPath, 'utf8');
   xml = replaceGuiAddress(xml, opts.guiAddress);
   xml = setSingleListenAddress(xml, opts.listenAddress);
-  xml = addTopLevelDevice(xml, opts.remoteDeviceId, opts.remoteName, opts.remoteAddress);
-  xml = addFolder(xml, folderId, folderId, opts.folderPath, opts.folderType, opts.localDeviceId, opts.remoteDeviceId);
+  for (const remote of opts.remoteDevices) {
+    xml = addTopLevelDevice(xml, remote.id, remote.name, remote.address);
+  }
+  xml = addFolder(xml, folderId, folderId, opts.folderPath, opts.folderType, opts.folderDeviceIds);
   fs.writeFileSync(configPath, xml);
 }
 
@@ -252,25 +262,31 @@ async function main() {
   const aId = readDeviceId(aHome);
   const bId = readDeviceId(bHome);
 
+  console.log('Preparing persisted cli-node identity...');
+  ensureDir(cliNodeHome);
+  execFileSync(syncthingBin, ['generate', '--home', cliNodeHome, '--no-port-probing'], { stdio: 'inherit' });
+  const cliNodeId = readDeviceId(cliNodeHome);
+
   configureHome(aHome, {
     guiAddress: A_GUI_ADDR,
     listenAddress: A_SYNC_ADDR,
-    localDeviceId: aId,
-    remoteDeviceId: bId,
-    remoteName: 'syncpeer-b',
-    remoteAddress: B_SYNC_ADDR,
+    remoteDevices: [
+      { id: bId, name: 'syncpeer-b', address: B_SYNC_ADDR },
+    ],
     folderPath: aRecvDir,
     folderType: 'sendreceive',
+    folderDeviceIds: [aId, bId],
   });
   configureHome(bHome, {
     guiAddress: B_GUI_ADDR,
     listenAddress: B_SYNC_ADDR,
-    localDeviceId: bId,
-    remoteDeviceId: aId,
-    remoteName: 'syncpeer-a',
-    remoteAddress: A_SYNC_ADDR,
+    remoteDevices: [
+      { id: aId, name: 'syncpeer-a', address: A_SYNC_ADDR },
+      { id: cliNodeId, name: 'syncpeer-cli-node', address: 'dynamic' },
+    ],
     folderPath: bShareDir,
     folderType: 'sendonly',
+    folderDeviceIds: [bId, aId, cliNodeId],
   });
 
   let a;
@@ -294,8 +310,8 @@ async function main() {
       'src/cli/main.ts',
       '--host', '127.0.0.1',
       '--port', '58301',
-      '--cert', path.join(aHome, 'cert.pem'),
-      '--key', path.join(aHome, 'key.pem'),
+      '--cert', path.join(cliNodeHome, 'cert.pem'),
+      '--key', path.join(cliNodeHome, 'key.pem'),
       '--remote-id', bId,
       '--timeout-ms', '20000',
     ];
@@ -305,6 +321,61 @@ async function main() {
     if (!listOutput.includes(`${folderId}\t`)) {
       throw new Error(`CLI list output did not contain expected folder "${folderId}":\n${listOutput}`);
     }
+    console.log('Legacy list check passed.');
+
+    const persistedListOutput = execFileSync(tsxBin, [
+      'src/cli/main.ts',
+      '--host', '127.0.0.1',
+      '--port', '58301',
+      '--remote-id', bId,
+      '--timeout-ms', '20000',
+      'list',
+    ], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        XDG_CONFIG_HOME: cliConfigHome,
+        SYNCTHING_BIN: syncthingBin,
+      },
+    });
+    if (!persistedListOutput.includes(`${folderId}\t`)) {
+      throw new Error(`Persisted cli-node list output missing folder "${folderId}":\n${persistedListOutput}`);
+    }
+    console.log('Persisted cli-node list check passed.');
+
+    const downloadOutPath = path.join(root, 'downloaded-nested.txt');
+    execFileSync(tsxBin, [
+      'src/cli/main.ts',
+      '--host', '127.0.0.1',
+      '--port', '58301',
+      '--remote-id', bId,
+      '--timeout-ms', '20000',
+      'download',
+      folderId,
+      'a.txt',
+      downloadOutPath,
+    ], {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        XDG_CONFIG_HOME: cliConfigHome,
+        SYNCTHING_BIN: syncthingBin,
+      },
+    });
+    const downloaded = fs.readFileSync(downloadOutPath, 'utf8');
+    if (downloaded !== expectedA) {
+      throw new Error(`Downloaded content mismatch: got "${downloaded}"`);
+    }
+    const persistedDeviceIdPath = path.join(cliNodeHome, 'device-id.txt');
+    if (!fs.existsSync(persistedDeviceIdPath)) {
+      throw new Error(`Persisted device-id file missing: ${persistedDeviceIdPath}`);
+    }
+    const persistedDeviceId = fs.readFileSync(persistedDeviceIdPath, 'utf8').trim();
+    if (persistedDeviceId !== cliNodeId) {
+      throw new Error(`Persisted device ID mismatch: expected ${cliNodeId}, got ${persistedDeviceId}`);
+    }
+    console.log('Download check passed.');
+    console.log('Persisted cli-node ID check passed.');
 
     console.log('');
     console.log('=== Automated local integration test passed ===');
@@ -316,6 +387,7 @@ async function main() {
     console.log(`B GUI:       http://${B_GUI_ADDR}`);
     console.log(`A device ID: ${aId}`);
     console.log(`B device ID: ${bId}`);
+    console.log(`CLI node ID: ${cliNodeId}`);
     console.log('');
     if (keep) {
       console.log('--keep flag used; leaving temp files in place.');

@@ -10,6 +10,7 @@ Minimal read-only Syncthing BEP client in TypeScript.
 - Remote folder listing
 - Tree view of indexed files
 - File download by path
+- Persisted local `cli-node` identity (`~/.config/syncpeer/cli-node`)
 - Local Syncthing test harness
 
 ## Quick start
@@ -49,7 +50,10 @@ Use `npm run test:local:keep` to keep processes and temp files for debugging.
 npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem list
 npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem tree <folder-id>
 npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/cert.pem download <folder-id> some/file.txt ./out.txt
+npx tsx src/cli/main.ts local-id
 ```
+
+If `--cert`/`--key` are omitted, `syncpeer` uses a persisted local identity at `~/.config/syncpeer/cli-node` (or `$XDG_CONFIG_HOME/syncpeer/cli-node`).
 
 ## Notes
 

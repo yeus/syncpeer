@@ -1,3 +1,5 @@
+import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as tls from 'tls';
 import { connectTLS, NodeTransportOptions } from './core/transport/node.js';
 import {
@@ -29,13 +31,18 @@ interface FolderState {
  */
 class BepSession {
   private parser: FrameParser;
-  private pending: Map<number, { resolve: (data: Uint8Array) => void; reject: (err: Error) => void }> = new Map();
+  private pending: Map<number, { resolve: (data: Uint8Array) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }> = new Map();
   private nextId = 1;
   private folders: Map<string, FolderState> = new Map();
   private readyPromise: Promise<void>;
   private readyResolve!: () => void;
   private closed = false;
-  constructor(private socket: tls.TLSSocket) {
+  private echoedClusterConfig = false;
+  constructor(
+    private socket: tls.TLSSocket,
+    private localDeviceId: Uint8Array,
+    private localDeviceName: string,
+  ) {
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
@@ -49,14 +56,16 @@ class BepSession {
     });
     this.socket.on('close', () => {
       this.closed = true;
-      for (const { reject } of this.pending.values()) {
+      for (const { reject, timer } of this.pending.values()) {
+        clearTimeout(timer);
         reject(new Error('Connection closed'));
       }
       this.pending.clear();
     });
     this.socket.on('error', (err) => {
       // Errors are propagated to pending requests
-      for (const { reject } of this.pending.values()) {
+      for (const { reject, timer } of this.pending.values()) {
+        clearTimeout(timer);
         reject(err);
       }
       this.pending.clear();
@@ -90,6 +99,32 @@ class BepSession {
       };
       this.folders.set(folder.id, state);
     }
+    // Re-announce folders after learning the peer's configuration. This helps
+    // trigger index transfer with peers that don't send file indexes when the
+    // initial client ClusterConfig is empty.
+    if (!this.echoedClusterConfig) {
+      this.echoedClusterConfig = true;
+      const folders = (cfg.folders || []).map((folder: any) => {
+        const devices = Array.isArray(folder.devices) ? [...folder.devices] : [];
+        const hasLocal = devices.some((device: any) => bytesEqual(device.id, this.localDeviceId));
+        if (!hasLocal) {
+          devices.push({
+            id: this.localDeviceId,
+            name: this.localDeviceName,
+            addresses: ['dynamic'],
+            compression: 0,
+            max_sequence: 0,
+            index_id: 0,
+          });
+        }
+        return {
+          ...folder,
+          devices,
+        };
+      });
+      const frame = encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, { folders }, 0);
+      this.sendFrame(frame);
+    }
     // We might already have received indexes before the cluster config (unlikely),
     // but once cluster config arrives we consider the session ready.
     this.readyResolve();
@@ -112,6 +147,7 @@ class BepSession {
       return;
     }
     this.pending.delete(id);
+    clearTimeout(entry.timer);
     if (resp.code && resp.code !== 0) {
       entry.reject(new Error(`Response error code ${resp.code}`));
     } else {
@@ -161,10 +197,15 @@ class BepSession {
       from_temporary: false,
     }, 0);
     return new Promise<Uint8Array>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Request timeout for ${name} at offset ${offset}`));
+      }, 10000);
+      this.pending.set(id, { resolve, reject, timer });
       try {
         this.sendFrame(frame);
       } catch (e) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(e as Error);
       }
@@ -177,6 +218,24 @@ class BepSession {
   buildRemoteFs(): RemoteFs {
     return new RemoteFs(this.folders, (folder, name, offset, size) => this.requestBlock(folder, name, offset, size));
   }
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function localDeviceIdFromCert(certInput: string | Buffer): Uint8Array {
+  const certPem = typeof certInput === 'string' ? fs.readFileSync(certInput) : certInput;
+  const cert = new crypto.X509Certificate(certPem);
+  return new Uint8Array(crypto.createHash('sha256').update(cert.raw).digest());
 }
 
 /**
@@ -232,6 +291,7 @@ export async function connectAndSync(opts: NodeTransportOptions & {
   clientVersion?: string;
 }): Promise<RemoteFs> {
   const socket = await connectTLS(opts);
+  const localDeviceId = localDeviceIdFromCert(opts.cert);
   // Send our hello immediately
   const helloFrame = encodeHelloFrame({
     device_name: opts.deviceName,
@@ -242,13 +302,10 @@ export async function connectAndSync(opts: NodeTransportOptions & {
   // Read the remote hello
   const { hello: remoteHello, leftover } = await readRemoteHello(socket);
   // If there was leftover data after the hello, feed it to the parser later
-  const session = new BepSession(socket);
+  const session = new BepSession(socket, localDeviceId, opts.deviceName);
   if (leftover && leftover.length > 0) {
     session['parser'].feed(leftover);
   }
-  // Send our cluster config (empty) to request index data.  We request
-  // uncompressed metadata by not setting compression on our device entry.
-  session.sendClusterConfig();
   // Wait for cluster config from remote
   await session.waitForReady();
   // Build remote FS

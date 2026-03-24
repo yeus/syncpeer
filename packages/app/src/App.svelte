@@ -1,6 +1,11 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { createSyncpeerUiClient, type ConnectOptions, type RemoteFsLike } from './lib/syncpeerClient';
+  import {
+    createSyncpeerUiClient,
+    reportUiError,
+    type ConnectOptions,
+    type RemoteFsLike,
+  } from './lib/syncpeerClient';
   import type { FileEntry, FolderInfo, RemoteDeviceInfo } from '@syncpeer/core/browser';
 
   type Tab = 'devices' | 'folders';
@@ -33,6 +38,7 @@
   let isConnected = false;
   let isConnecting = false;
   let isRefreshing = false;
+  let isLoadingDirectory = false;
   let lastUpdatedAt = '';
 
   let folders: FolderInfo[] = [];
@@ -41,6 +47,7 @@
 
   let currentFolderId = '';
   let currentPath = '';
+  let directoryLoadSeq = 0;
 
   let error: string | null = null;
 
@@ -121,6 +128,7 @@
     } catch (rawError: unknown) {
       const message = rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
+      reportUiError('connect.failed', rawError, connectionDetails());
       isConnected = false;
       remoteFs = null;
       remoteDevice = null;
@@ -162,17 +170,30 @@
   async function loadCurrentDirectory() {
     if (!remoteFs || !currentFolderId) return;
     error = null;
+    const requestSeq = ++directoryLoadSeq;
+    isLoadingDirectory = true;
     try {
-      entries = await remoteFs.readDir(currentFolderId, normalizedCurrentPath());
+      const nextEntries = await remoteFs.readDir(currentFolderId, normalizedCurrentPath());
+      if (requestSeq !== directoryLoadSeq) return;
+      entries = nextEntries;
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
+      if (requestSeq !== directoryLoadSeq) return;
       const message = rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
+      reportUiError('load_current_directory.failed', rawError, {
+        folderId: currentFolderId,
+        path: normalizedCurrentPath(),
+      });
+    } finally {
+      if (requestSeq === directoryLoadSeq) {
+        isLoadingDirectory = false;
+      }
     }
   }
 
   async function refreshActiveView() {
-    if (!isConnected || !remoteFs || isConnecting || isRefreshing) return;
+    if (!isConnected || !remoteFs || isConnecting || isRefreshing || isLoadingDirectory) return;
     isRefreshing = true;
     try {
       await loadFolders();
@@ -188,7 +209,7 @@
   }
 
   async function refreshOverview() {
-    if (!isConnected || isConnecting || isRefreshing) return;
+    if (!isConnected || isConnecting || isRefreshing || isLoadingDirectory) return;
     isRefreshing = true;
     error = null;
     try {
@@ -203,6 +224,7 @@
     } catch (rawError: unknown) {
       const message = rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
+      reportUiError('refresh_overview.failed', rawError, connectionDetails());
     } finally {
       isRefreshing = false;
     }
@@ -551,7 +573,7 @@
             {#if lastUpdatedAt}
               <span>Updated {lastUpdatedAt}</span>
             {/if}
-            <button on:click={() => refreshActiveView()} disabled={isRefreshing || isConnecting}>
+            <button on:click={() => refreshActiveView()} disabled={isRefreshing || isConnecting || isLoadingDirectory}>
               {isRefreshing ? 'Refreshing...' : 'Refresh'}
             </button>
           </div>
@@ -588,7 +610,9 @@
             </ul>
           {:else}
             <ul class="list">
-              {#if entries.length === 0}
+              {#if isLoadingDirectory}
+                <li class="empty">Loading folder contents...</li>
+              {:else if entries.length === 0}
                 <li class="empty">Folder is empty.</li>
               {:else}
                 {#each entries as entry (entry.path)}

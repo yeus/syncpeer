@@ -9,6 +9,7 @@ import {
   MessageTypeValues,
   Hello,
   ClusterConfig,
+  Index,
   Request,
 } from './core/protocol/bep.js';
 import { RemoteDeviceInfo, RemoteFs } from './core/model/remoteFs.js';
@@ -23,6 +24,7 @@ interface FolderState {
   id: string;
   label: string;
   readOnly: boolean;
+  indexReceived: boolean;
   files: Map<string, any>;
 }
 
@@ -35,16 +37,25 @@ class BepSession {
   private readyResolve!: () => void;
   private closed = false;
   private echoedClusterConfig = false;
+  private localIndexId: string;
   constructor(
     private socket: tls.TLSSocket,
     private localDeviceId: Uint8Array,
     private localDeviceName: string,
+    private remoteDeviceId?: Uint8Array,
   ) {
+    this.localIndexId = this.generateLocalIndexId();
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
     });
     this.setupListeners();
+  }
+  private generateLocalIndexId(): string {
+    const raw = crypto.randomBytes(8);
+    const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const value = view.getBigUint64(0, false);
+    return value === 0n ? '1' : value.toString();
   }
   private setupListeners() {
     this.socket.on('data', (chunk: Buffer) => {
@@ -91,6 +102,7 @@ class BepSession {
         id: folder.id,
         label: folder.label || folder.id,
         readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
+        indexReceived: false,
         files: new Map(),
       };
       this.folders.set(folder.id, state);
@@ -98,18 +110,35 @@ class BepSession {
     if (!this.echoedClusterConfig) {
       this.echoedClusterConfig = true;
       const folders = (cfg.folders || []).map((folder: any) => {
-        const devices = Array.isArray(folder.devices) ? [...folder.devices] : [];
-        const hasLocal = devices.some((device: any) => bytesEqual(device.id, this.localDeviceId));
-        if (!hasLocal) {
-          devices.push({
-            id: this.localDeviceId,
-            name: this.localDeviceName,
-            addresses: ['dynamic'],
-            compression: 0,
-            max_sequence: 0,
-            index_id: 0,
+        const baseDevices = Array.isArray(folder.devices) ? [...folder.devices] : [];
+        const devices = baseDevices
+          .filter((device: any) => !bytesEqual(device.id, this.localDeviceId))
+          .map((device: any) => {
+            const next = { ...device };
+            if (this.remoteDeviceId && bytesEqual(device.id, this.remoteDeviceId)) {
+              next.max_sequence = 0;
+              next.index_id = 0;
+              logClient('cluster_config.remote_device_reset', {
+                folderId: folder.id,
+                maxSequence: 0,
+                indexId: 0,
+              });
+            }
+            return next;
           });
-        }
+        devices.push({
+          id: this.localDeviceId,
+          name: this.localDeviceName,
+          addresses: ['dynamic'],
+          compression: 0,
+          max_sequence: 0,
+          index_id: this.localIndexId,
+        });
+        logClient('cluster_config.local_device_reset', {
+          folderId: folder.id,
+          maxSequence: 0,
+          indexId: this.localIndexId,
+        });
         return {
           ...folder,
           devices,
@@ -118,6 +147,16 @@ class BepSession {
       const frame = encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, { folders }, 0);
       this.sendFrame(frame);
       logClient('cluster_config.echoed', { folders: folders.length });
+      for (const folder of folders) {
+        const indexFrame = encodeMessageFrame(
+          MessageTypeValues.INDEX,
+          Index,
+          { folder: folder.id, files: [], last_sequence: 0 },
+          0,
+        );
+        this.sendFrame(indexFrame);
+        logClient('index.announced_empty', { folderId: folder.id, lastSequence: 0 });
+      }
     }
     this.readyResolve();
   }
@@ -125,6 +164,9 @@ class BepSession {
     const folderId = index.folder;
     const state = this.folders.get(folderId);
     if (!state) return;
+    state.indexReceived = true;
+    const fileCount = Array.isArray(index.files) ? index.files.length : 0;
+    logClient('index.received', { folderId, fileCount, updateType: Number(index.type ?? 0) });
     for (const file of index.files || []) {
       state.files.set(file.name, file);
     }
@@ -169,14 +211,31 @@ class BepSession {
     });
   }
   buildRemoteFs(): RemoteFs {
-    return new RemoteFs(this.folders, (folder, name, offset, size) => this.requestBlock(folder, name, offset, size));
+    return new RemoteFs(
+      this.folders,
+      (folder, name, offset, size) => this.requestBlock(folder, name, offset, size),
+      undefined,
+      () => this.close(),
+    );
   }
   buildRemoteFsWithMetadata(metadata: RemoteDeviceInfo): RemoteFs {
     return new RemoteFs(
       this.folders,
       (folder, name, offset, size) => this.requestBlock(folder, name, offset, size),
       metadata,
+      () => this.close(),
     );
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const { timer } of this.pending.values()) {
+      clearTimeout(timer);
+    }
+    this.pending.clear();
+    this.socket.end();
+    this.socket.destroy();
   }
 }
 
@@ -249,6 +308,9 @@ export async function connectAndSync(opts: NodeTransportOptions & {
   const { hello, leftover } = await readRemoteHello(socket);
   const peer = socket.getPeerCertificate(true);
   const deviceId = peer?.raw ? computeDeviceId(peer.raw) : 'unknown';
+  const remoteDeviceIdBytes = peer?.raw
+    ? new Uint8Array(crypto.createHash('sha256').update(peer.raw).digest())
+    : undefined;
   const remoteDeviceInfo: RemoteDeviceInfo = {
     id: deviceId,
     deviceName: String(hello.device_name ?? 'unknown'),
@@ -262,7 +324,7 @@ export async function connectAndSync(opts: NodeTransportOptions & {
     clientVersion: remoteDeviceInfo.clientVersion,
     leftoverBytes: leftover.length,
   });
-  const session = new BepSession(socket, localDeviceId, opts.deviceName);
+  const session = new BepSession(socket, localDeviceId, opts.deviceName, remoteDeviceIdBytes);
   if (leftover && leftover.length > 0) {
     (session as any)['parser'].feed(leftover);
   }

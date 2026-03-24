@@ -4,6 +4,8 @@ import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from '@
 export interface ConnectOptions {
   host: string;
   port: number;
+  discoveryMode?: 'global' | 'direct';
+  discoveryServer?: string;
   cert?: string;
   key?: string;
   remoteId?: string;
@@ -14,6 +16,7 @@ export interface ConnectOptions {
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
   readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
+  readFileFully: (folderId: string, path: string) => Promise<Uint8Array>;
 }
 
 export interface ConnectionOverview {
@@ -55,6 +58,9 @@ const tryForwardUiErrorToCli = async (
 const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   host: options.host,
   port: options.port,
+  discoveryMode: options.discoveryMode ?? 'global',
+  discoveryServer:
+    options.discoveryServer && options.discoveryServer.trim() !== '' ? options.discoveryServer.trim() : undefined,
   cert: options.cert && options.cert.trim() !== '' ? options.cert : undefined,
   key: options.key && options.key.trim() !== '' ? options.key : undefined,
   remoteId: options.remoteId && options.remoteId.trim() !== '' ? options.remoteId : undefined,
@@ -94,6 +100,10 @@ const createTauriRemoteFs = (invoke: InvokeFn, options: ConnectOptions): RemoteF
   listFolders: () => invoke<FolderInfo[]>('syncpeer_connect_and_list_folders', { request: options }),
   readDir: (folderId: string, path: string) =>
     invoke<FileEntry[]>('syncpeer_read_remote_dir', { request: { ...options, folderId, path } }),
+  readFileFully: async (folderId: string, path: string) => {
+    const bytes = await invoke<number[]>('syncpeer_read_remote_file', { request: { ...options, folderId, path } });
+    return new Uint8Array(bytes);
+  },
 });
 
 export const createSyncpeerUiClient = () => {

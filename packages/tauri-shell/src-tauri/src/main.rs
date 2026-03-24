@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 struct ConnectRequest {
   host: String,
   port: u16,
+  discovery_mode: Option<String>,
+  discovery_server: Option<String>,
   cert: Option<String>,
   key: Option<String>,
   remote_id: Option<String>,
@@ -25,6 +27,15 @@ struct ReadDirRequest {
   connection: ConnectRequest,
   folder_id: String,
   path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadFileRequest {
+  #[serde(flatten)]
+  connection: ConnectRequest,
+  folder_id: String,
+  path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +227,19 @@ async fn syncpeer_read_remote_dir(request: ReadDirRequest) -> Result<Vec<FileEnt
 }
 
 #[tauri::command]
+async fn syncpeer_read_remote_file(request: ReadFileRequest) -> Result<Vec<u8>, String> {
+  tauri_log(&format!(
+    "command syncpeer_read_remote_file folder_id={} path={}",
+    request.folder_id,
+    request.path
+  ));
+  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("read_remote_file", &request))
+    .await
+    .map_err(|error| format!("Bridge task join error: {error}"))??;
+  decode_json_output(&raw)
+}
+
+#[tauri::command]
 async fn syncpeer_connect_and_get_overview(request: ConnectRequest) -> Result<ConnectionOverview, String> {
   tauri_log(&format!(
     "command syncpeer_connect_and_get_overview host={} port={} remote_id={}",
@@ -260,6 +284,7 @@ fn main() {
       syncpeer_read_remote_dir,
       syncpeer_connect_and_get_overview,
       syncpeer_get_folder_versions,
+      syncpeer_read_remote_file,
       syncpeer_log_ui_error
     ])
     .run(tauri::generate_context!())

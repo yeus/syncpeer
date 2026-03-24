@@ -1,5 +1,5 @@
 import { createBrowserSyncpeerClient } from '@syncpeer/core/browser';
-import type { FileEntry, FolderInfo } from '@syncpeer/core/browser';
+import type { FileEntry, FolderInfo, RemoteDeviceInfo } from '@syncpeer/core/browser';
 
 export interface ConnectOptions {
   host: string;
@@ -14,6 +14,11 @@ export interface ConnectOptions {
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
   readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
+}
+
+export interface ConnectionOverview {
+  folders: FolderInfo[];
+  device: RemoteDeviceInfo | null;
 }
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -67,11 +72,18 @@ const createTauriRemoteFs = (invoke: InvokeFn, options: ConnectOptions): RemoteF
 
 export const createSyncpeerUiClient = () => {
   const invoke = createLoggedInvoke(resolveInvoke());
-  return createBrowserSyncpeerClient<ConnectOptions, RemoteFsLike>({
+  const browserClient = createBrowserSyncpeerClient<ConnectOptions, RemoteFsLike>({
     connectAndSync: async (options: ConnectOptions) => {
       const normalized = normalizeConnectOptions(options);
       logUi('connect.prepare', normalized);
       return createTauriRemoteFs(invoke, normalized);
     },
   });
+  return {
+    ...browserClient,
+    connectAndGetOverview: async (options: ConnectOptions): Promise<ConnectionOverview> => {
+      const normalized = normalizeConnectOptions(options);
+      return invoke<ConnectionOverview>('syncpeer_connect_and_get_overview', { request: normalized });
+    },
+  };
 };

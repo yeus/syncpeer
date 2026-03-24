@@ -2,7 +2,7 @@ import { createSyncpeerClient, type SyncpeerClient, type SyncpeerConnector } fro
 
 export { RemoteFs } from './core/model/remoteFs.js';
 export { createSyncpeerClient } from './clientFactory.js';
-export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo } from './core/model/remoteFs.js';
+export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from './core/model/remoteFs.js';
 export type { SyncpeerClient, SyncpeerConnector } from './clientFactory.js';
 
 export const createBrowserSyncpeerClient = <ConnectOptions, ClientFs>(

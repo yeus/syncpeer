@@ -6,7 +6,7 @@
     type ConnectOptions,
     type RemoteFsLike,
   } from './lib/syncpeerClient';
-  import type { FileEntry, FolderInfo, RemoteDeviceInfo } from '@syncpeer/core/browser';
+  import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from '@syncpeer/core/browser';
 
   type Tab = 'devices' | 'folders';
 
@@ -44,6 +44,8 @@
   let folders: FolderInfo[] = [];
   let entries: FileEntry[] = [];
   let remoteDevice: RemoteDeviceInfo | null = null;
+  let folderSyncStates: FolderSyncState[] = [];
+  let currentFolderVersionKey = '';
 
   let currentFolderId = '';
   let currentPath = '';
@@ -52,6 +54,7 @@
   let error: string | null = null;
 
   const REFRESH_MS = 3000;
+  const client = createSyncpeerUiClient();
   const refreshTimer = setInterval(() => {
     void refreshActiveView();
   }, REFRESH_MS);
@@ -111,18 +114,25 @@
     return segments;
   };
 
+  const folderVersionKey = (folderId: string): string => {
+    const syncState = folderSyncStates.find((state) => state.folderId === folderId);
+    if (!syncState) return '';
+    return `${syncState.remoteIndexId}:${syncState.remoteMaxSequence}`;
+  };
+
   async function connect() {
     error = null;
     isConnecting = true;
     try {
-      const client = createSyncpeerUiClient();
       remoteFs = await client.connectAndSync(connectionDetails());
       const overview = await client.connectAndGetOverview(connectionDetails());
       isConnected = true;
       folders = overview.folders;
       remoteDevice = overview.device;
+      folderSyncStates = overview.folderSyncStates ?? [];
       currentFolderId = '';
       currentPath = '';
+      currentFolderVersionKey = '';
       entries = [];
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
@@ -137,14 +147,10 @@
     }
   }
 
-  async function loadFolders() {
-    if (!remoteFs) return;
-    folders = await remoteFs.listFolders();
-  }
-
   async function openFolderRoot(folderId: string) {
     currentFolderId = folderId;
     currentPath = '';
+    currentFolderVersionKey = '';
     await loadCurrentDirectory();
   }
 
@@ -176,6 +182,7 @@
       const nextEntries = await remoteFs.readDir(currentFolderId, normalizedCurrentPath());
       if (requestSeq !== directoryLoadSeq) return;
       entries = nextEntries;
+      currentFolderVersionKey = folderVersionKey(currentFolderId);
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
       if (requestSeq !== directoryLoadSeq) return;
@@ -195,14 +202,26 @@
   async function refreshActiveView() {
     if (!isConnected || !remoteFs || isConnecting || isRefreshing || isLoadingDirectory) return;
     isRefreshing = true;
+    error = null;
     try {
-      await loadFolders();
+      const overview = await client.connectAndGetOverview(connectionDetails());
+      folders = overview.folders;
+      remoteDevice = overview.device;
+      folderSyncStates = overview.folderSyncStates ?? [];
       if (activeTab === 'folders' && currentFolderId) {
-        await loadCurrentDirectory();
+        const nextFolderVersionKey = folderVersionKey(currentFolderId);
+        const shouldReloadDirectory = entries.length === 0
+          || !currentFolderVersionKey
+          || currentFolderVersionKey !== nextFolderVersionKey;
+        if (shouldReloadDirectory) {
+          await loadCurrentDirectory();
+        }
       }
-      if (!currentFolderId) {
-        lastUpdatedAt = new Date().toLocaleTimeString();
-      }
+      lastUpdatedAt = new Date().toLocaleTimeString();
+    } catch (rawError: unknown) {
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('refresh_active_view.failed', rawError, connectionDetails());
     } finally {
       isRefreshing = false;
     }
@@ -213,12 +232,19 @@
     isRefreshing = true;
     error = null;
     try {
-      const client = createSyncpeerUiClient();
       const overview = await client.connectAndGetOverview(connectionDetails());
       folders = overview.folders;
       remoteDevice = overview.device;
+      folderSyncStates = overview.folderSyncStates ?? [];
       if (activeTab === 'folders' && currentFolderId) {
-        await loadCurrentDirectory();
+        const nextFolderVersionKey = folderVersionKey(currentFolderId);
+        if (
+          entries.length === 0
+          || !currentFolderVersionKey
+          || currentFolderVersionKey !== nextFolderVersionKey
+        ) {
+          await loadCurrentDirectory();
+        }
       }
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {

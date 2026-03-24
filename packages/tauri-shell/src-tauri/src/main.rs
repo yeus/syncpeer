@@ -45,9 +45,21 @@ struct RemoteDeviceInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderSyncState {
+  folder_id: String,
+  remote_index_id: String,
+  remote_max_sequence: String,
+  index_received: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConnectionOverview {
   folders: Vec<FolderInfo>,
   device: Option<RemoteDeviceInfo>,
+  #[serde(default)]
+  #[serde(rename = "folderSyncStates")]
+  folder_sync_states: Vec<FolderSyncState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +230,20 @@ async fn syncpeer_connect_and_get_overview(request: ConnectRequest) -> Result<Co
 }
 
 #[tauri::command]
+async fn syncpeer_get_folder_versions(request: ConnectRequest) -> Result<Vec<FolderSyncState>, String> {
+  tauri_log(&format!(
+    "command syncpeer_get_folder_versions host={} port={} remote_id={}",
+    request.host,
+    request.port,
+    request.remote_id.clone().unwrap_or_else(|| "(none)".to_string())
+  ));
+  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("connect_and_get_folder_versions", &request))
+    .await
+    .map_err(|error| format!("Bridge task join error: {error}"))??;
+  decode_json_output(&raw)
+}
+
+#[tauri::command]
 async fn syncpeer_log_ui_error(entry: UiErrorLogRequest) -> Result<(), String> {
   tauri_log(&format!(
     "ui.error event={} details={}",
@@ -233,6 +259,7 @@ fn main() {
       syncpeer_connect_and_list_folders,
       syncpeer_read_remote_dir,
       syncpeer_connect_and_get_overview,
+      syncpeer_get_folder_versions,
       syncpeer_log_ui_error
     ])
     .run(tauri::generate_context!())

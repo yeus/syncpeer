@@ -102,12 +102,25 @@ const connectAndGetOverview = async (payload) => {
   const remoteFs = await openRemoteFs(payload);
   try {
     logBridge('overview.fetch.start');
-    const [folders, device] = await Promise.all([
+    const [folders, device, folderSyncStates] = await Promise.all([
       remoteFs.listFolders(),
       Promise.resolve(remoteFs.getRemoteDeviceInfo?.() ?? null),
+      Promise.resolve(remoteFs.listFolderSyncStates?.() ?? []),
     ]);
     logBridge('overview.fetch.success', { folderCount: folders.length, hasDevice: !!device });
-    return { folders, device };
+    return { folders, device, folderSyncStates };
+  } finally {
+    remoteFs.close?.();
+  }
+};
+
+const connectAndGetFolderVersions = async (payload) => {
+  const remoteFs = await openRemoteFs(payload);
+  try {
+    logBridge('folder_versions.fetch.start');
+    const folderSyncStates = await Promise.resolve(remoteFs.listFolderSyncStates?.() ?? []);
+    logBridge('folder_versions.fetch.success', { count: folderSyncStates.length });
+    return folderSyncStates;
   } finally {
     remoteFs.close?.();
   }
@@ -160,6 +173,7 @@ const readRemoteDir = async (payload) => {
 const handlers = {
   connect_and_list_folders: connectAndListFolders,
   connect_and_get_overview: connectAndGetOverview,
+  connect_and_get_folder_versions: connectAndGetFolderVersions,
   read_remote_dir: readRemoteDir,
 };
 

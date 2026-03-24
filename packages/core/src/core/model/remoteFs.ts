@@ -26,11 +26,20 @@ export interface RemoteDeviceInfo {
   clientVersion: string;
 }
 
+export interface FolderSyncState {
+  folderId: string;
+  remoteIndexId: string;
+  remoteMaxSequence: string;
+  indexReceived: boolean;
+}
+
 interface FolderState {
   id: string;
   label: string;
   readOnly: boolean;
   indexReceived: boolean;
+  remoteIndexId?: string;
+  remoteMaxSequence?: string;
   files: Map<string, any>;
 }
 
@@ -79,6 +88,26 @@ export class RemoteFs {
       label: f.label,
       readOnly: f.readOnly,
     }));
+  }
+
+  async listFolderSyncStates(): Promise<FolderSyncState[]> {
+    return [...this.folders.values()].map((f) => ({
+      folderId: f.id,
+      remoteIndexId: String(f.remoteIndexId ?? "0"),
+      remoteMaxSequence: String(f.remoteMaxSequence ?? "0"),
+      indexReceived: Boolean(f.indexReceived),
+    }));
+  }
+
+  async getFolderSyncState(folderId: string): Promise<FolderSyncState | null> {
+    const folder = this.folders.get(folderId);
+    if (!folder) return null;
+    return {
+      folderId,
+      remoteIndexId: String(folder.remoteIndexId ?? "0"),
+      remoteMaxSequence: String(folder.remoteMaxSequence ?? "0"),
+      indexReceived: Boolean(folder.indexReceived),
+    };
   }
 
   async stat(folderId: string, path: string): Promise<FileEntry | null> {

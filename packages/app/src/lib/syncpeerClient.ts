@@ -1,5 +1,5 @@
 import { createBrowserSyncpeerClient } from '@syncpeer/core/browser';
-import type { FileEntry, FolderInfo, RemoteDeviceInfo } from '@syncpeer/core/browser';
+import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from '@syncpeer/core/browser';
 
 export interface ConnectOptions {
   host: string;
@@ -19,6 +19,7 @@ export interface RemoteFsLike {
 export interface ConnectionOverview {
   folders: FolderInfo[];
   device: RemoteDeviceInfo | null;
+  folderSyncStates: FolderSyncState[];
 }
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -109,6 +110,10 @@ export const createSyncpeerUiClient = () => {
     connectAndGetOverview: async (options: ConnectOptions): Promise<ConnectionOverview> => {
       const normalized = normalizeConnectOptions(options);
       return invoke<ConnectionOverview>('syncpeer_connect_and_get_overview', { request: normalized });
+    },
+    connectAndGetFolderVersions: async (options: ConnectOptions): Promise<FolderSyncState[]> => {
+      const normalized = normalizeConnectOptions(options);
+      return invoke<FolderSyncState[]>('syncpeer_get_folder_versions', { request: normalized });
     },
   };
 };

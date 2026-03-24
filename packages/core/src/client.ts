@@ -25,6 +25,8 @@ interface FolderState {
   label: string;
   readOnly: boolean;
   indexReceived: boolean;
+  remoteIndexId?: string;
+  remoteMaxSequence?: string;
   files: Map<string, any>;
 }
 
@@ -98,14 +100,27 @@ class BepSession {
   private handleClusterConfig(cfg: any) {
     logClient('cluster_config.received', { folders: (cfg.folders || []).length });
     for (const folder of cfg.folders || []) {
+      const folderDevices = Array.isArray(folder.devices) ? folder.devices : [];
+      const remoteDevice = this.remoteDeviceId
+        ? folderDevices.find((device: any) => bytesEqual(device.id, this.remoteDeviceId!))
+        : folderDevices.find((device: any) => !bytesEqual(device.id, this.localDeviceId));
+      const remoteIndexId = remoteDevice?.index_id != null ? String(remoteDevice.index_id) : '0';
+      const remoteMaxSequence = String(remoteDevice?.max_sequence ?? 0);
       const state: FolderState = {
         id: folder.id,
         label: folder.label || folder.id,
         readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
         indexReceived: false,
+        remoteIndexId,
+        remoteMaxSequence,
         files: new Map(),
       };
       this.folders.set(folder.id, state);
+      logClient('cluster_config.remote_folder_state', {
+        folderId: folder.id,
+        remoteIndexId,
+        remoteMaxSequence,
+      });
     }
     if (!this.echoedClusterConfig) {
       this.echoedClusterConfig = true;

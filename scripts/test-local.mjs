@@ -1,6 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import fs from "node:fs";
+import path from "node:path";
+import { spawn, execFileSync } from "node:child_process";
 
 /*
  * Local fully-automated Syncthing integration test.
@@ -8,29 +8,29 @@ import { spawn, execFileSync } from 'node:child_process';
  * waits for sync, then validates the syncpeer CLI against peer B.
  */
 
-const keep = process.argv.includes('--keep');
-const root = path.resolve('.tmp/syncpeer-test');
-const aHome = path.join(root, 'st-a');
-const bHome = path.join(root, 'st-b');
-const folderId = 'syncpeer-test';
-const bShareDir = path.join(root, 'share-b');
-const aRecvDir = path.join(root, 'share-a');
-const cliConfigHome = path.join(root, 'xdg-config');
-const cliNodeHome = path.join(cliConfigHome, 'syncpeer', 'cli-node');
-const toolsDir = path.resolve('.tools');
-const version = process.env.SYNCTHING_VERSION ?? 'v1.27.8';
-const A_SYNC_ADDR = 'tcp://127.0.0.1:58300';
-const B_SYNC_ADDR = 'tcp://127.0.0.1:58301';
-const A_GUI_ADDR = '127.0.0.1:58384';
-const B_GUI_ADDR = '127.0.0.1:58385';
+const keep = process.argv.includes("--keep");
+const root = path.resolve(".tmp/syncpeer-test");
+const aHome = path.join(root, "st-a");
+const bHome = path.join(root, "st-b");
+const folderId = "syncpeer-test";
+const bShareDir = path.join(root, "share-b");
+const aRecvDir = path.join(root, "share-a");
+const cliConfigHome = path.join(root, "xdg-config");
+const cliNodeHome = path.join(cliConfigHome, "syncpeer", "cli-node");
+const toolsDir = path.resolve(".tools");
+const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
+const A_SYNC_ADDR = "tcp://127.0.0.1:58300";
+const B_SYNC_ADDR = "tcp://127.0.0.1:58301";
+const A_GUI_ADDR = "127.0.0.1:58384";
+const B_GUI_ADDR = "127.0.0.1:58385";
 
-const platformMap: Record<string, string> = {
-  linux: 'linux',
-  darwin: 'macos',
+const platformMap = {
+  linux: "linux",
+  darwin: "macos",
 };
-const archMap: Record<string, string> = {
-  x64: 'amd64',
-  arm64: 'arm64',
+const archMap = {
+  x64: "amd64",
+  arm64: "arm64",
 };
 
 const platform = platformMap[process.platform];
@@ -40,45 +40,40 @@ if (!platform || !arch) {
   process.exit(1);
 }
 const syncthingDir = path.join(toolsDir, `syncthing-${platform}-${arch}-${version}`);
-const syncthingBin = path.join(syncthingDir, 'syncthing');
-const tsxBin = path.resolve('node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
+const syncthingBin = path.join(syncthingDir, "syncthing");
+const cliEntry = path.resolve("packages", "cli", "dist", "main.js");
+const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 
-function ensureDir(p: string) {
+function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
 
-function writeFile(p: string, content: string | Buffer) {
+function writeFile(p, content) {
   ensureDir(path.dirname(p));
   fs.writeFileSync(p, content);
 }
 
-function randomBuffer(size: number): Buffer {
+function randomBuffer(size) {
   const buf = Buffer.alloc(size);
   for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
   return buf;
 }
 
-function startSyncthing(home: string) {
-  const args = [
-    'serve',
-    '--home', home,
-    '--no-browser',
-    '--no-restart',
-    '--no-upgrade',
-  ];
+function startSyncthing(home) {
+  const args = ["serve", "--home", home, "--no-browser", "--no-restart", "--no-upgrade"];
   const child = spawn(syncthingBin, args, {
-    stdio: 'inherit',
+    stdio: "inherit",
     env: {
       ...process.env,
-      STNOUPGRADE: '1',
+      STNOUPGRADE: "1",
     },
   });
   return child;
 }
 
-function readDeviceId(home: string): string {
-  const out = execFileSync(syncthingBin, ['device-id', '--home', home], {
-    encoding: 'utf8',
+function readDeviceId(home) {
+  const out = execFileSync(syncthingBin, ["device-id", "--home", home], {
+    encoding: "utf8",
   });
   const match = out.match(/([A-Z2-7]{7}(?:-[A-Z2-7]{7}){7})/);
   if (!match) {
@@ -87,27 +82,27 @@ function readDeviceId(home: string): string {
   return match[1].trim();
 }
 
-function escapeXml(v: string): string {
+function escapeXml(v) {
   return v
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll('\'', '&apos;');
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
-function replaceGuiAddress(xml: string, guiAddress: string): string {
+function replaceGuiAddress(xml, guiAddress) {
   return xml.replace(
     /(<gui\b[^>]*>[\s\S]*?<address>)([^<]*)(<\/address>)/,
     `$1${escapeXml(guiAddress)}$3`,
   );
 }
 
-function setSingleListenAddress(xml: string, address: string): string {
+function setSingleListenAddress(xml, address) {
   return xml.replace(
     /<options>[\s\S]*?<\/options>/,
     (optsBlock) => {
-      let out = optsBlock.replace(/^\s*<listenAddress>.*<\/listenAddress>\s*\n/gm, '');
+      let out = optsBlock.replace(/^\s*<listenAddress>.*<\/listenAddress>\s*\n/gm, "");
       out = out.replace(
         /(<options>\s*\n)/,
         `$1        <listenAddress>${escapeXml(address)}</listenAddress>\n`,
@@ -117,7 +112,7 @@ function setSingleListenAddress(xml: string, address: string): string {
   );
 }
 
-function addTopLevelDevice(xml: string, deviceId: string, name: string, address: string): string {
+function addTopLevelDevice(xml, deviceId, name, address) {
   if (xml.includes(`<device id="${deviceId}"`)) {
     return xml;
   }
@@ -136,14 +131,7 @@ function addTopLevelDevice(xml: string, deviceId: string, name: string, address:
   return xml.replace(/(\s*<gui\b[\s\S]*$)/, `${block}$1`);
 }
 
-function addFolder(
-  xml: string,
-  id: string,
-  label: string,
-  folderPath: string,
-  type: 'sendreceive' | 'sendonly',
-  deviceIds: string[],
-): string {
+function addFolder(xml, id, label, folderPath, type, deviceIds) {
   if (xml.includes(`<folder id="${id}"`)) {
     return xml;
   }
@@ -152,7 +140,7 @@ function addFolder(
     .map((deviceId) => `        <device id="${escapeXml(deviceId)}" introducedBy="">
             <encryptionPassword></encryptionPassword>
         </device>`)
-    .join('\n');
+    .join("\n");
   const block = `    <folder id="${escapeXml(id)}" label="${escapeXml(label)}" path="${escapeXml(folderPath)}" type="${escapeXml(type)}" rescanIntervalS="30" fsWatcherEnabled="false" fsWatcherDelayS="10" fsWatcherTimeoutS="0" ignorePerms="false" autoNormalize="true">
         <filesystemType>basic</filesystemType>
 ${deviceBlocks}
@@ -195,19 +183,9 @@ ${deviceBlocks}
   return xml.replace(/(\s*<gui\b[\s\S]*$)/, `${block}$1`);
 }
 
-function configureHome(
-  home: string,
-  opts: {
-    guiAddress: string;
-    listenAddress: string;
-    remoteDevices: Array<{ id: string; name: string; address: string }>;
-    folderPath: string;
-    folderType: 'sendreceive' | 'sendonly';
-    folderDeviceIds: string[];
-  },
-) {
-  const configPath = path.join(home, 'config.xml');
-  let xml = fs.readFileSync(configPath, 'utf8');
+function configureHome(home, opts) {
+  const configPath = path.join(home, "config.xml");
+  let xml = fs.readFileSync(configPath, "utf8");
   xml = replaceGuiAddress(xml, opts.guiAddress);
   xml = setSingleListenAddress(xml, opts.listenAddress);
   for (const remote of opts.remoteDevices) {
@@ -217,11 +195,11 @@ function configureHome(
   fs.writeFileSync(configPath, xml);
 }
 
-async function waitForSync(filePath: string, expected: string, timeoutMs: number) {
+async function waitForSync(filePath, expected, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (fs.existsSync(filePath)) {
-      const content = fs.readFileSync(filePath, 'utf8');
+      const content = fs.readFileSync(filePath, "utf8");
       if (content === expected) {
         return;
       }
@@ -231,23 +209,21 @@ async function waitForSync(filePath: string, expected: string, timeoutMs: number
   throw new Error(`Timed out waiting for synced file: ${filePath}`);
 }
 
-async function sleep(ms: number) {
+async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForCliDownload(
-  tsxPath: string,
-  args: string[],
-  outPath: string,
-  expectedContent: string,
-  timeoutMs: number,
-) {
+function execCli(args, options = {}) {
+  return execFileSync("node", [cliEntry, ...args], options);
+}
+
+async function waitForCliDownload(args, outPath, expectedContent, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let lastErr: unknown = null;
+  let lastErr = null;
   while (Date.now() < deadline) {
     try {
-      execFileSync(tsxPath, args, { stdio: 'inherit' });
-      const actual = fs.readFileSync(outPath, 'utf8');
+      execCli(args, { stdio: "inherit" });
+      const actual = fs.readFileSync(outPath, "utf8");
       if (actual === expectedContent) {
         return;
       }
@@ -263,7 +239,7 @@ async function waitForCliDownload(
 async function main() {
   if (!fs.existsSync(syncthingBin)) {
     console.error(`Missing Syncthing binary: ${syncthingBin}`);
-    console.error('Run: npm run download:syncthing');
+    console.error("Run: npm run download:syncthing");
     process.exit(1);
   }
 
@@ -275,42 +251,44 @@ async function main() {
   ensureDir(aRecvDir);
   ensureDir(bShareDir);
 
-  const expectedA = 'hello from syncthing test\n';
-  writeFile(path.join(bShareDir, 'a.txt'), expectedA);
-  writeFile(path.join(bShareDir, 'subdir', 'nested.txt'), 'nested file\n');
-  writeFile(path.join(bShareDir, 'blob.bin'), randomBuffer(300 * 1024));
+  const expectedA = "hello from syncthing test\n";
+  writeFile(path.join(bShareDir, "a.txt"), expectedA);
+  writeFile(path.join(bShareDir, "subdir", "nested.txt"), "nested file\n");
+  writeFile(path.join(bShareDir, "blob.bin"), randomBuffer(300 * 1024));
 
-  console.log('Bootstrapping Syncthing homes...');
-  execFileSync(syncthingBin, ['generate', '--home', aHome, '--no-port-probing'], { stdio: 'inherit' });
-  execFileSync(syncthingBin, ['generate', '--home', bHome, '--no-port-probing'], { stdio: 'inherit' });
+  console.log("Building CLI packages...");
+  execFileSync(npmCmd, ["run", "build:core"], { stdio: "inherit" });
+  execFileSync(npmCmd, ["run", "build:cli"], { stdio: "inherit" });
+
+  console.log("Bootstrapping Syncthing homes...");
+  execFileSync(syncthingBin, ["generate", "--home", aHome, "--no-port-probing"], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", bHome, "--no-port-probing"], { stdio: "inherit" });
 
   const aId = readDeviceId(aHome);
   const bId = readDeviceId(bHome);
 
-  console.log('Preparing persisted cli-node identity...');
+  console.log("Preparing persisted cli-node identity...");
   ensureDir(cliNodeHome);
-  execFileSync(syncthingBin, ['generate', '--home', cliNodeHome, '--no-port-probing'], { stdio: 'inherit' });
+  execFileSync(syncthingBin, ["generate", "--home", cliNodeHome, "--no-port-probing"], { stdio: "inherit" });
   const cliNodeId = readDeviceId(cliNodeHome);
 
   configureHome(aHome, {
     guiAddress: A_GUI_ADDR,
     listenAddress: A_SYNC_ADDR,
-    remoteDevices: [
-      { id: bId, name: 'syncpeer-b', address: B_SYNC_ADDR },
-    ],
+    remoteDevices: [{ id: bId, name: "syncpeer-b", address: B_SYNC_ADDR }],
     folderPath: aRecvDir,
-    folderType: 'sendreceive',
+    folderType: "sendreceive",
     folderDeviceIds: [aId, bId],
   });
   configureHome(bHome, {
     guiAddress: B_GUI_ADDR,
     listenAddress: B_SYNC_ADDR,
     remoteDevices: [
-      { id: aId, name: 'syncpeer-a', address: A_SYNC_ADDR },
-      { id: cliNodeId, name: 'syncpeer-cli-node', address: 'dynamic' },
+      { id: aId, name: "syncpeer-a", address: A_SYNC_ADDR },
+      { id: cliNodeId, name: "syncpeer-cli-node", address: "dynamic" },
     ],
     folderPath: bShareDir,
-    folderType: 'sendonly',
+    folderType: "sendonly",
     folderDeviceIds: [bId, aId, cliNodeId],
   });
 
@@ -321,42 +299,38 @@ async function main() {
     b = startSyncthing(bHome);
 
     await sleep(3000);
-    await waitForSync(path.join(aRecvDir, 'a.txt'), expectedA, 90_000);
-    await waitForSync(path.join(aRecvDir, 'subdir', 'nested.txt'), 'nested file\n', 90_000);
+    await waitForSync(path.join(aRecvDir, "a.txt"), expectedA, 90_000);
+    await waitForSync(path.join(aRecvDir, "subdir", "nested.txt"), "nested file\n", 90_000);
 
-    console.log('');
-    console.log('=== Running syncpeer CLI checks ===');
+    console.log("");
+    console.log("=== Running syncpeer CLI checks ===");
     // Disconnect Syncthing A before using A's cert in the CLI client.
     if (a) {
-      a.kill('SIGTERM');
+      a.kill("SIGTERM");
       await sleep(1500);
     }
     const baseArgs = [
-      'src/cli/main.ts',
-      '--host', '127.0.0.1',
-      '--port', '58301',
-      '--cert', path.join(cliNodeHome, 'cert.pem'),
-      '--key', path.join(cliNodeHome, 'key.pem'),
-      '--remote-id', bId,
-      '--timeout-ms', '20000',
+      "--host", "127.0.0.1",
+      "--port", "58301",
+      "--cert", path.join(cliNodeHome, "cert.pem"),
+      "--key", path.join(cliNodeHome, "key.pem"),
+      "--remote-id", bId,
+      "--timeout-ms", "20000",
     ];
-    const listOutput = execFileSync(tsxBin, [...baseArgs, 'list'], {
-      encoding: 'utf8',
-    });
+    const listOutput = execCli([...baseArgs, "list"], { encoding: "utf8" });
     if (!listOutput.includes(`${folderId}\t`)) {
       throw new Error(`CLI list output did not contain expected folder "${folderId}":\n${listOutput}`);
     }
-    console.log('Legacy list check passed.');
+    console.log("Legacy list check passed.");
 
-    const persistedListOutput = execFileSync(tsxBin, [
-      'src/cli/main.ts',
-      '--host', '127.0.0.1',
-      '--port', '58301',
-      '--remote-id', bId,
-      '--timeout-ms', '20000',
-      'list',
+    const persistedListOutput = execCli([
+      "--host", "127.0.0.1",
+      "--port", "58301",
+      "--remote-id", bId,
+      "--timeout-ms", "20000",
+      "list",
     ], {
-      encoding: 'utf8',
+      encoding: "utf8",
       env: {
         ...process.env,
         XDG_CONFIG_HOME: cliConfigHome,
@@ -366,85 +340,72 @@ async function main() {
     if (!persistedListOutput.includes(`${folderId}\t`)) {
       throw new Error(`Persisted cli-node list output missing folder "${folderId}":\n${persistedListOutput}`);
     }
-    console.log('Persisted cli-node list check passed.');
+    console.log("Persisted cli-node list check passed.");
 
-    const downloadOutPath = path.join(root, 'downloaded-nested.txt');
-    execFileSync(tsxBin, [
-      'src/cli/main.ts',
-      '--host', '127.0.0.1',
-      '--port', '58301',
-      '--remote-id', bId,
-      '--timeout-ms', '20000',
-      'download',
+    const downloadOutPath = path.join(root, "downloaded-nested.txt");
+    execCli([
+      "--host", "127.0.0.1",
+      "--port", "58301",
+      "--remote-id", bId,
+      "--timeout-ms", "20000",
+      "download",
       folderId,
-      'a.txt',
+      "a.txt",
       downloadOutPath,
     ], {
-      stdio: 'inherit',
+      stdio: "inherit",
       env: {
         ...process.env,
         XDG_CONFIG_HOME: cliConfigHome,
         SYNCTHING_BIN: syncthingBin,
       },
     });
-    const downloaded = fs.readFileSync(downloadOutPath, 'utf8');
+    const downloaded = fs.readFileSync(downloadOutPath, "utf8");
     if (downloaded !== expectedA) {
       throw new Error(`Downloaded content mismatch: got "${downloaded}"`);
     }
-    const persistedDeviceIdPath = path.join(cliNodeHome, 'device-id.txt');
+    const persistedDeviceIdPath = path.join(cliNodeHome, "device-id.txt");
     if (!fs.existsSync(persistedDeviceIdPath)) {
       throw new Error(`Persisted device-id file missing: ${persistedDeviceIdPath}`);
     }
-    const persistedDeviceId = fs.readFileSync(persistedDeviceIdPath, 'utf8').trim();
+    const persistedDeviceId = fs.readFileSync(persistedDeviceIdPath, "utf8").trim();
     if (persistedDeviceId !== cliNodeId) {
       throw new Error(`Persisted device ID mismatch: expected ${cliNodeId}, got ${persistedDeviceId}`);
     }
-    console.log('Download check passed.');
-    console.log('Persisted cli-node ID check passed.');
+    console.log("Download check passed.");
+    console.log("Persisted cli-node ID check passed.");
 
-    const filesOutput = execFileSync(tsxBin, [
-      'src/cli/main.ts',
-      'files-local',
-      bShareDir,
-    ], {
-      encoding: 'utf8',
+    const filesOutput = execCli(["files-local", bShareDir], {
+      encoding: "utf8",
     });
-    if (!filesOutput.includes('\tblob.bin') || !filesOutput.includes('\ta.txt') || !filesOutput.includes('\tsubdir/')) {
+    if (!filesOutput.includes("\tblob.bin") || !filesOutput.includes("\ta.txt") || !filesOutput.includes("\tsubdir/")) {
       throw new Error(`CLI files output missing expected entries:\n${filesOutput}`);
     }
-    console.log('Peer folder file listing check passed.');
+    console.log("Peer folder file listing check passed.");
 
-    const uploadedRelPath = 'cli-upload/smoke.txt';
-    const uploadedExpected = 'hello from cli upload test\n';
-    execFileSync(tsxBin, [
-      'src/cli/main.ts',
-      'upload-test',
-      bShareDir,
-      uploadedRelPath,
-      uploadedExpected,
-    ], {
-      stdio: 'inherit',
+    const uploadedRelPath = "cli-upload/smoke.txt";
+    const uploadedExpected = "hello from cli upload test\n";
+    execCli(["upload-test", bShareDir, uploadedRelPath, uploadedExpected], {
+      stdio: "inherit",
     });
     const uploadedLocalPath = path.join(bShareDir, uploadedRelPath);
     if (!fs.existsSync(uploadedLocalPath)) {
       throw new Error(`Uploaded local test file missing at ${uploadedLocalPath}`);
     }
-    if (fs.readFileSync(uploadedLocalPath, 'utf8') !== uploadedExpected) {
+    if (fs.readFileSync(uploadedLocalPath, "utf8") !== uploadedExpected) {
       throw new Error(`Uploaded local test file contents mismatch at ${uploadedLocalPath}`);
     }
 
-    const uploadedDownloadPath = path.join(root, 'downloaded-upload-smoke.txt');
+    const uploadedDownloadPath = path.join(root, "downloaded-upload-smoke.txt");
     await waitForCliDownload(
-      tsxBin,
       [
-        'src/cli/main.ts',
-        '--host', '127.0.0.1',
-        '--port', '58301',
-        '--cert', path.join(cliNodeHome, 'cert.pem'),
-        '--key', path.join(cliNodeHome, 'key.pem'),
-        '--remote-id', bId,
-        '--timeout-ms', '20000',
-        'download',
+        "--host", "127.0.0.1",
+        "--port", "58301",
+        "--cert", path.join(cliNodeHome, "cert.pem"),
+        "--key", path.join(cliNodeHome, "key.pem"),
+        "--remote-id", bId,
+        "--timeout-ms", "20000",
+        "download",
         folderId,
         uploadedRelPath,
         uploadedDownloadPath,
@@ -453,10 +414,10 @@ async function main() {
       uploadedExpected,
       90_000,
     );
-    console.log('CLI upload test file check passed.');
+    console.log("CLI upload test file check passed.");
 
-    console.log('');
-    console.log('=== Automated local integration test passed ===');
+    console.log("");
+    console.log("=== Automated local integration test passed ===");
     console.log(`A home:      ${aHome}`);
     console.log(`B home:      ${bHome}`);
     console.log(`A folder:    ${aRecvDir}`);
@@ -466,19 +427,19 @@ async function main() {
     console.log(`A device ID: ${aId}`);
     console.log(`B device ID: ${bId}`);
     console.log(`CLI node ID: ${cliNodeId}`);
-    console.log('');
+    console.log("");
     if (keep) {
-      console.log('--keep flag used; leaving temp files in place.');
-      console.log('Syncthing processes are still running. Press Ctrl+C to stop.');
+      console.log("--keep flag used; leaving temp files in place.");
+      console.log("Syncthing processes are still running. Press Ctrl+C to stop.");
       return;
     }
   } finally {
-    if (a) a.kill('SIGTERM');
-    if (b) b.kill('SIGTERM');
+    if (a) a.kill("SIGTERM");
+    if (b) b.kill("SIGTERM");
     await sleep(1000);
     if (!keep) {
       fs.rmSync(root, { recursive: true, force: true });
-      console.log('Cleaned up test files and stopped Syncthing processes.');
+      console.log("Cleaned up test files and stopped Syncthing processes.");
     }
   }
 }

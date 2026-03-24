@@ -1,0 +1,16 @@
+{
+  "name": "@syncpeer/tauri-shell",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0-beta.7"
+  },
+  "dependencies": {
+    "@syncpeer/app": "0.0.0"
+  }
+}

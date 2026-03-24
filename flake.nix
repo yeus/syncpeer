@@ -16,7 +16,16 @@
           pkgs.yarn
           pkgs.rustc
           pkgs.cargo
+          pkgs.pkg-config
           pkgs.openssl
+          pkgs.gtk3
+          pkgs.webkitgtk_4_1
+          pkgs.libsoup_3
+          pkgs.glib
+          pkgs.cairo
+          pkgs.pango
+          pkgs.gdk-pixbuf
+          pkgs.atk
         ];
         RUST_BACKTRACE = "1";
         shellHook = ''

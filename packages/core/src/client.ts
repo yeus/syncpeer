@@ -13,6 +13,11 @@ import {
 } from './core/protocol/bep.js';
 import { RemoteFs } from './core/model/remoteFs.js';
 
+function logClient(event: string, details?: Record<string, unknown>): void {
+  const suffix = details ? ` ${JSON.stringify(details)}` : '';
+  process.stderr.write(`[syncpeer-core.client] ${new Date().toISOString()} ${event}${suffix}\n`);
+}
+
 interface FolderState {
   id: string;
   label: string;
@@ -45,6 +50,7 @@ class BepSession {
       this.parser.feed(new Uint8Array(chunk));
     });
     this.socket.on('close', () => {
+      logClient('socket.close');
       this.closed = true;
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
@@ -53,6 +59,7 @@ class BepSession {
       this.pending.clear();
     });
     this.socket.on('error', (err) => {
+      logClient('socket.error', { message: err.message });
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
         reject(err);
@@ -77,6 +84,7 @@ class BepSession {
     }
   }
   private handleClusterConfig(cfg: any) {
+    logClient('cluster_config.received', { folders: (cfg.folders || []).length });
     for (const folder of cfg.folders || []) {
       const state: FolderState = {
         id: folder.id,
@@ -108,6 +116,7 @@ class BepSession {
       });
       const frame = encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, { folders }, 0);
       this.sendFrame(frame);
+      logClient('cluster_config.echoed', { folders: folders.length });
     }
     this.readyResolve();
   }
@@ -213,19 +222,34 @@ export async function connectAndSync(opts: NodeTransportOptions & {
   clientName?: string;
   clientVersion?: string;
 }): Promise<RemoteFs> {
+  logClient('connect.start', {
+    host: opts.host,
+    port: opts.port,
+    deviceName: opts.deviceName,
+    expectedDeviceId: opts.expectedDeviceId ?? null,
+  });
   const socket = await connectTLS(opts);
   const localDeviceId = localDeviceIdFromCert(opts.cert);
+  logClient('connect.local_device_id_ready', { byteLength: localDeviceId.length });
   const helloFrame = encodeHelloFrame({
     device_name: opts.deviceName,
     client_name: opts.clientName ?? 'syncpeer',
     client_version: opts.clientVersion ?? '0.1.0',
   });
   socket.write(Buffer.from(helloFrame));
-  const { leftover } = await readRemoteHello(socket);
+  logClient('hello.sent');
+  const { hello, leftover } = await readRemoteHello(socket);
+  logClient('hello.received', {
+    deviceName: hello.device_name ?? null,
+    clientName: hello.client_name ?? null,
+    clientVersion: hello.client_version ?? null,
+    leftoverBytes: leftover.length,
+  });
   const session = new BepSession(socket, localDeviceId, opts.deviceName);
   if (leftover && leftover.length > 0) {
     (session as any)['parser'].feed(leftover);
   }
   await session.waitForReady();
+  logClient('connect.ready');
   return session.buildRemoteFs();
 }

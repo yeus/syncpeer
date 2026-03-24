@@ -1,0 +1,77 @@
+import { createBrowserSyncpeerClient } from '@syncpeer/core/browser';
+import type { FileEntry, FolderInfo } from '@syncpeer/core/browser';
+
+export interface ConnectOptions {
+  host: string;
+  port: number;
+  cert?: string;
+  key?: string;
+  remoteId?: string;
+  deviceName: string;
+  timeoutMs?: number;
+}
+
+export interface RemoteFsLike {
+  listFolders: () => Promise<FolderInfo[]>;
+  readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
+}
+
+type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+
+const logUi = (event: string, details?: Record<string, unknown>) => {
+  if (details) {
+    console.log(`[syncpeer-ui] ${event}`, details);
+    return;
+  }
+  console.log(`[syncpeer-ui] ${event}`);
+};
+
+const resolveInvoke = (): InvokeFn => {
+  const internals = (globalThis as { __TAURI_INTERNALS__?: { invoke?: unknown } }).__TAURI_INTERNALS__;
+  if (!internals || typeof internals.invoke !== 'function') {
+    throw new Error('Tauri runtime is unavailable. Launch this app through Tauri (npm run dev -w @syncpeer/tauri-shell).');
+  }
+  return internals.invoke as InvokeFn;
+};
+
+const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
+  host: options.host,
+  port: options.port,
+  cert: options.cert && options.cert.trim() !== '' ? options.cert : undefined,
+  key: options.key && options.key.trim() !== '' ? options.key : undefined,
+  remoteId: options.remoteId && options.remoteId.trim() !== '' ? options.remoteId : undefined,
+  deviceName: options.deviceName,
+  timeoutMs: options.timeoutMs,
+});
+
+const createLoggedInvoke = (invoke: InvokeFn): InvokeFn => {
+  return async <T>(command: string, args?: Record<string, unknown>) => {
+    const startedAt = Date.now();
+    logUi('tauri.invoke.start', { command, args });
+    try {
+      const result = await invoke<T>(command, args);
+      logUi('tauri.invoke.success', { command, durationMs: Date.now() - startedAt });
+      return result;
+    } catch (error) {
+      console.error(`[syncpeer-ui] tauri.invoke.error ${command}`, error);
+      throw error;
+    }
+  };
+};
+
+const createTauriRemoteFs = (invoke: InvokeFn, options: ConnectOptions): RemoteFsLike => ({
+  listFolders: () => invoke<FolderInfo[]>('syncpeer_connect_and_list_folders', { request: options }),
+  readDir: (folderId: string, path: string) =>
+    invoke<FileEntry[]>('syncpeer_read_remote_dir', { request: { ...options, folderId, path } }),
+});
+
+export const createSyncpeerUiClient = () => {
+  const invoke = createLoggedInvoke(resolveInvoke());
+  return createBrowserSyncpeerClient<ConnectOptions, RemoteFsLike>({
+    connectAndSync: async (options: ConnectOptions) => {
+      const normalized = normalizeConnectOptions(options);
+      logUi('connect.prepare', normalized);
+      return createTauriRemoteFs(invoke, normalized);
+    },
+  });
+};

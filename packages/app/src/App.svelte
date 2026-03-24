@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { connectAndSync } from "@syncpeer/core/browser";
+  import { createSyncpeerUiClient, type RemoteFsLike } from "./lib/syncpeerClient";
 
   let host = "127.0.0.1";
   let port = 22000;
@@ -7,26 +7,43 @@
   let key = "";
   let remoteId = "";
   let deviceName = "syncpeer-ui";
+  let timeoutMs = 15000;
 
-  let remoteFs: any = null;
+  let remoteFs: RemoteFsLike | null = null;
   let folders: Array<any> = [];
   let entries: Array<any> = [];
   let selectedFolderId = "";
   let error: string | null = null;
 
+  function logUi(event: string, details?: Record<string, unknown>) {
+    if (details) {
+      console.log(`[syncpeer-ui] ${event}`, details);
+      return;
+    }
+    console.log(`[syncpeer-ui] ${event}`);
+  }
+
   async function connect() {
     error = null;
+    logUi("connect.start", { host, port, remoteId: remoteId || null, deviceName, timeoutMs });
     try {
-      remoteFs = await connectAndSync({
+      const client = createSyncpeerUiClient();
+      remoteFs = await client.connectAndSync({
         host,
         port,
         cert: cert || undefined,
         key: key || undefined,
-        expectedDeviceId: remoteId || undefined,
+        remoteId: remoteId || undefined,
         deviceName,
-      } as any);
+        timeoutMs,
+      });
+      logUi("connect.remoteFs.ready");
       folders = await remoteFs.listFolders();
+      logUi("connect.folders.loaded", { count: folders.length });
+      entries = [];
+      selectedFolderId = "";
     } catch (e: any) {
+      console.error("[syncpeer-ui] connect.error", e);
       error = e?.message ?? String(e);
     }
   }
@@ -34,9 +51,12 @@
   async function loadFolder(folderId: string) {
     if (!remoteFs) return;
     selectedFolderId = folderId;
+    logUi("folder.load.start", { folderId });
     try {
       entries = await remoteFs.readDir(folderId, "");
+      logUi("folder.load.success", { folderId, count: entries.length });
     } catch (e: any) {
+      console.error("[syncpeer-ui] folder.load.error", e);
       error = e?.message ?? String(e);
     }
   }
@@ -59,10 +79,11 @@
   <form on:submit|preventDefault={connect}>
     <label>Host<input type="text" bind:value={host} /></label>
     <label>Port<input type="number" bind:value={port} /></label>
-    <label>TLS Certificate (optional)<input type="text" bind:value={cert} placeholder="/path/to/cert.pem" /></label>
-    <label>TLS Key (optional)<input type="text" bind:value={key} placeholder="/path/to/key.pem" /></label>
+    <label>TLS Certificate (optional)<input type="text" bind:value={cert} placeholder="Auto-uses persisted cli-node cert.pem" /></label>
+    <label>TLS Key (optional)<input type="text" bind:value={key} placeholder="Auto-uses persisted cli-node key.pem" /></label>
     <label>Remote Device ID (optional)<input type="text" bind:value={remoteId} placeholder="Device ID" /></label>
     <label>Device Name<input type="text" bind:value={deviceName} /></label>
+    <label>Timeout (ms)<input type="number" bind:value={timeoutMs} min="1000" step="1000" /></label>
     <button type="submit">Connect</button>
   </form>
 

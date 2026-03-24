@@ -2,6 +2,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import tls from "node:tls";
 
+function logTransport(event: string, details?: Record<string, unknown>): void {
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  process.stderr.write(`[syncpeer-core.transport] ${new Date().toISOString()} ${event}${suffix}\n`);
+}
+
 export interface NodeTransportOptions {
   host: string;
   port: number;
@@ -50,6 +55,11 @@ export function computeDeviceId(rawCert: Buffer): string {
 }
 
 export async function connectTLS(opts: NodeTransportOptions): Promise<tls.TLSSocket> {
+  logTransport("tls.connect.start", {
+    host: opts.host,
+    port: opts.port,
+    expectedDeviceId: opts.expectedDeviceId ?? null,
+  });
   const socket = tls.connect({
     host: opts.host,
     port: opts.port,
@@ -64,6 +74,7 @@ export async function connectTLS(opts: NodeTransportOptions): Promise<tls.TLSSoc
     socket.once("secureConnect", () => resolve());
     socket.once("error", reject);
   });
+  logTransport("tls.connect.secure");
 
   const peer = socket.getPeerCertificate(true);
   if (!peer?.raw) {
@@ -71,8 +82,15 @@ export async function connectTLS(opts: NodeTransportOptions): Promise<tls.TLSSoc
     throw new Error("Peer certificate missing");
   }
 
+  const actualDeviceId = canonicalDeviceId(computeDeviceId(peer.raw));
+  logTransport("tls.peer.certificate", {
+    subject: peer.subject?.CN ?? null,
+    issuer: peer.issuer?.CN ?? null,
+    actualDeviceId,
+  });
+
   if (opts.expectedDeviceId) {
-    const got = canonicalDeviceId(computeDeviceId(peer.raw));
+    const got = actualDeviceId;
     const want = canonicalDeviceId(opts.expectedDeviceId);
     if (got != want) {
       socket.destroy();

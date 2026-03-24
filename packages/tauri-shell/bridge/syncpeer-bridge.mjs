@@ -18,12 +18,21 @@ const parseJson = (raw) => {
 
 const withTimeout = async (promise, timeoutMs) => {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`Connection timed out after ${timeoutMs} ms`)), timeoutMs);
-    }),
-  ]);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Connection timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
 };
 
 const normalizeConnectOptions = (payload) => ({
@@ -79,32 +88,73 @@ const openRemoteFs = async (payload) => {
 
 const connectAndListFolders = async (payload) => {
   const remoteFs = await openRemoteFs(payload);
-  logBridge('folders.list.start');
-  const folders = await remoteFs.listFolders();
-  logBridge('folders.list.success', { count: folders.length });
-  return folders;
+  try {
+    logBridge('folders.list.start');
+    const folders = await remoteFs.listFolders();
+    logBridge('folders.list.success', { count: folders.length });
+    return folders;
+  } finally {
+    remoteFs.close?.();
+  }
 };
 
 const connectAndGetOverview = async (payload) => {
   const remoteFs = await openRemoteFs(payload);
-  logBridge('overview.fetch.start');
-  const [folders, device] = await Promise.all([
-    remoteFs.listFolders(),
-    Promise.resolve(remoteFs.getRemoteDeviceInfo?.() ?? null),
-  ]);
-  logBridge('overview.fetch.success', { folderCount: folders.length, hasDevice: !!device });
-  return { folders, device };
+  try {
+    logBridge('overview.fetch.start');
+    const [folders, device] = await Promise.all([
+      remoteFs.listFolders(),
+      Promise.resolve(remoteFs.getRemoteDeviceInfo?.() ?? null),
+    ]);
+    logBridge('overview.fetch.success', { folderCount: folders.length, hasDevice: !!device });
+    return { folders, device };
+  } finally {
+    remoteFs.close?.();
+  }
 };
 
 const readRemoteDir = async (payload) => {
   const remoteFs = await openRemoteFs(payload);
-  const folderId = String(payload.folderId ?? '');
-  const dirPath = String(payload.path ?? '');
-  if (!folderId) throw new Error('folderId is required.');
-  logBridge('dir.read.start', { folderId, path: dirPath });
-  const entries = await remoteFs.readDir(folderId, dirPath);
-  logBridge('dir.read.success', { folderId, path: dirPath, count: entries.length });
-  return entries;
+  try {
+    const folderId = String(payload.folderId ?? '');
+    const dirPath = String(payload.path ?? '');
+    if (!folderId) throw new Error('folderId is required.');
+    const requestedTimeout = Number(payload.timeoutMs ?? 3000);
+    const waitForIndexMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(requestedTimeout, 20000)
+      : 3000;
+    logBridge('dir.read.start', { folderId, path: dirPath });
+    const startedAt = Date.now();
+    let attempts = 0;
+    let indexed = false;
+    let entries = [];
+
+    do {
+      attempts += 1;
+      const elapsedMs = Date.now() - startedAt;
+      const remainingMs = Math.max(0, waitForIndexMs - elapsedMs);
+      if (typeof remoteFs.waitForFolderIndex === 'function' && !indexed) {
+        indexed = await remoteFs.waitForFolderIndex(folderId, Math.min(1000, remainingMs));
+      }
+      entries = await remoteFs.readDir(folderId, dirPath);
+      if (entries.length > 0) break;
+      if (dirPath !== '') break;
+      if (remainingMs <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } while (true);
+
+    logBridge('dir.read.index_status', {
+      folderId,
+      indexed,
+      waitForIndexMs,
+      waitedMs: Date.now() - startedAt,
+      attempts,
+    });
+    logBridge('dir.read.success', { folderId, path: dirPath, count: entries.length });
+    return entries;
+  } finally {
+    remoteFs.close?.();
+  }
 };
 
 const handlers = {

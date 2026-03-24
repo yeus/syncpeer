@@ -39,6 +39,18 @@ const resolveInvoke = (): InvokeFn => {
   return internals.invoke as InvokeFn;
 };
 
+const tryForwardUiErrorToCli = async (
+  invoke: InvokeFn,
+  event: string,
+  details: Record<string, unknown>,
+): Promise<void> => {
+  try {
+    await invoke<void>('syncpeer_log_ui_error', { event, details });
+  } catch {
+    // Ignore forwarding failures to avoid masking the original UI error.
+  }
+};
+
 const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   host: options.host,
   port: options.port,
@@ -59,9 +71,22 @@ const createLoggedInvoke = (invoke: InvokeFn): InvokeFn => {
       return result;
     } catch (error) {
       console.error(`[syncpeer-ui] tauri.invoke.error ${command}`, error);
+      const message = error instanceof Error ? error.message : String(error);
+      void tryForwardUiErrorToCli(invoke, 'tauri.invoke.error', { command, args, message });
       throw error;
     }
   };
+};
+
+export const reportUiError = (event: string, error: unknown, context?: Record<string, unknown>) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[syncpeer-ui] ${event}`, { message, ...context });
+  try {
+    const invoke = resolveInvoke();
+    void tryForwardUiErrorToCli(invoke, event, { message, ...context });
+  } catch {
+    // App might be running outside Tauri.
+  }
 };
 
 const createTauriRemoteFs = (invoke: InvokeFn, options: ConnectOptions): RemoteFsLike => ({

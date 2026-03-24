@@ -61,6 +61,12 @@ struct FileEntry {
   modified_ms: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UiErrorLogRequest {
+  event: String,
+  details: serde_json::Value,
+}
+
 fn resolve_workspace_root() -> Result<PathBuf, String> {
   let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
   let candidate = manifest_dir.join("../../..");
@@ -211,12 +217,23 @@ async fn syncpeer_connect_and_get_overview(request: ConnectRequest) -> Result<Co
   decode_json_output(&raw)
 }
 
+#[tauri::command]
+async fn syncpeer_log_ui_error(entry: UiErrorLogRequest) -> Result<(), String> {
+  tauri_log(&format!(
+    "ui.error event={} details={}",
+    entry.event,
+    entry.details
+  ));
+  Ok(())
+}
+
 fn main() {
   tauri::Builder::default()
     .invoke_handler(tauri::generate_handler![
       syncpeer_connect_and_list_folders,
       syncpeer_read_remote_dir,
-      syncpeer_connect_and_get_overview
+      syncpeer_connect_and_get_overview,
+      syncpeer_log_ui_error
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

@@ -30,6 +30,7 @@ interface FolderState {
   id: string;
   label: string;
   readOnly: boolean;
+  indexReceived: boolean;
   files: Map<string, any>;
 }
 
@@ -65,6 +66,7 @@ export class RemoteFs {
     private folders: Map<string, FolderState>,
     private requestBlock: (folderId: string, filePath: string, offset: number, length: number) => Promise<Uint8Array>,
     private remoteDevice?: RemoteDeviceInfo,
+    private closeConnection?: () => void,
   ) {}
 
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
@@ -141,6 +143,19 @@ export class RemoteFs {
     return this.requestBlock(folderId, path, offset, length);
   }
 
+  async waitForFolderIndex(folderId: string, timeoutMs = 3000, pollMs = 100): Promise<boolean> {
+    const folder = this.folders.get(folderId);
+    if (!folder) return false;
+    if (folder.indexReceived) return true;
+
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      if (folder.indexReceived) return true;
+    }
+    return folder.indexReceived;
+  }
+
   async readFileFully(folderId: string, path: string): Promise<Uint8Array> {
     let entry = await this.stat(folderId, path);
     const waitUntil = Date.now() + 5000;
@@ -176,5 +191,9 @@ export class RemoteFs {
     let end = chunk.length;
     while (end > 0 && chunk[end - 1] === 0) end--;
     return chunk.slice(0, end);
+  }
+
+  close(): void {
+    this.closeConnection?.();
   }
 }

@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package bep;
 
-// --- Pre-auth ---
-
 message Hello {
   string device_name = 1;
   string client_name = 2;
@@ -11,8 +9,6 @@ message Hello {
   int32 num_connections = 4;
   int64 timestamp = 5;
 }
-
-// --- Header ---
 
 message Header {
   MessageType type = 1;
@@ -35,10 +31,6 @@ enum MessageCompression {
   MESSAGE_COMPRESSION_LZ4 = 1;
 }
 
-// --- Actual messages ---
-
-// Cluster Config
-
 message ClusterConfig {
   repeated Folder folders = 1;
   bool secondary = 2;
@@ -50,7 +42,6 @@ message Folder {
   FolderType type = 3;
   FolderStopReason stop_reason = 7;
   reserved 4 to 6;
-
   repeated Device devices = 16;
 }
 
@@ -74,36 +65,31 @@ enum Compression {
 }
 
 enum FolderType {
-	FOLDER_TYPE_SEND_RECEIVE = 0;
-	FOLDER_TYPE_SEND_ONLY = 1;
-	FOLDER_TYPE_RECEIVE_ONLY = 2;
-	FOLDER_TYPE_RECEIVE_ENCRYPTED = 3;
+  FOLDER_TYPE_SEND_RECEIVE = 0;
+  FOLDER_TYPE_SEND_ONLY = 1;
+  FOLDER_TYPE_RECEIVE_ONLY = 2;
+  FOLDER_TYPE_RECEIVE_ENCRYPTED = 3;
 }
 
 enum FolderStopReason {
-  FOLDER_STOP_REASON_RUNNING = 0; // i.e., not stopped
+  FOLDER_STOP_REASON_RUNNING = 0;
   FOLDER_STOP_REASON_PAUSED = 1;
 }
-
-// Index and Index Update
 
 message Index {
   string folder = 1;
   repeated FileInfo files = 2;
-  int64 last_sequence = 3; // the highest sequence in this batch
+  int64 last_sequence = 3;
 }
 
 message IndexUpdate {
   string folder = 1;
   repeated FileInfo files = 2;
-  int64 last_sequence = 3; // the highest sequence in this batch
-  int64 prev_sequence = 4; // the highest sequence in the previous batch
+  int64 last_sequence = 3;
+  int64 prev_sequence = 4;
 }
 
 message FileInfo {
-  // The field ordering here optimizes for struct size / alignment --
-  // large types come before smaller ones.
-
   string name = 1;
   int64 size = 3;
   int64 modified_s = 5;
@@ -120,26 +106,13 @@ message FileInfo {
   int32 modified_ns = 11;
   int32 block_size = 13;
   PlatformData platform = 14;
-
-  // The local_flags fields stores flags that are relevant to the local
-  // host only. It is not part of the protocol, doesn't get sent or
-  // received (we make sure to zero it), nonetheless we need it on our
-  // struct and to be able to serialize it to/from the database.
   uint32 local_flags = 1000;
-
-  // The version_hash is an implementation detail and not part of the wire
-  // format. It is used in the old database format.
   bytes version_hash = 1001;
-
-  // The size of the data appended to the encrypted file on disk. This is
-  // host-local, not sent over the wire.
   int32 encryption_trailer_size = 1003;
-
   bool deleted = 6;
   bool invalid = 7;
   bool no_permissions = 8;
-
-  reserved 1002; // previously inode change time
+  reserved 1002;
 }
 
 enum FileInfoType {
@@ -157,14 +130,8 @@ message BlockInfo {
   reserved 4;
 }
 
-message Vector {
-  repeated Counter counters = 1;
-}
-
-message Counter {
-  uint64 id = 1;
-  uint64 value = 2;
-}
+message Vector { repeated Counter counters = 1; }
+message Counter { uint64 id = 1; uint64 value = 2; }
 
 message PlatformData {
   UnixData unix = 1;
@@ -176,9 +143,6 @@ message PlatformData {
 }
 
 message UnixData {
-  // The owner name and group name are set when known (i.e., could be
-  // resolved on the source device), while the UID and GID are always set
-  // as they come directly from the stat() call.
   string owner_name = 1;
   string group_name = 2;
   int32 uid = 3;
@@ -186,23 +150,12 @@ message UnixData {
 }
 
 message WindowsData {
-  // Windows file objects have a single owner, which may be a user or a
-  // group. We keep the name of that account, and a flag to indicate what
-  // type it is.
   string owner_name = 1;
   bool owner_is_group = 2;
 }
 
-message XattrData {
-  repeated Xattr xattrs = 1;
-}
-
-message Xattr {
-  string name = 1;
-  bytes value = 2;
-}
-
-// Request
+message XattrData { repeated Xattr xattrs = 1; }
+message Xattr { string name = 1; bytes value = 2; }
 
 message Request {
   int32 id = 1;
@@ -216,8 +169,6 @@ message Request {
   reserved 8;
 }
 
-// Response
-
 message Response {
   int32 id = 1;
   bytes data = 2;
@@ -230,8 +181,6 @@ enum ErrorCode {
   ERROR_CODE_NO_SUCH_FILE = 2;
   ERROR_CODE_INVALID_FILE = 3;
 }
-
-// DownloadProgress
 
 message DownloadProgress {
   string folder = 1;
@@ -251,12 +200,5 @@ enum FileDownloadProgressUpdateType {
   FILE_DOWNLOAD_PROGRESS_UPDATE_TYPE_FORGET = 1;
 }
 
-// Ping
-
 message Ping {}
-
-// Close
-
-message Close {
-  string reason = 1;
-}
+message Close { string reason = 1; }

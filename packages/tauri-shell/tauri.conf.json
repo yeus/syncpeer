@@ -1,0 +1,17 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm install && npm run build -w @syncpeer/app",
+    "beforeDevCommand": "npm run dev -w @syncpeer/app",
+    "devPath": "http://localhost:5173",
+    "distDir": "../app/dist"
+  },
+  "package": {
+    "productName": "Syncpeer",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "windows": [
+      { "title": "Syncpeer", "width": 800, "height": 600 }
+    ]
+  }
+}

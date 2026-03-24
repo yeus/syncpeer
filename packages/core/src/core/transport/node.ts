@@ -16,7 +16,6 @@ function base32NoPadding(input: Buffer): string {
   let bits = 0;
   let value = 0;
   let output = "";
-
   for (const byte of input) {
     value = (value << 8) | byte;
     bits += 8;
@@ -25,11 +24,7 @@ function base32NoPadding(input: Buffer): string {
       bits -= 5;
     }
   }
-
-  if (bits > 0) {
-    output += alphabet[(value << (5 - bits)) & 31];
-  }
-
+  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
   return output;
 }
 
@@ -39,11 +34,7 @@ function normalizeDeviceId(id: string): string {
 
 function canonicalDeviceId(id: string): string {
   const normalized = normalizeDeviceId(id);
-  // Syncthing display IDs are 56 chars with one check character every 13 chars.
-  // Our computed raw cert hash is 52 chars. Remove check characters for comparison.
-  if (normalized.length !== 56) {
-    return normalized;
-  }
+  if (normalized.length !== 56) return normalized;
   let out = "";
   for (let i = 0; i < normalized.length; i++) {
     const pos = i + 1;

@@ -1,21 +1,18 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 // Download a pinned Syncthing release into the .tools directory.
-// Syncthing publishes platform/arch‑specific tarballs on GitHub releases. We pin
-// the version for reproducibility. To override, set the environment
-// variable SYNCTHING_VERSION.
-
-const version = process.env.SYNCTHING_VERSION ?? 'v1.27.8';
+// Set SYNCTHING_VERSION to override the default.
+const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
 
 const platformMap = {
-  linux: 'linux',
-  darwin: 'macos',
+  linux: "linux",
+  darwin: "macos",
 };
 const archMap = {
-  x64: 'amd64',
-  arm64: 'arm64',
+  x64: "amd64",
+  arm64: "arm64",
 };
 
 const platform = platformMap[process.platform];
@@ -29,10 +26,10 @@ if (!platform || !arch) {
 const fileName = `syncthing-${platform}-${arch}-${version}.tar.gz`;
 const url = `https://github.com/syncthing/syncthing/releases/download/${version}/${fileName}`;
 
-const toolsDir = path.resolve('.tools');
+const toolsDir = path.resolve(".tools");
 const archivePath = path.join(toolsDir, fileName);
 const extractDir = path.join(toolsDir, `syncthing-${platform}-${arch}-${version}`);
-const binPath = path.join(extractDir, 'syncthing');
+const binPath = path.join(extractDir, "syncthing");
 
 fs.mkdirSync(toolsDir, { recursive: true });
 
@@ -42,10 +39,10 @@ if (fs.existsSync(binPath)) {
 }
 
 console.log(`Downloading ${url}`);
-execFileSync('curl', ['-L', '-o', archivePath, url], { stdio: 'inherit' });
+execFileSync("curl", ["-L", "-o", archivePath, url], { stdio: "inherit" });
 
 console.log(`Extracting ${archivePath}`);
-execFileSync('tar', ['-xzf', archivePath, '-C', toolsDir], { stdio: 'inherit' });
+execFileSync("tar", ["-xzf", archivePath, "-C", toolsDir], { stdio: "inherit" });
 
 if (!fs.existsSync(binPath)) {
   console.error(`Expected binary not found at ${binPath}`);

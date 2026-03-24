@@ -19,6 +19,13 @@ export interface FileEntry {
   blocks?: FileBlock[];
 }
 
+export interface RemoteDeviceInfo {
+  id: string;
+  deviceName: string;
+  clientName: string;
+  clientVersion: string;
+}
+
 interface FolderState {
   id: string;
   label: string;
@@ -57,7 +64,12 @@ export class RemoteFs {
   constructor(
     private folders: Map<string, FolderState>,
     private requestBlock: (folderId: string, filePath: string, offset: number, length: number) => Promise<Uint8Array>,
+    private remoteDevice?: RemoteDeviceInfo,
   ) {}
+
+  getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
+    return this.remoteDevice;
+  }
 
   async listFolders(): Promise<FolderInfo[]> {
     return [...this.folders.values()].map((f) => ({

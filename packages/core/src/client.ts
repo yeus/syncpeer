@@ -11,7 +11,8 @@ import {
   ClusterConfig,
   Request,
 } from './core/protocol/bep.js';
-import { RemoteFs } from './core/model/remoteFs.js';
+import { RemoteDeviceInfo, RemoteFs } from './core/model/remoteFs.js';
+import { computeDeviceId } from './core/transport/node.js';
 
 function logClient(event: string, details?: Record<string, unknown>): void {
   const suffix = details ? ` ${JSON.stringify(details)}` : '';
@@ -170,6 +171,13 @@ class BepSession {
   buildRemoteFs(): RemoteFs {
     return new RemoteFs(this.folders, (folder, name, offset, size) => this.requestBlock(folder, name, offset, size));
   }
+  buildRemoteFsWithMetadata(metadata: RemoteDeviceInfo): RemoteFs {
+    return new RemoteFs(
+      this.folders,
+      (folder, name, offset, size) => this.requestBlock(folder, name, offset, size),
+      metadata,
+    );
+  }
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -239,10 +247,19 @@ export async function connectAndSync(opts: NodeTransportOptions & {
   socket.write(Buffer.from(helloFrame));
   logClient('hello.sent');
   const { hello, leftover } = await readRemoteHello(socket);
+  const peer = socket.getPeerCertificate(true);
+  const deviceId = peer?.raw ? computeDeviceId(peer.raw) : 'unknown';
+  const remoteDeviceInfo: RemoteDeviceInfo = {
+    id: deviceId,
+    deviceName: String(hello.device_name ?? 'unknown'),
+    clientName: String(hello.client_name ?? 'unknown'),
+    clientVersion: String(hello.client_version ?? 'unknown'),
+  };
   logClient('hello.received', {
-    deviceName: hello.device_name ?? null,
-    clientName: hello.client_name ?? null,
-    clientVersion: hello.client_version ?? null,
+    deviceId: remoteDeviceInfo.id,
+    deviceName: remoteDeviceInfo.deviceName,
+    clientName: remoteDeviceInfo.clientName,
+    clientVersion: remoteDeviceInfo.clientVersion,
     leftoverBytes: leftover.length,
   });
   const session = new BepSession(socket, localDeviceId, opts.deviceName);
@@ -251,5 +268,5 @@ export async function connectAndSync(opts: NodeTransportOptions & {
   }
   await session.waitForReady();
   logClient('connect.ready');
-  return session.buildRemoteFs();
+  return session.buildRemoteFsWithMetadata(remoteDeviceInfo);
 }

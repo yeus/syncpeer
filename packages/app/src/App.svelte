@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import {
     createSyncpeerUiClient,
     reportUiError,
     type ConnectOptions,
     type RemoteFsLike,
-  } from './lib/syncpeerClient';
+  } from './lib/syncpeerClient.js';
   import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from '@syncpeer/core/browser';
 
   type Tab = 'favorites' | 'folders' | 'devices';
@@ -52,7 +52,6 @@
     createdAtMs: number;
   }
 
-  const FAVORITES_STORAGE_KEY = 'syncpeer.ui.favorites.v1';
   const CONNECTION_STORAGE_KEY = 'syncpeer.ui.connection.v1';
   const SAVED_DEVICES_STORAGE_KEY = 'syncpeer.ui.savedDevices.v1';
   const REFRESH_MS = 3000;
@@ -74,20 +73,9 @@
     return parseJson<StoredConnectionSettings>(window.localStorage.getItem(CONNECTION_STORAGE_KEY));
   };
 
-  const loadStoredFavorites = (): FavoriteItem[] => {
-    if (typeof window === 'undefined') return [];
-    const parsed = parseJson<FavoriteItem[]>(window.localStorage.getItem(FAVORITES_STORAGE_KEY));
-    return Array.isArray(parsed) ? parsed : [];
-  };
-
   const persistConnectionSettings = (settings: StoredConnectionSettings): void => {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(settings));
-  };
-
-  const persistFavorites = (items: FavoriteItem[]): void => {
-    if (typeof window === 'undefined') return;
-    window.localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(items));
   };
 
   const loadStoredDevices = (): SavedDevice[] => {
@@ -114,6 +102,13 @@
   const folderDisplayName = (folder: FolderInfo): string => folder.label || folder.id;
   const favoriteKey = (folderId: string, path: string, kind: FavoriteItem['kind']): string =>
     `${kind}:${folderId}:${normalizePath(path)}`;
+  const resolveDirectoryPath = (basePath: string, nextPath: string): string => {
+    const base = normalizePath(basePath);
+    const next = normalizePath(nextPath);
+    if (!next) return base;
+    if (!base || next === base || next.startsWith(`${base}/`) || next.includes('/')) return next;
+    return `${base}/${next}`;
+  };
 
   const toConnectionSettings = (): StoredConnectionSettings => ({
     host,
@@ -174,6 +169,7 @@
   let isRefreshing = false;
   let isLoadingDirectory = false;
   let isDownloading = false;
+  let isOpeningCachedFile = false;
   let isSettingsExpanded = false;
   let uploadMessage = '';
   let lastUpdatedAt = '';
@@ -188,12 +184,14 @@
   let currentPath = '';
   let directoryLoadSeq = 0;
 
-  let favorites: FavoriteItem[] = loadStoredFavorites();
+  let favorites: FavoriteItem[] = [];
   let savedDevices: SavedDevice[] = loadStoredDevices();
   let selectedSavedDeviceId = savedDevices[0]?.id ?? '';
   let newSavedDeviceName = '';
   let newSavedDeviceId = '';
   let visibleBreadcrumbs: BreadcrumbSegment[] = [];
+  let favoriteKeys = new Set<string>();
+  let cachedFileKeys = new Set<string>();
 
   let error: string | null = null;
 
@@ -205,8 +203,11 @@
     clearInterval(refreshTimer);
   });
 
+  onMount(() => {
+    void hydratePersistedState();
+  });
+
   $: persistConnectionSettings(toConnectionSettings());
-  $: persistFavorites(favorites);
   $: persistSavedDevices(savedDevices);
   $: if (savedDevices.length > 0 && !savedDevices.some((device) => device.id === selectedSavedDeviceId)) {
     selectedSavedDeviceId = savedDevices[0].id;
@@ -214,7 +215,8 @@
   $: if (savedDevices.length === 0) {
     selectedSavedDeviceId = '';
   }
-  $: visibleBreadcrumbs = breadcrumbSegments();
+  $: favoriteKeys = new Set(favorites.map((item) => item.key));
+  $: visibleBreadcrumbs = breadcrumbSegments(currentFolderId, currentPath, folders);
 
   const connectionDetails = (): ConnectOptions => ({
     host,
@@ -244,18 +246,22 @@
     return `${syncState.remoteIndexId}:${syncState.remoteMaxSequence}`;
   };
 
-  const breadcrumbSegments = (): BreadcrumbSegment[] => {
-    if (!currentFolderId) return [];
-    const folder = folders.find((candidate) => candidate.id === currentFolderId);
-    const folderLabel = folder?.label || currentFolderId;
-    const cleanPath = normalizePath(currentPath);
+  const breadcrumbSegments = (
+    folderId: string,
+    path: string,
+    availableFolders: FolderInfo[],
+  ): BreadcrumbSegment[] => {
+    if (!folderId) return [];
+    const folder = availableFolders.find((candidate) => candidate.id === folderId);
+    const folderLabel = folder?.label || folderId;
+    const cleanPath = normalizePath(path);
     const parts = cleanPath ? cleanPath.split('/') : [];
 
     const segments: BreadcrumbSegment[] = [
       {
-        key: `folder:${currentFolderId}`,
+        key: `folder:${folderId}`,
         label: folderLabel,
-        targetFolderId: currentFolderId,
+        targetFolderId: folderId,
         targetPath: '',
       },
     ];
@@ -265,7 +271,7 @@
       segments.push({
         key: `path:${segmentPath}`,
         label: parts[index],
-        targetFolderId: currentFolderId,
+        targetFolderId: folderId,
         targetPath: segmentPath,
       });
     }
@@ -275,7 +281,7 @@
       {
         key: 'ellipsis',
         label: '...',
-        targetFolderId: currentFolderId,
+        targetFolderId: folderId,
         targetPath: '',
         ellipsis: true,
       },
@@ -283,14 +289,62 @@
     ];
   };
 
-  const isFavorite = (folderId: string, path: string, kind: FavoriteItem['kind']): boolean =>
-    favorites.some((item) => item.key === favoriteKey(folderId, path, kind));
+  const cachedFileKey = (folderId: string, path: string): string => `${folderId}:${normalizePath(path)}`;
 
-  const toggleFavorite = (folderId: string, path: string, name: string, kind: FavoriteItem['kind']): void => {
+  async function hydratePersistedState() {
+    try {
+      favorites = await client.listFavorites();
+      const fileFavoritesByFolder = new Map<string, string[]>();
+      for (const favorite of favorites) {
+        if (favorite.kind !== 'file') continue;
+        if (!fileFavoritesByFolder.has(favorite.folderId)) {
+          fileFavoritesByFolder.set(favorite.folderId, []);
+        }
+        fileFavoritesByFolder.get(favorite.folderId)?.push(favorite.path);
+      }
+      for (const [folderId, paths] of fileFavoritesByFolder) {
+        await refreshCachedStatuses(folderId, paths);
+      }
+    } catch (rawError: unknown) {
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('hydrate_state.failed', rawError);
+    }
+  }
+
+  async function refreshCachedStatuses(folderId: string, paths: string[]) {
+    if (!folderId || paths.length === 0) return;
+    try {
+      const statuses = await client.getCachedStatuses(folderId, paths.map((item) => normalizePath(item)));
+      const next = new Set(cachedFileKeys);
+      for (const status of statuses) {
+        const keyValue = cachedFileKey(folderId, status.path);
+        if (status.available) {
+          next.add(keyValue);
+        } else {
+          next.delete(keyValue);
+        }
+      }
+      cachedFileKeys = next;
+    } catch (rawError: unknown) {
+      reportUiError('refresh_cached_statuses.failed', rawError, { folderId, count: paths.length });
+    }
+  }
+
+  async function toggleFavorite(folderId: string, path: string, name: string, kind: FavoriteItem['kind']): Promise<void> {
     const keyValue = favoriteKey(folderId, path, kind);
     const exists = favorites.some((item) => item.key === keyValue);
+    const previous = favorites;
     if (exists) {
       favorites = favorites.filter((item) => item.key !== keyValue);
+      try {
+        await client.removeFavorite(keyValue);
+      } catch (rawError: unknown) {
+        favorites = previous;
+        const message = rawError instanceof Error ? rawError.message : String(rawError);
+        error = message;
+        reportUiError('favorite.remove.failed', rawError, { key: keyValue });
+      }
       return;
     }
     favorites = [
@@ -303,10 +357,36 @@
         kind,
       },
     ].sort((a, b) => a.name.localeCompare(b.name));
+    try {
+      await client.upsertFavorite({
+        key: keyValue,
+        folderId,
+        path: normalizePath(path),
+        name,
+        kind,
+      });
+      if (kind === 'file') {
+        await refreshCachedStatuses(folderId, [path]);
+      }
+    } catch (rawError: unknown) {
+      favorites = previous;
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('favorite.upsert.failed', rawError, { key: keyValue });
+    }
   };
 
-  const removeFavorite = (favorite: FavoriteItem): void => {
+  const removeFavorite = async (favorite: FavoriteItem): Promise<void> => {
+    const previous = favorites;
     favorites = favorites.filter((item) => item.key !== favorite.key);
+    try {
+      await client.removeFavorite(favorite.key);
+    } catch (rawError: unknown) {
+      favorites = previous;
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('favorite.remove.failed', rawError, { key: favorite.key });
+    }
   };
 
   async function connect() {
@@ -356,7 +436,7 @@
 
   async function openDirectory(path: string) {
     if (!currentFolderId) return;
-    currentPath = normalizePath(path);
+    currentPath = resolveDirectoryPath(currentPath, path);
     uploadMessage = '';
     await loadCurrentDirectory();
   }
@@ -386,6 +466,10 @@
       const nextEntries = await remoteFs.readDir(currentFolderId, normalizePath(currentPath));
       if (requestSeq !== directoryLoadSeq) return;
       entries = nextEntries;
+      const filePaths = nextEntries
+        .filter((entry: FileEntry) => entry.type !== 'directory')
+        .map((entry: FileEntry) => entry.path);
+      void refreshCachedStatuses(currentFolderId, filePaths);
       currentFolderVersionKey = folderVersionKey(currentFolderId);
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
@@ -454,22 +538,31 @@
     error = null;
     try {
       const bytes = await remoteFs.readFileFully(folderId, path);
-      const blob = new Blob([bytes], { type: 'application/octet-stream' });
-      const href = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = href;
-      anchor.download = name;
-      anchor.style.display = 'none';
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(href);
+      await client.cacheFile(folderId, path, name, bytes);
+      const next = new Set(cachedFileKeys);
+      next.add(cachedFileKey(folderId, path));
+      cachedFileKeys = next;
     } catch (rawError: unknown) {
       const message = rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
       reportUiError('download_file.failed', rawError, { folderId, path });
     } finally {
       isDownloading = false;
+    }
+  }
+
+  async function openCachedFile(folderId: string, path: string) {
+    if (isOpeningCachedFile) return;
+    isOpeningCachedFile = true;
+    error = null;
+    try {
+      await client.openCachedFile(folderId, path);
+    } catch (rawError: unknown) {
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('open_cached_file.failed', rawError, { folderId, path });
+    } finally {
+      isOpeningCachedFile = false;
     }
   }
 
@@ -987,8 +1080,13 @@
                 <div class="item-meta">{remoteDevice.clientName} {remoteDevice.clientVersion}</div>
               </div>
               <div class="item-actions">
-                <button class="ghost" on:click={refreshOverview} disabled={!isConnected || isRefreshing || isConnecting}>
-                  {isRefreshing ? 'Refreshing...' : 'Refresh'}
+                <button
+                  class="ghost"
+                  on:click={refreshOverview}
+                  disabled={!isConnected || isRefreshing || isConnecting}
+                  title={isRefreshing ? 'Refreshing...' : 'Refresh'}
+                >
+                  Refresh
                 </button>
               </div>
             </li>
@@ -1016,11 +1114,17 @@
                 </div>
                 <div class="item-actions">
                   {#if favorite.kind === 'file'}
-                    <button class="ghost" on:click={() => downloadFile(favorite.folderId, favorite.path, favorite.name)} disabled={!isConnected || isDownloading}>
-                      Download
-                    </button>
+                    {#if cachedFileKeys.has(cachedFileKey(favorite.folderId, favorite.path))}
+                      <button class="ghost" on:click={() => openCachedFile(favorite.folderId, favorite.path)} disabled={isOpeningCachedFile}>
+                        Open
+                      </button>
+                    {:else}
+                      <button class="ghost" on:click={() => downloadFile(favorite.folderId, favorite.path, favorite.name)} disabled={!isConnected || isDownloading}>
+                        Download
+                      </button>
+                    {/if}
                   {/if}
-                  <button class="icon" on:click={() => removeFavorite(favorite)} title="Remove favorite">★</button>
+                  <button class="icon" on:click={() => void removeFavorite(favorite)} title="Remove favorite">★</button>
                 </div>
               </li>
             {/each}
@@ -1044,8 +1148,12 @@
             {#if lastUpdatedAt}
               <span>Updated {lastUpdatedAt}</span>
             {/if}
-            <button on:click={() => refreshActiveView()} disabled={isRefreshing || isConnecting || isLoadingDirectory}>
-              {isRefreshing ? 'Refreshing...' : 'Refresh'}
+            <button
+              on:click={() => refreshActiveView()}
+              disabled={isRefreshing || isConnecting || isLoadingDirectory}
+              title={isRefreshing ? 'Refreshing...' : 'Refresh'}
+            >
+              Refresh
             </button>
           </div>
 
@@ -1084,10 +1192,10 @@
                     <div class="item-actions">
                       <button
                         class="icon"
-                        on:click={() => toggleFavorite(folder.id, '', folder.name, 'folder')}
+                        on:click={() => void toggleFavorite(folder.id, '', folder.name, 'folder')}
                         title="Toggle favorite"
                       >
-                        {isFavorite(folder.id, '', 'folder') ? '★' : '☆'}
+                        {favoriteKeys.has(favoriteKey(folder.id, '', 'folder')) ? '★' : '☆'}
                       </button>
                     </div>
                   </li>
@@ -1113,16 +1221,22 @@
                     </div>
                     <div class="item-actions">
                       {#if entry.type !== 'directory'}
-                        <button class="ghost" on:click={() => downloadFile(currentFolderId, entry.path, entry.name)} disabled={isDownloading}>
-                          Download
-                        </button>
+                        {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
+                          <button class="ghost" on:click={() => openCachedFile(currentFolderId, entry.path)} disabled={isOpeningCachedFile}>
+                            Open
+                          </button>
+                        {:else}
+                          <button class="ghost" on:click={() => downloadFile(currentFolderId, entry.path, entry.name)} disabled={isDownloading}>
+                            Download
+                          </button>
+                        {/if}
                       {/if}
                       <button
                         class="icon"
-                        on:click={() => toggleFavorite(currentFolderId, entry.path, entry.name, entry.type === 'directory' ? 'folder' : 'file')}
+                        on:click={() => void toggleFavorite(currentFolderId, entry.path, entry.name, entry.type === 'directory' ? 'folder' : 'file')}
                         title="Toggle favorite"
                       >
-                        {isFavorite(currentFolderId, entry.path, entry.type === 'directory' ? 'folder' : 'file') ? '★' : '☆'}
+                        {favoriteKeys.has(favoriteKey(currentFolderId, entry.path, entry.type === 'directory' ? 'folder' : 'file')) ? '★' : '☆'}
                       </button>
                     </div>
                   </li>

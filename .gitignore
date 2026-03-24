@@ -4,3 +4,5 @@ dist/
 .envrc
 .tools/
 .tmp/
+packages/tauri-shell/src-tauri/target/
+

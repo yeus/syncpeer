@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { connectAndSync } from "@syncpeer/core";
+  import { connectAndSync } from "@syncpeer/core/browser";
 
   let host = "127.0.0.1";
   let port = 22000;

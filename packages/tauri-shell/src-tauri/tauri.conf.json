@@ -1,15 +1,15 @@
 {
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Syncpeer",
+  "version": "0.1.0",
+  "identifier": "dev.syncpeer.app",
   "build": {
     "beforeBuildCommand": "npm install && npm run build -w @syncpeer/app",
     "beforeDevCommand": "npm run dev -w @syncpeer/app",
-    "devPath": "http://localhost:5173",
-    "distDir": "../app/dist"
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../app/dist"
   },
-  "package": {
-    "productName": "Syncpeer",
-    "version": "0.1.0"
-  },
-  "tauri": {
+  "app": {
     "windows": [
       { "title": "Syncpeer", "width": 800, "height": 600 }
     ]

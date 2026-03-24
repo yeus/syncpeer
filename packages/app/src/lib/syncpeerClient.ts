@@ -25,10 +25,25 @@ export interface ConnectionOverview {
   folderSyncStates: FolderSyncState[];
 }
 
+export interface FavoriteRecord {
+  key: string;
+  folderId: string;
+  path: string;
+  name: string;
+  kind: 'folder' | 'file';
+}
+
+export interface CachedFileStatus {
+  path: string;
+  available: boolean;
+  localPath?: string;
+  cachedAtMs?: number;
+}
+
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
-const logUi = (event: string, details?: Record<string, unknown>) => {
-  if (details) {
+const logUi = (event: string, details?: unknown) => {
+  if (details !== undefined) {
     console.log(`[syncpeer-ui] ${event}`, details);
     return;
   }
@@ -85,12 +100,14 @@ const createLoggedInvoke = (invoke: InvokeFn): InvokeFn => {
   };
 };
 
-export const reportUiError = (event: string, error: unknown, context?: Record<string, unknown>) => {
+export const reportUiError = (event: string, error: unknown, context?: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(`[syncpeer-ui] ${event}`, { message, ...context });
+  const normalizedContext =
+    context && typeof context === 'object' ? (context as Record<string, unknown>) : {};
+  console.error(`[syncpeer-ui] ${event}`, { message, ...normalizedContext });
   try {
     const invoke = resolveInvoke();
-    void tryForwardUiErrorToCli(invoke, event, { message, ...context });
+    void tryForwardUiErrorToCli(invoke, event, { message, ...normalizedContext });
   } catch {
     // App might be running outside Tauri.
   }
@@ -125,5 +142,25 @@ export const createSyncpeerUiClient = () => {
       const normalized = normalizeConnectOptions(options);
       return invoke<FolderSyncState[]>('syncpeer_get_folder_versions', { request: normalized });
     },
+    listFavorites: async (): Promise<FavoriteRecord[]> => invoke<FavoriteRecord[]>('syncpeer_list_favorites'),
+    upsertFavorite: async (favorite: FavoriteRecord): Promise<FavoriteRecord[]> =>
+      invoke<FavoriteRecord[]>('syncpeer_upsert_favorite', { request: { favorite } }),
+    removeFavorite: async (key: string): Promise<FavoriteRecord[]> =>
+      invoke<FavoriteRecord[]>('syncpeer_remove_favorite', { request: { key } }),
+    cacheFile: async (
+      folderId: string,
+      path: string,
+      name: string,
+      bytes: Uint8Array,
+      modifiedMs?: number,
+    ): Promise<void> => {
+      await invoke('syncpeer_cache_file', {
+        request: { folderId, path, name, bytes: Array.from(bytes), modifiedMs: modifiedMs ?? null },
+      });
+    },
+    getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
+      invoke<CachedFileStatus[]>('syncpeer_get_cached_statuses', { request: { folderId, paths } }),
+    openCachedFile: async (folderId: string, path: string): Promise<void> =>
+      invoke('syncpeer_open_cached_file', { request: { folderId, path } }),
   };
 };

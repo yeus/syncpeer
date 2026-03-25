@@ -5,4 +5,5 @@ dist/
 .tools/
 .tmp/
 packages/tauri-shell/src-tauri/target/
+packages/tauri-shell/src-tauri/gen
 

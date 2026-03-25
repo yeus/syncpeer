@@ -15,6 +15,7 @@
     "build:cli": "npm run build -w @syncpeer/cli",
     "build:app": "npm run build -w @syncpeer/app",
     "build:tauri": "npm run build -w @syncpeer/tauri-shell",
+    "build:android:init": "npm run android:init -w @syncpeer/tauri-shell",
     "build:android": "npm run build:android:prod",
     "build:android:prod": "npm run build:android:prod -w @syncpeer/tauri-shell && node scripts/copy-android-apk.mjs release",
     "build:android:dev": "npm run build:android:dev -w @syncpeer/tauri-shell && node scripts/copy-android-apk.mjs debug",

@@ -10,11 +10,15 @@
     "download:syncthing": "node scripts/download-syncthing.mjs",
     "test:local": "node scripts/test-local.mjs",
     "test:local:keep": "node scripts/test-local.mjs --keep",
-    "build": "npm run build -w @syncpeer/core && npm run build -w @syncpeer/cli && npm run build -w @syncpeer/app && npm run build -w @syncpeer/tauri-shell",
+    "build": "npm run build:core && npm run build:cli && npm run build:app && npm run build:tauri",
     "build:core": "npm run build -w @syncpeer/core",
     "build:cli": "npm run build -w @syncpeer/cli",
     "build:app": "npm run build -w @syncpeer/app",
     "build:tauri": "npm run build -w @syncpeer/tauri-shell",
+    "build:android": "npm run build:android:prod",
+    "build:android:prod": "npm run build:android:prod -w @syncpeer/tauri-shell && node scripts/copy-android-apk.mjs release",
+    "build:android:dev": "npm run build:android:dev -w @syncpeer/tauri-shell && node scripts/copy-android-apk.mjs debug",
+    "android:dev": "npm run android:dev -w @syncpeer/tauri-shell",
     "dev": "npm run build && npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log"
   }
 }

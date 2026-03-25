@@ -287,6 +287,7 @@ export const createSyncpeerUiClient = () => {
     const normalized = normalizeConnectOptions(options);
     let certPem: string | null = null;
     let keyPem: string | null = null;
+    let defaultIdentityError: string | null = null;
 
     if (normalized.cert) {
       certPem = await resolvePemValue(invokeWithLogging, "cert", normalized.cert);
@@ -300,16 +301,22 @@ export const createSyncpeerUiClient = () => {
         const identity = await resolveDefaultIdentity();
         if (!certPem) certPem = identity.certPem;
         if (!keyPem) keyPem = identity.keyPem;
-      } catch {
-        // Keep existing values and fail with explicit missing field errors below.
+      } catch (error) {
+        defaultIdentityError = error instanceof Error ? error.message : String(error);
       }
     }
 
     if (!certPem) {
-      throw new Error("Missing cert. Provide PEM text or a readable file path.");
+      if (defaultIdentityError) {
+        throw new Error(`Missing cert. Provide PEM text or a readable file path. Default identity lookup failed: ${defaultIdentityError}`);
+      }
+      throw new Error("Missing cert. Provide PEM text or a readable file path. On Android, open Devices > Connection Settings and paste a cert PEM if no persisted identity exists.");
     }
     if (!keyPem) {
-      throw new Error("Missing key. Provide PEM text or a readable file path.");
+      if (defaultIdentityError) {
+        throw new Error(`Missing key. Provide PEM text or a readable file path. Default identity lookup failed: ${defaultIdentityError}`);
+      }
+      throw new Error("Missing key. Provide PEM text or a readable file path. On Android, open Devices > Connection Settings and paste a key PEM if no persisted identity exists.");
     }
     const key = serializeConnectionKey(normalized, certPem, keyPem);
     if (activeSession && activeConnectionKey === key) {

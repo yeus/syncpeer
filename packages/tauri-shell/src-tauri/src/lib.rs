@@ -1,92 +1,17 @@
+use native_tls::{Certificate, Identity, TlsConnector, TlsStream};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectRequest {
-  host: String,
-  port: u16,
-  discovery_mode: Option<String>,
-  discovery_server: Option<String>,
-  cert: Option<String>,
-  key: Option<String>,
-  remote_id: Option<String>,
-  device_name: String,
-  timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadDirRequest {
-  #[serde(flatten)]
-  connection: ConnectRequest,
-  folder_id: String,
-  path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadFileRequest {
-  #[serde(flatten)]
-  connection: ConnectRequest,
-  folder_id: String,
-  path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FolderInfo {
-  id: String,
-  label: String,
-  #[serde(rename = "readOnly")]
-  read_only: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteDeviceInfo {
-  id: String,
-  device_name: String,
-  client_name: String,
-  client_version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FolderSyncState {
-  folder_id: String,
-  remote_index_id: String,
-  remote_max_sequence: String,
-  index_received: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConnectionOverview {
-  folders: Vec<FolderInfo>,
-  device: Option<RemoteDeviceInfo>,
-  #[serde(default)]
-  #[serde(rename = "folderSyncStates")]
-  folder_sync_states: Vec<FolderSyncState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileEntry {
-  name: String,
-  path: String,
-  #[serde(rename = "type")]
-  entry_type: String,
-  size: f64,
-  #[serde(rename = "modifiedMs")]
-  modified_ms: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UiErrorLogRequest {
   event: String,
   details: serde_json::Value,
@@ -168,6 +93,88 @@ struct CachedFileStatus {
 struct OpenCachedFileRequest {
   folder_id: String,
   path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveCachedFileRequest {
+  folder_id: String,
+  path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadTextFileRequest {
+  path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsOpenRequest {
+  host: String,
+  port: u16,
+  cert_pem: String,
+  key_pem: String,
+  ca_pem: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsOpenResponse {
+  session_id: u64,
+  peer_certificate_der: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliNodeIdentityResponse {
+  cert_path: String,
+  key_path: String,
+  cert_pem: String,
+  key_pem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsReadRequest {
+  session_id: u64,
+  max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsReadResponse {
+  bytes: Vec<u8>,
+  eof: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsWriteRequest {
+  session_id: u64,
+  bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsCloseRequest {
+  session_id: u64,
+}
+
+struct TlsSession {
+  stream: TlsStream<TcpStream>,
+}
+
+#[derive(Default)]
+struct TlsSessionStore {
+  next_id: u64,
+  sessions: HashMap<u64, Arc<Mutex<TlsSession>>>,
+}
+
+type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
+
+fn tauri_log(message: &str) {
+  eprintln!("[syncpeer-tauri] {message}");
 }
 
 fn now_ms() -> u64 {
@@ -256,28 +263,28 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 fn open_file_with_system(path: &Path) -> Result<(), String> {
   #[cfg(target_os = "macos")]
   let mut command = {
-    let mut cmd = Command::new("open");
+    let mut cmd = std::process::Command::new("open");
     cmd.arg(path);
     cmd
   };
 
   #[cfg(target_os = "windows")]
   let mut command = {
-    let mut cmd = Command::new("cmd");
+    let mut cmd = std::process::Command::new("cmd");
     cmd.args(["/C", "start", ""]).arg(path);
     cmd
   };
 
   #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
   let mut command = {
-    let mut cmd = Command::new("xdg-open");
+    let mut cmd = std::process::Command::new("xdg-open");
     cmd.arg(path);
     cmd
   };
 
   #[cfg(target_os = "android")]
   let mut command = {
-    let mut cmd = Command::new("am");
+    let mut cmd = std::process::Command::new("am");
     let uri = format!("file://{}", path.display());
     cmd.args(["start", "-a", "android.intent.action.VIEW", "-d", &uri]);
     cmd
@@ -292,181 +299,198 @@ fn open_file_with_system(path: &Path) -> Result<(), String> {
   Ok(())
 }
 
-fn resolve_workspace_root() -> Result<PathBuf, String> {
-  let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-  let candidate = manifest_dir.join("../../..");
-  candidate
-    .canonicalize()
-    .map_err(|error| format!("Could not resolve workspace root: {error}"))
+fn get_tls_session(store: &tauri::State<SharedTlsStore>, session_id: u64) -> Result<Arc<Mutex<TlsSession>>, String> {
+  let guard = store
+    .lock()
+    .map_err(|_| "TLS session store lock poisoned".to_string())?;
+  guard
+    .sessions
+    .get(&session_id)
+    .cloned()
+    .ok_or_else(|| format!("Unknown TLS session: {session_id}"))
 }
 
-fn resolve_bridge_script(workspace_root: &Path) -> PathBuf {
-  workspace_root.join("packages/tauri-shell/bridge/syncpeer-bridge.mjs")
+#[tauri::command]
+async fn syncpeer_read_text_file(request: ReadTextFileRequest) -> Result<String, String> {
+  let path = PathBuf::from(request.path);
+  fs::read_to_string(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))
 }
 
-fn tauri_log(message: &str) {
-  eprintln!("[syncpeer-tauri] {message}");
-}
+#[tauri::command]
+async fn syncpeer_read_default_cli_identity(
+  app: tauri::AppHandle,
+) -> Result<CliNodeIdentityResponse, String> {
+  let config_dir = app
+    .path()
+    .config_dir()
+    .map_err(|error| format!("Could not resolve config dir: {error}"))?;
+  let cli_node_dir = config_dir.join("syncpeer").join("cli-node");
+  let cert_path = cli_node_dir.join("cert.pem");
+  let key_path = cli_node_dir.join("key.pem");
 
-fn extract_command_error(output: &std::process::Output, streamed_stderr: &str) -> String {
-  let stderr = if streamed_stderr.trim().is_empty() {
-    String::from_utf8_lossy(&output.stderr).trim().to_string()
-  } else {
-    streamed_stderr.trim().to_string()
-  };
-  if !stderr.is_empty() {
-    return stderr;
-  }
-  let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-  if !stdout.is_empty() {
-    return stdout;
-  }
-  "Node bridge process failed without output".to_string()
-}
-
-fn run_bridge_command<TPayload: Serialize>(operation: &str, payload: &TPayload) -> Result<String, String> {
-  let workspace_root = resolve_workspace_root()?;
-  let bridge_script = resolve_bridge_script(&workspace_root);
-  if !bridge_script.exists() {
+  if !cert_path.exists() || !key_path.exists() {
     return Err(format!(
-      "Bridge script not found at {}",
-      bridge_script.display()
+      "Missing cert/key. Provide PEM text, file paths, or create persisted identity at {}.",
+      cli_node_dir.display()
     ));
   }
 
-  let payload_json = serde_json::to_string(payload)
-    .map_err(|error| format!("Failed to encode payload: {error}"))?;
+  let cert_pem = fs::read_to_string(&cert_path)
+    .map_err(|error| format!("Could not read {}: {error}", cert_path.display()))?;
+  let key_pem = fs::read_to_string(&key_path)
+    .map_err(|error| format!("Could not read {}: {error}", key_path.display()))?;
 
-  tauri_log(&format!("bridge command start: {operation}"));
+  Ok(CliNodeIdentityResponse {
+    cert_path: cert_path.to_string_lossy().to_string(),
+    key_path: key_path.to_string_lossy().to_string(),
+    cert_pem,
+    key_pem,
+  })
+}
 
-  let mut child = Command::new("node")
-    .arg(bridge_script)
-    .arg(operation)
-    .arg(payload_json)
-    .current_dir(workspace_root)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .map_err(|error| format!("Failed to run Node bridge: {error}"))?;
+#[tauri::command]
+async fn syncpeer_tls_open(
+  store: tauri::State<'_, SharedTlsStore>,
+  request: TlsOpenRequest,
+) -> Result<TlsOpenResponse, String> {
+  let shared_store = store.inner().clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    let identity = Identity::from_pkcs8(request.cert_pem.as_bytes(), request.key_pem.as_bytes())
+      .map_err(|error| format!("Invalid client cert/key PEM: {error}"))?;
 
-  let stderr = child
-    .stderr
-    .take()
-    .ok_or_else(|| "Failed to capture bridge stderr".to_string())?;
-
-  let stderr_acc = Arc::new(Mutex::new(String::new()));
-  let stderr_acc_reader = Arc::clone(&stderr_acc);
-  let stderr_thread = std::thread::spawn(move || {
-    let reader = BufReader::new(stderr);
-    for line in reader.lines() {
-      match line {
-        Ok(raw_line) => {
-          let trimmed = raw_line.trim();
-          if !trimmed.is_empty() {
-            tauri_log(trimmed);
-            if let Ok(mut collected) = stderr_acc_reader.lock() {
-              if !collected.is_empty() {
-                collected.push('\n');
-              }
-              collected.push_str(trimmed);
-            }
-          }
-        }
-        Err(_) => break,
-      }
+    let mut builder = TlsConnector::builder();
+    builder.identity(identity);
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    if let Some(ca_pem) = request.ca_pem.as_ref() {
+      let cert = Certificate::from_pem(ca_pem.as_bytes()).map_err(|error| format!("Invalid CA PEM: {error}"))?;
+      builder.add_root_certificate(cert);
     }
-  });
+    let connector = builder
+      .build()
+      .map_err(|error| format!("Could not build TLS connector: {error}"))?;
 
-  let output = child
-    .wait_with_output()
-    .map_err(|error| format!("Failed while waiting for Node bridge output: {error}"))?;
+    let address = format!("{}:{}", request.host, request.port);
+    let tcp = TcpStream::connect(&address).map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
+    let stream = connector
+      .connect(&request.host, tcp)
+      .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
+    let peer_cert = stream
+      .peer_certificate()
+      .map_err(|error| format!("Could not read peer certificate: {error}"))?
+      .ok_or_else(|| "Peer certificate missing".to_string())?;
+    let peer_certificate_der = peer_cert
+      .to_der()
+      .map_err(|error| format!("Could not decode peer certificate DER: {error}"))?;
 
-  let _ = stderr_thread.join();
-  let streamed_stderr = stderr_acc
-    .lock()
-    .map(|value| value.clone())
-    .unwrap_or_default();
+    let mut guard = shared_store
+      .lock()
+      .map_err(|_| "TLS session store lock poisoned".to_string())?;
+    let next_id = guard.next_id.saturating_add(1).max(1);
+    guard.next_id = next_id;
+    guard.sessions.insert(
+      next_id,
+      Arc::new(Mutex::new(TlsSession {
+        stream,
+      })),
+    );
+    Ok(TlsOpenResponse {
+      session_id: next_id,
+      peer_certificate_der,
+    })
+  })
+  .await
+  .map_err(|error| format!("TLS open task join error: {error}"))?
+}
 
-  if !output.status.success() {
-    return Err(extract_command_error(&output, &streamed_stderr));
+#[tauri::command]
+async fn syncpeer_tls_read(
+  store: tauri::State<'_, SharedTlsStore>,
+  request: TlsReadRequest,
+) -> Result<TlsReadResponse, String> {
+  let session = get_tls_session(&store, request.session_id)?;
+  tauri::async_runtime::spawn_blocking(move || {
+    let mut guard = session
+      .lock()
+      .map_err(|_| "TLS session lock poisoned".to_string())?;
+    let max_bytes = request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024);
+    guard
+      .stream
+      .get_ref()
+      .set_read_timeout(Some(Duration::from_millis(250)))
+      .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
+    let mut buf = vec![0u8; max_bytes];
+    match guard.stream.read(&mut buf) {
+      Ok(0) => Ok(TlsReadResponse {
+        bytes: Vec::new(),
+        eof: true,
+      }),
+      Ok(read) => {
+        buf.truncate(read);
+        Ok(TlsReadResponse {
+          bytes: buf,
+          eof: false,
+        })
+      }
+      Err(error) if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => {
+        Ok(TlsReadResponse {
+          bytes: Vec::new(),
+          eof: false,
+        })
+      }
+      Err(error) => Err(format!("TLS read failed: {error}")),
+    }
+  })
+  .await
+  .map_err(|error| format!("TLS read task join error: {error}"))?
+}
+
+#[tauri::command]
+async fn syncpeer_tls_write(
+  store: tauri::State<'_, SharedTlsStore>,
+  request: TlsWriteRequest,
+) -> Result<(), String> {
+  let session = get_tls_session(&store, request.session_id)?;
+  tauri::async_runtime::spawn_blocking(move || {
+    let mut guard = session
+      .lock()
+      .map_err(|_| "TLS session lock poisoned".to_string())?;
+    guard
+      .stream
+      .write_all(&request.bytes)
+      .map_err(|error| format!("TLS write failed: {error}"))?;
+    guard
+      .stream
+      .flush()
+      .map_err(|error| format!("TLS flush failed: {error}"))?;
+    Ok(())
+  })
+  .await
+  .map_err(|error| format!("TLS write task join error: {error}"))?
+}
+
+#[tauri::command]
+async fn syncpeer_tls_close(
+  store: tauri::State<'_, SharedTlsStore>,
+  request: TlsCloseRequest,
+) -> Result<(), String> {
+  let removed = {
+    let mut guard = store
+      .lock()
+      .map_err(|_| "TLS session store lock poisoned".to_string())?;
+    guard.sessions.remove(&request.session_id)
+  };
+  if let Some(session) = removed {
+    tauri::async_runtime::spawn_blocking(move || {
+      if let Ok(mut guard) = session.lock() {
+        let _ = guard.stream.get_mut().shutdown(Shutdown::Both);
+      }
+      Ok::<(), String>(())
+    })
+    .await
+    .map_err(|error| format!("TLS close task join error: {error}"))??;
   }
-
-  tauri_log(&format!("bridge command success: {operation}"));
-
-  String::from_utf8(output.stdout)
-    .map_err(|error| format!("Bridge output is not valid UTF-8: {error}"))
-}
-
-fn decode_json_output<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<T, String> {
-  serde_json::from_str(raw).map_err(|error| format!("Failed to decode bridge JSON output: {error}"))
-}
-
-#[tauri::command]
-async fn syncpeer_connect_and_list_folders(request: ConnectRequest) -> Result<Vec<FolderInfo>, String> {
-  tauri_log(&format!(
-    "command syncpeer_connect_and_list_folders host={} port={} remote_id={}",
-    request.host,
-    request.port,
-    request.remote_id.clone().unwrap_or_else(|| "(none)".to_string())
-  ));
-  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("connect_and_list_folders", &request))
-    .await
-    .map_err(|error| format!("Bridge task join error: {error}"))??;
-  decode_json_output(&raw)
-}
-
-#[tauri::command]
-async fn syncpeer_read_remote_dir(request: ReadDirRequest) -> Result<Vec<FileEntry>, String> {
-  tauri_log(&format!(
-    "command syncpeer_read_remote_dir folder_id={} path={}",
-    request.folder_id,
-    request.path.clone().unwrap_or_default()
-  ));
-  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("read_remote_dir", &request))
-    .await
-    .map_err(|error| format!("Bridge task join error: {error}"))??;
-  decode_json_output(&raw)
-}
-
-#[tauri::command]
-async fn syncpeer_read_remote_file(request: ReadFileRequest) -> Result<Vec<u8>, String> {
-  tauri_log(&format!(
-    "command syncpeer_read_remote_file folder_id={} path={}",
-    request.folder_id,
-    request.path
-  ));
-  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("read_remote_file", &request))
-    .await
-    .map_err(|error| format!("Bridge task join error: {error}"))??;
-  decode_json_output(&raw)
-}
-
-#[tauri::command]
-async fn syncpeer_connect_and_get_overview(request: ConnectRequest) -> Result<ConnectionOverview, String> {
-  tauri_log(&format!(
-    "command syncpeer_connect_and_get_overview host={} port={} remote_id={}",
-    request.host,
-    request.port,
-    request.remote_id.clone().unwrap_or_else(|| "(none)".to_string())
-  ));
-  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("connect_and_get_overview", &request))
-    .await
-    .map_err(|error| format!("Bridge task join error: {error}"))??;
-  decode_json_output(&raw)
-}
-
-#[tauri::command]
-async fn syncpeer_get_folder_versions(request: ConnectRequest) -> Result<Vec<FolderSyncState>, String> {
-  tauri_log(&format!(
-    "command syncpeer_get_folder_versions host={} port={} remote_id={}",
-    request.host,
-    request.port,
-    request.remote_id.clone().unwrap_or_else(|| "(none)".to_string())
-  ));
-  let raw = tauri::async_runtime::spawn_blocking(move || run_bridge_command("connect_and_get_folder_versions", &request))
-    .await
-    .map_err(|error| format!("Bridge task join error: {error}"))??;
-  decode_json_output(&raw)
+  Ok(())
 }
 
 #[tauri::command]
@@ -617,6 +641,16 @@ async fn syncpeer_get_cached_statuses(
 }
 
 #[tauri::command]
+async fn syncpeer_list_cached_files(app: tauri::AppHandle) -> Result<Vec<CachedFileRecord>, String> {
+  let path = cache_index_path(&app)?;
+  let mut index = read_json_or_default::<CacheIndex>(&path)?;
+  index
+    .files
+    .sort_by(|a, b| b.cached_at_ms.cmp(&a.cached_at_ms).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+  Ok(index.files)
+}
+
+#[tauri::command]
 async fn syncpeer_open_cached_file(
   app: tauri::AppHandle,
   request: OpenCachedFileRequest,
@@ -643,22 +677,76 @@ async fn syncpeer_open_cached_file(
   open_file_with_system(&local_path)
 }
 
+#[tauri::command]
+async fn syncpeer_remove_cached_file(
+  app: tauri::AppHandle,
+  request: RemoveCachedFileRequest,
+) -> Result<bool, String> {
+  if request.folder_id.trim().is_empty() {
+    return Err("folderId is required.".to_string());
+  }
+  let normalized_path = normalize_path(&request.path);
+  if normalized_path.is_empty() {
+    return Err("path is required.".to_string());
+  }
+
+  let index_path = cache_index_path(&app)?;
+  let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
+  let key = cache_key(&request.folder_id, &normalized_path);
+  let Some(record_index) = index.files.iter().position(|entry| entry.key == key) else {
+    return Ok(false);
+  };
+
+  let record = index.files.remove(record_index);
+  write_json(&index_path, &index)?;
+
+  let local_path = PathBuf::from(record.local_path);
+  if local_path.exists() {
+    fs::remove_file(&local_path)
+      .map_err(|error| format!("Could not remove {}: {error}", local_path.display()))?;
+  }
+
+  Ok(true)
+}
+
+#[tauri::command]
+async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
+  let files_root = app_cache_files_root(&app)?;
+  if files_root.exists() {
+    fs::remove_dir_all(&files_root)
+      .map_err(|error| format!("Could not remove {}: {error}", files_root.display()))?;
+  }
+
+  let index_path = cache_index_path(&app)?;
+  if index_path.exists() {
+    fs::remove_file(&index_path)
+      .map_err(|error| format!("Could not remove {}: {error}", index_path.display()))?;
+  }
+
+  Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
     .invoke_handler(tauri::generate_handler![
-      syncpeer_connect_and_list_folders,
-      syncpeer_read_remote_dir,
-      syncpeer_connect_and_get_overview,
-      syncpeer_get_folder_versions,
-      syncpeer_read_remote_file,
+      syncpeer_read_text_file,
+      syncpeer_read_default_cli_identity,
+      syncpeer_tls_open,
+      syncpeer_tls_read,
+      syncpeer_tls_write,
+      syncpeer_tls_close,
       syncpeer_log_ui_error,
       syncpeer_list_favorites,
       syncpeer_upsert_favorite,
       syncpeer_remove_favorite,
       syncpeer_cache_file,
+      syncpeer_list_cached_files,
       syncpeer_get_cached_statuses,
-      syncpeer_open_cached_file
+      syncpeer_open_cached_file,
+      syncpeer_remove_cached_file,
+      syncpeer_clear_cache
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

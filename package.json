@@ -14,6 +14,7 @@
     "build:core": "npm run build -w @syncpeer/core",
     "build:cli": "npm run build -w @syncpeer/cli",
     "build:app": "npm run build -w @syncpeer/app",
-    "build:tauri": "npm run build -w @syncpeer/tauri-shell"
+    "build:tauri": "npm run build -w @syncpeer/tauri-shell",
+    "dev": "npm run build && npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log"
   }
 }

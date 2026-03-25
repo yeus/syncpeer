@@ -7,11 +7,15 @@
     "beforeBuildCommand": "npm install && npm run build -w @syncpeer/core && npm run build -w @syncpeer/app",
     "beforeDevCommand": "npm run build -w @syncpeer/core && npm run dev -w @syncpeer/app",
     "devUrl": "http://localhost:5173",
-    "frontendDist": "../app/dist"
+    "frontendDist": "../../app/dist"
   },
   "app": {
     "windows": [
-      { "title": "Syncpeer", "width": 800, "height": 600 }
+      {
+        "title": "Syncpeer",
+        "width": 800,
+        "height": 600
+      }
     ]
   }
 }

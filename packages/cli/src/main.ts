@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
-import { connectAndSync } from "@syncpeer/core";
+import { createNodeSyncpeerClient } from "@syncpeer/core/node";
 import { ensureCliNodeIdentity } from "./identity.js";
 
 interface CliOptions {
@@ -61,20 +61,19 @@ async function openRemoteFs(opts: CliOptions) {
     key = identity.key;
   }
 
-  const connectPromise = connectAndSync({
+  const client = createNodeSyncpeerClient();
+  const certPem = fs.readFileSync(cert, "utf8");
+  const keyPem = fs.readFileSync(key, "utf8");
+  return client.openSession({
     host: opts.host,
     port: opts.port,
-    cert,
-    key,
+    certPem,
+    keyPem,
     expectedDeviceId: opts.remoteId,
     deviceName: opts.deviceName,
-  } as any);
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error(`Connection timed out after ${opts.timeoutMs} ms`)), opts.timeoutMs);
+    timeoutMs: opts.timeoutMs,
+    discoveryMode: "direct",
   });
-
-  return Promise.race([connectPromise, timeoutPromise]);
 }
 
 async function renderTree(
@@ -112,42 +111,48 @@ async function main() {
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option("--timeout-ms <ms>", "Connection timeout in milliseconds", (value) => parseInt(value, 10), 15000);
 
-  program.command("list").description("List available folders on the remote peer").action(async () => {
+  const withSession = async (run: (remoteFs: any) => Promise<void>) => {
     const opts = program.opts<CliOptions>();
-    const remoteFs: any = await openRemoteFs(opts);
-    const folders = await remoteFs.listFolders();
-    for (const folder of folders) {
-      const mode = folder.readOnly ? "ro" : "rw";
-      console.log(`${folder.id}\t${mode}\t${folder.label}`);
+    const session = await openRemoteFs(opts);
+    try {
+      await run(session.remoteFs);
+    } finally {
+      await session.close();
     }
-  });
+  };
 
-  program.command("tree <folderId>").description("Show a tree of files in the specified folder").action(async (folderId: string) => {
-    const opts = program.opts<CliOptions>();
-    const remoteFs: any = await openRemoteFs(opts);
-    console.log(`${folderId}/`);
-    const lines = await renderTree(async (targetPath) => remoteFs.readDir(folderId, targetPath), "", "");
-    for (const line of lines) console.log(line);
-  });
+  program.command("list").description("List available folders on the remote peer").action(async () =>
+    withSession(async (remoteFs) => {
+      const folders = await remoteFs.listFolders();
+      for (const folder of folders) {
+        const mode = folder.readOnly ? "ro" : "rw";
+        console.log(`${folder.id}\t${mode}\t${folder.label}`);
+      }
+    }));
 
-  program.command("files <folderId> [dir]").description("List files from a peer folder directory").action(async (folderId: string, dir = "") => {
-    const opts = program.opts<CliOptions>();
-    const remoteFs: any = await openRemoteFs(opts);
-    const entries = await remoteFs.readDir(folderId, dir);
-    for (const entry of entries) {
-      const suffix = entry.type === "directory" ? "/" : "";
-      const type = entry.type.padEnd(9, " ");
-      console.log(`${type}\t${entry.path}${suffix}`);
-    }
-  });
+  program.command("tree <folderId>").description("Show a tree of files in the specified folder").action(async (folderId: string) =>
+    withSession(async (remoteFs) => {
+      console.log(`${folderId}/`);
+      const lines = await renderTree(async (targetPath) => remoteFs.readDir(folderId, targetPath), "", "");
+      for (const line of lines) console.log(line);
+    }));
 
-  program.command("download <folderId> <remotePath> <localPath>").description("Download a file from the remote peer").action(async (folderId: string, remotePath: string, localPath: string) => {
-    const opts = program.opts<CliOptions>();
-    const remoteFs: any = await openRemoteFs(opts);
-    const bytes = await remoteFs.readFileFully(folderId, remotePath);
-    fs.writeFileSync(localPath, Buffer.from(bytes));
-    console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
-  });
+  program.command("files <folderId> [dir]").description("List files from a peer folder directory").action(async (folderId: string, dir = "") =>
+    withSession(async (remoteFs) => {
+      const entries = await remoteFs.readDir(folderId, dir);
+      for (const entry of entries) {
+        const suffix = entry.type === "directory" ? "/" : "";
+        const type = entry.type.padEnd(9, " ");
+        console.log(`${type}\t${entry.path}${suffix}`);
+      }
+    }));
+
+  program.command("download <folderId> <remotePath> <localPath>").description("Download a file from the remote peer").action(async (folderId: string, remotePath: string, localPath: string) =>
+    withSession(async (remoteFs) => {
+      const bytes = await remoteFs.readFileFully(folderId, remotePath);
+      fs.writeFileSync(localPath, Buffer.from(bytes));
+      console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
+    }));
 
   program.command("upload-test <peerFolderPath> <remotePath> [content]").description("Write a small test file directly into a local peer folder path").action((peerFolderPath: string, remotePath: string, content?: string) => {
     const relative = normalizeRelativePath(remotePath);

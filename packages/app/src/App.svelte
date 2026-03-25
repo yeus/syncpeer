@@ -3,6 +3,7 @@
   import {
     createSyncpeerUiClient,
     reportUiError,
+    type CachedFileRecord,
     type ConnectOptions,
     type RemoteFsLike,
   } from './lib/syncpeerClient.js';
@@ -169,7 +170,13 @@
   let isRefreshing = false;
   let isLoadingDirectory = false;
   let isDownloading = false;
+  let activeDownloadKey = '';
+  let activeDownloadText = '';
   let isOpeningCachedFile = false;
+  let isRemovingCachedFile = false;
+  let isClearingCache = false;
+  let isLoadingDownloadedFiles = false;
+  let showDownloadedFiles = false;
   let isSettingsExpanded = false;
   let uploadMessage = '';
   let lastUpdatedAt = '';
@@ -192,6 +199,7 @@
   let visibleBreadcrumbs: BreadcrumbSegment[] = [];
   let favoriteKeys = new Set<string>();
   let cachedFileKeys = new Set<string>();
+  let downloadedFiles: CachedFileRecord[] = [];
 
   let error: string | null = null;
 
@@ -201,6 +209,7 @@
 
   onDestroy(() => {
     clearInterval(refreshTimer);
+    void client.disconnect?.();
   });
 
   onMount(() => {
@@ -290,6 +299,24 @@
   };
 
   const cachedFileKey = (folderId: string, path: string): string => `${folderId}:${normalizePath(path)}`;
+  const formatRate = (bytesPerSecond: number): string => {
+    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '0 B/s';
+    if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+    if (bytesPerSecond >= 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+    return `${Math.round(bytesPerSecond)} B/s`;
+  };
+  const formatEta = (seconds: number): string => {
+    if (!Number.isFinite(seconds) || seconds < 0) return '--';
+    if (seconds < 60) return `${Math.ceil(seconds)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remaining = Math.ceil(seconds % 60);
+    return `${minutes}m ${remaining}s`;
+  };
+  const downloadButtonLabel = (folderId: string, path: string): string => {
+    const keyValue = cachedFileKey(folderId, path);
+    if (keyValue !== activeDownloadKey) return 'Download';
+    return activeDownloadText || 'Downloading...';
+  };
 
   async function hydratePersistedState() {
     try {
@@ -490,7 +517,6 @@
   async function refreshOverview() {
     if (!isConnected || !remoteFs || isConnecting || isRefreshing || isLoadingDirectory) return;
     isRefreshing = true;
-    error = null;
     try {
       const overview = await client.connectAndGetOverview(connectionDetails());
       folders = overview.folders;
@@ -532,22 +558,51 @@
     return new Date(ms).toLocaleString();
   }
 
+  function formatBytes(size: number): string {
+    if (!Number.isFinite(size) || size < 0) return 'n/a';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = size;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    const digits = value >= 100 || unitIndex === 0 ? 0 : 1;
+    return `${value.toFixed(digits)} ${units[unitIndex]}`;
+  }
+
   async function downloadFile(folderId: string, path: string, name: string) {
     if (!remoteFs || !isConnected || isDownloading) return;
     isDownloading = true;
+    const startedAt = Date.now();
+    const downloadKey = cachedFileKey(folderId, path);
+    activeDownloadKey = downloadKey;
+    activeDownloadText = '0% • 0 B/s • ETA --';
     error = null;
     try {
-      const bytes = await remoteFs.readFileFully(folderId, path);
+      const bytes = await remoteFs.readFileFully(folderId, path, ({ downloadedBytes, totalBytes }) => {
+        const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
+        const speed = downloadedBytes / elapsedSeconds;
+        const percent = totalBytes > 0 ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100)) : 0;
+        const remainingBytes = Math.max(totalBytes - downloadedBytes, 0);
+        const etaSeconds = speed > 0 ? remainingBytes / speed : Number.POSITIVE_INFINITY;
+        activeDownloadText = `${percent}% • ${formatRate(speed)} • ETA ${formatEta(etaSeconds)}`;
+      });
       await client.cacheFile(folderId, path, name, bytes);
       const next = new Set(cachedFileKeys);
       next.add(cachedFileKey(folderId, path));
       cachedFileKeys = next;
+      activeDownloadText = '100% • Done';
     } catch (rawError: unknown) {
       const message = rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
       reportUiError('download_file.failed', rawError, { folderId, path });
     } finally {
       isDownloading = false;
+      if (activeDownloadKey === downloadKey) {
+        activeDownloadKey = '';
+        activeDownloadText = '';
+      }
     }
   }
 
@@ -563,6 +618,58 @@
       reportUiError('open_cached_file.failed', rawError, { folderId, path });
     } finally {
       isOpeningCachedFile = false;
+    }
+  }
+
+  async function clearAllCache() {
+    if (isClearingCache || isRemovingCachedFile) return;
+    isClearingCache = true;
+    error = null;
+    try {
+      await client.clearCache();
+      cachedFileKeys = new Set();
+      downloadedFiles = [];
+    } catch (rawError: unknown) {
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('clear_cache.failed', rawError);
+    } finally {
+      isClearingCache = false;
+    }
+  }
+
+  async function openDownloadedFilesPanel() {
+    if (isLoadingDownloadedFiles) return;
+    isLoadingDownloadedFiles = true;
+    error = null;
+    try {
+      downloadedFiles = await client.listCachedFiles();
+      showDownloadedFiles = true;
+    } catch (rawError: unknown) {
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('list_cached_files.failed', rawError);
+    } finally {
+      isLoadingDownloadedFiles = false;
+    }
+  }
+
+  async function removeCachedFile(folderId: string, path: string) {
+    if (isRemovingCachedFile || isClearingCache) return;
+    isRemovingCachedFile = true;
+    error = null;
+    try {
+      await client.removeCachedFile(folderId, path);
+      const next = new Set(cachedFileKeys);
+      next.delete(cachedFileKey(folderId, path));
+      cachedFileKeys = next;
+      downloadedFiles = downloadedFiles.filter((file) => file.key !== cachedFileKey(folderId, path));
+    } catch (rawError: unknown) {
+      const message = rawError instanceof Error ? rawError.message : String(rawError);
+      error = message;
+      reportUiError('remove_cached_file.failed', rawError, { folderId, path });
+    } finally {
+      isRemovingCachedFile = false;
     }
   }
 
@@ -650,29 +757,40 @@
   }
 
   .panel {
-    background: #ffffff;
-    border: 1px solid #dbe2ea;
-    border-radius: 12px;
-    box-shadow: 0 6px 20px rgba(15, 23, 42, 0.05);
-    padding: 0.75rem;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    padding: 0.35rem 0;
   }
 
   .panel + .panel {
-    margin-top: 0.6rem;
+    margin-top: 0.45rem;
+    padding-top: 0.55rem;
+    border-top: 1px solid #d4deea;
   }
 
   .heading {
-    margin: 0 0 0.5rem;
+    margin: 0 0 0.35rem;
     font-size: 0.94rem;
     font-weight: 700;
     letter-spacing: 0.01em;
   }
 
+  .heading-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.45rem;
+    margin-bottom: 0.35rem;
+    flex-wrap: wrap;
+  }
+
   form.settings {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 0.55rem;
-    margin-top: 0.5rem;
+    gap: 0.45rem;
+    margin-top: 0.35rem;
   }
 
   label {
@@ -685,7 +803,7 @@
 
   input,
   select {
-    padding: 0.45rem 0.5rem;
+    padding: 0.4rem 0.45rem;
     font-size: 0.88rem;
     border: 1px solid #c7d2df;
     border-radius: 8px;
@@ -694,8 +812,8 @@
 
   .actions {
     display: flex;
-    gap: 0.5rem;
-    margin-top: 0.6rem;
+    gap: 0.4rem;
+    margin-top: 0.4rem;
     flex-wrap: wrap;
   }
 
@@ -704,9 +822,11 @@
     border-radius: 8px;
     background: #ffffff;
     color: #1b3049;
-    padding: 0.4rem 0.7rem;
+    padding: 0.34rem 0.58rem;
     font-size: 0.85rem;
     cursor: pointer;
+    transition: transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+    will-change: transform;
   }
 
   button.primary {
@@ -731,20 +851,25 @@
     cursor: not-allowed;
   }
 
+  button:active:not(:disabled) {
+    transform: scale(0.97);
+    box-shadow: inset 0 0 0 999px rgba(15, 74, 147, 0.08);
+  }
+
   .global-connect {
-    margin-bottom: 0.55rem;
+    margin-bottom: 0.35rem;
     display: flex;
     justify-content: flex-end;
   }
 
   .status-row {
     display: flex;
-    gap: 0.55rem;
+    gap: 0.4rem;
     align-items: center;
     flex-wrap: wrap;
     font-size: 0.8rem;
     color: #4c627a;
-    margin-bottom: 0.55rem;
+    margin-bottom: 0.4rem;
   }
 
   .status-chip {
@@ -770,7 +895,7 @@
   details {
     border: 1px solid #dbe3ee;
     border-radius: 10px;
-    padding: 0.4rem 0.55rem;
+    padding: 0.32rem 0.45rem;
     background: #fbfdff;
   }
 
@@ -783,7 +908,7 @@
 
   .saved-device-editor {
     display: grid;
-    gap: 0.55rem;
+    gap: 0.45rem;
   }
 
   .breadcrumbs {
@@ -791,7 +916,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 0.3rem;
-    margin-bottom: 0.6rem;
+    margin-bottom: 0.4rem;
     font-size: 0.87rem;
   }
 
@@ -817,15 +942,15 @@
     padding: 0;
     margin: 0;
     border: 1px solid #dde5ef;
-    border-radius: 10px;
+    border-radius: 8px;
     overflow: hidden;
   }
 
   .list-item {
     display: grid;
     grid-template-columns: 1fr auto;
-    gap: 0.45rem;
-    padding: 0.55rem 0.65rem;
+    gap: 0.35rem;
+    padding: 0.42rem 0.5rem;
     border-bottom: 1px solid #eef2f7;
     background: #fff;
   }
@@ -864,7 +989,7 @@
   }
 
   .empty {
-    padding: 0.7rem;
+    padding: 0.5rem;
     color: #607286;
     font-size: 0.86rem;
   }
@@ -876,7 +1001,7 @@
   }
 
   .hint {
-    margin-top: 0.5rem;
+    margin-top: 0.35rem;
     font-size: 0.78rem;
     color: #7c2d12;
   }
@@ -912,7 +1037,7 @@
 
   @media (max-width: 640px) {
     .content {
-      padding: 0.55rem 0.55rem 4.7rem;
+      padding: 0.45rem 0.45rem 4.7rem;
     }
 
     form.settings {
@@ -1023,6 +1148,9 @@
             >
               Use Selected Device
             </button>
+            <button type="button" class="ghost" on:click={clearAllCache} disabled={isClearingCache}>
+              {isClearingCache ? 'Clearing Cache...' : 'Clear Cache'}
+            </button>
           </div>
 
         </details>
@@ -1098,6 +1226,11 @@
     {#if activeTab === 'favorites'}
       <section class="panel">
         <h2 class="heading">Favorites</h2>
+        <div class="actions">
+          <button class="ghost" on:click={openDownloadedFilesPanel} disabled={isLoadingDownloadedFiles}>
+            {isLoadingDownloadedFiles ? 'Loading Downloads...' : 'Show Downloaded Files'}
+          </button>
+        </div>
         {#if !isConnected}
           <p class="empty">Connect to open favorites and sync folder state.</p>
         {/if}
@@ -1120,7 +1253,7 @@
                       </button>
                     {:else}
                       <button class="ghost" on:click={() => downloadFile(favorite.folderId, favorite.path, favorite.name)} disabled={!isConnected || isDownloading}>
-                        Download
+                        {downloadButtonLabel(favorite.folderId, favorite.path)}
                       </button>
                     {/if}
                   {/if}
@@ -1130,6 +1263,38 @@
             {/each}
           {/if}
         </ul>
+
+        {#if showDownloadedFiles}
+          <div class="heading-row">
+            <h3 class="heading">Downloaded Files</h3>
+            <button class="ghost" on:click={clearAllCache} disabled={isClearingCache || isRemovingCachedFile}>
+              {isClearingCache ? 'Clearing...' : 'Clear All'}
+            </button>
+          </div>
+          <ul class="list">
+            {#if downloadedFiles.length === 0}
+              <li class="empty">No downloaded files in local cache yet.</li>
+            {:else}
+              {#each downloadedFiles as file (file.key)}
+                <li class="list-item">
+                  <div class="item-main">
+                    <div class="item-title">{file.name}</div>
+                    <div class="item-meta">{file.folderId}:{file.path}</div>
+                    <div class="item-meta">{formatBytes(file.sizeBytes)} | Cached {formatModified(file.cachedAtMs)}</div>
+                  </div>
+                  <div class="item-actions">
+                    <button class="ghost" on:click={() => openCachedFile(file.folderId, file.path)} disabled={isOpeningCachedFile}>
+                      Open
+                    </button>
+                    <button class="ghost" on:click={() => removeCachedFile(file.folderId, file.path)} disabled={isRemovingCachedFile || isClearingCache}>
+                      Drop
+                    </button>
+                  </div>
+                </li>
+              {/each}
+            {/if}
+          </ul>
+        {/if}
       </section>
     {/if}
 
@@ -1217,7 +1382,10 @@
                       {:else}
                         <span class="item-title">{entry.name}</span>
                       {/if}
-                      <div class="item-meta">{entry.type} | {entry.size} bytes | {formatModified(entry.modifiedMs)}</div>
+                      <div class="item-meta">{entry.type} | {formatBytes(entry.size)} | {formatModified(entry.modifiedMs)}</div>
+                      {#if entry.invalid}
+                        <div class="item-meta">Unavailable on remote (invalid)</div>
+                      {/if}
                     </div>
                     <div class="item-actions">
                       {#if entry.type !== 'directory'}
@@ -1226,8 +1394,8 @@
                             Open
                           </button>
                         {:else}
-                          <button class="ghost" on:click={() => downloadFile(currentFolderId, entry.path, entry.name)} disabled={isDownloading}>
-                            Download
+                          <button class="ghost" on:click={() => downloadFile(currentFolderId, entry.path, entry.name)} disabled={isDownloading || entry.invalid}>
+                            {downloadButtonLabel(currentFolderId, entry.path)}
                           </button>
                         {/if}
                       {/if}

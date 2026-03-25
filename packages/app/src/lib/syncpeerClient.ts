@@ -1,10 +1,10 @@
-import { createBrowserSyncpeerClient } from '@syncpeer/core/browser';
-import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from '@syncpeer/core/browser';
+import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "@syncpeer/core/browser";
+import type { FileDownloadProgress, FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "@syncpeer/core/browser";
 
 export interface ConnectOptions {
   host: string;
   port: number;
-  discoveryMode?: 'global' | 'direct';
+  discoveryMode?: "global" | "direct";
   discoveryServer?: string;
   cert?: string;
   key?: string;
@@ -16,7 +16,11 @@ export interface ConnectOptions {
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
   readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
-  readFileFully: (folderId: string, path: string) => Promise<Uint8Array>;
+  readFileFully: (
+    folderId: string,
+    path: string,
+    onProgress?: (progress: FileDownloadProgress) => void,
+  ) => Promise<Uint8Array>;
 }
 
 export interface ConnectionOverview {
@@ -30,7 +34,7 @@ export interface FavoriteRecord {
   folderId: string;
   path: string;
   name: string;
-  kind: 'folder' | 'file';
+  kind: "folder" | "file";
 }
 
 export interface CachedFileStatus {
@@ -40,7 +44,45 @@ export interface CachedFileStatus {
   cachedAtMs?: number;
 }
 
+export interface CachedFileRecord {
+  key: string;
+  folderId: string;
+  path: string;
+  name: string;
+  localPath: string;
+  sizeBytes: number;
+  cachedAtMs: number;
+  modifiedMs?: number;
+}
+
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+
+interface TauriV2Global {
+  core?: {
+    invoke?: unknown;
+  };
+}
+
+interface TauriInternalGlobal {
+  invoke?: unknown;
+}
+
+interface TlsOpenResponse {
+  sessionId: number;
+  peerCertificateDer: number[];
+}
+
+interface TlsReadResponse {
+  bytes: number[];
+  eof?: boolean;
+}
+
+interface CliNodeIdentityResponse {
+  certPath: string;
+  keyPath: string;
+  certPem: string;
+  keyPem: string;
+}
 
 const logUi = (event: string, details?: unknown) => {
   if (details !== undefined) {
@@ -51,11 +93,19 @@ const logUi = (event: string, details?: unknown) => {
 };
 
 const resolveInvoke = (): InvokeFn => {
-  const internals = (globalThis as { __TAURI_INTERNALS__?: { invoke?: unknown } }).__TAURI_INTERNALS__;
-  if (!internals || typeof internals.invoke !== 'function') {
-    throw new Error('Tauri runtime is unavailable. Launch this app through Tauri (npm run dev -w @syncpeer/tauri-shell).');
+  const tauri = (globalThis as { __TAURI__?: TauriV2Global }).__TAURI__;
+  const v2Invoke = tauri?.core?.invoke;
+  if (typeof v2Invoke === "function") {
+    return v2Invoke as InvokeFn;
   }
-  return internals.invoke as InvokeFn;
+
+  const internals = (globalThis as { __TAURI_INTERNALS__?: TauriInternalGlobal }).__TAURI_INTERNALS__;
+  const internalInvoke = internals?.invoke;
+  if (typeof internalInvoke === "function") {
+    return internalInvoke as InvokeFn;
+  }
+
+  throw new Error("Tauri runtime is unavailable. Launch this app through Tauri (npm run dev -w @syncpeer/tauri-shell).");
 };
 
 const tryForwardUiErrorToCli = async (
@@ -64,37 +114,30 @@ const tryForwardUiErrorToCli = async (
   details: Record<string, unknown>,
 ): Promise<void> => {
   try {
-    await invoke<void>('syncpeer_log_ui_error', { event, details });
+    await invoke<void>("syncpeer_log_ui_error", { event, details });
   } catch {
     // Ignore forwarding failures to avoid masking the original UI error.
   }
 };
 
-const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
-  host: options.host,
-  port: options.port,
-  discoveryMode: options.discoveryMode ?? 'global',
-  discoveryServer:
-    options.discoveryServer && options.discoveryServer.trim() !== '' ? options.discoveryServer.trim() : undefined,
-  cert: options.cert && options.cert.trim() !== '' ? options.cert : undefined,
-  key: options.key && options.key.trim() !== '' ? options.key : undefined,
-  remoteId: options.remoteId && options.remoteId.trim() !== '' ? options.remoteId : undefined,
-  deviceName: options.deviceName,
-  timeoutMs: options.timeoutMs,
-});
-
 const createLoggedInvoke = (invoke: InvokeFn): InvokeFn => {
+  const noisyCommands = new Set(["syncpeer_tls_read", "syncpeer_tls_write"]);
   return async <T>(command: string, args?: Record<string, unknown>) => {
     const startedAt = Date.now();
-    logUi('tauri.invoke.start', { command, args });
+    const shouldLogLifecycle = !noisyCommands.has(command);
+    if (shouldLogLifecycle) {
+      logUi("tauri.invoke.start", { command });
+    }
     try {
       const result = await invoke<T>(command, args);
-      logUi('tauri.invoke.success', { command, durationMs: Date.now() - startedAt });
+      if (shouldLogLifecycle) {
+        logUi("tauri.invoke.success", { command, durationMs: Date.now() - startedAt });
+      }
       return result;
     } catch (error) {
-      console.error(`[syncpeer-ui] tauri.invoke.error ${command}`, error);
       const message = error instanceof Error ? error.message : String(error);
-      void tryForwardUiErrorToCli(invoke, 'tauri.invoke.error', { command, args, message });
+      console.error(`[syncpeer-ui] tauri.invoke.error ${command}`, error);
+      void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command, message });
       throw error;
     }
   };
@@ -103,7 +146,7 @@ const createLoggedInvoke = (invoke: InvokeFn): InvokeFn => {
 export const reportUiError = (event: string, error: unknown, context?: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   const normalizedContext =
-    context && typeof context === 'object' ? (context as Record<string, unknown>) : {};
+    context && typeof context === "object" ? (context as Record<string, unknown>) : {};
   console.error(`[syncpeer-ui] ${event}`, { message, ...normalizedContext });
   try {
     const invoke = resolveInvoke();
@@ -113,40 +156,214 @@ export const reportUiError = (event: string, error: unknown, context?: unknown) 
   }
 };
 
-const createTauriRemoteFs = (invoke: InvokeFn, options: ConnectOptions): RemoteFsLike => ({
-  listFolders: () => invoke<FolderInfo[]>('syncpeer_connect_and_list_folders', { request: options }),
-  readDir: (folderId: string, path: string) =>
-    invoke<FileEntry[]>('syncpeer_read_remote_dir', { request: { ...options, folderId, path } }),
-  readFileFully: async (folderId: string, path: string) => {
-    const bytes = await invoke<number[]>('syncpeer_read_remote_file', { request: { ...options, folderId, path } });
-    return new Uint8Array(bytes);
-  },
+const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
+  host: options.host,
+  port: options.port,
+  discoveryMode: options.discoveryMode ?? "global",
+  discoveryServer:
+    options.discoveryServer && options.discoveryServer.trim() !== "" ? options.discoveryServer.trim() : undefined,
+  cert: options.cert && options.cert.trim() !== "" ? options.cert.trim() : undefined,
+  key: options.key && options.key.trim() !== "" ? options.key.trim() : undefined,
+  remoteId: options.remoteId && options.remoteId.trim() !== "" ? options.remoteId.trim() : undefined,
+  deviceName: options.deviceName,
+  timeoutMs: options.timeoutMs,
 });
 
-export const createSyncpeerUiClient = () => {
-  const invoke = createLoggedInvoke(resolveInvoke());
-  const browserClient = createBrowserSyncpeerClient<ConnectOptions, RemoteFsLike>({
-    connectAndSync: async (options: ConnectOptions) => {
-      const normalized = normalizeConnectOptions(options);
-      logUi('connect.prepare', normalized);
-      return createTauriRemoteFs(invoke, normalized);
-    },
+const maybeInlinePem = (value: string | undefined): string | null => {
+  if (!value) return null;
+  if (value.includes("-----BEGIN CERTIFICATE-----") || value.includes("-----BEGIN PRIVATE KEY-----") || value.includes("-----BEGIN RSA PRIVATE KEY-----")) {
+    return value;
+  }
+  return null;
+};
+
+const resolvePemValue = async (invoke: InvokeFn, label: "cert" | "key", value: string | undefined): Promise<string> => {
+  if (!value) {
+    throw new Error(`Missing ${label}. Provide PEM text or a readable file path.`);
+  }
+  const inline = maybeInlinePem(value);
+  if (inline) return inline;
+  return invoke<string>("syncpeer_read_text_file", { request: { path: value } });
+};
+
+const createTauriHostAdapter = (invoke: InvokeFn): SyncpeerHostAdapter => ({
+  connectTls: async ({ host, port, certPem, keyPem, caPem }) => {
+    const opened = await invoke<TlsOpenResponse>("syncpeer_tls_open", {
+      request: { host, port, certPem, keyPem, caPem: caPem ?? null },
+    });
+    const sessionId = Number(opened.sessionId);
+    const peerCertificateDer = new Uint8Array(opened.peerCertificateDer);
+    return {
+      peerCertificateDer: async () => peerCertificateDer,
+      read: async (maxBytes?: number) => {
+        const response = await invoke<TlsReadResponse>("syncpeer_tls_read", {
+          request: { sessionId, maxBytes: Number.isFinite(maxBytes) ? maxBytes : null },
+        });
+        if (response.eof) {
+          throw new Error("Connection closed");
+        }
+        return new Uint8Array(response.bytes);
+      },
+      write: async (bytes: Uint8Array) => {
+        await invoke<void>("syncpeer_tls_write", {
+          request: { sessionId, bytes: Array.from(bytes) },
+        });
+      },
+      close: async () => {
+        await invoke<void>("syncpeer_tls_close", {
+          request: { sessionId },
+        });
+      },
+    };
+  },
+  sha256: async (data: Uint8Array) => {
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return new Uint8Array(digest);
+  },
+  randomBytes: (length: number) => {
+    const output = new Uint8Array(length);
+    crypto.getRandomValues(output);
+    return output;
+  },
+  fetch: (input, init) => fetch(input, init),
+  log: (event, details) => logUi(event, details),
+});
+
+const serializeConnectionKey = (options: ConnectOptions, certPem: string, keyPem: string): string =>
+  JSON.stringify({
+    host: options.host,
+    port: options.port,
+    discoveryMode: options.discoveryMode ?? "global",
+    discoveryServer: options.discoveryServer ?? "",
+    remoteId: options.remoteId ?? "",
+    deviceName: options.deviceName,
+    certPem,
+    keyPem,
   });
+
+const toConnectionOverview = async (session: SyncpeerSessionHandle): Promise<ConnectionOverview> => {
+  const remoteFs = session.remoteFs;
+  const [folders, device, folderSyncStates] = await Promise.all([
+    remoteFs.listFolders(),
+    Promise.resolve(remoteFs.getRemoteDeviceInfo?.() ?? null),
+    Promise.resolve(remoteFs.listFolderSyncStates?.() ?? []),
+  ]);
   return {
-    ...browserClient,
+    folders,
+    device,
+    folderSyncStates,
+  };
+};
+
+export const createSyncpeerUiClient = () => {
+  let invoke: InvokeFn | null = null;
+  let cachedDefaultIdentity: CliNodeIdentityResponse | null = null;
+  const invokeWithLogging: InvokeFn = <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+    if (!invoke) {
+      invoke = createLoggedInvoke(resolveInvoke());
+    }
+    return invoke<T>(command, args);
+  };
+  const resolveDefaultIdentity = async (): Promise<CliNodeIdentityResponse> => {
+    if (cachedDefaultIdentity) return cachedDefaultIdentity;
+    const identity = await invokeWithLogging<CliNodeIdentityResponse>("syncpeer_read_default_cli_identity");
+    cachedDefaultIdentity = identity;
+    return identity;
+  };
+  const coreClient = createSyncpeerCoreClient(createTauriHostAdapter(invokeWithLogging));
+  let activeSession: SyncpeerSessionHandle | null = null;
+  let activeConnectionKey: string | null = null;
+
+  const closeActiveSession = async (): Promise<void> => {
+    const previous = activeSession;
+    activeSession = null;
+    activeConnectionKey = null;
+    if (previous) {
+      await previous.close();
+    }
+  };
+
+  const ensureSession = async (options: ConnectOptions): Promise<SyncpeerSessionHandle> => {
+    const normalized = normalizeConnectOptions(options);
+    let certPem: string | null = null;
+    let keyPem: string | null = null;
+
+    if (normalized.cert) {
+      certPem = await resolvePemValue(invokeWithLogging, "cert", normalized.cert);
+    }
+    if (normalized.key) {
+      keyPem = await resolvePemValue(invokeWithLogging, "key", normalized.key);
+    }
+
+    if (!certPem || !keyPem) {
+      try {
+        const identity = await resolveDefaultIdentity();
+        if (!certPem) certPem = identity.certPem;
+        if (!keyPem) keyPem = identity.keyPem;
+      } catch {
+        // Keep existing values and fail with explicit missing field errors below.
+      }
+    }
+
+    if (!certPem) {
+      throw new Error("Missing cert. Provide PEM text or a readable file path.");
+    }
+    if (!keyPem) {
+      throw new Error("Missing key. Provide PEM text or a readable file path.");
+    }
+    const key = serializeConnectionKey(normalized, certPem, keyPem);
+    if (activeSession && activeConnectionKey === key) {
+      return activeSession;
+    }
+    await closeActiveSession();
+    activeSession = await coreClient.openSession({
+      host: normalized.host,
+      port: normalized.port,
+      discoveryMode: normalized.discoveryMode,
+      discoveryServer: normalized.discoveryServer,
+      certPem,
+      keyPem,
+      expectedDeviceId: normalized.remoteId,
+      deviceName: normalized.deviceName,
+      timeoutMs: normalized.timeoutMs,
+    });
+    activeConnectionKey = key;
+    return activeSession;
+  };
+
+  const requireActiveSession = async (): Promise<SyncpeerSessionHandle> => {
+    if (!activeSession) throw new Error("No active connection. Connect first.");
+    return activeSession;
+  };
+
+  const remoteFsLike: RemoteFsLike = {
+    listFolders: async () => (await requireActiveSession()).remoteFs.listFolders(),
+    readDir: async (folderId: string, path: string) => (await requireActiveSession()).remoteFs.readDir(folderId, path),
+    readFileFully: async (folderId: string, path: string, onProgress?: (progress: FileDownloadProgress) => void) =>
+      (await requireActiveSession()).remoteFs.readFileFully(folderId, path, onProgress),
+  };
+
+  return {
+    connectAndSync: async (options: ConnectOptions): Promise<RemoteFsLike> => {
+      await ensureSession(options);
+      return remoteFsLike;
+    },
     connectAndGetOverview: async (options: ConnectOptions): Promise<ConnectionOverview> => {
-      const normalized = normalizeConnectOptions(options);
-      return invoke<ConnectionOverview>('syncpeer_connect_and_get_overview', { request: normalized });
+      const session = await ensureSession(options);
+      return toConnectionOverview(session);
     },
     connectAndGetFolderVersions: async (options: ConnectOptions): Promise<FolderSyncState[]> => {
-      const normalized = normalizeConnectOptions(options);
-      return invoke<FolderSyncState[]>('syncpeer_get_folder_versions', { request: normalized });
+      const session = await ensureSession(options);
+      return Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []);
     },
-    listFavorites: async (): Promise<FavoriteRecord[]> => invoke<FavoriteRecord[]>('syncpeer_list_favorites'),
+    disconnect: async (): Promise<void> => {
+      await closeActiveSession();
+    },
+    listFavorites: async (): Promise<FavoriteRecord[]> => invokeWithLogging<FavoriteRecord[]>("syncpeer_list_favorites"),
     upsertFavorite: async (favorite: FavoriteRecord): Promise<FavoriteRecord[]> =>
-      invoke<FavoriteRecord[]>('syncpeer_upsert_favorite', { request: { favorite } }),
+      invokeWithLogging<FavoriteRecord[]>("syncpeer_upsert_favorite", { request: { favorite } }),
     removeFavorite: async (key: string): Promise<FavoriteRecord[]> =>
-      invoke<FavoriteRecord[]>('syncpeer_remove_favorite', { request: { key } }),
+      invokeWithLogging<FavoriteRecord[]>("syncpeer_remove_favorite", { request: { key } }),
     cacheFile: async (
       folderId: string,
       path: string,
@@ -154,13 +371,17 @@ export const createSyncpeerUiClient = () => {
       bytes: Uint8Array,
       modifiedMs?: number,
     ): Promise<void> => {
-      await invoke('syncpeer_cache_file', {
+      await invokeWithLogging("syncpeer_cache_file", {
         request: { folderId, path, name, bytes: Array.from(bytes), modifiedMs: modifiedMs ?? null },
       });
     },
     getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
-      invoke<CachedFileStatus[]>('syncpeer_get_cached_statuses', { request: { folderId, paths } }),
+      invokeWithLogging<CachedFileStatus[]>("syncpeer_get_cached_statuses", { request: { folderId, paths } }),
+    listCachedFiles: async (): Promise<CachedFileRecord[]> => invokeWithLogging<CachedFileRecord[]>("syncpeer_list_cached_files"),
     openCachedFile: async (folderId: string, path: string): Promise<void> =>
-      invoke('syncpeer_open_cached_file', { request: { folderId, path } }),
+      invokeWithLogging("syncpeer_open_cached_file", { request: { folderId, path } }),
+    removeCachedFile: async (folderId: string, path: string): Promise<boolean> =>
+      invokeWithLogging<boolean>("syncpeer_remove_cached_file", { request: { folderId, path } }),
+    clearCache: async (): Promise<void> => invokeWithLogging("syncpeer_clear_cache"),
   };
 };

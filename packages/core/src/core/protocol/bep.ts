@@ -1,8 +1,24 @@
-import fs from "node:fs";
 import protobuf from "protobufjs";
 import { decompressBlock } from "lz4js";
 
-const schemaText = fs.readFileSync(new URL("./bep.proto", import.meta.url), "utf8");
+const loadSchemaText = async (): Promise<string> => {
+  try {
+    const rawModule = (await import("./bep.proto?raw")) as { default?: unknown };
+    if (typeof rawModule.default === "string" && rawModule.default.trim() !== "") {
+      return rawModule.default;
+    }
+  } catch {
+    // Non-Vite runtimes (Node CLI) will use the fallback below.
+  }
+
+  const dynamicImport = new Function("specifier", "return import(specifier)") as (
+    specifier: string,
+  ) => Promise<{ readFileSync: (path: URL, encoding: "utf8") => string }>;
+  const fs = await dynamicImport("node:fs");
+  return fs.readFileSync(new URL("./bep.proto", import.meta.url), "utf8");
+};
+
+const schemaText = await loadSchemaText();
 const root = protobuf.parse(schemaText, { keepCase: true }).root;
 
 function lookupTypeAny(...names: string[]) {

@@ -1,7 +1,13 @@
 import crypto from "node:crypto";
 import tls from "node:tls";
-import type { SyncpeerHostAdapter, SyncpeerTlsConnectOptions, SyncpeerTlsSocket } from "./client.js";
-import { createSyncpeerCoreClient } from "./client.js";
+import {
+  createSyncpeerCoreClient,
+  resolveGlobalDiscovery,
+  type SyncpeerGlobalDiscoveryOptions,
+  type SyncpeerHostAdapter,
+  type SyncpeerTlsConnectOptions,
+  type SyncpeerTlsSocket,
+} from "./client.js";
 
 class NodeTlsSocket implements SyncpeerTlsSocket {
   private queue: Uint8Array[] = [];
@@ -116,6 +122,12 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
     },
     fetch: (input, init) => fetch(input, init),
   };
+}
+
+export async function resolveNodeGlobalDiscovery(
+  options: SyncpeerGlobalDiscoveryOptions,
+): Promise<{ host: string; port: number }> {
+  return resolveGlobalDiscovery(createNodeHostAdapter(), options);
 }
 
 export const createNodeSyncpeerClient = () => createSyncpeerCoreClient(createNodeHostAdapter());

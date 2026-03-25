@@ -26,7 +26,9 @@ export interface SyncpeerTlsSocket {
 }
 
 export interface SyncpeerHostAdapter {
-  connectTls: (options: SyncpeerTlsConnectOptions) => Promise<SyncpeerTlsSocket>;
+  connectTls: (
+    options: SyncpeerTlsConnectOptions,
+  ) => Promise<SyncpeerTlsSocket>;
   sha256: (data: Uint8Array) => Promise<Uint8Array> | Uint8Array;
   randomBytes: (length: number) => Promise<Uint8Array> | Uint8Array;
   fetch: (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -45,6 +47,11 @@ export interface SyncpeerConnectOptions {
   clientVersion?: string;
   timeoutMs?: number;
   discoveryMode?: "global" | "direct";
+  discoveryServer?: string;
+}
+
+export interface SyncpeerGlobalDiscoveryOptions {
+  expectedDeviceId: string;
   discoveryServer?: string;
 }
 
@@ -123,13 +130,19 @@ function decodeBase64(raw: string): Uint8Array {
     for (let i = 0; i < decoded.length; i++) out[i] = decoded.charCodeAt(i);
     return out;
   }
-  const ctor = (globalThis as { Buffer?: { from: (value: string, encoding: string) => Uint8Array } }).Buffer;
+  const ctor = (
+    globalThis as {
+      Buffer?: { from: (value: string, encoding: string) => Uint8Array };
+    }
+  ).Buffer;
   if (ctor) return new Uint8Array(ctor.from(raw, "base64"));
   throw new Error("No base64 decoder available in this runtime");
 }
 
 function parseFirstCertificateDer(pem: string): Uint8Array {
-  const match = pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+  const match = pem.match(
+    /-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/,
+  );
   if (!match) {
     throw new Error("Could not parse CERTIFICATE PEM block from certPem");
   }
@@ -137,15 +150,22 @@ function parseFirstCertificateDer(pem: string): Uint8Array {
   return decodeBase64(body);
 }
 
-async function computeDeviceId(adapter: SyncpeerHostAdapter, certDer: Uint8Array): Promise<string> {
+async function computeDeviceId(
+  adapter: SyncpeerHostAdapter,
+  certDer: Uint8Array,
+): Promise<string> {
   const digest = await adapter.sha256(certDer);
   return base32NoPadding(digest);
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs?: number): Promise<T> {
-  if (!Number.isFinite(timeoutMs) || !timeoutMs || timeoutMs <= 0) return promise;
+  if (!Number.isFinite(timeoutMs) || !timeoutMs || timeoutMs <= 0)
+    return promise;
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Connection timed out after ${timeoutMs} ms`)), timeoutMs);
+    const timer = setTimeout(
+      () => reject(new Error(`Connection timed out after ${timeoutMs} ms`)),
+      timeoutMs,
+    );
     promise
       .then((value) => {
         clearTimeout(timer);
@@ -161,7 +181,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs?: number): Promise<T> {
 function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
   const raw = (rawUrl ?? "").trim();
   const defaultUrl = "https://discovery.syncthing.net/v2/";
-  const withScheme = raw === "" ? defaultUrl : raw.includes("://") ? raw : `https://${raw}`;
+  const withScheme =
+    raw === "" ? defaultUrl : raw.includes("://") ? raw : `https://${raw}`;
   const base = new URL(withScheme);
   if (base.pathname === "/" || base.pathname === "") {
     base.pathname = "/v2/";
@@ -172,7 +193,9 @@ function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
   return base;
 }
 
-function parseDiscoveryAddress(address: unknown): { host: string; port: number } | null {
+function parseDiscoveryAddress(
+  address: unknown,
+): { host: string; port: number } | null {
   if (typeof address !== "string" || address.trim() === "") return null;
   const value = address.trim();
   if (!value.startsWith("tcp://")) return null;
@@ -183,10 +206,12 @@ function parseDiscoveryAddress(address: unknown): { host: string; port: number }
 
 async function resolveHostPortFromGlobalDiscovery(
   adapter: SyncpeerHostAdapter,
-  options: SyncpeerConnectOptions,
+  options: SyncpeerGlobalDiscoveryOptions,
 ): Promise<{ host: string; port: number }> {
   if (!options.expectedDeviceId) {
-    throw new Error("Remote Device ID is required when discovery mode is global.");
+    throw new Error(
+      "Remote Device ID is required when discovery mode is global.",
+    );
   }
   const server = normalizeDiscoveryServerUrl(options.discoveryServer);
   server.searchParams.set("device", options.expectedDeviceId);
@@ -195,30 +220,59 @@ async function resolveHostPortFromGlobalDiscovery(
     headers: { Accept: "application/json" },
   });
   if (response.status === 404) {
-    throw new Error(`Global discovery did not find device ${options.expectedDeviceId}.`);
+    throw new Error(
+      `Global discovery did not find device ${options.expectedDeviceId}.`,
+    );
   }
   if (!response.ok) {
-    throw new Error(`Global discovery failed (${response.status}): ${await response.text()}`);
+    throw new Error(
+      `Global discovery failed (${response.status}): ${await response.text()}`,
+    );
   }
   const payload = await response.json();
-  const addresses: unknown[] = Array.isArray(payload?.addresses) ? payload.addresses : [];
-  const resolved = addresses.map(parseDiscoveryAddress).find((entry: { host: string; port: number } | null) => entry !== null) ?? null;
+  const addresses: unknown[] = Array.isArray(payload?.addresses)
+    ? payload.addresses
+    : [];
+
+  adapter.log?.("core.discovery.response", {
+    expectedDeviceId: options.expectedDeviceId,
+    addressCount: addresses.length,
+    addresses: addresses.map((value) => String(value)),
+  });
+
+  const resolved =
+    addresses
+      .map(parseDiscoveryAddress)
+      .find((entry: { host: string; port: number } | null) => entry !== null) ??
+    null;
+
   if (!resolved) {
     throw new Error(
       `Global discovery returned no supported tcp:// addresses for device ${options.expectedDeviceId}.`,
     );
   }
+
   return resolved;
+}
+
+export async function resolveGlobalDiscovery(
+  adapter: SyncpeerHostAdapter,
+  options: SyncpeerGlobalDiscoveryOptions,
+): Promise<{ host: string; port: number }> {
+  return resolveHostPortFromGlobalDiscovery(adapter, options);
 }
 
 class BepSession {
   private parser: FrameParser;
-  private pending = new Map<number, {
-    resolve: (data: Uint8Array) => void;
-    reject: (err: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-    meta: PendingRequestMeta;
-  }>();
+  private pending = new Map<
+    number,
+    {
+      resolve: (data: Uint8Array) => void;
+      reject: (err: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+      meta: PendingRequestMeta;
+    }
+  >();
   private nextId = 1;
   private folders = new Map<string, FolderState>();
   private readyPromise: Promise<void>;
@@ -243,7 +297,11 @@ class BepSession {
 
   async initialize(leftover: Uint8Array): Promise<void> {
     const random = await this.adapter.randomBytes(8);
-    const view = new DataView(random.buffer, random.byteOffset, random.byteLength);
+    const view = new DataView(
+      random.buffer,
+      random.byteOffset,
+      random.byteLength,
+    );
     const value = view.getBigUint64(0, false);
     this.localIndexId = value === 0n ? "1" : value.toString();
     if (leftover.length > 0) {
@@ -262,13 +320,14 @@ class BepSession {
         const chunk = await this.socket.read();
         if (this.closed) return;
         if (chunk.length === 0) {
-          // Tauri transport can return empty chunks on read poll timeouts.
           continue;
         }
         this.parser.feed(chunk);
       }
     } catch (error) {
-      this.onSocketClosed(error instanceof Error ? error : new Error(String(error)));
+      this.onSocketClosed(
+        error instanceof Error ? error : new Error(String(error)),
+      );
     }
   }
 
@@ -305,9 +364,14 @@ class BepSession {
     for (const folder of cfg.folders || []) {
       const folderDevices = Array.isArray(folder.devices) ? folder.devices : [];
       const remoteDevice = this.remoteDeviceId
-        ? folderDevices.find((device: any) => bytesEqual(device.id, this.remoteDeviceId!))
-        : folderDevices.find((device: any) => !bytesEqual(device.id, this.localDeviceId));
-      const remoteIndexId = remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0";
+        ? folderDevices.find((device: any) =>
+            bytesEqual(device.id, this.remoteDeviceId!),
+          )
+        : folderDevices.find(
+            (device: any) => !bytesEqual(device.id, this.localDeviceId),
+          );
+      const remoteIndexId =
+        remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0";
       const remoteMaxSequence = String(remoteDevice?.max_sequence ?? 0);
       const state: FolderState = {
         id: folder.id,
@@ -323,12 +387,17 @@ class BepSession {
     if (!this.echoedClusterConfig) {
       this.echoedClusterConfig = true;
       const folders = (cfg.folders || []).map((folder: any) => {
-        const baseDevices = Array.isArray(folder.devices) ? [...folder.devices] : [];
+        const baseDevices = Array.isArray(folder.devices)
+          ? [...folder.devices]
+          : [];
         const devices = baseDevices
           .filter((device: any) => !bytesEqual(device.id, this.localDeviceId))
           .map((device: any) => {
             const next = { ...device };
-            if (this.remoteDeviceId && bytesEqual(device.id, this.remoteDeviceId)) {
+            if (
+              this.remoteDeviceId &&
+              bytesEqual(device.id, this.remoteDeviceId)
+            ) {
               next.max_sequence = 0;
               next.index_id = 0;
             }
@@ -347,7 +416,12 @@ class BepSession {
           devices,
         };
       });
-      const frame = encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, { folders }, 0);
+      const frame = encodeMessageFrame(
+        MessageTypeValues.CLUSTER_CONFIG,
+        ClusterConfig,
+        { folders },
+        0,
+      );
       void this.socket.write(frame);
       for (const folder of folders) {
         const indexFrame = encodeMessageFrame(
@@ -393,10 +467,13 @@ class BepSession {
     if (resp.code && resp.code !== 0) {
       const code = Number(resp.code);
       const label =
-        code === 1 ? "Generic Error" :
-        code === 2 ? "No Such File" :
-        code === 3 ? "Invalid File" :
-        "Unknown Error";
+        code === 1
+          ? "Generic Error"
+          : code === 2
+            ? "No Such File"
+            : code === 3
+              ? "Invalid File"
+              : "Unknown Error";
       entry.reject(new Error(`Response error code ${code} (${label})`));
     } else {
       entry.resolve(resp.data as Uint8Array);
@@ -417,7 +494,9 @@ class BepSession {
     if (this.closed) return Promise.reject(new Error("Connection closed"));
     const id = this.nextId++;
     const blockHash = options?.hash ?? new Uint8Array(0);
-    const blockNo = Number.isFinite(options?.blockNo) ? Number(options?.blockNo) : 0;
+    const blockNo = Number.isFinite(options?.blockNo)
+      ? Number(options?.blockNo)
+      : 0;
     const fromTemporary = options?.fromTemporary ?? true;
     const meta: PendingRequestMeta = {
       id,
@@ -431,16 +510,21 @@ class BepSession {
       startedAtMs: Date.now(),
     };
     this.log("request.start", { ...meta });
-    const frame = encodeMessageFrame(MessageTypeValues.REQUEST, Request, {
-      id,
-      folder,
-      name,
-      offset,
-      size,
-      hash: blockHash,
-      block_no: blockNo,
-      from_temporary: fromTemporary,
-    }, 0);
+    const frame = encodeMessageFrame(
+      MessageTypeValues.REQUEST,
+      Request,
+      {
+        id,
+        folder,
+        name,
+        offset,
+        size,
+        hash: blockHash,
+        block_no: blockNo,
+        from_temporary: fromTemporary,
+      },
+      0,
+    );
     return new Promise<Uint8Array>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -467,7 +551,8 @@ class BepSession {
   buildRemoteFs(metadata: RemoteDeviceInfo): RemoteFs {
     return new RemoteFs(
       this.folders,
-      (folder, name, offset, size, options) => this.requestBlock(folder, name, offset, size, options),
+      (folder, name, offset, size, options) =>
+        this.requestBlock(folder, name, offset, size, options),
       (event, details) => this.log(event.replace(/^core\./, ""), details),
       metadata,
       () => {
@@ -487,12 +572,15 @@ class BepSession {
   }
 }
 
-async function readRemoteHello(socket: SyncpeerTlsSocket): Promise<{ hello: any; leftover: Uint8Array }> {
+async function readRemoteHello(
+  socket: SyncpeerTlsSocket,
+): Promise<{ hello: any; leftover: Uint8Array }> {
   let buf = new Uint8Array(0);
   const magic = 0x2ea7d90b;
   while (true) {
     const chunk = await socket.read();
-    if (chunk.length === 0) throw new Error("Connection closed before BEP hello");
+    if (chunk.length === 0)
+      throw new Error("Connection closed before BEP hello");
     const merged = new Uint8Array(buf.length + chunk.length);
     merged.set(buf, 0);
     merged.set(chunk, buf.length);
@@ -500,7 +588,8 @@ async function readRemoteHello(socket: SyncpeerTlsSocket): Promise<{ hello: any;
     if (buf.length < 6) continue;
     const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const gotMagic = view.getUint32(0, false);
-    if (gotMagic !== magic) throw new Error(`Invalid hello magic ${gotMagic.toString(16)}`);
+    if (gotMagic !== magic)
+      throw new Error(`Invalid hello magic ${gotMagic.toString(16)}`);
     const len = view.getUint16(4, false);
     if (buf.length < 6 + len) continue;
     const helloBuf = buf.slice(6, 6 + len);
@@ -510,23 +599,33 @@ async function readRemoteHello(socket: SyncpeerTlsSocket): Promise<{ hello: any;
   }
 }
 
-async function openSession(adapter: SyncpeerHostAdapter, opts: SyncpeerConnectOptions): Promise<SyncpeerSessionHandle> {
+async function openSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+): Promise<SyncpeerSessionHandle> {
   const discoveryMode = opts.discoveryMode ?? "direct";
   let targetHost = opts.host;
   let targetPort = opts.port;
 
   if (discoveryMode === "global") {
-    try {
-      const resolved = await resolveHostPortFromGlobalDiscovery(adapter, opts);
-      targetHost = resolved.host;
-      targetPort = resolved.port;
-    } catch (error) {
-      adapter.log?.("core.discovery.failed", {
-        message: error instanceof Error ? error.message : String(error),
-        fallbackHost: opts.host,
-        fallbackPort: opts.port,
-      });
-    }
+    const resolved = await resolveHostPortFromGlobalDiscovery(adapter, {
+      expectedDeviceId: opts.expectedDeviceId ?? "",
+      discoveryServer: opts.discoveryServer,
+    });
+    targetHost = resolved.host;
+    targetPort = resolved.port;
+
+    adapter.log?.("core.discovery.resolved", {
+      expectedDeviceId: opts.expectedDeviceId,
+      targetHost,
+      targetPort,
+      discoveryServer: opts.discoveryServer,
+    });
+  } else {
+    adapter.log?.("core.discovery.direct", {
+      targetHost,
+      targetPort,
+    });
   }
 
   const socket = await adapter.connectTls({
@@ -548,7 +647,9 @@ async function openSession(adapter: SyncpeerHostAdapter, opts: SyncpeerConnectOp
     const want = canonicalDeviceId(opts.expectedDeviceId);
     if (got !== want) {
       await socket.close();
-      throw new Error(`Remote device ID mismatch: expected ${opts.expectedDeviceId}, got ${got}`);
+      throw new Error(
+        `Remote device ID mismatch: expected ${opts.expectedDeviceId}, got ${got} (connected to ${targetHost}:${targetPort})`,
+      );
     }
   }
 
@@ -582,11 +683,16 @@ async function openSession(adapter: SyncpeerHostAdapter, opts: SyncpeerConnectOp
 }
 
 export interface SyncpeerCoreClient {
-  openSession: (options: SyncpeerConnectOptions) => Promise<SyncpeerSessionHandle>;
+  openSession: (
+    options: SyncpeerConnectOptions,
+  ) => Promise<SyncpeerSessionHandle>;
 }
 
-export function createSyncpeerCoreClient(adapter: SyncpeerHostAdapter): SyncpeerCoreClient {
+export function createSyncpeerCoreClient(
+  adapter: SyncpeerHostAdapter,
+): SyncpeerCoreClient {
   return {
-    openSession: (options: SyncpeerConnectOptions) => withTimeout(openSession(adapter, options), options.timeoutMs),
+    openSession: (options: SyncpeerConnectOptions) =>
+      withTimeout(openSession(adapter, options), options.timeoutMs),
   };
 }

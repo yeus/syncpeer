@@ -745,11 +745,12 @@
     display: flex;
     flex-direction: column;
     background: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
+    padding-top: env(safe-area-inset-top);
   }
 
   .content {
     flex: 1;
-    padding: 0.7rem 0.7rem 4.8rem;
+    padding: 0.9rem 0.8rem calc(5.4rem + env(safe-area-inset-bottom));
     max-width: 960px;
     margin: 0 auto;
     width: 100%;
@@ -822,8 +823,9 @@
     border-radius: 8px;
     background: #ffffff;
     color: #1b3049;
-    padding: 0.34rem 0.58rem;
-    font-size: 0.85rem;
+    padding: 0.5rem 0.8rem;
+    font-size: 0.9rem;
+    min-height: 42px;
     cursor: pointer;
     transition: transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
     will-change: transform;
@@ -1015,7 +1017,7 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
     background: #101d2e;
     border-top: 1px solid #1d324e;
-    padding: 0.35rem;
+    padding: 0.45rem 0.45rem calc(0.45rem + env(safe-area-inset-bottom));
     gap: 0.35rem;
   }
 
@@ -1026,7 +1028,8 @@
     border-radius: 8px;
     font-weight: 700;
     letter-spacing: 0.02em;
-    font-size: 0.8rem;
+    font-size: 0.9rem;
+    min-height: 44px;
   }
 
   .tab-button.active {
@@ -1037,7 +1040,7 @@
 
   @media (max-width: 640px) {
     .content {
-      padding: 0.45rem 0.45rem 4.7rem;
+      padding: 0.7rem 0.6rem calc(5.2rem + env(safe-area-inset-bottom));
     }
 
     form.settings {

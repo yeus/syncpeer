@@ -1,4 +1,6 @@
-use native_tls::{Certificate, Identity, TlsConnector, TlsStream};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -162,7 +164,7 @@ struct TlsCloseRequest {
 }
 
 struct TlsSession {
-  stream: TlsStream<TcpStream>,
+  stream: StreamOwned<ClientConnection, TcpStream>,
 }
 
 #[derive(Default)]
@@ -172,6 +174,54 @@ struct TlsSessionStore {
 }
 
 type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+  fn verify_server_cert(
+    &self,
+    _end_entity: &CertificateDer<'_>,
+    _intermediates: &[CertificateDer<'_>],
+    _server_name: &ServerName<'_>,
+    _ocsp_response: &[u8],
+    _now: UnixTime,
+  ) -> Result<ServerCertVerified, rustls::Error> {
+    Ok(ServerCertVerified::assertion())
+  }
+
+  fn verify_tls12_signature(
+    &self,
+    _message: &[u8],
+    _cert: &CertificateDer<'_>,
+    _dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, rustls::Error> {
+    Ok(HandshakeSignatureValid::assertion())
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    _message: &[u8],
+    _cert: &CertificateDer<'_>,
+    _dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, rustls::Error> {
+    Ok(HandshakeSignatureValid::assertion())
+  }
+
+  fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+    vec![
+      SignatureScheme::ECDSA_NISTP256_SHA256,
+      SignatureScheme::ECDSA_NISTP384_SHA384,
+      SignatureScheme::ED25519,
+      SignatureScheme::RSA_PSS_SHA256,
+      SignatureScheme::RSA_PSS_SHA384,
+      SignatureScheme::RSA_PSS_SHA512,
+      SignatureScheme::RSA_PKCS1_SHA256,
+      SignatureScheme::RSA_PKCS1_SHA384,
+      SignatureScheme::RSA_PKCS1_SHA512,
+    ]
+  }
+}
 
 fn tauri_log(message: &str) {
   eprintln!("[syncpeer-tauri] {message}");
@@ -355,33 +405,55 @@ async fn syncpeer_tls_open(
 ) -> Result<TlsOpenResponse, String> {
   let shared_store = store.inner().clone();
   tauri::async_runtime::spawn_blocking(move || {
-    let identity = Identity::from_pkcs8(request.cert_pem.as_bytes(), request.key_pem.as_bytes())
-      .map_err(|error| format!("Invalid client cert/key PEM: {error}"))?;
-
-    let mut builder = TlsConnector::builder();
-    builder.identity(identity);
-    builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(true);
-    if let Some(ca_pem) = request.ca_pem.as_ref() {
-      let cert = Certificate::from_pem(ca_pem.as_bytes()).map_err(|error| format!("Invalid CA PEM: {error}"))?;
-      builder.add_root_certificate(cert);
+    let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
+    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+      .collect::<Result<Vec<_>, _>>()
+      .map_err(|error| format!("Invalid client certificate PEM: {error}"))?;
+    if cert_chain.is_empty() {
+      return Err("Client certificate PEM did not contain any certificate".to_string());
     }
-    let connector = builder
-      .build()
-      .map_err(|error| format!("Could not build TLS connector: {error}"))?;
+
+    let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+      .map_err(|error| format!("Invalid client private key PEM: {error}"))?
+      .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
+
+    if let Some(ca_pem) = request.ca_pem.as_ref() {
+      let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
+      let ca_chain = rustls_pemfile::certs(&mut ca_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid CA PEM: {error}"))?;
+      if ca_chain.is_empty() {
+        return Err("CA PEM did not contain any certificate".to_string());
+      }
+    }
+
+    let config = ClientConfig::builder()
+      .dangerous()
+      .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+      .with_client_auth_cert(cert_chain, private_key)
+      .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
+    let config = Arc::new(config);
 
     let address = format!("{}:{}", request.host, request.port);
     let tcp = TcpStream::connect(&address).map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
-    let stream = connector
-      .connect(&request.host, tcp)
-      .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
-    let peer_cert = stream
-      .peer_certificate()
-      .map_err(|error| format!("Could not read peer certificate: {error}"))?
+    let server_name = ServerName::try_from(request.host.clone())
+      .map_err(|error| format!("Invalid TLS host '{}': {error}", request.host))?;
+    let connection =
+      ClientConnection::new(config, server_name).map_err(|error| format!("Could not create TLS client: {error}"))?;
+    let mut stream = StreamOwned::new(connection, tcp);
+    {
+      let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+      conn
+        .complete_io(sock)
+        .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
+    }
+    let peer_certificate_der = stream
+      .conn
+      .peer_certificates()
+      .and_then(|certs| certs.first())
+      .map(|cert| cert.as_ref().to_vec())
       .ok_or_else(|| "Peer certificate missing".to_string())?;
-    let peer_certificate_der = peer_cert
-      .to_der()
-      .map_err(|error| format!("Could not decode peer certificate DER: {error}"))?;
 
     let mut guard = shared_store
       .lock()

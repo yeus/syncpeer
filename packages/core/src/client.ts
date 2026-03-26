@@ -25,6 +25,19 @@ export interface SyncpeerTlsSocket {
   peerCertificateDer: () => Promise<Uint8Array>;
 }
 
+export interface SyncpeerRelayConnectOptions {
+  relayAddress: string;
+  expectedDeviceId: string;
+  certPem: string;
+  keyPem: string;
+  caPem?: string;
+}
+
+export interface SyncpeerRelayConnectResult {
+  socket: SyncpeerTlsSocket;
+  connectedVia: string;
+}
+
 export interface SyncpeerDiscoveryFetchInit {
   method?: string;
   headers?: Record<string, string>;
@@ -43,6 +56,9 @@ export interface SyncpeerHostAdapter {
   connectTls: (
     options: SyncpeerTlsConnectOptions,
   ) => Promise<SyncpeerTlsSocket>;
+  connectRelay?: (
+    options: SyncpeerRelayConnectOptions,
+  ) => Promise<SyncpeerRelayConnectResult>;
   sha256: (data: Uint8Array) => Promise<Uint8Array> | Uint8Array;
   randomBytes: (length: number) => Promise<Uint8Array> | Uint8Array;
   discoveryFetch: (
@@ -65,6 +81,7 @@ export interface SyncpeerConnectOptions {
   timeoutMs?: number;
   discoveryMode?: "global" | "direct";
   discoveryServer?: string;
+  enableRelayFallback?: boolean;
 }
 
 export interface SyncpeerGlobalDiscoveryOptions {
@@ -86,6 +103,8 @@ export interface SyncpeerGlobalDiscoveryResult {
 
 export interface SyncpeerSessionHandle {
   remoteFs: RemoteFs;
+  connectedVia: string;
+  transportKind: "direct-tcp" | "relay";
   close: () => Promise<void>;
 }
 
@@ -264,7 +283,13 @@ function scoreCandidate(candidate: DiscoveredCandidate): number {
   if (candidate.protocol === "relay") return 0;
   if (candidate.protocol !== "tcp") return -1;
   if (!candidate.host) return -1;
-  return isPrivateIpv4(candidate.host) ? 100 : 50;
+  // Prefer LAN/private routes first; on mobile this is often the fastest
+  // reliable path when both private and public candidates are present.
+  return isPrivateIpv4(candidate.host) ? 200 : 100;
+}
+
+function describeCandidate(candidate: DiscoveredCandidate): string {
+  return `${candidate.address} (${candidate.protocol}${candidate.host ? ` ${candidate.host}` : ""}${candidate.port ? `:${candidate.port}` : ""})`;
 }
 
 function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidate[] {
@@ -688,12 +713,25 @@ async function openBepSessionOnSocket(
   opts: SyncpeerConnectOptions,
   connectedHost: string,
   connectedPort: number,
+  connectedVia: string,
+  transportKind: "direct-tcp" | "relay",
 ): Promise<SyncpeerSessionHandle> {
+  adapter.log?.("core.bep.handshake.start", {
+    connectedHost,
+    connectedPort,
+    expectedDeviceId: opts.expectedDeviceId,
+  });
   const localCertDer = parseFirstCertificateDer(opts.certPem);
   const localDeviceId = await adapter.sha256(localCertDer);
   const peerCertDer = await socket.peerCertificateDer();
   const remoteDeviceIdBytes = await adapter.sha256(peerCertDer);
   const remoteDeviceId = await computeDeviceId(adapter, peerCertDer);
+  adapter.log?.("core.bep.handshake.peer_cert", {
+    connectedHost,
+    connectedPort,
+    remoteDeviceId,
+    peerCertificateBytes: peerCertDer.length,
+  });
 
   if (opts.expectedDeviceId) {
     const got = canonicalDeviceId(remoteDeviceId);
@@ -706,6 +744,10 @@ async function openBepSessionOnSocket(
     }
   }
 
+  adapter.log?.("core.bep.handshake.hello_send", {
+    connectedHost,
+    connectedPort,
+  });
   const helloFrame = encodeHelloFrame({
     device_name: opts.deviceName,
     client_name: opts.clientName ?? "syncpeer",
@@ -713,6 +755,14 @@ async function openBepSessionOnSocket(
   });
   await socket.write(helloFrame);
   const { hello, leftover } = await readRemoteHello(socket);
+  adapter.log?.("core.bep.handshake.hello_recv", {
+    connectedHost,
+    connectedPort,
+    remoteDeviceName: String(hello.device_name ?? "unknown"),
+    remoteClientName: String(hello.client_name ?? "unknown"),
+    remoteClientVersion: String(hello.client_version ?? "unknown"),
+    leftoverBytes: leftover.length,
+  });
   const remoteDeviceInfo: RemoteDeviceInfo = {
     id: remoteDeviceId,
     deviceName: String(hello.device_name ?? "unknown"),
@@ -728,9 +778,20 @@ async function openBepSessionOnSocket(
     remoteDeviceIdBytes,
   );
   await session.initialize(leftover);
+  adapter.log?.("core.bep.cluster_config.wait", {
+    connectedHost,
+    connectedPort,
+  });
   await session.waitForReady();
+  adapter.log?.("core.bep.handshake.ready", {
+    connectedHost,
+    connectedPort,
+    remoteDeviceId,
+  });
   return {
     remoteFs: session.buildRemoteFs(remoteDeviceInfo),
+    connectedVia,
+    transportKind,
     close: () => session.close(),
   };
 }
@@ -741,6 +802,12 @@ async function openDirectSession(
   host: string,
   port: number,
 ): Promise<SyncpeerSessionHandle> {
+  adapter.log?.("core.direct.connect.start", {
+    host,
+    port,
+    deviceName: opts.deviceName,
+    expectedDeviceId: opts.expectedDeviceId,
+  });
   const socket = await adapter.connectTls({
     host,
     port,
@@ -748,7 +815,66 @@ async function openDirectSession(
     keyPem: opts.keyPem,
     caPem: opts.caPem,
   });
-  return openBepSessionOnSocket(adapter, socket, opts, host, port);
+  adapter.log?.("core.direct.connect.tls_ready", {
+    host,
+    port,
+  });
+  const session = await openBepSessionOnSocket(
+    adapter,
+    socket,
+    opts,
+    host,
+    port,
+    `tcp://${host}:${port}`,
+    "direct-tcp",
+  );
+  adapter.log?.("core.direct.connect.ready", {
+    host,
+    port,
+  });
+  return session;
+}
+
+async function openRelaySession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  relayAddress: string,
+): Promise<SyncpeerSessionHandle> {
+  if (!adapter.connectRelay) {
+    throw new Error("Relay transport is not available in this host adapter");
+  }
+  if (!opts.expectedDeviceId) {
+    throw new Error("Remote Device ID is required for relay connection");
+  }
+  adapter.log?.("core.relay.connect.start", {
+    relayAddress,
+    expectedDeviceId: opts.expectedDeviceId,
+  });
+  const relay = await adapter.connectRelay({
+    relayAddress,
+    expectedDeviceId: opts.expectedDeviceId,
+    certPem: opts.certPem,
+    keyPem: opts.keyPem,
+    caPem: opts.caPem,
+  });
+  adapter.log?.("core.relay.connect.tunnel_ready", {
+    relayAddress,
+    connectedVia: relay.connectedVia,
+  });
+  const session = await openBepSessionOnSocket(
+    adapter,
+    relay.socket,
+    opts,
+    relay.connectedVia,
+    0,
+    relay.connectedVia,
+    "relay",
+  );
+  adapter.log?.("core.relay.connect.ready", {
+    relayAddress,
+    connectedVia: relay.connectedVia,
+  });
+  return session;
 }
 
 async function openSession(
@@ -786,30 +912,94 @@ async function openSession(
     relayCandidates,
   });
 
+  const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
+    ? opts.timeoutMs
+    : 15000;
+  const perCandidateTimeout = Math.max(
+    8000,
+    Math.min(30000, Math.floor(totalTimeout / Math.max(directCandidates.length || 1, 1))),
+  );
+  adapter.log?.("core.discovery.connect_strategy", {
+    totalTimeout,
+    perCandidateTimeout,
+    directCandidateCount: directCandidates.length,
+    relayCandidateCount: relayCandidates.length,
+    orderedCandidates: ordered.map((candidate) => describeCandidate(candidate)),
+  });
+
   const errors: string[] = [];
-  for (const candidate of directCandidates) {
-    try {
-      return await openDirectSession(
-        adapter,
-        opts,
-        candidate.host!,
-        candidate.port!,
-      );
-    } catch (error) {
-      errors.push(
-        `${candidate.address}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+  if (directCandidates.length > 0) {
+    const directResult = await new Promise<SyncpeerSessionHandle | null>((resolve) => {
+      let pending = directCandidates.length;
+      let settled = false;
+      for (const candidate of directCandidates) {
+        adapter.log?.("core.discovery.candidate.try", {
+          address: candidate.address,
+          host: candidate.host,
+          port: candidate.port,
+          perCandidateTimeout,
+        });
+        withTimeout(
+          openDirectSession(
+            adapter,
+            opts,
+            candidate.host!,
+            candidate.port!,
+          ),
+          perCandidateTimeout,
+        )
+          .then(async (session) => {
+            if (settled) {
+              await session.close().catch(() => undefined);
+              return;
+            }
+            settled = true;
+            resolve(session);
+          })
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            adapter.log?.("core.discovery.candidate.failed", {
+              address: candidate.address,
+              host: candidate.host,
+              port: candidate.port,
+              message,
+            });
+            errors.push(`${candidate.address}: ${message}`);
+          })
+          .finally(() => {
+            pending -= 1;
+            if (!settled && pending <= 0) {
+              resolve(null);
+            }
+          });
+      }
+    });
+    if (directResult) {
+      return directResult;
     }
   }
 
-  if (relayCandidates.length > 0) {
-    errors.push(
-      `Relay candidates discovered but relay transport is not implemented yet: ${relayCandidates
-        .map((candidate) => candidate.address)
-        .join(", ")}`,
-    );
+  if (opts.enableRelayFallback !== false) {
+    for (const candidate of relayCandidates) {
+      try {
+        adapter.log?.("core.discovery.relay.try", {
+          address: candidate.address,
+        });
+        return await withTimeout(
+          openRelaySession(adapter, opts, candidate.address),
+          Math.max(10000, totalTimeout),
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        adapter.log?.("core.discovery.relay.failed", {
+          address: candidate.address,
+          message,
+        });
+        errors.push(`${candidate.address}: ${message}`);
+      }
+    }
+  } else if (relayCandidates.length > 0) {
+    errors.push("Relay fallback is disabled by settings");
   }
 
   throw new Error(

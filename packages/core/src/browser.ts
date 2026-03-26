@@ -8,4 +8,4 @@ export type {
   SyncpeerTlsSocket,
 } from "./client.js";
 export { RemoteFs } from "./core/model/remoteFs.js";
-export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
+export type { AdvertisedDeviceInfo, FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";

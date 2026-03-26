@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 use url::Url;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::parse_x509_certificate;
@@ -307,30 +308,102 @@ fn cache_key(folder_id: &str, path: &str) -> String {
     format!("{}:{}", folder_id.trim(), normalize_path(path))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-fn sanitize_name(value: &str) -> String {
+fn sanitize_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.trim().chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' || ch == ' ' {
             out.push(ch);
         } else {
             out.push('_');
         }
     }
-    if out.is_empty() {
-        "download.bin".to_string()
+    if out.is_empty() || out == "." || out == ".." {
+        "_".to_string()
     } else {
         out
     }
+}
+
+fn cache_relative_path(folder_id: &str, normalized_path: &str, fallback_name: &str) -> PathBuf {
+    let mut relative = PathBuf::new();
+    relative.push(sanitize_path_segment(folder_id));
+    if normalized_path.is_empty() {
+        relative.push(sanitize_path_segment(fallback_name));
+        return relative;
+    }
+    for segment in normalized_path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        relative.push(sanitize_path_segment(segment));
+    }
+    relative
+}
+
+fn cache_folder_root_path(app: &tauri::AppHandle, folder_id: &str) -> Result<PathBuf, String> {
+    Ok(app_cache_files_root(app)?.join(sanitize_path_segment(folder_id)))
+}
+
+fn preferred_cache_file_path(app: &tauri::AppHandle, record: &CachedFileRecord) -> Result<PathBuf, String> {
+    let cache_root = app_cache_files_root(app)?;
+    let normalized_path = normalize_path(&record.path);
+    let local_rel = cache_relative_path(&record.folder_id, &normalized_path, &record.name);
+    Ok(cache_root.join(local_rel))
+}
+
+fn resolve_path_for_open_cached_file(
+    app: &tauri::AppHandle,
+    record: &CachedFileRecord,
+) -> Result<PathBuf, String> {
+    let current_path = PathBuf::from(&record.local_path);
+    if !current_path.exists() {
+        return Err("Cached file is missing on disk.".to_string());
+    }
+
+    let preferred_path = preferred_cache_file_path(app, record)?;
+    if preferred_path == current_path {
+        return Ok(current_path);
+    }
+    if preferred_path.exists() {
+        return Ok(preferred_path);
+    }
+
+    if let Some(parent) = preferred_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+    fs::copy(&current_path, &preferred_path).map_err(|error| {
+        format!(
+            "Could not copy cached file {} to {}: {error}",
+            current_path.display(),
+            preferred_path.display()
+        )
+    })?;
+    Ok(preferred_path)
+}
+
+fn resolve_cached_directory_path(
+    app: &tauri::AppHandle,
+    folder_id: &str,
+    path: &str,
+) -> Result<PathBuf, String> {
+    let normalized_path = normalize_path(path);
+    let target = if normalized_path.is_empty() {
+        cache_folder_root_path(app, folder_id)?
+    } else {
+        app_cache_files_root(app)?.join(cache_relative_path(folder_id, &normalized_path, ""))
+    };
+
+    if target.is_dir() {
+        return Ok(target);
+    }
+    if target.is_file() {
+        return target
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .ok_or_else(|| "Could not resolve parent directory.".to_string());
+    }
+    Err("Cached directory is missing on disk.".to_string())
 }
 
 fn dns_name_matches(host: &str, pattern: &str) -> bool {
@@ -511,43 +584,11 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .map_err(|error| format!("Could not rename {}: {error}", path.display()))
 }
 
-fn open_file_with_system(path: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut cmd = std::process::Command::new("open");
-        cmd.arg(path);
-        cmd
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", ""]).arg(path);
-        cmd
-    };
-
-    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
-    let mut command = {
-        let mut cmd = std::process::Command::new("xdg-open");
-        cmd.arg(path);
-        cmd
-    };
-
-    #[cfg(target_os = "android")]
-    let mut command = {
-        let mut cmd = std::process::Command::new("am");
-        let uri = format!("file://{}", path.display());
-        cmd.args(["start", "-a", "android.intent.action.VIEW", "-d", &uri]);
-        cmd
-    };
-
-    let status = command
-        .status()
-        .map_err(|error| format!("Could not launch open command: {error}"))?;
-    if !status.success() {
-        return Err(format!("Open command exited with status: {status}"));
-    }
-    Ok(())
+fn open_file_with_system(app: &tauri::AppHandle, path: &Path) -> Result<(), String> {
+    let path_string = path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(path_string, None::<&str>)
+        .map_err(|error| format!("Could not open {}: {error}", path.display()))
 }
 
 fn get_tls_session(
@@ -1612,22 +1653,18 @@ async fn syncpeer_cache_file(
     }
 
     let key = cache_key(&request.folder_id, &normalized_path);
-    let file_name_seed = format!(
-        "{}|{}|{}",
-        request.folder_id.trim(),
-        normalized_path,
-        sanitize_name(&request.name)
-    );
-    let ext = Path::new(&request.name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    let base_name = hex_encode(file_name_seed.as_bytes());
-    let local_file_name = if ext.is_empty() {
-        base_name
-    } else {
-        format!("{base_name}.{ext}")
+    let local_rel = cache_relative_path(&request.folder_id, &normalized_path, &request.name);
+    let display_name = {
+        let trimmed = request.name.trim();
+        if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            normalized_path
+                .split('/')
+                .next_back()
+                .unwrap_or("download.bin")
+                .to_string()
+        }
     };
 
     let cache_root = app_cache_files_root(&app)?;
@@ -1637,7 +1674,11 @@ async fn syncpeer_cache_file(
             cache_root.display()
         )
     })?;
-    let local_path = cache_root.join(local_file_name);
+    let local_path = cache_root.join(local_rel);
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
     fs::write(&local_path, &request.bytes).map_err(|error| {
         format!(
             "Could not write cached file {}: {error}",
@@ -1652,7 +1693,7 @@ async fn syncpeer_cache_file(
         key,
         folder_id: request.folder_id.trim().to_string(),
         path: normalized_path,
-        name: sanitize_name(&request.name),
+        name: display_name,
         local_path: local_path.to_string_lossy().to_string(),
         size_bytes: request.bytes.len(),
         cached_at_ms: now_ms(),
@@ -1738,11 +1779,48 @@ async fn syncpeer_open_cached_file(
         .iter()
         .find(|entry| entry.key == key)
         .ok_or_else(|| "No cached file for this path.".to_string())?;
-    let local_path = PathBuf::from(&record.local_path);
-    if !local_path.exists() {
-        return Err("Cached file is missing on disk.".to_string());
+    let open_path = resolve_path_for_open_cached_file(&app, record)?;
+    open_file_with_system(&app, &open_path)
+}
+
+#[tauri::command]
+async fn syncpeer_open_cached_file_directory(
+    app: tauri::AppHandle,
+    request: OpenCachedFileRequest,
+) -> Result<(), String> {
+    if request.folder_id.trim().is_empty() {
+        return Err("folderId is required.".to_string());
     }
-    open_file_with_system(&local_path)
+    let normalized_path = normalize_path(&request.path);
+    if normalized_path.is_empty() {
+        return Err("path is required.".to_string());
+    }
+    let index_path = cache_index_path(&app)?;
+    let index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let key = cache_key(&request.folder_id, &normalized_path);
+    let record = index
+        .files
+        .iter()
+        .find(|entry| entry.key == key)
+        .ok_or_else(|| "No cached file for this path.".to_string())?;
+    let open_path = resolve_path_for_open_cached_file(&app, record)?;
+    let parent = open_path
+        .parent()
+        .map(|value| value.to_path_buf())
+        .ok_or_else(|| "Could not resolve file parent directory.".to_string())?;
+    open_file_with_system(&app, &parent)
+}
+
+#[tauri::command]
+async fn syncpeer_open_cached_directory(
+    app: tauri::AppHandle,
+    request: OpenCachedFileRequest,
+) -> Result<(), String> {
+    if request.folder_id.trim().is_empty() {
+        return Err("folderId is required.".to_string());
+    }
+    let directory = resolve_cached_directory_path(&app, &request.folder_id, &request.path)?;
+    open_file_with_system(&app, &directory)
 }
 
 #[tauri::command]
@@ -1797,6 +1875,7 @@ async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .invoke_handler(tauri::generate_handler![
             syncpeer_read_text_file,
@@ -1817,6 +1896,8 @@ pub fn run() {
             syncpeer_list_cached_files,
             syncpeer_get_cached_statuses,
             syncpeer_open_cached_file,
+            syncpeer_open_cached_file_directory,
+            syncpeer_open_cached_directory,
             syncpeer_remove_cached_file,
             syncpeer_clear_cache
         ])

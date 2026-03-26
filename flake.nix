@@ -49,6 +49,7 @@
 
             pkg-config
             openssl
+            tcpdump
 
             gtk3
             webkitgtk_4_1

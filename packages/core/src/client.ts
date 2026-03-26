@@ -385,6 +385,8 @@ class BepSession {
   private folders = new Map<string, FolderState>();
   private readyPromise: Promise<void>;
   private readyResolve!: () => void;
+  private readyState: "pending" | "ready" | "closed" = "pending";
+  private closeReason: Error | null = null;
   private closed = false;
   private echoedClusterConfig = false;
   private localIndexId: string;
@@ -442,6 +444,8 @@ class BepSession {
   private onSocketClosed(error: Error): void {
     if (this.closed) return;
     this.closed = true;
+    this.readyState = "closed";
+    this.closeReason = error;
     this.log("socket.closed", { message: error.message });
     for (const { reject, timer } of this.pending.values()) {
       clearTimeout(timer);
@@ -541,7 +545,10 @@ class BepSession {
         void this.socket.write(indexFrame);
       }
     }
-    this.readyResolve();
+    if (this.readyState === "pending") {
+      this.readyState = "ready";
+      this.readyResolve();
+    }
   }
 
   private handleIndex(index: any): void {
@@ -590,6 +597,12 @@ class BepSession {
 
   async waitForReady(): Promise<void> {
     await this.readyPromise;
+    if (this.readyState !== "ready") {
+      throw (
+        this.closeReason ??
+        new Error("Connection closed before initial cluster config")
+      );
+    }
   }
 
   requestBlock(

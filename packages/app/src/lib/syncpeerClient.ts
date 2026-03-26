@@ -11,6 +11,7 @@ export interface ConnectOptions {
   remoteId?: string;
   deviceName: string;
   timeoutMs?: number;
+  enableRelayFallback?: boolean;
 }
 
 export interface RemoteFsLike {
@@ -27,6 +28,19 @@ export interface ConnectionOverview {
   folders: FolderInfo[];
   device: RemoteDeviceInfo | null;
   folderSyncStates: FolderSyncState[];
+  connectedVia: string;
+  transportKind: "direct-tcp" | "relay";
+}
+
+export interface UiLogEntry {
+  timestampMs: number;
+  level: "info" | "error";
+  event: string;
+  details?: unknown;
+}
+
+export interface CreateSyncpeerUiClientOptions {
+  onLog?: (entry: UiLogEntry) => void;
 }
 
 export interface FavoriteRecord {
@@ -72,6 +86,12 @@ interface TlsOpenResponse {
   peerCertificateDer: number[];
 }
 
+interface RelayOpenResponse {
+  sessionId: number;
+  peerCertificateDer: number[];
+  connectedVia: string;
+}
+
 interface TlsReadResponse {
   bytes: number[];
   eof?: boolean;
@@ -84,15 +104,74 @@ interface CliNodeIdentityResponse {
   keyPem: string;
 }
 
+interface IdentityRecoveryExportResponse {
+  deviceId: string;
+  recoverySecret: string;
+}
+
 interface DiscoveryFetchResponsePayload {
   status: number;
   body: string;
 }
 
+const SYNCTHING_DISCOVERY_ORIGIN = "https://discovery.syncthing.net";
+const SYNCTHING_DISCOVERY_SERVER_PIN =
+  "LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW";
 const DEFAULT_DISCOVERY_SERVER =
-  "https://discovery.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW";
+  `${SYNCTHING_DISCOVERY_ORIGIN}/v2/?id=${SYNCTHING_DISCOVERY_SERVER_PIN}`;
 
-const logUi = (event: string, details?: unknown) => {
+export const getDefaultDiscoveryServer = (): string => DEFAULT_DISCOVERY_SERVER;
+
+export const normalizeDiscoveryServer = (value: string | undefined): string => {
+  const raw = (value ?? "").trim();
+  if (raw === "") return DEFAULT_DISCOVERY_SERVER;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.includes("://") ? raw : `https://${raw}`);
+  } catch {
+    return DEFAULT_DISCOVERY_SERVER;
+  }
+
+  if (parsed.pathname === "" || parsed.pathname === "/") {
+    parsed.pathname = "/v2/";
+  }
+  if (!parsed.pathname.endsWith("/")) {
+    parsed.pathname = `${parsed.pathname}/`;
+  }
+
+  const isOfficialSyncthingDiscovery =
+    parsed.protocol === "https:" &&
+    parsed.hostname === "discovery.syncthing.net" &&
+    parsed.pathname === "/v2/";
+
+  if (isOfficialSyncthingDiscovery && !parsed.searchParams.get("id")) {
+    parsed.searchParams.set("id", SYNCTHING_DISCOVERY_SERVER_PIN);
+  }
+
+  return parsed.toString();
+};
+
+const emitLog = (
+  options: CreateSyncpeerUiClientOptions | undefined,
+  level: "info" | "error",
+  event: string,
+  details?: unknown,
+) => {
+  options?.onLog?.({
+    timestampMs: Date.now(),
+    level,
+    event,
+    details,
+  });
+};
+
+const logUi = (
+  options: CreateSyncpeerUiClientOptions | undefined,
+  event: string,
+  details?: unknown,
+) => {
+  emitLog(options, "info", event, details);
   if (details !== undefined) {
     console.log(`[syncpeer-ui] ${event}`, details);
     return;
@@ -128,23 +207,27 @@ const tryForwardUiErrorToCli = async (
   }
 };
 
-const createLoggedInvoke = (invoke: InvokeFn): InvokeFn => {
+const createLoggedInvoke = (
+  invoke: InvokeFn,
+  options: CreateSyncpeerUiClientOptions | undefined,
+): InvokeFn => {
   const noisyCommands = new Set(["syncpeer_tls_read", "syncpeer_tls_write"]);
   return async <T>(command: string, args?: Record<string, unknown>) => {
     const startedAt = Date.now();
     const shouldLogLifecycle = !noisyCommands.has(command);
     if (shouldLogLifecycle) {
-      logUi("tauri.invoke.start", { command });
+      logUi(options, "tauri.invoke.start", { command });
     }
     try {
       const result = await invoke<T>(command, args);
       if (shouldLogLifecycle) {
-        logUi("tauri.invoke.success", { command, durationMs: Date.now() - startedAt });
+        logUi(options, "tauri.invoke.success", { command, durationMs: Date.now() - startedAt });
       }
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[syncpeer-ui] tauri.invoke.error ${command}`, error);
+      emitLog(options, "error", "tauri.invoke.error", { command, message });
       void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command, message });
       throw error;
     }
@@ -168,13 +251,13 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   host: options.host,
   port: options.port,
   discoveryMode: options.discoveryMode ?? "global",
-  discoveryServer:
-    options.discoveryServer && options.discoveryServer.trim() !== "" ? options.discoveryServer.trim() : DEFAULT_DISCOVERY_SERVER,
+  discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
   cert: options.cert && options.cert.trim() !== "" ? options.cert.trim() : undefined,
   key: options.key && options.key.trim() !== "" ? options.key.trim() : undefined,
   remoteId: options.remoteId && options.remoteId.trim() !== "" ? options.remoteId.trim() : undefined,
   deviceName: options.deviceName,
   timeoutMs: options.timeoutMs,
+  enableRelayFallback: options.enableRelayFallback ?? true,
 });
 
 const maybeInlinePem = (value: string | undefined): string | null => {
@@ -207,7 +290,10 @@ const createDiscoveryResponseFromPayload = (
   },
 });
 
-const createTauriHostAdapter = (invoke: InvokeFn): SyncpeerHostAdapter => ({
+const createTauriHostAdapter = (
+  invoke: InvokeFn,
+  options: CreateSyncpeerUiClientOptions | undefined,
+): SyncpeerHostAdapter => ({
   connectTls: async ({ host, port, certPem, keyPem, caPem }) => {
     const opened = await invoke<TlsOpenResponse>("syncpeer_tls_open", {
       request: { host, port, certPem, keyPem, caPem: caPem ?? null },
@@ -237,6 +323,44 @@ const createTauriHostAdapter = (invoke: InvokeFn): SyncpeerHostAdapter => ({
       },
     };
   },
+  connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem }) => {
+    const opened = await invoke<RelayOpenResponse>("syncpeer_relay_open", {
+      request: {
+        relayAddress,
+        expectedDeviceId,
+        certPem,
+        keyPem,
+        caPem: caPem ?? null,
+      },
+    });
+    const sessionId = Number(opened.sessionId);
+    const peerCertificateDer = new Uint8Array(opened.peerCertificateDer);
+    return {
+      connectedVia: opened.connectedVia || relayAddress,
+      socket: {
+        peerCertificateDer: async () => peerCertificateDer,
+        read: async (maxBytes?: number) => {
+          const response = await invoke<TlsReadResponse>("syncpeer_tls_read", {
+            request: { sessionId, maxBytes: Number.isFinite(maxBytes) ? maxBytes : null },
+          });
+          if (response.eof) {
+            throw new Error("Connection closed");
+          }
+          return new Uint8Array(response.bytes);
+        },
+        write: async (bytes: Uint8Array) => {
+          await invoke<void>("syncpeer_tls_write", {
+            request: { sessionId, bytes: Array.from(bytes) },
+          });
+        },
+        close: async () => {
+          await invoke<void>("syncpeer_tls_close", {
+            request: { sessionId },
+          });
+        },
+      },
+    };
+  },
   sha256: async (data: Uint8Array) => {
     const digest = await crypto.subtle.digest("SHA-256", data);
     return new Uint8Array(digest);
@@ -258,7 +382,7 @@ const createTauriHostAdapter = (invoke: InvokeFn): SyncpeerHostAdapter => ({
     });
     return createDiscoveryResponseFromPayload(payload);
   },
-  log: (event, details) => logUi(event, details),
+  log: (event, details) => logUi(options, event, details),
 });
 
 const serializeConnectionKey = (options: ConnectOptions, certPem: string, keyPem: string): string =>
@@ -266,7 +390,7 @@ const serializeConnectionKey = (options: ConnectOptions, certPem: string, keyPem
     host: options.host,
     port: options.port,
     discoveryMode: options.discoveryMode ?? "global",
-    discoveryServer: options.discoveryServer ?? "",
+    discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
     remoteId: options.remoteId ?? "",
     deviceName: options.deviceName,
     certPem,
@@ -284,15 +408,17 @@ const toConnectionOverview = async (session: SyncpeerSessionHandle): Promise<Con
     folders,
     device,
     folderSyncStates,
+    connectedVia: session.connectedVia,
+    transportKind: session.transportKind,
   };
 };
 
-export const createSyncpeerUiClient = () => {
+export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) => {
   let invoke: InvokeFn | null = null;
   let cachedDefaultIdentity: CliNodeIdentityResponse | null = null;
   const invokeWithLogging: InvokeFn = <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
     if (!invoke) {
-      invoke = createLoggedInvoke(resolveInvoke());
+      invoke = createLoggedInvoke(resolveInvoke(), options);
     }
     return invoke<T>(command, args);
   };
@@ -302,7 +428,7 @@ export const createSyncpeerUiClient = () => {
     cachedDefaultIdentity = identity;
     return identity;
   };
-  const coreClient = createSyncpeerCoreClient(createTauriHostAdapter(invokeWithLogging));
+  const coreClient = createSyncpeerCoreClient(createTauriHostAdapter(invokeWithLogging, options));
   let activeSession: SyncpeerSessionHandle | null = null;
   let activeConnectionKey: string | null = null;
 
@@ -365,6 +491,7 @@ export const createSyncpeerUiClient = () => {
       expectedDeviceId: normalized.remoteId,
       deviceName: normalized.deviceName,
       timeoutMs: normalized.timeoutMs,
+      enableRelayFallback: normalized.enableRelayFallback,
     });
     activeConnectionKey = key;
     return activeSession;
@@ -422,5 +549,13 @@ export const createSyncpeerUiClient = () => {
     removeCachedFile: async (folderId: string, path: string): Promise<boolean> =>
       invokeWithLogging<boolean>("syncpeer_remove_cached_file", { request: { folderId, path } }),
     clearCache: async (): Promise<void> => invokeWithLogging("syncpeer_clear_cache"),
+    exportIdentityRecovery: async (): Promise<IdentityRecoveryExportResponse> =>
+      invokeWithLogging<IdentityRecoveryExportResponse>("syncpeer_export_identity_recovery"),
+    restoreIdentityRecovery: async (recoverySecret: string): Promise<void> => {
+      await invokeWithLogging<CliNodeIdentityResponse>("syncpeer_restore_identity_recovery", {
+        request: { recoverySecret },
+      });
+      cachedDefaultIdentity = null;
+    },
   };
 };

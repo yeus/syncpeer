@@ -7,12 +7,15 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::net::IpAddr;
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 use url::Url;
+use x509_parser::extensions::ParsedExtension;
+use x509_parser::prelude::parse_x509_certificate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,9 +127,20 @@ struct TlsOpenRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RelayOpenRequest {
+    relay_address: String,
+    expected_device_id: String,
+    cert_pem: String,
+    key_pem: String,
+    ca_pem: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TlsOpenResponse {
     session_id: u64,
     peer_certificate_der: Vec<u8>,
+    connected_via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +148,28 @@ struct TlsOpenResponse {
 struct CliNodeIdentityResponse {
     cert_path: String,
     key_path: String,
+    cert_pem: String,
+    key_pem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityRecoveryExportResponse {
+    device_id: String,
+    recovery_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityRecoveryRestoreRequest {
+    recovery_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityRecoveryPayload {
+    version: u8,
+    device_id: String,
     cert_pem: String,
     key_pem: String,
 }
@@ -194,6 +230,12 @@ struct TlsSessionStore {
 
 type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
 
+const RELAY_MAGIC: u32 = 0x9E79_BC40;
+const RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST: u32 = 3;
+const RELAY_MESSAGE_TYPE_RESPONSE: u32 = 4;
+const RELAY_MESSAGE_TYPE_CONNECT_REQUEST: u32 = 5;
+const RELAY_MESSAGE_TYPE_SESSION_INVITATION: u32 = 6;
+
 #[derive(Debug)]
 struct NoCertificateVerification;
 
@@ -246,6 +288,10 @@ fn tauri_log(message: &str) {
     eprintln!("[syncpeer-tauri] {message}");
 }
 
+fn mask_pem_summary(label: &str, pem: &str) -> String {
+    format!("{}Chars={}", label, pem.chars().count())
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -285,6 +331,136 @@ fn sanitize_name(value: &str) -> String {
     } else {
         out
     }
+}
+
+fn dns_name_matches(host: &str, pattern: &str) -> bool {
+    let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let normalized_pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host.is_empty() || normalized_pattern.is_empty() {
+        return false;
+    }
+    if let Some(suffix) = normalized_pattern.strip_prefix("*.") {
+        if suffix.is_empty() || suffix.contains('*') {
+            return false;
+        }
+        let expected_suffix = format!(".{suffix}");
+        if !normalized_host.ends_with(&expected_suffix) {
+            return false;
+        }
+        let prefix_len = normalized_host.len().saturating_sub(expected_suffix.len());
+        let prefix = &normalized_host[..prefix_len];
+        return !prefix.is_empty() && !prefix.contains('.');
+    }
+    normalized_host == normalized_pattern
+}
+
+fn strip_ipv6_brackets(host: &str) -> &str {
+    if host.starts_with('[') && host.ends_with(']') && host.len() > 2 {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    }
+}
+
+fn resolve_tls_hostname(host: &str) -> String {
+    let normalized = strip_ipv6_brackets(host.trim());
+    if normalized.parse::<IpAddr>().is_ok() {
+        // Syncthing peers commonly present certs for "syncthing" rather than raw IP SANs.
+        // Keep strict hostname verification by validating against this stable cert name.
+        "syncthing".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn ip_san_matches(host_ip: &IpAddr, ip_san: &[u8]) -> bool {
+    match host_ip {
+        IpAddr::V4(ipv4) => ip_san == ipv4.octets().as_slice(),
+        IpAddr::V6(ipv6) => ip_san == ipv6.octets().as_slice(),
+    }
+}
+
+fn verify_hostname_against_cert(cert_der: &[u8], host: &str) -> Result<(), String> {
+    let normalized_host = strip_ipv6_brackets(host.trim()).trim_end_matches('.');
+    if normalized_host.is_empty() {
+        return Err("x509: missing TLS hostname".to_string());
+    }
+
+    let (_, cert) = parse_x509_certificate(cert_der)
+        .map_err(|error| format!("x509: could not parse peer certificate: {error}"))?;
+    let host_ip = normalized_host.parse::<IpAddr>().ok();
+
+    let mut has_san = false;
+    let mut dns_sans: Vec<String> = Vec::new();
+    let mut ip_sans: Vec<Vec<u8>> = Vec::new();
+
+    for extension in cert.extensions() {
+        if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+            has_san = true;
+            for entry in &san.general_names {
+                match entry {
+                    x509_parser::extensions::GeneralName::DNSName(name) => {
+                        let text = name.trim();
+                        if !text.is_empty() {
+                            dns_sans.push(text.to_string());
+                        }
+                    }
+                    x509_parser::extensions::GeneralName::IPAddress(bytes) => {
+                        ip_sans.push(bytes.to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(ip) = host_ip {
+        if ip_sans.iter().any(|candidate| ip_san_matches(&ip, candidate)) {
+            return Ok(());
+        }
+        return Err(format!(
+            "x509: certificate is not valid for IP {}",
+            normalized_host
+        ));
+    }
+
+    if dns_sans.iter().any(|candidate| dns_name_matches(normalized_host, candidate)) {
+        return Ok(());
+    }
+    if has_san {
+        let names = if dns_sans.is_empty() {
+            "<no dns SAN entries>".to_string()
+        } else {
+            dns_sans.join(", ")
+        };
+        return Err(format!(
+            "x509: certificate is valid for {}, not {}",
+            names, normalized_host
+        ));
+    }
+
+    let common_names: Vec<String> = cert
+        .subject()
+        .iter_common_name()
+        .filter_map(|attribute| attribute.as_str().ok().map(|value| value.to_string()))
+        .collect();
+    if common_names
+        .iter()
+        .any(|candidate| dns_name_matches(normalized_host, candidate))
+    {
+        return Ok(());
+    }
+    if common_names.is_empty() {
+        return Err(format!(
+            "x509: certificate has no subjectAltName or commonName for {}",
+            normalized_host
+        ));
+    }
+    Err(format!(
+        "x509: certificate is valid for {}, not {}",
+        common_names.join(", "),
+        normalized_host
+    ))
 }
 
 fn app_data_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -418,6 +594,7 @@ fn create_identity_in_dir(cli_node_dir: &Path) -> Result<CliNodeIdentityResponse
     let cert = rcgen::generate_simple_self_signed(vec![
         "syncpeer.local".to_string(),
         "localhost".to_string(),
+        "syncthing".to_string(),
     ])
     .map_err(|error| format!("Could not generate self-signed certificate: {error}"))?;
     let cert_pem = cert
@@ -436,6 +613,19 @@ fn create_identity_in_dir(cli_node_dir: &Path) -> Result<CliNodeIdentityResponse
         cert_pem,
         key_pem,
     })
+}
+
+fn resolve_default_identity_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(path) = app.path().app_data_dir() {
+        return Ok(path.join("syncpeer").join("cli-node"));
+    }
+    if let Ok(path) = app.path().app_config_dir() {
+        return Ok(path.join("syncpeer").join("cli-node"));
+    }
+    if let Ok(path) = app.path().config_dir() {
+        return Ok(path.join("syncpeer").join("cli-node"));
+    }
+    Err("Could not resolve a writable identity directory".to_string())
 }
 
 fn normalize_device_id(value: &str) -> String {
@@ -470,6 +660,136 @@ fn base32_no_padding(bytes: &[u8]) -> String {
 fn compute_device_id_from_der(cert_der: &[u8]) -> String {
     let digest = Sha256::digest(cert_der);
     base32_no_padding(digest.as_slice())
+}
+
+fn parse_first_certificate_der(cert_pem: &str) -> Result<Vec<u8>, String> {
+    let mut cert_reader = std::io::BufReader::new(cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid certificate PEM: {error}"))?;
+    let first = certs
+        .first()
+        .ok_or_else(|| "Certificate PEM did not contain any certificates".to_string())?;
+    Ok(first.as_ref().to_vec())
+}
+
+fn decode_device_id_bytes(value: &str) -> Result<Vec<u8>, String> {
+    let normalized = canonical_device_id(value);
+    data_encoding::BASE32_NOPAD
+        .decode(normalized.as_bytes())
+        .map_err(|error| format!("Invalid device ID '{value}': {error}"))
+}
+
+fn xdr_pad_len(length: usize) -> usize {
+    (4 - (length % 4)) % 4
+}
+
+fn xdr_write_opaque(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bytes.len() + xdr_pad_len(bytes.len()));
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+    let pad = xdr_pad_len(bytes.len());
+    if pad > 0 {
+        out.extend_from_slice(&vec![0u8; pad]);
+    }
+    out
+}
+
+fn xdr_read_u32(payload: &[u8], offset: &mut usize) -> Result<u32, String> {
+    if *offset + 4 > payload.len() {
+        return Err("Relay message payload ended unexpectedly".to_string());
+    }
+    let value = u32::from_be_bytes([
+        payload[*offset],
+        payload[*offset + 1],
+        payload[*offset + 2],
+        payload[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn xdr_read_opaque(payload: &[u8], offset: &mut usize) -> Result<Vec<u8>, String> {
+    let length = xdr_read_u32(payload, offset)? as usize;
+    if *offset + length > payload.len() {
+        return Err("Relay opaque field exceeded payload size".to_string());
+    }
+    let value = payload[*offset..*offset + length].to_vec();
+    *offset += length;
+    let pad = xdr_pad_len(length);
+    if *offset + pad > payload.len() {
+        return Err("Relay opaque field padding exceeded payload size".to_string());
+    }
+    *offset += pad;
+    Ok(value)
+}
+
+fn relay_write_message<W: Write>(
+    writer: &mut W,
+    message_type: u32,
+    payload: &[u8],
+) -> Result<(), String> {
+    let mut header = [0u8; 12];
+    header[0..4].copy_from_slice(&RELAY_MAGIC.to_be_bytes());
+    header[4..8].copy_from_slice(&message_type.to_be_bytes());
+    header[8..12].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    writer
+        .write_all(&header)
+        .map_err(|error| format!("Relay write header failed: {error}"))?;
+    writer
+        .write_all(payload)
+        .map_err(|error| format!("Relay write payload failed: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("Relay flush failed: {error}"))?;
+    Ok(())
+}
+
+fn relay_read_message<R: Read>(reader: &mut R) -> Result<(u32, Vec<u8>), String> {
+    let mut header = [0u8; 12];
+    reader
+        .read_exact(&mut header)
+        .map_err(|error| format!("Relay read header failed: {error}"))?;
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != RELAY_MAGIC {
+        return Err(format!("Unexpected relay magic 0x{magic:08X}"));
+    }
+    let message_type = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let mut payload = vec![0u8; length];
+    if length > 0 {
+        reader
+            .read_exact(&mut payload)
+            .map_err(|error| format!("Relay read payload failed: {error}"))?;
+    }
+    Ok((message_type, payload))
+}
+
+fn relay_parse_response(payload: &[u8]) -> Result<(u32, String), String> {
+    let mut offset = 0usize;
+    let code = xdr_read_u32(payload, &mut offset)?;
+    let message_raw = xdr_read_opaque(payload, &mut offset)?;
+    let message = String::from_utf8_lossy(&message_raw).to_string();
+    Ok((code, message))
+}
+
+fn parse_ip_from_relay_address(address: &[u8]) -> Option<String> {
+    if address.is_empty() || address.iter().all(|value| *value == 0) {
+        return None;
+    }
+    if address.len() == 4 {
+        return Some(format!(
+            "{}.{}.{}.{}",
+            address[0], address[1], address[2], address[3]
+        ));
+    }
+    if address.len() == 16 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(address);
+        return Some(std::net::Ipv6Addr::from(octets).to_string());
+    }
+    let text = String::from_utf8_lossy(address).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn build_discovery_http_request(url: &Url, method: &str, headers: &HashMap<String, String>) -> String {
@@ -728,6 +1048,75 @@ async fn syncpeer_read_default_cli_identity(
 }
 
 #[tauri::command]
+async fn syncpeer_export_identity_recovery(
+    app: tauri::AppHandle,
+) -> Result<IdentityRecoveryExportResponse, String> {
+    let identity = syncpeer_read_default_cli_identity(app).await?;
+    let cert_der = parse_first_certificate_der(&identity.cert_pem)?;
+    let device_id = canonical_device_id(&compute_device_id_from_der(&cert_der));
+    let payload = IdentityRecoveryPayload {
+        version: 1,
+        device_id: device_id.clone(),
+        cert_pem: identity.cert_pem,
+        key_pem: identity.key_pem,
+    };
+    let json = serde_json::to_vec(&payload)
+        .map_err(|error| format!("Could not encode recovery payload: {error}"))?;
+    Ok(IdentityRecoveryExportResponse {
+        device_id,
+        recovery_secret: data_encoding::BASE64.encode(&json),
+    })
+}
+
+#[tauri::command]
+async fn syncpeer_restore_identity_recovery(
+    app: tauri::AppHandle,
+    request: IdentityRecoveryRestoreRequest,
+) -> Result<CliNodeIdentityResponse, String> {
+    let raw = request.recovery_secret.trim();
+    if raw.is_empty() {
+        return Err("Recovery secret is empty.".to_string());
+    }
+    let bytes = data_encoding::BASE64
+        .decode(raw.as_bytes())
+        .map_err(|error| format!("Recovery secret is not valid base64: {error}"))?;
+    let payload: IdentityRecoveryPayload = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Recovery secret payload is invalid JSON: {error}"))?;
+    if payload.version != 1 {
+        return Err(format!(
+            "Unsupported recovery payload version: {}",
+            payload.version
+        ));
+    }
+    let cert_der = parse_first_certificate_der(&payload.cert_pem)?;
+    let computed_device_id = canonical_device_id(&compute_device_id_from_der(&cert_der));
+    let expected_device_id = canonical_device_id(&payload.device_id);
+    if computed_device_id != expected_device_id {
+        return Err(format!(
+            "Recovery payload device ID mismatch: payload={}, cert={}",
+            expected_device_id, computed_device_id
+        ));
+    }
+
+    let identity_dir = resolve_default_identity_dir(&app)?;
+    fs::create_dir_all(&identity_dir)
+        .map_err(|error| format!("Could not create {}: {error}", identity_dir.display()))?;
+    let cert_path = identity_dir.join("cert.pem");
+    let key_path = identity_dir.join("key.pem");
+    fs::write(&cert_path, &payload.cert_pem)
+        .map_err(|error| format!("Could not write {}: {error}", cert_path.display()))?;
+    fs::write(&key_path, &payload.key_pem)
+        .map_err(|error| format!("Could not write {}: {error}", key_path.display()))?;
+
+    Ok(CliNodeIdentityResponse {
+        cert_path: cert_path.display().to_string(),
+        key_path: key_path.display().to_string(),
+        cert_pem: payload.cert_pem,
+        key_pem: payload.key_pem,
+    })
+}
+
+#[tauri::command]
 async fn syncpeer_discovery_fetch(
     request: DiscoveryFetchRequest,
 ) -> Result<DiscoveryFetchResponse, String> {
@@ -748,6 +1137,16 @@ async fn syncpeer_tls_open(
 ) -> Result<TlsOpenResponse, String> {
     let shared_store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let address = format!("{}:{}", request.host, request.port);
+        let tls_host = resolve_tls_hostname(&request.host);
+        tauri_log(&format!(
+            "tls.open.start address={} tlsHost={} {} {}",
+            address,
+            tls_host,
+            mask_pem_summary("cert", &request.cert_pem),
+            mask_pem_summary("key", &request.key_pem)
+        ));
+
         let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
         let cert_chain = rustls_pemfile::certs(&mut cert_reader)
             .collect::<Result<Vec<_>, _>>()
@@ -755,11 +1154,17 @@ async fn syncpeer_tls_open(
         if cert_chain.is_empty() {
             return Err("Client certificate PEM did not contain any certificate".to_string());
         }
+        tauri_log(&format!(
+            "tls.open.cert_parsed address={} certChainLen={}",
+            address,
+            cert_chain.len()
+        ));
 
         let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
         let private_key = rustls_pemfile::private_key(&mut key_reader)
             .map_err(|error| format!("Invalid client private key PEM: {error}"))?
             .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
+        tauri_log(&format!("tls.open.key_parsed address={}", address));
 
         let config = ClientConfig::builder()
             .dangerous()
@@ -768,25 +1173,41 @@ async fn syncpeer_tls_open(
             .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
         let config = Arc::new(config);
 
-        let address = format!("{}:{}", request.host, request.port);
+        tauri_log(&format!("tls.open.tcp_connect.start address={}", address));
         let tcp = TcpStream::connect(&address)
             .map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
-        let server_name = ServerName::try_from(request.host.clone())
-            .map_err(|error| format!("Invalid TLS host '{}': {error}", request.host))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("Could not set TLS write timeout: {error}"))?;
+        tauri_log(&format!("tls.open.tcp_connect.done address={}", address));
+
+        let server_name = ServerName::try_from(tls_host.clone())
+            .map_err(|error| format!("Invalid TLS host '{}': {error}", tls_host))?;
         let connection = ClientConnection::new(config, server_name)
             .map_err(|error| format!("Could not create TLS client: {error}"))?;
         let mut stream = StreamOwned::new(connection, tcp);
+        tauri_log(&format!("tls.open.handshake.start address={}", address));
         {
             let (conn, sock) = (&mut stream.conn, &mut stream.sock);
             conn.complete_io(sock)
                 .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
         }
+        tauri_log(&format!("tls.open.handshake.done address={}", address));
         let peer_certificate_der = stream
             .conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|cert| cert.as_ref().to_vec())
             .ok_or_else(|| "Peer certificate missing".to_string())?;
+        verify_hostname_against_cert(&peer_certificate_der, &tls_host)?;
+        let peer_device_id = canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
+        tauri_log(&format!(
+            "tls.open.peer_cert address={} peerCertBytes={} peerDeviceId={}",
+            address,
+            peer_certificate_der.len(),
+            peer_device_id
+        ));
 
         let mut guard = shared_store
             .lock()
@@ -796,13 +1217,236 @@ async fn syncpeer_tls_open(
         guard
             .sessions
             .insert(next_id, Arc::new(Mutex::new(TlsSession { stream })));
+        tauri_log(&format!("tls.open.ready address={} sessionId={}", address, next_id));
         Ok(TlsOpenResponse {
             session_id: next_id,
             peer_certificate_der,
+            connected_via: None,
         })
     })
     .await
     .map_err(|error| format!("TLS open task join error: {error}"))?
+}
+
+#[tauri::command]
+async fn syncpeer_relay_open(
+    store: tauri::State<'_, SharedTlsStore>,
+    request: RelayOpenRequest,
+) -> Result<TlsOpenResponse, String> {
+    let shared_store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let relay_url = Url::parse(&request.relay_address)
+            .map_err(|error| format!("Invalid relay address '{}': {error}", request.relay_address))?;
+        if relay_url.scheme() != "relay" {
+            return Err(format!(
+                "Relay address must use relay:// scheme, got {}",
+                relay_url.scheme()
+            ));
+        }
+        let relay_host = relay_url
+            .host_str()
+            .ok_or_else(|| "Relay address is missing host".to_string())?
+            .to_string();
+        let relay_port = relay_url.port().unwrap_or(22067);
+        let relay_server_id = relay_url
+            .query_pairs()
+            .find(|(key, _)| key == "id")
+            .map(|(_, value)| value.to_string());
+
+        tauri_log(&format!(
+            "relay.open.start relay={} expectedDeviceId={}",
+            request.relay_address, request.expected_device_id
+        ));
+
+        let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
+        let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Invalid client certificate PEM: {error}"))?;
+        if cert_chain.is_empty() {
+            return Err("Client certificate PEM did not contain any certificate".to_string());
+        }
+        let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
+        let private_key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|error| format!("Invalid client private key PEM: {error}"))?
+            .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
+
+        let mut relay_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_client_auth_cert(cert_chain.clone(), private_key.clone_key())
+            .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
+        relay_config.alpn_protocols = vec![b"bep-relay".to_vec()];
+        let relay_config = Arc::new(relay_config);
+
+        let relay_address = format!("{relay_host}:{relay_port}");
+        let relay_tcp = TcpStream::connect(&relay_address)
+            .map_err(|error| format!("Relay TCP connect to {relay_address} failed: {error}"))?;
+        relay_tcp
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("Could not set relay read timeout: {error}"))?;
+        relay_tcp
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("Could not set relay write timeout: {error}"))?;
+        let relay_server_name = ServerName::try_from(relay_host.clone())
+            .or_else(|_| ServerName::try_from("relay.local".to_string()))
+            .map_err(|error| format!("Invalid relay TLS host '{relay_host}': {error}"))?;
+        let relay_connection = ClientConnection::new(relay_config, relay_server_name)
+            .map_err(|error| format!("Could not create relay TLS client: {error}"))?;
+        let mut relay_stream = StreamOwned::new(relay_connection, relay_tcp);
+        {
+            let (conn, sock) = (&mut relay_stream.conn, &mut relay_stream.sock);
+            conn.complete_io(sock)
+                .map_err(|error| format!("Relay TLS handshake failed: {error}"))?;
+        }
+
+        if let Some(expected_relay_id) = relay_server_id.as_deref() {
+            let relay_peer_der = relay_stream
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| cert.as_ref().to_vec())
+                .ok_or_else(|| "Relay certificate missing".to_string())?;
+            let got = canonical_device_id(&compute_device_id_from_der(&relay_peer_der));
+            let want = canonical_device_id(expected_relay_id);
+            if got != want {
+                return Err(format!(
+                    "Relay certificate ID mismatch: expected {expected_relay_id}, got {got}"
+                ));
+            }
+        }
+
+        let target_device_id = decode_device_id_bytes(&request.expected_device_id)?;
+        relay_write_message(
+            &mut relay_stream,
+            RELAY_MESSAGE_TYPE_CONNECT_REQUEST,
+            &xdr_write_opaque(&target_device_id),
+        )?;
+        let (message_type, payload) = relay_read_message(&mut relay_stream)?;
+        if message_type == RELAY_MESSAGE_TYPE_RESPONSE {
+            let (code, message) = relay_parse_response(&payload)?;
+            return Err(format!(
+                "Relay connect request failed (code {code}): {}",
+                if message.is_empty() {
+                    "no message".to_string()
+                } else {
+                    message
+                }
+            ));
+        }
+        if message_type != RELAY_MESSAGE_TYPE_SESSION_INVITATION {
+            return Err(format!(
+                "Unexpected relay response type {message_type}, expected SessionInvitation"
+            ));
+        }
+
+        let mut invitation_offset = 0usize;
+        let _from = xdr_read_opaque(&payload, &mut invitation_offset)?;
+        let session_key = xdr_read_opaque(&payload, &mut invitation_offset)?;
+        let relay_session_address = xdr_read_opaque(&payload, &mut invitation_offset)?;
+        let session_port = xdr_read_u32(&payload, &mut invitation_offset)? as u16;
+        let server_socket = xdr_read_u32(&payload, &mut invitation_offset)?;
+        if server_socket != 0 {
+            return Err(
+                "Relay invitation requested server-socket mode, which is not implemented yet"
+                    .to_string(),
+            );
+        }
+
+        let session_host = parse_ip_from_relay_address(&relay_session_address).unwrap_or(relay_host);
+        let session_port = if session_port == 0 { relay_port } else { session_port };
+        let relay_session_endpoint = format!("{session_host}:{session_port}");
+        tauri_log(&format!(
+            "relay.open.session endpoint={} keyLen={}",
+            relay_session_endpoint,
+            session_key.len()
+        ));
+
+        let session_tcp = TcpStream::connect(&relay_session_endpoint).map_err(|error| {
+            format!("Relay session TCP connect to {relay_session_endpoint} failed: {error}")
+        })?;
+        session_tcp
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("Could not set relay session read timeout: {error}"))?;
+        session_tcp
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| format!("Could not set relay session write timeout: {error}"))?;
+
+        let mut relay_session_socket = session_tcp;
+        relay_write_message(
+            &mut relay_session_socket,
+            RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST,
+            &xdr_write_opaque(&session_key),
+        )?;
+        let (join_type, join_payload) = relay_read_message(&mut relay_session_socket)?;
+        if join_type != RELAY_MESSAGE_TYPE_RESPONSE {
+            return Err(format!(
+                "Unexpected relay session response type {join_type}, expected Response"
+            ));
+        }
+        let (join_code, join_message) = relay_parse_response(&join_payload)?;
+        if join_code != 0 {
+            return Err(format!(
+                "Relay join session failed (code {join_code}): {}",
+                if join_message.is_empty() {
+                    "no message".to_string()
+                } else {
+                    join_message
+                }
+            ));
+        }
+
+        let mut bep_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_client_auth_cert(cert_chain, private_key)
+            .map_err(|error| format!("Invalid BEP client cert/key pair: {error}"))?;
+        bep_config.alpn_protocols = vec![b"bep/1.0".to_vec()];
+        let bep_config = Arc::new(bep_config);
+        let bep_server_name = ServerName::try_from(session_host.clone())
+            .or_else(|_| ServerName::try_from("peer.local".to_string()))
+            .map_err(|error| format!("Invalid relay peer TLS host '{session_host}': {error}"))?;
+        let bep_connection = ClientConnection::new(bep_config, bep_server_name)
+            .map_err(|error| format!("Could not create relay BEP TLS client: {error}"))?;
+        let mut bep_stream = StreamOwned::new(bep_connection, relay_session_socket);
+        {
+            let (conn, sock) = (&mut bep_stream.conn, &mut bep_stream.sock);
+            conn.complete_io(sock)
+                .map_err(|error| format!("Relay BEP TLS handshake failed: {error}"))?;
+        }
+        let peer_certificate_der = bep_stream
+            .conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.as_ref().to_vec())
+            .ok_or_else(|| "Relay BEP peer certificate missing".to_string())?;
+        let peer_device_id = canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
+        tauri_log(&format!(
+            "relay.open.peer_cert endpoint={} peerDeviceId={}",
+            relay_session_endpoint, peer_device_id
+        ));
+
+        let mut guard = shared_store
+            .lock()
+            .map_err(|_| "TLS session store lock poisoned".to_string())?;
+        let next_id = guard.next_id.saturating_add(1).max(1);
+        guard.next_id = next_id;
+        guard.sessions.insert(
+            next_id,
+            Arc::new(Mutex::new(TlsSession { stream: bep_stream })),
+        );
+        Ok(TlsOpenResponse {
+            session_id: next_id,
+            peer_certificate_der,
+            connected_via: Some(format!(
+                "relay://{}:{} -> {}",
+                relay_url.host_str().unwrap_or(""),
+                relay_port,
+                relay_session_endpoint
+            )),
+        })
+    })
+    .await
+    .map_err(|error| format!("Relay open task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -1157,8 +1801,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             syncpeer_read_text_file,
             syncpeer_read_default_cli_identity,
+            syncpeer_export_identity_recovery,
+            syncpeer_restore_identity_recovery,
             syncpeer_discovery_fetch,
             syncpeer_tls_open,
+            syncpeer_relay_open,
             syncpeer_tls_read,
             syncpeer_tls_write,
             syncpeer_tls_close,

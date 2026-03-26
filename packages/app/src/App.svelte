@@ -2,10 +2,13 @@
   import { onDestroy, onMount } from "svelte";
   import {
     createSyncpeerUiClient,
+    getDefaultDiscoveryServer,
+    normalizeDiscoveryServer,
     reportUiError,
     type CachedFileRecord,
     type ConnectOptions,
     type RemoteFsLike,
+    type UiLogEntry,
   } from "./lib/syncpeerClient.js";
   import type {
     FileEntry,
@@ -50,6 +53,7 @@
     timeoutMs: number;
     discoveryMode: DiscoveryMode;
     discoveryServer: string;
+    enableRelayFallback: boolean;
   }
 
   interface SavedDevice {
@@ -58,12 +62,25 @@
     createdAtMs: number;
   }
 
-  const CONNECTION_STORAGE_KEY = "syncpeer.ui.connection.v1";
-  const SAVED_DEVICES_STORAGE_KEY = "syncpeer.ui.savedDevices.v1";
+  interface PersistedAppState {
+    activeTab: Tab;
+    selectedSavedDeviceId: string;
+    connection: StoredConnectionSettings;
+    savedDevices: SavedDevice[];
+  }
+
+  interface SessionLogItem {
+    id: string;
+    timestampMs: number;
+    level: "info" | "warning" | "error";
+    event: string;
+    message: string;
+    details?: unknown;
+  }
+
+  const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
   const REFRESH_MS = 3000;
   const MAX_VISIBLE_CRUMBS = 4;
-
-  const client = createSyncpeerUiClient();
 
   const parseJson = <T,>(raw: string | null): T | null => {
     if (!raw) return null;
@@ -74,28 +91,14 @@
     }
   };
 
-  const loadStoredConnectionSettings = (): StoredConnectionSettings | null => {
+  const loadPersistedAppState = (): PersistedAppState | null => {
     if (typeof window === "undefined") return null;
-    return parseJson<StoredConnectionSettings>(
-      window.localStorage.getItem(CONNECTION_STORAGE_KEY),
+    return parseJson<PersistedAppState>(
+      window.localStorage.getItem(APP_STATE_STORAGE_KEY),
     );
   };
 
-  const persistConnectionSettings = (
-    settings: StoredConnectionSettings,
-  ): void => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(
-      CONNECTION_STORAGE_KEY,
-      JSON.stringify(settings),
-    );
-  };
-
-  const loadStoredDevices = (): SavedDevice[] => {
-    if (typeof window === "undefined") return [];
-    const parsed = parseJson<SavedDevice[]>(
-      window.localStorage.getItem(SAVED_DEVICES_STORAGE_KEY),
-    );
+  const normalizeSavedDevices = (parsed: SavedDevice[] | null | undefined): SavedDevice[] => {
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter((item) => typeof item?.id === "string" && item.id.trim() !== "")
@@ -107,11 +110,11 @@
       .sort((a, b) => a.name.localeCompare(b.name));
   };
 
-  const persistSavedDevices = (items: SavedDevice[]): void => {
+  const persistAppState = (state: PersistedAppState): void => {
     if (typeof window === "undefined") return;
     window.localStorage.setItem(
-      SAVED_DEVICES_STORAGE_KEY,
-      JSON.stringify(items),
+      APP_STATE_STORAGE_KEY,
+      JSON.stringify(state),
     );
   };
 
@@ -122,6 +125,10 @@
       .trim()
       .toUpperCase()
       .replace(/[^A-Z2-7-]/g, "");
+  const compactDeviceId = (value: string): string =>
+    normalizeDeviceId(value).replace(/-/g, "");
+  const isValidSyncthingDeviceId = (value: string): boolean =>
+    compactDeviceId(value).length === 56;
   const folderDisplayName = (folder: FolderInfo): string =>
     folder.label || folder.id;
   const favoriteKey = (
@@ -152,7 +159,8 @@
     deviceName,
     timeoutMs,
     discoveryMode,
-    discoveryServer,
+    discoveryServer: normalizeDiscoveryServer(discoveryServer),
+    enableRelayFallback,
   });
 
   const fromConnectionSettings = (
@@ -171,7 +179,8 @@
         deviceName: "syncpeer-ui",
         timeoutMs: 15000,
         discoveryMode,
-        discoveryServer: "https://discovery.syncthing.net/v2/",
+        discoveryServer: getDefaultDiscoveryServer(),
+        enableRelayFallback: true,
       };
     }
 
@@ -187,16 +196,20 @@
       deviceName: stored.deviceName || "syncpeer-ui",
       timeoutMs: Number(stored.timeoutMs) || 15000,
       discoveryMode,
-      discoveryServer:
-        stored.discoveryServer || "https://discovery.syncthing.net/v2/",
+      discoveryServer: normalizeDiscoveryServer(stored.discoveryServer),
+      enableRelayFallback: stored.enableRelayFallback !== false,
     };
   };
 
+  const persistedState = loadPersistedAppState();
   const initialSettings = fromConnectionSettings(
-    loadStoredConnectionSettings(),
+    persistedState?.connection ?? null,
   );
 
-  let activeTab: Tab = "favorites";
+  let activeTab: Tab =
+    persistedState?.activeTab === "devices" || persistedState?.activeTab === "folders"
+      ? persistedState.activeTab
+      : "favorites";
 
   let host = initialSettings.host;
   let port = initialSettings.port;
@@ -207,6 +220,7 @@
   let timeoutMs = initialSettings.timeoutMs;
   let discoveryMode: DiscoveryMode = initialSettings.discoveryMode;
   let discoveryServer = initialSettings.discoveryServer;
+  let enableRelayFallback = initialSettings.enableRelayFallback;
 
   let remoteFs: RemoteFsLike | null = null;
   let isConnected = false;
@@ -224,6 +238,7 @@
   let isSettingsExpanded = false;
   let uploadMessage = "";
   let lastUpdatedAt = "";
+  let activeConnectDeviceId = "";
 
   let folders: FolderInfo[] = [];
   let entries: FileEntry[] = [];
@@ -236,8 +251,11 @@
   let directoryLoadSeq = 0;
 
   let favorites: FavoriteItem[] = [];
-  let savedDevices: SavedDevice[] = loadStoredDevices();
-  let selectedSavedDeviceId = savedDevices[0]?.id ?? "";
+  let savedDevices: SavedDevice[] = normalizeSavedDevices(
+    persistedState?.savedDevices,
+  );
+  let selectedSavedDeviceId =
+    persistedState?.selectedSavedDeviceId || savedDevices[0]?.id || "";
   let newSavedDeviceName = "";
   let newSavedDeviceId = "";
   let visibleBreadcrumbs: BreadcrumbSegment[] = [];
@@ -246,8 +264,84 @@
   let downloadedFiles: CachedFileRecord[] = [];
 
   let connectionModeLabel = "";
+  let connectionPath = "";
+  let connectionTransport: "direct-tcp" | "relay" | "" = "";
+  let recentError: string | null = null;
+  let sessionLogs: SessionLogItem[] = [];
+  let isLogPanelExpanded = false;
+  let lastLoggedError = "";
+  let identityRecoverySecret = "";
+  let exportedIdentityDeviceId = "";
+  let exportedIdentitySecret = "";
+  let isExportingIdentityRecovery = false;
+  let isRestoringIdentityRecovery = false;
 
   let error: string | null = null;
+  let nextSessionLogId = 1;
+
+  const pushSessionLog = (
+    level: "info" | "warning" | "error",
+    event: string,
+    message: string,
+    details?: unknown,
+  ) => {
+    const entry: SessionLogItem = {
+      id: `${Date.now()}-${nextSessionLogId}`,
+      timestampMs: Date.now(),
+      level,
+      event,
+      message,
+      details,
+    };
+    nextSessionLogId += 1;
+    sessionLogs = [entry, ...sessionLogs].slice(0, 300);
+  };
+
+  const classifyUiLogLevel = (
+    entry: UiLogEntry,
+    details: Record<string, unknown> | undefined,
+  ): "info" | "warning" | "error" => {
+    if (
+      entry.event === "tauri.invoke.error" &&
+      isConnecting &&
+      (details?.command === "syncpeer_tls_open" ||
+        details?.command === "syncpeer_relay_open")
+    ) {
+      return "warning";
+    }
+    if (
+      entry.event === "core.discovery.candidate.failed" ||
+      entry.event === "core.discovery.relay.failed"
+    ) {
+      return "warning";
+    }
+    return entry.level;
+  };
+
+  const pushClientLog = (entry: UiLogEntry) => {
+    const details =
+      entry.details !== undefined &&
+      entry.details !== null &&
+      typeof entry.details === "object"
+        ? (entry.details as Record<string, unknown>)
+        : undefined;
+    const level = classifyUiLogLevel(entry, details);
+    const messageCandidate = details?.message;
+    const message =
+      typeof messageCandidate === "string" && messageCandidate.trim() !== ""
+        ? messageCandidate
+        : entry.event;
+    pushSessionLog(level, entry.event, message, entry.details);
+  };
+
+  const setError = (event: string, rawError: unknown, context?: unknown) => {
+    const message =
+      rawError instanceof Error ? rawError.message : String(rawError);
+    error = message;
+    pushSessionLog("error", event, message, context);
+  };
+
+  const client = createSyncpeerUiClient({ onLog: pushClientLog });
 
   const refreshTimer = setInterval(() => {
     void refreshActiveView();
@@ -262,8 +356,12 @@
     void hydratePersistedState();
   });
 
-  $: persistConnectionSettings(toConnectionSettings());
-  $: persistSavedDevices(savedDevices);
+  $: persistAppState({
+    activeTab,
+    selectedSavedDeviceId,
+    connection: toConnectionSettings(),
+    savedDevices,
+  });
   $: if (
     savedDevices.length > 0 &&
     !savedDevices.some((device) => device.id === selectedSavedDeviceId)
@@ -282,17 +380,22 @@
   $: if (discoveryMode === "global" && host === "127.0.0.1") {
     host = "";
   }
+  $: if (error && error !== lastLoggedError) {
+    lastLoggedError = error;
+    pushSessionLog("error", "ui.error", error);
+  }
 
   const connectionDetails = (): ConnectOptions => ({
     host,
     port,
     discoveryMode,
-    discoveryServer,
+    discoveryServer: normalizeDiscoveryServer(discoveryServer),
     cert: cert || undefined,
     key: key || undefined,
     remoteId: remoteId || undefined,
     deviceName,
     timeoutMs,
+    enableRelayFallback,
   });
 
   const rootFolderEntries = (): RootFolderEntry[] =>
@@ -380,6 +483,8 @@
     if (keyValue !== activeDownloadKey) return "Download";
     return activeDownloadText || "Downloading...";
   };
+  const isSavedDeviceConnected = (deviceId: string): boolean =>
+    isConnected && normalizeDeviceId(remoteDevice?.id ?? remoteId) === normalizeDeviceId(deviceId);
 
   async function hydratePersistedState() {
     try {
@@ -494,9 +599,17 @@
     }
   };
 
-  async function connect() {
+  async function connect(targetDeviceId?: string) {
     error = null;
+    recentError = null;
     uploadMessage = "";
+    if (targetDeviceId) {
+      selectedSavedDeviceId = targetDeviceId;
+      remoteId = targetDeviceId;
+      discoveryMode = "global";
+      host = "";
+      activeConnectDeviceId = targetDeviceId;
+    }
     if (
       discoveryMode === "global" &&
       normalizeDeviceId(remoteId) === "" &&
@@ -505,13 +618,27 @@
       remoteId = selectedSavedDeviceId;
     }
     if (discoveryMode === "global" && normalizeDeviceId(remoteId) === "") {
-      error =
+      const message =
         "Global discovery requires a Remote Device ID. Add/select a saved device first.";
+      error = message;
+      recentError = message;
+      activeConnectDeviceId = "";
       return;
+    }
+    if (discoveryMode === "global" && !isValidSyncthingDeviceId(remoteId)) {
+      const message =
+        "Remote Device ID looks invalid. Expected 56 base32 chars (A-Z, 2-7), usually shown as 8 groups separated by dashes.";
+      error = message;
+      recentError = message;
+      activeConnectDeviceId = "";
+      return;
+    }
+    if (discoveryMode === "global") {
+      discoveryServer = normalizeDiscoveryServer(discoveryServer);
     }
     connectionModeLabel =
       discoveryMode === "global"
-        ? `Global discovery via ${discoveryServer}`
+        ? `Global discovery via ${normalizeDiscoveryServer(discoveryServer)}`
         : `Direct ${host || "127.0.0.1"}:${port}`;
 
     remoteId = normalizeDeviceId(remoteId);
@@ -523,6 +650,9 @@
       folders = overview.folders;
       remoteDevice = overview.device;
       folderSyncStates = overview.folderSyncStates ?? [];
+      connectionPath = overview.connectedVia;
+      connectionTransport = overview.transportKind;
+      recentError = null;
       if (!currentFolderId) {
         entries = [];
       }
@@ -532,12 +662,68 @@
       const message =
         rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
+      recentError = message;
       reportUiError("connect.failed", rawError, connectionDetails());
       isConnected = false;
       remoteFs = null;
       remoteDevice = null;
+      connectionPath = "";
+      connectionTransport = "";
     } finally {
       isConnecting = false;
+      activeConnectDeviceId = "";
+    }
+  }
+
+  async function connectToSavedDevice(deviceId: string) {
+    await connect(deviceId);
+  }
+
+  async function disconnect() {
+    if (isConnecting) return;
+    try {
+      await client.disconnect?.();
+    } catch (rawError: unknown) {
+      setError("disconnect.failed", rawError);
+      reportUiError("disconnect.failed", rawError);
+    } finally {
+      isConnected = false;
+      remoteFs = null;
+      remoteDevice = null;
+      folders = [];
+      entries = [];
+      folderSyncStates = [];
+      connectionPath = "";
+      connectionTransport = "";
+      currentFolderId = "";
+      currentPath = "";
+      currentFolderVersionKey = "";
+      activeConnectDeviceId = "";
+      recentError = null;
+      error = null;
+    }
+  }
+
+  async function copySessionLogs() {
+    const rendered = sessionLogs
+      .slice()
+      .reverse()
+      .map((item) => {
+        const ts = new Date(item.timestampMs).toISOString();
+        const base = `${ts} [${item.level.toUpperCase()}] ${item.event}: ${item.message}`;
+        if (item.details === undefined) return base;
+        return `${base}\n${JSON.stringify(item.details, null, 2)}`;
+      })
+      .join("\n\n");
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(rendered || "No session logs yet.");
+      } else {
+        throw new Error("Clipboard API unavailable on this device");
+      }
+    } catch (rawError: unknown) {
+      setError("logs.copy.failed", rawError);
+      reportUiError("logs.copy.failed", rawError);
     }
   }
 
@@ -622,6 +808,8 @@
       folders = overview.folders;
       remoteDevice = overview.device;
       folderSyncStates = overview.folderSyncStates ?? [];
+      connectionPath = overview.connectedVia;
+      connectionTransport = overview.transportKind;
       if (activeTab === "folders" && currentFolderId) {
         const nextFolderVersionKey = folderVersionKey(currentFolderId);
         const shouldReloadDirectory =
@@ -832,6 +1020,11 @@
       error = "Device ID is required.";
       return;
     }
+    if (!isValidSyncthingDeviceId(normalizedId)) {
+      error =
+        "Device ID looks invalid. Expected 56 base32 chars (A-Z, 2-7), usually shown as 8 groups separated by dashes.";
+      return;
+    }
     const displayName = newSavedDeviceName.trim() || normalizedId;
     const existing = savedDevices.find((device) => device.id === normalizedId);
     if (existing) {
@@ -860,30 +1053,87 @@
     remoteId = deviceId;
   }
 
+  function resetDiscoveryServer() {
+    discoveryServer = getDefaultDiscoveryServer();
+  }
+
   function removeSavedDevice(deviceId: string) {
     savedDevices = savedDevices.filter((device) => device.id !== deviceId);
     if (remoteId === deviceId) {
       remoteId = "";
     }
   }
+
+  async function exportIdentityRecovery() {
+    if (isExportingIdentityRecovery) return;
+    isExportingIdentityRecovery = true;
+    error = null;
+    try {
+      const exported = await client.exportIdentityRecovery();
+      exportedIdentityDeviceId = exported.deviceId;
+      exportedIdentitySecret = exported.recoverySecret;
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(exported.recoverySecret);
+      }
+    } catch (rawError: unknown) {
+      setError("identity_recovery.export.failed", rawError);
+      reportUiError("identity_recovery.export.failed", rawError);
+    } finally {
+      isExportingIdentityRecovery = false;
+    }
+  }
+
+  async function restoreIdentityRecovery() {
+    if (isRestoringIdentityRecovery) return;
+    const secret = identityRecoverySecret.trim();
+    if (!secret) {
+      error = "Recovery secret is required.";
+      return;
+    }
+    isRestoringIdentityRecovery = true;
+    error = null;
+    try {
+      await client.restoreIdentityRecovery(secret);
+      identityRecoverySecret = "";
+      exportedIdentitySecret = "";
+      exportedIdentityDeviceId = "";
+    } catch (rawError: unknown) {
+      setError("identity_recovery.restore.failed", rawError);
+      reportUiError("identity_recovery.restore.failed", rawError);
+    } finally {
+      isRestoringIdentityRecovery = false;
+    }
+  }
 </script>
 
 <div class="app-shell">
   <main class="content">
+    {#if recentError}
+      <section class="panel error-banner-panel">
+        <p class="error">{recentError}</p>
+      </section>
+    {/if}
+
     {#if !isConnected}
       <div class="global-connect">
-        <button class="primary" on:click={connect} disabled={isConnecting}>
+        <button class="primary" on:click={() => connect()} disabled={isConnecting}>
           {isConnecting ? "Connecting..." : "Connect"}
         </button>
         {#if connectionModeLabel}
           <span>{connectionModeLabel}</span>
         {/if}
       </div>
+    {:else}
+      <div class="global-connect">
+        <button class="ghost" on:click={disconnect} disabled={isConnecting}>
+          Disconnect
+        </button>
+      </div>
     {/if}
 
     {#if activeTab === "devices"}
       <section class="panel">
-        <h2 class="heading">Devices</h2>
+        <h2 class="heading">Settings</h2>
 
         <div class="status-row">
           <span class={`status-chip ${isConnected ? "online" : "offline"}`}>
@@ -892,17 +1142,20 @@
           {#if lastUpdatedAt}
             <span>Updated {lastUpdatedAt}</span>
           {/if}
+          {#if isConnected && connectionPath}
+            <span>Path: {connectionTransport === "relay" ? "relay" : "direct tcp"} ({connectionPath})</span>
+          {/if}
         </div>
 
         {#if !isConnected}
-          <button class="primary" on:click={connect} disabled={isConnecting}>
+          <button class="primary" on:click={() => connect()} disabled={isConnecting}>
             {isConnecting ? "Connecting..." : "Connect Using Last Settings"}
           </button>
         {/if}
 
         <details bind:open={isSettingsExpanded}>
           <summary>Connection Settings</summary>
-          <form class="settings" on:submit|preventDefault={connect}>
+          <form class="settings" on:submit|preventDefault={() => connect()}>
             <label>
               Discovery Method
               <select bind:value={discoveryMode}>
@@ -930,8 +1183,7 @@
               </label>
             {:else}
               <div class="hint">
-                Global discovery ignores manual host/port. The app should
-                resolve the remote device from its Device ID.
+                Global discovery ignores manual host/port. The official Syncthing discovery server pin is applied automatically when you use discovery.syncthing.net.
               </div>
             {/if}
 
@@ -990,6 +1242,11 @@
                 step="1000"
               />
             </label>
+
+            <label class="checkbox-row">
+              <input type="checkbox" bind:checked={enableRelayFallback} />
+              <span>Enable relay fallback (Syncthing relay://)</span>
+            </label>
           </form>
 
           <div class="actions">
@@ -1004,22 +1261,65 @@
             <button
               type="button"
               class="ghost"
+              on:click={resetDiscoveryServer}
+              disabled={discoveryMode !== "global"}
+            >
+              Use Official Discovery Server
+            </button>
+            <button
+              type="button"
+              class="ghost"
               on:click={clearAllCache}
               disabled={isClearingCache}
             >
               {isClearingCache ? "Clearing Cache..." : "Clear Cache"}
             </button>
           </div>
-
-          {#if discoveryMode === "global"}
-            <div class="hint">
-              If you get a remote ID mismatch in global mode, that usually means
-              discovery resolved the wrong endpoint or the core layer fell back
-              to a direct/local address. It should not silently connect to
-              localhost.
-            </div>
-          {/if}
         </details>
+      </section>
+
+      <section class="panel">
+        <h2 class="heading">Identity Recovery</h2>
+        <p class="hint">
+          Back up this device identity so reinstalling can restore the same device ID.
+        </p>
+        <div class="actions">
+          <button
+            type="button"
+            class="primary"
+            on:click={exportIdentityRecovery}
+            disabled={isExportingIdentityRecovery}
+          >
+            {isExportingIdentityRecovery ? "Exporting..." : "Export Recovery Secret"}
+          </button>
+        </div>
+        {#if exportedIdentitySecret}
+          <div class="item-meta">Device ID: {exportedIdentityDeviceId}</div>
+          <textarea
+            class="recovery-secret"
+            readonly
+            value={exportedIdentitySecret}
+          />
+        {/if}
+
+        <label>
+          Restore From Recovery Secret
+          <textarea
+            class="recovery-secret"
+            bind:value={identityRecoverySecret}
+            placeholder="Paste recovery secret here"
+          />
+        </label>
+        <div class="actions">
+          <button
+            type="button"
+            class="ghost"
+            on:click={restoreIdentityRecovery}
+            disabled={isRestoringIdentityRecovery}
+          >
+            {isRestoringIdentityRecovery ? "Restoring..." : "Restore Identity"}
+          </button>
+        </div>
       </section>
 
       <section class="panel">
@@ -1060,14 +1360,26 @@
             {#each savedDevices as device (device.id)}
               <li class="list-item">
                 <div class="item-main">
-                  <button
-                    class="item-title"
-                    on:click={() => useSavedDevice(device.id)}
-                    >{device.name}</button
-                  >
+                  <div class="item-title-row">
+                    <button
+                      class="item-title"
+                      on:click={() => useSavedDevice(device.id)}
+                      >{device.name}</button
+                    >
+                    {#if isSavedDeviceConnected(device.id)}
+                      <span class="status-chip online small">online</span>
+                    {/if}
+                  </div>
                   <div class="item-meta">{device.id}</div>
                 </div>
                 <div class="item-actions">
+                  <button
+                    class="primary"
+                    on:click={() => connectToSavedDevice(device.id)}
+                    disabled={isConnecting}
+                  >
+                    {isConnecting && activeConnectDeviceId === device.id ? "Connecting..." : "Connect"}
+                  </button>
                   <button
                     class="ghost"
                     on:click={() => useSavedDevice(device.id)}>Use</button
@@ -1085,11 +1397,11 @@
       </section>
 
       <section class="panel">
-        <h2 class="heading">Discovered Devices</h2>
+        <h2 class="heading">Active Remote Device</h2>
         <ul class="list">
           {#if !remoteDevice}
             <li class="empty">
-              No remote device metadata yet. Connect to load the list.
+              No remote device metadata yet. Connect to a saved device.
             </li>
           {:else}
             <li class="list-item">
@@ -1102,6 +1414,11 @@
                   {remoteDevice.clientName}
                   {remoteDevice.clientVersion}
                 </div>
+                {#if connectionPath}
+                  <div class="item-meta">
+                    Connected via {connectionTransport === "relay" ? "relay" : "direct tcp"}: {connectionPath}
+                  </div>
+                {/if}
               </div>
               <div class="item-actions">
                 <button
@@ -1116,6 +1433,41 @@
             </li>
           {/if}
         </ul>
+      </section>
+
+      <section class="panel">
+        <h2 class="heading">Session Logs</h2>
+        <details bind:open={isLogPanelExpanded}>
+          <summary>View logs ({sessionLogs.length})</summary>
+          <div class="actions">
+            <button
+              type="button"
+              class="ghost"
+              on:click={copySessionLogs}
+            >
+              Copy Logs
+            </button>
+          </div>
+          <ul class="list">
+            {#if sessionLogs.length === 0}
+              <li class="empty">No session logs yet.</li>
+            {:else}
+              {#each sessionLogs as item (item.id)}
+                <li class="list-item">
+                  <div class="item-main">
+                    <div class="item-meta">
+                      {new Date(item.timestampMs).toLocaleTimeString()} | {item.level.toUpperCase()} | {item.event}
+                    </div>
+                    <div class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}>{item.message}</div>
+                    {#if item.details !== undefined}
+                      <pre class="log-details">{JSON.stringify(item.details, null, 2)}</pre>
+                    {/if}
+                  </div>
+                </li>
+              {/each}
+            {/if}
+          </ul>
+        </details>
       </section>
     {/if}
 
@@ -1434,11 +1786,6 @@
       </section>
     {/if}
 
-    {#if error}
-      <section class="panel">
-        <p class="error">{error}</p>
-      </section>
-    {/if}
   </main>
 
   <nav class="bottom-tabs">
@@ -1446,19 +1793,22 @@
       class={`tab-button ${activeTab === "favorites" ? "active" : ""}`}
       on:click={() => switchTab("favorites")}
     >
-      Favorites
+      <span class="tab-icon" aria-hidden="true">★</span>
+      <span class="sr-only">Favorites</span>
     </button>
     <button
       class={`tab-button ${activeTab === "folders" ? "active" : ""}`}
       on:click={() => switchTab("folders")}
     >
-      Folders
+      <span class="tab-icon" aria-hidden="true">▦</span>
+      <span class="sr-only">Folders</span>
     </button>
     <button
       class={`tab-button ${activeTab === "devices" ? "active" : ""}`}
       on:click={() => switchTab("devices")}
     >
-      Devices
+      <span class="tab-icon" aria-hidden="true">☰</span>
+      <span class="sr-only">Settings</span>
     </button>
   </nav>
 </div>
@@ -1494,6 +1844,14 @@
     border-radius: 0;
     box-shadow: none;
     padding: 0.35rem 0;
+  }
+
+  .error-banner-panel {
+    margin-bottom: 0.35rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid #f0c6c6;
+    border-radius: 8px;
+    background: #fff1f1;
   }
 
   .panel + .panel {
@@ -1533,6 +1891,19 @@
     color: #445366;
   }
 
+  .checkbox-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 42px;
+  }
+
+  .checkbox-row input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    margin: 0;
+  }
+
   input,
   select {
     padding: 0.4rem 0.45rem;
@@ -1540,6 +1911,19 @@
     border: 1px solid #c7d2df;
     border-radius: 8px;
     background: #fff;
+  }
+
+  textarea.recovery-secret {
+    width: 100%;
+    min-height: 88px;
+    resize: vertical;
+    padding: 0.4rem 0.45rem;
+    font-size: 0.78rem;
+    border: 1px solid #c7d2df;
+    border-radius: 8px;
+    background: #fff;
+    box-sizing: border-box;
+    font-family: "IBM Plex Mono", monospace;
   }
 
   .actions {
@@ -1628,6 +2012,11 @@
     color: #9c2d2d;
   }
 
+  .status-chip.small {
+    font-size: 0.68rem;
+    padding: 0.08rem 0.35rem;
+  }
+
   details {
     border: 1px solid #dbe3ee;
     border-radius: 10px;
@@ -1699,6 +2088,13 @@
     min-width: 0;
   }
 
+  .item-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
   .item-title {
     border: none;
     background: none;
@@ -1715,6 +2111,28 @@
   .item-meta {
     font-size: 0.74rem;
     color: #61778f;
+  }
+
+  .log-error {
+    color: #a61b1b;
+  }
+
+  .log-warning {
+    color: #9a5c00;
+  }
+
+  .log-details {
+    margin: 0.35rem 0 0;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.7rem;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #263b52;
+    background: #f4f8fc;
+    border: 1px solid #d8e2ee;
+    border-radius: 6px;
+    padding: 0.35rem 0.4rem;
   }
 
   .item-actions {
@@ -1764,12 +2182,32 @@
     letter-spacing: 0.02em;
     font-size: 0.9rem;
     min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .tab-button.active {
     background: #d6e9ff;
     color: #0d3668;
     border-color: #d6e9ff;
+  }
+
+  .tab-icon {
+    font-size: 1.15rem;
+    line-height: 1;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   @media (max-width: 640px) {

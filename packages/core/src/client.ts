@@ -8,7 +8,7 @@ import {
   Index,
   Request,
 } from "./core/protocol/bep.js";
-import { RemoteDeviceInfo, RemoteFs } from "./core/model/remoteFs.js";
+import { type AdvertisedDeviceInfo, RemoteDeviceInfo, RemoteFs } from "./core/model/remoteFs.js";
 
 export interface SyncpeerTlsConnectOptions {
   host: string;
@@ -112,6 +112,7 @@ interface FolderState {
   id: string;
   label: string;
   readOnly: boolean;
+  advertisedDevices: AdvertisedDeviceInfo[];
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
@@ -144,6 +145,10 @@ function canonicalDeviceId(id: string): string {
     out += normalized[i];
   }
   return out;
+}
+
+function encodeDeviceId(raw: Uint8Array): string {
+  return base32NoPadding(raw);
 }
 
 function base32NoPadding(input: Uint8Array): string {
@@ -475,6 +480,15 @@ class BepSession {
   private handleClusterConfig(cfg: any): void {
     for (const folder of cfg.folders || []) {
       const folderDevices = Array.isArray(folder.devices) ? folder.devices : [];
+      const advertisedDevices: AdvertisedDeviceInfo[] = folderDevices
+        .filter((device: any) => device?.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
+        .map((device: any) => ({
+          id: encodeDeviceId(device.id),
+          name:
+            typeof device.name === "string" && device.name.trim() !== ""
+              ? device.name.trim()
+              : undefined,
+        }));
       const remoteDevice = this.remoteDeviceId
         ? folderDevices.find((device: any) =>
             bytesEqual(device.id, this.remoteDeviceId!),
@@ -489,6 +503,7 @@ class BepSession {
         id: folder.id,
         label: folder.label || folder.id,
         readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
+        advertisedDevices,
         indexReceived: false,
         remoteIndexId,
         remoteMaxSequence,

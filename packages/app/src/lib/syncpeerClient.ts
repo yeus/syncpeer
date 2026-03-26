@@ -546,6 +546,10 @@ export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) 
     listCachedFiles: async (): Promise<CachedFileRecord[]> => invokeWithLogging<CachedFileRecord[]>("syncpeer_list_cached_files"),
     openCachedFile: async (folderId: string, path: string): Promise<void> =>
       invokeWithLogging("syncpeer_open_cached_file", { request: { folderId, path } }),
+    openCachedFileDirectory: async (folderId: string, path: string): Promise<void> =>
+      invokeWithLogging("syncpeer_open_cached_file_directory", { request: { folderId, path } }),
+    openCachedDirectory: async (folderId: string, path: string): Promise<void> =>
+      invokeWithLogging("syncpeer_open_cached_directory", { request: { folderId, path } }),
     removeCachedFile: async (folderId: string, path: string): Promise<boolean> =>
       invokeWithLogging<boolean>("syncpeer_remove_cached_file", { request: { folderId, path } }),
     clearCache: async (): Promise<void> => invokeWithLogging("syncpeer_clear_cache"),

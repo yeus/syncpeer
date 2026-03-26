@@ -2,6 +2,12 @@ export interface FolderInfo {
   id: string;
   label: string;
   readOnly: boolean;
+  advertisedDevices?: AdvertisedDeviceInfo[];
+}
+
+export interface AdvertisedDeviceInfo {
+  id: string;
+  name?: string;
 }
 
 export interface FileBlock {
@@ -44,6 +50,7 @@ interface FolderState {
   id: string;
   label: string;
   readOnly: boolean;
+  advertisedDevices: AdvertisedDeviceInfo[];
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
@@ -121,6 +128,7 @@ export class RemoteFs {
       id: f.id,
       label: f.label,
       readOnly: f.readOnly,
+      advertisedDevices: [...f.advertisedDevices],
     }));
   }
 

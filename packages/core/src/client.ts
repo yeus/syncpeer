@@ -25,13 +25,30 @@ export interface SyncpeerTlsSocket {
   peerCertificateDer: () => Promise<Uint8Array>;
 }
 
+export interface SyncpeerDiscoveryFetchInit {
+  method?: string;
+  headers?: Record<string, string>;
+  pinServerDeviceId?: string;
+  allowInsecureTls?: boolean;
+}
+
+export interface SyncpeerDiscoveryResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+}
+
 export interface SyncpeerHostAdapter {
   connectTls: (
     options: SyncpeerTlsConnectOptions,
   ) => Promise<SyncpeerTlsSocket>;
   sha256: (data: Uint8Array) => Promise<Uint8Array> | Uint8Array;
   randomBytes: (length: number) => Promise<Uint8Array> | Uint8Array;
-  fetch: (input: string | URL, init?: RequestInit) => Promise<Response>;
+  discoveryFetch: (
+    input: string | URL,
+    init?: SyncpeerDiscoveryFetchInit,
+  ) => Promise<SyncpeerDiscoveryResponse>;
   log?: (event: string, details?: Record<string, unknown>) => void;
 }
 
@@ -53,6 +70,18 @@ export interface SyncpeerConnectOptions {
 export interface SyncpeerGlobalDiscoveryOptions {
   expectedDeviceId: string;
   discoveryServer?: string;
+}
+
+export interface DiscoveredCandidate {
+  address: string;
+  protocol: "tcp" | "relay" | "unknown";
+  host?: string;
+  port?: number;
+}
+
+export interface SyncpeerGlobalDiscoveryResult {
+  payload: unknown;
+  candidates: DiscoveredCandidate[];
 }
 
 export interface SyncpeerSessionHandle {
@@ -193,31 +222,92 @@ function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
   return base;
 }
 
-function parseDiscoveryAddress(
-  address: unknown,
-): { host: string; port: number } | null {
+function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
   if (typeof address !== "string" || address.trim() === "") return null;
   const value = address.trim();
-  if (!value.startsWith("tcp://")) return null;
-  const parsed = new URL(value);
-  if (!parsed.hostname || !parsed.port) return null;
-  return { host: parsed.hostname, port: Number(parsed.port) };
+  if (value.startsWith("tcp://")) {
+    const parsed = new URL(value);
+    if (!parsed.hostname || !parsed.port) return null;
+    return {
+      address: value,
+      protocol: "tcp",
+      host: parsed.hostname,
+      port: Number(parsed.port),
+    };
+  }
+  if (value.startsWith("relay://")) {
+    const parsed = new URL(value);
+    return {
+      address: value,
+      protocol: "relay",
+      host: parsed.hostname || undefined,
+      port: parsed.port ? Number(parsed.port) : undefined,
+    };
+  }
+  return { address: value, protocol: "unknown" };
 }
 
-async function resolveHostPortFromGlobalDiscovery(
+function isPrivateIpv4(host: string): boolean {
+  if (/^10\./.test(host)) return true;
+  if (/^127\./.test(host)) return true;
+  if (/^192\.168\./.test(host)) return true;
+  if (/^169\.254\./.test(host)) return true;
+  const m = host.match(/^172\.(\d+)\./);
+  if (m) {
+    const n = Number(m[1]);
+    return n >= 16 && n <= 31;
+  }
+  return false;
+}
+
+function scoreCandidate(candidate: DiscoveredCandidate): number {
+  if (candidate.protocol === "relay") return 0;
+  if (candidate.protocol !== "tcp") return -1;
+  if (!candidate.host) return -1;
+  return isPrivateIpv4(candidate.host) ? 100 : 50;
+}
+
+function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidate[] {
+  const seen = new Set<string>();
+  const out: DiscoveredCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = `${candidate.protocol}:${candidate.host ?? ""}:${candidate.port ?? ""}:${candidate.address}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
+}
+
+function extractDiscoveryAuth(url: URL): {
+  pinServerDeviceId?: string;
+  allowInsecureTls: boolean;
+} {
+  const pinServerDeviceId =
+    url.searchParams.get("id")?.trim() || undefined;
+  const allowInsecureTls = url.searchParams.has("insecure");
+  url.searchParams.delete("id");
+  url.searchParams.delete("insecure");
+  return { pinServerDeviceId, allowInsecureTls };
+}
+
+async function resolveGlobalDiscoveryInternal(
   adapter: SyncpeerHostAdapter,
   options: SyncpeerGlobalDiscoveryOptions,
-): Promise<{ host: string; port: number }> {
+): Promise<SyncpeerGlobalDiscoveryResult> {
   if (!options.expectedDeviceId) {
     throw new Error(
       "Remote Device ID is required when discovery mode is global.",
     );
   }
   const server = normalizeDiscoveryServerUrl(options.discoveryServer);
+  const auth = extractDiscoveryAuth(server);
   server.searchParams.set("device", options.expectedDeviceId);
-  const response = await adapter.fetch(server.toString(), {
+  const response = await adapter.discoveryFetch(server.toString(), {
     method: "GET",
     headers: { Accept: "application/json" },
+    pinServerDeviceId: auth.pinServerDeviceId,
+    allowInsecureTls: auth.allowInsecureTls,
   });
   if (response.status === 404) {
     throw new Error(
@@ -230,36 +320,29 @@ async function resolveHostPortFromGlobalDiscovery(
     );
   }
   const payload = await response.json();
-  const addresses: unknown[] = Array.isArray(payload?.addresses)
-    ? payload.addresses
+  const rawAddresses: unknown[] = Array.isArray((payload as any)?.addresses)
+    ? (payload as any).addresses
     : [];
+  const candidates = dedupeCandidates(
+    rawAddresses
+      .map(parseDiscoveryCandidate)
+      .filter((entry): entry is DiscoveredCandidate => entry !== null),
+  );
 
-  adapter.log?.("core.discovery.response", {
+  adapter.log?.("core.discovery.full_response", {
     expectedDeviceId: options.expectedDeviceId,
-    addressCount: addresses.length,
-    addresses: addresses.map((value) => String(value)),
+    payload,
+    candidates,
   });
 
-  const resolved =
-    addresses
-      .map(parseDiscoveryAddress)
-      .find((entry: { host: string; port: number } | null) => entry !== null) ??
-    null;
-
-  if (!resolved) {
-    throw new Error(
-      `Global discovery returned no supported tcp:// addresses for device ${options.expectedDeviceId}.`,
-    );
-  }
-
-  return resolved;
+  return { payload, candidates };
 }
 
 export async function resolveGlobalDiscovery(
   adapter: SyncpeerHostAdapter,
   options: SyncpeerGlobalDiscoveryOptions,
-): Promise<{ host: string; port: number }> {
-  return resolveHostPortFromGlobalDiscovery(adapter, options);
+): Promise<SyncpeerGlobalDiscoveryResult> {
+  return resolveGlobalDiscoveryInternal(adapter, options);
 }
 
 class BepSession {
@@ -599,43 +682,13 @@ async function readRemoteHello(
   }
 }
 
-async function openSession(
+async function openBepSessionOnSocket(
   adapter: SyncpeerHostAdapter,
+  socket: SyncpeerTlsSocket,
   opts: SyncpeerConnectOptions,
+  connectedHost: string,
+  connectedPort: number,
 ): Promise<SyncpeerSessionHandle> {
-  const discoveryMode = opts.discoveryMode ?? "direct";
-  let targetHost = opts.host;
-  let targetPort = opts.port;
-
-  if (discoveryMode === "global") {
-    const resolved = await resolveHostPortFromGlobalDiscovery(adapter, {
-      expectedDeviceId: opts.expectedDeviceId ?? "",
-      discoveryServer: opts.discoveryServer,
-    });
-    targetHost = resolved.host;
-    targetPort = resolved.port;
-
-    adapter.log?.("core.discovery.resolved", {
-      expectedDeviceId: opts.expectedDeviceId,
-      targetHost,
-      targetPort,
-      discoveryServer: opts.discoveryServer,
-    });
-  } else {
-    adapter.log?.("core.discovery.direct", {
-      targetHost,
-      targetPort,
-    });
-  }
-
-  const socket = await adapter.connectTls({
-    host: targetHost,
-    port: targetPort,
-    certPem: opts.certPem,
-    keyPem: opts.keyPem,
-    caPem: opts.caPem,
-  });
-
   const localCertDer = parseFirstCertificateDer(opts.certPem);
   const localDeviceId = await adapter.sha256(localCertDer);
   const peerCertDer = await socket.peerCertificateDer();
@@ -648,7 +701,7 @@ async function openSession(
     if (got !== want) {
       await socket.close();
       throw new Error(
-        `Remote device ID mismatch: expected ${opts.expectedDeviceId}, got ${got} (connected to ${targetHost}:${targetPort})`,
+        `Remote device ID mismatch: expected ${opts.expectedDeviceId}, got ${got} (connected to ${connectedHost}:${connectedPort})`,
       );
     }
   }
@@ -680,6 +733,88 @@ async function openSession(
     remoteFs: session.buildRemoteFs(remoteDeviceInfo),
     close: () => session.close(),
   };
+}
+
+async function openDirectSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  host: string,
+  port: number,
+): Promise<SyncpeerSessionHandle> {
+  const socket = await adapter.connectTls({
+    host,
+    port,
+    certPem: opts.certPem,
+    keyPem: opts.keyPem,
+    caPem: opts.caPem,
+  });
+  return openBepSessionOnSocket(adapter, socket, opts, host, port);
+}
+
+async function openSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+): Promise<SyncpeerSessionHandle> {
+  const discoveryMode = opts.discoveryMode ?? "direct";
+
+  if (discoveryMode !== "global") {
+    return openDirectSession(adapter, opts, opts.host, opts.port);
+  }
+
+  const discovery = await resolveGlobalDiscoveryInternal(adapter, {
+    expectedDeviceId: opts.expectedDeviceId ?? "",
+    discoveryServer: opts.discoveryServer,
+  });
+
+  const ordered = [...discovery.candidates].sort(
+    (a, b) => scoreCandidate(b) - scoreCandidate(a),
+  );
+
+  const directCandidates = ordered.filter(
+    (candidate) =>
+      candidate.protocol === "tcp" &&
+      candidate.host &&
+      Number.isFinite(candidate.port),
+  );
+
+  const relayCandidates = ordered.filter(
+    (candidate) => candidate.protocol === "relay",
+  );
+
+  adapter.log?.("core.discovery.candidates.ordered", {
+    directCandidates,
+    relayCandidates,
+  });
+
+  const errors: string[] = [];
+  for (const candidate of directCandidates) {
+    try {
+      return await openDirectSession(
+        adapter,
+        opts,
+        candidate.host!,
+        candidate.port!,
+      );
+    } catch (error) {
+      errors.push(
+        `${candidate.address}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  if (relayCandidates.length > 0) {
+    errors.push(
+      `Relay candidates discovered but relay transport is not implemented yet: ${relayCandidates
+        .map((candidate) => candidate.address)
+        .join(", ")}`,
+    );
+  }
+
+  throw new Error(
+    `Could not connect using discovered candidates. ${errors.join(" | ")}`,
+  );
 }
 
 export interface SyncpeerCoreClient {

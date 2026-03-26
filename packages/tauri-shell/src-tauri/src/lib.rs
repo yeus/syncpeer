@@ -3,6 +3,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,6 +163,23 @@ struct TlsWriteRequest {
 #[serde(rename_all = "camelCase")]
 struct TlsCloseRequest {
     session_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryFetchRequest {
+    url: String,
+    method: String,
+    headers: HashMap<String, String>,
+    pin_server_device_id: Option<String>,
+    allow_insecure_tls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryFetchResponse {
+    status: u16,
+    body: String,
 }
 
 struct TlsSession {
@@ -419,6 +438,226 @@ fn create_identity_in_dir(cli_node_dir: &Path) -> Result<CliNodeIdentityResponse
     })
 }
 
+fn normalize_device_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_uppercase() || ('2'..='7').contains(ch) || ch.is_ascii_lowercase())
+        .map(|ch| ch.to_ascii_uppercase())
+        .filter(|ch| ch.is_ascii_uppercase() || ('2'..='7').contains(ch))
+        .collect()
+}
+
+fn canonical_device_id(value: &str) -> String {
+    let normalized = normalize_device_id(value);
+    if normalized.len() != 56 {
+        return normalized;
+    }
+    let mut out = String::new();
+    for (index, ch) in normalized.chars().enumerate() {
+        let pos = index + 1;
+        if pos % 14 == 0 {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn base32_no_padding(bytes: &[u8]) -> String {
+    data_encoding::BASE32_NOPAD.encode(bytes)
+}
+
+fn compute_device_id_from_der(cert_der: &[u8]) -> String {
+    let digest = Sha256::digest(cert_der);
+    base32_no_padding(digest.as_slice())
+}
+
+fn build_discovery_http_request(url: &Url, method: &str, headers: &HashMap<String, String>) -> String {
+    let mut path = url.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let mut lines = vec![
+        format!("{method} {path} HTTP/1.1"),
+        format!("Host: {}", url.host_str().unwrap_or_default()),
+        "Accept: application/json".to_string(),
+        "Connection: close".to_string(),
+    ];
+    for (key, value) in headers {
+        lines.push(format!("{key}: {value}"));
+    }
+    lines.push(String::new());
+    lines.push(String::new());
+    lines.join("\r\n")
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut offset = 0usize;
+    let mut out = Vec::new();
+    while offset < body.len() {
+        let remaining = &body[offset..];
+        let Some(line_end) = remaining.windows(2).position(|window| window == b"\r\n") else {
+            break;
+        };
+        let size_line = std::str::from_utf8(&remaining[..line_end])
+            .map_err(|error| format!("Invalid chunk size line: {error}"))?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|error| format!("Invalid chunk size '{size_hex}': {error}"))?;
+        offset += line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if offset + size > body.len() {
+            return Err("Chunk body exceeds response size".to_string());
+        }
+        out.extend_from_slice(&body[offset..offset + size]);
+        offset += size + 2;
+    }
+    Ok(out)
+}
+
+fn parse_http_response(raw: &[u8]) -> Result<DiscoveryFetchResponse, String> {
+    let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err("Malformed HTTP response from discovery server".to_string());
+    };
+    let header_text = std::str::from_utf8(&raw[..header_end])
+        .map_err(|error| format!("Invalid HTTP response headers: {error}"))?;
+    let mut lines = header_text.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let mut status_parts = status_line.split_whitespace();
+    let _http_version = status_parts.next().unwrap_or("");
+    let status = status_parts
+        .next()
+        .ok_or_else(|| format!("Malformed HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|error| format!("Malformed HTTP status code: {error}"))?;
+    let mut transfer_encoding = String::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim().eq_ignore_ascii_case("transfer-encoding") {
+                transfer_encoding = value.trim().to_ascii_lowercase();
+            }
+        }
+    }
+    let mut body = raw[header_end + 4..].to_vec();
+    if transfer_encoding.contains("chunked") {
+        body = decode_chunked_body(&body)?;
+    }
+    let body = String::from_utf8(body)
+        .map_err(|error| format!("Discovery response body is not valid UTF-8: {error}"))?;
+    Ok(DiscoveryFetchResponse { status, body })
+}
+
+fn read_all_from_stream(stream: &mut StreamOwned<ClientConnection, TcpStream>) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut buf = [0u8; 8192];
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => continue,
+            Err(error) => return Err(format!("Discovery read failed: {error}")),
+        }
+    }
+    Ok(bytes)
+}
+
+fn perform_pinned_discovery_request(request: &DiscoveryFetchRequest) -> Result<DiscoveryFetchResponse, String> {
+    let url = Url::parse(&request.url).map_err(|error| format!("Invalid discovery URL: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Discovery URL missing host".to_string())?
+        .to_string();
+    let port = url.port_or_known_default().ok_or_else(|| "Discovery URL missing port".to_string())?;
+    let address = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&address)
+        .map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|error| format!("Could not set read timeout: {error}"))?;
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(host.clone())
+        .map_err(|error| format!("Invalid TLS host '{host}': {error}"))?;
+    let connection = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|error| format!("Could not create TLS client: {error}"))?;
+    let mut stream = StreamOwned::new(connection, tcp);
+    {
+        let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+        conn.complete_io(sock)
+            .map_err(|error| format!("Pinned discovery TLS connect failed: {error}"))?;
+    }
+
+    if let Some(expected_server_id) = request.pin_server_device_id.as_ref() {
+        let peer_der = stream
+            .conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.as_ref().to_vec())
+            .ok_or_else(|| "Discovery server certificate missing".to_string())?;
+        let got = canonical_device_id(&compute_device_id_from_der(&peer_der));
+        let want = canonical_device_id(expected_server_id);
+        if got != want {
+            return Err(format!(
+                "Discovery server certificate ID mismatch: expected {expected_server_id}, got {got}"
+            ));
+        }
+    }
+
+    let request_text = build_discovery_http_request(
+        &url,
+        if request.method.trim().is_empty() { "GET" } else { &request.method },
+        &request.headers,
+    );
+    stream
+        .write_all(request_text.as_bytes())
+        .map_err(|error| format!("Discovery write failed: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("Discovery flush failed: {error}"))?;
+    let raw = read_all_from_stream(&mut stream)?;
+    parse_http_response(&raw)
+}
+
+fn perform_ca_validated_discovery_request(
+    request: &DiscoveryFetchRequest,
+) -> Result<DiscoveryFetchResponse, String> {
+    let method = if request.method.trim().is_empty() {
+        reqwest::Method::GET
+    } else {
+        reqwest::Method::from_bytes(request.method.trim().as_bytes())
+            .map_err(|error| format!("Invalid discovery HTTP method '{}': {error}", request.method))?
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .https_only(true)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("Could not build discovery HTTP client: {error}"))?;
+
+    let mut builder = client.request(method, &request.url);
+    for (key, value) in &request.headers {
+        builder = builder.header(key, value);
+    }
+
+    let response = builder
+        .send()
+        .map_err(|error| format!("CA-validated discovery fetch failed: {error}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .map_err(|error| format!("Could not read discovery response body: {error}"))?;
+
+    Ok(DiscoveryFetchResponse { status, body })
+}
+
 #[tauri::command]
 async fn syncpeer_read_text_file(request: ReadTextFileRequest) -> Result<String, String> {
     let path = PathBuf::from(request.path);
@@ -484,8 +723,22 @@ async fn syncpeer_read_default_cli_identity(
         .join(", ");
 
     Err(format!(
-    "Missing cert/key and auto-create failed. Looked in: {searched}. Create attempts: {attempted}"
-  ))
+        "Missing cert/key and auto-create failed. Looked in: {searched}. Create attempts: {attempted}"
+    ))
+}
+
+#[tauri::command]
+async fn syncpeer_discovery_fetch(
+    request: DiscoveryFetchRequest,
+) -> Result<DiscoveryFetchResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if request.pin_server_device_id.is_some() || request.allow_insecure_tls {
+            return perform_pinned_discovery_request(&request);
+        }
+        perform_ca_validated_discovery_request(&request)
+    })
+    .await
+    .map_err(|error| format!("Discovery fetch task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -507,16 +760,6 @@ async fn syncpeer_tls_open(
         let private_key = rustls_pemfile::private_key(&mut key_reader)
             .map_err(|error| format!("Invalid client private key PEM: {error}"))?
             .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
-
-        if let Some(ca_pem) = request.ca_pem.as_ref() {
-            let mut ca_reader = std::io::BufReader::new(ca_pem.as_bytes());
-            let ca_chain = rustls_pemfile::certs(&mut ca_reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("Invalid CA PEM: {error}"))?;
-            if ca_chain.is_empty() {
-                return Err("CA PEM did not contain any certificate".to_string());
-            }
-        }
 
         let config = ClientConfig::builder()
             .dangerous()
@@ -914,6 +1157,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             syncpeer_read_text_file,
             syncpeer_read_default_cli_identity,
+            syncpeer_discovery_fetch,
             syncpeer_tls_open,
             syncpeer_tls_read,
             syncpeer_tls_write,

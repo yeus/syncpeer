@@ -1,4 +1,4 @@
-import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "@syncpeer/core/browser";
+import { createSyncpeerCoreClient, type SyncpeerDiscoveryFetchInit, type SyncpeerDiscoveryResponse, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "@syncpeer/core/browser";
 import type { FileDownloadProgress, FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "@syncpeer/core/browser";
 
 export interface ConnectOptions {
@@ -84,6 +84,14 @@ interface CliNodeIdentityResponse {
   keyPem: string;
 }
 
+interface DiscoveryFetchResponsePayload {
+  status: number;
+  body: string;
+}
+
+const DEFAULT_DISCOVERY_SERVER =
+  "https://discovery.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW";
+
 const logUi = (event: string, details?: unknown) => {
   if (details !== undefined) {
     console.log(`[syncpeer-ui] ${event}`, details);
@@ -161,7 +169,7 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   port: options.port,
   discoveryMode: options.discoveryMode ?? "global",
   discoveryServer:
-    options.discoveryServer && options.discoveryServer.trim() !== "" ? options.discoveryServer.trim() : undefined,
+    options.discoveryServer && options.discoveryServer.trim() !== "" ? options.discoveryServer.trim() : DEFAULT_DISCOVERY_SERVER,
   cert: options.cert && options.cert.trim() !== "" ? options.cert.trim() : undefined,
   key: options.key && options.key.trim() !== "" ? options.key.trim() : undefined,
   remoteId: options.remoteId && options.remoteId.trim() !== "" ? options.remoteId.trim() : undefined,
@@ -185,6 +193,19 @@ const resolvePemValue = async (invoke: InvokeFn, label: "cert" | "key", value: s
   if (inline) return inline;
   return invoke<string>("syncpeer_read_text_file", { request: { path: value } });
 };
+
+const createDiscoveryResponseFromPayload = (
+  payload: DiscoveryFetchResponsePayload,
+): SyncpeerDiscoveryResponse => ({
+  ok: payload.status >= 200 && payload.status < 300,
+  status: payload.status,
+  async text(): Promise<string> {
+    return payload.body;
+  },
+  async json(): Promise<unknown> {
+    return JSON.parse(payload.body);
+  },
+});
 
 const createTauriHostAdapter = (invoke: InvokeFn): SyncpeerHostAdapter => ({
   connectTls: async ({ host, port, certPem, keyPem, caPem }) => {
@@ -225,7 +246,18 @@ const createTauriHostAdapter = (invoke: InvokeFn): SyncpeerHostAdapter => ({
     crypto.getRandomValues(output);
     return output;
   },
-  fetch: (input, init) => fetch(input, init),
+  discoveryFetch: async (input: string | URL, init?: SyncpeerDiscoveryFetchInit): Promise<SyncpeerDiscoveryResponse> => {
+    const payload = await invoke<DiscoveryFetchResponsePayload>("syncpeer_discovery_fetch", {
+      request: {
+        url: String(input),
+        method: init?.method ?? "GET",
+        headers: init?.headers ?? {},
+        pinServerDeviceId: init?.pinServerDeviceId ?? null,
+        allowInsecureTls: !!init?.allowInsecureTls,
+      },
+    });
+    return createDiscoveryResponseFromPayload(payload);
+  },
   log: (event, details) => logUi(event, details),
 });
 

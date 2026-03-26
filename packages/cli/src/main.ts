@@ -8,12 +8,16 @@ import {
 } from "@syncpeer/core/node";
 import { ensureCliNodeIdentity } from "./identity.js";
 
+const DEFAULT_DISCOVERY_SERVER =
+  "https://discovery.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW";
+
 interface CliOptions {
   host: string;
   port: number;
   cert?: string;
   key?: string;
   remoteId?: string;
+  discoveryServer?: string;
   deviceName: string;
   timeoutMs: number;
 }
@@ -137,7 +141,7 @@ async function main() {
     .option(
       "--discovery-server <url>",
       "Global discovery server",
-      "https://discovery.syncthing.net/v2/",
+      DEFAULT_DISCOVERY_SERVER,
     )
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option(
@@ -213,25 +217,30 @@ async function main() {
   program
     .command("global-discovery-test")
     .description(
-      "Resolve a Syncthing device ID through global discovery without connecting to the peer",
+      "Resolve a Syncthing device ID through global discovery and dump all candidates",
     )
     .action(async () => {
-      const opts = program.opts<CliOptions & { discoveryServer?: string }>();
+      const opts = program.opts<CliOptions>();
 
       if (!opts.remoteId) {
         throw new Error("Missing required option --remote-id");
       }
 
-      const resolved = await resolveNodeGlobalDiscovery({
+      const result = await resolveNodeGlobalDiscovery({
         expectedDeviceId: opts.remoteId,
-        discoveryServer:
-          opts.discoveryServer ?? "https://discovery.syncthing.net/v2/",
+        discoveryServer: opts.discoveryServer ?? DEFAULT_DISCOVERY_SERVER,
       });
 
       console.log(`deviceId\t${opts.remoteId}`);
-      console.log(`host\t${resolved.host}`);
-      console.log(`port\t${resolved.port}`);
-      console.log(`endpoint\t${resolved.host}:${resolved.port}`);
+      const addresses = Array.isArray((result.payload as any)?.addresses)
+        ? (result.payload as any).addresses
+        : [];
+      console.log(`rawAddresses\t${JSON.stringify(addresses)}`);
+      for (const candidate of result.candidates) {
+        console.log(
+          `candidate\t${candidate.protocol}\t${candidate.host ?? ""}\t${candidate.port ?? ""}\t${candidate.address}`,
+        );
+      }
     });
 
   program

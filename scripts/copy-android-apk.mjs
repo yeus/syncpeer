@@ -13,9 +13,21 @@ const candidates = [
   ),
   path.join(
     root,
+    "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal",
+    mode,
+    `app-universal-${mode}-unsigned.apk`,
+  ),
+  path.join(
+    root,
     "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk",
     mode,
     `app-${mode}.apk`,
+  ),
+  path.join(
+    root,
+    "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk",
+    mode,
+    `app-${mode}-unsigned.apk`,
   ),
 ];
 

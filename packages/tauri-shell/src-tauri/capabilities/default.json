@@ -5,6 +5,25 @@
   "windows": ["*"],
   "permissions": [
     "core:default",
-    "core:webview:allow-internal-toggle-devtools"
+    "core:webview:allow-internal-toggle-devtools",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        {
+          "path": "$APPCACHE/syncpeer/files"
+        },
+        {
+          "path": "$APPCACHE/syncpeer/files/**"
+        }
+      ]
+    },
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "file://*"
+        }
+      ]
+    }
   ]
 }

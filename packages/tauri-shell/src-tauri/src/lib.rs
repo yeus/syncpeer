@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+#[cfg(target_os = "android")]
+use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
 use url::Url;
 use x509_parser::extensions::ParsedExtension;
@@ -69,7 +72,8 @@ struct CachedFileRecord {
     folder_id: String,
     path: String,
     name: String,
-    local_path: String,
+    local_path: Option<String>,
+    saf_relative_path: Option<String>,
     size_bytes: usize,
     cached_at_ms: u64,
     modified_ms: Option<f64>,
@@ -101,6 +105,35 @@ struct CachedFileStatus {
 struct OpenCachedFileRequest {
     folder_id: String,
     path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidOpenWithChooserRequest {
+    path: String,
+    mime_type: Option<String>,
+    chooser_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidSafWriteFileRequest {
+    tree_uri: String,
+    relative_path: String,
+    bytes: Vec<u8>,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AppSettings {
+    android_saf_tree_uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetAndroidSafTreeRequest {
+    tree_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,11 +373,26 @@ fn cache_relative_path(folder_id: &str, normalized_path: &str, fallback_name: &s
     relative
 }
 
+fn cache_relative_directory_path(folder_id: &str, normalized_path: &str) -> PathBuf {
+    let mut relative = PathBuf::new();
+    relative.push(sanitize_path_segment(folder_id));
+    for segment in normalized_path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        relative.push(sanitize_path_segment(segment));
+    }
+    relative
+}
+
 fn cache_folder_root_path(app: &tauri::AppHandle, folder_id: &str) -> Result<PathBuf, String> {
     Ok(app_cache_files_root(app)?.join(sanitize_path_segment(folder_id)))
 }
 
-fn preferred_cache_file_path(app: &tauri::AppHandle, record: &CachedFileRecord) -> Result<PathBuf, String> {
+fn preferred_cache_file_path(
+    app: &tauri::AppHandle,
+    record: &CachedFileRecord,
+) -> Result<PathBuf, String> {
     let cache_root = app_cache_files_root(app)?;
     let normalized_path = normalize_path(&record.path);
     let local_rel = cache_relative_path(&record.folder_id, &normalized_path, &record.name);
@@ -355,7 +403,11 @@ fn resolve_path_for_open_cached_file(
     app: &tauri::AppHandle,
     record: &CachedFileRecord,
 ) -> Result<PathBuf, String> {
-    let current_path = PathBuf::from(&record.local_path);
+    let local_path = record
+        .local_path
+        .as_ref()
+        .ok_or_else(|| "Cached file has no local filesystem path.".to_string())?;
+    let current_path = PathBuf::from(local_path);
     if !current_path.exists() {
         return Err("Cached file is missing on disk.".to_string());
     }
@@ -391,7 +443,7 @@ fn resolve_cached_directory_path(
     let target = if normalized_path.is_empty() {
         cache_folder_root_path(app, folder_id)?
     } else {
-        app_cache_files_root(app)?.join(cache_relative_path(folder_id, &normalized_path, ""))
+        app_cache_files_root(app)?.join(cache_relative_directory_path(folder_id, &normalized_path))
     };
 
     if target.is_dir() {
@@ -488,7 +540,10 @@ fn verify_hostname_against_cert(cert_der: &[u8], host: &str) -> Result<(), Strin
     }
 
     if let Some(ip) = host_ip {
-        if ip_sans.iter().any(|candidate| ip_san_matches(&ip, candidate)) {
+        if ip_sans
+            .iter()
+            .any(|candidate| ip_san_matches(&ip, candidate))
+        {
             return Ok(());
         }
         return Err(format!(
@@ -497,7 +552,10 @@ fn verify_hostname_against_cert(cert_der: &[u8], host: &str) -> Result<(), Strin
         ));
     }
 
-    if dns_sans.iter().any(|candidate| dns_name_matches(normalized_host, candidate)) {
+    if dns_sans
+        .iter()
+        .any(|candidate| dns_name_matches(normalized_host, candidate))
+    {
         return Ok(());
     }
     if has_san {
@@ -560,6 +618,10 @@ fn cache_index_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_root(app)?.join("cache-index.json"))
 }
 
+fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_root(app)?.join("settings.json"))
+}
+
 fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
         return Ok(T::default());
@@ -584,11 +646,102 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .map_err(|error| format!("Could not rename {}: {error}", path.display()))
 }
 
-fn open_file_with_system(app: &tauri::AppHandle, path: &Path) -> Result<(), String> {
+#[cfg(target_os = "android")]
+fn android_open_with_chooser(
+    app: &tauri::AppHandle,
+    path: &Path,
+    mime_type: Option<&str>,
+    chooser_title: Option<&str>,
+) -> Result<(), String> {
     let path_string = path.to_string_lossy().to_string();
-    app.opener()
-        .open_path(path_string, None::<&str>)
+    app.syncpeer_android()
+        .open_with_chooser(&path_string, mime_type, chooser_title)
         .map_err(|error| format!("Could not open {}: {error}", path.display()))
+}
+
+#[cfg(target_os = "android")]
+fn android_write_to_saf_tree(
+    app: &tauri::AppHandle,
+    tree_uri: &str,
+    relative_path: &str,
+    bytes: &[u8],
+    mime_type: Option<&str>,
+) -> Result<(), String> {
+    app.syncpeer_android()
+        .write_file_to_saf_tree(tree_uri, relative_path, bytes, mime_type)
+        .map_err(|error| format!("Could not write {relative_path} to SAF tree: {error}"))
+}
+
+fn read_app_settings(app: &tauri::AppHandle) -> Result<AppSettings, String> {
+    let path = settings_path(app)?;
+    read_json_or_default::<AppSettings>(&path)
+}
+
+fn write_app_settings(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let path = settings_path(app)?;
+    write_json(&path, settings)
+}
+
+fn relative_path_for_saf(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(target_os = "android")]
+fn configured_android_saf_tree_uri(app: &tauri::AppHandle) -> Result<Option<String>, String> {
+    Ok(read_app_settings(app)?.android_saf_tree_uri)
+}
+
+#[cfg(not(target_os = "android"))]
+fn configured_android_saf_tree_uri(_app: &tauri::AppHandle) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "android")]
+fn android_open_saf_path_with_chooser(
+    app: &tauri::AppHandle,
+    tree_uri: &str,
+    relative_path: &str,
+    open_parent: bool,
+) -> Result<(), String> {
+    app.syncpeer_android()
+        .open_saf_path_with_chooser(tree_uri, relative_path, open_parent)
+        .map_err(|error| format!("Could not open SAF path {relative_path}: {error}"))
+}
+
+#[cfg(target_os = "android")]
+fn android_saf_path_exists(
+    app: &tauri::AppHandle,
+    tree_uri: &str,
+    relative_path: &str,
+) -> Result<bool, String> {
+    app.syncpeer_android()
+        .saf_path_exists(tree_uri, relative_path)
+        .map_err(|error| format!("Could not check SAF path {relative_path}: {error}"))
+}
+
+#[cfg(target_os = "android")]
+fn android_delete_saf_path(
+    app: &tauri::AppHandle,
+    tree_uri: &str,
+    relative_path: &str,
+) -> Result<bool, String> {
+    app.syncpeer_android()
+        .delete_saf_path(tree_uri, relative_path)
+        .map_err(|error| format!("Could not delete SAF path {relative_path}: {error}"))
+}
+
+fn open_file_with_system(app: &tauri::AppHandle, path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return android_open_with_chooser(app, path, None, Some("Open with"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let path_string = path.to_string_lossy().to_string();
+        app.opener()
+            .open_path(path_string, None::<&str>)
+            .map_err(|error| format!("Could not open {}: {error}", path.display()))
+    }
 }
 
 fn get_tls_session(
@@ -830,10 +983,18 @@ fn parse_ip_from_relay_address(address: &[u8]) -> Option<String> {
         return Some(std::net::Ipv6Addr::from(octets).to_string());
     }
     let text = String::from_utf8_lossy(address).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
-fn build_discovery_http_request(url: &Url, method: &str, headers: &HashMap<String, String>) -> String {
+fn build_discovery_http_request(
+    url: &Url,
+    method: &str,
+    headers: &HashMap<String, String>,
+) -> String {
     let mut path = url.path().to_string();
     if path.is_empty() {
         path.push('/');
@@ -914,27 +1075,38 @@ fn parse_http_response(raw: &[u8]) -> Result<DiscoveryFetchResponse, String> {
     Ok(DiscoveryFetchResponse { status, body })
 }
 
-fn read_all_from_stream(stream: &mut StreamOwned<ClientConnection, TcpStream>) -> Result<Vec<u8>, String> {
+fn read_all_from_stream(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     loop {
         let mut buf = [0u8; 8192];
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => bytes.extend_from_slice(&buf[..n]),
-            Err(error) if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => continue,
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(error) => return Err(format!("Discovery read failed: {error}")),
         }
     }
     Ok(bytes)
 }
 
-fn perform_pinned_discovery_request(request: &DiscoveryFetchRequest) -> Result<DiscoveryFetchResponse, String> {
-    let url = Url::parse(&request.url).map_err(|error| format!("Invalid discovery URL: {error}"))?;
+fn perform_pinned_discovery_request(
+    request: &DiscoveryFetchRequest,
+) -> Result<DiscoveryFetchResponse, String> {
+    let url =
+        Url::parse(&request.url).map_err(|error| format!("Invalid discovery URL: {error}"))?;
     let host = url
         .host_str()
         .ok_or_else(|| "Discovery URL missing host".to_string())?
         .to_string();
-    let port = url.port_or_known_default().ok_or_else(|| "Discovery URL missing port".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "Discovery URL missing port".to_string())?;
     let address = format!("{host}:{port}");
     let tcp = TcpStream::connect(&address)
         .map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
@@ -973,7 +1145,11 @@ fn perform_pinned_discovery_request(request: &DiscoveryFetchRequest) -> Result<D
 
     let request_text = build_discovery_http_request(
         &url,
-        if request.method.trim().is_empty() { "GET" } else { &request.method },
+        if request.method.trim().is_empty() {
+            "GET"
+        } else {
+            &request.method
+        },
         &request.headers,
     );
     stream
@@ -992,8 +1168,12 @@ fn perform_ca_validated_discovery_request(
     let method = if request.method.trim().is_empty() {
         reqwest::Method::GET
     } else {
-        reqwest::Method::from_bytes(request.method.trim().as_bytes())
-            .map_err(|error| format!("Invalid discovery HTTP method '{}': {error}", request.method))?
+        reqwest::Method::from_bytes(request.method.trim().as_bytes()).map_err(|error| {
+            format!(
+                "Invalid discovery HTTP method '{}': {error}",
+                request.method
+            )
+        })?
     };
 
     let client = reqwest::blocking::Client::builder()
@@ -1242,7 +1422,8 @@ async fn syncpeer_tls_open(
             .map(|cert| cert.as_ref().to_vec())
             .ok_or_else(|| "Peer certificate missing".to_string())?;
         verify_hostname_against_cert(&peer_certificate_der, &tls_host)?;
-        let peer_device_id = canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
+        let peer_device_id =
+            canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
         tauri_log(&format!(
             "tls.open.peer_cert address={} peerCertBytes={} peerDeviceId={}",
             address,
@@ -1258,7 +1439,10 @@ async fn syncpeer_tls_open(
         guard
             .sessions
             .insert(next_id, Arc::new(Mutex::new(TlsSession { stream })));
-        tauri_log(&format!("tls.open.ready address={} sessionId={}", address, next_id));
+        tauri_log(&format!(
+            "tls.open.ready address={} sessionId={}",
+            address, next_id
+        ));
         Ok(TlsOpenResponse {
             session_id: next_id,
             peer_certificate_der,
@@ -1276,8 +1460,9 @@ async fn syncpeer_relay_open(
 ) -> Result<TlsOpenResponse, String> {
     let shared_store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let relay_url = Url::parse(&request.relay_address)
-            .map_err(|error| format!("Invalid relay address '{}': {error}", request.relay_address))?;
+        let relay_url = Url::parse(&request.relay_address).map_err(|error| {
+            format!("Invalid relay address '{}': {error}", request.relay_address)
+        })?;
         if relay_url.scheme() != "relay" {
             return Err(format!(
                 "Relay address must use relay:// scheme, got {}",
@@ -1393,8 +1578,13 @@ async fn syncpeer_relay_open(
             );
         }
 
-        let session_host = parse_ip_from_relay_address(&relay_session_address).unwrap_or(relay_host);
-        let session_port = if session_port == 0 { relay_port } else { session_port };
+        let session_host =
+            parse_ip_from_relay_address(&relay_session_address).unwrap_or(relay_host);
+        let session_port = if session_port == 0 {
+            relay_port
+        } else {
+            session_port
+        };
         let relay_session_endpoint = format!("{session_host}:{session_port}");
         tauri_log(&format!(
             "relay.open.session endpoint={} keyLen={}",
@@ -1460,7 +1650,8 @@ async fn syncpeer_relay_open(
             .and_then(|certs| certs.first())
             .map(|cert| cert.as_ref().to_vec())
             .ok_or_else(|| "Relay BEP peer certificate missing".to_string())?;
-        let peer_device_id = canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
+        let peer_device_id =
+            canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
         tauri_log(&format!(
             "relay.open.peer_cert endpoint={} peerDeviceId={}",
             relay_session_endpoint, peer_device_id
@@ -1667,24 +1858,34 @@ async fn syncpeer_cache_file(
         }
     };
 
-    let cache_root = app_cache_files_root(&app)?;
-    fs::create_dir_all(&cache_root).map_err(|error| {
-        format!(
-            "Could not create cache root {}: {error}",
-            cache_root.display()
-        )
-    })?;
-    let local_path = cache_root.join(local_rel);
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    let mut local_path: Option<String> = None;
+    let mut saf_relative_path: Option<String> = None;
+    if let Some(_tree_uri) = configured_android_saf_tree_uri(&app)? {
+        let relative_path = relative_path_for_saf(&local_rel);
+        #[cfg(target_os = "android")]
+        android_write_to_saf_tree(&app, &_tree_uri, &relative_path, &request.bytes, None)?;
+        saf_relative_path = Some(relative_path);
+    } else {
+        let cache_root = app_cache_files_root(&app)?;
+        fs::create_dir_all(&cache_root).map_err(|error| {
+            format!(
+                "Could not create cache root {}: {error}",
+                cache_root.display()
+            )
+        })?;
+        let local_abs_path = cache_root.join(local_rel);
+        if let Some(parent) = local_abs_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+        }
+        fs::write(&local_abs_path, &request.bytes).map_err(|error| {
+            format!(
+                "Could not write cached file {}: {error}",
+                local_abs_path.display()
+            )
+        })?;
+        local_path = Some(local_abs_path.to_string_lossy().to_string());
     }
-    fs::write(&local_path, &request.bytes).map_err(|error| {
-        format!(
-            "Could not write cached file {}: {error}",
-            local_path.display()
-        )
-    })?;
 
     let index_path = cache_index_path(&app)?;
     let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
@@ -1694,7 +1895,8 @@ async fn syncpeer_cache_file(
         folder_id: request.folder_id.trim().to_string(),
         path: normalized_path,
         name: display_name,
-        local_path: local_path.to_string_lossy().to_string(),
+        local_path,
+        saf_relative_path,
         size_bytes: request.bytes.len(),
         cached_at_ms: now_ms(),
         modified_ms: request.modified_ms,
@@ -1703,6 +1905,142 @@ async fn syncpeer_cache_file(
     write_json(&index_path, &index)?;
 
     Ok(record)
+}
+
+#[tauri::command]
+async fn syncpeer_android_open_with_chooser(
+    app: tauri::AppHandle,
+    request: AndroidOpenWithChooserRequest,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let path = PathBuf::from(&request.path);
+        return android_open_with_chooser(
+            &app,
+            &path,
+            request.mime_type.as_deref(),
+            request.chooser_title.as_deref(),
+        );
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_write_saf_file(
+    app: tauri::AppHandle,
+    request: AndroidSafWriteFileRequest,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return android_write_to_saf_tree(
+            &app,
+            &request.tree_uri,
+            &request.relative_path,
+            &request.bytes,
+            request.mime_type.as_deref(),
+        );
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_pick_saf_directory(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .pick_saf_directory()
+            .map_err(|error| format!("Could not pick SAF directory: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_list_persisted_saf_uris(
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .list_persisted_saf_tree_uris()
+            .map_err(|error| format!("Could not list SAF URIs: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_get_android_saf_tree_uri(
+    app: tauri::AppHandle,
+) -> Result<Option<String>, String> {
+    Ok(read_app_settings(&app)?.android_saf_tree_uri)
+}
+
+#[tauri::command]
+async fn syncpeer_set_android_saf_tree_uri(
+    app: tauri::AppHandle,
+    request: SetAndroidSafTreeRequest,
+) -> Result<Option<String>, String> {
+    let mut settings = read_app_settings(&app)?;
+    #[cfg(target_os = "android")]
+    if let Some(new_tree_uri) = request.tree_uri.as_deref() {
+        if settings.android_saf_tree_uri.as_deref() != Some(new_tree_uri) {
+            let index_path = cache_index_path(&app)?;
+            let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
+            let mut touched = false;
+            for record in &mut index.files {
+                let normalized_path = normalize_path(&record.path);
+                let relative = relative_path_for_saf(&cache_relative_path(
+                    &record.folder_id,
+                    &normalized_path,
+                    &record.name,
+                ));
+                if record.saf_relative_path.as_deref() != Some(relative.as_str()) {
+                    if let Some(local_path) = &record.local_path {
+                        let local_path = PathBuf::from(local_path);
+                        if local_path.exists() {
+                            let bytes = fs::read(&local_path).map_err(|error| {
+                                format!("Could not read {}: {error}", local_path.display())
+                            })?;
+                            android_write_to_saf_tree(&app, new_tree_uri, &relative, &bytes, None)?;
+                        }
+                    }
+                    record.saf_relative_path = Some(relative);
+                    touched = true;
+                }
+                if record.local_path.is_some() {
+                    record.local_path = None;
+                    touched = true;
+                }
+            }
+            if touched {
+                write_json(&index_path, &index)?;
+            }
+            let files_root = app_cache_files_root(&app)?;
+            if files_root.exists() {
+                let _ = fs::remove_dir_all(&files_root);
+            }
+        }
+    }
+    settings.android_saf_tree_uri = request.tree_uri;
+    write_app_settings(&app, &settings)?;
+    Ok(settings.android_saf_tree_uri)
 }
 
 #[tauri::command]
@@ -1723,12 +2061,36 @@ async fn syncpeer_get_cached_statuses(
             let normalized = normalize_path(&raw_path);
             let key = cache_key(&request.folder_id, &normalized);
             if let Some(record) = index.files.iter().find(|entry| entry.key == key) {
-                let local_path = PathBuf::from(&record.local_path);
-                if local_path.exists() {
+                if let Some(local_path) = &record.local_path {
+                    let local_path = PathBuf::from(local_path);
+                    if local_path.exists() {
+                        return CachedFileStatus {
+                            path: normalized,
+                            available: true,
+                            local_path: Some(local_path.to_string_lossy().to_string()),
+                            cached_at_ms: Some(record.cached_at_ms),
+                        };
+                    }
+                }
+                #[cfg(target_os = "android")]
+                if let (Some(tree_uri), Some(relative_path)) = (
+                    configured_android_saf_tree_uri(&app).ok().flatten(),
+                    record.saf_relative_path.as_deref(),
+                ) {
+                    if android_saf_path_exists(&app, &tree_uri, relative_path).unwrap_or(false) {
+                        return CachedFileStatus {
+                            path: normalized,
+                            available: true,
+                            local_path: None,
+                            cached_at_ms: Some(record.cached_at_ms),
+                        };
+                    }
+                }
+                if record.local_path.is_none() && record.saf_relative_path.is_some() {
                     return CachedFileStatus {
                         path: normalized,
                         available: true,
-                        local_path: Some(record.local_path.clone()),
+                        local_path: None,
                         cached_at_ms: Some(record.cached_at_ms),
                     };
                 }
@@ -1779,6 +2141,13 @@ async fn syncpeer_open_cached_file(
         .iter()
         .find(|entry| entry.key == key)
         .ok_or_else(|| "No cached file for this path.".to_string())?;
+    #[cfg(target_os = "android")]
+    if let (Some(tree_uri), Some(relative_path)) = (
+        configured_android_saf_tree_uri(&app)?,
+        record.saf_relative_path.as_deref(),
+    ) {
+        return android_open_saf_path_with_chooser(&app, &tree_uri, relative_path, false);
+    }
     let open_path = resolve_path_for_open_cached_file(&app, record)?;
     open_file_with_system(&app, &open_path)
 }
@@ -1803,6 +2172,13 @@ async fn syncpeer_open_cached_file_directory(
         .iter()
         .find(|entry| entry.key == key)
         .ok_or_else(|| "No cached file for this path.".to_string())?;
+    #[cfg(target_os = "android")]
+    if let (Some(tree_uri), Some(relative_path)) = (
+        configured_android_saf_tree_uri(&app)?,
+        record.saf_relative_path.as_deref(),
+    ) {
+        return android_open_saf_path_with_chooser(&app, &tree_uri, relative_path, true);
+    }
     let open_path = resolve_path_for_open_cached_file(&app, record)?;
     let parent = open_path
         .parent()
@@ -1819,8 +2195,29 @@ async fn syncpeer_open_cached_directory(
     if request.folder_id.trim().is_empty() {
         return Err("folderId is required.".to_string());
     }
+    #[cfg(target_os = "android")]
+    if let Some(tree_uri) = configured_android_saf_tree_uri(&app)? {
+        let normalized_path = normalize_path(&request.path);
+        let relative = relative_path_for_saf(&cache_relative_directory_path(
+            &request.folder_id,
+            &normalized_path,
+        ));
+        return android_open_saf_path_with_chooser(&app, &tree_uri, &relative, false);
+    }
     let directory = resolve_cached_directory_path(&app, &request.folder_id, &request.path)?;
     open_file_with_system(&app, &directory)
+}
+
+#[tauri::command]
+async fn syncpeer_resolve_cached_directory(
+    app: tauri::AppHandle,
+    request: OpenCachedFileRequest,
+) -> Result<String, String> {
+    if request.folder_id.trim().is_empty() {
+        return Err("folderId is required.".to_string());
+    }
+    let directory = resolve_cached_directory_path(&app, &request.folder_id, &request.path)?;
+    Ok(directory.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1846,10 +2243,20 @@ async fn syncpeer_remove_cached_file(
     let record = index.files.remove(record_index);
     write_json(&index_path, &index)?;
 
-    let local_path = PathBuf::from(record.local_path);
-    if local_path.exists() {
-        fs::remove_file(&local_path)
-            .map_err(|error| format!("Could not remove {}: {error}", local_path.display()))?;
+    if let Some(local_path) = record.local_path.as_deref() {
+        let local_path = PathBuf::from(local_path);
+        if local_path.exists() {
+            fs::remove_file(&local_path)
+                .map_err(|error| format!("Could not remove {}: {error}", local_path.display()))?;
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    if let (Some(tree_uri), Some(relative_path)) = (
+        configured_android_saf_tree_uri(&app)?,
+        record.saf_relative_path.as_deref(),
+    ) {
+        let _ = android_delete_saf_path(&app, &tree_uri, relative_path);
     }
 
     Ok(true)
@@ -1857,13 +2264,32 @@ async fn syncpeer_remove_cached_file(
 
 #[tauri::command]
 async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
-    let files_root = app_cache_files_root(&app)?;
-    if files_root.exists() {
-        fs::remove_dir_all(&files_root)
-            .map_err(|error| format!("Could not remove {}: {error}", files_root.display()))?;
+    let index_path = cache_index_path(&app)?;
+    let index = read_json_or_default::<CacheIndex>(&index_path)?;
+
+    for record in &index.files {
+        if let Some(local_path) = &record.local_path {
+            let local_path = PathBuf::from(local_path);
+            if local_path.exists() {
+                let _ = fs::remove_file(&local_path);
+            }
+        }
     }
 
-    let index_path = cache_index_path(&app)?;
+    let files_root = app_cache_files_root(&app)?;
+    if files_root.exists() {
+        let _ = fs::remove_dir_all(&files_root);
+    }
+
+    #[cfg(target_os = "android")]
+    if let Some(tree_uri) = configured_android_saf_tree_uri(&app)? {
+        for record in &index.files {
+            if let Some(relative_path) = &record.saf_relative_path {
+                let _ = android_delete_saf_path(&app, &tree_uri, relative_path);
+            }
+        }
+    }
+
     if index_path.exists() {
         fs::remove_file(&index_path)
             .map_err(|error| format!("Could not remove {}: {error}", index_path.display()))?;
@@ -1875,6 +2301,7 @@ async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_syncpeer_android::init())
         .plugin(tauri_plugin_opener::init())
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .invoke_handler(tauri::generate_handler![
@@ -1893,11 +2320,18 @@ pub fn run() {
             syncpeer_upsert_favorite,
             syncpeer_remove_favorite,
             syncpeer_cache_file,
+            syncpeer_android_open_with_chooser,
+            syncpeer_android_write_saf_file,
+            syncpeer_android_pick_saf_directory,
+            syncpeer_android_list_persisted_saf_uris,
+            syncpeer_get_android_saf_tree_uri,
+            syncpeer_set_android_saf_tree_uri,
             syncpeer_list_cached_files,
             syncpeer_get_cached_statuses,
             syncpeer_open_cached_file,
             syncpeer_open_cached_file_directory,
             syncpeer_open_cached_directory,
+            syncpeer_resolve_cached_directory,
             syncpeer_remove_cached_file,
             syncpeer_clear_cache
         ])

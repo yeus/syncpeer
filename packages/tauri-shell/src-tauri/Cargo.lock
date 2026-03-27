@@ -4144,6 +4144,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-syncpeer-android"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tauri-runtime"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4209,6 +4220,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tauri-plugin-syncpeer-android",
  "url",
  "x509-parser",
 ]

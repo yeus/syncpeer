@@ -46,6 +46,7 @@
             yarn
 
             rustup
+            gh
 
             pkg-config
             openssl

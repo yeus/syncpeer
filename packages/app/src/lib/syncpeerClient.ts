@@ -63,7 +63,8 @@ export interface CachedFileRecord {
   folderId: string;
   path: string;
   name: string;
-  localPath: string;
+  localPath?: string;
+  safRelativePath?: string;
   sizeBytes: number;
   cachedAtMs: number;
   modifiedMs?: number;
@@ -553,6 +554,16 @@ export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) 
     removeCachedFile: async (folderId: string, path: string): Promise<boolean> =>
       invokeWithLogging<boolean>("syncpeer_remove_cached_file", { request: { folderId, path } }),
     clearCache: async (): Promise<void> => invokeWithLogging("syncpeer_clear_cache"),
+    getAndroidSafTreeUri: async (): Promise<string | null> =>
+      invokeWithLogging<string | null>("syncpeer_get_android_saf_tree_uri"),
+    pickAndroidSafDirectory: async (): Promise<string> =>
+      invokeWithLogging<string>("syncpeer_android_pick_saf_directory"),
+    setAndroidSafTreeUri: async (treeUri?: string | null): Promise<string | null> =>
+      invokeWithLogging<string | null>("syncpeer_set_android_saf_tree_uri", {
+        request: { treeUri: treeUri ?? null },
+      }),
+    listAndroidPersistedSafUris: async (): Promise<string[]> =>
+      invokeWithLogging<string[]>("syncpeer_android_list_persisted_saf_uris"),
     exportIdentityRecovery: async (): Promise<IdentityRecoveryExportResponse> =>
       invokeWithLogging<IdentityRecoveryExportResponse>("syncpeer_export_identity_recovery"),
     restoreIdentityRecovery: async (recoverySecret: string): Promise<void> => {

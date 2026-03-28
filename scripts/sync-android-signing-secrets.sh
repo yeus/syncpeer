@@ -14,14 +14,21 @@ Usage:
 Wizard behavior:
   - Loads Android signing values from Linux Secret Service.
   - Missing values are auto-created with safe defaults (no free-text prompts).
-  - Creates default keystore if missing.
-  - Uploads GitHub Actions secrets to the target repo.
+  - Ensures keystore exists locally (restores from Secret Service base64 or creates default).
+  - Secret Service is treated as source of truth and overwrites GitHub Actions secrets.
 
 GitHub secrets written:
   ANDROID_KEYSTORE_BASE64
   ANDROID_KEYSTORE_PASSWORD
   ANDROID_KEY_ALIAS
   ANDROID_KEY_PASSWORD
+
+Secret Service entries written:
+  android_keystore_path
+  android_keystore_base64
+  android_keystore_password
+  android_key_alias
+  android_key_password
 USAGE
 }
 
@@ -59,6 +66,49 @@ secret_store() {
       app "$APP_NAME" \
       scope "$DEFAULT_SCOPE" \
       key "$key" >/dev/null
+}
+
+decode_base64_to_file() {
+  local value="$1"
+  local destination="$2"
+
+  if printf '%s' "$value" | base64 -d >"$destination" 2>/dev/null; then
+    return 0
+  fi
+  if printf '%s' "$value" | base64 --decode >"$destination" 2>/dev/null; then
+    return 0
+  fi
+  if printf '%s' "$value" | base64 -D >"$destination" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+encode_file_base64() {
+  local file_path="$1"
+  if encoded="$(base64 -w 0 "$file_path" 2>/dev/null)"; then
+    printf '%s' "$encoded"
+  else
+    base64 "$file_path" | tr -d '\n'
+  fi
+}
+
+expand_home_path() {
+  local path="$1"
+  local expanded="$path"
+  expanded="${expanded/#\~/$HOME}"
+  expanded="${expanded//\$\{HOME\}/$HOME}"
+  expanded="${expanded//\$HOME/$HOME}"
+  printf '%s' "$expanded"
+}
+
+require_non_empty_secret() {
+  local key="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    echo "Missing required Secret Service entry after reconciliation: $key" >&2
+    exit 1
+  fi
 }
 
 prompt_yes_no() {
@@ -189,8 +239,15 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-existing_path="$(secret_lookup "android_keystore_path")"
-keystore_path="$DEFAULT_KEYSTORE_PATH"
+stored_keystore_path="$(get_or_create_default_secret \
+  "android_keystore_path" \
+  "Syncpeer Android keystore path" \
+  "$DEFAULT_KEYSTORE_PATH")"
+keystore_path="$(expand_home_path "$stored_keystore_path")"
+if [[ "$keystore_path" != "$stored_keystore_path" ]]; then
+  secret_store "android_keystore_path" "Syncpeer Android keystore path" "$keystore_path"
+  echo "Normalized Secret Service entry: android_keystore_path"
+fi
 
 key_alias="$(get_or_create_default_secret \
   "android_key_alias" \
@@ -205,21 +262,35 @@ key_password="$(get_or_create_generated_secret \
   "android_key_password" \
   "Syncpeer Android key password")"
 
+keystore_b64_from_store="$(secret_lookup "android_keystore_base64")"
+
 printf 'Wizard summary:\n'
 printf '  Repo: %s\n' "$TARGET_REPO"
 printf '  Keystore path: %s\n' "$keystore_path"
 printf '  Key alias: %s\n' "$key_alias"
 printf '  Missing values were auto-created in Secret Service.\n'
-if [[ -n "$existing_path" && "$existing_path" != "$DEFAULT_KEYSTORE_PATH" ]]; then
-  printf '  Note: existing stored keystore path will be replaced: %s\n' "$existing_path"
-fi
+printf '  Secret Service is the source of truth and will overwrite GitHub secrets.\n'
 
-if ! prompt_yes_no "Proceed to create/use the default keystore and upload GitHub secrets?"; then
+if ! prompt_yes_no "Proceed to reconcile local Secret Service + keystore and overwrite GitHub secrets?"; then
   echo "Aborted by user."
   exit 0
 fi
 
-ensure_default_keystore "$keystore_path" "$key_alias" "$keystore_password" "$key_password"
+if [[ ! -f "$keystore_path" ]]; then
+  mkdir -p "$(dirname "$keystore_path")"
+  if [[ -n "$keystore_b64_from_store" ]]; then
+    if decode_base64_to_file "$keystore_b64_from_store" "$keystore_path"; then
+      chmod 600 "$keystore_path"
+      echo "Restored keystore from Secret Service base64: $keystore_path"
+    else
+      echo "Stored 'android_keystore_base64' is not valid base64; cannot restore keystore." >&2
+      exit 1
+    fi
+  else
+    ensure_default_keystore "$keystore_path" "$key_alias" "$keystore_password" "$key_password"
+  fi
+fi
+
 if ! keystore_has_alias "$keystore_path" "$keystore_password" "$key_alias"; then
   backup_path="${keystore_path}.bak.$(date +%s)"
   if prompt_yes_no "Default keystore exists but alias '$key_alias' is missing. Recreate default keystore (backup -> $backup_path)?"; then
@@ -237,16 +308,23 @@ if [[ ! -f "$keystore_path" ]]; then
   exit 1
 fi
 
-if keystore_b64="$(base64 -w 0 "$keystore_path" 2>/dev/null)"; then
-  :
-else
-  keystore_b64="$(base64 "$keystore_path" | tr -d '\n')"
-fi
+keystore_b64="$(encode_file_base64 "$keystore_path")"
+secret_store "android_keystore_base64" "Syncpeer Android keystore base64" "$keystore_b64"
 
-upload_secret "$TARGET_REPO" "ANDROID_KEYSTORE_BASE64" "$keystore_b64"
-upload_secret "$TARGET_REPO" "ANDROID_KEYSTORE_PASSWORD" "$keystore_password"
-upload_secret "$TARGET_REPO" "ANDROID_KEY_ALIAS" "$key_alias"
-upload_secret "$TARGET_REPO" "ANDROID_KEY_PASSWORD" "$key_password"
+local_keystore_b64="$(secret_lookup "android_keystore_base64")"
+local_keystore_password="$(secret_lookup "android_keystore_password")"
+local_key_alias="$(secret_lookup "android_key_alias")"
+local_key_password="$(secret_lookup "android_key_password")"
+
+require_non_empty_secret "android_keystore_base64" "$local_keystore_b64"
+require_non_empty_secret "android_keystore_password" "$local_keystore_password"
+require_non_empty_secret "android_key_alias" "$local_key_alias"
+require_non_empty_secret "android_key_password" "$local_key_password"
+
+upload_secret "$TARGET_REPO" "ANDROID_KEYSTORE_BASE64" "$local_keystore_b64"
+upload_secret "$TARGET_REPO" "ANDROID_KEYSTORE_PASSWORD" "$local_keystore_password"
+upload_secret "$TARGET_REPO" "ANDROID_KEY_ALIAS" "$local_key_alias"
+upload_secret "$TARGET_REPO" "ANDROID_KEY_PASSWORD" "$local_key_password"
 
 echo
 printf 'Done. Uploaded Android release signing secrets to %s\n' "$TARGET_REPO"

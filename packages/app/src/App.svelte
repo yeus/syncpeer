@@ -73,6 +73,7 @@
     savedDevices: SavedDevice[];
     syncApprovedIntroducedFolderKeys?: string[];
     acceptedIntroducedFolderKeys?: string[];
+    folderPasswords?: Record<string, string>;
   }
 
   interface SessionLogItem {
@@ -124,8 +125,10 @@
     return parsed
       .filter((item) => typeof item?.id === "string" && item.id.trim() !== "")
       .map((item) => ({
-        id: String(item.id).trim(),
-        name: String(item.name ?? "").trim() || String(item.id).trim(),
+        id: String(item.id).trim().toUpperCase().replace(/[^A-Z2-7]/g, ""),
+        name:
+          String(item.name ?? "").trim() ||
+          String(item.id).trim().toUpperCase().replace(/[^A-Z2-7]/g, ""),
         createdAtMs: Number(item.createdAtMs) || Date.now(),
         isIntroducer: item.isIntroducer === true,
       }))
@@ -156,13 +159,33 @@
     value
       .trim()
       .toUpperCase()
-      .replace(/[^A-Z2-7-]/g, "");
+      .replace(/[^A-Z2-7]/g, "");
   const compactDeviceId = (value: string): string =>
-    normalizeDeviceId(value).replace(/-/g, "");
+    normalizeDeviceId(value);
   const isValidSyncthingDeviceId = (value: string): boolean =>
     [52, 56].includes(compactDeviceId(value).length);
+  const normalizeFolderPasswords = (
+    value: Record<string, string> | null | undefined,
+  ): Record<string, string> =>
+    Object.fromEntries(
+      Object.entries(value ?? {})
+        .map(([folderId, password]) => [folderId.trim(), String(password ?? "").trim()])
+        .filter(([folderId, password]) => folderId !== "" && password !== ""),
+    );
   const folderDisplayName = (folder: FolderInfo): string =>
     folder.label || folder.id;
+  const folderState = (folderId: string): FolderInfo | undefined =>
+    folders.find((folder) => folder.id === folderId);
+  const folderIsLocked = (folderId: string): boolean => {
+    const folder = folderState(folderId);
+    return !!folder?.encrypted && !!folder?.needsPassword;
+  };
+  const folderLockLabel = (folderId: string): string => {
+    const folder = folderState(folderId);
+    if (!folder?.encrypted) return "";
+    if (folder.passwordError) return "password error";
+    return folder.needsPassword ? "locked" : "unlocked";
+  };
   const favoriteKey = (
     folderId: string,
     path: string,
@@ -299,7 +322,9 @@
       persistedState?.acceptedIntroducedFolderKeys,
   );
   let selectedSavedDeviceId =
-    persistedState?.selectedSavedDeviceId || savedDevices[0]?.id || "";
+    normalizeDeviceId(persistedState?.selectedSavedDeviceId || savedDevices[0]?.id || "");
+  let folderPasswords = normalizeFolderPasswords(persistedState?.folderPasswords);
+  let folderPasswordDrafts: Record<string, string> = { ...folderPasswords };
   let newSavedDeviceName = "";
   let newSavedDeviceId = "";
   let visibleBreadcrumbs: BreadcrumbSegment[] = [];
@@ -409,6 +434,7 @@
     connection: toConnectionSettings(),
     savedDevices,
     syncApprovedIntroducedFolderKeys: [...syncApprovedIntroducedFolderKeys].sort(),
+    folderPasswords,
   });
   $: if (
     savedDevices.length > 0 &&
@@ -456,6 +482,7 @@
     deviceName,
     timeoutMs,
     enableRelayFallback,
+    folderPasswords,
   });
 
   const rootFolderEntries = (): RootFolderEntry[] =>
@@ -695,6 +722,47 @@
       next.add(folder.key);
     }
     syncApprovedIntroducedFolderKeys = next;
+  };
+  const updateFolderPasswordDraft = (folderId: string, password: string): void => {
+    folderPasswordDrafts = {
+      ...folderPasswordDrafts,
+      [folderId]: password,
+    };
+  };
+  const handleFolderPasswordInput = (folderId: string, event: Event): void => {
+    const target = event.currentTarget;
+    updateFolderPasswordDraft(
+      folderId,
+      target instanceof HTMLInputElement ? target.value : "",
+    );
+  };
+  const saveFolderPassword = async (folderId: string): Promise<void> => {
+    const password = (folderPasswordDrafts[folderId] ?? "").trim();
+    if (!password) {
+      const next = { ...folderPasswords };
+      delete next[folderId];
+      folderPasswords = next;
+      return;
+    }
+    folderPasswords = {
+      ...folderPasswords,
+      [folderId]: password,
+    };
+    if (isConnected) {
+      await refreshOverview();
+    }
+  };
+  const clearFolderPassword = async (folderId: string): Promise<void> => {
+    const next = { ...folderPasswords };
+    delete next[folderId];
+    folderPasswords = next;
+    folderPasswordDrafts = {
+      ...folderPasswordDrafts,
+      [folderId]: "",
+    };
+    if (isConnected) {
+      await refreshOverview();
+    }
   };
 
   async function hydratePersistedState() {
@@ -951,6 +1019,7 @@
   }
 
   async function openFolderRoot(folderId: string) {
+    if (folderIsLocked(folderId)) return;
     currentFolderId = folderId;
     currentPath = "";
     currentFolderVersionKey = "";
@@ -984,6 +1053,11 @@
 
   async function loadCurrentDirectory() {
     if (!remoteFs || !currentFolderId) return;
+    if (folderIsLocked(currentFolderId)) {
+      entries = [];
+      isLoadingDirectory = false;
+      return;
+    }
     error = null;
     const requestSeq = ++directoryLoadSeq;
     isLoadingDirectory = true;
@@ -1046,6 +1120,12 @@
       connectionPath = overview.connectedVia;
       connectionTransport = overview.transportKind;
       if (activeTab === "folders" && currentFolderId) {
+        if (folderIsLocked(currentFolderId)) {
+          entries = [];
+          currentFolderVersionKey = "";
+          lastUpdatedAt = new Date().toLocaleTimeString();
+          return;
+        }
         const nextFolderVersionKey = folderVersionKey(currentFolderId);
         const shouldReloadDirectory =
           entries.length === 0 ||
@@ -2085,13 +2165,52 @@
                       <button
                         class="item-title"
                         on:click={() => openFolderRoot(folder.id)}
+                        disabled={folderIsLocked(folder.id)}
                         >{folder.name}</button
                       >
                       <div class="item-meta">
                         {folder.readOnly ? "read-only" : "read-write"}
                       </div>
+                      {#if folderState(folder.id)?.encrypted}
+                        <div class="item-meta">
+                          receive-encrypted | {folderLockLabel(folder.id)}
+                        </div>
+                        {#if folderState(folder.id)?.passwordError}
+                          <div class="item-meta">
+                            {folderState(folder.id)?.passwordError}
+                          </div>
+                        {/if}
+                        <label class="inline-input">
+                          <span>Folder Password</span>
+                          <input
+                            type="password"
+                            value={folderPasswordDrafts[folder.id] ?? folderPasswords[folder.id] ?? ""}
+                            on:input={(event) =>
+                              handleFolderPasswordInput(folder.id, event)}
+                            placeholder="Syncthing folder encryption password"
+                          />
+                        </label>
+                      {/if}
                     </div>
                     <div class="item-actions">
+                      {#if folderState(folder.id)?.encrypted}
+                        <span class={`status-chip small ${folderIsLocked(folder.id) ? "offline" : "online"}`}>
+                          {folderLockLabel(folder.id)}
+                        </span>
+                        <button
+                          class="ghost"
+                          on:click={() => saveFolderPassword(folder.id)}
+                        >
+                          Save Password
+                        </button>
+                        <button
+                          class="ghost"
+                          on:click={() => clearFolderPassword(folder.id)}
+                          disabled={!folderPasswords[folder.id]}
+                        >
+                          Clear Password
+                        </button>
+                      {/if}
                       <button
                         class="ghost"
                         on:click={() => openCachedDirectory(folder.id, "")}
@@ -2121,7 +2240,11 @@
             </ul>
           {:else}
             <ul class="list">
-              {#if isLoadingDirectory}
+              {#if folderIsLocked(currentFolderId)}
+                <li class="empty">
+                  This receive-encrypted folder is locked. Save the folder password from the folder list to browse or download files.
+                </li>
+              {:else if isLoadingDirectory}
                 <li class="empty">Loading folder contents...</li>
               {:else if entries.length === 0}
                 <li class="empty">Folder is empty.</li>
@@ -2349,6 +2472,11 @@
     align-items: center;
     gap: 0.45rem;
     min-height: 42px;
+  }
+
+  .inline-input {
+    margin-top: 0.35rem;
+    max-width: 24rem;
   }
 
   .checkbox-row input[type="checkbox"] {

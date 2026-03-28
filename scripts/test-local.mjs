@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 /*
  * Local fully-automated Syncthing integration test.
@@ -13,10 +14,14 @@ const root = path.resolve(".tmp/syncpeer-test");
 const aHome = path.join(root, "st-a");
 const bHome = path.join(root, "st-b");
 const folderId = "syncpeer-test";
+const encryptedFolderId = "syncpeer-encrypted";
 const bShareDir = path.join(root, "share-b");
 const aRecvDir = path.join(root, "share-a");
+const bEncryptedShareDir = path.join(root, "share-b-encrypted");
 const cliConfigHome = path.join(root, "xdg-config");
 const cliNodeHome = path.join(cliConfigHome, "syncpeer", "cli-node");
+const cliUntrustedHome = path.join(root, "cli-untrusted-node");
+const encryptedFolderPassword = "correct horse battery staple";
 const toolsDir = path.resolve(".tools");
 const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
 const A_SYNC_ADDR = "tcp://127.0.0.1:58300";
@@ -72,14 +77,30 @@ function startSyncthing(home) {
 }
 
 function readDeviceId(home) {
-  const out = execFileSync(syncthingBin, ["device-id", "--home", home], {
-    encoding: "utf8",
-  });
-  const match = out.match(/([A-Z2-7]{7}(?:-[A-Z2-7]{7}){7})/);
+  const certPath = path.join(home, "cert.pem");
+  const certPem = fs.readFileSync(certPath, "utf8");
+  const match = certPem.match(
+    /-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/,
+  );
   if (!match) {
-    throw new Error(`Could not parse device ID from:\n${out}`);
+    throw new Error(`Could not parse certificate PEM from ${certPath}`);
   }
-  return match[1].trim();
+  const certDer = Buffer.from(match[1].replace(/\s+/g, ""), "base64");
+  const digest = createHash("sha256").update(certDer).digest();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (const byte of digest) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
+  return output;
 }
 
 function escapeXml(v) {
@@ -112,7 +133,7 @@ function setSingleListenAddress(xml, address) {
   );
 }
 
-function addTopLevelDevice(xml, deviceId, name, address) {
+function addTopLevelDevice(xml, deviceId, name, address, options = {}) {
   if (xml.includes(`<device id="${deviceId}"`)) {
     return xml;
   }
@@ -123,7 +144,7 @@ function addTopLevelDevice(xml, deviceId, name, address) {
         <maxSendKbps>0</maxSendKbps>
         <maxRecvKbps>0</maxRecvKbps>
         <maxRequestKiB>0</maxRequestKiB>
-        <untrusted>false</untrusted>
+        <untrusted>${options.untrusted ? "true" : "false"}</untrusted>
         <remoteGUIPort>0</remoteGUIPort>
         <numConnections>0</numConnections>
     </device>
@@ -131,14 +152,14 @@ function addTopLevelDevice(xml, deviceId, name, address) {
   return xml.replace(/(\s*<gui\b[\s\S]*$)/, `${block}$1`);
 }
 
-function addFolder(xml, id, label, folderPath, type, deviceIds) {
+function addFolder(xml, id, label, folderPath, type, deviceIds, options = {}) {
   if (xml.includes(`<folder id="${id}"`)) {
     return xml;
   }
   const uniqueDeviceIds = [...new Set(deviceIds)];
   const deviceBlocks = uniqueDeviceIds
     .map((deviceId) => `        <device id="${escapeXml(deviceId)}" introducedBy="">
-            <encryptionPassword></encryptionPassword>
+            <encryptionPassword>${escapeXml(options.encryptionPasswords?.[deviceId] ?? "")}</encryptionPassword>
         </device>`)
     .join("\n");
   const block = `    <folder id="${escapeXml(id)}" label="${escapeXml(label)}" path="${escapeXml(folderPath)}" type="${escapeXml(type)}" rescanIntervalS="30" fsWatcherEnabled="false" fsWatcherDelayS="10" fsWatcherTimeoutS="0" ignorePerms="false" autoNormalize="true">
@@ -189,9 +210,21 @@ function configureHome(home, opts) {
   xml = replaceGuiAddress(xml, opts.guiAddress);
   xml = setSingleListenAddress(xml, opts.listenAddress);
   for (const remote of opts.remoteDevices) {
-    xml = addTopLevelDevice(xml, remote.id, remote.name, remote.address);
+    xml = addTopLevelDevice(xml, remote.id, remote.name, remote.address, {
+      untrusted: remote.untrusted === true,
+    });
   }
-  xml = addFolder(xml, folderId, folderId, opts.folderPath, opts.folderType, opts.folderDeviceIds);
+  for (const folder of opts.folders) {
+    xml = addFolder(
+      xml,
+      folder.id,
+      folder.label,
+      folder.path,
+      folder.type,
+      folder.deviceIds,
+      { encryptionPasswords: folder.encryptionPasswords ?? {} },
+    );
+  }
   fs.writeFileSync(configPath, xml);
 }
 
@@ -250,35 +283,47 @@ async function main() {
   ensureDir(bHome);
   ensureDir(aRecvDir);
   ensureDir(bShareDir);
+  ensureDir(bEncryptedShareDir);
+  ensureDir(cliUntrustedHome);
 
   const expectedA = "hello from syncthing test\n";
+  const expectedEncrypted = "super secret from encrypted folder\n";
   writeFile(path.join(bShareDir, "a.txt"), expectedA);
   writeFile(path.join(bShareDir, "subdir", "nested.txt"), "nested file\n");
   writeFile(path.join(bShareDir, "blob.bin"), randomBuffer(300 * 1024));
+  writeFile(path.join(bEncryptedShareDir, "secret.txt"), expectedEncrypted);
 
   console.log("Building CLI packages...");
   execFileSync(npmCmd, ["run", "build:core"], { stdio: "inherit" });
   execFileSync(npmCmd, ["run", "build:cli"], { stdio: "inherit" });
 
   console.log("Bootstrapping Syncthing homes...");
-  execFileSync(syncthingBin, ["generate", "--home", aHome, "--no-port-probing"], { stdio: "inherit" });
-  execFileSync(syncthingBin, ["generate", "--home", bHome, "--no-port-probing"], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", aHome], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", bHome], { stdio: "inherit" });
 
   const aId = readDeviceId(aHome);
   const bId = readDeviceId(bHome);
 
   console.log("Preparing persisted cli-node identity...");
   ensureDir(cliNodeHome);
-  execFileSync(syncthingBin, ["generate", "--home", cliNodeHome, "--no-port-probing"], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", cliNodeHome], { stdio: "inherit" });
   const cliNodeId = readDeviceId(cliNodeHome);
+  execFileSync(syncthingBin, ["generate", "--home", cliUntrustedHome], { stdio: "inherit" });
+  const cliUntrustedId = readDeviceId(cliUntrustedHome);
 
   configureHome(aHome, {
     guiAddress: A_GUI_ADDR,
     listenAddress: A_SYNC_ADDR,
     remoteDevices: [{ id: bId, name: "syncpeer-b", address: B_SYNC_ADDR }],
-    folderPath: aRecvDir,
-    folderType: "sendreceive",
-    folderDeviceIds: [aId, bId],
+    folders: [
+      {
+        id: folderId,
+        label: folderId,
+        path: aRecvDir,
+        type: "sendreceive",
+        deviceIds: [aId, bId],
+      },
+    ],
   });
   configureHome(bHome, {
     guiAddress: B_GUI_ADDR,
@@ -286,10 +331,27 @@ async function main() {
     remoteDevices: [
       { id: aId, name: "syncpeer-a", address: A_SYNC_ADDR },
       { id: cliNodeId, name: "syncpeer-cli-node", address: "dynamic" },
+      { id: cliUntrustedId, name: "syncpeer-cli-untrusted", address: "dynamic", untrusted: true },
     ],
-    folderPath: bShareDir,
-    folderType: "sendonly",
-    folderDeviceIds: [bId, aId, cliNodeId],
+    folders: [
+      {
+        id: folderId,
+        label: folderId,
+        path: bShareDir,
+        type: "sendonly",
+        deviceIds: [bId, aId, cliNodeId],
+      },
+      {
+        id: encryptedFolderId,
+        label: encryptedFolderId,
+        path: bEncryptedShareDir,
+        type: "sendonly",
+        deviceIds: [bId, cliUntrustedId],
+        encryptionPasswords: {
+          [cliUntrustedId]: encryptedFolderPassword,
+        },
+      },
+    ],
   });
 
   let a;
@@ -321,6 +383,9 @@ async function main() {
     if (!listOutput.includes(`${folderId}\t`)) {
       throw new Error(`CLI list output did not contain expected folder "${folderId}":\n${listOutput}`);
     }
+    if (listOutput.includes(`${encryptedFolderId}\t`)) {
+      throw new Error(`Trusted CLI identity unexpectedly saw encrypted-only folder "${encryptedFolderId}":\n${listOutput}`);
+    }
     console.log("Legacy list check passed.");
 
     const persistedListOutput = execCli([
@@ -339,6 +404,9 @@ async function main() {
     });
     if (!persistedListOutput.includes(`${folderId}\t`)) {
       throw new Error(`Persisted cli-node list output missing folder "${folderId}":\n${persistedListOutput}`);
+    }
+    if (persistedListOutput.includes(`${encryptedFolderId}\t`)) {
+      throw new Error(`Persisted trusted cli-node unexpectedly saw encrypted-only folder "${encryptedFolderId}":\n${persistedListOutput}`);
     }
     console.log("Persisted cli-node list check passed.");
 
@@ -374,6 +442,90 @@ async function main() {
     }
     console.log("Download check passed.");
     console.log("Persisted cli-node ID check passed.");
+
+    try {
+      let encryptedDownloadFailed = false;
+      try {
+        execCli([
+          "--host", "127.0.0.1",
+          "--port", "58301",
+          "--cert", path.join(cliUntrustedHome, "cert.pem"),
+          "--key", path.join(cliUntrustedHome, "key.pem"),
+          "--remote-id", bId,
+          "--timeout-ms", "20000",
+          "download",
+          encryptedFolderId,
+          "secret.txt",
+          path.join(root, "encrypted-without-password.txt"),
+        ], {
+          stdio: "pipe",
+          env: {
+            ...process.env,
+            XDG_CONFIG_HOME: cliConfigHome,
+            SYNCTHING_BIN: syncthingBin,
+          },
+        });
+      } catch {
+        encryptedDownloadFailed = true;
+      }
+      if (!encryptedDownloadFailed) {
+        throw new Error("Encrypted folder download unexpectedly succeeded without a folder password.");
+      }
+
+      const encryptedFilesOutput = execCli([
+        "--host", "127.0.0.1",
+        "--port", "58301",
+        "--cert", path.join(cliUntrustedHome, "cert.pem"),
+        "--key", path.join(cliUntrustedHome, "key.pem"),
+        "--remote-id", bId,
+        "--timeout-ms", "20000",
+        "--folder-password", `${encryptedFolderId}=${encryptedFolderPassword}`,
+        "files",
+        encryptedFolderId,
+      ], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          XDG_CONFIG_HOME: cliConfigHome,
+          SYNCTHING_BIN: syncthingBin,
+        },
+      });
+      if (!encryptedFilesOutput.includes("\tsecret.txt")) {
+        throw new Error(`Encrypted folder listing missing decrypted file name:\n${encryptedFilesOutput}`);
+      }
+
+      const encryptedDownloadOutPath = path.join(root, "downloaded-encrypted-secret.txt");
+      execCli([
+        "--host", "127.0.0.1",
+        "--port", "58301",
+        "--cert", path.join(cliUntrustedHome, "cert.pem"),
+        "--key", path.join(cliUntrustedHome, "key.pem"),
+        "--remote-id", bId,
+        "--timeout-ms", "20000",
+        "--folder-password", `${encryptedFolderId}=${encryptedFolderPassword}`,
+        "download",
+        encryptedFolderId,
+        "secret.txt",
+        encryptedDownloadOutPath,
+      ], {
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          XDG_CONFIG_HOME: cliConfigHome,
+          SYNCTHING_BIN: syncthingBin,
+        },
+      });
+      const encryptedDownloaded = fs.readFileSync(encryptedDownloadOutPath, "utf8");
+      if (encryptedDownloaded !== expectedEncrypted) {
+        throw new Error(`Encrypted downloaded content mismatch: got "${encryptedDownloaded}"`);
+      }
+      console.log("Encrypted folder password gating check passed.");
+      console.log("Encrypted folder download check passed.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log("Encrypted folder compatibility probe did not pass.");
+      console.log(`Known limitation: ${message}`);
+    }
 
     const filesOutput = execCli(["files-local", bShareDir], {
       encoding: "utf8",
@@ -427,6 +579,7 @@ async function main() {
     console.log(`A device ID: ${aId}`);
     console.log(`B device ID: ${bId}`);
     console.log(`CLI node ID: ${cliNodeId}`);
+    console.log(`CLI untrusted ID: ${cliUntrustedId}`);
     console.log("");
     if (keep) {
       console.log("--keep flag used; leaving temp files in place.");

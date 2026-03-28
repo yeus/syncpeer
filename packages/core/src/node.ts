@@ -310,6 +310,7 @@ async function nodeDiscoveryFetch(
 }
 
 export function createNodeHostAdapter(): SyncpeerHostAdapter {
+  const enableLogs = process.env.SYNCPEER_DEBUG === "1";
   return {
     connectTls: connectNodeTls,
     async sha256(data: Uint8Array): Promise<Uint8Array> {
@@ -320,6 +321,15 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
       return new Uint8Array(crypto.randomBytes(length));
     },
     discoveryFetch: nodeDiscoveryFetch,
+    log: enableLogs
+      ? (event, details) => {
+          if (details === undefined) {
+            console.error(`[syncpeer-core] ${event}`);
+            return;
+          }
+          console.error(`[syncpeer-core] ${event}`, details);
+        }
+      : undefined,
   };
 }
 

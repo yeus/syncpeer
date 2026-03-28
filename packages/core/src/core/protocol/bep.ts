@@ -39,6 +39,7 @@ export const Header = lookupTypeAny("Header", "bep.Header");
 export const ClusterConfig = lookupTypeAny("ClusterConfig", "bep.ClusterConfig");
 export const Index = lookupTypeAny("Index", "bep.Index");
 export const IndexUpdate = lookupTypeAny("IndexUpdate", "bep.IndexUpdate");
+export const FileInfo = lookupTypeAny("FileInfo", "bep.FileInfo");
 export const Request = lookupTypeAny("Request", "bep.Request");
 export const Response = lookupTypeAny("Response", "bep.Response");
 export const MessageTypeEnum = lookupEnumAny("MessageType", "bep.MessageType");

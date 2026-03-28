@@ -20,6 +20,7 @@ interface CliOptions {
   discoveryServer?: string;
   deviceName: string;
   timeoutMs: number;
+  folderPassword?: string[];
 }
 
 function normalizeRelativePath(input: string): string {
@@ -66,6 +67,29 @@ function requiredPath(name: string, value: string | undefined): string {
   return value;
 }
 
+function parseFolderPasswords(values: string[] | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawValue of values ?? []) {
+    const value = rawValue.trim();
+    if (!value) continue;
+    const separatorIndex = value.indexOf("=");
+    if (separatorIndex <= 0) {
+      throw new Error(
+        `Invalid --folder-password value "${rawValue}". Expected <folderId>=<password>.`,
+      );
+    }
+    const folderId = value.slice(0, separatorIndex).trim();
+    const password = value.slice(separatorIndex + 1).trim();
+    if (!folderId || !password) {
+      throw new Error(
+        `Invalid --folder-password value "${rawValue}". Expected <folderId>=<password>.`,
+      );
+    }
+    out[folderId] = password;
+  }
+  return out;
+}
+
 async function openRemoteFs(opts: CliOptions) {
   let cert: string;
   let key: string;
@@ -90,6 +114,7 @@ async function openRemoteFs(opts: CliOptions) {
     deviceName: opts.deviceName,
     timeoutMs: opts.timeoutMs,
     discoveryMode: "direct",
+    folderPasswords: parseFolderPasswords(opts.folderPassword),
   });
 }
 
@@ -145,6 +170,12 @@ async function main() {
     )
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option(
+      "--folder-password <folderId=password>",
+      "Folder decryption password for Syncthing receive-encrypted shares; repeat for multiple folders",
+      (value, previous: string[] = []) => [...previous, value],
+      [],
+    )
+    .option(
       "--timeout-ms <ms>",
       "Connection timeout in milliseconds",
       (value) => parseInt(value, 10),
@@ -179,6 +210,7 @@ async function main() {
     .description("Show a tree of files in the specified folder")
     .action(async (folderId: string) =>
       withSession(async (remoteFs) => {
+        await remoteFs.waitForFolderIndex(folderId, 7000, 100);
         console.log(`${folderId}/`);
         const lines = await renderTree(
           async (targetPath) => remoteFs.readDir(folderId, targetPath),
@@ -194,6 +226,7 @@ async function main() {
     .description("List files from a peer folder directory")
     .action(async (folderId: string, dir = "") =>
       withSession(async (remoteFs) => {
+        await remoteFs.waitForFolderIndex(folderId, 7000, 100);
         const entries = await remoteFs.readDir(folderId, dir);
         for (const entry of entries) {
           const suffix = entry.type === "directory" ? "/" : "";

@@ -1,8 +1,13 @@
+import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
+
 export interface FolderInfo {
   id: string;
   label: string;
   readOnly: boolean;
   advertisedDevices?: AdvertisedDeviceInfo[];
+  encrypted?: boolean;
+  needsPassword?: boolean;
+  passwordError?: string;
 }
 
 export interface AdvertisedDeviceInfo {
@@ -51,24 +56,52 @@ interface FolderState {
   label: string;
   readOnly: boolean;
   advertisedDevices: AdvertisedDeviceInfo[];
+  encrypted: boolean;
+  needsPassword: boolean;
+  passwordError?: string;
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
-  files: Map<string, any>;
+  files: Map<string, StoredFileRecord>;
+}
+
+interface StoredFileRecord {
+  indexFile: any;
+  request?: EncryptedRequestRecord;
+}
+
+interface EncryptedRequestRecord {
+  encryptedName: string;
+  fileKey: Uint8Array;
+  encryptedBlocks: FileBlock[];
 }
 
 function normalizePath(p: string): string {
   return p.replace(/^\/+|\/+$/g, "");
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function resolveRequestName(folder: FolderState, requestedPath: string): string {
   const normalized = normalizePath(requestedPath);
-  for (const key of folder.files.keys()) {
+  for (const [key, value] of folder.files) {
     if (normalizePath(key) === normalized) {
-      return key;
+      return value.request?.encryptedName ?? key;
     }
   }
   return normalized;
+}
+
+function resolveStoredFile(folder: FolderState, requestedPath: string): StoredFileRecord | null {
+  const normalized = normalizePath(requestedPath);
+  for (const [key, value] of folder.files) {
+    if (normalizePath(key) === normalized) {
+      return value;
+    }
+  }
+  return null;
 }
 
 function isRetryableCompatibilityError(error: unknown): boolean {
@@ -104,6 +137,26 @@ function toEntry(path: string, file: any): FileEntry {
   };
 }
 
+async function mapConcurrent<T>(
+  total: number,
+  concurrency: number,
+  worker: (index: number) => Promise<T>,
+): Promise<T[]> {
+  const results = new Array<T>(total);
+  let nextIndex = 0;
+  const runner = async (): Promise<void> => {
+    while (nextIndex < total) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(currentIndex);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(concurrency, total)) }, () => runner()),
+  );
+  return results;
+}
+
 export class RemoteFs {
   constructor(
     private folders: Map<string, FolderState>,
@@ -129,6 +182,9 @@ export class RemoteFs {
       label: f.label,
       readOnly: f.readOnly,
       advertisedDevices: [...f.advertisedDevices],
+      encrypted: f.encrypted,
+      needsPassword: f.needsPassword,
+      passwordError: f.passwordError,
     }));
   }
 
@@ -158,7 +214,7 @@ export class RemoteFs {
     const normalized = normalizePath(path);
     for (const [key, value] of folder.files) {
       const keyPath = normalizePath(key);
-      if (keyPath === normalized) return toEntry(keyPath, value);
+      if (keyPath === normalized) return toEntry(keyPath, value.indexFile);
     }
     const prefix = normalized ? normalized + "/" : "";
     for (const key of folder.files.keys()) {
@@ -179,6 +235,22 @@ export class RemoteFs {
   async readDir(folderId: string, path: string): Promise<FileEntry[]> {
     const folder = this.folders.get(folderId);
     if (!folder) return [];
+    if (
+      folder.encrypted &&
+      folder.files.size === 0 &&
+      !folder.needsPassword &&
+      !folder.passwordError
+    ) {
+      const deadline = Date.now() + 6000;
+      while (
+        folder.files.size === 0 &&
+        !folder.needsPassword &&
+        !folder.passwordError &&
+        Date.now() < deadline
+      ) {
+        await sleep(120);
+      }
+    }
     const normalized = normalizePath(path);
     const prefix = normalized ? normalized + "/" : "";
     const out = new Map<string, FileEntry>();
@@ -189,7 +261,7 @@ export class RemoteFs {
       if (!rest) continue;
       const firstSlash = rest.indexOf("/");
       if (firstSlash === -1) {
-        out.set(rest, toEntry(keyPath, value));
+        out.set(rest, toEntry(keyPath, value.indexFile));
       } else {
         const childName = rest.slice(0, firstSlash);
         const childPath = normalized ? `${normalized}/${childName}` : childName;
@@ -237,6 +309,10 @@ export class RemoteFs {
   ): Promise<Uint8Array> {
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
+    const storedFile = resolveStoredFile(folder, path);
+    if (folder.encrypted) {
+      return this.readEncryptedFileFully(folder, path, storedFile, onProgress);
+    }
     const requestName = resolveRequestName(folder, path);
 
     const requestWithCompatibilityFallback = async (
@@ -326,7 +402,7 @@ export class RemoteFs {
       }
     };
 
-    let entry = await this.stat(folderId, path);
+    let entry = storedFile ? toEntry(normalizePath(path), storedFile.indexFile) : await this.stat(folderId, path);
     const waitUntil = Date.now() + 5000;
     while (!entry && Date.now() < waitUntil) {
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -345,26 +421,27 @@ export class RemoteFs {
         return this.readFileByProbing(folderId, path, onProgress);
       }
       const chunkSize = 128 * 1024;
-      const chunks: Uint8Array[] = [];
+      const plan: Array<{ offset: number; size: number }> = [];
+      for (let offset = 0; offset < entry.size; offset += chunkSize) {
+        plan.push({
+          offset,
+          size: Math.min(chunkSize, entry.size - offset),
+        });
+      }
       let downloaded = 0;
-      let offset = 0;
-      while (offset < entry.size) {
-        const nextSize = Math.min(chunkSize, entry.size - offset);
-        const chunk = await requestWithTemporaryFallback(offset, nextSize);
+      const chunks = await mapConcurrent(plan.length, 4, async (index) => {
+        const next = plan[index];
+        const chunk = await requestWithTemporaryFallback(next.offset, next.size);
         if (chunk.length === 0) {
-          throw new Error(`Unexpected empty block while reading ${requestName} at offset ${offset}`);
+          throw new Error(`Unexpected empty block while reading ${requestName} at offset ${next.offset}`);
         }
-        chunks.push(chunk);
         downloaded += chunk.length;
-        offset += chunk.length;
         onProgress?.({
           downloadedBytes: downloaded,
           totalBytes: entry.size,
         });
-        if (chunk.length < nextSize) {
-          break;
-        }
-      }
+        return chunk;
+      });
       const out = new Uint8Array(downloaded);
       let pos = 0;
       for (const chunk of chunks) {
@@ -373,27 +450,102 @@ export class RemoteFs {
       }
       return out;
     }
-    const chunks: Uint8Array[] = [];
     let total = 0;
     const totalBytes = entry.size > 0 ? entry.size : entry.blocks.reduce((sum, block) => sum + block.size, 0);
-    for (let index = 0; index < entry.blocks.length; index += 1) {
-      const block = entry.blocks[index];
+    const chunks = await mapConcurrent(entry.blocks.length, 6, async (index) => {
+      const block = entry.blocks![index];
       const chunk = await requestWithTemporaryFallback(block.offset, block.size, {
         hash: block.hash,
         blockNo: index,
       });
-      chunks.push(chunk);
       total += chunk.length;
       onProgress?.({
         downloadedBytes: total,
         totalBytes: Math.max(totalBytes, total),
       });
-    }
+      return chunk;
+    });
     const out = new Uint8Array(total);
     let pos = 0;
     for (const chunk of chunks) {
       out.set(chunk, pos);
       pos += chunk.length;
+    }
+    return out;
+  }
+
+  private async readEncryptedFileFully(
+    folder: FolderState,
+    path: string,
+    storedFile: StoredFileRecord | null,
+    onProgress?: (progress: FileDownloadProgress) => void,
+  ): Promise<Uint8Array> {
+    let resolvedFile = storedFile;
+    if (!resolvedFile || !resolvedFile.request) {
+      const deadline = Date.now() + 7000;
+      while (
+        (!resolvedFile || !resolvedFile.request) &&
+        !folder.needsPassword &&
+        !folder.passwordError &&
+        Date.now() < deadline
+      ) {
+        await sleep(120);
+        resolvedFile = resolveStoredFile(folder, path);
+      }
+    }
+    if (!resolvedFile || !resolvedFile.request) {
+      if (folder.needsPassword) {
+        throw new Error(`Folder ${folder.id} requires an encryption password before files can be downloaded.`);
+      }
+      if (folder.passwordError) {
+        throw new Error(folder.passwordError);
+      }
+      throw new Error(`Encrypted metadata for ${path} is unavailable.`);
+    }
+    const entry = toEntry(normalizePath(path), resolvedFile.indexFile);
+    if (entry.type === "directory") throw new Error(`Not a file: ${path}`);
+    if (!entry.blocks || entry.blocks.length === 0) {
+      return new Uint8Array(0);
+    }
+    const encryptedBlocks = resolvedFile.request.encryptedBlocks;
+    if (encryptedBlocks.length !== entry.blocks.length) {
+      throw new Error(`Encrypted block metadata mismatch for ${path}`);
+    }
+    let downloaded = 0;
+    const chunks = await mapConcurrent(entry.blocks.length, 6, async (index) => {
+      const originalBlock = entry.blocks![index];
+      const encryptedBlock = encryptedBlocks[index];
+      const payload = await this.requestBlock(
+        folder.id,
+        resolvedFile.request!.encryptedName,
+        encryptedBlock.offset,
+        encryptedBlock.size,
+        {
+          hash: encryptedBlock.hash,
+          blockNo: index,
+          fromTemporary: false,
+        },
+      );
+      if (payload.length === 0) {
+        throw new Error(`Unexpected empty encrypted block for ${path} at block ${index}`);
+      }
+      const plaintext = decryptEncryptedBytes(resolvedFile.request!.fileKey, payload);
+      if (plaintext.length < originalBlock.size) {
+        throw new Error(`Encrypted block for ${path} was shorter than expected`);
+      }
+      const chunk = plaintext.slice(0, originalBlock.size);
+      downloaded += chunk.length;
+      onProgress?.({
+        downloadedBytes: downloaded,
+        totalBytes: entry.size,
+      });
+      return chunk;
+    });
+    const out = new Uint8Array(entry.size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
     }
     return out;
   }

@@ -12,6 +12,7 @@ export interface ConnectOptions {
   deviceName: string;
   timeoutMs?: number;
   enableRelayFallback?: boolean;
+  folderPasswords?: Record<string, string>;
 }
 
 export interface RemoteFsLike {
@@ -259,6 +260,11 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   deviceName: options.deviceName,
   timeoutMs: options.timeoutMs,
   enableRelayFallback: options.enableRelayFallback ?? true,
+  folderPasswords: Object.fromEntries(
+    Object.entries(options.folderPasswords ?? {})
+      .map(([folderId, password]) => [folderId.trim(), password.trim()])
+      .filter(([folderId, password]) => folderId !== "" && password !== ""),
+  ),
 });
 
 const maybeInlinePem = (value: string | undefined): string | null => {
@@ -396,6 +402,7 @@ const serializeConnectionKey = (options: ConnectOptions, certPem: string, keyPem
     deviceName: options.deviceName,
     certPem,
     keyPem,
+    folderPasswords: options.folderPasswords ?? {},
   });
 
 const toConnectionOverview = async (session: SyncpeerSessionHandle): Promise<ConnectionOverview> => {
@@ -493,6 +500,7 @@ export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) 
       deviceName: normalized.deviceName,
       timeoutMs: normalized.timeoutMs,
       enableRelayFallback: normalized.enableRelayFallback,
+      folderPasswords: normalized.folderPasswords,
     });
     activeConnectionKey = key;
     return activeSession;

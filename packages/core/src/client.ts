@@ -6,9 +6,18 @@ import {
   Hello,
   ClusterConfig,
   Index,
+  FileInfo,
   Request,
 } from "./core/protocol/bep.js";
 import { type AdvertisedDeviceInfo, RemoteDeviceInfo, RemoteFs } from "./core/model/remoteFs.js";
+import {
+  decryptEncryptedFilename,
+  decryptUntrustedBytes,
+  deriveUntrustedFileKey,
+  deriveUntrustedFolderCrypto,
+  verifyUntrustedPasswordToken,
+  type UntrustedFolderCrypto,
+} from "./core/model/untrusted.js";
 
 export interface SyncpeerTlsConnectOptions {
   host: string;
@@ -82,6 +91,7 @@ export interface SyncpeerConnectOptions {
   discoveryMode?: "global" | "direct";
   discoveryServer?: string;
   enableRelayFallback?: boolean;
+  folderPasswords?: Record<string, string>;
 }
 
 export interface SyncpeerGlobalDiscoveryOptions {
@@ -113,10 +123,14 @@ interface FolderState {
   label: string;
   readOnly: boolean;
   advertisedDevices: AdvertisedDeviceInfo[];
+  encrypted: boolean;
+  needsPassword: boolean;
+  passwordError?: string;
+  folderCrypto?: UntrustedFolderCrypto;
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
-  files: Map<string, any>;
+  files: Map<string, { indexFile: any; request?: { encryptedName: string; fileKey: Uint8Array; encryptedBlocks: any[] } }>;
 }
 
 interface PendingRequestMeta {
@@ -395,12 +409,14 @@ class BepSession {
   private closed = false;
   private echoedClusterConfig = false;
   private localIndexId: string;
+  private readonly folderPasswords: Map<string, string>;
 
   constructor(
     private socket: SyncpeerTlsSocket,
     private adapter: SyncpeerHostAdapter,
     private localDeviceId: Uint8Array,
     private localDeviceName: string,
+    folderPasswords?: Record<string, string>,
     private remoteDeviceId?: Uint8Array,
   ) {
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
@@ -408,6 +424,11 @@ class BepSession {
       this.readyResolve = resolve;
     });
     this.localIndexId = "1";
+    this.folderPasswords = new Map(
+      Object.entries(folderPasswords ?? {})
+        .map(([folderId, password]) => [folderId.trim(), password.trim()] as const)
+        .filter(([folderId, password]) => folderId !== "" && password !== ""),
+    );
   }
 
   async initialize(leftover: Uint8Array): Promise<void> {
@@ -463,11 +484,11 @@ class BepSession {
   private onFrame(type: number, msg: any): void {
     switch (type) {
       case MessageTypeValues.CLUSTER_CONFIG:
-        this.handleClusterConfig(msg);
+        void this.handleClusterConfig(msg);
         break;
       case MessageTypeValues.INDEX:
       case MessageTypeValues.INDEX_UPDATE:
-        this.handleIndex(msg);
+        void this.handleIndex(msg);
         break;
       case MessageTypeValues.RESPONSE:
         this.handleResponse(msg);
@@ -477,7 +498,7 @@ class BepSession {
     }
   }
 
-  private handleClusterConfig(cfg: any): void {
+  private async handleClusterConfig(cfg: any): Promise<void> {
     for (const folder of cfg.folders || []) {
       const folderDevices = Array.isArray(folder.devices) ? folder.devices : [];
       const advertisedDevices: AdvertisedDeviceInfo[] = folderDevices
@@ -496,24 +517,88 @@ class BepSession {
         : folderDevices.find(
             (device: any) => !bytesEqual(device.id, this.localDeviceId),
           );
+      const localDeviceEntry = folderDevices.find((device: any) =>
+        device?.id instanceof Uint8Array && bytesEqual(device.id, this.localDeviceId),
+      );
       const remoteIndexId =
         remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0";
       const remoteMaxSequence = String(remoteDevice?.max_sequence ?? 0);
+      const folderId = String(folder.id ?? "").trim();
+      const localToken =
+        localDeviceEntry?.encryption_password_token instanceof Uint8Array
+          ? localDeviceEntry.encryption_password_token
+          : null;
+      const remoteToken =
+        remoteDevice?.encryption_password_token instanceof Uint8Array
+          ? remoteDevice.encryption_password_token
+          : null;
+      const announcedToken = localToken ?? remoteToken;
+      const encrypted =
+        Number(folder.type ?? 0) === 3 ||
+        (announcedToken?.length ?? 0) > 0 ||
+        this.folderPasswords.has(folderId);
+      let folderCrypto: UntrustedFolderCrypto | undefined;
+      let needsPassword = false;
+      let passwordError: string | undefined;
+      if (encrypted) {
+        const password = this.folderPasswords.get(folderId);
+        if (!password) {
+          needsPassword = true;
+        } else {
+          try {
+            const derived = await deriveUntrustedFolderCrypto(folderId, password);
+            const tokenValid = await verifyUntrustedPasswordToken(
+              derived,
+              announcedToken,
+            );
+            this.log("untrusted.folder.token_check", {
+              folderId,
+              hasPassword: true,
+              localTokenLengthFromPeer: localToken?.length ?? 0,
+              remoteTokenLengthFromPeer: remoteToken?.length ?? 0,
+              localTokenLength: derived.passwordToken.length,
+              tokenValid,
+            });
+            if (!tokenValid) {
+              needsPassword = true;
+              passwordError = `Encryption password did not match folder ${folderId}.`;
+            } else {
+              folderCrypto = derived;
+            }
+          } catch (error) {
+            needsPassword = true;
+            passwordError = error instanceof Error ? error.message : String(error);
+          }
+        }
+      }
       const state: FolderState = {
-        id: folder.id,
-        label: folder.label || folder.id,
+        id: folderId,
+        label: folder.label || folderId,
         readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
         advertisedDevices,
+        encrypted,
+        needsPassword,
+        passwordError,
+        folderCrypto,
         indexReceived: false,
         remoteIndexId,
         remoteMaxSequence,
         files: new Map(),
       };
-      this.folders.set(folder.id, state);
+      this.folders.set(folderId, state);
+      if (encrypted) {
+        this.log("untrusted.folder.state", {
+          folderId,
+          needsPassword,
+          hasFolderCrypto: !!folderCrypto,
+          passwordError: passwordError ?? null,
+        });
+      }
     }
     if (!this.echoedClusterConfig) {
       this.echoedClusterConfig = true;
       const folders = (cfg.folders || []).map((folder: any) => {
+        const state = this.folders.get(String(folder.id ?? ""));
         const baseDevices = Array.isArray(folder.devices)
           ? [...folder.devices]
           : [];
@@ -537,7 +622,18 @@ class BepSession {
           compression: 0,
           max_sequence: 0,
           index_id: this.localIndexId,
+          encryption_password_token:
+            state?.encrypted && state.folderCrypto
+              ? state.folderCrypto.passwordToken
+              : undefined,
         });
+        if (state?.encrypted) {
+          this.log("untrusted.folder.echo_config", {
+            folderId: folder.id,
+            type: folder.type,
+            localTokenLength: state.folderCrypto?.passwordToken.length ?? 0,
+          });
+        }
         return {
           ...folder,
           devices,
@@ -566,13 +662,62 @@ class BepSession {
     }
   }
 
-  private handleIndex(index: any): void {
+  private async handleIndex(index: any): Promise<void> {
     const folderId = index.folder;
     const state = this.folders.get(folderId);
     if (!state) return;
     state.indexReceived = true;
     for (const file of index.files || []) {
-      state.files.set(file.name, file);
+      if (!state.encrypted) {
+        state.files.set(file.name, { indexFile: file });
+        continue;
+      }
+      if (!state.folderCrypto) {
+        continue;
+      }
+      try {
+        const encryptedName = String(file.name ?? "");
+        const plaintextName = await decryptEncryptedFilename(
+          state.folderCrypto.folderKey,
+          encryptedName,
+        );
+        const fileKey = deriveUntrustedFileKey(
+          state.folderCrypto.folderKey,
+          plaintextName,
+        );
+        const encryptedMetadata =
+          file.encrypted instanceof Uint8Array
+            ? file.encrypted
+            : new Uint8Array(file.encrypted ?? []);
+        const originalFile =
+          encryptedMetadata.length > 0
+            ? FileInfo.decode(decryptUntrustedBytes(fileKey, encryptedMetadata))
+            : file;
+        const encryptedBlocks = Array.isArray(file.blocks ?? file.Blocks)
+          ? (file.blocks ?? file.Blocks).map((block: any) => ({
+              offset: Number(block.offset ?? 0),
+              size: Number(block.size ?? 0),
+              hash: block.hash instanceof Uint8Array ? block.hash : new Uint8Array(block.hash ?? []),
+            }))
+          : [];
+        state.files.set(plaintextName, {
+          indexFile: originalFile,
+          request: {
+            encryptedName,
+            fileKey,
+            encryptedBlocks,
+          },
+        });
+      } catch (error) {
+        this.log("untrusted.index.decrypt_failed", {
+          folderId,
+          encryptedName: String(file?.name ?? ""),
+          message: error instanceof Error ? error.message : String(error),
+        });
+        state.passwordError =
+          error instanceof Error ? error.message : String(error);
+        state.needsPassword = true;
+      }
     }
   }
 
@@ -803,6 +948,7 @@ async function openBepSessionOnSocket(
     adapter,
     localDeviceId,
     opts.deviceName,
+    opts.folderPasswords,
     remoteDeviceIdBytes,
   );
   await session.initialize(leftover);

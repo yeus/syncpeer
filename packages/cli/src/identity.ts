@@ -1,10 +1,11 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_SYNCTHING_VERSION = process.env.SYNCTHING_VERSION ?? "v1.27.8";
-const DEVICE_ID_RE = /([A-Z2-7]{7}(?:-[A-Z2-7]{7}){7})/;
+const DEVICE_ID_RE = /([A-Z2-7-]{52,56})/;
 
 export interface CliNodeIdentity {
   cert: string;
@@ -48,11 +49,36 @@ function readDeviceIdFile(deviceIdPath: string): string | null {
   return match ? match[1] : null;
 }
 
-function readDeviceIdFromSyncthing(syncthingBin: string, home: string): string {
-  const output = execFileSync(syncthingBin, ["device-id", "--home", home], { encoding: "utf8" });
-  const match = output.match(DEVICE_ID_RE);
-  if (!match) throw new Error(`Could not parse Syncthing device ID from output:\n${output}`);
-  return match[1].trim();
+function parseFirstCertificateDer(pem: string): Buffer {
+  const match = pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+  if (!match) {
+    throw new Error("Could not parse certificate PEM block");
+  }
+  return Buffer.from(match[1].replace(/\s+/g, ""), "base64");
+}
+
+function base32NoPadding(input: Uint8Array): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let value = 0;
+  let output = "";
+  for (const byte of input) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += alphabet[(value << (5 - bits)) & 31];
+  return output;
+}
+
+function readDeviceIdFromCert(certPath: string): string {
+  const certPem = fs.readFileSync(certPath, "utf8");
+  const certDer = parseFirstCertificateDer(certPem);
+  const digest = createHash("sha256").update(certDer).digest();
+  return base32NoPadding(digest);
 }
 
 export function ensureCliNodeIdentity(): CliNodeIdentity {
@@ -73,7 +99,7 @@ export function ensureCliNodeIdentity(): CliNodeIdentity {
         "Or pass --cert and --key explicitly.",
       ].join("\n"));
     }
-    execFileSync(syncthingBin, ["generate", "--home", cliNodeDir, "--no-port-probing"], { stdio: "ignore" });
+    execFileSync(syncthingBin, ["generate", "--home", cliNodeDir], { stdio: "ignore" });
   }
 
   if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
@@ -82,11 +108,8 @@ export function ensureCliNodeIdentity(): CliNodeIdentity {
 
   let deviceId = readDeviceIdFile(deviceIdPath);
   if (!deviceId) {
-    const syncthingBin = resolveSyncthingBin();
-    if (syncthingBin) {
-      deviceId = readDeviceIdFromSyncthing(syncthingBin, cliNodeDir);
-      fs.writeFileSync(deviceIdPath, `${deviceId}\n`);
-    }
+    deviceId = readDeviceIdFromCert(certPath);
+    fs.writeFileSync(deviceIdPath, `${deviceId}\n`);
   }
 
   return { cert: certPath, key: keyPath, deviceId: deviceId ?? null, configDir: cliNodeDir };

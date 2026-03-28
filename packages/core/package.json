@@ -21,7 +21,9 @@
     "build": "tsc -p tsconfig.json && mkdir -p dist/core/protocol && cp src/core/protocol/bep.proto dist/core/protocol/bep.proto"
   },
   "dependencies": {
-    "protobufjs": "^8.0.0",
-    "lz4js": "^0.2.0"
+    "@noble/ciphers": "^2.1.1",
+    "@noble/hashes": "^2.0.1",
+    "lz4js": "^0.2.0",
+    "protobufjs": "^8.0.0"
   }
 }

@@ -301,6 +301,10 @@ export const createTauriAdapters = (
         request: { recoverySecret },
       });
     },
+    getDefaultDeviceId: async (): Promise<string> =>
+      invokeWithLogging<string>("syncpeer_get_default_device_id"),
+    regenerateDefaultIdentity: async (): Promise<string> =>
+      invokeWithLogging<string>("syncpeer_regenerate_default_cli_identity"),
     logError: async (event: string, details: Record<string, unknown>): Promise<void> => {
       await tryForwardUiErrorToCli(invokeWithLogging, event, details);
     },

@@ -105,6 +105,8 @@ export interface SyncpeerPlatformAdapter {
   listAndroidPersistedSafUris?: () => Promise<string[]>;
   exportIdentityRecovery?: () => Promise<IdentityRecoveryExportResponse>;
   restoreIdentityRecovery?: (recoverySecret: string) => Promise<void>;
+  getDefaultDeviceId?: () => Promise<string>;
+  regenerateDefaultIdentity?: () => Promise<string>;
   logError?: (event: string, details: Record<string, unknown>) => Promise<void>;
 }
 
@@ -142,6 +144,8 @@ export interface SyncpeerBrowserClient {
   listAndroidPersistedSafUris: () => Promise<string[]>;
   exportIdentityRecovery: () => Promise<IdentityRecoveryExportResponse>;
   restoreIdentityRecovery: (recoverySecret: string) => Promise<void>;
+  getDefaultDeviceId: () => Promise<string>;
+  regenerateDefaultIdentity: () => Promise<string>;
 }
 
 const SYNCTHING_DISCOVERY_ORIGIN = "https://discovery.syncthing.net";
@@ -328,6 +332,8 @@ export const createSyncpeerBrowserClient = (
   let cachedDefaultIdentity: SyncpeerIdentityRecord | null = null;
   let activeSession: SyncpeerSessionHandle | null = null;
   let activeConnectionKey: string | null = null;
+  let openingSession: Promise<SyncpeerSessionHandle> | null = null;
+  let openingConnectionKey: string | null = null;
 
   const closeActiveSession = async (): Promise<void> => {
     const previous = activeSession;
@@ -388,6 +394,10 @@ export const createSyncpeerBrowserClient = (
     const key = serializeConnectionKey(normalized, certPem, keyPem);
     if (activeSession && activeConnectionKey === key) {
       if (!activeSession.isClosed()) {
+        logClient(options.onLog, "client.session.ensure.reuse", {
+          connectedVia: activeSession.connectedVia,
+          transportKind: activeSession.transportKind,
+        });
         return activeSession;
       }
       logClient(options.onLog, "client.session.reopen.closed", {
@@ -396,22 +406,65 @@ export const createSyncpeerBrowserClient = (
       });
     }
 
-    await closeActiveSession();
-    activeSession = await coreClient.openSession({
-      host: normalized.host,
-      port: normalized.port,
-      discoveryMode: normalized.discoveryMode,
-      discoveryServer: normalized.discoveryServer,
-      certPem,
-      keyPem,
-      expectedDeviceId: normalized.remoteId,
-      deviceName: normalized.deviceName,
-      timeoutMs: normalized.timeoutMs,
-      enableRelayFallback: normalized.enableRelayFallback,
-      folderPasswords: normalized.folderPasswords,
-    });
-    activeConnectionKey = key;
-    return activeSession;
+    if (openingSession) {
+      if (openingConnectionKey === key) {
+        logClient(options.onLog, "client.session.ensure.wait_existing_open", {
+          reason: "same_connection_key",
+        });
+        return openingSession;
+      }
+      logClient(options.onLog, "client.session.ensure.wait_existing_open", {
+        reason: "different_connection_key",
+      });
+      try {
+        await openingSession;
+      } catch {
+        // Ignore prior open failure; we are about to attempt another open.
+      }
+      if (activeSession && activeConnectionKey === key && !activeSession.isClosed()) {
+        return activeSession;
+      }
+    }
+
+    openingConnectionKey = key;
+    openingSession = (async () => {
+      await closeActiveSession();
+      logClient(options.onLog, "client.session.open.start", {
+        discoveryMode: normalized.discoveryMode ?? "global",
+        host: normalized.host,
+        port: normalized.port,
+        hasRemoteId: !!normalized.remoteId,
+      });
+      const session = await coreClient.openSession({
+        host: normalized.host,
+        port: normalized.port,
+        discoveryMode: normalized.discoveryMode,
+        discoveryServer: normalized.discoveryServer,
+        certPem,
+        keyPem,
+        expectedDeviceId: normalized.remoteId,
+        deviceName: normalized.deviceName,
+        timeoutMs: normalized.timeoutMs,
+        enableRelayFallback: normalized.enableRelayFallback,
+        folderPasswords: normalized.folderPasswords,
+      });
+      activeSession = session;
+      activeConnectionKey = key;
+      logClient(options.onLog, "client.session.open.ready", {
+        connectedVia: session.connectedVia,
+        transportKind: session.transportKind,
+      });
+      return session;
+    })();
+
+    try {
+      return await openingSession;
+    } finally {
+      if (openingSession && openingConnectionKey === key) {
+        openingSession = null;
+        openingConnectionKey = null;
+      }
+    }
   };
 
   const requireActiveSession = async (): Promise<SyncpeerSessionHandle> => {
@@ -535,6 +588,18 @@ export const createSyncpeerBrowserClient = (
       }
       await platformAdapter.restoreIdentityRecovery(recoverySecret);
       cachedDefaultIdentity = null;
+    },
+    getDefaultDeviceId: async (): Promise<string> =>
+      platformAdapter.getDefaultDeviceId
+        ? platformAdapter.getDefaultDeviceId()
+        : throwMissingAdapter("getDefaultDeviceId"),
+    regenerateDefaultIdentity: async (): Promise<string> => {
+      if (!platformAdapter.regenerateDefaultIdentity) {
+        return throwMissingAdapter("regenerateDefaultIdentity");
+      }
+      const deviceId = await platformAdapter.regenerateDefaultIdentity();
+      cachedDefaultIdentity = null;
+      return deviceId;
     },
   };
 };

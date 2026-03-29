@@ -13,6 +13,7 @@ export interface SavedDeviceLike {
   name: string;
   createdAtMs: number;
   isIntroducer: boolean;
+  customName?: boolean;
 }
 
 export interface AdvertisedDeviceItem {
@@ -36,11 +37,25 @@ export const normalizePath = (value: string): string =>
 export const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-export const normalizeDeviceId = (value: string): string =>
+const sanitizeDeviceId = (value: string): string =>
   value
     .trim()
     .toUpperCase()
     .replace(/[^A-Z2-7]/g, "");
+
+const canonicalComparableDeviceId = (value: string): string => {
+  const normalized = sanitizeDeviceId(value);
+  if (normalized.length !== 56) return normalized;
+  let out = "";
+  for (let index = 0; index < normalized.length; index += 1) {
+    if ((index + 1) % 14 === 0) continue;
+    out += normalized[index];
+  }
+  return out;
+};
+
+export const normalizeDeviceId = (value: string): string =>
+  canonicalComparableDeviceId(value);
 
 const compactDeviceId = (value: string): string => normalizeDeviceId(value);
 
@@ -53,14 +68,26 @@ export const normalizeSavedDevices = (
   if (!Array.isArray(parsed)) return [];
   return parsed
     .filter((item) => typeof item?.id === "string" && item.id.trim() !== "")
-    .map((item) => ({
-      id: String(item.id).trim().toUpperCase().replace(/[^A-Z2-7]/g, ""),
-      name:
-        String(item.name ?? "").trim() ||
-        String(item.id).trim().toUpperCase().replace(/[^A-Z2-7]/g, ""),
-      createdAtMs: Number(item.createdAtMs) || Date.now(),
-      isIntroducer: item.isIntroducer === true,
-    }))
+    .flatMap((item) => {
+      const normalizedId = normalizeDeviceId(String(item.id ?? ""));
+      if (!normalizedId) return [];
+      const preferredName = String(item.name ?? "").trim();
+      const temporaryName = normalizedId.slice(0, 5) || normalizedId;
+      const normalizedName = preferredName || normalizedId;
+      const normalized: SavedDeviceLike = {
+        id: normalizedId,
+        name: normalizedName,
+        createdAtMs: Number(item.createdAtMs) || Date.now(),
+        isIntroducer: item.isIntroducer === true,
+        // Legacy entries without this flag are treated as non-custom when
+        // they still use an auto-generated placeholder.
+        customName:
+          typeof item.customName === "boolean"
+            ? item.customName
+            : normalizedName !== normalizedId && normalizedName !== temporaryName,
+      };
+      return [normalized];
+    })
     .sort((a, b) => a.name.localeCompare(b.name));
 };
 

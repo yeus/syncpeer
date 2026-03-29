@@ -42,6 +42,16 @@
     reportUiError,
     createTauriAdapters,
   } from "./lib/tauriAdapters.js";
+  import DiagnosticsPage from "./DiagnosticsPage.svelte";
+  import {
+    runFolderContentDiagnostics,
+    type FolderDiagnosticsReport,
+  } from "./lib/folderDiagnostics.ts";
+  import {
+    buildDiagnosticsRegistry,
+    runDiagnosticsTests,
+    type TaskyonTestFn,
+  } from "../../shared/modules/diagnosticsRunner.ts";
   import {
     Download,
     ExternalLink,
@@ -83,6 +93,17 @@
     syncApprovedIntroducedFolderKeys?: string[];
     acceptedIntroducedFolderKeys?: string[];
     folderPasswords?: Record<string, string>;
+    offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
+  }
+
+  interface OfflineFolderSnapshot {
+    deviceId: string;
+    remoteDevice: RemoteDeviceInfo | null;
+    folders: FolderInfo[];
+    folderSyncStates: FolderSyncState[];
+    connectedVia: string;
+    transportKind: "direct-tcp" | "relay" | "";
+    lastSeenAtMs: number;
   }
 
   interface SessionLogItem {
@@ -111,6 +132,7 @@
 
   const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
   const REFRESH_MS = 3000;
+  const SESSION_LOG_LIMIT = 2000;
   const MAX_VISIBLE_CRUMBS = 4;
   const FOLDER_PASSWORD_SCOPE_SEPARATOR = ":";
 
@@ -216,6 +238,7 @@
       ? persistedState.activeTab
       : "favorites",
   );
+  let currentPage = $state<"main" | "diagnostics">("main");
 
   let connection = $state<StoredConnectionSettings>({
     host: initialSettings.host,
@@ -255,6 +278,9 @@
   let remoteDevice = $state<RemoteDeviceInfo | null>(null);
   let folderSyncStates = $state<FolderSyncState[]>([]);
   let currentFolderVersionKey = $state("");
+  let offlineFolderSnapshots = $state<Record<string, OfflineFolderSnapshot>>(
+    persistedState?.offlineFolderSnapshots ?? {},
+  );
 
   let currentFolderId = $state("");
   let currentPath = $state("");
@@ -284,11 +310,11 @@
     folderPasswords,
     activeFolderPasswordScopeDeviceId(),
   ));
-  let newSavedDeviceName = $state("");
   let newSavedDeviceId = $state("");
   let cachedFileKeys = $state(new Set<string>());
   let downloadedFiles = $state<CachedFileRecord[]>([]);
   let newSavedDeviceIsIntroducer = $state(false);
+  let newSavedDeviceCustomName = $state("");
 
   let connectionModeLabel = $state("");
   let connectionPath = $state("");
@@ -297,12 +323,17 @@
   let sessionLogs = $state<SessionLogItem[]>([]);
   let isLogPanelExpanded = $state(false);
   let lastLoggedError = $state("");
+  let currentDeviceId = $state("");
+  let isLoadingCurrentDeviceId = $state(false);
+  let isRegeneratingDeviceId = $state(false);
+  let isDeviceBackupExpanded = $state(false);
+  let showRestoreFromBackup = $state(false);
+  let deviceIdentityNotice = $state("");
   let identityRecoverySecret = $state("");
-  let exportedIdentityDeviceId = $state("");
-  let exportedIdentitySecret = $state("");
   let isExportingIdentityRecovery = $state(false);
   let isRestoringIdentityRecovery = $state(false);
   let remoteApprovalPendingIds = $state<Set<string>>(new Set());
+  let pendingApprovalPromptDeviceId = $state("");
 
   let error = $state<string | null>(null);
   let nextSessionLogId = $state(1);
@@ -322,7 +353,7 @@
       details,
     };
     nextSessionLogId += 1;
-    sessionLogs = [entry, ...sessionLogs].slice(0, 300);
+    sessionLogs = [entry, ...sessionLogs].slice(0, SESSION_LOG_LIMIT);
   };
 
   const classifyUiLogLevel = (
@@ -371,12 +402,17 @@
 
   const shouldHintRemoteApprovalPending = (message: string): boolean => {
     const normalized = message.toLowerCase();
+    const connectionClosedCount = (normalized.match(/connection closed/g) ?? [])
+      .length;
     return (
       normalized.includes("may be waiting for you to accept this device") ||
       normalized.includes("remote peer rejected this device") ||
+      normalized.includes("waiting for approval of this client") ||
       normalized.includes("unknown device") ||
       normalized.includes("not configured") ||
-      normalized.includes("not in config")
+      normalized.includes("not in config") ||
+      (normalized.includes("could not connect using discovered candidates") &&
+        connectionClosedCount >= 2)
     );
   };
 
@@ -418,10 +454,108 @@
 
   onMount(() => {
     void hydratePersistedState();
+    void refreshCurrentDeviceId();
+    restoreOfflineFolderSnapshot(
+      normalizeDeviceId(connection.remoteId || selectedSavedDeviceId),
+      "startup",
+    );
   });
 
   const connectionDetails = (): ConnectOptions =>
     buildConnectionDetails(connection, activeFolderPasswords);
+
+  const activeOrSelectedDeviceId = (): string =>
+    normalizeDeviceId(
+      remoteDevice?.id ?? connection.remoteId ?? selectedSavedDeviceId,
+    );
+
+  const saveOfflineFolderSnapshot = (
+    sourceDeviceId: string,
+    snapshot: {
+      folders: FolderInfo[];
+      device: RemoteDeviceInfo | null;
+      folderSyncStates: FolderSyncState[];
+      connectedVia: string;
+      transportKind: "direct-tcp" | "relay";
+    },
+  ): void => {
+    const normalizedDeviceId = normalizeDeviceId(sourceDeviceId);
+    if (!normalizedDeviceId) return;
+    const nextFolders = Array.isArray(snapshot.folders) ? snapshot.folders : [];
+    const nextFolderSyncStates = Array.isArray(snapshot.folderSyncStates)
+      ? snapshot.folderSyncStates
+      : [];
+    if (nextFolders.length === 0 && nextFolderSyncStates.length === 0) return;
+    offlineFolderSnapshots = {
+      ...offlineFolderSnapshots,
+      [normalizedDeviceId]: {
+        deviceId: normalizedDeviceId,
+        remoteDevice: snapshot.device ?? null,
+        folders: nextFolders,
+        folderSyncStates: nextFolderSyncStates,
+        connectedVia: snapshot.connectedVia,
+        transportKind: snapshot.transportKind,
+        lastSeenAtMs: Date.now(),
+      },
+    };
+  };
+
+  const restoreOfflineFolderSnapshot = (
+    preferredDeviceId?: string,
+    reason = "restore",
+  ): boolean => {
+    const normalizedPreferred = normalizeDeviceId(
+      preferredDeviceId ?? activeOrSelectedDeviceId(),
+    );
+    let snapshot: OfflineFolderSnapshot | undefined;
+    if (normalizedPreferred) {
+      snapshot = offlineFolderSnapshots[normalizedPreferred];
+    }
+    if (!snapshot) {
+      const snapshots = Object.values(offlineFolderSnapshots).sort(
+        (a, b) => b.lastSeenAtMs - a.lastSeenAtMs,
+      );
+      snapshot = snapshots[0];
+    }
+    if (!snapshot) return false;
+    folders = Array.isArray(snapshot.folders) ? snapshot.folders : [];
+    folderSyncStates = Array.isArray(snapshot.folderSyncStates)
+      ? snapshot.folderSyncStates
+      : [];
+    remoteDevice = snapshot.remoteDevice ?? null;
+    connectionPath = snapshot.connectedVia ?? "";
+    connectionTransport = snapshot.transportKind ?? "";
+    pushSessionLog(
+      "info",
+      "offline.snapshot.restored",
+      `Restored offline folder snapshot (${reason}) for ${snapshot.deviceId}.`,
+      {
+        deviceId: snapshot.deviceId,
+        folderCount: folders.length,
+        folderSyncStateCount: folderSyncStates.length,
+        lastSeenAtMs: snapshot.lastSeenAtMs,
+      },
+    );
+    ensureCurrentFolderExists();
+    return true;
+  };
+
+  const clearOfflineFolderState = (): void => {
+    offlineFolderSnapshots = {};
+    if (!isConnected) {
+      folders = [];
+      folderSyncStates = [];
+      remoteDevice = null;
+      connectionPath = "";
+      connectionTransport = "";
+      clearDirectoryView();
+    }
+    pushSessionLog(
+      "info",
+      "offline.snapshot.cleared",
+      "Cleared all persisted offline folder snapshots.",
+    );
+  };
 
   const clearDirectoryView = (): void => {
     currentFolderId = "";
@@ -433,12 +567,7 @@
   const resetConnectionRuntimeState = (): void => {
     isConnected = false;
     remoteFs = null;
-    remoteDevice = null;
-    folders = [];
     entries = [];
-    folderSyncStates = [];
-    connectionPath = "";
-    connectionTransport = "";
     activeConnectDeviceId = "";
     recentError = null;
   };
@@ -452,15 +581,45 @@
       transportKind: "direct-tcp" | "relay";
     },
   ): void => {
-    folders = overview.folders;
-    remoteDevice = overview.device;
-    folderSyncStates = overview.folderSyncStates ?? [];
-    connectionPath = overview.connectedVia;
-    connectionTransport = overview.transportKind;
+    const nextFolders = Array.isArray(overview.folders) ? overview.folders : [];
+    const sourceDeviceId = normalizeDeviceId(
+      overview.device?.id ?? connection.remoteId ?? selectedSavedDeviceId,
+    );
+    pushSessionLog(
+      "info",
+      "overview.advertised.summary",
+      `Overview from ${sourceDeviceId || "unknown"} has ${nextFolders.length} folders.`,
+      {
+        sourceDeviceId,
+        folderIds: nextFolders.map((folder) => folder.id),
+        advertisedDeviceIdsByFolder: nextFolders.map((folder) => ({
+          folderId: folder.id,
+          advertisedDeviceIds: (folder.advertisedDevices ?? []).map((device) =>
+            normalizeDeviceId(device.id),
+          ),
+        })),
+      },
+    );
+    const shouldPreserveFolders = nextFolders.length === 0 && folders.length > 0;
+    if (!shouldPreserveFolders) {
+      folders = nextFolders;
+      remoteDevice = overview.device;
+      folderSyncStates = overview.folderSyncStates ?? [];
+      connectionPath = overview.connectedVia;
+      connectionTransport = overview.transportKind;
+      saveOfflineFolderSnapshot(sourceDeviceId, overview);
+      return;
+    }
+    pushSessionLog(
+      "warning",
+      "overview.snapshot.empty_ignored",
+      "Ignoring transient empty overview snapshot to preserve visible folder state.",
+    );
   };
 
   const ensureCurrentFolderExists = (): void => {
     if (!currentFolderId) return;
+    if (folders.length === 0) return;
     if (!folders.some((folder) => folder.id === currentFolderId)) {
       clearDirectoryView();
     }
@@ -482,10 +641,41 @@
     folderId: string,
     timeoutMs = 3500,
   ): Promise<boolean> => {
+    const initialState = folderSyncStates.find((item) => item.folderId === folderId);
+    pushSessionLog(
+      "info",
+      "folder.index.wait.start",
+      `Waiting for folder index state for ${folderId}.`,
+      {
+        folderId,
+        timeoutMs,
+        initialIndexReceived: initialState?.indexReceived ?? false,
+        initialRemoteIndexId: initialState?.remoteIndexId ?? null,
+        initialRemoteMaxSequence: initialState?.remoteMaxSequence ?? null,
+        knownFolderSyncStateCount: folderSyncStates.length,
+      },
+    );
+
     const deadline = Date.now() + timeoutMs;
+    let attempt = 0;
     while (Date.now() < deadline && isConnected) {
+      attempt += 1;
       const syncState = folderSyncStates.find((item) => item.folderId === folderId);
-      if (syncState?.indexReceived) return true;
+      if (syncState?.indexReceived) {
+        pushSessionLog(
+          "info",
+          "folder.index.wait.ready",
+          `Folder index is marked as received for ${folderId}.`,
+          {
+            folderId,
+            attempt,
+            remoteIndexId: syncState.remoteIndexId ?? null,
+            remoteMaxSequence: syncState.remoteMaxSequence ?? null,
+          },
+        );
+        return true;
+      }
+      const remainingMs = Math.max(deadline - Date.now(), 0);
       const versions = await Promise.race<FolderSyncState[] | null>([
         client.connectAndGetFolderVersions(connectionDetails()),
         sleep(1200).then(() => null),
@@ -495,22 +685,64 @@
           "warning",
           "folder.index.poll.timeout",
           `Timed out fetching folder sync states for ${folderId}.`,
+          {
+            folderId,
+            attempt,
+            remainingMs,
+          },
         );
         await sleep(150);
         continue;
       }
+      const previous = folderSyncStates.find((item) => item.folderId === folderId);
       folderSyncStates = versions;
-      if (versions.find((item) => item.folderId === folderId)?.indexReceived) {
+      const next = versions.find((item) => item.folderId === folderId);
+      pushSessionLog(
+        "info",
+        "folder.index.poll.state",
+        `Polled folder sync states for ${folderId}.`,
+        {
+          folderId,
+          attempt,
+          remainingMs,
+          knownFolderSyncStateCount: versions.length,
+          previousIndexReceived: previous?.indexReceived ?? false,
+          previousRemoteIndexId: previous?.remoteIndexId ?? null,
+          previousRemoteMaxSequence: previous?.remoteMaxSequence ?? null,
+          nextIndexReceived: next?.indexReceived ?? false,
+          nextRemoteIndexId: next?.remoteIndexId ?? null,
+          nextRemoteMaxSequence: next?.remoteMaxSequence ?? null,
+        },
+      );
+      if (next?.indexReceived) {
+        pushSessionLog(
+          "info",
+          "folder.index.wait.ready",
+          `Folder index became available for ${folderId}.`,
+          {
+            folderId,
+            attempt,
+            remoteIndexId: next.remoteIndexId ?? null,
+            remoteMaxSequence: next.remoteMaxSequence ?? null,
+          },
+        );
         return true;
       }
       await sleep(150);
     }
-    const received = !!folderSyncStates.find((item) => item.folderId === folderId)?.indexReceived;
+    const finalState = folderSyncStates.find((item) => item.folderId === folderId);
+    const received = !!finalState?.indexReceived;
     if (!received) {
       pushSessionLog(
         "warning",
         "folder.index.not_received",
         `Folder index not received yet for ${folderId}.`,
+        {
+          folderId,
+          finalIndexReceived: finalState?.indexReceived ?? false,
+          finalRemoteIndexId: finalState?.remoteIndexId ?? null,
+          finalRemoteMaxSequence: finalState?.remoteMaxSequence ?? null,
+        },
       );
     }
     return received;
@@ -612,16 +844,40 @@
     normalizeDeviceId(remoteDevice?.id ?? connection.remoteId);
   const currentSourceIsIntroducer = (): boolean =>
     isConnected && isIntroducerDevice(currentSourceDeviceId());
-  const upsertSavedDeviceEntry = (deviceId: string, deviceName?: string): boolean => {
+  const temporarySavedDeviceName = (deviceId: string): string => {
+    const normalizedId = normalizeDeviceId(deviceId);
+    if (!normalizedId) return "";
+    return normalizedId.slice(0, 5) || normalizedId;
+  };
+  const suggestedSavedDeviceName = (deviceId: string): string => {
+    const normalizedId = normalizeDeviceId(deviceId);
+    if (!normalizedId) return "";
+    const advertised = advertisedDevices.find(
+      (device) => normalizeDeviceId(device.id) === normalizedId,
+    );
+    if (advertised?.name?.trim()) return advertised.name.trim();
+    const existing = savedDevices.find(
+      (device) => normalizeDeviceId(device.id) === normalizedId,
+    );
+    if (existing?.name?.trim()) return existing.name.trim();
+    return temporarySavedDeviceName(normalizedId);
+  };
+  const upsertSavedDeviceEntry = (
+    deviceId: string,
+    deviceName?: string,
+    options?: { customName?: boolean },
+  ): boolean => {
     const normalizedId = normalizeDeviceId(deviceId);
     if (!normalizedId) return false;
-    const displayName = (deviceName ?? "").trim() || normalizedId;
+    const displayName =
+      (deviceName ?? "").trim() || temporarySavedDeviceName(normalizedId);
     const existing = savedDevices.find((device) => device.id === normalizedId);
+    const customName = options?.customName ?? existing?.customName ?? false;
     if (existing) {
       savedDevices = savedDevices
         .map((device) =>
           device.id === normalizedId
-            ? { ...device, name: displayName }
+            ? { ...device, name: displayName, customName }
             : device,
         )
         .sort((a, b) => a.name.localeCompare(b.name));
@@ -633,10 +889,25 @@
           name: displayName,
           createdAtMs: Date.now(),
           isIntroducer: false,
+          customName,
         },
       ].sort((a, b) => a.name.localeCompare(b.name));
     }
     return true;
+  };
+  const syncConnectedDeviceSavedName = (
+    deviceId: string,
+    advertisedDeviceName?: string,
+  ): void => {
+    const normalizedId = normalizeDeviceId(deviceId);
+    const advertisedName = (advertisedDeviceName ?? "").trim();
+    if (!normalizedId || !advertisedName) return;
+    const existing = savedDevices.find(
+      (device) => normalizeDeviceId(device.id) === normalizedId,
+    );
+    if (!existing || existing.customName) return;
+    if (existing.name.trim() === advertisedName) return;
+    upsertSavedDeviceEntry(normalizedId, advertisedName, { customName: false });
   };
   const setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean): void => {
     const normalizedId = normalizeDeviceId(deviceId);
@@ -743,8 +1014,11 @@
     if (isConnected) {
       await refreshOverview();
       if (!folderIsLocked(folderId)) {
+        const fs = remoteFs;
         try {
-          await remoteFs?.readDir(folderId, "");
+          if (fs) {
+            await fs.readDir(folderId, "");
+          }
         } catch {
           // Keep the action resilient; periodic refresh will retry.
         }
@@ -803,6 +1077,7 @@
       savedDevices,
       syncApprovedIntroducedFolderKeys: [...syncApprovedIntroducedFolderKeys].sort(),
       folderPasswords,
+      offlineFolderSnapshots,
     });
   });
 
@@ -827,18 +1102,6 @@
     if (error && error !== lastLoggedError) {
       lastLoggedError = error;
       pushSessionLog("error", "ui.error", error);
-    }
-  });
-
-  $effect(() => {
-    const normalizedId = normalizeDeviceId(newSavedDeviceId);
-    if (!normalizedId) return;
-    const advertised = advertisedDevices.find(
-      (device) => normalizeDeviceId(device.id) === normalizedId,
-    );
-    if (!advertised?.name) return;
-    if (!newSavedDeviceName.trim()) {
-      newSavedDeviceName = advertised.name;
     }
   });
 
@@ -1042,6 +1305,7 @@
     const attemptedDeviceId = normalizeDeviceId(
       targetDeviceId ?? connection.remoteId ?? selectedSavedDeviceId,
     );
+    restoreOfflineFolderSnapshot(attemptedDeviceId, "connect_start");
     try {
       const previousPeerId = normalizeDeviceId(remoteDevice?.id ?? "");
       remoteFs = await client.connectAndSync(connectionDetails());
@@ -1052,8 +1316,16 @@
       const sourceDeviceId = normalizeDeviceId(
         overview.device?.id ?? connection.remoteId,
       );
+      syncConnectedDeviceSavedName(sourceDeviceId, overview.device?.deviceName);
       setRemoteApprovalPending(attemptedDeviceId, false);
       setRemoteApprovalPending(sourceDeviceId, false);
+      if (
+        pendingApprovalPromptDeviceId &&
+        (normalizeDeviceId(pendingApprovalPromptDeviceId) === attemptedDeviceId ||
+          normalizeDeviceId(pendingApprovalPromptDeviceId) === sourceDeviceId)
+      ) {
+        pendingApprovalPromptDeviceId = "";
+      }
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
         overview.folders,
@@ -1084,9 +1356,11 @@
       recentError = message;
       if (attemptedDeviceId && shouldHintRemoteApprovalPending(message)) {
         setRemoteApprovalPending(attemptedDeviceId, true);
+        pendingApprovalPromptDeviceId = attemptedDeviceId;
       }
       reportUiError("connect.failed", rawError, connectionDetails());
       resetConnectionRuntimeState();
+      restoreOfflineFolderSnapshot(attemptedDeviceId, "connect_failed");
     } finally {
       isConnecting = false;
       activeConnectDeviceId = "";
@@ -1107,6 +1381,7 @@
     } finally {
       resetConnectionRuntimeState();
       clearDirectoryView();
+      restoreOfflineFolderSnapshot(undefined, "disconnect");
       error = null;
     }
   }
@@ -1166,7 +1441,8 @@
   }
 
   async function loadCurrentDirectory() {
-    if (!remoteFs || !currentFolderId) return;
+    const fs = remoteFs;
+    if (!fs || !currentFolderId) return;
     if (folderIsLocked(currentFolderId)) {
       entries = [];
       isLoadingDirectory = false;
@@ -1184,7 +1460,8 @@
     isLoadingDirectory = true;
     try {
       await waitForFolderIndexToArrive(targetFolderId);
-      let nextEntries = await remoteFs.readDir(
+      if (requestSeq !== directoryLoadSeq || remoteFs !== fs) return;
+      let nextEntries = await fs.readDir(
         targetFolderId,
         targetPath,
       );
@@ -1196,7 +1473,8 @@
         const deadline = Date.now() + 4000;
         while (Date.now() < deadline && nextEntries.length === 0) {
           await sleep(200);
-          nextEntries = await remoteFs.readDir(
+          if (requestSeq !== directoryLoadSeq || remoteFs !== fs) return;
+          nextEntries = await fs.readDir(
             targetFolderId,
             targetPath,
           );
@@ -1246,6 +1524,7 @@
       const sourceDeviceId = normalizeDeviceId(
         overview.device?.id ?? connection.remoteId,
       );
+      syncConnectedDeviceSavedName(sourceDeviceId, overview.device?.deviceName);
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
         overview.folders,
@@ -1300,6 +1579,61 @@
     if (tab === "folders" || tab === "favorites") {
       void refreshActiveView();
     }
+  }
+
+  function openDiagnosticsPage() {
+    currentPage = "diagnostics";
+  }
+
+  function closeDiagnosticsPage() {
+    currentPage = "main";
+  }
+
+  async function runFolderDiagnosticsTest(): Promise<{
+    summary: {
+      runAtIso: string;
+      allPassed: boolean;
+      passed: number;
+      failed: number;
+    };
+    results: unknown[];
+  }> {
+    const folderDiagnosticsTest: TaskyonTestFn = async () =>
+      runFolderContentDiagnostics({
+        client,
+        options: connectionDetails(),
+        maxPollAttempts: 16,
+        pollIntervalMs: 250,
+      }) as unknown as FolderDiagnosticsReport;
+    folderDiagnosticsTest.description =
+      "End-to-end folder/index/readDir diagnostics";
+    folderDiagnosticsTest.timeoutMs = 90_000;
+
+    const registry = buildDiagnosticsRegistry({
+      builtins: [
+        {
+          testName: "folderContentDiagnostics",
+          func: folderDiagnosticsTest,
+          sourcePath: "packages/app/src/lib/folderDiagnostics.ts",
+        },
+      ],
+      modules: [],
+    });
+
+    const results = await runDiagnosticsTests(registry.tests, {
+      details: true,
+      timeoutMs: 90_000,
+    });
+    const passed = results.filter((result) => result.ok).length;
+    return {
+      summary: {
+        runAtIso: new Date().toISOString(),
+        allPassed: passed === results.length,
+        passed,
+        failed: results.length - passed,
+      },
+      results,
+    };
   }
 
   function formatModified(ms: number): string {
@@ -1519,17 +1853,38 @@
         "Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
       return;
     }
-    const advertised = advertisedDevices.find(
-      (device) => normalizeDeviceId(device.id) === normalizedId,
-    );
-    const preferredName = (advertised?.name ?? "").trim() || newSavedDeviceName;
-    upsertSavedDeviceEntry(normalizedId, preferredName);
+    const customName = newSavedDeviceCustomName.trim();
+    const preferredName = customName || suggestedSavedDeviceName(normalizedId);
+    upsertSavedDeviceEntry(normalizedId, preferredName, {
+      customName: customName !== "",
+    });
     setSavedDeviceIntroducer(normalizedId, newSavedDeviceIsIntroducer);
     selectedSavedDeviceId = normalizedId;
     connection.remoteId = normalizedId;
-    newSavedDeviceName = "";
     newSavedDeviceId = "";
     newSavedDeviceIsIntroducer = false;
+    newSavedDeviceCustomName = "";
+    error = null;
+  }
+
+  function editSavedDeviceName(deviceId: string) {
+    const normalizedId = normalizeDeviceId(deviceId);
+    if (!normalizedId) return;
+    const existing = savedDevices.find(
+      (device) => normalizeDeviceId(device.id) === normalizedId,
+    );
+    const initialName = existing?.name?.trim() || suggestedSavedDeviceName(normalizedId);
+    const updated =
+      typeof window !== "undefined"
+        ? window.prompt("Edit device name:", initialName)
+        : initialName;
+    if (updated === null) return;
+    const trimmed = updated.trim();
+    if (!trimmed) {
+      error = "Device name cannot be empty.";
+      return;
+    }
+    upsertSavedDeviceEntry(normalizedId, trimmed, { customName: true });
     error = null;
   }
 
@@ -1538,7 +1893,7 @@
       error = `Advertised device ID is invalid and cannot be approved: ${device.id}`;
       return;
     }
-    upsertSavedDeviceEntry(device.id, device.name);
+    upsertSavedDeviceEntry(device.id, device.name, { customName: false });
     selectedSavedDeviceId = device.id;
     connection.remoteId = device.id;
     error = null;
@@ -1554,6 +1909,9 @@
   function useSavedDevice(deviceId: string) {
     selectedSavedDeviceId = deviceId;
     connection.remoteId = deviceId;
+    if (!isConnected) {
+      restoreOfflineFolderSnapshot(deviceId, "use_saved_device");
+    }
   }
 
   function resetDiscoveryServer() {
@@ -1563,6 +1921,9 @@
   function removeSavedDevice(deviceId: string) {
     const normalized = normalizeDeviceId(deviceId);
     setRemoteApprovalPending(normalized, false);
+    if (normalizeDeviceId(pendingApprovalPromptDeviceId) === normalized) {
+      pendingApprovalPromptDeviceId = "";
+    }
     savedDevices = savedDevices.filter(
       (device) => normalizeDeviceId(device.id) !== normalized,
     );
@@ -1581,55 +1942,172 @@
         ([key]) => !key.startsWith(scopedPrefix),
       ),
     );
+    offlineFolderSnapshots = Object.fromEntries(
+      Object.entries(offlineFolderSnapshots).filter(
+        ([key]) => normalizeDeviceId(key) !== normalized,
+      ),
+    );
   }
 
-  async function exportIdentityRecovery() {
+  async function copyTextToClipboard(text: string): Promise<void> {
+    if (!text.trim()) {
+      throw new Error("Nothing to copy.");
+    }
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      throw new Error("Clipboard API unavailable on this device");
+    }
+    await navigator.clipboard.writeText(text);
+  }
+
+  async function refreshCurrentDeviceId() {
+    if (isLoadingCurrentDeviceId) return;
+    isLoadingCurrentDeviceId = true;
+    try {
+      currentDeviceId = await client.getDefaultDeviceId();
+    } catch (rawError: unknown) {
+      setError("device_id.read.failed", rawError);
+      reportUiError("device_id.read.failed", rawError);
+    } finally {
+      isLoadingCurrentDeviceId = false;
+    }
+  }
+
+  async function copyCurrentDeviceId() {
+    error = null;
+    if (!currentDeviceId) {
+      await refreshCurrentDeviceId();
+    }
+    try {
+      await copyTextToClipboard(currentDeviceId);
+      deviceIdentityNotice = "Device ID copied.";
+    } catch (rawError: unknown) {
+      setError("device_id.copy.failed", rawError);
+      reportUiError("device_id.copy.failed", rawError);
+    }
+  }
+
+  async function copyIdentityBackupSecret() {
     if (isExportingIdentityRecovery) return;
     isExportingIdentityRecovery = true;
     error = null;
     try {
       const exported = await client.exportIdentityRecovery();
-      exportedIdentityDeviceId = exported.deviceId;
-      exportedIdentitySecret = exported.recoverySecret;
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(exported.recoverySecret);
-      }
+      await copyTextToClipboard(exported.recoverySecret);
+      currentDeviceId = exported.deviceId;
+      deviceIdentityNotice = "Backup secret copied. Keep it in a safe place.";
     } catch (rawError: unknown) {
-      setError("identity_recovery.export.failed", rawError);
-      reportUiError("identity_recovery.export.failed", rawError);
+      setError("identity_backup.copy_secret.failed", rawError);
+      reportUiError("identity_backup.copy_secret.failed", rawError);
     } finally {
       isExportingIdentityRecovery = false;
     }
+  }
+
+  async function regenerateDeviceId() {
+    if (isRegeneratingDeviceId) return;
+    const confirmed =
+      typeof window !== "undefined"
+        ? window.confirm(
+            "Generate a new device ID now? Other peers will treat this as a new device until approved again.",
+          )
+        : true;
+    if (!confirmed) return;
+    isRegeneratingDeviceId = true;
+    error = null;
+    try {
+      const nextDeviceId = await client.regenerateDefaultIdentity();
+      currentDeviceId = nextDeviceId;
+      deviceIdentityNotice = "New device ID generated.";
+      identityRecoverySecret = "";
+      showRestoreFromBackup = false;
+    } catch (rawError: unknown) {
+      setError("device_id.regenerate.failed", rawError);
+      reportUiError("device_id.regenerate.failed", rawError);
+    } finally {
+      isRegeneratingDeviceId = false;
+    }
+  }
+
+  function editLocalDeviceName() {
+    const initial = connection.deviceName.trim() || suggestedClientName();
+    const updated =
+      typeof window !== "undefined"
+        ? window.prompt("Edit this device name (advertised to peers):", initial)
+        : initial;
+    if (updated === null) return;
+    const trimmed = updated.trim();
+    if (!trimmed) {
+      error = "Device name is required.";
+      return;
+    }
+    connection.deviceName = trimmed;
+    deviceIdentityNotice = "Advertised device name updated.";
+    error = null;
   }
 
   async function restoreIdentityRecovery() {
     if (isRestoringIdentityRecovery) return;
     const secret = identityRecoverySecret.trim();
     if (!secret) {
-      error = "Recovery secret is required.";
+      error = "Backup secret is required.";
       return;
     }
     isRestoringIdentityRecovery = true;
     error = null;
     try {
       await client.restoreIdentityRecovery(secret);
+      await refreshCurrentDeviceId();
       identityRecoverySecret = "";
-      exportedIdentitySecret = "";
-      exportedIdentityDeviceId = "";
+      showRestoreFromBackup = false;
+      deviceIdentityNotice = "Device identity restored from backup secret.";
     } catch (rawError: unknown) {
-      setError("identity_recovery.restore.failed", rawError);
-      reportUiError("identity_recovery.restore.failed", rawError);
+      setError("identity_backup.restore.failed", rawError);
+      reportUiError("identity_backup.restore.failed", rawError);
     } finally {
       isRestoringIdentityRecovery = false;
     }
   }
 </script>
 
+{#if currentPage === "main"}
 <div class="app-shell">
   <main class="content">
     {#if recentError}
       <section class="panel error-banner-panel">
         <p class="error">{recentError}</p>
+      </section>
+    {/if}
+
+    {#if pendingApprovalPromptDeviceId}
+      <section class="panel">
+        <p class="hint">
+          Waiting for remote approval for
+          <strong>{suggestedSavedDeviceName(pendingApprovalPromptDeviceId)}</strong>.
+          The remote peer device should now show a prompt to accept this client.
+          Accept it there, then connect again.
+        </p>
+        <div class="item-meta">{pendingApprovalPromptDeviceId}</div>
+        <div class="actions">
+          <button
+            class="primary"
+            onclick={() => connectToSavedDevice(pendingApprovalPromptDeviceId)}
+            disabled={isConnecting}
+          >
+            {isConnecting &&
+            activeConnectDeviceId === pendingApprovalPromptDeviceId
+              ? "Connecting..."
+              : "Connect Again"}
+          </button>
+          <button
+            class="ghost"
+            onclick={() => {
+              pendingApprovalPromptDeviceId = "";
+            }}
+            disabled={isConnecting}
+          >
+            Dismiss
+          </button>
+        </div>
       </section>
     {/if}
 
@@ -1664,6 +2142,38 @@
           {#if isConnected && connectionPath}
             <span>Path: {connectionTransport === "relay" ? "relay" : "direct tcp"} ({connectionPath})</span>
           {/if}
+        </div>
+
+        <div class="identity-inline">
+          <div class="item-main">
+            <div class="item-title-row">
+              <span class="item-title">This Device ID</span>
+              {#if isLoadingCurrentDeviceId}
+                <span class="status-chip small">loading...</span>
+              {/if}
+            </div>
+            <div class="item-meta">
+              {currentDeviceId || "Unavailable"}
+            </div>
+            <div class="item-meta">
+              Advertised name: {connection.deviceName.trim() || "syncpeer-ui"}
+            </div>
+            {#if deviceIdentityNotice}
+              <div class="item-meta">{deviceIdentityNotice}</div>
+            {/if}
+          </div>
+          <div class="item-actions">
+            <button class="ghost" onclick={copyCurrentDeviceId}>Copy ID</button>
+            <button class="ghost" onclick={editLocalDeviceName}>Edit Name</button>
+            <button
+              class="ghost"
+              onclick={regenerateDeviceId}
+              disabled={isRegeneratingDeviceId}
+              title="Generate a new certificate and device ID"
+            >
+              {isRegeneratingDeviceId ? "Generating..." : "Generate New ID"}
+            </button>
+          </div>
         </div>
 
         {#if !isConnected}
@@ -1754,11 +2264,6 @@
             </label>
 
             <label>
-              Device Name
-              <input type="text" bind:value={connection.deviceName} />
-            </label>
-
-            <label>
               Timeout (ms)
               <input
                 type="number"
@@ -1809,71 +2314,116 @@
             >
               {isClearingCache ? "Clearing Cache..." : "Clear Cache"}
             </button>
+            <button
+              type="button"
+              class="ghost"
+              onclick={clearOfflineFolderState}
+            >
+              Clear Offline Folder State
+            </button>
+            <button
+              type="button"
+              class="ghost"
+              onclick={openDiagnosticsPage}
+            >
+              Open Diagnostics Page
+            </button>
           </div>
         </details>
       </section>
 
       <section class="panel">
-        <h2 class="heading">Identity Recovery</h2>
-        <p class="hint">
-          Back up this device identity so reinstalling can restore the same device ID.
-        </p>
-        <div class="actions">
-          <button
-            type="button"
-            class="primary"
-            onclick={exportIdentityRecovery}
-            disabled={isExportingIdentityRecovery}
-          >
-            {isExportingIdentityRecovery ? "Exporting..." : "Export Recovery Secret"}
-          </button>
-        </div>
-        {#if exportedIdentitySecret}
-          <div class="item-meta">Device ID: {exportedIdentityDeviceId}</div>
-          <textarea
-            class="recovery-secret"
-            readonly
-            value={exportedIdentitySecret}
-          ></textarea>
-        {/if}
+        <details bind:open={isDeviceBackupExpanded}>
+          <summary>Device ID Backup</summary>
+          <p class="hint">
+            Keep a backup secret to restore this exact device ID after reinstall.
+          </p>
+          <div class="item-meta">Device ID: {currentDeviceId || "Unavailable"}</div>
+          <div class="actions">
+            <button
+              type="button"
+              class="primary"
+              onclick={copyCurrentDeviceId}
+            >
+              Copy Device ID
+            </button>
+            <button
+              type="button"
+              class="primary"
+              onclick={copyIdentityBackupSecret}
+              disabled={isExportingIdentityRecovery}
+            >
+              {isExportingIdentityRecovery ? "Copying..." : "Copy Backup Secret"}
+            </button>
+            <button
+              type="button"
+              class="ghost"
+              onclick={() => {
+                showRestoreFromBackup = !showRestoreFromBackup;
+                error = null;
+              }}
+            >
+              {showRestoreFromBackup ? "Hide Restore" : "Restore From Backup Secret"}
+            </button>
+          </div>
 
-        <label>
-          Restore From Recovery Secret
-          <textarea
-            class="recovery-secret"
-            bind:value={identityRecoverySecret}
-            placeholder="Paste recovery secret here"
-          ></textarea>
-        </label>
-        <div class="actions">
-          <button
-            type="button"
-            class="ghost"
-            onclick={restoreIdentityRecovery}
-            disabled={isRestoringIdentityRecovery}
-          >
-            {isRestoringIdentityRecovery ? "Restoring..." : "Restore Identity"}
-          </button>
-        </div>
+          {#if showRestoreFromBackup}
+            <label>
+              Backup Secret
+              <textarea
+                class="recovery-secret"
+                bind:value={identityRecoverySecret}
+                placeholder="Paste backup secret here"
+              ></textarea>
+            </label>
+            <div class="actions">
+              <button
+                type="button"
+                class="ghost"
+                onclick={restoreIdentityRecovery}
+                disabled={isRestoringIdentityRecovery}
+              >
+                {isRestoringIdentityRecovery ? "Restoring..." : "Restore Device ID"}
+              </button>
+              <button
+                type="button"
+                class="ghost"
+                onclick={() => {
+                  identityRecoverySecret = "";
+                  error = null;
+                }}
+                disabled={!identityRecoverySecret.trim()}
+              >
+                Clear Input
+              </button>
+            </div>
+          {/if}
+        </details>
       </section>
 
       <section class="panel">
         <h2 class="heading">Add Device</h2>
         <div class="saved-device-editor">
           <label>
-            Device Name (auto from advertised, editable)
-            <input
-              type="text"
-              bind:value={newSavedDeviceName}
-              placeholder="Kitchen Pixel"
-            />
-          </label>
-          <label>
             Device ID
             <input
               type="text"
               bind:value={newSavedDeviceId}
               placeholder="ABCD123-..."
+            />
+          </label>
+          {#if normalizeDeviceId(newSavedDeviceId)}
+            <p class="hint">
+              Saved as <strong>{newSavedDeviceCustomName.trim() || suggestedSavedDeviceName(newSavedDeviceId)}</strong>.
+              We’ll switch to the device’s advertised name after first connection unless you set a custom name.
+            </p>
+          {/if}
+          <label>
+            Custom name (optional)
+            <input
+              type="text"
+              bind:value={newSavedDeviceCustomName}
+              placeholder="Leave blank to use device advertised name later"
             />
           </label>
           <label class="checkbox-row">
@@ -2010,7 +2560,7 @@
                     {/if}
                     {#if isSavedDeviceAwaitingRemoteApproval(device.id)}
                       <span class="status-chip offline small" title="This peer may still need to approve your device on their Syncthing side.">
-                        awaiting approval
+                        not approved yet
                       </span>
                     {/if}
                   </div>
@@ -2028,6 +2578,13 @@
                     class="ghost"
                     onclick={() => useSavedDevice(device.id)}>Use</button
                   >
+                  <button
+                    class="ghost"
+                    onclick={() => editSavedDeviceName(device.id)}
+                    title="Edit saved device name"
+                  >
+                    Edit Name
+                  </button>
                   <button
                     class="ghost"
                     onclick={() =>
@@ -2597,6 +3154,9 @@
     </button>
   </nav>
 </div>
+{:else}
+  <DiagnosticsPage onBack={closeDiagnosticsPage} onRun={runFolderDiagnosticsTest} />
+{/if}
 
 <style>
   :global(body) {
@@ -2792,6 +3352,19 @@
     font-size: 0.8rem;
     color: #4c627a;
     margin-bottom: 0.4rem;
+  }
+
+  .identity-inline {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    align-items: flex-start;
+    border: 1px solid #dbe3ee;
+    border-radius: 10px;
+    padding: 0.45rem 0.55rem;
+    background: #fbfdff;
+    margin-bottom: 0.45rem;
+    flex-wrap: wrap;
   }
 
   .status-chip {

@@ -1,4 +1,4 @@
-import type { AdvertisedDeviceInfo, FolderInfo } from "@syncpeer/core/browser";
+import type { AdvertisedDeviceInfo, FolderInfo } from "../core/model/remoteFs.js";
 
 export interface BreadcrumbSegment {
   key: string;

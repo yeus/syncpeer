@@ -246,6 +246,45 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs?: number): Promise<T> {
   });
 }
 
+function isTimeoutLikeError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("timed out") ||
+    normalized.includes("timeout") ||
+    normalized.includes("i/o timeout")
+  );
+}
+
+function isRemoteApprovalLikelyError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("unknown device") ||
+    normalized.includes("not configured") ||
+    normalized.includes("not in config") ||
+    normalized.includes("certificate unknown") ||
+    normalized.includes("access denied") ||
+    normalized.includes("not authorized")
+  );
+}
+
+function maybeConnectionHint(
+  opts: SyncpeerConnectOptions,
+  errors: string[],
+): string {
+  if (!opts.expectedDeviceId || errors.length === 0) return "";
+  const hasApprovalSignal = errors.some((entry) =>
+    isRemoteApprovalLikelyError(entry),
+  );
+  if (hasApprovalSignal) {
+    return "Remote peer rejected this device. On the remote Syncthing instance, add/accept this device, then retry.";
+  }
+  const allTimeoutLike = errors.every((entry) => isTimeoutLikeError(entry));
+  if (allTimeoutLike) {
+    return "All connection attempts timed out. If the remote peer is online but this is a new pairing, it may be waiting for you to accept this device on the remote Syncthing instance.";
+  }
+  return "";
+}
+
 function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
   const raw = (rawUrl ?? "").trim();
   const defaultUrl = "https://discovery.syncthing.net/v2/";
@@ -564,8 +603,7 @@ class BepSession {
       });
       const encrypted =
         Number(folder.type ?? 0) === 3 ||
-        (announcedToken?.length ?? 0) > 0 ||
-        this.folderPasswords.has(folderId);
+        (announcedToken?.length ?? 0) > 0;
       let folderCrypto: UntrustedFolderCrypto | undefined;
       let needsPassword = false;
       let passwordError: string | undefined;
@@ -1235,9 +1273,9 @@ async function openSession(
     errors.push("Relay fallback is disabled by settings");
   }
 
-  throw new Error(
-    `Could not connect using discovered candidates. ${errors.join(" | ")}`,
-  );
+  const hint = maybeConnectionHint(opts, errors);
+  const technical = `Could not connect using discovered candidates. ${errors.join(" | ")}`;
+  throw new Error(hint ? `${hint} Technical details: ${technical}` : technical);
 }
 
 export interface SyncpeerCoreClient {
@@ -1250,7 +1288,23 @@ export function createSyncpeerCoreClient(
   adapter: SyncpeerHostAdapter,
 ): SyncpeerCoreClient {
   return {
-    openSession: (options: SyncpeerConnectOptions) =>
-      withTimeout(openSession(adapter, options), options.timeoutMs),
+    openSession: async (options: SyncpeerConnectOptions) => {
+      try {
+        return await withTimeout(openSession(adapter, options), options.timeoutMs);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          options.expectedDeviceId &&
+          isTimeoutLikeError(message) &&
+          !isRemoteApprovalLikelyError(message)
+        ) {
+          throw new Error(
+            "Connection timed out. If this is a new pairing, the remote Syncthing instance may be waiting for you to accept this device. " +
+              `Technical details: ${message}`,
+          );
+        }
+        throw error;
+      }
+    },
   };
 }

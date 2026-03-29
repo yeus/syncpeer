@@ -2,21 +2,12 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import {
-    createSyncpeerUiClient,
+    createSyncpeerBrowserClient,
     getDefaultDiscoveryServer,
     normalizeDiscoveryServer,
-    reportUiError,
-    type CachedFileRecord,
-    type ConnectOptions,
-    type RemoteFsLike,
-    type UiLogEntry,
-  } from "./lib/syncpeerClient.js";
-  import {
     buildConnectionDetails,
     fromConnectionSettings,
     toConnectionSettings,
-  } from "./lib/state/useConnectionState.js";
-  import {
     breadcrumbSegments,
     cachedFileKey,
     collectAdvertisedDevices,
@@ -34,30 +25,43 @@
     resolveDirectoryPath,
     sleep,
     syncApprovedFolderKey,
-  } from "./lib/state/uiHelpers.js";
-  import type {
-    FileEntry,
-    FolderInfo,
-    FolderSyncState,
-    RemoteDeviceInfo,
+    type BreadcrumbSegment,
+    type CachedFileRecord,
+    type ConnectOptions,
+    type DiscoveryMode,
+    type RemoteFsLike,
+    type SavedDeviceLike,
+    type StoredConnectionSettingsLike,
+    type UiLogEntry,
+    type FileEntry,
+    type FolderInfo,
+    type FolderSyncState,
+    type RemoteDeviceInfo,
   } from "@syncpeer/core/browser";
+  import {
+    reportUiError,
+    createTauriAdapters,
+  } from "./lib/tauriAdapters.js";
+  import {
+    Download,
+    ExternalLink,
+    FolderOpen,
+    KeyRound,
+    RefreshCw,
+    Settings,
+    Star,
+    StarOff,
+    Trash2,
+    Unlock,
+  } from "lucide-svelte";
 
   type Tab = "favorites" | "folders" | "devices";
-  type DiscoveryMode = "global" | "direct";
 
   interface RootFolderEntry {
     type: "root-folder";
     id: string;
     name: string;
     readOnly: boolean;
-  }
-
-  interface BreadcrumbSegment {
-    key: string;
-    label: string;
-    targetFolderId: string;
-    targetPath: string;
-    ellipsis?: boolean;
   }
 
   interface FavoriteItem {
@@ -68,27 +72,8 @@
     kind: "folder" | "file";
   }
 
-  interface StoredConnectionSettings {
-    host: string;
-    port: number;
-    cert: string;
-    key: string;
-    remoteId: string;
-    deviceName: string;
-    timeoutMs: number;
-    discoveryMode: DiscoveryMode;
-    discoveryServer: string;
-    enableRelayFallback: boolean;
-    autoAcceptNewDevices: boolean;
-    autoAcceptIntroducedFolders: boolean;
-  }
-
-  interface SavedDevice {
-    id: string;
-    name: string;
-    createdAtMs: number;
-    isIntroducer: boolean;
-  }
+  type StoredConnectionSettings = StoredConnectionSettingsLike;
+  type SavedDevice = SavedDeviceLike;
 
   interface PersistedAppState {
     activeTab: Tab;
@@ -127,6 +112,7 @@
   const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
   const REFRESH_MS = 3000;
   const MAX_VISIBLE_CRUMBS = 4;
+  const FOLDER_PASSWORD_SCOPE_SEPARATOR = ":";
 
   const parseJson = <T,>(raw: string | null): T | null => {
     if (!raw) return null;
@@ -150,6 +136,60 @@
       APP_STATE_STORAGE_KEY,
       JSON.stringify(state),
     );
+  };
+
+  const isScopedFolderPasswordKey = (value: string): boolean => {
+    const separatorIndex = value.indexOf(FOLDER_PASSWORD_SCOPE_SEPARATOR);
+    if (separatorIndex <= 0) return false;
+    const possibleDeviceId = normalizeDeviceId(value.slice(0, separatorIndex));
+    if (!possibleDeviceId) return false;
+    const scopedFolderId = value
+      .slice(separatorIndex + FOLDER_PASSWORD_SCOPE_SEPARATOR.length)
+      .trim();
+    return scopedFolderId !== "";
+  };
+
+  const folderPasswordScopedKey = (
+    sourceDeviceId: string,
+    folderId: string,
+  ): string => {
+    const normalizedFolderId = folderId.trim();
+    if (!normalizedFolderId) return "";
+    const normalizedDeviceId = normalizeDeviceId(sourceDeviceId);
+    if (!normalizedDeviceId) return normalizedFolderId;
+    return `${normalizedDeviceId}${FOLDER_PASSWORD_SCOPE_SEPARATOR}${normalizedFolderId}`;
+  };
+
+  const resolveFolderPasswordsForDevice = (
+    passwordStore: Record<string, string>,
+    sourceDeviceId: string,
+  ): Record<string, string> => {
+    const normalizedDeviceId = normalizeDeviceId(sourceDeviceId);
+    const scopedPrefix =
+      normalizedDeviceId === ""
+        ? ""
+        : `${normalizedDeviceId}${FOLDER_PASSWORD_SCOPE_SEPARATOR}`;
+    const resolved: Record<string, string> = {};
+
+    if (scopedPrefix !== "") {
+      for (const [storedKey, storedPassword] of Object.entries(passwordStore)) {
+        if (!storedKey.startsWith(scopedPrefix)) continue;
+        const folderId = storedKey.slice(scopedPrefix.length).trim();
+        if (!folderId) continue;
+        resolved[folderId] = storedPassword;
+      }
+    }
+
+    // Backward compatibility with old non-scoped storage.
+    for (const [storedKey, storedPassword] of Object.entries(passwordStore)) {
+      const folderId = storedKey.trim();
+      if (!folderId || isScopedFolderPasswordKey(folderId)) continue;
+      if (!(folderId in resolved)) {
+        resolved[folderId] = storedPassword;
+      }
+    }
+
+    return resolved;
   };
 
   const folderState = (folderId: string): FolderInfo | undefined =>
@@ -237,6 +277,13 @@
   let folderPasswordDrafts = $state<Record<string, string>>({
     ...initialFolderPasswords,
   });
+  let folderPasswordInputVisible = $state<Record<string, boolean>>({});
+  const activeFolderPasswordScopeDeviceId = (): string =>
+    normalizeDeviceId(remoteDevice?.id ?? connection.remoteId ?? selectedSavedDeviceId);
+  let activeFolderPasswords = $derived(resolveFolderPasswordsForDevice(
+    folderPasswords,
+    activeFolderPasswordScopeDeviceId(),
+  ));
   let newSavedDeviceName = $state("");
   let newSavedDeviceId = $state("");
   let cachedFileKeys = $state(new Set<string>());
@@ -255,6 +302,7 @@
   let exportedIdentitySecret = $state("");
   let isExportingIdentityRecovery = $state(false);
   let isRestoringIdentityRecovery = $state(false);
+  let remoteApprovalPendingIds = $state<Set<string>>(new Set());
 
   let error = $state<string | null>(null);
   let nextSessionLogId = $state(1);
@@ -321,7 +369,43 @@
     pushSessionLog("error", event, message, context);
   };
 
-  const client = createSyncpeerUiClient({ onLog: pushClientLog });
+  const shouldHintRemoteApprovalPending = (message: string): boolean => {
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes("may be waiting for you to accept this device") ||
+      normalized.includes("remote peer rejected this device") ||
+      normalized.includes("unknown device") ||
+      normalized.includes("not configured") ||
+      normalized.includes("not in config")
+    );
+  };
+
+  const setRemoteApprovalPending = (
+    deviceId: string,
+    pending: boolean,
+  ): void => {
+    const normalized = normalizeDeviceId(deviceId);
+    if (!normalized) return;
+    const next = new Set(remoteApprovalPendingIds);
+    if (pending) {
+      next.add(normalized);
+    } else {
+      next.delete(normalized);
+    }
+    remoteApprovalPendingIds = next;
+  };
+
+  const isSavedDeviceAwaitingRemoteApproval = (deviceId: string): boolean =>
+    remoteApprovalPendingIds.has(normalizeDeviceId(deviceId));
+
+  const { hostAdapter, platformAdapter } = createTauriAdapters({
+    onLog: pushClientLog,
+  });
+  const client = createSyncpeerBrowserClient({
+    hostAdapter,
+    platformAdapter,
+    onLog: pushClientLog,
+  });
 
   const refreshTimer = setInterval(() => {
     void refreshActiveView();
@@ -337,7 +421,7 @@
   });
 
   const connectionDetails = (): ConnectOptions =>
-    buildConnectionDetails(connection, folderPasswords);
+    buildConnectionDetails(connection, activeFolderPasswords);
 
   const clearDirectoryView = (): void => {
     currentFolderId = "";
@@ -455,6 +539,64 @@
     if (keyValue !== activeDownloadKey) return "Download";
     return activeDownloadText || "Downloading...";
   };
+  const inferPlatformLabel = (): string => {
+    if (typeof navigator === "undefined") return "device";
+    const uaDataPlatform =
+      (navigator as Navigator & { userAgentData?: { platform?: string } })
+        .userAgentData?.platform ?? "";
+    const platform = `${uaDataPlatform} ${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`.toLowerCase();
+    if (platform.includes("android")) return "android";
+    if (
+      platform.includes("iphone") ||
+      platform.includes("ipad") ||
+      platform.includes("ios")
+    ) {
+      return "ios";
+    }
+    if (platform.includes("mac")) return "mac";
+    if (platform.includes("win")) return "windows";
+    if (platform.includes("linux")) return "linux";
+    return "device";
+  };
+  const suggestedClientName = (): string => {
+    if (typeof window !== "undefined") {
+      const host = window.location.hostname.trim().toLowerCase();
+      if (
+        host &&
+        host !== "localhost" &&
+        host !== "127.0.0.1" &&
+        host !== "tauri.localhost"
+      ) {
+        return `syncpeer-${host}`;
+      }
+    }
+    return `syncpeer-${inferPlatformLabel()}`;
+  };
+  const ensureClientNameBeforeConnect = (): boolean => {
+    const currentName = connection.deviceName.trim();
+    if (currentName !== "" && currentName !== "syncpeer-ui") {
+      connection.deviceName = currentName;
+      return true;
+    }
+    const chosen =
+      typeof window !== "undefined"
+        ? window.prompt(
+            "Name this Syncpeer client (shown to remote devices):",
+            suggestedClientName(),
+          )
+        : suggestedClientName();
+    if (chosen === null) {
+      error = "Connection cancelled. Client name is required.";
+      return false;
+    }
+    const normalized = chosen.trim();
+    if (!normalized) {
+      error = "Client name is required.";
+      return false;
+    }
+    connection.deviceName = normalized;
+    return true;
+  };
   const isSavedDeviceConnected = (deviceId: string): boolean =>
     isConnected &&
     normalizeDeviceId(remoteDevice?.id ?? connection.remoteId) ===
@@ -558,18 +700,46 @@
       target instanceof HTMLInputElement ? target.value : "",
     );
   };
+  const isFolderPasswordInputVisible = (folderId: string): boolean => {
+    if (folderPasswordInputVisible[folderId]) return true;
+    if (!folderState(folderId)?.encrypted) return false;
+    if (folderIsLocked(folderId)) return true;
+    if (folderState(folderId)?.passwordError) return true;
+    return !activeFolderPasswords[folderId];
+  };
+  const openFolderPasswordInput = (folderId: string): void => {
+    folderPasswordInputVisible = {
+      ...folderPasswordInputVisible,
+      [folderId]: true,
+    };
+  };
+  const hideFolderPasswordInput = (folderId: string): void => {
+    folderPasswordInputVisible = {
+      ...folderPasswordInputVisible,
+      [folderId]: false,
+    };
+  };
   const saveFolderPassword = async (folderId: string): Promise<void> => {
     const password = (folderPasswordDrafts[folderId] ?? "").trim();
+    const scopedKey = folderPasswordScopedKey(
+      activeFolderPasswordScopeDeviceId(),
+      folderId,
+    );
     if (!password) {
       const next = { ...folderPasswords };
       delete next[folderId];
+      if (scopedKey) {
+        delete next[scopedKey];
+      }
       folderPasswords = next;
+      hideFolderPasswordInput(folderId);
       return;
     }
     folderPasswords = {
       ...folderPasswords,
-      [folderId]: password,
+      [scopedKey || folderId]: password,
     };
+    hideFolderPasswordInput(folderId);
     if (isConnected) {
       await refreshOverview();
       if (!folderIsLocked(folderId)) {
@@ -585,13 +755,21 @@
     }
   };
   const clearFolderPassword = async (folderId: string): Promise<void> => {
+    const scopedKey = folderPasswordScopedKey(
+      activeFolderPasswordScopeDeviceId(),
+      folderId,
+    );
     const next = { ...folderPasswords };
     delete next[folderId];
+    if (scopedKey) {
+      delete next[scopedKey];
+    }
     folderPasswords = next;
     folderPasswordDrafts = {
       ...folderPasswordDrafts,
       [folderId]: "",
     };
+    openFolderPasswordInput(folderId);
     if (isConnected) {
       await refreshOverview();
     }
@@ -809,6 +987,10 @@
     error = null;
     recentError = null;
     uploadMessage = "";
+    if (!ensureClientNameBeforeConnect()) {
+      activeConnectDeviceId = "";
+      return;
+    }
     if (targetDeviceId) {
       selectedSavedDeviceId = targetDeviceId;
       connection.remoteId = targetDeviceId;
@@ -857,6 +1039,9 @@
 
     connection.remoteId = normalizeDeviceId(connection.remoteId);
     isConnecting = true;
+    const attemptedDeviceId = normalizeDeviceId(
+      targetDeviceId ?? connection.remoteId ?? selectedSavedDeviceId,
+    );
     try {
       const previousPeerId = normalizeDeviceId(remoteDevice?.id ?? "");
       remoteFs = await client.connectAndSync(connectionDetails());
@@ -867,6 +1052,8 @@
       const sourceDeviceId = normalizeDeviceId(
         overview.device?.id ?? connection.remoteId,
       );
+      setRemoteApprovalPending(attemptedDeviceId, false);
+      setRemoteApprovalPending(sourceDeviceId, false);
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
         overview.folders,
@@ -895,6 +1082,9 @@
         rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
       recentError = message;
+      if (attemptedDeviceId && shouldHintRemoteApprovalPending(message)) {
+        setRemoteApprovalPending(attemptedDeviceId, true);
+      }
       reportUiError("connect.failed", rawError, connectionDetails());
       resetConnectionRuntimeState();
     } finally {
@@ -1372,6 +1562,7 @@
 
   function removeSavedDevice(deviceId: string) {
     const normalized = normalizeDeviceId(deviceId);
+    setRemoteApprovalPending(normalized, false);
     savedDevices = savedDevices.filter(
       (device) => normalizeDeviceId(device.id) !== normalized,
     );
@@ -1384,6 +1575,12 @@
       ),
     );
     syncApprovedIntroducedFolderKeys = nextSyncApproved;
+    const scopedPrefix = `${normalized}${FOLDER_PASSWORD_SCOPE_SEPARATOR}`;
+    folderPasswords = Object.fromEntries(
+      Object.entries(folderPasswords).filter(
+        ([key]) => !key.startsWith(scopedPrefix),
+      ),
+    );
   }
 
   async function exportIdentityRecovery() {
@@ -1811,6 +2008,11 @@
                     {#if isSavedDeviceConnected(device.id)}
                       <span class="status-chip online small">online</span>
                     {/if}
+                    {#if isSavedDeviceAwaitingRemoteApproval(device.id)}
+                      <span class="status-chip offline small" title="This peer may still need to approve your device on their Syncthing side.">
+                        awaiting approval
+                      </span>
+                    {/if}
                   </div>
                   <div class="item-meta">{device.id}</div>
                 </div>
@@ -1835,9 +2037,13 @@
                     {device.isIntroducer ? "Unset Introducer" : "Set Introducer"}
                   </button>
                   <button
-                    class="icon"
+                    class="icon icon-only"
                     onclick={() => removeSavedDevice(device.id)}
-                    title="Remove saved device">X</button
+                    title="Remove saved device"
+                    aria-label="Remove saved device"
+                  >
+                    <Trash2 size={16} />
+                  </button
                   >
                 </div>
               </li>
@@ -1995,9 +2201,13 @@
                     {/if}
                   {/if}
                   <button
-                    class="icon"
+                    class="icon icon-only"
                     onclick={() => void removeFavorite(favorite)}
-                    title="Remove favorite">★</button
+                    title="Remove favorite"
+                    aria-label="Remove favorite"
+                  >
+                    <Trash2 size={16} />
+                  </button
                   >
                 </div>
               </li>
@@ -2080,11 +2290,13 @@
               <span>Updated {lastUpdatedAt}</span>
             {/if}
             <button
+              class="ghost icon-only"
               onclick={() => refreshActiveView()}
               disabled={isRefreshing || isConnecting || isLoadingDirectory}
               title={isRefreshing ? "Refreshing..." : "Refresh"}
+              aria-label={isRefreshing ? "Refreshing..." : "Refresh"}
             >
-              Refresh
+              <RefreshCw size={16} />
             </button>
           </div>
 
@@ -2141,16 +2353,18 @@
                             {folderState(folder.id)?.passwordError}
                           </div>
                         {/if}
-                        <label class="inline-input">
-                          <span>Folder Password</span>
-                          <input
-                            type="password"
-                            value={folderPasswordDrafts[folder.id] ?? folderPasswords[folder.id] ?? ""}
-                            oninput={(event) =>
-                              handleFolderPasswordInput(folder.id, event)}
-                            placeholder="Syncthing folder encryption password"
-                          />
-                        </label>
+                        {#if isFolderPasswordInputVisible(folder.id)}
+                          <label class="inline-input">
+                            <span>Folder Password</span>
+                            <input
+                              type="password"
+                              value={folderPasswordDrafts[folder.id] ?? activeFolderPasswords[folder.id] ?? ""}
+                              oninput={(event) =>
+                                handleFolderPasswordInput(folder.id, event)}
+                              placeholder="Syncthing folder encryption password"
+                            />
+                          </label>
+                        {/if}
                       {/if}
                     </div>
                     <div class="item-actions">
@@ -2158,31 +2372,47 @@
                         <span class={`status-chip small ${folderIsLocked(folder.id) ? "offline" : "online"}`}>
                           {folderLockLabel(folder.id)}
                         </span>
+                        {#if !isFolderPasswordInputVisible(folder.id)}
+                          <button
+                            class="ghost icon-only"
+                            onclick={() => openFolderPasswordInput(folder.id)}
+                            title="Edit folder password"
+                            aria-label="Edit folder password"
+                          >
+                            <KeyRound size={16} />
+                          </button>
+                        {/if}
                         <button
-                          class="ghost"
+                          class="ghost icon-only"
                           onclick={() => saveFolderPassword(folder.id)}
+                          title="Unlock and decrypt folder"
+                          aria-label="Unlock and decrypt folder"
                         >
-                          Unlock & Decrypt
+                          <Unlock size={16} />
                         </button>
                         <button
-                          class="ghost"
+                          class="ghost icon-only"
                           onclick={() => clearFolderPassword(folder.id)}
-                          disabled={!folderPasswords[folder.id]}
+                          disabled={!activeFolderPasswords[folder.id]}
+                          title="Forget saved folder password"
+                          aria-label="Forget saved folder password"
                         >
-                          Forget Password
+                          <Trash2 size={16} />
                         </button>
                       {/if}
                       {#if cachedFileKeys.has(cachedFileKey(folder.id, ""))}
                         <button
-                          class="ghost"
+                          class="ghost icon-only"
                           onclick={() => openCachedDirectory(folder.id, "")}
                           disabled={isOpeningCachedFile}
+                          title="Open local cached folder"
+                          aria-label="Open local cached folder"
                         >
-                          Open Local
+                          <ExternalLink size={16} />
                         </button>
                       {/if}
                       <button
-                        class="icon"
+                        class="icon icon-only"
                         onclick={() =>
                           void toggleFavorite(
                             folder.id,
@@ -2191,10 +2421,13 @@
                             "folder",
                           )}
                         title="Toggle favorite"
+                        aria-label="Toggle favorite"
                       >
-                        {favoriteKeys.has(favoriteKey(folder.id, "", "folder"))
-                          ? "★"
-                          : "☆"}
+                        {#if favoriteKeys.has(favoriteKey(folder.id, "", "folder"))}
+                          <Star size={16} />
+                        {:else}
+                          <StarOff size={16} />
+                        {/if}
                       </button>
                     </div>
                   </li>
@@ -2205,7 +2438,7 @@
             <ul class="list">
               {#if folderIsLocked(currentFolderId)}
                 <li class="empty">
-                  This receive-encrypted folder is locked. Use Unlock & Decrypt from the folder list to browse or download files.
+                  This receive-encrypted folder is locked. Use the unlock button in the folder list to browse or download files.
                 </li>
               {:else if isLoadingDirectory}
                 <li class="empty">Loading folder contents...</li>
@@ -2239,36 +2472,42 @@
                       {#if entry.type === "directory"}
                         {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
                           <button
-                            class="ghost"
+                            class="ghost icon-only"
                             onclick={() =>
                               openCachedDirectory(currentFolderId, entry.path)}
                             disabled={isOpeningCachedFile}
+                            title="Open local cached directory"
+                            aria-label="Open local cached directory"
                           >
-                            Open Local
+                            <ExternalLink size={16} />
                           </button>
                         {/if}
                       {/if}
                       {#if entry.type !== "directory"}
                         {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
                           <button
-                            class="ghost"
+                            class="ghost icon-only"
                             onclick={() =>
                               openCachedFile(currentFolderId, entry.path)}
                             disabled={isOpeningCachedFile}
+                            title="Open cached file"
+                            aria-label="Open cached file"
                           >
-                            Open
+                            <ExternalLink size={16} />
                           </button>
                           <button
-                            class="ghost"
+                            class="ghost icon-only"
                             onclick={() =>
                               openCachedFileDirectory(currentFolderId, entry.path)}
                             disabled={isOpeningCachedFile}
+                            title="Open cached file directory"
+                            aria-label="Open cached file directory"
                           >
-                            Open Folder
+                            <FolderOpen size={16} />
                           </button>
                         {:else}
                           <button
-                            class="ghost"
+                            class="ghost icon-only"
                             onclick={() =>
                               downloadFile(
                                 currentFolderId,
@@ -2276,13 +2515,15 @@
                                 entry.name,
                               )}
                             disabled={isDownloading || entry.invalid}
+                            title={downloadButtonLabel(currentFolderId, entry.path)}
+                            aria-label={downloadButtonLabel(currentFolderId, entry.path)}
                           >
-                            {downloadButtonLabel(currentFolderId, entry.path)}
+                            <Download size={16} />
                           </button>
                         {/if}
                       {/if}
                       <button
-                        class="icon"
+                        class="icon icon-only"
                         onclick={() =>
                           void toggleFavorite(
                             currentFolderId,
@@ -2291,16 +2532,19 @@
                             entry.type === "directory" ? "folder" : "file",
                           )}
                         title="Toggle favorite"
+                        aria-label="Toggle favorite"
                       >
-                        {favoriteKeys.has(
+                        {#if favoriteKeys.has(
                           favoriteKey(
                             currentFolderId,
                             entry.path,
                             entry.type === "directory" ? "folder" : "file",
                           ),
-                        )
-                          ? "★"
-                          : "☆"}
+                        )}
+                          <Star size={16} />
+                        {:else}
+                          <StarOff size={16} />
+                        {/if}
                       </button>
                     </div>
                   </li>
@@ -2334,21 +2578,21 @@
       class={`tab-button ${activeTab === "favorites" ? "active" : ""}`}
       onclick={() => switchTab("favorites")}
     >
-      <span class="tab-icon" aria-hidden="true">★</span>
+      <Star size={18} aria-hidden="true" />
       <span class="sr-only">Favorites</span>
     </button>
     <button
       class={`tab-button ${activeTab === "folders" ? "active" : ""}`}
       onclick={() => switchTab("folders")}
     >
-      <span class="tab-icon" aria-hidden="true">▦</span>
+      <FolderOpen size={18} aria-hidden="true" />
       <span class="sr-only">Folders</span>
     </button>
     <button
       class={`tab-button ${activeTab === "devices" ? "active" : ""}`}
       onclick={() => switchTab("devices")}
     >
-      <span class="tab-icon" aria-hidden="true">☰</span>
+      <Settings size={18} aria-hidden="true" />
       <span class="sr-only">Settings</span>
     </button>
   </nav>
@@ -2493,6 +2737,10 @@
       box-shadow 120ms ease,
       background-color 120ms ease;
     will-change: transform;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
   }
 
   button.primary {
@@ -2507,9 +2755,15 @@
   }
 
   button.icon {
-    min-width: 2.1rem;
+    min-width: 2.3rem;
     padding: 0.35rem 0.5rem;
     text-align: center;
+  }
+
+  button.icon-only {
+    width: 2.3rem;
+    min-width: 2.3rem;
+    padding: 0.35rem;
   }
 
   button:disabled {
@@ -2526,6 +2780,8 @@
     margin-bottom: 0.35rem;
     display: flex;
     justify-content: flex-end;
+    align-items: center;
+    gap: 0.45rem;
   }
 
   .status-row {
@@ -2619,7 +2875,7 @@
 
   .list-item {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 0.35rem;
     padding: 0.42rem 0.5rem;
     border-bottom: 1px solid #eef2f7;
@@ -2657,6 +2913,7 @@
   .item-meta {
     font-size: 0.74rem;
     color: #61778f;
+    overflow-wrap: anywhere;
   }
 
   .log-error {
@@ -2685,7 +2942,9 @@
     display: flex;
     gap: 0.35rem;
     align-items: center;
-    align-self: center;
+    align-self: stretch;
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
 
   .empty {
@@ -2739,11 +2998,6 @@
     border-color: #d6e9ff;
   }
 
-  .tab-icon {
-    font-size: 1.15rem;
-    line-height: 1;
-  }
-
   .sr-only {
     position: absolute;
     width: 1px;
@@ -2763,6 +3017,14 @@
 
     form.settings {
       grid-template-columns: 1fr;
+    }
+
+    .list-item {
+      grid-template-columns: 1fr;
+    }
+
+    .item-actions {
+      justify-content: flex-start;
     }
   }
 </style>

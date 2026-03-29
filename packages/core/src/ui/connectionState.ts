@@ -1,4 +1,4 @@
-import { getDefaultDiscoveryServer, normalizeDiscoveryServer, type ConnectOptions } from "../syncpeerClient.js";
+import { getDefaultDiscoveryServer, normalizeDiscoveryServer, type ConnectOptions } from "./browserClient.js";
 
 export type DiscoveryMode = "global" | "direct";
 

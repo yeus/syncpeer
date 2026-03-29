@@ -402,14 +402,34 @@
     while (Date.now() < deadline && isConnected) {
       const syncState = folderSyncStates.find((item) => item.folderId === folderId);
       if (syncState?.indexReceived) return true;
-      const versions = await client.connectAndGetFolderVersions(connectionDetails());
+      const versions = await Promise.race<FolderSyncState[] | null>([
+        client.connectAndGetFolderVersions(connectionDetails()),
+        sleep(1200).then(() => null),
+      ]);
+      if (!versions) {
+        pushSessionLog(
+          "warning",
+          "folder.index.poll.timeout",
+          `Timed out fetching folder sync states for ${folderId}.`,
+        );
+        await sleep(150);
+        continue;
+      }
       folderSyncStates = versions;
       if (versions.find((item) => item.folderId === folderId)?.indexReceived) {
         return true;
       }
       await sleep(150);
     }
-    return !!folderSyncStates.find((item) => item.folderId === folderId)?.indexReceived;
+    const received = !!folderSyncStates.find((item) => item.folderId === folderId)?.indexReceived;
+    if (!received) {
+      pushSessionLog(
+        "warning",
+        "folder.index.not_received",
+        `Folder index not received yet for ${folderId}.`,
+      );
+    }
+    return received;
   };
 
   const rootFolderEntries = (): RootFolderEntry[] =>
@@ -552,6 +572,16 @@
     };
     if (isConnected) {
       await refreshOverview();
+      if (!folderIsLocked(folderId)) {
+        try {
+          await remoteFs?.readDir(folderId, "");
+        } catch {
+          // Keep the action resilient; periodic refresh will retry.
+        }
+        if (currentFolderId === folderId) {
+          await loadCurrentDirectory();
+        }
+      }
     }
   };
   const clearFolderPassword = async (folderId: string): Promise<void> => {
@@ -622,6 +652,18 @@
     }
   });
 
+  $effect(() => {
+    const normalizedId = normalizeDeviceId(newSavedDeviceId);
+    if (!normalizedId) return;
+    const advertised = advertisedDevices.find(
+      (device) => normalizeDeviceId(device.id) === normalizedId,
+    );
+    if (!advertised?.name) return;
+    if (!newSavedDeviceName.trim()) {
+      newSavedDeviceName = advertised.name;
+    }
+  });
+
   async function hydratePersistedState() {
     try {
       favorites = await client.listFavorites();
@@ -665,6 +707,34 @@
       reportUiError("refresh_cached_statuses.failed", rawError, {
         folderId,
         count: paths.length,
+      });
+    }
+  }
+
+  async function refreshFolderRootCachedStatuses(folderIds: string[]) {
+    const uniqueFolderIds = [...new Set(folderIds.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueFolderIds.length === 0) return;
+    try {
+      const responses = await Promise.all(
+        uniqueFolderIds.map(async (folderId) => ({
+          folderId,
+          statuses: await client.getCachedStatuses(folderId, [""]),
+        })),
+      );
+      const next = new Set(cachedFileKeys);
+      for (const response of responses) {
+        const keyValue = cachedFileKey(response.folderId, "");
+        const available = response.statuses[0]?.available ?? false;
+        if (available) {
+          next.add(keyValue);
+        } else {
+          next.delete(keyValue);
+        }
+      }
+      cachedFileKeys = next;
+    } catch (rawError: unknown) {
+      reportUiError("refresh_folder_root_cached_statuses.failed", rawError, {
+        count: uniqueFolderIds.length,
       });
     }
   }
@@ -793,6 +863,7 @@
       const overview = await client.connectAndGetOverview(connectionDetails());
       isConnected = true;
       applyOverviewSnapshot(overview);
+      void refreshFolderRootCachedStatuses(overview.folders.map((folder) => folder.id));
       const sourceDeviceId = normalizeDeviceId(
         overview.device?.id ?? connection.remoteId,
       );
@@ -912,21 +983,45 @@
       return;
     }
     error = null;
+    const targetFolderId = currentFolderId;
+    const targetPath = normalizePath(currentPath);
+    pushSessionLog(
+      "info",
+      "folder.load.start",
+      `Loading folder ${targetFolderId}:${targetPath || "/"}`,
+    );
     const requestSeq = ++directoryLoadSeq;
     isLoadingDirectory = true;
     try {
-      await waitForFolderIndexToArrive(currentFolderId);
-      const nextEntries = await remoteFs.readDir(
-        currentFolderId,
-        normalizePath(currentPath),
+      await waitForFolderIndexToArrive(targetFolderId);
+      let nextEntries = await remoteFs.readDir(
+        targetFolderId,
+        targetPath,
       );
+      if (
+        nextEntries.length === 0 &&
+        folderState(targetFolderId)?.encrypted &&
+        !folderIsLocked(targetFolderId)
+      ) {
+        const deadline = Date.now() + 4000;
+        while (Date.now() < deadline && nextEntries.length === 0) {
+          await sleep(200);
+          nextEntries = await remoteFs.readDir(
+            targetFolderId,
+            targetPath,
+          );
+        }
+      }
       if (requestSeq !== directoryLoadSeq) return;
       entries = nextEntries;
-      const filePaths = nextEntries
-        .filter((entry: FileEntry) => entry.type !== "directory")
-        .map((entry: FileEntry) => entry.path);
-      void refreshCachedStatuses(currentFolderId, filePaths);
-      currentFolderVersionKey = folderVersionKey(currentFolderId);
+      const entryPaths = nextEntries.map((entry: FileEntry) => entry.path);
+      void refreshCachedStatuses(targetFolderId, entryPaths);
+      currentFolderVersionKey = folderVersionKey(targetFolderId);
+      pushSessionLog(
+        "info",
+        "folder.load.result",
+        `Loaded ${nextEntries.length} entries from ${targetFolderId}:${targetPath || "/"}`,
+      );
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
       if (requestSeq !== directoryLoadSeq) return;
@@ -934,8 +1029,8 @@
         rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
       reportUiError("load_current_directory.failed", rawError, {
-        folderId: currentFolderId,
-        path: normalizePath(currentPath),
+        folderId: targetFolderId,
+        path: targetPath,
       });
     } finally {
       if (requestSeq === directoryLoadSeq) {
@@ -957,6 +1052,7 @@
     try {
       const overview = await client.connectAndGetOverview(connectionDetails());
       applyOverviewSnapshot(overview);
+      void refreshFolderRootCachedStatuses(overview.folders.map((folder) => folder.id));
       const sourceDeviceId = normalizeDeviceId(
         overview.device?.id ?? connection.remoteId,
       );
@@ -1066,6 +1162,7 @@
       const next = new Set(cachedFileKeys);
       next.add(cachedFileKey(folderId, path));
       cachedFileKeys = next;
+      await refreshFolderRootCachedStatuses([folderId]);
       activeDownloadText = "100% • Done";
     } catch (rawError: unknown) {
       const message =
@@ -1179,6 +1276,7 @@
       const next = new Set(cachedFileKeys);
       next.delete(cachedFileKey(folderId, path));
       cachedFileKeys = next;
+      await refreshFolderRootCachedStatuses([folderId]);
       downloadedFiles = downloadedFiles.filter(
         (file) => file.key !== cachedFileKey(folderId, path),
       );
@@ -1231,7 +1329,11 @@
         "Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
       return;
     }
-    upsertSavedDeviceEntry(normalizedId, newSavedDeviceName);
+    const advertised = advertisedDevices.find(
+      (device) => normalizeDeviceId(device.id) === normalizedId,
+    );
+    const preferredName = (advertised?.name ?? "").trim() || newSavedDeviceName;
+    upsertSavedDeviceEntry(normalizedId, preferredName);
     setSavedDeviceIntroducer(normalizedId, newSavedDeviceIsIntroducer);
     selectedSavedDeviceId = normalizedId;
     connection.remoteId = normalizedId;
@@ -1562,7 +1664,7 @@
         <h2 class="heading">Add Device</h2>
         <div class="saved-device-editor">
           <label>
-            Device Name
+            Device Name (auto from advertised, editable)
             <input
               type="text"
               bind:value={newSavedDeviceName}
@@ -2060,23 +2162,25 @@
                           class="ghost"
                           onclick={() => saveFolderPassword(folder.id)}
                         >
-                          Save Password
+                          Unlock & Decrypt
                         </button>
                         <button
                           class="ghost"
                           onclick={() => clearFolderPassword(folder.id)}
                           disabled={!folderPasswords[folder.id]}
                         >
-                          Clear Password
+                          Forget Password
                         </button>
                       {/if}
-                      <button
-                        class="ghost"
-                        onclick={() => openCachedDirectory(folder.id, "")}
-                        disabled={isOpeningCachedFile}
-                      >
-                        Open Local
-                      </button>
+                      {#if cachedFileKeys.has(cachedFileKey(folder.id, ""))}
+                        <button
+                          class="ghost"
+                          onclick={() => openCachedDirectory(folder.id, "")}
+                          disabled={isOpeningCachedFile}
+                        >
+                          Open Local
+                        </button>
+                      {/if}
                       <button
                         class="icon"
                         onclick={() =>
@@ -2101,7 +2205,7 @@
             <ul class="list">
               {#if folderIsLocked(currentFolderId)}
                 <li class="empty">
-                  This receive-encrypted folder is locked. Save the folder password from the folder list to browse or download files.
+                  This receive-encrypted folder is locked. Use Unlock & Decrypt from the folder list to browse or download files.
                 </li>
               {:else if isLoadingDirectory}
                 <li class="empty">Loading folder contents...</li>
@@ -2133,14 +2237,16 @@
                     </div>
                     <div class="item-actions">
                       {#if entry.type === "directory"}
-                        <button
-                          class="ghost"
-                          onclick={() =>
-                            openCachedDirectory(currentFolderId, entry.path)}
-                          disabled={isOpeningCachedFile}
-                        >
-                          Open Local
-                        </button>
+                        {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
+                          <button
+                            class="ghost"
+                            onclick={() =>
+                              openCachedDirectory(currentFolderId, entry.path)}
+                            disabled={isOpeningCachedFile}
+                          >
+                            Open Local
+                          </button>
+                        {/if}
                       {/if}
                       {#if entry.type !== "directory"}
                         {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}

@@ -267,6 +267,15 @@ function isRemoteApprovalLikelyError(message: string): boolean {
   );
 }
 
+function isImmediateRemoteCloseLikeError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("connection closed") ||
+    normalized.includes("socket hang up") ||
+    normalized.includes("eof")
+  );
+}
+
 function maybeConnectionHint(
   opts: SyncpeerConnectOptions,
   errors: string[],
@@ -281,6 +290,12 @@ function maybeConnectionHint(
   const allTimeoutLike = errors.every((entry) => isTimeoutLikeError(entry));
   if (allTimeoutLike) {
     return "All connection attempts timed out. If the remote peer is online but this is a new pairing, it may be waiting for you to accept this device on the remote Syncthing instance.";
+  }
+  const immediateCloseCount = errors.filter((entry) =>
+    isImmediateRemoteCloseLikeError(entry),
+  ).length;
+  if (immediateCloseCount >= 2) {
+    return "Connection was closed by the remote peer before sync started. If this is a first-time pairing, the remote Syncthing device is likely waiting for approval of this client. Accept the new device there, then retry.";
   }
   return "";
 }
@@ -582,6 +597,9 @@ class BepSession {
         remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0";
       const remoteMaxSequence = String(remoteDevice?.max_sequence ?? 0);
       const folderId = String(folder.id ?? "").trim();
+      const normalizedDeviceIds = folderDevices
+        .filter((device: any) => device?.id instanceof Uint8Array)
+        .map((device: any) => encodeDeviceId(device.id));
       const localToken =
         localDeviceEntry?.encryption_password_token instanceof Uint8Array
           ? localDeviceEntry.encryption_password_token
@@ -598,6 +616,10 @@ class BepSession {
         remoteIndexId,
         remoteMaxSequence,
         deviceCount: folderDevices.length,
+        localDevicePresentInFolder: !!localDeviceEntry,
+        remoteDevicePresentInFolder: !!remoteDevice,
+        folderDeviceIds: normalizedDeviceIds,
+        advertisedDeviceIds: advertisedDevices.map((device) => device.id),
         localTokenLengthFromPeer: localToken?.length ?? 0,
         remoteTokenLengthFromPeer: remoteToken?.length ?? 0,
       });
@@ -638,6 +660,11 @@ class BepSession {
           }
         }
       }
+      const previousState = this.folders.get(folderId);
+      const preserveIndexState =
+        previousState &&
+        previousState.remoteIndexId === remoteIndexId &&
+        previousState.remoteMaxSequence === remoteMaxSequence;
       const state: FolderState = {
         id: folderId,
         label: folder.label || folderId,
@@ -647,10 +674,14 @@ class BepSession {
         needsPassword,
         passwordError,
         folderCrypto,
-        indexReceived: false,
+        indexReceived: preserveIndexState
+          ? previousState.indexReceived
+          : false,
         remoteIndexId,
         remoteMaxSequence,
-        files: new Map(),
+        files: preserveIndexState
+          ? previousState.files
+          : new Map(),
       };
       this.folders.set(folderId, state);
       if (encrypted) {
@@ -693,6 +724,13 @@ class BepSession {
           // we also have encrypted-at-rest data for the same folder.
           encryption_password_token: undefined,
         });
+        this.log("cluster.echo.folder.prepared", {
+          folderId: String(folder.id ?? ""),
+          stopReason: Number(folder.stop_reason ?? 0),
+          deviceCountIn: Array.isArray(folder.devices) ? folder.devices.length : 0,
+          deviceCountOut: devices.length,
+          localDeviceInserted: true,
+        });
         if (state?.encrypted) {
           this.log("untrusted.folder.echo_config", {
             folderId: folder.id,
@@ -714,15 +752,43 @@ class BepSession {
         { folders },
         0,
       );
-      void this.socket.write(frame);
-      for (const folder of folders) {
-        const indexFrame = encodeMessageFrame(
-          MessageTypeValues.INDEX,
-          Index,
-          { folder: folder.id, files: [], last_sequence: 0 },
-          0,
-        );
-        void this.socket.write(indexFrame);
+      this.log("cluster.echo.send.start", {
+        folderCount: folders.length,
+      });
+      try {
+        await this.socket.write(frame);
+        this.log("cluster.echo.send.done", {
+          folderCount: folders.length,
+          bytes: frame.length,
+        });
+        for (const folder of folders) {
+          const folderId = String(folder?.id ?? "").trim();
+          if (!folderId) continue;
+          const stopReason = Number(folder?.stop_reason ?? 0);
+          if (stopReason !== 0) {
+            this.log("index.bootstrap.skipped", {
+              folderId,
+              stopReason,
+              reason: "folder_stopped_by_peer",
+            });
+            continue;
+          }
+          const indexFrame = encodeMessageFrame(
+            MessageTypeValues.INDEX,
+            Index,
+            { folder: folderId, files: [], last_sequence: 0 },
+            0,
+          );
+          await this.socket.write(indexFrame);
+          this.log("index.bootstrap.sent", {
+            folderId,
+            bytes: indexFrame.length,
+          });
+        }
+      } catch (error) {
+        this.log("cluster.echo.send.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     }
     if (this.readyState === "pending") {
@@ -992,12 +1058,14 @@ async function openBepSessionOnSocket(
   });
   const localCertDer = parseFirstCertificateDer(opts.certPem);
   const localDeviceId = await adapter.sha256(localCertDer);
+  const localDeviceIdEncoded = encodeDeviceId(localDeviceId);
   const peerCertDer = await socket.peerCertificateDer();
   const remoteDeviceIdBytes = await adapter.sha256(peerCertDer);
   const remoteDeviceId = await computeDeviceId(adapter, peerCertDer);
   adapter.log?.("core.bep.handshake.peer_cert", {
     connectedHost,
     connectedPort,
+    localDeviceId: localDeviceIdEncoded,
     remoteDeviceId,
     peerCertificateBytes: peerCertDer.length,
   });

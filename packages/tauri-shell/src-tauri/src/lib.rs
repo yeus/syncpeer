@@ -867,6 +867,11 @@ fn parse_first_certificate_der(cert_pem: &str) -> Result<Vec<u8>, String> {
     Ok(first.as_ref().to_vec())
 }
 
+fn device_id_from_cert_pem(cert_pem: &str) -> Result<String, String> {
+    let cert_der = parse_first_certificate_der(cert_pem)?;
+    Ok(canonical_device_id(&compute_device_id_from_der(&cert_der)))
+}
+
 fn decode_device_id_bytes(value: &str) -> Result<Vec<u8>, String> {
     let normalized = canonical_device_id(value);
     data_encoding::BASE32_NOPAD
@@ -1273,8 +1278,7 @@ async fn syncpeer_export_identity_recovery(
     app: tauri::AppHandle,
 ) -> Result<IdentityRecoveryExportResponse, String> {
     let identity = syncpeer_read_default_cli_identity(app).await?;
-    let cert_der = parse_first_certificate_der(&identity.cert_pem)?;
-    let device_id = canonical_device_id(&compute_device_id_from_der(&cert_der));
+    let device_id = device_id_from_cert_pem(&identity.cert_pem)?;
     let payload = IdentityRecoveryPayload {
         version: 1,
         device_id: device_id.clone(),
@@ -1287,6 +1291,21 @@ async fn syncpeer_export_identity_recovery(
         device_id,
         recovery_secret: data_encoding::BASE64.encode(&json),
     })
+}
+
+#[tauri::command]
+async fn syncpeer_get_default_device_id(app: tauri::AppHandle) -> Result<String, String> {
+    let identity = syncpeer_read_default_cli_identity(app).await?;
+    device_id_from_cert_pem(&identity.cert_pem)
+}
+
+#[tauri::command]
+async fn syncpeer_regenerate_default_cli_identity(
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let identity_dir = resolve_default_identity_dir(&app)?;
+    let identity = create_identity_in_dir(&identity_dir)?;
+    device_id_from_cert_pem(&identity.cert_pem)
 }
 
 #[tauri::command]
@@ -2366,6 +2385,8 @@ pub fn run() {
             syncpeer_read_text_file,
             syncpeer_read_default_cli_identity,
             syncpeer_export_identity_recovery,
+            syncpeer_get_default_device_id,
+            syncpeer_regenerate_default_cli_identity,
             syncpeer_restore_identity_recovery,
             syncpeer_discovery_fetch,
             syncpeer_tls_open,

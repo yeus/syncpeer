@@ -21,6 +21,7 @@
     "build:android:dev": "npm run build:android:dev -w @syncpeer/tauri-shell && node scripts/copy-android-apk.mjs debug",
     "android:install:diagnose": "scripts/diagnose-android-install.sh dist/syncpeer-android-release-arm64-v8a.apk dev.syncpeer.app",
     "android:dev": "npm run android:dev -w @syncpeer/tauri-shell",
-    "dev": "npm run build && npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log"
+    "build:dev": "npm run build && npm run dev",
+    "dev": "npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log"
   }
 }

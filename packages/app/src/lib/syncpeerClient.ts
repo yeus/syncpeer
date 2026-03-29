@@ -486,9 +486,35 @@ export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) 
     }
     const key = serializeConnectionKey(normalized, certPem, keyPem);
     if (activeSession && activeConnectionKey === key) {
-      return activeSession;
+      if (activeSession.isClosed()) {
+        logUi(options, "ui.session.reopen_closed", {
+          connectedVia: activeSession.connectedVia,
+          transportKind: activeSession.transportKind,
+        });
+      } else {
+        return activeSession;
+      }
+    }
+    if (activeSession && activeConnectionKey && activeConnectionKey !== key) {
+      logUi(options, "ui.session.reopen_key_changed", {
+        previousKeyLength: activeConnectionKey.length,
+        nextKeyLength: key.length,
+      });
+    }
+    if (activeSession) {
+      logUi(options, "ui.session.close_previous", {
+        previousConnectedVia: activeSession.connectedVia,
+        previousTransportKind: activeSession.transportKind,
+      });
     }
     await closeActiveSession();
+    logUi(options, "ui.session.open", {
+      discoveryMode: normalized.discoveryMode,
+      host: normalized.host,
+      port: normalized.port,
+      remoteId: normalized.remoteId ?? "",
+      hasFolderPasswords: Object.keys(normalized.folderPasswords ?? {}).length > 0,
+    });
     activeSession = await coreClient.openSession({
       host: normalized.host,
       port: normalized.port,
@@ -503,12 +529,25 @@ export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) 
       folderPasswords: normalized.folderPasswords,
     });
     activeConnectionKey = key;
+    logUi(options, "ui.session.opened", {
+      connectedVia: activeSession.connectedVia,
+      transportKind: activeSession.transportKind,
+    });
     return activeSession;
   };
 
   const requireActiveSession = async (): Promise<SyncpeerSessionHandle> => {
     if (!activeSession) throw new Error("No active connection. Connect first.");
     return activeSession;
+  };
+
+  const getSessionForPolling = async (
+    options: ConnectOptions,
+  ): Promise<SyncpeerSessionHandle> => {
+    if (activeSession && !activeSession.isClosed()) {
+      return activeSession;
+    }
+    return ensureSession(options);
   };
 
   const remoteFsLike: RemoteFsLike = {
@@ -528,7 +567,7 @@ export const createSyncpeerUiClient = (options?: CreateSyncpeerUiClientOptions) 
       return toConnectionOverview(session);
     },
     connectAndGetFolderVersions: async (options: ConnectOptions): Promise<FolderSyncState[]> => {
-      const session = await ensureSession(options);
+      const session = await getSessionForPolling(options);
       return Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []);
     },
     disconnect: async (): Promise<void> => {

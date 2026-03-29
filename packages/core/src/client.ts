@@ -115,6 +115,7 @@ export interface SyncpeerSessionHandle {
   remoteFs: RemoteFs;
   connectedVia: string;
   transportKind: "direct-tcp" | "relay";
+  isClosed: () => boolean;
   close: () => Promise<void>;
 }
 
@@ -482,6 +483,15 @@ class BepSession {
   }
 
   private onFrame(type: number, msg: any): void {
+    if (type !== MessageTypeValues.PING) {
+      this.log("frame.received", {
+        type,
+        isClusterConfig: type === MessageTypeValues.CLUSTER_CONFIG,
+        isIndex: type === MessageTypeValues.INDEX,
+        isIndexUpdate: type === MessageTypeValues.INDEX_UPDATE,
+        isResponse: type === MessageTypeValues.RESPONSE,
+      });
+    }
     switch (type) {
       case MessageTypeValues.CLUSTER_CONFIG:
         void this.handleClusterConfig(msg);
@@ -493,6 +503,15 @@ class BepSession {
       case MessageTypeValues.RESPONSE:
         this.handleResponse(msg);
         break;
+      case MessageTypeValues.CLOSE: {
+        const reason =
+          typeof msg?.reason === "string" && msg.reason.trim() !== ""
+            ? msg.reason.trim()
+            : "Remote sent CLOSE";
+        this.log("frame.close", { reason });
+        this.onSocketClosed(new Error(`BEP close from remote: ${reason}`));
+        break;
+      }
       default:
         break;
     }
@@ -533,6 +552,16 @@ class BepSession {
           ? remoteDevice.encryption_password_token
           : null;
       const announcedToken = localToken ?? remoteToken;
+      this.log("cluster.folder.received", {
+        folderId,
+        folderType: Number(folder.type ?? 0),
+        stopReason: Number(folder.stop_reason ?? 0),
+        remoteIndexId,
+        remoteMaxSequence,
+        deviceCount: folderDevices.length,
+        localTokenLengthFromPeer: localToken?.length ?? 0,
+        remoteTokenLengthFromPeer: remoteToken?.length ?? 0,
+      });
       const encrypted =
         Number(folder.type ?? 0) === 3 ||
         (announcedToken?.length ?? 0) > 0 ||
@@ -622,20 +651,22 @@ class BepSession {
           compression: 0,
           max_sequence: 0,
           index_id: this.localIndexId,
-          encryption_password_token:
-            state?.encrypted && state.folderCrypto
-              ? state.folderCrypto.passwordToken
-              : undefined,
+          // Compatibility: some peers reject our cluster config if we advertise that
+          // we also have encrypted-at-rest data for the same folder.
+          encryption_password_token: undefined,
         });
         if (state?.encrypted) {
           this.log("untrusted.folder.echo_config", {
             folderId: folder.id,
-            type: folder.type,
-            localTokenLength: state.folderCrypto?.passwordToken.length ?? 0,
+            sourceType: Number(folder.type ?? 0),
+            echoedType: state?.encrypted ? 3 : Number(folder.type ?? 0),
+            localTokenLength: 0,
+            localTokenSuppressed: true,
           });
         }
         return {
           ...folder,
+          type: state?.encrypted ? 3 : folder.type,
           devices,
         };
       });
@@ -666,10 +697,21 @@ class BepSession {
     const folderId = index.folder;
     const state = this.folders.get(folderId);
     if (!state) return;
+    const files = Array.isArray(index.files) ? index.files : [];
+    this.log("index.received", {
+      folderId,
+      fileCount: files.length,
+      encrypted: state.encrypted,
+      hasFolderCrypto: !!state.folderCrypto,
+      needsPassword: state.needsPassword,
+    });
     state.indexReceived = true;
-    for (const file of index.files || []) {
+    let decryptedStored = 0;
+    let decryptFailed = 0;
+    for (const file of files) {
       if (!state.encrypted) {
         state.files.set(file.name, { indexFile: file });
+        decryptedStored += 1;
         continue;
       }
       if (!state.folderCrypto) {
@@ -708,7 +750,9 @@ class BepSession {
             encryptedBlocks,
           },
         });
+        decryptedStored += 1;
       } catch (error) {
+        decryptFailed += 1;
         this.log("untrusted.index.decrypt_failed", {
           folderId,
           encryptedName: String(file?.name ?? ""),
@@ -719,6 +763,16 @@ class BepSession {
         state.needsPassword = true;
       }
     }
+    this.log("index.applied", {
+      folderId,
+      encrypted: state.encrypted,
+      storedFiles: state.files.size,
+      processedFiles: files.length,
+      decryptedStored,
+      decryptFailed,
+      needsPassword: state.needsPassword,
+      passwordError: state.passwordError ?? null,
+    });
   }
 
   private handleResponse(resp: any): void {
@@ -851,6 +905,10 @@ class BepSession {
     this.pending.clear();
     await this.socket.close();
   }
+
+  isClosed(): boolean {
+    return this.closed;
+  }
 }
 
 async function readRemoteHello(
@@ -966,6 +1024,7 @@ async function openBepSessionOnSocket(
     remoteFs: session.buildRemoteFs(remoteDeviceInfo),
     connectedVia,
     transportKind,
+    isClosed: () => session.isClosed(),
     close: () => session.close(),
   };
 }

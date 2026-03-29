@@ -269,6 +269,29 @@ async function waitForCliDownload(args, outPath, expectedContent, timeoutMs) {
   throw new Error(`Timed out waiting for CLI download to match expected content: ${String(lastErr)}`);
 }
 
+async function waitForCliOutputContains(args, expectedText, timeoutMs, options = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastOutput = "";
+  let lastErr = null;
+  while (Date.now() < deadline) {
+    try {
+      const output = execCli(args, { encoding: "utf8", ...options });
+      lastOutput = output;
+      if (output.includes(expectedText)) {
+        return output;
+      }
+      lastErr = new Error(`Output did not contain expected text "${expectedText}" yet.`);
+    } catch (err) {
+      lastErr = err;
+    }
+    await sleep(1500);
+  }
+  const detail = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(
+    `Timed out waiting for CLI output to include "${expectedText}". Last error: ${detail}\nLast output:\n${lastOutput}`,
+  );
+}
+
 async function main() {
   if (!fs.existsSync(syncthingBin)) {
     console.error(`Missing Syncthing binary: ${syncthingBin}`);
@@ -443,6 +466,21 @@ async function main() {
     console.log("Download check passed.");
     console.log("Persisted cli-node ID check passed.");
 
+    const encryptedCliBaseArgs = [
+      "--host", "127.0.0.1",
+      "--port", "58301",
+      "--cert", path.join(cliUntrustedHome, "cert.pem"),
+      "--key", path.join(cliUntrustedHome, "key.pem"),
+      "--remote-id", bId,
+      "--timeout-ms", "20000",
+      "--folder-password", `${encryptedFolderId}=${encryptedFolderPassword}`,
+    ];
+    const encryptedCliEnv = {
+      ...process.env,
+      XDG_CONFIG_HOME: cliConfigHome,
+      SYNCTHING_BIN: syncthingBin,
+    };
+
     try {
       let encryptedDownloadFailed = false;
       try {
@@ -473,22 +511,12 @@ async function main() {
       }
 
       const encryptedFilesOutput = execCli([
-        "--host", "127.0.0.1",
-        "--port", "58301",
-        "--cert", path.join(cliUntrustedHome, "cert.pem"),
-        "--key", path.join(cliUntrustedHome, "key.pem"),
-        "--remote-id", bId,
-        "--timeout-ms", "20000",
-        "--folder-password", `${encryptedFolderId}=${encryptedFolderPassword}`,
+        ...encryptedCliBaseArgs,
         "files",
         encryptedFolderId,
       ], {
         encoding: "utf8",
-        env: {
-          ...process.env,
-          XDG_CONFIG_HOME: cliConfigHome,
-          SYNCTHING_BIN: syncthingBin,
-        },
+        env: encryptedCliEnv,
       });
       if (!encryptedFilesOutput.includes("\tsecret.txt")) {
         throw new Error(`Encrypted folder listing missing decrypted file name:\n${encryptedFilesOutput}`);
@@ -496,24 +524,14 @@ async function main() {
 
       const encryptedDownloadOutPath = path.join(root, "downloaded-encrypted-secret.txt");
       execCli([
-        "--host", "127.0.0.1",
-        "--port", "58301",
-        "--cert", path.join(cliUntrustedHome, "cert.pem"),
-        "--key", path.join(cliUntrustedHome, "key.pem"),
-        "--remote-id", bId,
-        "--timeout-ms", "20000",
-        "--folder-password", `${encryptedFolderId}=${encryptedFolderPassword}`,
+        ...encryptedCliBaseArgs,
         "download",
         encryptedFolderId,
         "secret.txt",
         encryptedDownloadOutPath,
       ], {
         stdio: "inherit",
-        env: {
-          ...process.env,
-          XDG_CONFIG_HOME: cliConfigHome,
-          SYNCTHING_BIN: syncthingBin,
-        },
+        env: encryptedCliEnv,
       });
       const encryptedDownloaded = fs.readFileSync(encryptedDownloadOutPath, "utf8");
       if (encryptedDownloaded !== expectedEncrypted) {
@@ -526,6 +544,21 @@ async function main() {
       console.log("Encrypted folder compatibility probe did not pass.");
       console.log(`Known limitation: ${message}`);
     }
+
+    // Additional strict regression guard for encrypted browse listing.
+    await waitForCliOutputContains(
+      [...encryptedCliBaseArgs, "files", encryptedFolderId],
+      "\tsecret.txt",
+      60_000,
+      { env: encryptedCliEnv },
+    );
+    await waitForCliOutputContains(
+      [...encryptedCliBaseArgs, "tree", encryptedFolderId],
+      "secret.txt",
+      60_000,
+      { env: encryptedCliEnv },
+    );
+    console.log("Encrypted folder browse regression check passed.");
 
     const filesOutput = execCli(["files-local", bShareDir], {
       encoding: "utf8",

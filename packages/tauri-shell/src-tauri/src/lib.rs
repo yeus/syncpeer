@@ -2048,19 +2048,25 @@ async fn syncpeer_get_cached_statuses(
     app: tauri::AppHandle,
     request: CachedStatusesRequest,
 ) -> Result<Vec<CachedFileStatus>, String> {
-    if request.folder_id.trim().is_empty() {
+    let folder_id = request.folder_id.trim().to_string();
+    if folder_id.is_empty() {
         return Err("folderId is required.".to_string());
     }
     let index_path = cache_index_path(&app)?;
     let index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let folder_records = index
+        .files
+        .iter()
+        .filter(|entry| entry.folder_id.trim() == folder_id)
+        .collect::<Vec<_>>();
 
     let statuses = request
         .paths
         .into_iter()
         .map(|raw_path| {
             let normalized = normalize_path(&raw_path);
-            let key = cache_key(&request.folder_id, &normalized);
-            if let Some(record) = index.files.iter().find(|entry| entry.key == key) {
+            let key = cache_key(&folder_id, &normalized);
+            if let Some(record) = folder_records.iter().find(|entry| entry.key == key) {
                 if let Some(local_path) = &record.local_path {
                     let local_path = PathBuf::from(local_path);
                     if local_path.exists() {
@@ -2095,6 +2101,58 @@ async fn syncpeer_get_cached_statuses(
                     };
                 }
             }
+
+            let has_descendant = if normalized.is_empty() {
+                !folder_records.is_empty()
+            } else {
+                let normalized_with_sep = format!("{normalized}/");
+                folder_records.iter().any(|entry| {
+                    let entry_path = normalize_path(&entry.path);
+                    entry_path == normalized || entry_path.starts_with(&normalized_with_sep)
+                })
+            };
+
+            if has_descendant {
+                if let Ok(local_directory) =
+                    resolve_cached_directory_path(&app, &folder_id, &normalized)
+                {
+                    return CachedFileStatus {
+                        path: normalized,
+                        available: true,
+                        local_path: Some(local_directory.to_string_lossy().to_string()),
+                        cached_at_ms: folder_records.iter().map(|entry| entry.cached_at_ms).max(),
+                    };
+                }
+
+                #[cfg(target_os = "android")]
+                if let Some(tree_uri) = configured_android_saf_tree_uri(&app).ok().flatten() {
+                    let relative = relative_path_for_saf(&cache_relative_directory_path(
+                        &folder_id,
+                        &normalized,
+                    ));
+                    if android_saf_path_exists(&app, &tree_uri, &relative).unwrap_or(false) {
+                        return CachedFileStatus {
+                            path: normalized,
+                            available: true,
+                            local_path: None,
+                            cached_at_ms: folder_records.iter().map(|entry| entry.cached_at_ms).max(),
+                        };
+                    }
+                }
+
+                if folder_records
+                    .iter()
+                    .any(|entry| entry.local_path.is_none() && entry.saf_relative_path.is_some())
+                {
+                    return CachedFileStatus {
+                        path: normalized,
+                        available: true,
+                        local_path: None,
+                        cached_at_ms: folder_records.iter().map(|entry| entry.cached_at_ms).max(),
+                    };
+                }
+            }
+
             CachedFileStatus {
                 path: normalized,
                 available: false,

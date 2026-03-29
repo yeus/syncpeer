@@ -250,6 +250,85 @@ function execCli(args, options = {}) {
   return execFileSync("node", [cliEntry, ...args], options);
 }
 
+function normalizeDeviceId(value) {
+  return String(value ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z2-7]/g, "");
+}
+
+async function waitForIntroducedDeviceAdvertisement(options) {
+  const {
+    introducerHost,
+    introducerPort,
+    introducerDeviceId,
+    localCertPath,
+    localKeyPath,
+    localDeviceName,
+    expectedFolderId,
+    expectedIntroducedDeviceId,
+    timeoutMs,
+  } = options;
+  const expectedIntroduced = normalizeDeviceId(expectedIntroducedDeviceId);
+  const deadline = Date.now() + timeoutMs;
+  let lastErr = null;
+  while (Date.now() < deadline) {
+    let session = null;
+    try {
+      const { createNodeSyncpeerClient } = await import("../packages/core/dist/node.js");
+      const certPem = fs.readFileSync(localCertPath, "utf8");
+      const keyPem = fs.readFileSync(localKeyPath, "utf8");
+      const client = createNodeSyncpeerClient();
+      session = await client.openSession({
+        host: introducerHost,
+        port: introducerPort,
+        certPem,
+        keyPem,
+        expectedDeviceId: introducerDeviceId,
+        deviceName: localDeviceName,
+        timeoutMs: 10_000,
+        discoveryMode: "direct",
+      });
+      const folders = await session.remoteFs.listFolders();
+      const targetFolder = folders.find((folder) => folder.id === expectedFolderId);
+      if (!targetFolder) {
+        lastErr = new Error(
+          `Introducer did not advertise expected folder "${expectedFolderId}" yet.`,
+        );
+      } else {
+        const advertised = (targetFolder.advertisedDevices ?? []).map((device) => ({
+          id: normalizeDeviceId(device.id),
+          name: device.name ?? "",
+        }));
+        const matched = advertised.find((device) => device.id === expectedIntroduced);
+        if (matched) {
+          return {
+            introducedDeviceId: matched.id,
+            introducedDeviceName: matched.name,
+          };
+        }
+        lastErr = new Error(
+          `Introducer folder "${expectedFolderId}" did not advertise device ${expectedIntroduced} yet. Advertised: ${advertised.map((item) => item.id).join(", ")}`,
+        );
+      }
+    } catch (err) {
+      lastErr = err;
+    } finally {
+      if (session) {
+        try {
+          await session.close();
+        } catch {
+          // Best-effort close during polling.
+        }
+      }
+    }
+    await sleep(1500);
+  }
+  throw new Error(
+    `Timed out waiting for introducer advertisement: ${String(lastErr)}`,
+  );
+}
+
 async function waitForCliDownload(args, outPath, expectedContent, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = null;
@@ -337,14 +416,17 @@ async function main() {
   configureHome(aHome, {
     guiAddress: A_GUI_ADDR,
     listenAddress: A_SYNC_ADDR,
-    remoteDevices: [{ id: bId, name: "syncpeer-b", address: B_SYNC_ADDR }],
+    remoteDevices: [
+      { id: bId, name: "syncpeer-b", address: B_SYNC_ADDR },
+      { id: cliNodeId, name: "syncpeer-cli-node", address: "dynamic" },
+    ],
     folders: [
       {
         id: folderId,
         label: folderId,
         path: aRecvDir,
         type: "sendreceive",
-        deviceIds: [aId, bId],
+        deviceIds: [aId, bId, cliNodeId],
       },
     ],
   });
@@ -386,6 +468,24 @@ async function main() {
     await sleep(3000);
     await waitForSync(path.join(aRecvDir, "a.txt"), expectedA, 90_000);
     await waitForSync(path.join(aRecvDir, "subdir", "nested.txt"), "nested file\n", 90_000);
+
+    const introduced = await waitForIntroducedDeviceAdvertisement({
+      introducerHost: "127.0.0.1",
+      introducerPort: 58300,
+      introducerDeviceId: aId,
+      localCertPath: path.join(cliNodeHome, "cert.pem"),
+      localKeyPath: path.join(cliNodeHome, "key.pem"),
+      localDeviceName: "syncpeer-cli-introducer-check",
+      expectedFolderId: folderId,
+      expectedIntroducedDeviceId: bId,
+      timeoutMs: 60_000,
+    });
+    if (introduced.introducedDeviceId !== normalizeDeviceId(bId)) {
+      throw new Error(
+        `Introducer advertisement device ID mismatch: expected ${normalizeDeviceId(bId)}, got ${introduced.introducedDeviceId}`,
+      );
+    }
+    console.log("Introducer advertisement check passed.");
 
     console.log("");
     console.log("=== Running syncpeer CLI checks ===");

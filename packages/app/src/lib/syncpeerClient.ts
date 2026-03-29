@@ -369,7 +369,7 @@ const createTauriHostAdapter = (
     };
   },
   sha256: async (data: Uint8Array) => {
-    const digest = await crypto.subtle.digest("SHA-256", data);
+    const digest = await crypto.subtle.digest("SHA-256", data as BufferSource);
     return new Uint8Array(digest);
   },
   randomBytes: (length: number) => {

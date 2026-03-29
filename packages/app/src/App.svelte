@@ -1,3 +1,4 @@
+<svelte:options runes={true} />
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import {
@@ -10,8 +11,31 @@
     type RemoteFsLike,
     type UiLogEntry,
   } from "./lib/syncpeerClient.js";
+  import {
+    buildConnectionDetails,
+    fromConnectionSettings,
+    toConnectionSettings,
+  } from "./lib/state/useConnectionState.js";
+  import {
+    breadcrumbSegments,
+    cachedFileKey,
+    collectAdvertisedDevices,
+    collectAdvertisedFolders,
+    favoriteKey,
+    folderDisplayName,
+    formatEta,
+    formatRate,
+    isValidSyncthingDeviceId,
+    normalizeDeviceId,
+    normalizeFolderPasswords,
+    normalizePath,
+    normalizeSavedDevices,
+    normalizeSyncApprovedIntroducedFolderKeys,
+    resolveDirectoryPath,
+    sleep,
+    syncApprovedFolderKey,
+  } from "./lib/state/uiHelpers.js";
   import type {
-    AdvertisedDeviceInfo,
     FileEntry,
     FolderInfo,
     FolderSyncState,
@@ -120,21 +144,6 @@
     );
   };
 
-  const normalizeSavedDevices = (parsed: SavedDevice[] | null | undefined): SavedDevice[] => {
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((item) => typeof item?.id === "string" && item.id.trim() !== "")
-      .map((item) => ({
-        id: String(item.id).trim().toUpperCase().replace(/[^A-Z2-7]/g, ""),
-        name:
-          String(item.name ?? "").trim() ||
-          String(item.id).trim().toUpperCase().replace(/[^A-Z2-7]/g, ""),
-        createdAtMs: Number(item.createdAtMs) || Date.now(),
-        isIntroducer: item.isIntroducer === true,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  };
-
   const persistAppState = (state: PersistedAppState): void => {
     if (typeof window === "undefined") return;
     window.localStorage.setItem(
@@ -143,37 +152,6 @@
     );
   };
 
-  const normalizeSyncApprovedIntroducedFolderKeys = (
-    value: string[] | null | undefined,
-  ): Set<string> => {
-    if (!Array.isArray(value)) return new Set<string>();
-    const normalized = value
-      .map((item) => String(item ?? "").trim())
-      .filter((item) => item !== "");
-    return new Set(normalized);
-  };
-
-  const normalizePath = (value: string): string =>
-    value.replace(/^\/+|\/+$/g, "");
-  const normalizeDeviceId = (value: string): string =>
-    value
-      .trim()
-      .toUpperCase()
-      .replace(/[^A-Z2-7]/g, "");
-  const compactDeviceId = (value: string): string =>
-    normalizeDeviceId(value);
-  const isValidSyncthingDeviceId = (value: string): boolean =>
-    [52, 56].includes(compactDeviceId(value).length);
-  const normalizeFolderPasswords = (
-    value: Record<string, string> | null | undefined,
-  ): Record<string, string> =>
-    Object.fromEntries(
-      Object.entries(value ?? {})
-        .map(([folderId, password]) => [folderId.trim(), String(password ?? "").trim()])
-        .filter(([folderId, password]) => folderId !== "" && password !== ""),
-    );
-  const folderDisplayName = (folder: FolderInfo): string =>
-    folder.label || folder.id;
   const folderState = (folderId: string): FolderInfo | undefined =>
     folders.find((folder) => folder.id === folderId);
   const folderIsLocked = (folderId: string): boolean => {
@@ -186,170 +164,100 @@
     if (folder.passwordError) return "password error";
     return folder.needsPassword ? "locked" : "unlocked";
   };
-  const favoriteKey = (
-    folderId: string,
-    path: string,
-    kind: FavoriteItem["kind"],
-  ): string => `${kind}:${folderId}:${normalizePath(path)}`;
-  const resolveDirectoryPath = (basePath: string, nextPath: string): string => {
-    const base = normalizePath(basePath);
-    const next = normalizePath(nextPath);
-    if (!next) return base;
-    if (
-      !base ||
-      next === base ||
-      next.startsWith(`${base}/`) ||
-      next.includes("/")
-    )
-      return next;
-    return `${base}/${next}`;
-  };
-
-  const toConnectionSettings = (): StoredConnectionSettings => ({
-    host,
-    port,
-    cert,
-    key,
-    remoteId,
-    deviceName,
-    timeoutMs,
-    discoveryMode,
-    discoveryServer: normalizeDiscoveryServer(discoveryServer),
-    enableRelayFallback,
-    autoAcceptNewDevices,
-    autoAcceptIntroducedFolders,
-  });
-
-  const fromConnectionSettings = (
-    stored: StoredConnectionSettings | null,
-  ): StoredConnectionSettings => {
-    const discoveryMode: DiscoveryMode =
-      stored?.discoveryMode === "direct" ? "direct" : "global";
-
-    if (!stored) {
-      return {
-        host: "",
-        port: 22000,
-        cert: "",
-        key: "",
-        remoteId: "",
-        deviceName: "syncpeer-ui",
-        timeoutMs: 15000,
-        discoveryMode,
-        discoveryServer: getDefaultDiscoveryServer(),
-        enableRelayFallback: true,
-        autoAcceptNewDevices: false,
-        autoAcceptIntroducedFolders: false,
-      };
-    }
-
-    return {
-      host:
-        discoveryMode === "direct"
-          ? stored.host || "127.0.0.1"
-          : stored.host || "",
-      port: Number(stored.port) || 22000,
-      cert: stored.cert || "",
-      key: stored.key || "",
-      remoteId: stored.remoteId || "",
-      deviceName: stored.deviceName || "syncpeer-ui",
-      timeoutMs: Number(stored.timeoutMs) || 15000,
-      discoveryMode,
-      discoveryServer: normalizeDiscoveryServer(stored.discoveryServer),
-      enableRelayFallback: stored.enableRelayFallback !== false,
-      autoAcceptNewDevices: stored.autoAcceptNewDevices === true,
-      autoAcceptIntroducedFolders: stored.autoAcceptIntroducedFolders === true,
-    };
-  };
 
   const persistedState = loadPersistedAppState();
   const initialSettings = fromConnectionSettings(
     persistedState?.connection ?? null,
   );
 
-  let activeTab: Tab =
-    persistedState?.activeTab === "devices" || persistedState?.activeTab === "folders"
+  let activeTab = $state<Tab>(
+    persistedState?.activeTab === "devices" ||
+      persistedState?.activeTab === "folders"
       ? persistedState.activeTab
-      : "favorites";
-
-  let host = initialSettings.host;
-  let port = initialSettings.port;
-  let cert = initialSettings.cert;
-  let key = initialSettings.key;
-  let remoteId = initialSettings.remoteId;
-  let deviceName = initialSettings.deviceName;
-  let timeoutMs = initialSettings.timeoutMs;
-  let discoveryMode: DiscoveryMode = initialSettings.discoveryMode;
-  let discoveryServer = initialSettings.discoveryServer;
-  let enableRelayFallback = initialSettings.enableRelayFallback;
-  let autoAcceptNewDevices = initialSettings.autoAcceptNewDevices;
-  let autoAcceptIntroducedFolders = initialSettings.autoAcceptIntroducedFolders;
-
-  let remoteFs: RemoteFsLike | null = null;
-  let isConnected = false;
-  let isConnecting = false;
-  let isRefreshing = false;
-  let isLoadingDirectory = false;
-  let isDownloading = false;
-  let activeDownloadKey = "";
-  let activeDownloadText = "";
-  let isOpeningCachedFile = false;
-  let isRemovingCachedFile = false;
-  let isClearingCache = false;
-  let isLoadingDownloadedFiles = false;
-  let showDownloadedFiles = false;
-  let isSettingsExpanded = false;
-  let uploadMessage = "";
-  let lastUpdatedAt = "";
-  let activeConnectDeviceId = "";
-
-  let folders: FolderInfo[] = [];
-  let entries: FileEntry[] = [];
-  let remoteDevice: RemoteDeviceInfo | null = null;
-  let folderSyncStates: FolderSyncState[] = [];
-  let currentFolderVersionKey = "";
-
-  let currentFolderId = "";
-  let currentPath = "";
-  let directoryLoadSeq = 0;
-
-  let favorites: FavoriteItem[] = [];
-  let savedDevices: SavedDevice[] = normalizeSavedDevices(
-    persistedState?.savedDevices,
+      : "favorites",
   );
-  let syncApprovedIntroducedFolderKeys = normalizeSyncApprovedIntroducedFolderKeys(
+
+  let connection = $state<StoredConnectionSettings>({
+    host: initialSettings.host,
+    port: initialSettings.port,
+    cert: initialSettings.cert,
+    key: initialSettings.key,
+    remoteId: initialSettings.remoteId,
+    deviceName: initialSettings.deviceName,
+    timeoutMs: initialSettings.timeoutMs,
+    discoveryMode: initialSettings.discoveryMode,
+    discoveryServer: initialSettings.discoveryServer,
+    enableRelayFallback: initialSettings.enableRelayFallback,
+    autoAcceptNewDevices: initialSettings.autoAcceptNewDevices,
+    autoAcceptIntroducedFolders: initialSettings.autoAcceptIntroducedFolders,
+  });
+
+  let remoteFs = $state<RemoteFsLike | null>(null);
+  let isConnected = $state(false);
+  let isConnecting = $state(false);
+  let isRefreshing = $state(false);
+  let isLoadingDirectory = $state(false);
+  let isDownloading = $state(false);
+  let activeDownloadKey = $state("");
+  let activeDownloadText = $state("");
+  let isOpeningCachedFile = $state(false);
+  let isRemovingCachedFile = $state(false);
+  let isClearingCache = $state(false);
+  let isLoadingDownloadedFiles = $state(false);
+  let showDownloadedFiles = $state(false);
+  let isSettingsExpanded = $state(false);
+  let uploadMessage = $state("");
+  let lastUpdatedAt = $state("");
+  let activeConnectDeviceId = $state("");
+
+  let folders = $state<FolderInfo[]>([]);
+  let entries = $state<FileEntry[]>([]);
+  let remoteDevice = $state<RemoteDeviceInfo | null>(null);
+  let folderSyncStates = $state<FolderSyncState[]>([]);
+  let currentFolderVersionKey = $state("");
+
+  let currentFolderId = $state("");
+  let currentPath = $state("");
+  let directoryLoadSeq = $state(0);
+
+  const initialSavedDevices = normalizeSavedDevices(persistedState?.savedDevices);
+  let favorites = $state<FavoriteItem[]>([]);
+  let savedDevices = $state<SavedDevice[]>(initialSavedDevices);
+  let syncApprovedIntroducedFolderKeys = $state<Set<string>>(normalizeSyncApprovedIntroducedFolderKeys(
     persistedState?.syncApprovedIntroducedFolderKeys ??
       persistedState?.acceptedIntroducedFolderKeys,
+  ));
+  let selectedSavedDeviceId = $state(
+    normalizeDeviceId(persistedState?.selectedSavedDeviceId || initialSavedDevices[0]?.id || ""),
   );
-  let selectedSavedDeviceId =
-    normalizeDeviceId(persistedState?.selectedSavedDeviceId || savedDevices[0]?.id || "");
-  let folderPasswords = normalizeFolderPasswords(persistedState?.folderPasswords);
-  let folderPasswordDrafts: Record<string, string> = { ...folderPasswords };
-  let newSavedDeviceName = "";
-  let newSavedDeviceId = "";
-  let visibleBreadcrumbs: BreadcrumbSegment[] = [];
-  let favoriteKeys = new Set<string>();
-  let cachedFileKeys = new Set<string>();
-  let downloadedFiles: CachedFileRecord[] = [];
-  let advertisedDevices: AdvertisedDeviceItem[] = [];
-  let advertisedFolders: AdvertisedFolderItem[] = [];
-  let newSavedDeviceIsIntroducer = false;
+  const initialFolderPasswords = normalizeFolderPasswords(
+    persistedState?.folderPasswords,
+  );
+  let folderPasswords = $state(initialFolderPasswords);
+  let folderPasswordDrafts = $state<Record<string, string>>({
+    ...initialFolderPasswords,
+  });
+  let newSavedDeviceName = $state("");
+  let newSavedDeviceId = $state("");
+  let cachedFileKeys = $state(new Set<string>());
+  let downloadedFiles = $state<CachedFileRecord[]>([]);
+  let newSavedDeviceIsIntroducer = $state(false);
 
-  let connectionModeLabel = "";
-  let connectionPath = "";
-  let connectionTransport: "direct-tcp" | "relay" | "" = "";
-  let recentError: string | null = null;
-  let sessionLogs: SessionLogItem[] = [];
-  let isLogPanelExpanded = false;
-  let lastLoggedError = "";
-  let identityRecoverySecret = "";
-  let exportedIdentityDeviceId = "";
-  let exportedIdentitySecret = "";
-  let isExportingIdentityRecovery = false;
-  let isRestoringIdentityRecovery = false;
+  let connectionModeLabel = $state("");
+  let connectionPath = $state("");
+  let connectionTransport = $state<"direct-tcp" | "relay" | "">("");
+  let recentError = $state<string | null>(null);
+  let sessionLogs = $state<SessionLogItem[]>([]);
+  let isLogPanelExpanded = $state(false);
+  let lastLoggedError = $state("");
+  let identityRecoverySecret = $state("");
+  let exportedIdentityDeviceId = $state("");
+  let exportedIdentitySecret = $state("");
+  let isExportingIdentityRecovery = $state(false);
+  let isRestoringIdentityRecovery = $state(false);
 
-  let error: string | null = null;
-  let nextSessionLogId = 1;
+  let error = $state<string | null>(null);
+  let nextSessionLogId = $state(1);
 
   const pushSessionLog = (
     level: "info" | "warning" | "error",
@@ -428,62 +336,81 @@
     void hydratePersistedState();
   });
 
-  $: persistAppState({
-    activeTab,
-    selectedSavedDeviceId,
-    connection: toConnectionSettings(),
-    savedDevices,
-    syncApprovedIntroducedFolderKeys: [...syncApprovedIntroducedFolderKeys].sort(),
-    folderPasswords,
-  });
-  $: if (
-    savedDevices.length > 0 &&
-    !savedDevices.some((device) => device.id === selectedSavedDeviceId)
-  ) {
-    selectedSavedDeviceId = savedDevices[0].id;
-  }
-  $: if (savedDevices.length === 0) {
-    selectedSavedDeviceId = "";
-  }
-  $: favoriteKeys = new Set(favorites.map((item) => item.key));
-  $: advertisedDevices = collectAdvertisedDevices(
-    folders,
-    savedDevices,
-    currentSourceDeviceId(),
-    currentSourceIsIntroducer(),
-  );
-  $: advertisedFolders = collectAdvertisedFolders(
-    folders,
-    currentSourceDeviceId(),
-    currentSourceIsIntroducer(),
-    syncApprovedIntroducedFolderKeys,
-  );
-  $: visibleBreadcrumbs = breadcrumbSegments(
-    currentFolderId,
-    currentPath,
-    folders,
-  );
-  $: if (discoveryMode === "global" && host === "127.0.0.1") {
-    host = "";
-  }
-  $: if (error && error !== lastLoggedError) {
-    lastLoggedError = error;
-    pushSessionLog("error", "ui.error", error);
-  }
+  const connectionDetails = (): ConnectOptions =>
+    buildConnectionDetails(connection, folderPasswords);
 
-  const connectionDetails = (): ConnectOptions => ({
-    host,
-    port,
-    discoveryMode,
-    discoveryServer: normalizeDiscoveryServer(discoveryServer),
-    cert: cert || undefined,
-    key: key || undefined,
-    remoteId: remoteId || undefined,
-    deviceName,
-    timeoutMs,
-    enableRelayFallback,
-    folderPasswords,
-  });
+  const clearDirectoryView = (): void => {
+    currentFolderId = "";
+    currentPath = "";
+    entries = [];
+    currentFolderVersionKey = "";
+  };
+
+  const resetConnectionRuntimeState = (): void => {
+    isConnected = false;
+    remoteFs = null;
+    remoteDevice = null;
+    folders = [];
+    entries = [];
+    folderSyncStates = [];
+    connectionPath = "";
+    connectionTransport = "";
+    activeConnectDeviceId = "";
+    recentError = null;
+  };
+
+  const applyOverviewSnapshot = (
+    overview: {
+      folders: FolderInfo[];
+      device: RemoteDeviceInfo | null;
+      folderSyncStates: FolderSyncState[];
+      connectedVia: string;
+      transportKind: "direct-tcp" | "relay";
+    },
+  ): void => {
+    folders = overview.folders;
+    remoteDevice = overview.device;
+    folderSyncStates = overview.folderSyncStates ?? [];
+    connectionPath = overview.connectedVia;
+    connectionTransport = overview.transportKind;
+  };
+
+  const ensureCurrentFolderExists = (): void => {
+    if (!currentFolderId) return;
+    if (!folders.some((folder) => folder.id === currentFolderId)) {
+      clearDirectoryView();
+    }
+  };
+
+  const waitForFoldersToPopulate = async (timeoutMs = 4000): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && isConnected) {
+      if (folders.length > 0) return;
+      const overview = await client.connectAndGetOverview(connectionDetails());
+      applyOverviewSnapshot(overview);
+      ensureCurrentFolderExists();
+      if (folders.length > 0) return;
+      await sleep(200);
+    }
+  };
+
+  const waitForFolderIndexToArrive = async (
+    folderId: string,
+    timeoutMs = 3500,
+  ): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && isConnected) {
+      const syncState = folderSyncStates.find((item) => item.folderId === folderId);
+      if (syncState?.indexReceived) return true;
+      const versions = await client.connectAndGetFolderVersions(connectionDetails());
+      folderSyncStates = versions;
+      if (versions.find((item) => item.folderId === folderId)?.indexReceived) {
+        return true;
+      }
+      await sleep(150);
+    }
+    return !!folderSyncStates.find((item) => item.folderId === folderId)?.indexReceived;
+  };
 
   const rootFolderEntries = (): RootFolderEntry[] =>
     folders
@@ -503,75 +430,15 @@
     return `${syncState.remoteIndexId}:${syncState.remoteMaxSequence}`;
   };
 
-  const breadcrumbSegments = (
-    folderId: string,
-    path: string,
-    availableFolders: FolderInfo[],
-  ): BreadcrumbSegment[] => {
-    if (!folderId) return [];
-    const folder = availableFolders.find(
-      (candidate) => candidate.id === folderId,
-    );
-    const folderLabel = folder?.label || folderId;
-    const cleanPath = normalizePath(path);
-    const parts = cleanPath ? cleanPath.split("/") : [];
-
-    const segments: BreadcrumbSegment[] = [
-      {
-        key: `folder:${folderId}`,
-        label: folderLabel,
-        targetFolderId: folderId,
-        targetPath: "",
-      },
-    ];
-
-    for (let index = 0; index < parts.length; index += 1) {
-      const segmentPath = parts.slice(0, index + 1).join("/");
-      segments.push({
-        key: `path:${segmentPath}`,
-        label: parts[index],
-        targetFolderId: folderId,
-        targetPath: segmentPath,
-      });
-    }
-
-    if (segments.length <= MAX_VISIBLE_CRUMBS) return segments;
-    return [
-      {
-        key: "ellipsis",
-        label: "...",
-        targetFolderId: folderId,
-        targetPath: "",
-        ellipsis: true,
-      },
-      ...segments.slice(segments.length - (MAX_VISIBLE_CRUMBS - 1)),
-    ];
-  };
-
-  const cachedFileKey = (folderId: string, path: string): string =>
-    `${folderId}:${normalizePath(path)}`;
-  const formatRate = (bytesPerSecond: number): string => {
-    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "0 B/s";
-    if (bytesPerSecond >= 1024 * 1024)
-      return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
-    if (bytesPerSecond >= 1024)
-      return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
-    return `${Math.round(bytesPerSecond)} B/s`;
-  };
-  const formatEta = (seconds: number): string => {
-    if (!Number.isFinite(seconds) || seconds < 0) return "--";
-    if (seconds < 60) return `${Math.ceil(seconds)}s`;
-    const minutes = Math.floor(seconds / 60);
-    const remaining = Math.ceil(seconds % 60);
-    return `${minutes}m ${remaining}s`;
-  };
   const downloadButtonLabel = (folderId: string, path: string): string => {
     const keyValue = cachedFileKey(folderId, path);
     if (keyValue !== activeDownloadKey) return "Download";
     return activeDownloadText || "Downloading...";
   };
   const isSavedDeviceConnected = (deviceId: string): boolean =>
-    isConnected && normalizeDeviceId(remoteDevice?.id ?? remoteId) === normalizeDeviceId(deviceId);
+    isConnected &&
+    normalizeDeviceId(remoteDevice?.id ?? connection.remoteId) ===
+      normalizeDeviceId(deviceId);
   const isIntroducerDevice = (deviceId: string): boolean => {
     const normalized = normalizeDeviceId(deviceId);
     return savedDevices.some(
@@ -580,11 +447,9 @@
     );
   };
   const currentSourceDeviceId = (): string =>
-    normalizeDeviceId(remoteDevice?.id ?? remoteId);
+    normalizeDeviceId(remoteDevice?.id ?? connection.remoteId);
   const currentSourceIsIntroducer = (): boolean =>
     isConnected && isIntroducerDevice(currentSourceDeviceId());
-  const syncApprovedFolderKey = (sourceDeviceId: string, folderId: string): string =>
-    `${normalizeDeviceId(sourceDeviceId)}:${folderId.trim()}`;
   const upsertSavedDeviceEntry = (deviceId: string, deviceName?: string): boolean => {
     const normalizedId = normalizeDeviceId(deviceId);
     if (!normalizedId) return false;
@@ -621,75 +486,12 @@
       )
       .sort((a, b) => a.name.localeCompare(b.name));
   };
-  const collectAdvertisedDevices = (
-    availableFolders: FolderInfo[],
-    knownDevices: SavedDevice[],
-    sourceDeviceId: string,
-    sourceIsIntroducer: boolean,
-  ): AdvertisedDeviceItem[] => {
-    if (!sourceIsIntroducer || !sourceDeviceId) return [];
-    const savedIds = new Set(knownDevices.map((device) => normalizeDeviceId(device.id)));
-    const map = new Map<string, AdvertisedDeviceItem>();
-    for (const folder of availableFolders) {
-      const devices = Array.isArray(folder.advertisedDevices)
-        ? (folder.advertisedDevices as AdvertisedDeviceInfo[])
-        : [];
-      for (const device of devices) {
-        const normalizedId = normalizeDeviceId(device.id);
-        if (!normalizedId) continue;
-        const entry = map.get(normalizedId);
-        const normalizedName = (device.name ?? "").trim() || normalizedId;
-        if (!entry) {
-          map.set(normalizedId, {
-            id: normalizedId,
-            name: normalizedName,
-            sourceFolderIds: [folder.id],
-            accepted: savedIds.has(normalizedId),
-          });
-          continue;
-        }
-        if (!entry.sourceFolderIds.includes(folder.id)) {
-          entry.sourceFolderIds = [...entry.sourceFolderIds, folder.id].sort();
-        }
-        if (entry.name === entry.id && normalizedName !== normalizedId) {
-          entry.name = normalizedName;
-        }
-      }
-    }
-    return [...map.values()].sort((a, b) => {
-      if (a.accepted !== b.accepted) return a.accepted ? 1 : -1;
-      return a.name.localeCompare(b.name);
-    });
-  };
-  const collectAdvertisedFolders = (
-    availableFolders: FolderInfo[],
-    sourceDeviceId: string,
-    sourceIsIntroducer: boolean,
-    syncApprovedKeys: Set<string>,
-  ): AdvertisedFolderItem[] => {
-    if (!sourceIsIntroducer || !sourceDeviceId) return [];
-    return availableFolders
-      .map((folder) => {
-        const key = syncApprovedFolderKey(sourceDeviceId, folder.id);
-        return {
-          key,
-          folderId: folder.id,
-          label: folder.label || folder.id,
-          sourceDeviceId,
-          syncApproved: syncApprovedKeys.has(key),
-        };
-      })
-      .sort((a, b) => {
-        if (a.syncApproved !== b.syncApproved) return a.syncApproved ? 1 : -1;
-        return a.label.localeCompare(b.label);
-      });
-  };
   const applyAutoAcceptForAdvertisedDevices = (
     availableFolders: FolderInfo[],
     sourceDeviceId: string,
     sourceIsIntroducer: boolean,
   ): void => {
-    if (!autoAcceptNewDevices) return;
+    if (!connection.autoAcceptNewDevices) return;
     const nextAdvertised = collectAdvertisedDevices(
       availableFolders,
       savedDevices,
@@ -708,7 +510,7 @@
     sourceDeviceId: string,
     sourceIsIntroducer: boolean,
   ): void => {
-    if (!autoAcceptIntroducedFolders) return;
+    if (!connection.autoAcceptIntroducedFolders) return;
     const nextAdvertised = collectAdvertisedFolders(
       availableFolders,
       sourceDeviceId,
@@ -764,6 +566,61 @@
       await refreshOverview();
     }
   };
+
+  let favoriteKeys = $derived(new Set(favorites.map((item) => item.key)));
+  let advertisedDevices = $derived(collectAdvertisedDevices(
+    folders,
+    savedDevices,
+    currentSourceDeviceId(),
+    currentSourceIsIntroducer(),
+  ));
+  let advertisedFolders = $derived(collectAdvertisedFolders(
+    folders,
+    currentSourceDeviceId(),
+    currentSourceIsIntroducer(),
+    syncApprovedIntroducedFolderKeys,
+  ));
+  let visibleBreadcrumbs = $derived(breadcrumbSegments(
+    currentFolderId,
+    currentPath,
+    folders,
+    MAX_VISIBLE_CRUMBS,
+  ));
+
+  $effect(() => {
+    persistAppState({
+      activeTab,
+      selectedSavedDeviceId,
+      connection: toConnectionSettings(connection),
+      savedDevices,
+      syncApprovedIntroducedFolderKeys: [...syncApprovedIntroducedFolderKeys].sort(),
+      folderPasswords,
+    });
+  });
+
+  $effect(() => {
+    if (
+      savedDevices.length > 0 &&
+      !savedDevices.some((device) => device.id === selectedSavedDeviceId)
+    ) {
+      selectedSavedDeviceId = savedDevices[0].id;
+    } else if (savedDevices.length === 0) {
+      selectedSavedDeviceId = "";
+    }
+  });
+
+  $effect(() => {
+    if (connection.discoveryMode === "global" && connection.host === "127.0.0.1") {
+      connection.host = "";
+    }
+  });
+
+  $effect(() => {
+    if (error && error !== lastLoggedError) {
+      lastLoggedError = error;
+      pushSessionLog("error", "ui.error", error);
+    }
+  });
 
   async function hydratePersistedState() {
     try {
@@ -884,19 +741,22 @@
     uploadMessage = "";
     if (targetDeviceId) {
       selectedSavedDeviceId = targetDeviceId;
-      remoteId = targetDeviceId;
-      discoveryMode = "global";
-      host = "";
+      connection.remoteId = targetDeviceId;
+      connection.discoveryMode = "global";
+      connection.host = "";
       activeConnectDeviceId = targetDeviceId;
     }
     if (
-      discoveryMode === "global" &&
-      normalizeDeviceId(remoteId) === "" &&
+      connection.discoveryMode === "global" &&
+      normalizeDeviceId(connection.remoteId) === "" &&
       selectedSavedDeviceId
     ) {
-      remoteId = selectedSavedDeviceId;
+      connection.remoteId = selectedSavedDeviceId;
     }
-    if (discoveryMode === "global" && normalizeDeviceId(remoteId) === "") {
+    if (
+      connection.discoveryMode === "global" &&
+      normalizeDeviceId(connection.remoteId) === ""
+    ) {
       const message =
         "Global discovery requires a Remote Device ID. Add/select a saved device first.";
       error = message;
@@ -904,7 +764,10 @@
       activeConnectDeviceId = "";
       return;
     }
-    if (discoveryMode === "global" && !isValidSyncthingDeviceId(remoteId)) {
+    if (
+      connection.discoveryMode === "global" &&
+      !isValidSyncthingDeviceId(connection.remoteId)
+    ) {
       const message =
         "Remote Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
       error = message;
@@ -912,23 +775,27 @@
       activeConnectDeviceId = "";
       return;
     }
-    if (discoveryMode === "global") {
-      discoveryServer = normalizeDiscoveryServer(discoveryServer);
+    if (connection.discoveryMode === "global") {
+      connection.discoveryServer = normalizeDiscoveryServer(
+        connection.discoveryServer,
+      );
     }
     connectionModeLabel =
-      discoveryMode === "global"
-        ? `Global discovery via ${normalizeDiscoveryServer(discoveryServer)}`
-        : `Direct ${host || "127.0.0.1"}:${port}`;
+      connection.discoveryMode === "global"
+        ? `Global discovery via ${normalizeDiscoveryServer(connection.discoveryServer)}`
+        : `Direct ${connection.host || "127.0.0.1"}:${connection.port}`;
 
-    remoteId = normalizeDeviceId(remoteId);
+    connection.remoteId = normalizeDeviceId(connection.remoteId);
     isConnecting = true;
     try {
+      const previousPeerId = normalizeDeviceId(remoteDevice?.id ?? "");
       remoteFs = await client.connectAndSync(connectionDetails());
       const overview = await client.connectAndGetOverview(connectionDetails());
       isConnected = true;
-      folders = overview.folders;
-      remoteDevice = overview.device;
-      const sourceDeviceId = normalizeDeviceId(overview.device?.id ?? remoteId);
+      applyOverviewSnapshot(overview);
+      const sourceDeviceId = normalizeDeviceId(
+        overview.device?.id ?? connection.remoteId,
+      );
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
         overview.folders,
@@ -940,13 +807,16 @@
         sourceDeviceId,
         sourceIsIntroducer,
       );
-      folderSyncStates = overview.folderSyncStates ?? [];
-      connectionPath = overview.connectedVia;
-      connectionTransport = overview.transportKind;
       recentError = null;
-      if (!currentFolderId) {
-        entries = [];
+      const switchedPeer =
+        previousPeerId !== "" &&
+        sourceDeviceId !== "" &&
+        previousPeerId !== sourceDeviceId;
+      if (switchedPeer) {
+        clearDirectoryView();
       }
+      ensureCurrentFolderExists();
+      await waitForFoldersToPopulate();
       currentFolderVersionKey = "";
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
@@ -955,11 +825,7 @@
       error = message;
       recentError = message;
       reportUiError("connect.failed", rawError, connectionDetails());
-      isConnected = false;
-      remoteFs = null;
-      remoteDevice = null;
-      connectionPath = "";
-      connectionTransport = "";
+      resetConnectionRuntimeState();
     } finally {
       isConnecting = false;
       activeConnectDeviceId = "";
@@ -978,19 +844,8 @@
       setError("disconnect.failed", rawError);
       reportUiError("disconnect.failed", rawError);
     } finally {
-      isConnected = false;
-      remoteFs = null;
-      remoteDevice = null;
-      folders = [];
-      entries = [];
-      folderSyncStates = [];
-      connectionPath = "";
-      connectionTransport = "";
-      currentFolderId = "";
-      currentPath = "";
-      currentFolderVersionKey = "";
-      activeConnectDeviceId = "";
-      recentError = null;
+      resetConnectionRuntimeState();
+      clearDirectoryView();
       error = null;
     }
   }
@@ -1044,9 +899,7 @@
   }
 
   async function goToRootView() {
-    currentFolderId = "";
-    currentPath = "";
-    entries = [];
+    clearDirectoryView();
     uploadMessage = "";
     await refreshActiveView();
   }
@@ -1062,6 +915,7 @@
     const requestSeq = ++directoryLoadSeq;
     isLoadingDirectory = true;
     try {
+      await waitForFolderIndexToArrive(currentFolderId);
       const nextEntries = await remoteFs.readDir(
         currentFolderId,
         normalizePath(currentPath),
@@ -1102,9 +956,10 @@
     isRefreshing = true;
     try {
       const overview = await client.connectAndGetOverview(connectionDetails());
-      folders = overview.folders;
-      remoteDevice = overview.device;
-      const sourceDeviceId = normalizeDeviceId(overview.device?.id ?? remoteId);
+      applyOverviewSnapshot(overview);
+      const sourceDeviceId = normalizeDeviceId(
+        overview.device?.id ?? connection.remoteId,
+      );
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
         overview.folders,
@@ -1116,9 +971,7 @@
         sourceDeviceId,
         sourceIsIntroducer,
       );
-      folderSyncStates = overview.folderSyncStates ?? [];
-      connectionPath = overview.connectedVia;
-      connectionTransport = overview.transportKind;
+      ensureCurrentFolderExists();
       if (activeTab === "folders" && currentFolderId) {
         if (folderIsLocked(currentFolderId)) {
           entries = [];
@@ -1381,7 +1234,7 @@
     upsertSavedDeviceEntry(normalizedId, newSavedDeviceName);
     setSavedDeviceIntroducer(normalizedId, newSavedDeviceIsIntroducer);
     selectedSavedDeviceId = normalizedId;
-    remoteId = normalizedId;
+    connection.remoteId = normalizedId;
     newSavedDeviceName = "";
     newSavedDeviceId = "";
     newSavedDeviceIsIntroducer = false;
@@ -1395,7 +1248,7 @@
     }
     upsertSavedDeviceEntry(device.id, device.name);
     selectedSavedDeviceId = device.id;
-    remoteId = device.id;
+    connection.remoteId = device.id;
     error = null;
   }
 
@@ -1408,11 +1261,11 @@
 
   function useSavedDevice(deviceId: string) {
     selectedSavedDeviceId = deviceId;
-    remoteId = deviceId;
+    connection.remoteId = deviceId;
   }
 
   function resetDiscoveryServer() {
-    discoveryServer = getDefaultDiscoveryServer();
+    connection.discoveryServer = getDefaultDiscoveryServer();
   }
 
   function removeSavedDevice(deviceId: string) {
@@ -1420,8 +1273,8 @@
     savedDevices = savedDevices.filter(
       (device) => normalizeDeviceId(device.id) !== normalized,
     );
-    if (remoteId === deviceId) {
-      remoteId = "";
+    if (connection.remoteId === deviceId) {
+      connection.remoteId = "";
     }
     const nextSyncApproved = new Set(
       [...syncApprovedIntroducedFolderKeys].filter(
@@ -1483,7 +1336,7 @@
 
     {#if !isConnected}
       <div class="global-connect">
-        <button class="primary" on:click={() => connect()} disabled={isConnecting}>
+        <button class="primary" onclick={() => connect()} disabled={isConnecting}>
           {isConnecting ? "Connecting..." : "Connect"}
         </button>
         {#if connectionModeLabel}
@@ -1492,7 +1345,7 @@
       </div>
     {:else}
       <div class="global-connect">
-        <button class="ghost" on:click={disconnect} disabled={isConnecting}>
+        <button class="ghost" onclick={disconnect} disabled={isConnecting}>
           Disconnect
         </button>
       </div>
@@ -1515,38 +1368,44 @@
         </div>
 
         {#if !isConnected}
-          <button class="primary" on:click={() => connect()} disabled={isConnecting}>
+          <button class="primary" onclick={() => connect()} disabled={isConnecting}>
             {isConnecting ? "Connecting..." : "Connect Using Last Settings"}
           </button>
         {/if}
 
         <details bind:open={isSettingsExpanded}>
           <summary>Connection Settings</summary>
-          <form class="settings" on:submit|preventDefault={() => connect()}>
+          <form
+            class="settings"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void connect();
+            }}
+          >
             <label>
               Discovery Method
-              <select bind:value={discoveryMode}>
+              <select bind:value={connection.discoveryMode}>
                 <option value="global">Global Discovery (default)</option>
                 <option value="direct">Direct Host/Port</option>
               </select>
             </label>
 
-            {#if discoveryMode === "global"}
+            {#if connection.discoveryMode === "global"}
               <label>
                 Discovery Server
-                <input type="text" bind:value={discoveryServer} />
+                <input type="text" bind:value={connection.discoveryServer} />
               </label>
             {/if}
 
-            {#if discoveryMode === "direct"}
+            {#if connection.discoveryMode === "direct"}
               <label>
                 Host
-                <input type="text" bind:value={host} placeholder="127.0.0.1" />
+                <input type="text" bind:value={connection.host} placeholder="127.0.0.1" />
               </label>
 
               <label>
                 Port
-                <input type="number" bind:value={port} min="1" max="65535" />
+                <input type="number" bind:value={connection.port} min="1" max="65535" />
               </label>
             {:else}
               <div class="hint">
@@ -1568,7 +1427,7 @@
               Remote Device ID
               <input
                 type="text"
-                bind:value={remoteId}
+                bind:value={connection.remoteId}
                 placeholder="ABCD123-... (required for global discovery)"
                 spellcheck="false"
                 autocapitalize="characters"
@@ -1581,7 +1440,7 @@
               TLS Certificate (optional)
               <input
                 type="text"
-                bind:value={cert}
+                bind:value={connection.cert}
                 placeholder="Auto uses persisted cli-node cert.pem"
               />
             </label>
@@ -1590,38 +1449,38 @@
               TLS Key (optional)
               <input
                 type="text"
-                bind:value={key}
+                bind:value={connection.key}
                 placeholder="Auto uses persisted cli-node key.pem"
               />
             </label>
 
             <label>
               Device Name
-              <input type="text" bind:value={deviceName} />
+              <input type="text" bind:value={connection.deviceName} />
             </label>
 
             <label>
               Timeout (ms)
               <input
                 type="number"
-                bind:value={timeoutMs}
+                bind:value={connection.timeoutMs}
                 min="1000"
                 step="1000"
               />
             </label>
 
             <label class="checkbox-row">
-              <input type="checkbox" bind:checked={enableRelayFallback} />
+              <input type="checkbox" bind:checked={connection.enableRelayFallback} />
               <span>Enable relay fallback (Syncthing relay://)</span>
             </label>
 
             <label class="checkbox-row">
-              <input type="checkbox" bind:checked={autoAcceptNewDevices} />
+              <input type="checkbox" bind:checked={connection.autoAcceptNewDevices} />
               <span>Auto-accept newly advertised devices</span>
             </label>
 
             <label class="checkbox-row">
-              <input type="checkbox" bind:checked={autoAcceptIntroducedFolders} />
+              <input type="checkbox" bind:checked={connection.autoAcceptIntroducedFolders} />
               <span>Auto-approve folder sync for introduced folders</span>
             </label>
           </form>
@@ -1630,7 +1489,7 @@
             <button
               type="button"
               class="ghost"
-              on:click={() => useSavedDevice(selectedSavedDeviceId)}
+              onclick={() => useSavedDevice(selectedSavedDeviceId)}
               disabled={selectedSavedDeviceId === ""}
             >
               Use Selected Device
@@ -1638,15 +1497,15 @@
             <button
               type="button"
               class="ghost"
-              on:click={resetDiscoveryServer}
-              disabled={discoveryMode !== "global"}
+              onclick={resetDiscoveryServer}
+              disabled={connection.discoveryMode !== "global"}
             >
               Use Official Discovery Server
             </button>
             <button
               type="button"
               class="ghost"
-              on:click={clearAllCache}
+              onclick={clearAllCache}
               disabled={isClearingCache}
             >
               {isClearingCache ? "Clearing Cache..." : "Clear Cache"}
@@ -1664,7 +1523,7 @@
           <button
             type="button"
             class="primary"
-            on:click={exportIdentityRecovery}
+            onclick={exportIdentityRecovery}
             disabled={isExportingIdentityRecovery}
           >
             {isExportingIdentityRecovery ? "Exporting..." : "Export Recovery Secret"}
@@ -1676,7 +1535,7 @@
             class="recovery-secret"
             readonly
             value={exportedIdentitySecret}
-          />
+          ></textarea>
         {/if}
 
         <label>
@@ -1685,13 +1544,13 @@
             class="recovery-secret"
             bind:value={identityRecoverySecret}
             placeholder="Paste recovery secret here"
-          />
+          ></textarea>
         </label>
         <div class="actions">
           <button
             type="button"
             class="ghost"
-            on:click={restoreIdentityRecovery}
+            onclick={restoreIdentityRecovery}
             disabled={isRestoringIdentityRecovery}
           >
             {isRestoringIdentityRecovery ? "Restoring..." : "Restore Identity"}
@@ -1723,7 +1582,7 @@
             <span>Treat as introducer</span>
           </label>
           <div class="actions">
-            <button type="button" class="primary" on:click={addSavedDevice}
+            <button type="button" class="primary" onclick={addSavedDevice}
               >Add Device</button
             >
           </div>
@@ -1761,14 +1620,14 @@
                   {#if device.accepted}
                     <button
                       class="ghost"
-                      on:click={() => useSavedDevice(device.id)}
+                      onclick={() => useSavedDevice(device.id)}
                     >
                       Use
                     </button>
                   {:else}
                     <button
                       class="primary"
-                      on:click={() => approveAdvertisedDevice(device)}
+                      onclick={() => approveAdvertisedDevice(device)}
                     >
                       Approve
                     </button>
@@ -1807,7 +1666,7 @@
                   {#if folder.syncApproved}
                     <button
                       class="ghost"
-                      on:click={() => openFolderRoot(folder.folderId)}
+                      onclick={() => openFolderRoot(folder.folderId)}
                       disabled={!isConnected}
                     >
                       Open
@@ -1815,7 +1674,7 @@
                   {:else}
                     <button
                       class="primary"
-                      on:click={() => approveFolderSync(folder)}
+                      onclick={() => approveFolderSync(folder)}
                     >
                       Approve Sync
                     </button>
@@ -1841,7 +1700,7 @@
                   <div class="item-title-row">
                     <button
                       class="item-title"
-                      on:click={() => useSavedDevice(device.id)}
+                      onclick={() => useSavedDevice(device.id)}
                       >{device.name}</button
                     >
                     {#if device.isIntroducer}
@@ -1856,18 +1715,18 @@
                 <div class="item-actions">
                   <button
                     class="primary"
-                    on:click={() => connectToSavedDevice(device.id)}
+                    onclick={() => connectToSavedDevice(device.id)}
                     disabled={isConnecting}
                   >
                     {isConnecting && activeConnectDeviceId === device.id ? "Connecting..." : "Connect"}
                   </button>
                   <button
                     class="ghost"
-                    on:click={() => useSavedDevice(device.id)}>Use</button
+                    onclick={() => useSavedDevice(device.id)}>Use</button
                   >
                   <button
                     class="ghost"
-                    on:click={() =>
+                    onclick={() =>
                       setSavedDeviceIntroducer(device.id, !device.isIntroducer)}
                     title={device.isIntroducer ? "Unset introducer" : "Mark as introducer"}
                   >
@@ -1875,7 +1734,7 @@
                   </button>
                   <button
                     class="icon"
-                    on:click={() => removeSavedDevice(device.id)}
+                    onclick={() => removeSavedDevice(device.id)}
                     title="Remove saved device">X</button
                   >
                 </div>
@@ -1912,7 +1771,7 @@
               <div class="item-actions">
                 <button
                   class="ghost"
-                  on:click={refreshOverview}
+                  onclick={refreshOverview}
                   disabled={!isConnected || isRefreshing || isConnecting}
                   title={isRefreshing ? "Refreshing..." : "Refresh"}
                 >
@@ -1932,7 +1791,7 @@
             <button
               type="button"
               class="ghost"
-              on:click={copySessionLogs}
+              onclick={copySessionLogs}
             >
               Copy Logs
             </button>
@@ -1966,7 +1825,7 @@
         <div class="actions">
           <button
             class="ghost"
-            on:click={openDownloadedFilesPanel}
+            onclick={openDownloadedFilesPanel}
             disabled={isLoadingDownloadedFiles}
           >
             {isLoadingDownloadedFiles
@@ -1989,7 +1848,7 @@
                 <div class="item-main">
                   <button
                     class="item-title"
-                    on:click={() => openFavorite(favorite)}
+                    onclick={() => openFavorite(favorite)}
                     disabled={!isConnected}>{favorite.name}</button
                   >
                   <div class="item-meta">
@@ -2001,7 +1860,7 @@
                     {#if cachedFileKeys.has(cachedFileKey(favorite.folderId, favorite.path))}
                       <button
                         class="ghost"
-                        on:click={() =>
+                        onclick={() =>
                           openCachedFile(favorite.folderId, favorite.path)}
                         disabled={isOpeningCachedFile}
                       >
@@ -2009,7 +1868,7 @@
                       </button>
                       <button
                         class="ghost"
-                        on:click={() =>
+                        onclick={() =>
                           openCachedFileDirectory(
                             favorite.folderId,
                             favorite.path,
@@ -2021,7 +1880,7 @@
                     {:else}
                       <button
                         class="ghost"
-                        on:click={() =>
+                        onclick={() =>
                           downloadFile(
                             favorite.folderId,
                             favorite.path,
@@ -2035,7 +1894,7 @@
                   {/if}
                   <button
                     class="icon"
-                    on:click={() => void removeFavorite(favorite)}
+                    onclick={() => void removeFavorite(favorite)}
                     title="Remove favorite">★</button
                   >
                 </div>
@@ -2049,7 +1908,7 @@
             <h3 class="heading">Downloaded Files</h3>
             <button
               class="ghost"
-              on:click={clearAllCache}
+              onclick={clearAllCache}
               disabled={isClearingCache || isRemovingCachedFile}
             >
               {isClearingCache ? "Clearing..." : "Clear All"}
@@ -2073,14 +1932,14 @@
                   <div class="item-actions">
                     <button
                       class="ghost"
-                      on:click={() => openCachedFile(file.folderId, file.path)}
+                      onclick={() => openCachedFile(file.folderId, file.path)}
                       disabled={isOpeningCachedFile}
                     >
                       Open
                     </button>
                     <button
                       class="ghost"
-                      on:click={() =>
+                      onclick={() =>
                         openCachedFileDirectory(file.folderId, file.path)}
                       disabled={isOpeningCachedFile}
                     >
@@ -2088,7 +1947,7 @@
                     </button>
                     <button
                       class="ghost"
-                      on:click={() =>
+                      onclick={() =>
                         removeCachedFile(file.folderId, file.path)}
                       disabled={isRemovingCachedFile || isClearingCache}
                     >
@@ -2119,7 +1978,7 @@
               <span>Updated {lastUpdatedAt}</span>
             {/if}
             <button
-              on:click={() => refreshActiveView()}
+              onclick={() => refreshActiveView()}
               disabled={isRefreshing || isConnecting || isLoadingDirectory}
               title={isRefreshing ? "Refreshing..." : "Refresh"}
             >
@@ -2131,7 +1990,7 @@
             {#if !currentFolderId}
               <span class="crumb-current">All Syncthing Folders</span>
             {:else}
-              <button class="crumb-button" on:click={goToRootView}
+              <button class="crumb-button" onclick={goToRootView}
                 >All Syncthing Folders</button
               >
               <span class="crumb-separator">&gt;</span>
@@ -2142,7 +2001,7 @@
                   {:else}
                     <button
                       class="crumb-button"
-                      on:click={() => goToBreadcrumb(segment)}
+                      onclick={() => goToBreadcrumb(segment)}
                       >{segment.label}</button
                     >
                   {/if}
@@ -2164,7 +2023,7 @@
                     <div class="item-main">
                       <button
                         class="item-title"
-                        on:click={() => openFolderRoot(folder.id)}
+                        onclick={() => openFolderRoot(folder.id)}
                         disabled={folderIsLocked(folder.id)}
                         >{folder.name}</button
                       >
@@ -2185,7 +2044,7 @@
                           <input
                             type="password"
                             value={folderPasswordDrafts[folder.id] ?? folderPasswords[folder.id] ?? ""}
-                            on:input={(event) =>
+                            oninput={(event) =>
                               handleFolderPasswordInput(folder.id, event)}
                             placeholder="Syncthing folder encryption password"
                           />
@@ -2199,13 +2058,13 @@
                         </span>
                         <button
                           class="ghost"
-                          on:click={() => saveFolderPassword(folder.id)}
+                          onclick={() => saveFolderPassword(folder.id)}
                         >
                           Save Password
                         </button>
                         <button
                           class="ghost"
-                          on:click={() => clearFolderPassword(folder.id)}
+                          onclick={() => clearFolderPassword(folder.id)}
                           disabled={!folderPasswords[folder.id]}
                         >
                           Clear Password
@@ -2213,14 +2072,14 @@
                       {/if}
                       <button
                         class="ghost"
-                        on:click={() => openCachedDirectory(folder.id, "")}
+                        onclick={() => openCachedDirectory(folder.id, "")}
                         disabled={isOpeningCachedFile}
                       >
                         Open Local
                       </button>
                       <button
                         class="icon"
-                        on:click={() =>
+                        onclick={() =>
                           void toggleFavorite(
                             folder.id,
                             "",
@@ -2255,7 +2114,7 @@
                       {#if entry.type === "directory"}
                         <button
                           class="item-title"
-                          on:click={() => openDirectory(entry.path)}
+                          onclick={() => openDirectory(entry.path)}
                           >{entry.name}/</button
                         >
                       {:else}
@@ -2276,7 +2135,7 @@
                       {#if entry.type === "directory"}
                         <button
                           class="ghost"
-                          on:click={() =>
+                          onclick={() =>
                             openCachedDirectory(currentFolderId, entry.path)}
                           disabled={isOpeningCachedFile}
                         >
@@ -2287,7 +2146,7 @@
                         {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
                           <button
                             class="ghost"
-                            on:click={() =>
+                            onclick={() =>
                               openCachedFile(currentFolderId, entry.path)}
                             disabled={isOpeningCachedFile}
                           >
@@ -2295,7 +2154,7 @@
                           </button>
                           <button
                             class="ghost"
-                            on:click={() =>
+                            onclick={() =>
                               openCachedFileDirectory(currentFolderId, entry.path)}
                             disabled={isOpeningCachedFile}
                           >
@@ -2304,7 +2163,7 @@
                         {:else}
                           <button
                             class="ghost"
-                            on:click={() =>
+                            onclick={() =>
                               downloadFile(
                                 currentFolderId,
                                 entry.path,
@@ -2318,7 +2177,7 @@
                       {/if}
                       <button
                         class="icon"
-                        on:click={() =>
+                        onclick={() =>
                           void toggleFavorite(
                             currentFolderId,
                             entry.path,
@@ -2348,9 +2207,9 @@
                 id="folder-upload-input"
                 type="file"
                 style="display: none;"
-                on:change={handleUploadSelected}
+                onchange={handleUploadSelected}
               />
-              <button class="primary" on:click={handleUploadClick}
+              <button class="primary" onclick={handleUploadClick}
                 >Upload</button
               >
             </div>
@@ -2367,21 +2226,21 @@
   <nav class="bottom-tabs">
     <button
       class={`tab-button ${activeTab === "favorites" ? "active" : ""}`}
-      on:click={() => switchTab("favorites")}
+      onclick={() => switchTab("favorites")}
     >
       <span class="tab-icon" aria-hidden="true">★</span>
       <span class="sr-only">Favorites</span>
     </button>
     <button
       class={`tab-button ${activeTab === "folders" ? "active" : ""}`}
-      on:click={() => switchTab("folders")}
+      onclick={() => switchTab("folders")}
     >
       <span class="tab-icon" aria-hidden="true">▦</span>
       <span class="sr-only">Folders</span>
     </button>
     <button
       class={`tab-button ${activeTab === "devices" ? "active" : ""}`}
-      on:click={() => switchTab("devices")}
+      onclick={() => switchTab("devices")}
     >
       <span class="tab-icon" aria-hidden="true">☰</span>
       <span class="sr-only">Settings</span>

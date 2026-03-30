@@ -275,7 +275,7 @@ async function waitForIntroducedDeviceAdvertisement(options) {
   while (Date.now() < deadline) {
     let session = null;
     try {
-      const { createNodeSyncpeerClient } = await import("../packages/core/dist/node.js");
+      const { createNodeSyncpeerClient } = await import("../packages/core/src/node.ts");
       const certPem = fs.readFileSync(localCertPath, "utf8");
       const keyPem = fs.readFileSync(localKeyPath, "utf8");
       const client = createNodeSyncpeerClient();
@@ -396,7 +396,6 @@ async function main() {
   writeFile(path.join(bEncryptedShareDir, "secret.txt"), expectedEncrypted);
 
   console.log("Building CLI packages...");
-  execFileSync(npmCmd, ["run", "build:core"], { stdio: "inherit" });
   execFileSync(npmCmd, ["run", "build:cli"], { stdio: "inherit" });
 
   console.log("Bootstrapping Syncthing homes...");
@@ -486,6 +485,65 @@ async function main() {
       );
     }
     console.log("Introducer advertisement check passed.");
+
+    console.log("");
+    console.log("=== Running core session-store parity checks ===");
+    const {
+      createNodeSessionTransport,
+      createSyncpeerSessionStore,
+    } = await import("../packages/core/src/index.ts");
+    const sessionTransport = createNodeSessionTransport();
+    const sessionTraceEvents = [];
+    const sessionStore = createSyncpeerSessionStore({
+      transport: sessionTransport,
+      onTrace: (entry) => {
+        sessionTraceEvents.push(entry);
+      },
+    });
+    const sessionOptions = {
+      discoveryMode: "direct",
+      host: "127.0.0.1",
+      port: 58301,
+      cert: path.join(cliNodeHome, "cert.pem"),
+      key: path.join(cliNodeHome, "key.pem"),
+      remoteId: bId,
+      deviceName: "syncpeer-cli-session-parity",
+      timeoutMs: 20_000,
+      folderPasswords: {},
+    };
+    await sessionStore.actions.connect(sessionOptions);
+    let sessionState = sessionStore.getState();
+    if (!sessionState.folders.some((folder) => folder.id === folderId)) {
+      throw new Error(
+        `Session-store connect did not expose expected folder "${folderId}".`,
+      );
+    }
+    await sessionStore.actions.openFolder(folderId, sessionOptions);
+    sessionState = sessionStore.getState();
+    const rootEntryPaths = new Set(sessionState.entries.map((entry) => entry.path));
+    if (!rootEntryPaths.has("a.txt")) {
+      throw new Error(
+        `Session-store root listing missing a.txt. Entries: ${[...rootEntryPaths].join(", ")}`,
+      );
+    }
+    if (!rootEntryPaths.has("subdir")) {
+      throw new Error(
+        `Session-store root listing missing subdir. Entries: ${[...rootEntryPaths].join(", ")}`,
+      );
+    }
+
+    await sessionStore.actions.disconnect();
+    await sessionStore.actions.connect(sessionOptions);
+    await sessionStore.actions.openFolder(folderId, sessionOptions);
+    sessionState = sessionStore.getState();
+    const reconnectEntryPaths = new Set(sessionState.entries.map((entry) => entry.path));
+    if (!reconnectEntryPaths.has("a.txt")) {
+      throw new Error(
+        `Session-store reconnect listing missing a.txt. Entries: ${[...reconnectEntryPaths].join(", ")}`,
+      );
+    }
+    await sessionStore.actions.disconnect();
+    console.log(`Core session-store parity check passed (${sessionTraceEvents.length} trace events).`);
 
     console.log("");
     console.log("=== Running syncpeer CLI checks ===");

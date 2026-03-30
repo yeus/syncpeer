@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { readFile } from "node:fs/promises";
 import https from "node:https";
 import tls from "node:tls";
 import {
@@ -10,7 +11,9 @@ import {
   type SyncpeerHostAdapter,
   type SyncpeerTlsConnectOptions,
   type SyncpeerTlsSocket,
-} from "./client.js";
+} from "./client.ts";
+import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.ts";
+import type { SessionTransport } from "./ui/sessionTypes.ts";
 
 type ByteBuffer = Buffer<ArrayBufferLike>;
 
@@ -19,8 +22,10 @@ class NodeTlsSocket implements SyncpeerTlsSocket {
   private waiters: Array<{ resolve: (chunk: Uint8Array) => void; reject: (error: Error) => void }> = [];
   private closed = false;
   private closeError: Error | null = null;
+  private socket: tls.TLSSocket;
 
-  constructor(private socket: tls.TLSSocket) {
+  constructor(socket: tls.TLSSocket) {
+    this.socket = socket;
     socket.on("data", (chunk: ByteBuffer) => {
       const data = new Uint8Array(chunk);
       const waiter = this.waiters.shift();
@@ -340,3 +345,143 @@ export async function resolveNodeGlobalDiscovery(
 }
 
 export const createNodeSyncpeerClient = () => createSyncpeerCoreClient(createNodeHostAdapter());
+
+const maybeInlinePem = (value: string | undefined): string | null => {
+  if (!value) return null;
+  if (
+    value.includes("-----BEGIN CERTIFICATE-----") ||
+    value.includes("-----BEGIN PRIVATE KEY-----") ||
+    value.includes("-----BEGIN RSA PRIVATE KEY-----")
+  ) {
+    return value;
+  }
+  return null;
+};
+
+const resolvePemValue = async (
+  value: string | undefined,
+  label: "cert" | "key",
+): Promise<string> => {
+  if (!value) {
+    throw new Error(`Missing ${label}. Provide PEM text or a readable file path.`);
+  }
+  const inline = maybeInlinePem(value);
+  if (inline) return inline;
+  return readFile(value, "utf8");
+};
+
+export const createNodeSessionTransport = (): SessionTransport => {
+  const coreClient = createNodeSyncpeerClient();
+  let activeSession: Awaited<ReturnType<typeof coreClient.openSession>> | null = null;
+  let activeKey = "";
+  let opening: Promise<Awaited<ReturnType<typeof coreClient.openSession>>> | null = null;
+
+  const keyFor = (options: ConnectOptions, certPem: string, keyPem: string): string =>
+    JSON.stringify({
+      host: options.host,
+      port: options.port,
+      discoveryMode: options.discoveryMode ?? "global",
+      discoveryServer: options.discoveryServer ?? "",
+      remoteId: options.remoteId ?? "",
+      deviceName: options.deviceName,
+      timeoutMs: options.timeoutMs ?? 0,
+      enableRelayFallback: options.enableRelayFallback ?? true,
+      folderPasswords: options.folderPasswords ?? {},
+      certPem,
+      keyPem,
+    });
+
+  const asRemoteFsLike = (): RemoteFsLike => ({
+    listFolders: async () => {
+      if (!activeSession || activeSession.isClosed()) {
+        throw new Error("No active connection. Connect first.");
+      }
+      return activeSession.remoteFs.listFolders();
+    },
+    readDir: async (folderId, path) => {
+      if (!activeSession || activeSession.isClosed()) {
+        throw new Error("No active connection. Connect first.");
+      }
+      return activeSession.remoteFs.readDir(folderId, path);
+    },
+    readFileFully: async (folderId, path, onProgress) => {
+      if (!activeSession || activeSession.isClosed()) {
+        throw new Error("No active connection. Connect first.");
+      }
+      return activeSession.remoteFs.readFileFully(folderId, path, onProgress);
+    },
+  });
+
+  const ensureSession = async (options: ConnectOptions) => {
+    const certPem = await resolvePemValue(options.cert, "cert");
+    const keyPem = await resolvePemValue(options.key, "key");
+    const sessionKey = keyFor(options, certPem, keyPem);
+
+    if (activeSession && !activeSession.isClosed() && activeKey === sessionKey) {
+      return activeSession;
+    }
+    if (opening) {
+      const opened = await opening;
+      if (!opened.isClosed() && activeKey === sessionKey) {
+        return opened;
+      }
+    }
+    if (activeSession) {
+      await activeSession.close().catch(() => undefined);
+    }
+    opening = coreClient.openSession({
+      host: options.host,
+      port: options.port,
+      discoveryMode: options.discoveryMode,
+      discoveryServer: options.discoveryServer,
+      certPem,
+      keyPem,
+      expectedDeviceId: options.remoteId,
+      deviceName: options.deviceName,
+      timeoutMs: options.timeoutMs,
+      enableRelayFallback: options.enableRelayFallback,
+      folderPasswords: options.folderPasswords,
+    });
+    const session = await opening;
+    opening = null;
+    activeSession = session;
+    activeKey = sessionKey;
+    return session;
+  };
+
+  return {
+    connectAndSync: async (options: ConnectOptions): Promise<RemoteFsLike> => {
+      await ensureSession(options);
+      return asRemoteFsLike();
+    },
+    connectAndGetOverview: async (options: ConnectOptions): Promise<ConnectionOverview> => {
+      const session = await ensureSession(options);
+      const [folders, device, folderSyncStates] = await Promise.all([
+        session.remoteFs.listFolders(),
+        Promise.resolve(session.remoteFs.getRemoteDeviceInfo?.() ?? null),
+        Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
+      ]);
+      return {
+        folders,
+        device,
+        folderSyncStates,
+        connectedVia: session.connectedVia,
+        transportKind: session.transportKind,
+      };
+    },
+    connectAndGetFolderVersions: async (options: ConnectOptions) => {
+      const session = activeSession && !activeSession.isClosed()
+        ? activeSession
+        : await ensureSession(options);
+      return Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []);
+    },
+    disconnect: async () => {
+      const previous = activeSession;
+      activeSession = null;
+      activeKey = "";
+      if (previous) {
+        await previous.close();
+      }
+    },
+  };
+};

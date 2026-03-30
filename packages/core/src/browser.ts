@@ -1,4 +1,4 @@
-export { createSyncpeerCoreClient } from "./client.js";
+export { createSyncpeerCoreClient } from "./client.ts";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
@@ -8,8 +8,8 @@ export type {
   SyncpeerSessionHandle,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
-} from "./client.js";
-export { RemoteFs } from "./core/model/remoteFs.js";
+} from "./client.ts";
+export { RemoteFs } from "./core/model/remoteFs.ts";
 export type {
   AdvertisedDeviceInfo,
   FileBlock,
@@ -18,16 +18,16 @@ export type {
   FolderInfo,
   FolderSyncState,
   RemoteDeviceInfo,
-} from "./core/model/remoteFs.js";
+} from "./core/model/remoteFs.ts";
 export {
   buildConnectionDetails,
   fromConnectionSettings,
   toConnectionSettings,
-} from "./ui/connectionState.js";
+} from "./ui/connectionState.ts";
 export type {
   DiscoveryMode,
   StoredConnectionSettingsLike,
-} from "./ui/connectionState.js";
+} from "./ui/connectionState.ts";
 export {
   breadcrumbSegments,
   cachedFileKey,
@@ -46,19 +46,25 @@ export {
   resolveDirectoryPath,
   sleep,
   syncApprovedFolderKey,
-} from "./ui/helpers.js";
+} from "./ui/helpers.ts";
 export type {
   AdvertisedDeviceItem,
   AdvertisedFolderItem,
   BreadcrumbSegment,
   SavedDeviceLike,
-} from "./ui/helpers.js";
+} from "./ui/helpers.ts";
 export {
   createSyncpeerBrowserClient,
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
   reportClientError,
-} from "./ui/browserClient.js";
+} from "./ui/browserClient.ts";
+export { createSyncpeerSessionStore } from "./ui/sessionStore.ts";
+export {
+  makeReadDirWithRetryFlow,
+  makeWaitForFolderIndexToArriveFlow,
+  makeWaitForFoldersToPopulateFlow,
+} from "./ui/sessionFlows.ts";
 export type {
   CachedFileRecord,
   CachedFileStatus,
@@ -72,4 +78,16 @@ export type {
   SyncpeerIdentityRecord,
   SyncpeerPlatformAdapter,
   UiLogEntry,
-} from "./ui/browserClient.js";
+} from "./ui/browserClient.ts";
+export type {
+  SessionPendingState,
+  SessionPhase,
+  SessionRuntimeActions,
+  SessionRuntimeDeps,
+  SessionSnapshotState,
+  SessionState,
+  SessionTraceEvent,
+  SessionTransport,
+  SyncpeerSessionStore,
+} from "./ui/sessionTypes.ts";
+export type { FolderIndexPollAttempt, ReadDirAttempt } from "./ui/sessionFlows.ts";

@@ -1,4 +1,4 @@
-import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
+import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.ts";
 
 export interface FolderInfo {
   id: string;
@@ -158,19 +158,37 @@ async function mapConcurrent<T>(
 }
 
 export class RemoteFs {
+  private folders: Map<string, FolderState>;
+  private requestBlock: (
+    folderId: string,
+    filePath: string,
+    offset: number,
+    length: number,
+    options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
+  ) => Promise<Uint8Array>;
+  private log?: (event: string, details?: Record<string, unknown>) => void;
+  private remoteDevice?: RemoteDeviceInfo;
+  private closeConnection?: () => void;
+
   constructor(
-    private folders: Map<string, FolderState>,
-    private requestBlock: (
+    folders: Map<string, FolderState>,
+    requestBlock: (
       folderId: string,
       filePath: string,
       offset: number,
       length: number,
       options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
     ) => Promise<Uint8Array>,
-    private log?: (event: string, details?: Record<string, unknown>) => void,
-    private remoteDevice?: RemoteDeviceInfo,
-    private closeConnection?: () => void,
-  ) {}
+    log?: (event: string, details?: Record<string, unknown>) => void,
+    remoteDevice?: RemoteDeviceInfo,
+    closeConnection?: () => void,
+  ) {
+    this.folders = folders;
+    this.requestBlock = requestBlock;
+    this.log = log;
+    this.remoteDevice = remoteDevice;
+    this.closeConnection = closeConnection;
+  }
 
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
     return this.remoteDevice;

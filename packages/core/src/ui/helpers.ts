@@ -1,4 +1,4 @@
-import type { AdvertisedDeviceInfo, FolderInfo } from "../core/model/remoteFs.js";
+import type { AdvertisedDeviceInfo, FolderInfo } from "../core/model/remoteFs.ts";
 
 export interface BreadcrumbSegment {
   key: string;

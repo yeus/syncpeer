@@ -3,6 +3,7 @@
   import { onDestroy, onMount } from "svelte";
   import {
     createSyncpeerBrowserClient,
+    createSyncpeerSessionStore,
     getDefaultDiscoveryServer,
     normalizeDiscoveryServer,
     buildConnectionDetails,
@@ -30,6 +31,7 @@
     type ConnectOptions,
     type DiscoveryMode,
     type RemoteFsLike,
+    type SessionState,
     type SavedDeviceLike,
     type StoredConnectionSettingsLike,
     type UiLogEntry,
@@ -47,6 +49,11 @@
     runFolderContentDiagnostics,
     type FolderDiagnosticsReport,
   } from "./lib/folderDiagnostics.ts";
+  import {
+    readDirWithFrontendRetryFlow,
+    waitForFolderIndexToArriveFlow,
+    waitForFoldersToPopulateFlow,
+  } from "./lib/folderFlow.ts";
   import {
     buildDiagnosticsRegistry,
     runDiagnosticsTests,
@@ -216,6 +223,7 @@
 
   const folderState = (folderId: string): FolderInfo | undefined =>
     folders.find((folder) => folder.id === folderId);
+    
   const folderIsLocked = (folderId: string): boolean => {
     const folder = folderState(folderId);
     return !!folder?.encrypted && !!folder?.needsPassword;
@@ -320,6 +328,8 @@
   let connectionPath = $state("");
   let connectionTransport = $state<"direct-tcp" | "relay" | "">("");
   let recentError = $state<string | null>(null);
+  let connectedSourceDeviceId = $state("");
+  let hasNonEmptyOverviewInSession = $state(false);
   let sessionLogs = $state<SessionLogItem[]>([]);
   let isLogPanelExpanded = $state(false);
   let lastLoggedError = $state("");
@@ -442,6 +452,34 @@
     platformAdapter,
     onLog: pushClientLog,
   });
+  const sessionStore = createSyncpeerSessionStore({
+    transport: client,
+    onTrace: (event) => {
+      pushSessionLog(event.level, event.event, event.message, event.details);
+    },
+  });
+
+  const applySessionState = (next: SessionState): void => {
+    remoteFs = next.remoteFs;
+    isConnected = next.phase === "connected" || next.phase === "refreshing";
+    isConnecting = next.pending.connecting;
+    isRefreshing = next.pending.refreshingOverview;
+    isLoadingDirectory = next.pending.loadingDirectory;
+    folders = next.folders;
+    folderSyncStates = next.folderSyncStates;
+    currentFolderId = next.currentFolderId;
+    currentPath = next.currentPath;
+    entries = next.entries;
+    currentFolderVersionKey = next.currentFolderVersionKey;
+    remoteDevice = next.remoteDevice;
+    connectionPath = next.connectionPath;
+    connectionTransport = next.connectionTransport;
+    if (next.lastError) {
+      error = next.lastError;
+      recentError = next.lastError;
+    }
+  };
+  const unsubscribeSessionStore = sessionStore.subscribe(applySessionState);
 
   const refreshTimer = setInterval(() => {
     void refreshActiveView();
@@ -449,6 +487,7 @@
 
   onDestroy(() => {
     clearInterval(refreshTimer);
+    unsubscribeSessionStore();
     void client.disconnect?.();
   });
 
@@ -570,6 +609,8 @@
     entries = [];
     activeConnectDeviceId = "";
     recentError = null;
+    connectedSourceDeviceId = "";
+    hasNonEmptyOverviewInSession = false;
   };
 
   const applyOverviewSnapshot = (
@@ -600,13 +641,23 @@
         })),
       },
     );
-    const shouldPreserveFolders = nextFolders.length === 0 && folders.length > 0;
+    const sameSourceSession =
+      sourceDeviceId !== "" && sourceDeviceId === connectedSourceDeviceId;
+    const shouldPreserveFolders =
+      nextFolders.length === 0 &&
+      folders.length > 0 &&
+      sameSourceSession &&
+      hasNonEmptyOverviewInSession;
     if (!shouldPreserveFolders) {
       folders = nextFolders;
       remoteDevice = overview.device;
       folderSyncStates = overview.folderSyncStates ?? [];
       connectionPath = overview.connectedVia;
       connectionTransport = overview.transportKind;
+      connectedSourceDeviceId = sourceDeviceId;
+      if (nextFolders.length > 0) {
+        hasNonEmptyOverviewInSession = true;
+      }
       saveOfflineFolderSnapshot(sourceDeviceId, overview);
       return;
     }
@@ -626,126 +677,42 @@
   };
 
   const waitForFoldersToPopulate = async (timeoutMs = 4000): Promise<void> => {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && isConnected) {
-      if (folders.length > 0) return;
-      const overview = await client.connectAndGetOverview(connectionDetails());
-      applyOverviewSnapshot(overview);
-      ensureCurrentFolderExists();
-      if (folders.length > 0) return;
-      await sleep(200);
-    }
+    await waitForFoldersToPopulateFlow({
+      client,
+      options: connectionDetails(),
+      timeoutMs,
+      pollIntervalMs: 200,
+      isConnected: () => isConnected,
+      getCurrentFolderCount: () => folders.length,
+      applyOverview: (overview) => {
+        applyOverviewSnapshot(overview);
+        ensureCurrentFolderExists();
+      },
+      logger: (entry) => {
+        pushSessionLog(entry.level, entry.event, entry.message, entry.details);
+      },
+    });
   };
 
   const waitForFolderIndexToArrive = async (
     folderId: string,
     timeoutMs = 3500,
   ): Promise<boolean> => {
-    const initialState = folderSyncStates.find((item) => item.folderId === folderId);
-    pushSessionLog(
-      "info",
-      "folder.index.wait.start",
-      `Waiting for folder index state for ${folderId}.`,
-      {
-        folderId,
-        timeoutMs,
-        initialIndexReceived: initialState?.indexReceived ?? false,
-        initialRemoteIndexId: initialState?.remoteIndexId ?? null,
-        initialRemoteMaxSequence: initialState?.remoteMaxSequence ?? null,
-        knownFolderSyncStateCount: folderSyncStates.length,
+    const result = await waitForFolderIndexToArriveFlow({
+      client,
+      options: connectionDetails(),
+      folderId,
+      timeoutMs,
+      initialFolderSyncStates: folderSyncStates,
+      isConnected: () => isConnected,
+      onFolderSyncStates: (states) => {
+        folderSyncStates = states;
       },
-    );
-
-    const deadline = Date.now() + timeoutMs;
-    let attempt = 0;
-    while (Date.now() < deadline && isConnected) {
-      attempt += 1;
-      const syncState = folderSyncStates.find((item) => item.folderId === folderId);
-      if (syncState?.indexReceived) {
-        pushSessionLog(
-          "info",
-          "folder.index.wait.ready",
-          `Folder index is marked as received for ${folderId}.`,
-          {
-            folderId,
-            attempt,
-            remoteIndexId: syncState.remoteIndexId ?? null,
-            remoteMaxSequence: syncState.remoteMaxSequence ?? null,
-          },
-        );
-        return true;
-      }
-      const remainingMs = Math.max(deadline - Date.now(), 0);
-      const versions = await Promise.race<FolderSyncState[] | null>([
-        client.connectAndGetFolderVersions(connectionDetails()),
-        sleep(1200).then(() => null),
-      ]);
-      if (!versions) {
-        pushSessionLog(
-          "warning",
-          "folder.index.poll.timeout",
-          `Timed out fetching folder sync states for ${folderId}.`,
-          {
-            folderId,
-            attempt,
-            remainingMs,
-          },
-        );
-        await sleep(150);
-        continue;
-      }
-      const previous = folderSyncStates.find((item) => item.folderId === folderId);
-      folderSyncStates = versions;
-      const next = versions.find((item) => item.folderId === folderId);
-      pushSessionLog(
-        "info",
-        "folder.index.poll.state",
-        `Polled folder sync states for ${folderId}.`,
-        {
-          folderId,
-          attempt,
-          remainingMs,
-          knownFolderSyncStateCount: versions.length,
-          previousIndexReceived: previous?.indexReceived ?? false,
-          previousRemoteIndexId: previous?.remoteIndexId ?? null,
-          previousRemoteMaxSequence: previous?.remoteMaxSequence ?? null,
-          nextIndexReceived: next?.indexReceived ?? false,
-          nextRemoteIndexId: next?.remoteIndexId ?? null,
-          nextRemoteMaxSequence: next?.remoteMaxSequence ?? null,
-        },
-      );
-      if (next?.indexReceived) {
-        pushSessionLog(
-          "info",
-          "folder.index.wait.ready",
-          `Folder index became available for ${folderId}.`,
-          {
-            folderId,
-            attempt,
-            remoteIndexId: next.remoteIndexId ?? null,
-            remoteMaxSequence: next.remoteMaxSequence ?? null,
-          },
-        );
-        return true;
-      }
-      await sleep(150);
-    }
-    const finalState = folderSyncStates.find((item) => item.folderId === folderId);
-    const received = !!finalState?.indexReceived;
-    if (!received) {
-      pushSessionLog(
-        "warning",
-        "folder.index.not_received",
-        `Folder index not received yet for ${folderId}.`,
-        {
-          folderId,
-          finalIndexReceived: finalState?.indexReceived ?? false,
-          finalRemoteIndexId: finalState?.remoteIndexId ?? null,
-          finalRemoteMaxSequence: finalState?.remoteMaxSequence ?? null,
-        },
-      );
-    }
-    return received;
+      logger: (entry) => {
+        pushSessionLog(entry.level, entry.event, entry.message, entry.details);
+      },
+    });
+    return result.received;
   };
 
   const rootFolderEntries = (): RootFolderEntry[] =>
@@ -1099,6 +1066,10 @@
   });
 
   $effect(() => {
+    void sessionStore.actions.setFolderPasswords(activeFolderPasswords);
+  });
+
+  $effect(() => {
     if (error && error !== lastLoggedError) {
       lastLoggedError = error;
       pushSessionLog("error", "ui.error", error);
@@ -1305,18 +1276,17 @@
     const attemptedDeviceId = normalizeDeviceId(
       targetDeviceId ?? connection.remoteId ?? selectedSavedDeviceId,
     );
+    await sessionStore.actions.setFolderPasswords(activeFolderPasswords);
     restoreOfflineFolderSnapshot(attemptedDeviceId, "connect_start");
     try {
       const previousPeerId = normalizeDeviceId(remoteDevice?.id ?? "");
-      remoteFs = await client.connectAndSync(connectionDetails());
-      const overview = await client.connectAndGetOverview(connectionDetails());
-      isConnected = true;
-      applyOverviewSnapshot(overview);
-      void refreshFolderRootCachedStatuses(overview.folders.map((folder) => folder.id));
+      await sessionStore.actions.connect(connectionDetails());
+      const liveState = sessionStore.getState();
+      void refreshFolderRootCachedStatuses(liveState.folders.map((folder) => folder.id));
       const sourceDeviceId = normalizeDeviceId(
-        overview.device?.id ?? connection.remoteId,
+        liveState.remoteDevice?.id ?? connection.remoteId,
       );
-      syncConnectedDeviceSavedName(sourceDeviceId, overview.device?.deviceName);
+      syncConnectedDeviceSavedName(sourceDeviceId, liveState.remoteDevice?.deviceName);
       setRemoteApprovalPending(attemptedDeviceId, false);
       setRemoteApprovalPending(sourceDeviceId, false);
       if (
@@ -1328,12 +1298,12 @@
       }
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
-        overview.folders,
+        liveState.folders,
         sourceDeviceId,
         sourceIsIntroducer,
       );
       applyAutoAcceptForAdvertisedFolders(
-        overview.folders,
+        liveState.folders,
         sourceDeviceId,
         sourceIsIntroducer,
       );
@@ -1346,7 +1316,6 @@
         clearDirectoryView();
       }
       ensureCurrentFolderExists();
-      await waitForFoldersToPopulate();
       currentFolderVersionKey = "";
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
@@ -1374,7 +1343,7 @@
   async function disconnect() {
     if (isConnecting) return;
     try {
-      await client.disconnect?.();
+      await sessionStore.actions.disconnect();
     } catch (rawError: unknown) {
       setError("disconnect.failed", rawError);
       reportUiError("disconnect.failed", rawError);
@@ -1411,27 +1380,27 @@
 
   async function openFolderRoot(folderId: string) {
     if (folderIsLocked(folderId)) return;
-    currentFolderId = folderId;
-    currentPath = "";
-    currentFolderVersionKey = "";
     uploadMessage = "";
     activeTab = "folders";
-    await loadCurrentDirectory();
+    await sessionStore.actions.openFolder(folderId, connectionDetails());
+    currentFolderVersionKey = "";
   }
 
   async function openDirectory(path: string) {
     if (!currentFolderId) return;
-    currentPath = resolveDirectoryPath(currentPath, path);
+    const nextPath = resolveDirectoryPath(currentPath, path);
     uploadMessage = "";
-    await loadCurrentDirectory();
+    await sessionStore.actions.openPath(nextPath, connectionDetails());
   }
 
   async function goToBreadcrumb(segment: BreadcrumbSegment) {
     if (segment.ellipsis) return;
-    currentFolderId = segment.targetFolderId;
-    currentPath = segment.targetPath;
     uploadMessage = "";
-    await loadCurrentDirectory();
+    await sessionStore.actions.goToPath(
+      segment.targetFolderId,
+      segment.targetPath,
+      connectionDetails(),
+    );
   }
 
   async function goToRootView() {
@@ -1441,13 +1410,7 @@
   }
 
   async function loadCurrentDirectory() {
-    const fs = remoteFs;
-    if (!fs || !currentFolderId) return;
-    if (folderIsLocked(currentFolderId)) {
-      entries = [];
-      isLoadingDirectory = false;
-      return;
-    }
+    if (!remoteFs || !currentFolderId) return;
     error = null;
     const targetFolderId = currentFolderId;
     const targetPath = normalizePath(currentPath);
@@ -1456,43 +1419,18 @@
       "folder.load.start",
       `Loading folder ${targetFolderId}:${targetPath || "/"}`,
     );
-    const requestSeq = ++directoryLoadSeq;
-    isLoadingDirectory = true;
     try {
-      await waitForFolderIndexToArrive(targetFolderId);
-      if (requestSeq !== directoryLoadSeq || remoteFs !== fs) return;
-      let nextEntries = await fs.readDir(
-        targetFolderId,
-        targetPath,
-      );
-      if (
-        nextEntries.length === 0 &&
-        folderState(targetFolderId)?.encrypted &&
-        !folderIsLocked(targetFolderId)
-      ) {
-        const deadline = Date.now() + 4000;
-        while (Date.now() < deadline && nextEntries.length === 0) {
-          await sleep(200);
-          if (requestSeq !== directoryLoadSeq || remoteFs !== fs) return;
-          nextEntries = await fs.readDir(
-            targetFolderId,
-            targetPath,
-          );
-        }
-      }
-      if (requestSeq !== directoryLoadSeq) return;
-      entries = nextEntries;
-      const entryPaths = nextEntries.map((entry: FileEntry) => entry.path);
+      await sessionStore.actions.reloadCurrentDirectory(connectionDetails());
+      const entryPaths = entries.map((entry: FileEntry) => entry.path);
       void refreshCachedStatuses(targetFolderId, entryPaths);
       currentFolderVersionKey = folderVersionKey(targetFolderId);
       pushSessionLog(
         "info",
         "folder.load.result",
-        `Loaded ${nextEntries.length} entries from ${targetFolderId}:${targetPath || "/"}`,
+        `Loaded ${entries.length} entries from ${targetFolderId}:${targetPath || "/"}`,
       );
       lastUpdatedAt = new Date().toLocaleTimeString();
     } catch (rawError: unknown) {
-      if (requestSeq !== directoryLoadSeq) return;
       const message =
         rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
@@ -1500,11 +1438,7 @@
         folderId: targetFolderId,
         path: targetPath,
       });
-    } finally {
-      if (requestSeq === directoryLoadSeq) {
-        isLoadingDirectory = false;
-      }
-    }
+    } finally {}
   }
 
   async function refreshOverview() {
@@ -1516,23 +1450,22 @@
       isLoadingDirectory
     )
       return;
-    isRefreshing = true;
     try {
-      const overview = await client.connectAndGetOverview(connectionDetails());
-      applyOverviewSnapshot(overview);
-      void refreshFolderRootCachedStatuses(overview.folders.map((folder) => folder.id));
+      await sessionStore.actions.refreshOverview(connectionDetails());
+      const liveState = sessionStore.getState();
+      void refreshFolderRootCachedStatuses(liveState.folders.map((folder) => folder.id));
       const sourceDeviceId = normalizeDeviceId(
-        overview.device?.id ?? connection.remoteId,
+        liveState.remoteDevice?.id ?? connection.remoteId,
       );
-      syncConnectedDeviceSavedName(sourceDeviceId, overview.device?.deviceName);
+      syncConnectedDeviceSavedName(sourceDeviceId, liveState.remoteDevice?.deviceName);
       const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
       applyAutoAcceptForAdvertisedDevices(
-        overview.folders,
+        liveState.folders,
         sourceDeviceId,
         sourceIsIntroducer,
       );
       applyAutoAcceptForAdvertisedFolders(
-        overview.folders,
+        liveState.folders,
         sourceDeviceId,
         sourceIsIntroducer,
       );
@@ -1559,9 +1492,7 @@
         rawError instanceof Error ? rawError.message : String(rawError);
       error = message;
       reportUiError("refresh_overview.failed", rawError, connectionDetails());
-    } finally {
-      isRefreshing = false;
-    }
+    } finally {}
   }
 
   async function refreshActiveView() {

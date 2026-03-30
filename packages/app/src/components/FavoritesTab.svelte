@@ -1,7 +1,7 @@
 <script lang="ts">
   import Star from "lucide-svelte/icons/star";
+  import FileSystemListItem from "./FileSystemListItem.svelte";
   import Panel from "./Panel.svelte";
-  import ListRow from "./ListRow.svelte";
 
   interface Props {
     app: any;
@@ -51,15 +51,12 @@
       <li class="empty">No favorites yet. Tap a star on folders/files to add them.</li>
     {:else}
       {#each app.favorites.items as favorite (favorite.key)}
-        <ListRow>
-          <button
-            class="item-title"
-            onclick={() => onOpenFavorite(favorite)}
-            disabled={!app.session.isConnected}
-          >
-            {favorite.name}
-          </button>
-          <div class="item-meta">{favorite.folderId}:{favorite.path || "/"}</div>
+        <FileSystemListItem
+          title={favorite.name}
+          onTitleClick={() => onOpenFavorite(favorite)}
+          titleDisabled={!app.session.isConnected}
+          metaLines={[`${favorite.folderId}:${favorite.path || "/"}`]}
+        >
           <svelte:fragment slot="actions">
             {#if favorite.kind === "file"}
               {#if app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`)}
@@ -98,7 +95,7 @@
               <Star size={16} />
             </button>
           </svelte:fragment>
-        </ListRow>
+        </FileSystemListItem>
       {/each}
     {/if}
   </ul>
@@ -119,12 +116,13 @@
         <li class="empty">No downloaded files in local cache yet.</li>
       {:else}
         {#each app.favorites.downloadedFiles as file (file.key)}
-          <ListRow>
-            <div class="item-title">{file.name}</div>
-            <div class="item-meta">{file.folderId}:{file.path}</div>
-            <div class="item-meta">
-              {formatBytes(file.sizeBytes)} | Cached {formatModified(file.cachedAtMs)}
-            </div>
+          <FileSystemListItem
+            title={file.name}
+            metaLines={[
+              `${file.folderId}:${file.path}`,
+              `${formatBytes(file.sizeBytes)} | Cached ${formatModified(file.cachedAtMs)}`,
+            ]}
+          >
             <svelte:fragment slot="actions">
               <button
                 class="ghost"
@@ -148,7 +146,7 @@
                 Drop
               </button>
             </svelte:fragment>
-          </ListRow>
+          </FileSystemListItem>
         {/each}
       {/if}
     </ul>

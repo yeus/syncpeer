@@ -1,5 +1,6 @@
 <script lang="ts">
   import Trash2 from "lucide-svelte/icons/trash-2";
+  import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
@@ -355,15 +356,17 @@
       <li class="empty">No introduced devices pending from the current introducer peer.</li>
     {:else}
       {#each advertisedDevices as device (device.id)}
-        <ListRow>
-          <div class="item-title-row">
-            <div class="item-title">{device.name}</div>
-            <StatusChip tone={device.accepted ? "online" : "offline"} small>
-              {device.accepted ? "accepted" : "non-accepted"}
-            </StatusChip>
-          </div>
-          <div class="item-meta">{device.id}</div>
-          <div class="item-meta">Seen in folders: {device.sourceFolderIds.join(", ")}</div>
+        <DeviceListItem
+          title={device.name}
+          deviceId={device.id}
+          metaLines={[`Seen in folders: ${device.sourceFolderIds.join(", ")}`]}
+          badges={[
+            {
+              label: device.accepted ? "accepted" : "non-accepted",
+              tone: device.accepted ? "online" : "offline",
+            },
+          ]}
+        >
           <svelte:fragment slot="actions">
             {#if device.accepted}
               <button class="ghost" onclick={() => onUseSavedDevice(device.id)}>Use</button>
@@ -373,7 +376,7 @@
               </button>
             {/if}
           </svelte:fragment>
-        </ListRow>
+        </DeviceListItem>
       {/each}
     {/if}
   </ul>
@@ -420,22 +423,24 @@
       <li class="empty">No saved devices yet. Add one from Connection Settings.</li>
     {:else}
       {#each app.devices.savedDevices as device (device.id)}
-        <ListRow>
-          <div class="item-title-row">
-            <button class="item-title" onclick={() => onUseSavedDevice(device.id)}>{device.name}</button>
-            {#if device.isIntroducer}
-              <StatusChip small>introducer</StatusChip>
-            {/if}
-            {#if isSavedDeviceConnected(device.id)}
-              <StatusChip tone="online" small>online</StatusChip>
-            {/if}
-            {#if isSavedDeviceAwaitingRemoteApproval(device.id)}
-              <StatusChip tone="offline" small title="This peer may still need to approve your device on their Syncthing side.">
-                not approved yet
-              </StatusChip>
-            {/if}
-          </div>
-          <div class="item-meta">{device.id}</div>
+        <DeviceListItem
+          title={device.name}
+          deviceId={device.id}
+          onTitleClick={() => onUseSavedDevice(device.id)}
+          badges={[
+            ...(device.isIntroducer ? [{ label: "introducer" }] : []),
+            ...(isSavedDeviceConnected(device.id) ? [{ label: "online", tone: "online" as const }] : []),
+            ...(isSavedDeviceAwaitingRemoteApproval(device.id)
+              ? [
+                  {
+                    label: "not approved yet",
+                    tone: "offline" as const,
+                    title: "This peer may still need to approve your device on their Syncthing side.",
+                  },
+                ]
+              : []),
+          ]}
+        >
           <svelte:fragment slot="actions">
             <button
               class="primary"
@@ -458,7 +463,7 @@
               <Trash2 size={16} />
             </button>
           </svelte:fragment>
-        </ListRow>
+        </DeviceListItem>
       {/each}
     {/if}
   </ul>
@@ -469,21 +474,17 @@
     {#if !app.session.remoteDevice}
       <li class="empty">No remote device metadata yet. Connect to a saved device.</li>
     {:else}
-      <ListRow>
-        <div class="item-title" title={app.session.remoteDevice.deviceName}>
-          {app.session.remoteDevice.deviceName}
-        </div>
-        <div class="item-meta">{app.session.remoteDevice.id}</div>
-        <div class="item-meta">
-          {app.session.remoteDevice.clientName}
-          {app.session.remoteDevice.clientVersion}
-        </div>
-        {#if app.session.connectionPath}
-          <div class="item-meta">
-            Connected via {app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}:
-            {app.session.connectionPath}
-          </div>
-        {/if}
+      <DeviceListItem
+        title={app.session.remoteDevice.deviceName}
+        titleTooltip={app.session.remoteDevice.deviceName}
+        deviceId={app.session.remoteDevice.id}
+        metaLines={[
+          `${app.session.remoteDevice.clientName}${app.session.remoteDevice.clientVersion}`,
+          app.session.connectionPath
+            ? `Connected via ${app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}: ${app.session.connectionPath}`
+            : "",
+        ]}
+      >
         <svelte:fragment slot="actions">
           <button
             class="ghost"
@@ -493,7 +494,7 @@
             Refresh
           </button>
         </svelte:fragment>
-      </ListRow>
+      </DeviceListItem>
     {/if}
   </ul>
 </Panel>

@@ -57,6 +57,12 @@ const canonicalComparableDeviceId = (value: string): string => {
 export const normalizeDeviceId = (value: string): string =>
   canonicalComparableDeviceId(value);
 
+export const sameDeviceId = (left: string, right: string): boolean => {
+  const normalizedLeft = normalizeDeviceId(left);
+  if (!normalizedLeft) return false;
+  return normalizedLeft === normalizeDeviceId(right);
+};
+
 const compactDeviceId = (value: string): string => normalizeDeviceId(value);
 
 export const isValidSyncthingDeviceId = (value: string): boolean =>

@@ -4,3089 +4,295 @@
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
-    getDefaultDiscoveryServer,
-    normalizeDiscoveryServer,
-    buildConnectionDetails,
-    fromConnectionSettings,
-    toConnectionSettings,
-    breadcrumbSegments,
-    cachedFileKey,
-    collectAdvertisedDevices,
-    collectAdvertisedFolders,
-    favoriteKey,
-    folderDisplayName,
-    formatEta,
-    formatRate,
-    isValidSyncthingDeviceId,
-    normalizeDeviceId,
-    normalizeFolderPasswords,
-    normalizePath,
-    normalizeSavedDevices,
-    normalizeSyncApprovedIntroducedFolderKeys,
-    resolveDirectoryPath,
-    sleep,
-    syncApprovedFolderKey,
-    type BreadcrumbSegment,
-    type CachedFileRecord,
-    type ConnectOptions,
-    type DiscoveryMode,
-    type RemoteFsLike,
-    type SessionState,
-    type SavedDeviceLike,
-    type StoredConnectionSettingsLike,
-    type UiLogEntry,
-    type FileEntry,
-    type FolderInfo,
-    type FolderSyncState,
-    type RemoteDeviceInfo,
   } from "@syncpeer/core/browser";
-  import {
-    reportUiError,
-    createTauriAdapters,
-  } from "./lib/tauriAdapters.js";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
+  import DeviceTab from "./components/DeviceTab.svelte";
+  import FavoritesTab from "./components/FavoritesTab.svelte";
+  import FoldersTab from "./components/FoldersTab.svelte";
+  import { createTauriAdapters } from "./lib/tauriAdapters.js";
   import {
-    runFolderContentDiagnostics,
-    type FolderDiagnosticsReport,
-  } from "./lib/folderDiagnostics.ts";
+    createAppActions,
+    formatBytes,
+    formatModified,
+    rootFolderEntries,
+  } from "./app/actions.ts";
   import {
-    readDirWithFrontendRetryFlow,
-    waitForFolderIndexToArriveFlow,
-    waitForFoldersToPopulateFlow,
-  } from "./lib/folderFlow.ts";
-  import {
-    buildDiagnosticsRegistry,
-    runDiagnosticsTests,
-    type TaskyonTestFn,
-  } from "../../shared/modules/diagnosticsRunner.ts";
-  import {
-    Download,
-    ExternalLink,
-    FolderOpen,
-    KeyRound,
-    RefreshCw,
-    Settings,
-    Star,
-    StarOff,
-    Trash2,
-    Unlock,
-  } from "lucide-svelte";
+    activeFolderPasswords,
+    advertisedDevices,
+    advertisedFolders,
+    applySessionState,
+    connectionModeLabel,
+    currentSourceIsIntroducer,
+    downloadButtonLabel,
+    favoriteKeys,
+    folderIsLocked,
+    folderLockLabel,
+    folderState,
+    isFolderPasswordInputVisible,
+    isSavedDeviceAwaitingRemoteApproval,
+    isSavedDeviceConnected,
+    persistState,
+    pushClientLog,
+    pushSessionLog,
+    visibleBreadcrumbs,
+    createInitialState,
+  } from "./app/state.ts";
+  import FolderOpen from "lucide-svelte/icons/folder-open";
+  import Settings from "lucide-svelte/icons/settings";
+  import Star from "lucide-svelte/icons/star";
 
-  type Tab = "favorites" | "folders" | "devices";
-
-  interface RootFolderEntry {
-    type: "root-folder";
-    id: string;
-    name: string;
-    readOnly: boolean;
-  }
-
-  interface FavoriteItem {
-    key: string;
-    folderId: string;
-    path: string;
-    name: string;
-    kind: "folder" | "file";
-  }
-
-  type StoredConnectionSettings = StoredConnectionSettingsLike;
-  type SavedDevice = SavedDeviceLike;
-
-  interface PersistedAppState {
-    activeTab: Tab;
-    selectedSavedDeviceId: string;
-    connection: StoredConnectionSettings;
-    savedDevices: SavedDevice[];
-    syncApprovedIntroducedFolderKeys?: string[];
-    acceptedIntroducedFolderKeys?: string[];
-    folderPasswords?: Record<string, string>;
-    offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
-  }
-
-  interface OfflineFolderSnapshot {
-    deviceId: string;
-    remoteDevice: RemoteDeviceInfo | null;
-    folders: FolderInfo[];
-    folderSyncStates: FolderSyncState[];
-    connectedVia: string;
-    transportKind: "direct-tcp" | "relay" | "";
-    lastSeenAtMs: number;
-  }
-
-  interface SessionLogItem {
-    id: string;
-    timestampMs: number;
-    level: "info" | "warning" | "error";
-    event: string;
-    message: string;
-    details?: unknown;
-  }
-
-  interface AdvertisedDeviceItem {
-    id: string;
-    name: string;
-    sourceFolderIds: string[];
-    accepted: boolean;
-  }
-
-  interface AdvertisedFolderItem {
-    key: string;
-    folderId: string;
-    label: string;
-    sourceDeviceId: string;
-    syncApproved: boolean;
-  }
-
-  const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
-  const REFRESH_MS = 3000;
-  const SESSION_LOG_LIMIT = 2000;
-  const MAX_VISIBLE_CRUMBS = 4;
-  const FOLDER_PASSWORD_SCOPE_SEPARATOR = ":";
-
-  const parseJson = <T,>(raw: string | null): T | null => {
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw) as T;
-    } catch {
-      return null;
-    }
-  };
-
-  const loadPersistedAppState = (): PersistedAppState | null => {
-    if (typeof window === "undefined") return null;
-    return parseJson<PersistedAppState>(
-      window.localStorage.getItem(APP_STATE_STORAGE_KEY),
-    );
-  };
-
-  const persistAppState = (state: PersistedAppState): void => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(
-      APP_STATE_STORAGE_KEY,
-      JSON.stringify(state),
-    );
-  };
-
-  const isScopedFolderPasswordKey = (value: string): boolean => {
-    const separatorIndex = value.indexOf(FOLDER_PASSWORD_SCOPE_SEPARATOR);
-    if (separatorIndex <= 0) return false;
-    const possibleDeviceId = normalizeDeviceId(value.slice(0, separatorIndex));
-    if (!possibleDeviceId) return false;
-    const scopedFolderId = value
-      .slice(separatorIndex + FOLDER_PASSWORD_SCOPE_SEPARATOR.length)
-      .trim();
-    return scopedFolderId !== "";
-  };
-
-  const folderPasswordScopedKey = (
-    sourceDeviceId: string,
-    folderId: string,
-  ): string => {
-    const normalizedFolderId = folderId.trim();
-    if (!normalizedFolderId) return "";
-    const normalizedDeviceId = normalizeDeviceId(sourceDeviceId);
-    if (!normalizedDeviceId) return normalizedFolderId;
-    return `${normalizedDeviceId}${FOLDER_PASSWORD_SCOPE_SEPARATOR}${normalizedFolderId}`;
-  };
-
-  const resolveFolderPasswordsForDevice = (
-    passwordStore: Record<string, string>,
-    sourceDeviceId: string,
-  ): Record<string, string> => {
-    const normalizedDeviceId = normalizeDeviceId(sourceDeviceId);
-    const scopedPrefix =
-      normalizedDeviceId === ""
-        ? ""
-        : `${normalizedDeviceId}${FOLDER_PASSWORD_SCOPE_SEPARATOR}`;
-    const resolved: Record<string, string> = {};
-
-    if (scopedPrefix !== "") {
-      for (const [storedKey, storedPassword] of Object.entries(passwordStore)) {
-        if (!storedKey.startsWith(scopedPrefix)) continue;
-        const folderId = storedKey.slice(scopedPrefix.length).trim();
-        if (!folderId) continue;
-        resolved[folderId] = storedPassword;
-      }
-    }
-
-    // Backward compatibility with old non-scoped storage.
-    for (const [storedKey, storedPassword] of Object.entries(passwordStore)) {
-      const folderId = storedKey.trim();
-      if (!folderId || isScopedFolderPasswordKey(folderId)) continue;
-      if (!(folderId in resolved)) {
-        resolved[folderId] = storedPassword;
-      }
-    }
-
-    return resolved;
-  };
-
-  const folderState = (folderId: string): FolderInfo | undefined =>
-    folders.find((folder) => folder.id === folderId);
-    
-  const folderIsLocked = (folderId: string): boolean => {
-    const folder = folderState(folderId);
-    return !!folder?.encrypted && !!folder?.needsPassword;
-  };
-  const folderLockLabel = (folderId: string): string => {
-    const folder = folderState(folderId);
-    if (!folder?.encrypted) return "";
-    if (folder.passwordError) return "password error";
-    return folder.needsPassword ? "locked" : "unlocked";
-  };
-
-  const persistedState = loadPersistedAppState();
-  const initialSettings = fromConnectionSettings(
-    persistedState?.connection ?? null,
-  );
-
-  let activeTab = $state<Tab>(
-    persistedState?.activeTab === "devices" ||
-      persistedState?.activeTab === "folders"
-      ? persistedState.activeTab
-      : "favorites",
-  );
-  let currentPage = $state<"main" | "diagnostics">("main");
-
-  let connection = $state<StoredConnectionSettings>({
-    host: initialSettings.host,
-    port: initialSettings.port,
-    cert: initialSettings.cert,
-    key: initialSettings.key,
-    remoteId: initialSettings.remoteId,
-    deviceName: initialSettings.deviceName,
-    timeoutMs: initialSettings.timeoutMs,
-    discoveryMode: initialSettings.discoveryMode,
-    discoveryServer: initialSettings.discoveryServer,
-    enableRelayFallback: initialSettings.enableRelayFallback,
-    autoAcceptNewDevices: initialSettings.autoAcceptNewDevices,
-    autoAcceptIntroducedFolders: initialSettings.autoAcceptIntroducedFolders,
-  });
-
-  let remoteFs = $state<RemoteFsLike | null>(null);
-  let isConnected = $state(false);
-  let isConnecting = $state(false);
-  let isRefreshing = $state(false);
-  let isLoadingDirectory = $state(false);
-  let isDownloading = $state(false);
-  let activeDownloadKey = $state("");
-  let activeDownloadText = $state("");
-  let isOpeningCachedFile = $state(false);
-  let isRemovingCachedFile = $state(false);
-  let isClearingCache = $state(false);
-  let isLoadingDownloadedFiles = $state(false);
-  let showDownloadedFiles = $state(false);
-  let isSettingsExpanded = $state(false);
-  let uploadMessage = $state("");
-  let lastUpdatedAt = $state("");
-  let activeConnectDeviceId = $state("");
-
-  let folders = $state<FolderInfo[]>([]);
-  let entries = $state<FileEntry[]>([]);
-  let remoteDevice = $state<RemoteDeviceInfo | null>(null);
-  let folderSyncStates = $state<FolderSyncState[]>([]);
-  let currentFolderVersionKey = $state("");
-  let offlineFolderSnapshots = $state<Record<string, OfflineFolderSnapshot>>(
-    persistedState?.offlineFolderSnapshots ?? {},
-  );
-
-  let currentFolderId = $state("");
-  let currentPath = $state("");
-  let directoryLoadSeq = $state(0);
-
-  const initialSavedDevices = normalizeSavedDevices(persistedState?.savedDevices);
-  let favorites = $state<FavoriteItem[]>([]);
-  let savedDevices = $state<SavedDevice[]>(initialSavedDevices);
-  let syncApprovedIntroducedFolderKeys = $state<Set<string>>(normalizeSyncApprovedIntroducedFolderKeys(
-    persistedState?.syncApprovedIntroducedFolderKeys ??
-      persistedState?.acceptedIntroducedFolderKeys,
-  ));
-  let selectedSavedDeviceId = $state(
-    normalizeDeviceId(persistedState?.selectedSavedDeviceId || initialSavedDevices[0]?.id || ""),
-  );
-  const initialFolderPasswords = normalizeFolderPasswords(
-    persistedState?.folderPasswords,
-  );
-  let folderPasswords = $state(initialFolderPasswords);
-  let folderPasswordDrafts = $state<Record<string, string>>({
-    ...initialFolderPasswords,
-  });
-  let folderPasswordInputVisible = $state<Record<string, boolean>>({});
-  const activeFolderPasswordScopeDeviceId = (): string =>
-    normalizeDeviceId(remoteDevice?.id ?? connection.remoteId ?? selectedSavedDeviceId);
-  let activeFolderPasswords = $derived(resolveFolderPasswordsForDevice(
-    folderPasswords,
-    activeFolderPasswordScopeDeviceId(),
-  ));
-  let newSavedDeviceId = $state("");
-  let cachedFileKeys = $state(new Set<string>());
-  let downloadedFiles = $state<CachedFileRecord[]>([]);
-  let newSavedDeviceIsIntroducer = $state(false);
-  let newSavedDeviceCustomName = $state("");
-
-  let connectionModeLabel = $state("");
-  let connectionPath = $state("");
-  let connectionTransport = $state<"direct-tcp" | "relay" | "">("");
-  let recentError = $state<string | null>(null);
-  let connectedSourceDeviceId = $state("");
-  let hasNonEmptyOverviewInSession = $state(false);
-  let sessionLogs = $state<SessionLogItem[]>([]);
-  let isLogPanelExpanded = $state(false);
-  let lastLoggedError = $state("");
-  let currentDeviceId = $state("");
-  let isLoadingCurrentDeviceId = $state(false);
-  let isRegeneratingDeviceId = $state(false);
-  let isDeviceBackupExpanded = $state(false);
-  let showRestoreFromBackup = $state(false);
-  let deviceIdentityNotice = $state("");
-  let identityRecoverySecret = $state("");
-  let isExportingIdentityRecovery = $state(false);
-  let isRestoringIdentityRecovery = $state(false);
-  let remoteApprovalPendingIds = $state<Set<string>>(new Set());
-  let pendingApprovalPromptDeviceId = $state("");
-
-  let error = $state<string | null>(null);
-  let nextSessionLogId = $state(1);
-
-  const pushSessionLog = (
-    level: "info" | "warning" | "error",
-    event: string,
-    message: string,
-    details?: unknown,
-  ) => {
-    const entry: SessionLogItem = {
-      id: `${Date.now()}-${nextSessionLogId}`,
-      timestampMs: Date.now(),
-      level,
-      event,
-      message,
-      details,
-    };
-    nextSessionLogId += 1;
-    sessionLogs = [entry, ...sessionLogs].slice(0, SESSION_LOG_LIMIT);
-  };
-
-  const classifyUiLogLevel = (
-    entry: UiLogEntry,
-    details: Record<string, unknown> | undefined,
-  ): "info" | "warning" | "error" => {
-    if (
-      entry.event === "tauri.invoke.error" &&
-      isConnecting &&
-      (details?.command === "syncpeer_tls_open" ||
-        details?.command === "syncpeer_relay_open")
-    ) {
-      return "warning";
-    }
-    if (
-      entry.event === "core.discovery.candidate.failed" ||
-      entry.event === "core.discovery.relay.failed"
-    ) {
-      return "warning";
-    }
-    return entry.level;
-  };
-
-  const pushClientLog = (entry: UiLogEntry) => {
-    const details =
-      entry.details !== undefined &&
-      entry.details !== null &&
-      typeof entry.details === "object"
-        ? (entry.details as Record<string, unknown>)
-        : undefined;
-    const level = classifyUiLogLevel(entry, details);
-    const messageCandidate = details?.message;
-    const message =
-      typeof messageCandidate === "string" && messageCandidate.trim() !== ""
-        ? messageCandidate
-        : entry.event;
-    pushSessionLog(level, entry.event, message, entry.details);
-  };
-
-  const setError = (event: string, rawError: unknown, context?: unknown) => {
-    const message =
-      rawError instanceof Error ? rawError.message : String(rawError);
-    error = message;
-    pushSessionLog("error", event, message, context);
-  };
-
-  const shouldHintRemoteApprovalPending = (message: string): boolean => {
-    const normalized = message.toLowerCase();
-    const connectionClosedCount = (normalized.match(/connection closed/g) ?? [])
-      .length;
-    return (
-      normalized.includes("may be waiting for you to accept this device") ||
-      normalized.includes("remote peer rejected this device") ||
-      normalized.includes("waiting for approval of this client") ||
-      normalized.includes("unknown device") ||
-      normalized.includes("not configured") ||
-      normalized.includes("not in config") ||
-      (normalized.includes("could not connect using discovered candidates") &&
-        connectionClosedCount >= 2)
-    );
-  };
-
-  const setRemoteApprovalPending = (
-    deviceId: string,
-    pending: boolean,
-  ): void => {
-    const normalized = normalizeDeviceId(deviceId);
-    if (!normalized) return;
-    const next = new Set(remoteApprovalPendingIds);
-    if (pending) {
-      next.add(normalized);
-    } else {
-      next.delete(normalized);
-    }
-    remoteApprovalPendingIds = next;
-  };
-
-  const isSavedDeviceAwaitingRemoteApproval = (deviceId: string): boolean =>
-    remoteApprovalPendingIds.has(normalizeDeviceId(deviceId));
+  let app = $state(createInitialState());
 
   const { hostAdapter, platformAdapter } = createTauriAdapters({
-    onLog: pushClientLog,
+    onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
     hostAdapter,
     platformAdapter,
-    onLog: pushClientLog,
+    onLog: (entry) => pushClientLog(app, entry),
   });
   const sessionStore = createSyncpeerSessionStore({
     transport: client,
     onTrace: (event) => {
-      pushSessionLog(event.level, event.event, event.message, event.details);
+      pushSessionLog(app, event.level, event.event, event.message, event.details);
     },
   });
+  const actions = createAppActions({ state: app, client, sessionStore });
 
-  const applySessionState = (next: SessionState): void => {
-    remoteFs = next.remoteFs;
-    isConnected = next.phase === "connected" || next.phase === "refreshing";
-    isConnecting = next.pending.connecting;
-    isRefreshing = next.pending.refreshingOverview;
-    isLoadingDirectory = next.pending.loadingDirectory;
-    folders = next.folders;
-    folderSyncStates = next.folderSyncStates;
-    currentFolderId = next.currentFolderId;
-    currentPath = next.currentPath;
-    entries = next.entries;
-    currentFolderVersionKey = next.currentFolderVersionKey;
-    remoteDevice = next.remoteDevice;
-    connectionPath = next.connectionPath;
-    connectionTransport = next.connectionTransport;
-    if (next.lastError) {
-      error = next.lastError;
-      recentError = next.lastError;
+  const unsubscribe = sessionStore.subscribe((next) => {
+    applySessionState(app, next);
+  });
+
+  let activePasswords = $derived(activeFolderPasswords(app));
+  let currentAdvertisedDevices = $derived(advertisedDevices(app));
+  let currentAdvertisedFolders = $derived(advertisedFolders(app));
+  let currentFavoriteKeys = $derived(favoriteKeys(app));
+  let currentBreadcrumbs = $derived(visibleBreadcrumbs(app));
+  let currentRootFolders = $derived(rootFolderEntries(app));
+  let currentConnectionModeLabel = $derived(connectionModeLabel(app));
+
+  $effect(() => {
+    persistState(app);
+  });
+
+  $effect(() => {
+    if (
+      app.devices.savedDevices.length > 0 &&
+      !app.devices.savedDevices.some(
+        (device) => device.id === app.devices.selectedSavedDeviceId,
+      )
+    ) {
+      app.devices.selectedSavedDeviceId = app.devices.savedDevices[0].id;
+    } else if (app.devices.savedDevices.length === 0) {
+      app.devices.selectedSavedDeviceId = "";
     }
-  };
-  const unsubscribeSessionStore = sessionStore.subscribe(applySessionState);
+  });
 
-  const refreshTimer = setInterval(() => {
-    void refreshActiveView();
-  }, REFRESH_MS);
+  $effect(() => {
+    if (
+      app.connection.discoveryMode === "global" &&
+      app.connection.host === "127.0.0.1"
+    ) {
+      app.connection.host = "";
+    }
+  });
 
-  onDestroy(() => {
-    clearInterval(refreshTimer);
-    unsubscribeSessionStore();
-    void client.disconnect?.();
+  $effect(() => {
+    void sessionStore.actions.setFolderPasswords(activePasswords);
+  });
+
+  $effect(() => {
+    if (app.ui.recentError && app.ui.recentError !== app.ui.lastLoggedError) {
+      app.ui.lastLoggedError = app.ui.recentError;
+      pushSessionLog(app, "error", "ui.error", app.ui.recentError);
+    }
   });
 
   onMount(() => {
-    void hydratePersistedState();
-    void refreshCurrentDeviceId();
-    restoreOfflineFolderSnapshot(
-      normalizeDeviceId(connection.remoteId || selectedSavedDeviceId),
-      "startup",
-    );
+    void actions.hydrate();
+    void actions.refreshCurrentDeviceId();
+    actions.restoreOfflineSnapshot(undefined, "startup");
   });
 
-  const connectionDetails = (): ConnectOptions =>
-    buildConnectionDetails(connection, activeFolderPasswords);
+  const refreshTimer = setInterval(() => {
+    void actions.refreshActiveView();
+  }, 3000);
 
-  const activeOrSelectedDeviceId = (): string =>
-    normalizeDeviceId(
-      remoteDevice?.id ?? connection.remoteId ?? selectedSavedDeviceId,
-    );
-
-  const saveOfflineFolderSnapshot = (
-    sourceDeviceId: string,
-    snapshot: {
-      folders: FolderInfo[];
-      device: RemoteDeviceInfo | null;
-      folderSyncStates: FolderSyncState[];
-      connectedVia: string;
-      transportKind: "direct-tcp" | "relay";
-    },
-  ): void => {
-    const normalizedDeviceId = normalizeDeviceId(sourceDeviceId);
-    if (!normalizedDeviceId) return;
-    const nextFolders = Array.isArray(snapshot.folders) ? snapshot.folders : [];
-    const nextFolderSyncStates = Array.isArray(snapshot.folderSyncStates)
-      ? snapshot.folderSyncStates
-      : [];
-    if (nextFolders.length === 0 && nextFolderSyncStates.length === 0) return;
-    offlineFolderSnapshots = {
-      ...offlineFolderSnapshots,
-      [normalizedDeviceId]: {
-        deviceId: normalizedDeviceId,
-        remoteDevice: snapshot.device ?? null,
-        folders: nextFolders,
-        folderSyncStates: nextFolderSyncStates,
-        connectedVia: snapshot.connectedVia,
-        transportKind: snapshot.transportKind,
-        lastSeenAtMs: Date.now(),
-      },
-    };
-  };
-
-  const restoreOfflineFolderSnapshot = (
-    preferredDeviceId?: string,
-    reason = "restore",
-  ): boolean => {
-    const normalizedPreferred = normalizeDeviceId(
-      preferredDeviceId ?? activeOrSelectedDeviceId(),
-    );
-    let snapshot: OfflineFolderSnapshot | undefined;
-    if (normalizedPreferred) {
-      snapshot = offlineFolderSnapshots[normalizedPreferred];
-    }
-    if (!snapshot) {
-      const snapshots = Object.values(offlineFolderSnapshots).sort(
-        (a, b) => b.lastSeenAtMs - a.lastSeenAtMs,
-      );
-      snapshot = snapshots[0];
-    }
-    if (!snapshot) return false;
-    folders = Array.isArray(snapshot.folders) ? snapshot.folders : [];
-    folderSyncStates = Array.isArray(snapshot.folderSyncStates)
-      ? snapshot.folderSyncStates
-      : [];
-    remoteDevice = snapshot.remoteDevice ?? null;
-    connectionPath = snapshot.connectedVia ?? "";
-    connectionTransport = snapshot.transportKind ?? "";
-    pushSessionLog(
-      "info",
-      "offline.snapshot.restored",
-      `Restored offline folder snapshot (${reason}) for ${snapshot.deviceId}.`,
-      {
-        deviceId: snapshot.deviceId,
-        folderCount: folders.length,
-        folderSyncStateCount: folderSyncStates.length,
-        lastSeenAtMs: snapshot.lastSeenAtMs,
-      },
-    );
-    ensureCurrentFolderExists();
-    return true;
-  };
-
-  const clearOfflineFolderState = (): void => {
-    offlineFolderSnapshots = {};
-    if (!isConnected) {
-      folders = [];
-      folderSyncStates = [];
-      remoteDevice = null;
-      connectionPath = "";
-      connectionTransport = "";
-      clearDirectoryView();
-    }
-    pushSessionLog(
-      "info",
-      "offline.snapshot.cleared",
-      "Cleared all persisted offline folder snapshots.",
-    );
-  };
-
-  const clearDirectoryView = (): void => {
-    currentFolderId = "";
-    currentPath = "";
-    entries = [];
-    currentFolderVersionKey = "";
-  };
-
-  const resetConnectionRuntimeState = (): void => {
-    isConnected = false;
-    remoteFs = null;
-    entries = [];
-    activeConnectDeviceId = "";
-    recentError = null;
-    connectedSourceDeviceId = "";
-    hasNonEmptyOverviewInSession = false;
-  };
-
-  const applyOverviewSnapshot = (
-    overview: {
-      folders: FolderInfo[];
-      device: RemoteDeviceInfo | null;
-      folderSyncStates: FolderSyncState[];
-      connectedVia: string;
-      transportKind: "direct-tcp" | "relay";
-    },
-  ): void => {
-    const nextFolders = Array.isArray(overview.folders) ? overview.folders : [];
-    const sourceDeviceId = normalizeDeviceId(
-      overview.device?.id ?? connection.remoteId ?? selectedSavedDeviceId,
-    );
-    pushSessionLog(
-      "info",
-      "overview.advertised.summary",
-      `Overview from ${sourceDeviceId || "unknown"} has ${nextFolders.length} folders.`,
-      {
-        sourceDeviceId,
-        folderIds: nextFolders.map((folder) => folder.id),
-        advertisedDeviceIdsByFolder: nextFolders.map((folder) => ({
-          folderId: folder.id,
-          advertisedDeviceIds: (folder.advertisedDevices ?? []).map((device) =>
-            normalizeDeviceId(device.id),
-          ),
-        })),
-      },
-    );
-    const sameSourceSession =
-      sourceDeviceId !== "" && sourceDeviceId === connectedSourceDeviceId;
-    const shouldPreserveFolders =
-      nextFolders.length === 0 &&
-      folders.length > 0 &&
-      sameSourceSession &&
-      hasNonEmptyOverviewInSession;
-    if (!shouldPreserveFolders) {
-      folders = nextFolders;
-      remoteDevice = overview.device;
-      folderSyncStates = overview.folderSyncStates ?? [];
-      connectionPath = overview.connectedVia;
-      connectionTransport = overview.transportKind;
-      connectedSourceDeviceId = sourceDeviceId;
-      if (nextFolders.length > 0) {
-        hasNonEmptyOverviewInSession = true;
-      }
-      saveOfflineFolderSnapshot(sourceDeviceId, overview);
-      return;
-    }
-    pushSessionLog(
-      "warning",
-      "overview.snapshot.empty_ignored",
-      "Ignoring transient empty overview snapshot to preserve visible folder state.",
-    );
-  };
-
-  const ensureCurrentFolderExists = (): void => {
-    if (!currentFolderId) return;
-    if (folders.length === 0) return;
-    if (!folders.some((folder) => folder.id === currentFolderId)) {
-      clearDirectoryView();
-    }
-  };
-
-  const waitForFoldersToPopulate = async (timeoutMs = 4000): Promise<void> => {
-    await waitForFoldersToPopulateFlow({
-      client,
-      options: connectionDetails(),
-      timeoutMs,
-      pollIntervalMs: 200,
-      isConnected: () => isConnected,
-      getCurrentFolderCount: () => folders.length,
-      applyOverview: (overview) => {
-        applyOverviewSnapshot(overview);
-        ensureCurrentFolderExists();
-      },
-      logger: (entry) => {
-        pushSessionLog(entry.level, entry.event, entry.message, entry.details);
-      },
-    });
-  };
-
-  const waitForFolderIndexToArrive = async (
-    folderId: string,
-    timeoutMs = 3500,
-  ): Promise<boolean> => {
-    const result = await waitForFolderIndexToArriveFlow({
-      client,
-      options: connectionDetails(),
-      folderId,
-      timeoutMs,
-      initialFolderSyncStates: folderSyncStates,
-      isConnected: () => isConnected,
-      onFolderSyncStates: (states) => {
-        folderSyncStates = states;
-      },
-      logger: (entry) => {
-        pushSessionLog(entry.level, entry.event, entry.message, entry.details);
-      },
-    });
-    return result.received;
-  };
-
-  const rootFolderEntries = (): RootFolderEntry[] =>
-    folders
-      .map((folder) => ({
-        type: "root-folder" as const,
-        id: folder.id,
-        name: folderDisplayName(folder),
-        readOnly: folder.readOnly,
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-
-  const folderVersionKey = (folderId: string): string => {
-    const syncState = folderSyncStates.find(
-      (state) => state.folderId === folderId,
-    );
-    if (!syncState) return "";
-    return `${syncState.remoteIndexId}:${syncState.remoteMaxSequence}`;
-  };
-
-  const downloadButtonLabel = (folderId: string, path: string): string => {
-    const keyValue = cachedFileKey(folderId, path);
-    if (keyValue !== activeDownloadKey) return "Download";
-    return activeDownloadText || "Downloading...";
-  };
-  const inferPlatformLabel = (): string => {
-    if (typeof navigator === "undefined") return "device";
-    const uaDataPlatform =
-      (navigator as Navigator & { userAgentData?: { platform?: string } })
-        .userAgentData?.platform ?? "";
-    const platform = `${uaDataPlatform} ${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`.toLowerCase();
-    if (platform.includes("android")) return "android";
-    if (
-      platform.includes("iphone") ||
-      platform.includes("ipad") ||
-      platform.includes("ios")
-    ) {
-      return "ios";
-    }
-    if (platform.includes("mac")) return "mac";
-    if (platform.includes("win")) return "windows";
-    if (platform.includes("linux")) return "linux";
-    return "device";
-  };
-  const suggestedClientName = (): string => {
-    if (typeof window !== "undefined") {
-      const host = window.location.hostname.trim().toLowerCase();
-      if (
-        host &&
-        host !== "localhost" &&
-        host !== "127.0.0.1" &&
-        host !== "tauri.localhost"
-      ) {
-        return `syncpeer-${host}`;
-      }
-    }
-    return `syncpeer-${inferPlatformLabel()}`;
-  };
-  const ensureClientNameBeforeConnect = (): boolean => {
-    const currentName = connection.deviceName.trim();
-    if (currentName !== "" && currentName !== "syncpeer-ui") {
-      connection.deviceName = currentName;
-      return true;
-    }
-    const chosen =
-      typeof window !== "undefined"
-        ? window.prompt(
-            "Name this Syncpeer client (shown to remote devices):",
-            suggestedClientName(),
-          )
-        : suggestedClientName();
-    if (chosen === null) {
-      error = "Connection cancelled. Client name is required.";
-      return false;
-    }
-    const normalized = chosen.trim();
-    if (!normalized) {
-      error = "Client name is required.";
-      return false;
-    }
-    connection.deviceName = normalized;
-    return true;
-  };
-  const isSavedDeviceConnected = (deviceId: string): boolean =>
-    isConnected &&
-    normalizeDeviceId(remoteDevice?.id ?? connection.remoteId) ===
-      normalizeDeviceId(deviceId);
-  const isIntroducerDevice = (deviceId: string): boolean => {
-    const normalized = normalizeDeviceId(deviceId);
-    return savedDevices.some(
-      (device) =>
-        normalizeDeviceId(device.id) === normalized && device.isIntroducer,
-    );
-  };
-  const currentSourceDeviceId = (): string =>
-    normalizeDeviceId(remoteDevice?.id ?? connection.remoteId);
-  const currentSourceIsIntroducer = (): boolean =>
-    isConnected && isIntroducerDevice(currentSourceDeviceId());
-  const temporarySavedDeviceName = (deviceId: string): string => {
-    const normalizedId = normalizeDeviceId(deviceId);
-    if (!normalizedId) return "";
-    return normalizedId.slice(0, 5) || normalizedId;
-  };
-  const suggestedSavedDeviceName = (deviceId: string): string => {
-    const normalizedId = normalizeDeviceId(deviceId);
-    if (!normalizedId) return "";
-    const advertised = advertisedDevices.find(
-      (device) => normalizeDeviceId(device.id) === normalizedId,
-    );
-    if (advertised?.name?.trim()) return advertised.name.trim();
-    const existing = savedDevices.find(
-      (device) => normalizeDeviceId(device.id) === normalizedId,
-    );
-    if (existing?.name?.trim()) return existing.name.trim();
-    return temporarySavedDeviceName(normalizedId);
-  };
-  const upsertSavedDeviceEntry = (
-    deviceId: string,
-    deviceName?: string,
-    options?: { customName?: boolean },
-  ): boolean => {
-    const normalizedId = normalizeDeviceId(deviceId);
-    if (!normalizedId) return false;
-    const displayName =
-      (deviceName ?? "").trim() || temporarySavedDeviceName(normalizedId);
-    const existing = savedDevices.find((device) => device.id === normalizedId);
-    const customName = options?.customName ?? existing?.customName ?? false;
-    if (existing) {
-      savedDevices = savedDevices
-        .map((device) =>
-          device.id === normalizedId
-            ? { ...device, name: displayName, customName }
-            : device,
-        )
-        .sort((a, b) => a.name.localeCompare(b.name));
-    } else {
-      savedDevices = [
-        ...savedDevices,
-        {
-          id: normalizedId,
-          name: displayName,
-          createdAtMs: Date.now(),
-          isIntroducer: false,
-          customName,
-        },
-      ].sort((a, b) => a.name.localeCompare(b.name));
-    }
-    return true;
-  };
-  const syncConnectedDeviceSavedName = (
-    deviceId: string,
-    advertisedDeviceName?: string,
-  ): void => {
-    const normalizedId = normalizeDeviceId(deviceId);
-    const advertisedName = (advertisedDeviceName ?? "").trim();
-    if (!normalizedId || !advertisedName) return;
-    const existing = savedDevices.find(
-      (device) => normalizeDeviceId(device.id) === normalizedId,
-    );
-    if (!existing || existing.customName) return;
-    if (existing.name.trim() === advertisedName) return;
-    upsertSavedDeviceEntry(normalizedId, advertisedName, { customName: false });
-  };
-  const setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean): void => {
-    const normalizedId = normalizeDeviceId(deviceId);
-    savedDevices = savedDevices
-      .map((device) =>
-        normalizeDeviceId(device.id) === normalizedId
-          ? { ...device, isIntroducer }
-          : device,
-      )
-      .sort((a, b) => a.name.localeCompare(b.name));
-  };
-  const applyAutoAcceptForAdvertisedDevices = (
-    availableFolders: FolderInfo[],
-    sourceDeviceId: string,
-    sourceIsIntroducer: boolean,
-  ): void => {
-    if (!connection.autoAcceptNewDevices) return;
-    const nextAdvertised = collectAdvertisedDevices(
-      availableFolders,
-      savedDevices,
-      sourceDeviceId,
-      sourceIsIntroducer,
-    );
-    const pending = nextAdvertised.filter((device) => !device.accepted);
-    if (pending.length === 0) return;
-    for (const device of pending) {
-      if (!isValidSyncthingDeviceId(device.id)) continue;
-      upsertSavedDeviceEntry(device.id, device.name);
-    }
-  };
-  const applyAutoAcceptForAdvertisedFolders = (
-    availableFolders: FolderInfo[],
-    sourceDeviceId: string,
-    sourceIsIntroducer: boolean,
-  ): void => {
-    if (!connection.autoAcceptIntroducedFolders) return;
-    const nextAdvertised = collectAdvertisedFolders(
-      availableFolders,
-      sourceDeviceId,
-      sourceIsIntroducer,
-      syncApprovedIntroducedFolderKeys,
-    );
-    const pending = nextAdvertised.filter((folder) => !folder.syncApproved);
-    if (pending.length === 0) return;
-    const next = new Set(syncApprovedIntroducedFolderKeys);
-    for (const folder of pending) {
-      next.add(folder.key);
-    }
-    syncApprovedIntroducedFolderKeys = next;
-  };
-  const updateFolderPasswordDraft = (folderId: string, password: string): void => {
-    folderPasswordDrafts = {
-      ...folderPasswordDrafts,
-      [folderId]: password,
-    };
-  };
-  const handleFolderPasswordInput = (folderId: string, event: Event): void => {
-    const target = event.currentTarget;
-    updateFolderPasswordDraft(
-      folderId,
-      target instanceof HTMLInputElement ? target.value : "",
-    );
-  };
-  const isFolderPasswordInputVisible = (folderId: string): boolean => {
-    if (folderPasswordInputVisible[folderId]) return true;
-    if (!folderState(folderId)?.encrypted) return false;
-    if (folderIsLocked(folderId)) return true;
-    if (folderState(folderId)?.passwordError) return true;
-    return !activeFolderPasswords[folderId];
-  };
-  const openFolderPasswordInput = (folderId: string): void => {
-    folderPasswordInputVisible = {
-      ...folderPasswordInputVisible,
-      [folderId]: true,
-    };
-  };
-  const hideFolderPasswordInput = (folderId: string): void => {
-    folderPasswordInputVisible = {
-      ...folderPasswordInputVisible,
-      [folderId]: false,
-    };
-  };
-  const saveFolderPassword = async (folderId: string): Promise<void> => {
-    const password = (folderPasswordDrafts[folderId] ?? "").trim();
-    const scopedKey = folderPasswordScopedKey(
-      activeFolderPasswordScopeDeviceId(),
-      folderId,
-    );
-    if (!password) {
-      const next = { ...folderPasswords };
-      delete next[folderId];
-      if (scopedKey) {
-        delete next[scopedKey];
-      }
-      folderPasswords = next;
-      hideFolderPasswordInput(folderId);
-      return;
-    }
-    folderPasswords = {
-      ...folderPasswords,
-      [scopedKey || folderId]: password,
-    };
-    hideFolderPasswordInput(folderId);
-    if (isConnected) {
-      await refreshOverview();
-      if (!folderIsLocked(folderId)) {
-        const fs = remoteFs;
-        try {
-          if (fs) {
-            await fs.readDir(folderId, "");
-          }
-        } catch {
-          // Keep the action resilient; periodic refresh will retry.
-        }
-        if (currentFolderId === folderId) {
-          await loadCurrentDirectory();
-        }
-      }
-    }
-  };
-  const clearFolderPassword = async (folderId: string): Promise<void> => {
-    const scopedKey = folderPasswordScopedKey(
-      activeFolderPasswordScopeDeviceId(),
-      folderId,
-    );
-    const next = { ...folderPasswords };
-    delete next[folderId];
-    if (scopedKey) {
-      delete next[scopedKey];
-    }
-    folderPasswords = next;
-    folderPasswordDrafts = {
-      ...folderPasswordDrafts,
-      [folderId]: "",
-    };
-    openFolderPasswordInput(folderId);
-    if (isConnected) {
-      await refreshOverview();
-    }
-  };
-
-  let favoriteKeys = $derived(new Set(favorites.map((item) => item.key)));
-  let advertisedDevices = $derived(collectAdvertisedDevices(
-    folders,
-    savedDevices,
-    currentSourceDeviceId(),
-    currentSourceIsIntroducer(),
-  ));
-  let advertisedFolders = $derived(collectAdvertisedFolders(
-    folders,
-    currentSourceDeviceId(),
-    currentSourceIsIntroducer(),
-    syncApprovedIntroducedFolderKeys,
-  ));
-  let visibleBreadcrumbs = $derived(breadcrumbSegments(
-    currentFolderId,
-    currentPath,
-    folders,
-    MAX_VISIBLE_CRUMBS,
-  ));
-
-  $effect(() => {
-    persistAppState({
-      activeTab,
-      selectedSavedDeviceId,
-      connection: toConnectionSettings(connection),
-      savedDevices,
-      syncApprovedIntroducedFolderKeys: [...syncApprovedIntroducedFolderKeys].sort(),
-      folderPasswords,
-      offlineFolderSnapshots,
-    });
+  onDestroy(() => {
+    clearInterval(refreshTimer);
+    unsubscribe();
+    void client.disconnect();
   });
-
-  $effect(() => {
-    if (
-      savedDevices.length > 0 &&
-      !savedDevices.some((device) => device.id === selectedSavedDeviceId)
-    ) {
-      selectedSavedDeviceId = savedDevices[0].id;
-    } else if (savedDevices.length === 0) {
-      selectedSavedDeviceId = "";
-    }
-  });
-
-  $effect(() => {
-    if (connection.discoveryMode === "global" && connection.host === "127.0.0.1") {
-      connection.host = "";
-    }
-  });
-
-  $effect(() => {
-    void sessionStore.actions.setFolderPasswords(activeFolderPasswords);
-  });
-
-  $effect(() => {
-    if (error && error !== lastLoggedError) {
-      lastLoggedError = error;
-      pushSessionLog("error", "ui.error", error);
-    }
-  });
-
-  async function hydratePersistedState() {
-    try {
-      favorites = await client.listFavorites();
-      const fileFavoritesByFolder = new Map<string, string[]>();
-      for (const favorite of favorites) {
-        if (favorite.kind !== "file") continue;
-        if (!fileFavoritesByFolder.has(favorite.folderId)) {
-          fileFavoritesByFolder.set(favorite.folderId, []);
-        }
-        fileFavoritesByFolder.get(favorite.folderId)?.push(favorite.path);
-      }
-      for (const [folderId, paths] of fileFavoritesByFolder) {
-        await refreshCachedStatuses(folderId, paths);
-      }
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("hydrate_state.failed", rawError);
-    }
-  }
-
-  async function refreshCachedStatuses(folderId: string, paths: string[]) {
-    if (!folderId || paths.length === 0) return;
-    try {
-      const statuses = await client.getCachedStatuses(
-        folderId,
-        paths.map((item) => normalizePath(item)),
-      );
-      const next = new Set(cachedFileKeys);
-      for (const status of statuses) {
-        const keyValue = cachedFileKey(folderId, status.path);
-        if (status.available) {
-          next.add(keyValue);
-        } else {
-          next.delete(keyValue);
-        }
-      }
-      cachedFileKeys = next;
-    } catch (rawError: unknown) {
-      reportUiError("refresh_cached_statuses.failed", rawError, {
-        folderId,
-        count: paths.length,
-      });
-    }
-  }
-
-  async function refreshFolderRootCachedStatuses(folderIds: string[]) {
-    const uniqueFolderIds = [...new Set(folderIds.map((item) => item.trim()).filter(Boolean))];
-    if (uniqueFolderIds.length === 0) return;
-    try {
-      const responses = await Promise.all(
-        uniqueFolderIds.map(async (folderId) => ({
-          folderId,
-          statuses: await client.getCachedStatuses(folderId, [""]),
-        })),
-      );
-      const next = new Set(cachedFileKeys);
-      for (const response of responses) {
-        const keyValue = cachedFileKey(response.folderId, "");
-        const available = response.statuses[0]?.available ?? false;
-        if (available) {
-          next.add(keyValue);
-        } else {
-          next.delete(keyValue);
-        }
-      }
-      cachedFileKeys = next;
-    } catch (rawError: unknown) {
-      reportUiError("refresh_folder_root_cached_statuses.failed", rawError, {
-        count: uniqueFolderIds.length,
-      });
-    }
-  }
-
-  async function toggleFavorite(
-    folderId: string,
-    path: string,
-    name: string,
-    kind: FavoriteItem["kind"],
-  ): Promise<void> {
-    const keyValue = favoriteKey(folderId, path, kind);
-    const exists = favorites.some((item) => item.key === keyValue);
-    const previous = favorites;
-    if (exists) {
-      favorites = favorites.filter((item) => item.key !== keyValue);
-      try {
-        await client.removeFavorite(keyValue);
-      } catch (rawError: unknown) {
-        favorites = previous;
-        const message =
-          rawError instanceof Error ? rawError.message : String(rawError);
-        error = message;
-        reportUiError("favorite.remove.failed", rawError, { key: keyValue });
-      }
-      return;
-    }
-    favorites = [
-      ...favorites,
-      {
-        key: keyValue,
-        folderId,
-        path: normalizePath(path),
-        name,
-        kind,
-      },
-    ].sort((a, b) => a.name.localeCompare(b.name));
-    try {
-      await client.upsertFavorite({
-        key: keyValue,
-        folderId,
-        path: normalizePath(path),
-        name,
-        kind,
-      });
-      if (kind === "file") {
-        await refreshCachedStatuses(folderId, [path]);
-      }
-    } catch (rawError: unknown) {
-      favorites = previous;
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("favorite.upsert.failed", rawError, { key: keyValue });
-    }
-  }
-
-  const removeFavorite = async (favorite: FavoriteItem): Promise<void> => {
-    const previous = favorites;
-    favorites = favorites.filter((item) => item.key !== favorite.key);
-    try {
-      await client.removeFavorite(favorite.key);
-    } catch (rawError: unknown) {
-      favorites = previous;
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("favorite.remove.failed", rawError, { key: favorite.key });
-    }
-  };
-
-  async function connect(targetDeviceId?: string) {
-    error = null;
-    recentError = null;
-    uploadMessage = "";
-    if (!ensureClientNameBeforeConnect()) {
-      activeConnectDeviceId = "";
-      return;
-    }
-    if (targetDeviceId) {
-      selectedSavedDeviceId = targetDeviceId;
-      connection.remoteId = targetDeviceId;
-      connection.discoveryMode = "global";
-      connection.host = "";
-      activeConnectDeviceId = targetDeviceId;
-    }
-    if (
-      connection.discoveryMode === "global" &&
-      normalizeDeviceId(connection.remoteId) === "" &&
-      selectedSavedDeviceId
-    ) {
-      connection.remoteId = selectedSavedDeviceId;
-    }
-    if (
-      connection.discoveryMode === "global" &&
-      normalizeDeviceId(connection.remoteId) === ""
-    ) {
-      const message =
-        "Global discovery requires a Remote Device ID. Add/select a saved device first.";
-      error = message;
-      recentError = message;
-      activeConnectDeviceId = "";
-      return;
-    }
-    if (
-      connection.discoveryMode === "global" &&
-      !isValidSyncthingDeviceId(connection.remoteId)
-    ) {
-      const message =
-        "Remote Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
-      error = message;
-      recentError = message;
-      activeConnectDeviceId = "";
-      return;
-    }
-    if (connection.discoveryMode === "global") {
-      connection.discoveryServer = normalizeDiscoveryServer(
-        connection.discoveryServer,
-      );
-    }
-    connectionModeLabel =
-      connection.discoveryMode === "global"
-        ? `Global discovery via ${normalizeDiscoveryServer(connection.discoveryServer)}`
-        : `Direct ${connection.host || "127.0.0.1"}:${connection.port}`;
-
-    connection.remoteId = normalizeDeviceId(connection.remoteId);
-    isConnecting = true;
-    const attemptedDeviceId = normalizeDeviceId(
-      targetDeviceId ?? connection.remoteId ?? selectedSavedDeviceId,
-    );
-    await sessionStore.actions.setFolderPasswords(activeFolderPasswords);
-    restoreOfflineFolderSnapshot(attemptedDeviceId, "connect_start");
-    try {
-      const previousPeerId = normalizeDeviceId(remoteDevice?.id ?? "");
-      await sessionStore.actions.connect(connectionDetails());
-      const liveState = sessionStore.getState();
-      void refreshFolderRootCachedStatuses(liveState.folders.map((folder) => folder.id));
-      const sourceDeviceId = normalizeDeviceId(
-        liveState.remoteDevice?.id ?? connection.remoteId,
-      );
-      syncConnectedDeviceSavedName(sourceDeviceId, liveState.remoteDevice?.deviceName);
-      setRemoteApprovalPending(attemptedDeviceId, false);
-      setRemoteApprovalPending(sourceDeviceId, false);
-      if (
-        pendingApprovalPromptDeviceId &&
-        (normalizeDeviceId(pendingApprovalPromptDeviceId) === attemptedDeviceId ||
-          normalizeDeviceId(pendingApprovalPromptDeviceId) === sourceDeviceId)
-      ) {
-        pendingApprovalPromptDeviceId = "";
-      }
-      const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
-      applyAutoAcceptForAdvertisedDevices(
-        liveState.folders,
-        sourceDeviceId,
-        sourceIsIntroducer,
-      );
-      applyAutoAcceptForAdvertisedFolders(
-        liveState.folders,
-        sourceDeviceId,
-        sourceIsIntroducer,
-      );
-      recentError = null;
-      const switchedPeer =
-        previousPeerId !== "" &&
-        sourceDeviceId !== "" &&
-        previousPeerId !== sourceDeviceId;
-      if (switchedPeer) {
-        clearDirectoryView();
-      }
-      ensureCurrentFolderExists();
-      currentFolderVersionKey = "";
-      lastUpdatedAt = new Date().toLocaleTimeString();
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      recentError = message;
-      if (attemptedDeviceId && shouldHintRemoteApprovalPending(message)) {
-        setRemoteApprovalPending(attemptedDeviceId, true);
-        pendingApprovalPromptDeviceId = attemptedDeviceId;
-      }
-      reportUiError("connect.failed", rawError, connectionDetails());
-      resetConnectionRuntimeState();
-      restoreOfflineFolderSnapshot(attemptedDeviceId, "connect_failed");
-    } finally {
-      isConnecting = false;
-      activeConnectDeviceId = "";
-    }
-  }
-
-  async function connectToSavedDevice(deviceId: string) {
-    await connect(deviceId);
-  }
-
-  async function disconnect() {
-    if (isConnecting) return;
-    try {
-      await sessionStore.actions.disconnect();
-    } catch (rawError: unknown) {
-      setError("disconnect.failed", rawError);
-      reportUiError("disconnect.failed", rawError);
-    } finally {
-      resetConnectionRuntimeState();
-      clearDirectoryView();
-      restoreOfflineFolderSnapshot(undefined, "disconnect");
-      error = null;
-    }
-  }
-
-  async function copySessionLogs() {
-    const rendered = sessionLogs
-      .slice()
-      .reverse()
-      .map((item) => {
-        const ts = new Date(item.timestampMs).toISOString();
-        const base = `${ts} [${item.level.toUpperCase()}] ${item.event}: ${item.message}`;
-        if (item.details === undefined) return base;
-        return `${base}\n${JSON.stringify(item.details, null, 2)}`;
-      })
-      .join("\n\n");
-    try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(rendered || "No session logs yet.");
-      } else {
-        throw new Error("Clipboard API unavailable on this device");
-      }
-    } catch (rawError: unknown) {
-      setError("logs.copy.failed", rawError);
-      reportUiError("logs.copy.failed", rawError);
-    }
-  }
-
-  async function openFolderRoot(folderId: string) {
-    if (folderIsLocked(folderId)) return;
-    uploadMessage = "";
-    activeTab = "folders";
-    await sessionStore.actions.openFolder(folderId, connectionDetails());
-    currentFolderVersionKey = "";
-  }
-
-  async function openDirectory(path: string) {
-    if (!currentFolderId) return;
-    const nextPath = resolveDirectoryPath(currentPath, path);
-    uploadMessage = "";
-    await sessionStore.actions.openPath(nextPath, connectionDetails());
-  }
-
-  async function goToBreadcrumb(segment: BreadcrumbSegment) {
-    if (segment.ellipsis) return;
-    uploadMessage = "";
-    await sessionStore.actions.goToPath(
-      segment.targetFolderId,
-      segment.targetPath,
-      connectionDetails(),
-    );
-  }
-
-  async function goToRootView() {
-    clearDirectoryView();
-    uploadMessage = "";
-    await refreshActiveView();
-  }
-
-  async function loadCurrentDirectory() {
-    if (!remoteFs || !currentFolderId) return;
-    error = null;
-    const targetFolderId = currentFolderId;
-    const targetPath = normalizePath(currentPath);
-    pushSessionLog(
-      "info",
-      "folder.load.start",
-      `Loading folder ${targetFolderId}:${targetPath || "/"}`,
-    );
-    try {
-      await sessionStore.actions.reloadCurrentDirectory(connectionDetails());
-      const entryPaths = entries.map((entry: FileEntry) => entry.path);
-      void refreshCachedStatuses(targetFolderId, entryPaths);
-      currentFolderVersionKey = folderVersionKey(targetFolderId);
-      pushSessionLog(
-        "info",
-        "folder.load.result",
-        `Loaded ${entries.length} entries from ${targetFolderId}:${targetPath || "/"}`,
-      );
-      lastUpdatedAt = new Date().toLocaleTimeString();
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("load_current_directory.failed", rawError, {
-        folderId: targetFolderId,
-        path: targetPath,
-      });
-    } finally {}
-  }
-
-  async function refreshOverview() {
-    if (
-      !isConnected ||
-      !remoteFs ||
-      isConnecting ||
-      isRefreshing ||
-      isLoadingDirectory
-    )
-      return;
-    try {
-      await sessionStore.actions.refreshOverview(connectionDetails());
-      const liveState = sessionStore.getState();
-      void refreshFolderRootCachedStatuses(liveState.folders.map((folder) => folder.id));
-      const sourceDeviceId = normalizeDeviceId(
-        liveState.remoteDevice?.id ?? connection.remoteId,
-      );
-      syncConnectedDeviceSavedName(sourceDeviceId, liveState.remoteDevice?.deviceName);
-      const sourceIsIntroducer = isIntroducerDevice(sourceDeviceId);
-      applyAutoAcceptForAdvertisedDevices(
-        liveState.folders,
-        sourceDeviceId,
-        sourceIsIntroducer,
-      );
-      applyAutoAcceptForAdvertisedFolders(
-        liveState.folders,
-        sourceDeviceId,
-        sourceIsIntroducer,
-      );
-      ensureCurrentFolderExists();
-      if (activeTab === "folders" && currentFolderId) {
-        if (folderIsLocked(currentFolderId)) {
-          entries = [];
-          currentFolderVersionKey = "";
-          lastUpdatedAt = new Date().toLocaleTimeString();
-          return;
-        }
-        const nextFolderVersionKey = folderVersionKey(currentFolderId);
-        const shouldReloadDirectory =
-          entries.length === 0 ||
-          !currentFolderVersionKey ||
-          currentFolderVersionKey !== nextFolderVersionKey;
-        if (shouldReloadDirectory) {
-          await loadCurrentDirectory();
-        }
-      }
-      lastUpdatedAt = new Date().toLocaleTimeString();
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("refresh_overview.failed", rawError, connectionDetails());
-    } finally {}
-  }
-
-  async function refreshActiveView() {
-    if (
-      activeTab === "devices" ||
-      activeTab === "folders" ||
-      activeTab === "favorites"
-    ) {
-      await refreshOverview();
-    }
-  }
-
-  function switchTab(tab: Tab) {
-    activeTab = tab;
-    if (tab === "folders" || tab === "favorites") {
-      void refreshActiveView();
-    }
-  }
-
-  function openDiagnosticsPage() {
-    currentPage = "diagnostics";
-  }
-
-  function closeDiagnosticsPage() {
-    currentPage = "main";
-  }
-
-  async function runFolderDiagnosticsTest(): Promise<{
-    summary: {
-      runAtIso: string;
-      allPassed: boolean;
-      passed: number;
-      failed: number;
-    };
-    results: unknown[];
-  }> {
-    const folderDiagnosticsTest: TaskyonTestFn = async () =>
-      runFolderContentDiagnostics({
-        client,
-        options: connectionDetails(),
-        maxPollAttempts: 16,
-        pollIntervalMs: 250,
-      }) as unknown as FolderDiagnosticsReport;
-    folderDiagnosticsTest.description =
-      "End-to-end folder/index/readDir diagnostics";
-    folderDiagnosticsTest.timeoutMs = 90_000;
-
-    const registry = buildDiagnosticsRegistry({
-      builtins: [
-        {
-          testName: "folderContentDiagnostics",
-          func: folderDiagnosticsTest,
-          sourcePath: "packages/app/src/lib/folderDiagnostics.ts",
-        },
-      ],
-      modules: [],
-    });
-
-    const results = await runDiagnosticsTests(registry.tests, {
-      details: true,
-      timeoutMs: 90_000,
-    });
-    const passed = results.filter((result) => result.ok).length;
-    return {
-      summary: {
-        runAtIso: new Date().toISOString(),
-        allPassed: passed === results.length,
-        passed,
-        failed: results.length - passed,
-      },
-      results,
-    };
-  }
-
-  function formatModified(ms: number): string {
-    if (!ms) return "n/a";
-    return new Date(ms).toLocaleString();
-  }
-
-  function formatBytes(size: number): string {
-    if (!Number.isFinite(size) || size < 0) return "n/a";
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    let value = size;
-    let unitIndex = 0;
-    while (value >= 1024 && unitIndex < units.length - 1) {
-      value /= 1024;
-      unitIndex += 1;
-    }
-    const digits = value >= 100 || unitIndex === 0 ? 0 : 1;
-    return `${value.toFixed(digits)} ${units[unitIndex]}`;
-  }
-
-  async function downloadFile(folderId: string, path: string, name: string) {
-    if (!remoteFs || !isConnected || isDownloading) return;
-    isDownloading = true;
-    const startedAt = Date.now();
-    const downloadKey = cachedFileKey(folderId, path);
-    activeDownloadKey = downloadKey;
-    activeDownloadText = "0% • 0 B/s • ETA --";
-    error = null;
-    try {
-      const bytes = await remoteFs.readFileFully(
-        folderId,
-        path,
-        ({ downloadedBytes, totalBytes }) => {
-          const elapsedSeconds = Math.max(
-            (Date.now() - startedAt) / 1000,
-            0.001,
-          );
-          const speed = downloadedBytes / elapsedSeconds;
-          const percent =
-            totalBytes > 0
-              ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100))
-              : 0;
-          const remainingBytes = Math.max(totalBytes - downloadedBytes, 0);
-          const etaSeconds =
-            speed > 0 ? remainingBytes / speed : Number.POSITIVE_INFINITY;
-          activeDownloadText = `${percent}% • ${formatRate(speed)} • ETA ${formatEta(etaSeconds)}`;
-        },
-      );
-      await client.cacheFile(folderId, path, name, bytes);
-      const next = new Set(cachedFileKeys);
-      next.add(cachedFileKey(folderId, path));
-      cachedFileKeys = next;
-      await refreshFolderRootCachedStatuses([folderId]);
-      activeDownloadText = "100% • Done";
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("download_file.failed", rawError, { folderId, path });
-    } finally {
-      isDownloading = false;
-      if (activeDownloadKey === downloadKey) {
-        activeDownloadKey = "";
-        activeDownloadText = "";
-      }
-    }
-  }
-
-  async function openCachedFile(folderId: string, path: string) {
-    if (isOpeningCachedFile) return;
-    isOpeningCachedFile = true;
-    error = null;
-    try {
-      await client.openCachedFile(folderId, path);
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("open_cached_file.failed", rawError, { folderId, path });
-    } finally {
-      isOpeningCachedFile = false;
-    }
-  }
-
-  async function openCachedFileDirectory(folderId: string, path: string) {
-    if (isOpeningCachedFile) return;
-    isOpeningCachedFile = true;
-    error = null;
-    try {
-      await client.openCachedFileDirectory(folderId, path);
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("open_cached_file_directory.failed", rawError, {
-        folderId,
-        path,
-      });
-    } finally {
-      isOpeningCachedFile = false;
-    }
-  }
-
-  async function openCachedDirectory(folderId: string, path: string) {
-    if (isOpeningCachedFile) return;
-    isOpeningCachedFile = true;
-    error = null;
-    try {
-      await client.openCachedDirectory(folderId, path);
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("open_cached_directory.failed", rawError, {
-        folderId,
-        path,
-      });
-    } finally {
-      isOpeningCachedFile = false;
-    }
-  }
-
-  async function clearAllCache() {
-    if (isClearingCache || isRemovingCachedFile) return;
-    isClearingCache = true;
-    error = null;
-    try {
-      await client.clearCache();
-      cachedFileKeys = new Set();
-      downloadedFiles = [];
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("clear_cache.failed", rawError);
-    } finally {
-      isClearingCache = false;
-    }
-  }
-
-  async function openDownloadedFilesPanel() {
-    if (isLoadingDownloadedFiles) return;
-    isLoadingDownloadedFiles = true;
-    error = null;
-    try {
-      downloadedFiles = await client.listCachedFiles();
-      showDownloadedFiles = true;
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("list_cached_files.failed", rawError);
-    } finally {
-      isLoadingDownloadedFiles = false;
-    }
-  }
-
-  async function removeCachedFile(folderId: string, path: string) {
-    if (isRemovingCachedFile || isClearingCache) return;
-    isRemovingCachedFile = true;
-    error = null;
-    try {
-      await client.removeCachedFile(folderId, path);
-      const next = new Set(cachedFileKeys);
-      next.delete(cachedFileKey(folderId, path));
-      cachedFileKeys = next;
-      await refreshFolderRootCachedStatuses([folderId]);
-      downloadedFiles = downloadedFiles.filter(
-        (file) => file.key !== cachedFileKey(folderId, path),
-      );
-    } catch (rawError: unknown) {
-      const message =
-        rawError instanceof Error ? rawError.message : String(rawError);
-      error = message;
-      reportUiError("remove_cached_file.failed", rawError, { folderId, path });
-    } finally {
-      isRemovingCachedFile = false;
-    }
-  }
-
-  async function openFavorite(favorite: FavoriteItem) {
-    if (!isConnected) return;
-    activeTab = "folders";
-    currentFolderId = favorite.folderId;
-    currentPath =
-      favorite.kind === "folder"
-        ? favorite.path
-        : normalizePath(favorite.path.split("/").slice(0, -1).join("/"));
-    uploadMessage = "";
-    await loadCurrentDirectory();
-  }
-
-  function handleUploadClick() {
-    const input = document.getElementById(
-      "folder-upload-input",
-    ) as HTMLInputElement | null;
-    input?.click();
-  }
-
-  function handleUploadSelected(event: Event) {
-    const input = event.currentTarget as HTMLInputElement;
-    const fileName = input.files?.[0]?.name;
-    uploadMessage = fileName
-      ? `Upload selected (${fileName}) but uploading is not available in this read-only BEP client yet.`
-      : "";
-    input.value = "";
-  }
-
-  function addSavedDevice() {
-    const normalizedId = normalizeDeviceId(newSavedDeviceId);
-    if (!normalizedId) {
-      error = "Device ID is required.";
-      return;
-    }
-    if (!isValidSyncthingDeviceId(normalizedId)) {
-      error =
-        "Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
-      return;
-    }
-    const customName = newSavedDeviceCustomName.trim();
-    const preferredName = customName || suggestedSavedDeviceName(normalizedId);
-    upsertSavedDeviceEntry(normalizedId, preferredName, {
-      customName: customName !== "",
-    });
-    setSavedDeviceIntroducer(normalizedId, newSavedDeviceIsIntroducer);
-    selectedSavedDeviceId = normalizedId;
-    connection.remoteId = normalizedId;
-    newSavedDeviceId = "";
-    newSavedDeviceIsIntroducer = false;
-    newSavedDeviceCustomName = "";
-    error = null;
-  }
-
-  function editSavedDeviceName(deviceId: string) {
-    const normalizedId = normalizeDeviceId(deviceId);
-    if (!normalizedId) return;
-    const existing = savedDevices.find(
-      (device) => normalizeDeviceId(device.id) === normalizedId,
-    );
-    const initialName = existing?.name?.trim() || suggestedSavedDeviceName(normalizedId);
-    const updated =
-      typeof window !== "undefined"
-        ? window.prompt("Edit device name:", initialName)
-        : initialName;
-    if (updated === null) return;
-    const trimmed = updated.trim();
-    if (!trimmed) {
-      error = "Device name cannot be empty.";
-      return;
-    }
-    upsertSavedDeviceEntry(normalizedId, trimmed, { customName: true });
-    error = null;
-  }
-
-  function approveAdvertisedDevice(device: AdvertisedDeviceItem) {
-    if (!isValidSyncthingDeviceId(device.id)) {
-      error = `Advertised device ID is invalid and cannot be approved: ${device.id}`;
-      return;
-    }
-    upsertSavedDeviceEntry(device.id, device.name, { customName: false });
-    selectedSavedDeviceId = device.id;
-    connection.remoteId = device.id;
-    error = null;
-  }
-
-  function approveFolderSync(folder: AdvertisedFolderItem) {
-    const next = new Set(syncApprovedIntroducedFolderKeys);
-    next.add(folder.key);
-    syncApprovedIntroducedFolderKeys = next;
-    error = null;
-  }
-
-  function useSavedDevice(deviceId: string) {
-    selectedSavedDeviceId = deviceId;
-    connection.remoteId = deviceId;
-    if (!isConnected) {
-      restoreOfflineFolderSnapshot(deviceId, "use_saved_device");
-    }
-  }
-
-  function resetDiscoveryServer() {
-    connection.discoveryServer = getDefaultDiscoveryServer();
-  }
-
-  function removeSavedDevice(deviceId: string) {
-    const normalized = normalizeDeviceId(deviceId);
-    setRemoteApprovalPending(normalized, false);
-    if (normalizeDeviceId(pendingApprovalPromptDeviceId) === normalized) {
-      pendingApprovalPromptDeviceId = "";
-    }
-    savedDevices = savedDevices.filter(
-      (device) => normalizeDeviceId(device.id) !== normalized,
-    );
-    if (connection.remoteId === deviceId) {
-      connection.remoteId = "";
-    }
-    const nextSyncApproved = new Set(
-      [...syncApprovedIntroducedFolderKeys].filter(
-        (key) => !key.startsWith(`${normalized}:`),
-      ),
-    );
-    syncApprovedIntroducedFolderKeys = nextSyncApproved;
-    const scopedPrefix = `${normalized}${FOLDER_PASSWORD_SCOPE_SEPARATOR}`;
-    folderPasswords = Object.fromEntries(
-      Object.entries(folderPasswords).filter(
-        ([key]) => !key.startsWith(scopedPrefix),
-      ),
-    );
-    offlineFolderSnapshots = Object.fromEntries(
-      Object.entries(offlineFolderSnapshots).filter(
-        ([key]) => normalizeDeviceId(key) !== normalized,
-      ),
-    );
-  }
-
-  async function copyTextToClipboard(text: string): Promise<void> {
-    if (!text.trim()) {
-      throw new Error("Nothing to copy.");
-    }
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-      throw new Error("Clipboard API unavailable on this device");
-    }
-    await navigator.clipboard.writeText(text);
-  }
-
-  async function refreshCurrentDeviceId() {
-    if (isLoadingCurrentDeviceId) return;
-    isLoadingCurrentDeviceId = true;
-    try {
-      currentDeviceId = await client.getDefaultDeviceId();
-    } catch (rawError: unknown) {
-      setError("device_id.read.failed", rawError);
-      reportUiError("device_id.read.failed", rawError);
-    } finally {
-      isLoadingCurrentDeviceId = false;
-    }
-  }
-
-  async function copyCurrentDeviceId() {
-    error = null;
-    if (!currentDeviceId) {
-      await refreshCurrentDeviceId();
-    }
-    try {
-      await copyTextToClipboard(currentDeviceId);
-      deviceIdentityNotice = "Device ID copied.";
-    } catch (rawError: unknown) {
-      setError("device_id.copy.failed", rawError);
-      reportUiError("device_id.copy.failed", rawError);
-    }
-  }
-
-  async function copyIdentityBackupSecret() {
-    if (isExportingIdentityRecovery) return;
-    isExportingIdentityRecovery = true;
-    error = null;
-    try {
-      const exported = await client.exportIdentityRecovery();
-      await copyTextToClipboard(exported.recoverySecret);
-      currentDeviceId = exported.deviceId;
-      deviceIdentityNotice = "Backup secret copied. Keep it in a safe place.";
-    } catch (rawError: unknown) {
-      setError("identity_backup.copy_secret.failed", rawError);
-      reportUiError("identity_backup.copy_secret.failed", rawError);
-    } finally {
-      isExportingIdentityRecovery = false;
-    }
-  }
-
-  async function regenerateDeviceId() {
-    if (isRegeneratingDeviceId) return;
-    const confirmed =
-      typeof window !== "undefined"
-        ? window.confirm(
-            "Generate a new device ID now? Other peers will treat this as a new device until approved again.",
-          )
-        : true;
-    if (!confirmed) return;
-    isRegeneratingDeviceId = true;
-    error = null;
-    try {
-      const nextDeviceId = await client.regenerateDefaultIdentity();
-      currentDeviceId = nextDeviceId;
-      deviceIdentityNotice = "New device ID generated.";
-      identityRecoverySecret = "";
-      showRestoreFromBackup = false;
-    } catch (rawError: unknown) {
-      setError("device_id.regenerate.failed", rawError);
-      reportUiError("device_id.regenerate.failed", rawError);
-    } finally {
-      isRegeneratingDeviceId = false;
-    }
-  }
-
-  function editLocalDeviceName() {
-    const initial = connection.deviceName.trim() || suggestedClientName();
-    const updated =
-      typeof window !== "undefined"
-        ? window.prompt("Edit this device name (advertised to peers):", initial)
-        : initial;
-    if (updated === null) return;
-    const trimmed = updated.trim();
-    if (!trimmed) {
-      error = "Device name is required.";
-      return;
-    }
-    connection.deviceName = trimmed;
-    deviceIdentityNotice = "Advertised device name updated.";
-    error = null;
-  }
-
-  async function restoreIdentityRecovery() {
-    if (isRestoringIdentityRecovery) return;
-    const secret = identityRecoverySecret.trim();
-    if (!secret) {
-      error = "Backup secret is required.";
-      return;
-    }
-    isRestoringIdentityRecovery = true;
-    error = null;
-    try {
-      await client.restoreIdentityRecovery(secret);
-      await refreshCurrentDeviceId();
-      identityRecoverySecret = "";
-      showRestoreFromBackup = false;
-      deviceIdentityNotice = "Device identity restored from backup secret.";
-    } catch (rawError: unknown) {
-      setError("identity_backup.restore.failed", rawError);
-      reportUiError("identity_backup.restore.failed", rawError);
-    } finally {
-      isRestoringIdentityRecovery = false;
-    }
-  }
 </script>
 
-{#if currentPage === "main"}
-<div class="app-shell">
-  <main class="content">
-    {#if recentError}
-      <section class="panel error-banner-panel">
-        <p class="error">{recentError}</p>
-      </section>
-    {/if}
+{#if app.currentPage === "main"}
+  <div class="app-shell">
+    <main class="content">
+      {#if app.ui.recentError}
+        <section class="panel error-banner-panel">
+          <p class="error">{app.ui.recentError}</p>
+        </section>
+      {/if}
 
-    {#if pendingApprovalPromptDeviceId}
-      <section class="panel">
-        <p class="hint">
-          Waiting for remote approval for
-          <strong>{suggestedSavedDeviceName(pendingApprovalPromptDeviceId)}</strong>.
-          The remote peer device should now show a prompt to accept this client.
-          Accept it there, then connect again.
-        </p>
-        <div class="item-meta">{pendingApprovalPromptDeviceId}</div>
-        <div class="actions">
-          <button
-            class="primary"
-            onclick={() => connectToSavedDevice(pendingApprovalPromptDeviceId)}
-            disabled={isConnecting}
-          >
-            {isConnecting &&
-            activeConnectDeviceId === pendingApprovalPromptDeviceId
-              ? "Connecting..."
-              : "Connect Again"}
-          </button>
-          <button
-            class="ghost"
-            onclick={() => {
-              pendingApprovalPromptDeviceId = "";
-            }}
-            disabled={isConnecting}
-          >
-            Dismiss
-          </button>
-        </div>
-      </section>
-    {/if}
-
-    {#if !isConnected}
-      <div class="global-connect">
-        <button class="primary" onclick={() => connect()} disabled={isConnecting}>
-          {isConnecting ? "Connecting..." : "Connect"}
-        </button>
-        {#if connectionModeLabel}
-          <span>{connectionModeLabel}</span>
-        {/if}
-      </div>
-    {:else}
-      <div class="global-connect">
-        <button class="ghost" onclick={disconnect} disabled={isConnecting}>
-          Disconnect
-        </button>
-      </div>
-    {/if}
-
-    {#if activeTab === "devices"}
-      <section class="panel">
-        <h2 class="heading">Settings</h2>
-
-        <div class="status-row">
-          <span class={`status-chip ${isConnected ? "online" : "offline"}`}>
-            {isConnected ? "Connected" : "Disconnected"}
-          </span>
-          {#if lastUpdatedAt}
-            <span>Updated {lastUpdatedAt}</span>
-          {/if}
-          {#if isConnected && connectionPath}
-            <span>Path: {connectionTransport === "relay" ? "relay" : "direct tcp"} ({connectionPath})</span>
-          {/if}
-        </div>
-
-        <div class="identity-inline">
-          <div class="item-main">
-            <div class="item-title-row">
-              <span class="item-title">This Device ID</span>
-              {#if isLoadingCurrentDeviceId}
-                <span class="status-chip small">loading...</span>
-              {/if}
-            </div>
-            <div class="item-meta">
-              {currentDeviceId || "Unavailable"}
-            </div>
-            <div class="item-meta">
-              Advertised name: {connection.deviceName.trim() || "syncpeer-ui"}
-            </div>
-            {#if deviceIdentityNotice}
-              <div class="item-meta">{deviceIdentityNotice}</div>
-            {/if}
-          </div>
-          <div class="item-actions">
-            <button class="ghost" onclick={copyCurrentDeviceId}>Copy ID</button>
-            <button class="ghost" onclick={editLocalDeviceName}>Edit Name</button>
-            <button
-              class="ghost"
-              onclick={regenerateDeviceId}
-              disabled={isRegeneratingDeviceId}
-              title="Generate a new certificate and device ID"
-            >
-              {isRegeneratingDeviceId ? "Generating..." : "Generate New ID"}
-            </button>
-          </div>
-        </div>
-
-        {#if !isConnected}
-          <button class="primary" onclick={() => connect()} disabled={isConnecting}>
-            {isConnecting ? "Connecting..." : "Connect Using Last Settings"}
-          </button>
-        {/if}
-
-        <details bind:open={isSettingsExpanded}>
-          <summary>Connection Settings</summary>
-          <form
-            class="settings"
-            onsubmit={(event) => {
-              event.preventDefault();
-              void connect();
-            }}
-          >
-            <label>
-              Discovery Method
-              <select bind:value={connection.discoveryMode}>
-                <option value="global">Global Discovery (default)</option>
-                <option value="direct">Direct Host/Port</option>
-              </select>
-            </label>
-
-            {#if connection.discoveryMode === "global"}
-              <label>
-                Discovery Server
-                <input type="text" bind:value={connection.discoveryServer} />
-              </label>
-            {/if}
-
-            {#if connection.discoveryMode === "direct"}
-              <label>
-                Host
-                <input type="text" bind:value={connection.host} placeholder="127.0.0.1" />
-              </label>
-
-              <label>
-                Port
-                <input type="number" bind:value={connection.port} min="1" max="65535" />
-              </label>
-            {:else}
-              <div class="hint">
-                Global discovery ignores manual host/port. The official Syncthing discovery server pin is applied automatically when you use discovery.syncthing.net.
-              </div>
-            {/if}
-
-            <label>
-              Saved Devices
-              <select bind:value={selectedSavedDeviceId}>
-                <option value="">Manual entry</option>
-                {#each savedDevices as device (device.id)}
-                  <option value={device.id}>{device.name}</option>
-                {/each}
-              </select>
-            </label>
-
-            <label>
-              Remote Device ID
-              <input
-                type="text"
-                bind:value={connection.remoteId}
-                placeholder="ABCD123-... (required for global discovery)"
-                spellcheck="false"
-                autocapitalize="characters"
-                autocomplete="off"
-                autocorrect="off"
-              />
-            </label>
-
-            <label>
-              TLS Certificate (optional)
-              <input
-                type="text"
-                bind:value={connection.cert}
-                placeholder="Auto uses persisted cli-node cert.pem"
-              />
-            </label>
-
-            <label>
-              TLS Key (optional)
-              <input
-                type="text"
-                bind:value={connection.key}
-                placeholder="Auto uses persisted cli-node key.pem"
-              />
-            </label>
-
-            <label>
-              Timeout (ms)
-              <input
-                type="number"
-                bind:value={connection.timeoutMs}
-                min="1000"
-                step="1000"
-              />
-            </label>
-
-            <label class="checkbox-row">
-              <input type="checkbox" bind:checked={connection.enableRelayFallback} />
-              <span>Enable relay fallback (Syncthing relay://)</span>
-            </label>
-
-            <label class="checkbox-row">
-              <input type="checkbox" bind:checked={connection.autoAcceptNewDevices} />
-              <span>Auto-accept newly advertised devices</span>
-            </label>
-
-            <label class="checkbox-row">
-              <input type="checkbox" bind:checked={connection.autoAcceptIntroducedFolders} />
-              <span>Auto-approve folder sync for introduced folders</span>
-            </label>
-          </form>
-
-          <div class="actions">
-            <button
-              type="button"
-              class="ghost"
-              onclick={() => useSavedDevice(selectedSavedDeviceId)}
-              disabled={selectedSavedDeviceId === ""}
-            >
-              Use Selected Device
-            </button>
-            <button
-              type="button"
-              class="ghost"
-              onclick={resetDiscoveryServer}
-              disabled={connection.discoveryMode !== "global"}
-            >
-              Use Official Discovery Server
-            </button>
-            <button
-              type="button"
-              class="ghost"
-              onclick={clearAllCache}
-              disabled={isClearingCache}
-            >
-              {isClearingCache ? "Clearing Cache..." : "Clear Cache"}
-            </button>
-            <button
-              type="button"
-              class="ghost"
-              onclick={clearOfflineFolderState}
-            >
-              Clear Offline Folder State
-            </button>
-            <button
-              type="button"
-              class="ghost"
-              onclick={openDiagnosticsPage}
-            >
-              Open Diagnostics Page
-            </button>
-          </div>
-        </details>
-      </section>
-
-      <section class="panel">
-        <details bind:open={isDeviceBackupExpanded}>
-          <summary>Device ID Backup</summary>
+      {#if app.approvals.pendingApprovalPromptDeviceId}
+        <section class="panel">
           <p class="hint">
-            Keep a backup secret to restore this exact device ID after reinstall.
+            Waiting for remote approval for <strong>{app.approvals.pendingApprovalPromptDeviceId}</strong>.
+            The remote peer device should now show a prompt to accept this client. Accept
+            it there, then connect again.
           </p>
-          <div class="item-meta">Device ID: {currentDeviceId || "Unavailable"}</div>
+          <div class="item-meta">{app.approvals.pendingApprovalPromptDeviceId}</div>
           <div class="actions">
             <button
-              type="button"
               class="primary"
-              onclick={copyCurrentDeviceId}
+              onclick={() => actions.connect(app.approvals.pendingApprovalPromptDeviceId)}
+              disabled={app.session.isConnecting}
             >
-              Copy Device ID
+              {app.session.isConnecting &&
+              app.session.activeConnectDeviceId === app.approvals.pendingApprovalPromptDeviceId
+                ? "Connecting..."
+                : "Connect Again"}
             </button>
             <button
-              type="button"
-              class="primary"
-              onclick={copyIdentityBackupSecret}
-              disabled={isExportingIdentityRecovery}
-            >
-              {isExportingIdentityRecovery ? "Copying..." : "Copy Backup Secret"}
-            </button>
-            <button
-              type="button"
               class="ghost"
               onclick={() => {
-                showRestoreFromBackup = !showRestoreFromBackup;
-                error = null;
+                app.approvals.pendingApprovalPromptDeviceId = "";
               }}
+              disabled={app.session.isConnecting}
             >
-              {showRestoreFromBackup ? "Hide Restore" : "Restore From Backup Secret"}
+              Dismiss
             </button>
           </div>
+        </section>
+      {/if}
 
-          {#if showRestoreFromBackup}
-            <label>
-              Backup Secret
-              <textarea
-                class="recovery-secret"
-                bind:value={identityRecoverySecret}
-                placeholder="Paste backup secret here"
-              ></textarea>
-            </label>
-            <div class="actions">
-              <button
-                type="button"
-                class="ghost"
-                onclick={restoreIdentityRecovery}
-                disabled={isRestoringIdentityRecovery}
-              >
-                {isRestoringIdentityRecovery ? "Restoring..." : "Restore Device ID"}
-              </button>
-              <button
-                type="button"
-                class="ghost"
-                onclick={() => {
-                  identityRecoverySecret = "";
-                  error = null;
-                }}
-                disabled={!identityRecoverySecret.trim()}
-              >
-                Clear Input
-              </button>
-            </div>
-          {/if}
-        </details>
-      </section>
-
-      <section class="panel">
-        <h2 class="heading">Add Device</h2>
-        <div class="saved-device-editor">
-          <label>
-            Device ID
-            <input
-              type="text"
-              bind:value={newSavedDeviceId}
-              placeholder="ABCD123-..."
-            />
-          </label>
-          {#if normalizeDeviceId(newSavedDeviceId)}
-            <p class="hint">
-              Saved as <strong>{newSavedDeviceCustomName.trim() || suggestedSavedDeviceName(newSavedDeviceId)}</strong>.
-              We’ll switch to the device’s advertised name after first connection unless you set a custom name.
-            </p>
-          {/if}
-          <label>
-            Custom name (optional)
-            <input
-              type="text"
-              bind:value={newSavedDeviceCustomName}
-              placeholder="Leave blank to use device advertised name later"
-            />
-          </label>
-          <label class="checkbox-row">
-            <input type="checkbox" bind:checked={newSavedDeviceIsIntroducer} />
-            <span>Treat as introducer</span>
-          </label>
-          <div class="actions">
-            <button type="button" class="primary" onclick={addSavedDevice}
-              >Add Device</button
-            >
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <h2 class="heading">Advertised Devices</h2>
-        {#if isConnected && !currentSourceIsIntroducer()}
-          <p class="hint">
-            Introductions are only trusted from introducer peers. Mark this connected device as introducer to review/accept advertised devices.
-          </p>
-        {/if}
-        <ul class="list">
-          {#if advertisedDevices.length === 0}
-            <li class="empty">
-              No introduced devices pending from the current introducer peer.
-            </li>
-          {:else}
-            {#each advertisedDevices as device (device.id)}
-              <li class="list-item">
-                <div class="item-main">
-                  <div class="item-title-row">
-                    <div class="item-title">{device.name}</div>
-                    <span class={`status-chip ${device.accepted ? "online" : "offline"} small`}>
-                      {device.accepted ? "accepted" : "non-accepted"}
-                    </span>
-                  </div>
-                  <div class="item-meta">{device.id}</div>
-                  <div class="item-meta">
-                    Seen in folders: {device.sourceFolderIds.join(", ")}
-                  </div>
-                </div>
-                <div class="item-actions">
-                  {#if device.accepted}
-                    <button
-                      class="ghost"
-                      onclick={() => useSavedDevice(device.id)}
-                    >
-                      Use
-                    </button>
-                  {:else}
-                    <button
-                      class="primary"
-                      onclick={() => approveAdvertisedDevice(device)}
-                    >
-                      Approve
-                    </button>
-                  {/if}
-                </div>
-              </li>
-            {/each}
-          {/if}
-        </ul>
-      </section>
-
-      <section class="panel">
-        <h2 class="heading">Folder Sync Approvals</h2>
-        {#if isConnected && !currentSourceIsIntroducer()}
-          <p class="hint">
-            Introduced folder sync can only be approved from introducer peers.
-          </p>
-        {/if}
-        <ul class="list">
-          {#if advertisedFolders.length === 0}
-            <li class="empty">No introduced folder sync approvals pending from the current introducer peer.</li>
-          {:else}
-            {#each advertisedFolders as folder (folder.key)}
-              <li class="list-item">
-                <div class="item-main">
-                  <div class="item-title-row">
-                    <div class="item-title">{folder.label}</div>
-                    <span class={`status-chip ${folder.syncApproved ? "online" : "offline"} small`}>
-                      {folder.syncApproved ? "sync approved" : "sync not approved"}
-                    </span>
-                  </div>
-                  <div class="item-meta">Folder ID: {folder.folderId}</div>
-                  <div class="item-meta">Introduced by: {folder.sourceDeviceId}</div>
-                </div>
-                <div class="item-actions">
-                  {#if folder.syncApproved}
-                    <button
-                      class="ghost"
-                      onclick={() => openFolderRoot(folder.folderId)}
-                      disabled={!isConnected}
-                    >
-                      Open
-                    </button>
-                  {:else}
-                    <button
-                      class="primary"
-                      onclick={() => approveFolderSync(folder)}
-                    >
-                      Approve Sync
-                    </button>
-                  {/if}
-                </div>
-              </li>
-            {/each}
-          {/if}
-        </ul>
-      </section>
-
-      <section class="panel">
-        <h2 class="heading">Saved Devices</h2>
-        <ul class="list">
-          {#if savedDevices.length === 0}
-            <li class="empty">
-              No saved devices yet. Add one from Connection Settings.
-            </li>
-          {:else}
-            {#each savedDevices as device (device.id)}
-              <li class="list-item">
-                <div class="item-main">
-                  <div class="item-title-row">
-                    <button
-                      class="item-title"
-                      onclick={() => useSavedDevice(device.id)}
-                      >{device.name}</button
-                    >
-                    {#if device.isIntroducer}
-                      <span class="status-chip small">introducer</span>
-                    {/if}
-                    {#if isSavedDeviceConnected(device.id)}
-                      <span class="status-chip online small">online</span>
-                    {/if}
-                    {#if isSavedDeviceAwaitingRemoteApproval(device.id)}
-                      <span class="status-chip offline small" title="This peer may still need to approve your device on their Syncthing side.">
-                        not approved yet
-                      </span>
-                    {/if}
-                  </div>
-                  <div class="item-meta">{device.id}</div>
-                </div>
-                <div class="item-actions">
-                  <button
-                    class="primary"
-                    onclick={() => connectToSavedDevice(device.id)}
-                    disabled={isConnecting}
-                  >
-                    {isConnecting && activeConnectDeviceId === device.id ? "Connecting..." : "Connect"}
-                  </button>
-                  <button
-                    class="ghost"
-                    onclick={() => useSavedDevice(device.id)}>Use</button
-                  >
-                  <button
-                    class="ghost"
-                    onclick={() => editSavedDeviceName(device.id)}
-                    title="Edit saved device name"
-                  >
-                    Edit Name
-                  </button>
-                  <button
-                    class="ghost"
-                    onclick={() =>
-                      setSavedDeviceIntroducer(device.id, !device.isIntroducer)}
-                    title={device.isIntroducer ? "Unset introducer" : "Mark as introducer"}
-                  >
-                    {device.isIntroducer ? "Unset Introducer" : "Set Introducer"}
-                  </button>
-                  <button
-                    class="icon icon-only"
-                    onclick={() => removeSavedDevice(device.id)}
-                    title="Remove saved device"
-                    aria-label="Remove saved device"
-                  >
-                    <Trash2 size={16} />
-                  </button
-                  >
-                </div>
-              </li>
-            {/each}
-          {/if}
-        </ul>
-      </section>
-
-      <section class="panel">
-        <h2 class="heading">Active Remote Device</h2>
-        <ul class="list">
-          {#if !remoteDevice}
-            <li class="empty">
-              No remote device metadata yet. Connect to a saved device.
-            </li>
-          {:else}
-            <li class="list-item">
-              <div class="item-main">
-                <div class="item-title" title={remoteDevice.deviceName}>
-                  {remoteDevice.deviceName}
-                </div>
-                <div class="item-meta">{remoteDevice.id}</div>
-                <div class="item-meta">
-                  {remoteDevice.clientName}
-                  {remoteDevice.clientVersion}
-                </div>
-                {#if connectionPath}
-                  <div class="item-meta">
-                    Connected via {connectionTransport === "relay" ? "relay" : "direct tcp"}: {connectionPath}
-                  </div>
-                {/if}
-              </div>
-              <div class="item-actions">
-                <button
-                  class="ghost"
-                  onclick={refreshOverview}
-                  disabled={!isConnected || isRefreshing || isConnecting}
-                  title={isRefreshing ? "Refreshing..." : "Refresh"}
-                >
-                  Refresh
-                </button>
-              </div>
-            </li>
-          {/if}
-        </ul>
-      </section>
-
-      <section class="panel">
-        <h2 class="heading">Session Logs</h2>
-        <details bind:open={isLogPanelExpanded}>
-          <summary>View logs ({sessionLogs.length})</summary>
-          <div class="actions">
-            <button
-              type="button"
-              class="ghost"
-              onclick={copySessionLogs}
-            >
-              Copy Logs
-            </button>
-          </div>
-          <ul class="list">
-            {#if sessionLogs.length === 0}
-              <li class="empty">No session logs yet.</li>
-            {:else}
-              {#each sessionLogs as item (item.id)}
-                <li class="list-item">
-                  <div class="item-main">
-                    <div class="item-meta">
-                      {new Date(item.timestampMs).toLocaleTimeString()} | {item.level.toUpperCase()} | {item.event}
-                    </div>
-                    <div class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}>{item.message}</div>
-                    {#if item.details !== undefined}
-                      <pre class="log-details">{JSON.stringify(item.details, null, 2)}</pre>
-                    {/if}
-                  </div>
-                </li>
-              {/each}
-            {/if}
-          </ul>
-        </details>
-      </section>
-    {/if}
-
-    {#if activeTab === "favorites"}
-      <section class="panel">
-        <h2 class="heading">Favorites</h2>
-        <div class="actions">
-          <button
-            class="ghost"
-            onclick={openDownloadedFilesPanel}
-            disabled={isLoadingDownloadedFiles}
-          >
-            {isLoadingDownloadedFiles
-              ? "Loading Downloads..."
-              : "Show Downloaded Files"}
+      {#if !app.session.isConnected}
+        <div class="global-connect">
+          <button class="primary" onclick={() => actions.connect()} disabled={app.session.isConnecting}>
+            {app.session.isConnecting ? "Connecting..." : "Connect"}
           </button>
+          {#if currentConnectionModeLabel}
+            <span>{currentConnectionModeLabel}</span>
+          {/if}
         </div>
-        {#if !isConnected}
-          <p class="empty">Connect to open favorites and sync folder state.</p>
-        {/if}
+      {/if}
 
-        <ul class="list">
-          {#if favorites.length === 0}
-            <li class="empty">
-              No favorites yet. Tap a star on folders/files to add them.
-            </li>
-          {:else}
-            {#each favorites as favorite (favorite.key)}
-              <li class="list-item">
-                <div class="item-main">
-                  <button
-                    class="item-title"
-                    onclick={() => openFavorite(favorite)}
-                    disabled={!isConnected}>{favorite.name}</button
-                  >
-                  <div class="item-meta">
-                    {favorite.folderId}:{favorite.path || "/"}
-                  </div>
-                </div>
-                <div class="item-actions">
-                  {#if favorite.kind === "file"}
-                    {#if cachedFileKeys.has(cachedFileKey(favorite.folderId, favorite.path))}
-                      <button
-                        class="ghost"
-                        onclick={() =>
-                          openCachedFile(favorite.folderId, favorite.path)}
-                        disabled={isOpeningCachedFile}
-                      >
-                        Open
-                      </button>
-                      <button
-                        class="ghost"
-                        onclick={() =>
-                          openCachedFileDirectory(
-                            favorite.folderId,
-                            favorite.path,
-                          )}
-                        disabled={isOpeningCachedFile}
-                      >
-                        Open Folder
-                      </button>
-                    {:else}
-                      <button
-                        class="ghost"
-                        onclick={() =>
-                          downloadFile(
-                            favorite.folderId,
-                            favorite.path,
-                            favorite.name,
-                          )}
-                        disabled={!isConnected || isDownloading}
-                      >
-                        {downloadButtonLabel(favorite.folderId, favorite.path)}
-                      </button>
-                    {/if}
-                  {/if}
-                  <button
-                    class="icon icon-only"
-                    onclick={() => void removeFavorite(favorite)}
-                    title="Remove favorite"
-                    aria-label="Remove favorite"
-                  >
-                    <Trash2 size={16} />
-                  </button
-                  >
-                </div>
-              </li>
-            {/each}
-          {/if}
-        </ul>
+      {#if app.activeTab === "devices"}
+        <DeviceTab
+          {app}
+          connectionModeLabel={currentConnectionModeLabel}
+          advertisedDevices={currentAdvertisedDevices}
+          advertisedFolders={currentAdvertisedFolders}
+          isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
+          isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
+            isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
+          currentSourceIsIntroducer={currentSourceIsIntroducer(app)}
+          onConnect={() => actions.connect()}
+          onDisconnect={actions.disconnect}
+          onUseSavedDevice={actions.useSavedDevice}
+          onResetDiscoveryServer={actions.resetDiscoveryServer}
+          onClearAllCache={actions.clearAllCache}
+          onClearOfflineFolderState={actions.clearOfflineFolderState}
+          onOpenDiagnosticsPage={actions.openDiagnosticsPage}
+          onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
+          onCopySessionLogs={actions.copySessionLogs}
+          onEditLocalDeviceName={actions.editLocalDeviceName}
+          onRegenerateDeviceId={actions.regenerateDeviceId}
+          onCopyIdentityBackupSecret={actions.copyIdentityBackupSecret}
+          onRestoreIdentityRecovery={actions.restoreIdentityRecovery}
+          onAddSavedDevice={actions.addSavedDevice}
+          onApproveAdvertisedDevice={actions.approveAdvertisedDevice}
+          onApproveFolderSync={actions.approveFolderSync}
+          onConnectToSavedDevice={(deviceId) => actions.connect(deviceId)}
+          onEditSavedDeviceName={actions.editSavedDeviceName}
+          onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
+          onRemoveSavedDevice={actions.removeSavedDevice}
+          onRefreshOverview={actions.refreshOverview}
+          onOpenFolderRoot={actions.openFolderRoot}
+        />
+      {/if}
 
-        {#if showDownloadedFiles}
-          <div class="heading-row">
-            <h3 class="heading">Downloaded Files</h3>
-            <button
-              class="ghost"
-              onclick={clearAllCache}
-              disabled={isClearingCache || isRemovingCachedFile}
-            >
-              {isClearingCache ? "Clearing..." : "Clear All"}
-            </button>
-          </div>
-          <ul class="list">
-            {#if downloadedFiles.length === 0}
-              <li class="empty">No downloaded files in local cache yet.</li>
-            {:else}
-              {#each downloadedFiles as file (file.key)}
-                <li class="list-item">
-                  <div class="item-main">
-                    <div class="item-title">{file.name}</div>
-                    <div class="item-meta">{file.folderId}:{file.path}</div>
-                    <div class="item-meta">
-                      {formatBytes(file.sizeBytes)} | Cached {formatModified(
-                        file.cachedAtMs,
-                      )}
-                    </div>
-                  </div>
-                  <div class="item-actions">
-                    <button
-                      class="ghost"
-                      onclick={() => openCachedFile(file.folderId, file.path)}
-                      disabled={isOpeningCachedFile}
-                    >
-                      Open
-                    </button>
-                    <button
-                      class="ghost"
-                      onclick={() =>
-                        openCachedFileDirectory(file.folderId, file.path)}
-                      disabled={isOpeningCachedFile}
-                    >
-                      Open Folder
-                    </button>
-                    <button
-                      class="ghost"
-                      onclick={() =>
-                        removeCachedFile(file.folderId, file.path)}
-                      disabled={isRemovingCachedFile || isClearingCache}
-                    >
-                      Drop
-                    </button>
-                  </div>
-                </li>
-              {/each}
-            {/if}
-          </ul>
-        {/if}
-      </section>
-    {/if}
+      {#if app.activeTab === "favorites"}
+        <FavoritesTab
+          {app}
+          onOpenDownloadedFilesPanel={actions.openDownloadedFilesPanel}
+          onOpenFavorite={actions.openFavorite}
+          onOpenCachedFile={actions.openCachedFile}
+          onOpenCachedFileDirectory={actions.openCachedFileDirectory}
+          onRemoveCachedFile={actions.removeCachedFile}
+          onDownloadFile={actions.downloadFile}
+          onRemoveFavorite={actions.removeFavorite}
+          onClearAllCache={actions.clearAllCache}
+          {formatBytes}
+          {formatModified}
+        />
+      {/if}
 
-    {#if activeTab === "folders"}
-      <section class="panel">
-        <h2 class="heading">Folders</h2>
+      {#if app.activeTab === "folders"}
+        <FoldersTab
+          {app}
+          breadcrumbs={currentBreadcrumbs}
+          rootFolders={currentRootFolders}
+          favoriteKeys={currentFavoriteKeys}
+          onRefreshActiveView={actions.refreshActiveView}
+          onGoToRootView={actions.goToRootView}
+          onGoToBreadcrumb={actions.goToBreadcrumb}
+          onOpenFolderRoot={actions.openFolderRoot}
+          onOpenDirectory={actions.openDirectory}
+          onOpenCachedDirectory={actions.openCachedDirectory}
+          onOpenCachedFile={actions.openCachedFile}
+          onOpenCachedFileDirectory={actions.openCachedFileDirectory}
+          onDownloadFile={actions.downloadFile}
+          onToggleFavorite={actions.toggleFavorite}
+          onSetPasswordVisible={actions.setFolderPasswordInputVisible}
+          onUpdateFolderPasswordDraft={actions.updateFolderPasswordDraft}
+          onSaveFolderPassword={actions.saveFolderPassword}
+          onClearFolderPassword={actions.clearFolderPassword}
+          isFolderLocked={(folderId) => folderIsLocked(app, folderId)}
+          folderLockLabel={(folderId) => folderLockLabel(app, folderId)}
+          folderState={(folderId) => folderState(app, folderId)}
+          isPasswordInputVisible={(folderId) => isFolderPasswordInputVisible(app, folderId)}
+          activeFolderPasswords={activePasswords}
+          downloadButtonLabel={(folderId, path) => downloadButtonLabel(app, folderId, path)}
+          {formatBytes}
+          {formatModified}
+          onHandleUploadSelected={actions.handleUploadSelected}
+        />
+      {/if}
+    </main>
 
-        {#if !isConnected}
-          <p class="empty">Connect to browse folders.</p>
-        {:else}
-          <div class="status-row">
-            <span class="status-chip online">Connected</span>
-            {#if remoteDevice}
-              <span>{remoteDevice.deviceName}</span>
-            {/if}
-            {#if lastUpdatedAt}
-              <span>Updated {lastUpdatedAt}</span>
-            {/if}
-            <button
-              class="ghost icon-only"
-              onclick={() => refreshActiveView()}
-              disabled={isRefreshing || isConnecting || isLoadingDirectory}
-              title={isRefreshing ? "Refreshing..." : "Refresh"}
-              aria-label={isRefreshing ? "Refreshing..." : "Refresh"}
-            >
-              <RefreshCw size={16} />
-            </button>
-          </div>
-
-          <div class="breadcrumbs">
-            {#if !currentFolderId}
-              <span class="crumb-current">All Syncthing Folders</span>
-            {:else}
-              <button class="crumb-button" onclick={goToRootView}
-                >All Syncthing Folders</button
-              >
-              <span class="crumb-separator">&gt;</span>
-              {#each visibleBreadcrumbs as segment, index (segment.key)}
-                {#if index < visibleBreadcrumbs.length - 1}
-                  {#if segment.ellipsis}
-                    <span class="crumb-current">...</span>
-                  {:else}
-                    <button
-                      class="crumb-button"
-                      onclick={() => goToBreadcrumb(segment)}
-                      >{segment.label}</button
-                    >
-                  {/if}
-                  <span class="crumb-separator">&gt;</span>
-                {:else}
-                  <span class="crumb-current">{segment.label}</span>
-                {/if}
-              {/each}
-            {/if}
-          </div>
-
-          {#if !currentFolderId}
-            <ul class="list">
-              {#if rootFolderEntries().length === 0}
-                <li class="empty">No folders shared by the remote device.</li>
-              {:else}
-                {#each rootFolderEntries() as folder (folder.id)}
-                  <li class="list-item">
-                    <div class="item-main">
-                      <button
-                        class="item-title"
-                        onclick={() => openFolderRoot(folder.id)}
-                        disabled={folderIsLocked(folder.id)}
-                        >{folder.name}</button
-                      >
-                      <div class="item-meta">
-                        {folder.readOnly ? "read-only" : "read-write"}
-                      </div>
-                      {#if folderState(folder.id)?.encrypted}
-                        <div class="item-meta">
-                          receive-encrypted | {folderLockLabel(folder.id)}
-                        </div>
-                        {#if folderState(folder.id)?.passwordError}
-                          <div class="item-meta">
-                            {folderState(folder.id)?.passwordError}
-                          </div>
-                        {/if}
-                        {#if isFolderPasswordInputVisible(folder.id)}
-                          <label class="inline-input">
-                            <span>Folder Password</span>
-                            <input
-                              type="password"
-                              value={folderPasswordDrafts[folder.id] ?? activeFolderPasswords[folder.id] ?? ""}
-                              oninput={(event) =>
-                                handleFolderPasswordInput(folder.id, event)}
-                              placeholder="Syncthing folder encryption password"
-                            />
-                          </label>
-                        {/if}
-                      {/if}
-                    </div>
-                    <div class="item-actions">
-                      {#if folderState(folder.id)?.encrypted}
-                        <span class={`status-chip small ${folderIsLocked(folder.id) ? "offline" : "online"}`}>
-                          {folderLockLabel(folder.id)}
-                        </span>
-                        {#if !isFolderPasswordInputVisible(folder.id)}
-                          <button
-                            class="ghost icon-only"
-                            onclick={() => openFolderPasswordInput(folder.id)}
-                            title="Edit folder password"
-                            aria-label="Edit folder password"
-                          >
-                            <KeyRound size={16} />
-                          </button>
-                        {/if}
-                        <button
-                          class="ghost icon-only"
-                          onclick={() => saveFolderPassword(folder.id)}
-                          title="Unlock and decrypt folder"
-                          aria-label="Unlock and decrypt folder"
-                        >
-                          <Unlock size={16} />
-                        </button>
-                        <button
-                          class="ghost icon-only"
-                          onclick={() => clearFolderPassword(folder.id)}
-                          disabled={!activeFolderPasswords[folder.id]}
-                          title="Forget saved folder password"
-                          aria-label="Forget saved folder password"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      {/if}
-                      {#if cachedFileKeys.has(cachedFileKey(folder.id, ""))}
-                        <button
-                          class="ghost icon-only"
-                          onclick={() => openCachedDirectory(folder.id, "")}
-                          disabled={isOpeningCachedFile}
-                          title="Open local cached folder"
-                          aria-label="Open local cached folder"
-                        >
-                          <ExternalLink size={16} />
-                        </button>
-                      {/if}
-                      <button
-                        class="icon icon-only"
-                        onclick={() =>
-                          void toggleFavorite(
-                            folder.id,
-                            "",
-                            folder.name,
-                            "folder",
-                          )}
-                        title="Toggle favorite"
-                        aria-label="Toggle favorite"
-                      >
-                        {#if favoriteKeys.has(favoriteKey(folder.id, "", "folder"))}
-                          <Star size={16} />
-                        {:else}
-                          <StarOff size={16} />
-                        {/if}
-                      </button>
-                    </div>
-                  </li>
-                {/each}
-              {/if}
-            </ul>
-          {:else}
-            <ul class="list">
-              {#if folderIsLocked(currentFolderId)}
-                <li class="empty">
-                  This receive-encrypted folder is locked. Use the unlock button in the folder list to browse or download files.
-                </li>
-              {:else if isLoadingDirectory}
-                <li class="empty">Loading folder contents...</li>
-              {:else if entries.length === 0}
-                <li class="empty">Folder is empty.</li>
-              {:else}
-                {#each entries as entry (entry.path)}
-                  <li class="list-item">
-                    <div class="item-main">
-                      {#if entry.type === "directory"}
-                        <button
-                          class="item-title"
-                          onclick={() => openDirectory(entry.path)}
-                          >{entry.name}/</button
-                        >
-                      {:else}
-                        <span class="item-title">{entry.name}</span>
-                      {/if}
-                      <div class="item-meta">
-                        {entry.type} | {formatBytes(entry.size)} | {formatModified(
-                          entry.modifiedMs,
-                        )}
-                      </div>
-                      {#if entry.invalid}
-                        <div class="item-meta">
-                          Unavailable on remote (invalid)
-                        </div>
-                      {/if}
-                    </div>
-                    <div class="item-actions">
-                      {#if entry.type === "directory"}
-                        {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
-                          <button
-                            class="ghost icon-only"
-                            onclick={() =>
-                              openCachedDirectory(currentFolderId, entry.path)}
-                            disabled={isOpeningCachedFile}
-                            title="Open local cached directory"
-                            aria-label="Open local cached directory"
-                          >
-                            <ExternalLink size={16} />
-                          </button>
-                        {/if}
-                      {/if}
-                      {#if entry.type !== "directory"}
-                        {#if cachedFileKeys.has(cachedFileKey(currentFolderId, entry.path))}
-                          <button
-                            class="ghost icon-only"
-                            onclick={() =>
-                              openCachedFile(currentFolderId, entry.path)}
-                            disabled={isOpeningCachedFile}
-                            title="Open cached file"
-                            aria-label="Open cached file"
-                          >
-                            <ExternalLink size={16} />
-                          </button>
-                          <button
-                            class="ghost icon-only"
-                            onclick={() =>
-                              openCachedFileDirectory(currentFolderId, entry.path)}
-                            disabled={isOpeningCachedFile}
-                            title="Open cached file directory"
-                            aria-label="Open cached file directory"
-                          >
-                            <FolderOpen size={16} />
-                          </button>
-                        {:else}
-                          <button
-                            class="ghost icon-only"
-                            onclick={() =>
-                              downloadFile(
-                                currentFolderId,
-                                entry.path,
-                                entry.name,
-                              )}
-                            disabled={isDownloading || entry.invalid}
-                            title={downloadButtonLabel(currentFolderId, entry.path)}
-                            aria-label={downloadButtonLabel(currentFolderId, entry.path)}
-                          >
-                            <Download size={16} />
-                          </button>
-                        {/if}
-                      {/if}
-                      <button
-                        class="icon icon-only"
-                        onclick={() =>
-                          void toggleFavorite(
-                            currentFolderId,
-                            entry.path,
-                            entry.name,
-                            entry.type === "directory" ? "folder" : "file",
-                          )}
-                        title="Toggle favorite"
-                        aria-label="Toggle favorite"
-                      >
-                        {#if favoriteKeys.has(
-                          favoriteKey(
-                            currentFolderId,
-                            entry.path,
-                            entry.type === "directory" ? "folder" : "file",
-                          ),
-                        )}
-                          <Star size={16} />
-                        {:else}
-                          <StarOff size={16} />
-                        {/if}
-                      </button>
-                    </div>
-                  </li>
-                {/each}
-              {/if}
-            </ul>
-
-            <div class="actions">
-              <input
-                id="folder-upload-input"
-                type="file"
-                style="display: none;"
-                onchange={handleUploadSelected}
-              />
-              <button class="primary" onclick={handleUploadClick}
-                >Upload</button
-              >
-            </div>
-            {#if uploadMessage}
-              <div class="hint">{uploadMessage}</div>
-            {/if}
-          {/if}
-        {/if}
-      </section>
-    {/if}
-
-  </main>
-
-  <nav class="bottom-tabs">
-    <button
-      class={`tab-button ${activeTab === "favorites" ? "active" : ""}`}
-      onclick={() => switchTab("favorites")}
-    >
-      <Star size={18} aria-hidden="true" />
-      <span class="sr-only">Favorites</span>
-    </button>
-    <button
-      class={`tab-button ${activeTab === "folders" ? "active" : ""}`}
-      onclick={() => switchTab("folders")}
-    >
-      <FolderOpen size={18} aria-hidden="true" />
-      <span class="sr-only">Folders</span>
-    </button>
-    <button
-      class={`tab-button ${activeTab === "devices" ? "active" : ""}`}
-      onclick={() => switchTab("devices")}
-    >
-      <Settings size={18} aria-hidden="true" />
-      <span class="sr-only">Settings</span>
-    </button>
-  </nav>
-</div>
+    <nav class="bottom-tabs">
+      <button
+        type="button"
+        class={`tab-button ${app.activeTab === "favorites" ? "active" : ""}`}
+        onclick={(event) => actions.switchTab("favorites", event)}
+      >
+        <Star size={18} aria-hidden="true" />
+        <span class="sr-only">Favorites</span>
+      </button>
+      <button
+        type="button"
+        class={`tab-button ${app.activeTab === "folders" ? "active" : ""}`}
+        onclick={(event) => actions.switchTab("folders", event)}
+      >
+        <FolderOpen size={18} aria-hidden="true" />
+        <span class="sr-only">Folders</span>
+      </button>
+      <button
+        type="button"
+        class={`tab-button ${app.activeTab === "devices" ? "active" : ""}`}
+        onclick={(event) => actions.switchTab("devices", event)}
+      >
+        <Settings size={18} aria-hidden="true" />
+        <span class="sr-only">Settings</span>
+      </button>
+    </nav>
+  </div>
 {:else}
-  <DiagnosticsPage onBack={closeDiagnosticsPage} onRun={runFolderDiagnosticsTest} />
+  <DiagnosticsPage
+    onBack={actions.closeDiagnosticsPage}
+    onRun={actions.runFolderDiagnosticsTest}
+  />
 {/if}
 
 <style>
@@ -3097,24 +303,28 @@
     color: #1f2933;
   }
 
-  .app-shell {
-    min-height: 100vh;
+  :global(.app-shell) {
+    height: 100dvh;
     display: flex;
     flex-direction: column;
     background: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
     padding-top: env(safe-area-inset-top);
+    overflow: hidden;
   }
 
-  .content {
+  :global(.content) {
     flex: 1;
-    padding: 0.9rem 0.8rem calc(5.4rem + env(safe-area-inset-bottom));
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0.9rem 0.8rem 0.9rem;
     max-width: 960px;
     margin: 0 auto;
     width: 100%;
     box-sizing: border-box;
   }
 
-  .panel {
+  :global(.panel) {
     background: transparent;
     border: none;
     border-radius: 0;
@@ -3130,20 +340,20 @@
     background: #fff1f1;
   }
 
-  .panel + .panel {
+  :global(.panel + .panel) {
     margin-top: 0.45rem;
     padding-top: 0.55rem;
     border-top: 1px solid #d4deea;
   }
 
-  .heading {
+  :global(.heading) {
     margin: 0 0 0.35rem;
     font-size: 0.94rem;
     font-weight: 700;
     letter-spacing: 0.01em;
   }
 
-  .heading-row {
+  :global(.heading-row) {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -3152,14 +362,14 @@
     flex-wrap: wrap;
   }
 
-  form.settings {
+  :global(form.settings) {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 0.45rem;
     margin-top: 0.35rem;
   }
 
-  label {
+  :global(label) {
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
@@ -3167,26 +377,26 @@
     color: #445366;
   }
 
-  .checkbox-row {
+  :global(.checkbox-row) {
     flex-direction: row;
     align-items: center;
     gap: 0.45rem;
     min-height: 42px;
   }
 
-  .inline-input {
+  :global(.inline-input) {
     margin-top: 0.35rem;
     max-width: 24rem;
   }
 
-  .checkbox-row input[type="checkbox"] {
+  :global(.checkbox-row input[type="checkbox"]) {
     width: 18px;
     height: 18px;
     margin: 0;
   }
 
-  input,
-  select {
+  :global(input),
+  :global(select) {
     padding: 0.4rem 0.45rem;
     font-size: 0.88rem;
     border: 1px solid #c7d2df;
@@ -3194,7 +404,7 @@
     background: #fff;
   }
 
-  textarea.recovery-secret {
+  :global(textarea.recovery-secret) {
     width: 100%;
     min-height: 88px;
     resize: vertical;
@@ -3207,14 +417,14 @@
     font-family: "IBM Plex Mono", monospace;
   }
 
-  .actions {
+  :global(.actions) {
     display: flex;
     gap: 0.4rem;
     margin-top: 0.4rem;
     flex-wrap: wrap;
   }
 
-  button {
+  :global(button) {
     border: 1px solid #a6b7ca;
     border-radius: 8px;
     background: #ffffff;
@@ -3224,46 +434,44 @@
     min-height: 42px;
     cursor: pointer;
     transition:
-      transform 120ms ease,
       box-shadow 120ms ease,
       background-color 120ms ease;
-    will-change: transform;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 0.35rem;
+    touch-action: manipulation;
   }
 
-  button.primary {
+  :global(button.primary) {
     border-color: #0f4a93;
     background: #0f4a93;
     color: #fff;
   }
 
-  button.ghost {
+  :global(button.ghost) {
     border-color: #c8d4e2;
     background: #f8fbff;
   }
 
-  button.icon {
+  :global(button.icon) {
     min-width: 2.3rem;
     padding: 0.35rem 0.5rem;
     text-align: center;
   }
 
-  button.icon-only {
+  :global(button.icon-only) {
     width: 2.3rem;
     min-width: 2.3rem;
     padding: 0.35rem;
   }
 
-  button:disabled {
+  :global(button:disabled) {
     opacity: 0.55;
     cursor: not-allowed;
   }
 
-  button:active:not(:disabled) {
-    transform: scale(0.97);
+  :global(button:active:not(:disabled)) {
     box-shadow: inset 0 0 0 999px rgba(15, 74, 147, 0.08);
   }
 
@@ -3275,7 +483,7 @@
     gap: 0.45rem;
   }
 
-  .status-row {
+  :global(.status-row) {
     display: flex;
     gap: 0.4rem;
     align-items: center;
@@ -3285,7 +493,7 @@
     margin-bottom: 0.4rem;
   }
 
-  .identity-inline {
+  :global(.identity-inline) {
     display: flex;
     justify-content: space-between;
     gap: 0.5rem;
@@ -3298,7 +506,7 @@
     flex-wrap: wrap;
   }
 
-  .status-chip {
+  :global(.status-chip) {
     display: inline-flex;
     align-items: center;
     padding: 0.12rem 0.45rem;
@@ -3308,41 +516,41 @@
     letter-spacing: 0.02em;
   }
 
-  .status-chip.online {
+  :global(.status-chip.online) {
     background: #d7f4e4;
     color: #0d7044;
   }
 
-  .status-chip.offline {
+  :global(.status-chip.offline) {
     background: #fde3e3;
     color: #9c2d2d;
   }
 
-  .status-chip.small {
+  :global(.status-chip.small) {
     font-size: 0.68rem;
     padding: 0.08rem 0.35rem;
   }
 
-  details {
+  :global(details) {
     border: 1px solid #dbe3ee;
     border-radius: 10px;
     padding: 0.32rem 0.45rem;
     background: #fbfdff;
   }
 
-  summary {
+  :global(summary) {
     cursor: pointer;
     font-size: 0.82rem;
     color: #304a66;
     font-weight: 600;
   }
 
-  .saved-device-editor {
+  :global(.saved-device-editor) {
     display: grid;
     gap: 0.45rem;
   }
 
-  .breadcrumbs {
+  :global(.breadcrumbs) {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -3351,11 +559,11 @@
     font-size: 0.87rem;
   }
 
-  .crumb-separator {
+  :global(.crumb-separator) {
     color: #6f8297;
   }
 
-  .crumb-button {
+  :global(.crumb-button) {
     border: none;
     background: none;
     color: #0f4a93;
@@ -3363,12 +571,12 @@
     border-radius: 0;
   }
 
-  .crumb-current {
+  :global(.crumb-current) {
     font-weight: 700;
     color: #1d334a;
   }
 
-  .list {
+  :global(.list) {
     list-style: none;
     padding: 0;
     margin: 0;
@@ -3377,7 +585,7 @@
     overflow: hidden;
   }
 
-  .list-item {
+  :global(.list-item) {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 0.35rem;
@@ -3386,22 +594,22 @@
     background: #fff;
   }
 
-  .list-item:last-child {
+  :global(.list-item:last-child) {
     border-bottom: none;
   }
 
-  .item-main {
+  :global(.item-main) {
     min-width: 0;
   }
 
-  .item-title-row {
+  :global(.item-title-row) {
     display: flex;
     align-items: center;
     gap: 0.4rem;
     flex-wrap: wrap;
   }
 
-  .item-title {
+  :global(.item-title) {
     border: none;
     background: none;
     padding: 0;
@@ -3414,21 +622,21 @@
     white-space: nowrap;
   }
 
-  .item-meta {
+  :global(.item-meta) {
     font-size: 0.74rem;
     color: #61778f;
     overflow-wrap: anywhere;
   }
 
-  .log-error {
+  :global(.log-error) {
     color: #a61b1b;
   }
 
-  .log-warning {
+  :global(.log-warning) {
     color: #9a5c00;
   }
 
-  .log-details {
+  :global(.log-details) {
     margin: 0.35rem 0 0;
     font-family: "IBM Plex Mono", monospace;
     font-size: 0.7rem;
@@ -3442,7 +650,7 @@
     padding: 0.35rem 0.4rem;
   }
 
-  .item-actions {
+  :global(.item-actions) {
     display: flex;
     gap: 0.35rem;
     align-items: center;
@@ -3451,7 +659,7 @@
     flex-wrap: wrap;
   }
 
-  .empty {
+  :global(.empty) {
     padding: 0.5rem;
     color: #607286;
     font-size: 0.86rem;
@@ -3463,23 +671,23 @@
     font-size: 0.84rem;
   }
 
-  .hint {
+  :global(.hint) {
     margin-top: 0.35rem;
     font-size: 0.78rem;
     color: #7c2d12;
   }
 
   .bottom-tabs {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
+    position: relative;
+    flex-shrink: 0;
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     background: #101d2e;
     border-top: 1px solid #1d324e;
     padding: 0.45rem 0.45rem calc(0.45rem + env(safe-area-inset-bottom));
     gap: 0.35rem;
+    z-index: 1000;
+    pointer-events: auto;
   }
 
   .tab-button {
@@ -3494,6 +702,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    pointer-events: auto;
   }
 
   .tab-button.active {
@@ -3515,19 +724,19 @@
   }
 
   @media (max-width: 640px) {
-    .content {
-      padding: 0.7rem 0.6rem calc(5.2rem + env(safe-area-inset-bottom));
+    :global(.content) {
+      padding: 0.7rem 0.6rem 0.7rem;
     }
 
-    form.settings {
+    :global(form.settings) {
       grid-template-columns: 1fr;
     }
 
-    .list-item {
+    :global(.list-item) {
       grid-template-columns: 1fr;
     }
 
-    .item-actions {
+    :global(.item-actions) {
       justify-content: flex-start;
     }
   }

@@ -33,6 +33,19 @@ const cloneState = (state: SessionState): SessionState => ({
   connectOptions: state.connectOptions ? { ...state.connectOptions } : null,
 });
 
+const sameStringRecord = (
+  left: Record<string, string> | null | undefined,
+  right: Record<string, string> | null | undefined,
+): boolean => {
+  const leftEntries = Object.entries(left ?? {});
+  const rightEntries = Object.entries(right ?? {});
+  if (leftEntries.length !== rightEntries.length) return false;
+  for (const [key, value] of leftEntries) {
+    if ((right ?? {})[key] !== value) return false;
+  }
+  return true;
+};
+
 export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): SyncpeerSessionStore => {
   const now = depsInput.now ?? (() => Date.now());
   const sleep = depsInput.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -297,10 +310,22 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     },
 
     setFolderPasswords: async (folderPasswords: Record<string, string>): Promise<void> => {
-      setState((current) => ({
-        ...current,
-        connectOptions: withUpdatedFolderPasswords(current.connectOptions, folderPasswords),
-      }));
+      if (sameStringRecord(state.connectOptions?.folderPasswords, folderPasswords)) {
+        return;
+      }
+      setState((current) => {
+        const nextConnectOptions = withUpdatedFolderPasswords(
+          current.connectOptions,
+          folderPasswords,
+        );
+        if (sameStringRecord(current.connectOptions?.folderPasswords, folderPasswords)) {
+          return current;
+        }
+        return {
+          ...current,
+          connectOptions: nextConnectOptions,
+        };
+      });
     },
   };
 
@@ -316,4 +341,3 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     actions,
   };
 };
-

@@ -37,6 +37,13 @@ export const resolveOverviewSourceDeviceId = (
 ): string =>
   normalizeDeviceId(overview.device?.id ?? connectOptions?.remoteId ?? "");
 
+export const resolvePreferredSourceDeviceId = (
+  remoteDeviceId: string | null | undefined,
+  connectionRemoteId: string | null | undefined,
+  selectedSavedDeviceId: string | null | undefined,
+): string =>
+  normalizeDeviceId(remoteDeviceId ?? connectionRemoteId ?? selectedSavedDeviceId ?? "");
+
 export const shouldPreserveEmptyOverview = (
   state: SessionState,
   sourceDeviceId: string,
@@ -133,4 +140,3 @@ export const withUpdatedFolderPasswords = (
     folderPasswords: { ...folderPasswords },
   };
 };
-

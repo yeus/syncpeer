@@ -42,11 +42,18 @@ export {
   normalizeFolderPasswords,
   normalizePath,
   normalizeSavedDevices,
+  sameDeviceId,
   normalizeSyncApprovedIntroducedFolderKeys,
   resolveDirectoryPath,
   sleep,
   syncApprovedFolderKey,
 } from "./ui/helpers.ts";
+export {
+  FOLDER_PASSWORD_SCOPE_SEPARATOR,
+  folderPasswordScopedKey,
+  isScopedFolderPasswordKey,
+  resolveFolderPasswordsForDevice,
+} from "./ui/sessionPasswords.ts";
 export type {
   AdvertisedDeviceItem,
   AdvertisedFolderItem,
@@ -65,6 +72,7 @@ export {
   makeWaitForFolderIndexToArriveFlow,
   makeWaitForFoldersToPopulateFlow,
 } from "./ui/sessionFlows.ts";
+export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.ts";
 export type {
   CachedFileRecord,
   CachedFileStatus,

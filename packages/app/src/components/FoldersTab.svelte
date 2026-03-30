@@ -9,7 +9,7 @@
   import Trash2 from "lucide-svelte/icons/trash-2";
   import Unlock from "lucide-svelte/icons/unlock";
   import Breadcrumbs from "./Breadcrumbs.svelte";
-  import ListRow from "./ListRow.svelte";
+  import FileSystemListItem from "./FileSystemListItem.svelte";
   import Panel from "./Panel.svelte";
   import StatusChip from "./StatusChip.svelte";
 
@@ -109,15 +109,12 @@
           <li class="empty">No folders shared by the remote device.</li>
         {:else}
           {#each rootFolders as folder (folder.id)}
-            <ListRow>
-              <button
-                class="item-title"
-                onclick={() => onOpenFolderRoot(folder.id)}
-                disabled={isFolderLocked(folder.id)}
-              >
-                {folder.name}
-              </button>
-              <div class="item-meta">{folder.readOnly ? "read-only" : "read-write"}</div>
+            <FileSystemListItem
+              title={folder.name}
+              onTitleClick={() => onOpenFolderRoot(folder.id)}
+              titleDisabled={isFolderLocked(folder.id)}
+              metaLines={[folder.readOnly ? "read-only" : "read-write"]}
+            >
               {#if folderState(folder.id)?.encrypted}
                 <div class="item-meta">receive-encrypted | {folderLockLabel(folder.id)}</div>
                 {#if folderState(folder.id)?.passwordError}
@@ -189,7 +186,7 @@
                   {/if}
                 </button>
               </svelte:fragment>
-            </ListRow>
+            </FileSystemListItem>
           {/each}
         {/if}
       </ul>
@@ -205,15 +202,11 @@
           <li class="empty">Folder is empty.</li>
         {:else}
           {#each app.session.entries as entry (entry.path)}
-            <ListRow>
-              {#if entry.type === "directory"}
-                <button class="item-title" onclick={() => onOpenDirectory(entry.path)}>{entry.name}/</button>
-              {:else}
-                <span class="item-title">{entry.name}</span>
-              {/if}
-              <div class="item-meta">
-                {entry.type} | {formatBytes(entry.size)} | {formatModified(entry.modifiedMs)}
-              </div>
+            <FileSystemListItem
+              title={entry.type === "directory" ? `${entry.name}/` : entry.name}
+              onTitleClick={entry.type === "directory" ? () => onOpenDirectory(entry.path) : undefined}
+              metaLines={[`${entry.type} | ${formatBytes(entry.size)} | ${formatModified(entry.modifiedMs)}`]}
+            >
               {#if entry.invalid}
                 <div class="item-meta">Unavailable on remote (invalid)</div>
               {/if}
@@ -277,7 +270,7 @@
                   {/if}
                 </button>
               </svelte:fragment>
-            </ListRow>
+            </FileSystemListItem>
           {/each}
         {/if}
       </ul>

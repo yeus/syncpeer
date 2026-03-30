@@ -1,4 +1,4 @@
-export { createSyncpeerCoreClient } from "./client.js";
+export { createSyncpeerCoreClient } from "./client.ts";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
@@ -6,7 +6,19 @@ export type {
   SyncpeerSessionHandle,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
-} from "./client.js";
-export { createNodeHostAdapter, createNodeSyncpeerClient } from "./node.js";
-export { RemoteFs } from "./core/model/remoteFs.js";
-export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
+} from "./client.ts";
+export { createNodeHostAdapter, createNodeSessionTransport, createNodeSyncpeerClient } from "./node.ts";
+export { RemoteFs } from "./core/model/remoteFs.ts";
+export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.ts";
+export { createSyncpeerSessionStore } from "./ui/sessionStore.ts";
+export type {
+  SessionPendingState,
+  SessionPhase,
+  SessionRuntimeActions,
+  SessionRuntimeDeps,
+  SessionSnapshotState,
+  SessionState,
+  SessionTraceEvent,
+  SessionTransport,
+  SyncpeerSessionStore,
+} from "./ui/sessionTypes.ts";

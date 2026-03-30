@@ -8,8 +8,9 @@ import {
   Index,
   FileInfo,
   Request,
-} from "./core/protocol/bep.js";
-import { type AdvertisedDeviceInfo, RemoteDeviceInfo, RemoteFs } from "./core/model/remoteFs.js";
+} from "./core/protocol/bep.ts";
+import { RemoteFs } from "./core/model/remoteFs.ts";
+import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.ts";
 import {
   decryptEncryptedFilename,
   decryptUntrustedBytes,
@@ -17,7 +18,7 @@ import {
   deriveUntrustedFolderCrypto,
   verifyUntrustedPasswordToken,
   type UntrustedFolderCrypto,
-} from "./core/model/untrusted.js";
+} from "./core/model/untrusted.ts";
 
 export interface SyncpeerTlsConnectOptions {
   host: string;
@@ -465,15 +466,25 @@ class BepSession {
   private echoedClusterConfig = false;
   private localIndexId: string;
   private readonly folderPasswords: Map<string, string>;
+  private socket: SyncpeerTlsSocket;
+  private adapter: SyncpeerHostAdapter;
+  private localDeviceId: Uint8Array;
+  private localDeviceName: string;
+  private remoteDeviceId?: Uint8Array;
 
   constructor(
-    private socket: SyncpeerTlsSocket,
-    private adapter: SyncpeerHostAdapter,
-    private localDeviceId: Uint8Array,
-    private localDeviceName: string,
+    socket: SyncpeerTlsSocket,
+    adapter: SyncpeerHostAdapter,
+    localDeviceId: Uint8Array,
+    localDeviceName: string,
     folderPasswords?: Record<string, string>,
-    private remoteDeviceId?: Uint8Array,
+    remoteDeviceId?: Uint8Array,
   ) {
+    this.socket = socket;
+    this.adapter = adapter;
+    this.localDeviceId = localDeviceId;
+    this.localDeviceName = localDeviceName;
+    this.remoteDeviceId = remoteDeviceId;
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;

@@ -85,7 +85,10 @@ export function encodeHelloFrame(message: Record<string, unknown>): Uint8Array {
 
 export class FrameParser {
   private buffer = new Uint8Array(0);
-  constructor(private onFrame: (type: MessageType, msg: unknown) => void) {}
+  private onFrame: (type: MessageType, msg: unknown) => void;
+  constructor(onFrame: (type: MessageType, msg: unknown) => void) {
+    this.onFrame = onFrame;
+  }
   feed(data: Uint8Array): void {
     const combined = new Uint8Array(this.buffer.length + data.length);
     combined.set(this.buffer, 0);

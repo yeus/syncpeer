@@ -119,7 +119,6 @@ label {
 .panel {
   background: var(--bg-surface-soft);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
   box-shadow: var(--shadow-soft);
   padding: var(--space-3);
 }

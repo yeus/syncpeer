@@ -329,7 +329,7 @@
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 0.9rem 0.8rem;
+    padding: 0.9rem 0.0rem;
     max-width: 960px;
     margin: 0 auto;
     width: 100%;

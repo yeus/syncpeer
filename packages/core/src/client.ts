@@ -129,6 +129,8 @@ interface FolderState {
   needsPassword: boolean;
   passwordError?: string;
   folderCrypto?: UntrustedFolderCrypto;
+  localDevicePresentInFolder: boolean;
+  stopReason: number;
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
@@ -608,6 +610,7 @@ class BepSession {
         remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0";
       const remoteMaxSequence = String(remoteDevice?.max_sequence ?? 0);
       const folderId = String(folder.id ?? "").trim();
+      const stopReason = Number(folder.stop_reason ?? 0);
       const normalizedDeviceIds = folderDevices
         .filter((device: any) => device?.id instanceof Uint8Array)
         .map((device: any) => encodeDeviceId(device.id));
@@ -623,7 +626,7 @@ class BepSession {
       this.log("cluster.folder.received", {
         folderId,
         folderType: Number(folder.type ?? 0),
-        stopReason: Number(folder.stop_reason ?? 0),
+        stopReason,
         remoteIndexId,
         remoteMaxSequence,
         deviceCount: folderDevices.length,
@@ -685,6 +688,8 @@ class BepSession {
         needsPassword,
         passwordError,
         folderCrypto,
+        localDevicePresentInFolder: !!localDeviceEntry,
+        stopReason,
         indexReceived: preserveIndexState
           ? previousState.indexReceived
           : false,

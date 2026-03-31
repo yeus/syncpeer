@@ -28,6 +28,8 @@ export interface FolderInfo {
   encrypted?: boolean;
   needsPassword?: boolean;
   passwordError?: string;
+  localDevicePresentInFolder?: boolean;
+  stopReason?: number;
 }
 
 export interface FolderSyncState {
@@ -157,4 +159,3 @@ export function normalizeDeviceId(value: string): string;
 export function normalizePath(value: string): string;
 export function resolveDirectoryPath(basePath: string, childPath: string): string;
 export function sleep(ms: number): Promise<void>;
-

@@ -321,6 +321,10 @@ const ensureClientName = (state: AppState) => {
   return true;
 };
 
+const remoteHasUnapprovedFolderShare = (
+  folders: Array<{ localDevicePresentInFolder?: boolean }>,
+) => folders.some((folder) => folder.localDevicePresentInFolder === false);
+
 const validateConnection = (state: AppState) => {
   if (
     state.connection.discoveryMode === "global" &&
@@ -417,6 +421,9 @@ export const createAppActions = (args: {
       );
       setRemoteApprovalPending(state, attemptedDeviceId, false);
       setRemoteApprovalPending(state, sourceDeviceId, false);
+      if (remoteHasUnapprovedFolderShare(session.folders)) {
+        setRemoteApprovalPending(state, sourceDeviceId, true);
+      }
       if (
         state.approvals.pendingApprovalPromptDeviceId &&
         (sameDeviceId(state.approvals.pendingApprovalPromptDeviceId, attemptedDeviceId) ||
@@ -475,6 +482,11 @@ export const createAppActions = (args: {
         sourceDeviceId,
         session.remoteDevice?.deviceName,
       );
+      if (remoteHasUnapprovedFolderShare(session.folders)) {
+        setRemoteApprovalPending(state, sourceDeviceId, true);
+      } else {
+        setRemoteApprovalPending(state, sourceDeviceId, false);
+      }
       saveOfflineSnapshot(state, sourceDeviceId, {
         folders: session.folders,
         remoteDevice: session.remoteDevice,

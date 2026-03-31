@@ -19,6 +19,8 @@ export interface FolderDiagnosticsFolderResult {
   label: string;
   encrypted: boolean;
   needsPassword: boolean;
+  localDevicePresentInFolder: boolean;
+  stopReason: number;
   indexReceived: boolean;
   remoteIndexId: string | null;
   remoteMaxSequence: string | null;
@@ -143,6 +145,8 @@ export async function runFolderContentDiagnostics(args: {
       label: folder.label || folder.id,
       encrypted: Boolean(folder.encrypted),
       needsPassword: Boolean(folder.needsPassword),
+      localDevicePresentInFolder: folder.localDevicePresentInFolder !== false,
+      stopReason: Number(folder.stopReason ?? 0),
     });
     await session.actions.openFolder(folder.id, args.options);
     const folderState = session.getState();
@@ -155,6 +159,8 @@ export async function runFolderContentDiagnostics(args: {
       label: folder.label || folder.id,
       encrypted: !!folder.encrypted,
       needsPassword: !!folder.needsPassword,
+      localDevicePresentInFolder: folder.localDevicePresentInFolder !== false,
+      stopReason: Number(folder.stopReason ?? 0),
       indexReceived: !!syncState?.indexReceived,
       remoteIndexId: syncState?.remoteIndexId ?? null,
       remoteMaxSequence: syncState?.remoteMaxSequence ?? null,
@@ -165,6 +171,17 @@ export async function runFolderContentDiagnostics(args: {
     };
     if (folder.needsPassword) {
       result.readDirError = "Folder is locked (missing or invalid password).";
+      folderResults.push(result);
+      continue;
+    }
+    if (!result.localDevicePresentInFolder) {
+      result.readDirError =
+        "Remote has not approved this local device for the folder yet (local device not listed in folder devices).";
+      folderResults.push(result);
+      continue;
+    }
+    if (result.stopReason !== 0) {
+      result.readDirError = `Remote folder is stopped (stopReason=${result.stopReason}).`;
       folderResults.push(result);
       continue;
     }

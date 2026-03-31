@@ -138,7 +138,7 @@
                   </label>
                 {/if}
               {/if}
-              <svelte:fragment slot="actions">
+              {#snippet actions()}
                 {#if folderState(folder.id)?.encrypted}
                   <StatusChip tone={isFolderLocked(folder.id) ? "offline" : "online"} small>
                     {folderLockLabel(folder.id)}
@@ -185,7 +185,7 @@
                     <StarOff size={16} />
                   {/if}
                 </button>
-              </svelte:fragment>
+              {/snippet}
             </FileSystemListItem>
           {/each}
         {/if}
@@ -210,7 +210,7 @@
               {#if entry.invalid}
                 <div class="item-meta">Unavailable on remote (invalid)</div>
               {/if}
-              <svelte:fragment slot="actions">
+              {#snippet actions()}
                 {#if entry.type === "directory"}
                   {#if app.favorites.cachedFileKeys.has(`${app.session.currentFolderId}:${entry.path}`)}
                     <button
@@ -269,7 +269,7 @@
                     <StarOff size={16} />
                   {/if}
                 </button>
-              </svelte:fragment>
+              {/snippet}
             </FileSystemListItem>
           {/each}
         {/if}

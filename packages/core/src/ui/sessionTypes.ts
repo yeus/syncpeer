@@ -63,6 +63,7 @@ export interface SessionRuntimeActions {
   connect: (options: ConnectOptions) => Promise<void>;
   disconnect: () => Promise<void>;
   refreshOverview: (options?: ConnectOptions) => Promise<void>;
+  goToRoot: () => Promise<void>;
   openFolder: (folderId: string, options?: ConnectOptions) => Promise<void>;
   openPath: (path: string, options?: ConnectOptions) => Promise<void>;
   goToPath: (folderId: string, path: string, options?: ConnectOptions) => Promise<void>;
@@ -75,4 +76,3 @@ export interface SyncpeerSessionStore {
   subscribe: (listener: (state: SessionState) => void) => () => void;
   actions: SessionRuntimeActions;
 }
-

@@ -467,6 +467,7 @@ class BepSession {
   private closed = false;
   private echoedClusterConfig = false;
   private localIndexId: string;
+  private localIndexIdsByFolder = new Map<string, string>();
   private readonly folderPasswords: Map<string, string>;
   private socket: SyncpeerTlsSocket;
   private adapter: SyncpeerHostAdapter;
@@ -516,6 +517,22 @@ class BepSession {
 
   private log(event: string, details?: Record<string, unknown>): void {
     this.adapter.log?.(`core.${event}`, details);
+  }
+
+  private localIndexIdForFolder(folderId: string): string {
+    const existing = this.localIndexIdsByFolder.get(folderId);
+    if (existing) return existing;
+    const mask64 = (1n << 64n) - 1n;
+    let hash = 1469598103934665603n;
+    const seed = `${this.localIndexId}:${folderId}`;
+    for (let index = 0; index < seed.length; index += 1) {
+      hash ^= BigInt(seed.charCodeAt(index));
+      hash = (hash * 1099511628211n) & mask64;
+    }
+    if (hash === 0n) hash = 1n;
+    const next = hash.toString();
+    this.localIndexIdsByFolder.set(folderId, next);
+    return next;
   }
 
   private async readLoop(): Promise<void> {
@@ -712,7 +729,9 @@ class BepSession {
     if (!this.echoedClusterConfig) {
       this.echoedClusterConfig = true;
       const folders = (cfg.folders || []).map((folder: any) => {
-        const state = this.folders.get(String(folder.id ?? ""));
+        const folderId = String(folder.id ?? "");
+        const state = this.folders.get(folderId);
+        const localFolderIndexId = this.localIndexIdForFolder(folderId);
         const baseDevices = Array.isArray(folder.devices)
           ? [...folder.devices]
           : [];
@@ -735,7 +754,7 @@ class BepSession {
           addresses: ["dynamic"],
           compression: 0,
           max_sequence: 0,
-          index_id: this.localIndexId,
+          index_id: localFolderIndexId,
           // Compatibility: some peers reject our cluster config if we advertise that
           // we also have encrypted-at-rest data for the same folder.
           encryption_password_token: undefined,
@@ -1284,17 +1303,16 @@ async function openSession(
 
   const errors: string[] = [];
   if (directCandidates.length > 0) {
-    const directResult = await new Promise<SyncpeerSessionHandle | null>((resolve) => {
-      let pending = directCandidates.length;
-      let settled = false;
-      for (const candidate of directCandidates) {
+    for (const candidate of directCandidates) {
+      try {
         adapter.log?.("core.discovery.candidate.try", {
           address: candidate.address,
           host: candidate.host,
           port: candidate.port,
           perCandidateTimeout,
+          strategy: "sequential",
         });
-        withTimeout(
+        return await withTimeout(
           openDirectSession(
             adapter,
             opts,
@@ -1302,35 +1320,17 @@ async function openSession(
             candidate.port!,
           ),
           perCandidateTimeout,
-        )
-          .then(async (session) => {
-            if (settled) {
-              await session.close().catch(() => undefined);
-              return;
-            }
-            settled = true;
-            resolve(session);
-          })
-          .catch((error) => {
-            const message = error instanceof Error ? error.message : String(error);
-            adapter.log?.("core.discovery.candidate.failed", {
-              address: candidate.address,
-              host: candidate.host,
-              port: candidate.port,
-              message,
-            });
-            errors.push(`${candidate.address}: ${message}`);
-          })
-          .finally(() => {
-            pending -= 1;
-            if (!settled && pending <= 0) {
-              resolve(null);
-            }
-          });
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        adapter.log?.("core.discovery.candidate.failed", {
+          address: candidate.address,
+          host: candidate.host,
+          port: candidate.port,
+          message,
+        });
+        errors.push(`${candidate.address}: ${message}`);
       }
-    });
-    if (directResult) {
-      return directResult;
     }
   }
 

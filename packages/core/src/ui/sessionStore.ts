@@ -216,6 +216,17 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       }
     },
 
+    goToRoot: async (): Promise<void> => {
+      setState((current) => ({
+        ...current,
+        currentFolderId: "",
+        currentPath: "",
+        entries: [],
+        currentFolderVersionKey: "",
+        pending: { ...current.pending, loadingDirectory: false },
+      }));
+    },
+
     openFolder: async (folderId: string, options?: ConnectOptions): Promise<void> => {
       setState((current) => setCurrentLocation(current, folderId, ""));
       await actions.reloadCurrentDirectory(options);

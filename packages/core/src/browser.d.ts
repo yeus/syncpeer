@@ -126,6 +126,7 @@ export interface SyncpeerSessionStore {
     connect: (options: ConnectOptions) => Promise<void>;
     disconnect: () => Promise<void>;
     refreshOverview: (options?: ConnectOptions) => Promise<void>;
+    goToRoot: () => Promise<void>;
     openFolder: (folderId: string, options?: ConnectOptions) => Promise<void>;
     openPath: (path: string, options?: ConnectOptions) => Promise<void>;
     goToPath: (folderId: string, path: string, options?: ConnectOptions) => Promise<void>;

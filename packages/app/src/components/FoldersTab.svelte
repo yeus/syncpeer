@@ -23,6 +23,8 @@
     onGoToBreadcrumb: (segment: any) => void;
     onOpenFolderRoot: (folderId: string) => void;
     onOpenDirectory: (path: string) => void;
+    onSetDirectoryPage: (page: number) => void;
+    onSetDirectoryPageSize: (size: number) => void;
     onOpenCachedDirectory: (folderId: string, path: string) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
@@ -38,6 +40,10 @@
     isPasswordInputVisible: (folderId: string) => boolean;
     activeFolderPasswords: Record<string, string>;
     downloadButtonLabel: (folderId: string, path: string) => string;
+    entries: any[];
+    directoryPage: number;
+    directoryTotalPages: number;
+    directoryPageSize: number;
     formatBytes: (value: number) => string;
     formatModified: (value: number) => string;
     onHandleUploadSelected: (event: Event) => void;
@@ -53,6 +59,8 @@
     onGoToBreadcrumb,
     onOpenFolderRoot,
     onOpenDirectory,
+    onSetDirectoryPage,
+    onSetDirectoryPageSize,
     onOpenCachedDirectory,
     onOpenCachedFile,
     onOpenCachedFileDirectory,
@@ -68,6 +76,10 @@
     isPasswordInputVisible,
     activeFolderPasswords,
     downloadButtonLabel,
+    entries,
+    directoryPage,
+    directoryTotalPages,
+    directoryPageSize,
     formatBytes,
     formatModified,
     onHandleUploadSelected,
@@ -201,7 +213,7 @@
         {:else if app.session.entries.length === 0}
           <li class="empty">Folder is empty.</li>
         {:else}
-          {#each app.session.entries as entry (entry.path)}
+          {#each entries as entry (entry.path)}
             <FileSystemListItem
               title={entry.type === "directory" ? `${entry.name}/` : entry.name}
               onTitleClick={entry.type === "directory" ? () => onOpenDirectory(entry.path) : undefined}
@@ -274,6 +286,42 @@
           {/each}
         {/if}
       </ul>
+
+      {#if app.session.entries.length > 0}
+        <div class="actions">
+          <label>
+            Files per page
+            <input
+              type="number"
+              min="10"
+              max="2000"
+              value={directoryPageSize}
+              oninput={(event) => {
+                const next =
+                  event.currentTarget instanceof HTMLInputElement
+                    ? Number(event.currentTarget.value)
+                    : Number.NaN;
+                onSetDirectoryPageSize(next);
+              }}
+            />
+          </label>
+          <button
+            class="ghost"
+            onclick={() => onSetDirectoryPage(directoryPage - 1)}
+            disabled={directoryPage <= 1}
+          >
+            Previous
+          </button>
+          <span class="item-meta">Page {directoryPage} of {directoryTotalPages}</span>
+          <button
+            class="ghost"
+            onclick={() => onSetDirectoryPage(directoryPage + 1)}
+            disabled={directoryPage >= directoryTotalPages}
+          >
+            Next
+          </button>
+        </div>
+      {/if}
 
       <div class="actions">
         <input id="folder-upload-input" type="file" style="display: none;" onchange={onHandleUploadSelected} />

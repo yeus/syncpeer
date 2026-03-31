@@ -321,17 +321,20 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     },
 
     setFolderPasswords: async (folderPasswords: Record<string, string>): Promise<void> => {
+      if (!state.connectOptions) {
+        return;
+      }
       if (sameStringRecord(state.connectOptions?.folderPasswords, folderPasswords)) {
         return;
       }
       setState((current) => {
+        if (!current.connectOptions) {
+          return current;
+        }
         const nextConnectOptions = withUpdatedFolderPasswords(
           current.connectOptions,
           folderPasswords,
         );
-        if (sameStringRecord(current.connectOptions?.folderPasswords, folderPasswords)) {
-          return current;
-        }
         return {
           ...current,
           connectOptions: nextConnectOptions,

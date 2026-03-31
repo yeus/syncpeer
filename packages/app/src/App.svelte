@@ -21,6 +21,9 @@
     advertisedDevices,
     advertisedFolders,
     applySessionState,
+    connectTargetLabel,
+    directoryCurrentPage,
+    directoryTotalPages,
     connectionModeLabel,
     currentSourceIsIntroducer,
     downloadButtonLabel,
@@ -31,6 +34,7 @@
     isFolderPasswordInputVisible,
     isSavedDeviceAwaitingRemoteApproval,
     isSavedDeviceConnected,
+    paginatedDirectoryEntries,
     persistState,
     pushClientLog,
     pushSessionLog,
@@ -70,6 +74,10 @@
   let currentBreadcrumbs = $derived(visibleBreadcrumbs(app));
   let currentRootFolders = $derived(rootFolderEntries(app));
   let currentConnectionModeLabel = $derived(connectionModeLabel(app));
+  let currentConnectTargetLabel = $derived(connectTargetLabel(app));
+  let currentDirectoryEntries = $derived(paginatedDirectoryEntries(app));
+  let currentDirectoryPage = $derived(directoryCurrentPage(app));
+  let currentDirectoryTotalPages = $derived(directoryTotalPages(app));
 
   $effect(() => {
     persistState(app);
@@ -171,6 +179,9 @@
           <button class="primary" onclick={() => actions.connect()} disabled={app.session.isConnecting}>
             {app.session.isConnecting ? "Connecting..." : "Connect"}
           </button>
+          {#if currentConnectTargetLabel}
+            <span>Target: {currentConnectTargetLabel}</span>
+          {/if}
           {#if currentConnectionModeLabel}
             <span>{currentConnectionModeLabel}</span>
           {/if}
@@ -239,6 +250,8 @@
           onGoToBreadcrumb={actions.goToBreadcrumb}
           onOpenFolderRoot={actions.openFolderRoot}
           onOpenDirectory={actions.openDirectory}
+          onSetDirectoryPage={actions.setDirectoryPage}
+          onSetDirectoryPageSize={actions.setDirectoryPageSize}
           onOpenCachedDirectory={actions.openCachedDirectory}
           onOpenCachedFile={actions.openCachedFile}
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
@@ -254,6 +267,10 @@
           isPasswordInputVisible={(folderId) => isFolderPasswordInputVisible(app, folderId)}
           activeFolderPasswords={activePasswords}
           downloadButtonLabel={(folderId, path) => downloadButtonLabel(app, folderId, path)}
+          entries={currentDirectoryEntries}
+          directoryPage={currentDirectoryPage}
+          directoryTotalPages={currentDirectoryTotalPages}
+          directoryPageSize={app.ui.directoryPageSize}
           {formatBytes}
           {formatModified}
           onHandleUploadSelected={actions.handleUploadSelected}

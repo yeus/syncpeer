@@ -1,0 +1,59 @@
+:root {
+  --font-sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --bg-canvas: #f3f5f8;
+  --bg-shell: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
+  --bg-surface: #ffffff;
+  --bg-surface-soft: #fbfdff;
+  --bg-surface-muted: #f4f8fc;
+  --bg-nav: rgba(255, 255, 255, 0.92);
+
+  --text-primary: #1f2933;
+  --text-strong: #1d334a;
+  --text-secondary: #445366;
+  --text-muted: #61778f;
+
+  --color-primary: #0f4a93;
+  --color-primary-strong: #0d3668;
+  --color-primary-soft: #eaf3ff;
+  --color-primary-hover: #0d4385;
+  --color-on-primary: #ffffff;
+
+  --border-soft: #dde5ef;
+  --border-default: #dbe3ee;
+  --border-strong: #c7d2df;
+  --border-accent: #d7e7fb;
+  --border-hover: #9eb6d3;
+  --border-list-divider: #eef2f7;
+  --border-log: #d8e2ee;
+
+  --state-success-bg: #d7f4e4;
+  --state-success-text: #0d7044;
+  --state-offline-bg: #fde3e3;
+  --state-offline-text: #9c2d2d;
+  --state-danger-bg: #fff1f1;
+  --state-danger-border: #f0c6c6;
+  --state-danger-text: #a61b1b;
+  --state-warning-text: #9a5c00;
+  --state-hint-text: #7c2d12;
+
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+
+  --space-1: 0.35rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+
+  --button-hover-bg: #f7fbff;
+  --text-item-title: #163554;
+  --text-summary: #304a66;
+  --text-separator: #6f8297;
+  --text-empty: #607286;
+  --text-log: #263b52;
+
+  --shadow-soft: 0 1px 2px rgba(16, 29, 46, 0.06);
+  --focus-ring: 0 0 0 3px rgba(15, 74, 147, 0.18);
+}

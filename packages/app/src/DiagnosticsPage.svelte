@@ -42,12 +42,12 @@
 </script>
 
 <main class="diagnostics-page">
-  <header class="heading">
+  <header class="diagnostics-header">
     <button class="ghost" onclick={onBack}>Back To Main App</button>
-    <h1>Diagnostics</h1>
+    <h1 class="diagnostics-title">Diagnostics</h1>
   </header>
 
-  <section class="panel">
+  <section class="panel diagnostics-panel">
     <p class="hint">
       Runs a folder/index diagnostics test and returns a structured result object.
     </p>
@@ -85,20 +85,17 @@
     display: grid;
     gap: 1rem;
   }
-  .heading {
+  .diagnostics-header {
     display: flex;
     align-items: center;
     gap: 0.75rem;
+    flex-wrap: wrap;
   }
-  .heading h1 {
+  .diagnostics-title {
     font-size: 1.15rem;
     margin: 0;
   }
-  .panel {
-    border: 1px solid #d9dee8;
-    border-radius: 12px;
-    padding: 0.9rem;
-    background: #fff;
+  .diagnostics-panel {
     display: grid;
     gap: 0.75rem;
   }
@@ -109,49 +106,28 @@
   }
   .hint,
   .meta {
-    color: #5b6679;
+    color: var(--text-secondary);
     margin: 0;
     font-size: 0.92rem;
   }
   .success {
-    color: #0b6b32;
+    color: var(--state-success-text);
     font-size: 0.9rem;
   }
   .error {
-    color: #8b1e2d;
+    color: var(--state-danger-text);
     font-size: 0.9rem;
   }
   .result-box {
     width: 100%;
     min-height: 420px;
-    border: 1px solid #d9dee8;
-    border-radius: 10px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
     padding: 0.7rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 0.82rem;
     line-height: 1.35;
     resize: vertical;
-    background: #f8fafc;
-  }
-  button {
-    border-radius: 8px;
-    border: 1px solid #cfd6e3;
-    background: #f8fafc;
-    color: #111827;
-    padding: 0.5rem 0.75rem;
-    font: inherit;
-    cursor: pointer;
-  }
-  button.primary {
-    background: #1d4ed8;
-    border-color: #1d4ed8;
-    color: #fff;
-  }
-  button.ghost {
-    background: #f8fafc;
-  }
-  button:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
+    background: var(--bg-surface-muted);
   }
 </style>

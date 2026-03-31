@@ -179,12 +179,14 @@
           <button class="primary" onclick={() => actions.connect()} disabled={app.session.isConnecting}>
             {app.session.isConnecting ? "Connecting..." : "Connect"}
           </button>
-          {#if currentConnectTargetLabel}
-            <span>Target: {currentConnectTargetLabel}</span>
-          {/if}
-          {#if currentConnectionModeLabel}
-            <span>{currentConnectionModeLabel}</span>
-          {/if}
+          <div class="global-connect-meta">
+            {#if currentConnectTargetLabel}
+              <p>Target: {currentConnectTargetLabel}</p>
+            {/if}
+            {#if currentConnectionModeLabel}
+              <p>{currentConnectionModeLabel}</p>
+            {/if}
+          </div>
         </div>
       {/if}
 
@@ -313,385 +315,69 @@
 {/if}
 
 <style>
-  :global(body) {
-    margin: 0;
-    font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-    background: #f3f5f8;
-    color: #1f2933;
-  }
-
-  :global(.app-shell) {
+  .app-shell {
     height: 100dvh;
     display: flex;
     flex-direction: column;
-    background: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
+    background: var(--bg-shell);
     padding-top: env(safe-area-inset-top);
     overflow: hidden;
   }
 
-  :global(.content) {
+  .content {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 0.9rem 0.8rem 0.9rem;
+    padding: 0.9rem 0.8rem;
     max-width: 960px;
     margin: 0 auto;
     width: 100%;
     box-sizing: border-box;
   }
 
-  :global(.panel) {
-    background: transparent;
-    border: none;
-    border-radius: 0;
-    box-shadow: none;
-    padding: 0.35rem 0;
-  }
-
   .error-banner-panel {
-    margin-bottom: 0.35rem;
+    margin-bottom: 0.5rem;
     padding: 0.5rem 0.6rem;
-    border: 1px solid #f0c6c6;
-    border-radius: 8px;
-    background: #fff1f1;
-  }
-
-  :global(.panel + .panel) {
-    margin-top: 0.45rem;
-    padding-top: 0.55rem;
-    border-top: 1px solid #d4deea;
-  }
-
-  :global(.heading) {
-    margin: 0 0 0.35rem;
-    font-size: 0.94rem;
-    font-weight: 700;
-    letter-spacing: 0.01em;
-  }
-
-  :global(.heading-row) {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.45rem;
-    margin-bottom: 0.35rem;
-    flex-wrap: wrap;
-  }
-
-  :global(form.settings) {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 0.45rem;
-    margin-top: 0.35rem;
-  }
-
-  :global(label) {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    font-size: 0.78rem;
-    color: #445366;
-  }
-
-  :global(.checkbox-row) {
-    flex-direction: row;
-    align-items: center;
-    gap: 0.45rem;
-    min-height: 42px;
-  }
-
-  :global(.inline-input) {
-    margin-top: 0.35rem;
-    max-width: 24rem;
-  }
-
-  :global(.checkbox-row input[type="checkbox"]) {
-    width: 18px;
-    height: 18px;
-    margin: 0;
-  }
-
-  :global(input),
-  :global(select) {
-    padding: 0.4rem 0.45rem;
-    font-size: 0.88rem;
-    border: 1px solid #c7d2df;
-    border-radius: 8px;
-    background: #fff;
-  }
-
-  :global(textarea.recovery-secret) {
-    width: 100%;
-    min-height: 88px;
-    resize: vertical;
-    padding: 0.4rem 0.45rem;
-    font-size: 0.78rem;
-    border: 1px solid #c7d2df;
-    border-radius: 8px;
-    background: #fff;
-    box-sizing: border-box;
-    font-family: "IBM Plex Mono", monospace;
-  }
-
-  :global(.actions) {
-    display: flex;
-    gap: 0.4rem;
-    margin-top: 0.4rem;
-    flex-wrap: wrap;
-  }
-
-  :global(button) {
-    border: 1px solid #a6b7ca;
-    border-radius: 8px;
-    background: #ffffff;
-    color: #1b3049;
-    padding: 0.5rem 0.8rem;
-    font-size: 0.9rem;
-    min-height: 42px;
-    cursor: pointer;
-    transition:
-      box-shadow 120ms ease,
-      background-color 120ms ease;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.35rem;
-    touch-action: manipulation;
-  }
-
-  :global(button.primary) {
-    border-color: #0f4a93;
-    background: #0f4a93;
-    color: #fff;
-  }
-
-  :global(button.ghost) {
-    border-color: #c8d4e2;
-    background: #f8fbff;
-  }
-
-  :global(button.icon) {
-    min-width: 2.3rem;
-    padding: 0.35rem 0.5rem;
-    text-align: center;
-  }
-
-  :global(button.icon-only) {
-    width: 2.3rem;
-    min-width: 2.3rem;
-    padding: 0.35rem;
-  }
-
-  :global(button:disabled) {
-    opacity: 0.55;
-    cursor: not-allowed;
-  }
-
-  :global(button:active:not(:disabled)) {
-    box-shadow: inset 0 0 0 999px rgba(15, 74, 147, 0.08);
+    border-color: var(--state-danger-border);
+    background: var(--state-danger-bg);
   }
 
   .global-connect {
-    margin-bottom: 0.35rem;
+    margin-bottom: 0.55rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
     display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    gap: 0.45rem;
-  }
-
-  :global(.status-row) {
-    display: flex;
-    gap: 0.4rem;
-    align-items: center;
     flex-wrap: wrap;
-    font-size: 0.8rem;
-    color: #4c627a;
-    margin-bottom: 0.4rem;
-  }
-
-  :global(.identity-inline) {
-    display: flex;
-    justify-content: space-between;
-    gap: 0.5rem;
     align-items: flex-start;
-    border: 1px solid #dbe3ee;
-    border-radius: 10px;
-    padding: 0.45rem 0.55rem;
-    background: #fbfdff;
-    margin-bottom: 0.45rem;
-    flex-wrap: wrap;
+    gap: 0.55rem;
   }
 
-  :global(.status-chip) {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.12rem 0.45rem;
-    border-radius: 999px;
-    font-size: 0.74rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
+  .global-connect button {
+    flex: 0 0 auto;
   }
 
-  :global(.status-chip.online) {
-    background: #d7f4e4;
-    color: #0d7044;
-  }
-
-  :global(.status-chip.offline) {
-    background: #fde3e3;
-    color: #9c2d2d;
-  }
-
-  :global(.status-chip.small) {
-    font-size: 0.68rem;
-    padding: 0.08rem 0.35rem;
-  }
-
-  :global(details) {
-    border: 1px solid #dbe3ee;
-    border-radius: 10px;
-    padding: 0.32rem 0.45rem;
-    background: #fbfdff;
-  }
-
-  :global(summary) {
-    cursor: pointer;
-    font-size: 0.82rem;
-    color: #304a66;
-    font-weight: 600;
-  }
-
-  :global(.saved-device-editor) {
+  .global-connect-meta {
     display: grid;
-    gap: 0.45rem;
-  }
-
-  :global(.breadcrumbs) {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.3rem;
-    margin-bottom: 0.4rem;
-    font-size: 0.87rem;
-  }
-
-  :global(.crumb-separator) {
-    color: #6f8297;
-  }
-
-  :global(.crumb-button) {
-    border: none;
-    background: none;
-    color: #0f4a93;
-    padding: 0;
-    border-radius: 0;
-  }
-
-  :global(.crumb-current) {
-    font-weight: 700;
-    color: #1d334a;
-  }
-
-  :global(.list) {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    border: 1px solid #dde5ef;
-    border-radius: 8px;
-    overflow: hidden;
-  }
-
-  :global(.list-item) {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 0.35rem;
-    padding: 0.42rem 0.5rem;
-    border-bottom: 1px solid #eef2f7;
-    background: #fff;
-  }
-
-  :global(.list-item:last-child) {
-    border-bottom: none;
-  }
-
-  :global(.item-main) {
+    gap: 0.2rem;
     min-width: 0;
+    flex: 1 1 20rem;
   }
 
-  :global(.item-title-row) {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-  }
-
-  :global(.item-title) {
-    border: none;
-    background: none;
-    padding: 0;
-    text-align: left;
-    color: #163554;
-    font-size: 0.88rem;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  :global(.item-meta) {
-    font-size: 0.74rem;
-    color: #61778f;
-    overflow-wrap: anywhere;
-  }
-
-  :global(.log-error) {
-    color: #a61b1b;
-  }
-
-  :global(.log-warning) {
-    color: #9a5c00;
-  }
-
-  :global(.log-details) {
-    margin: 0.35rem 0 0;
-    font-family: "IBM Plex Mono", monospace;
-    font-size: 0.7rem;
+  .global-connect-meta p {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.84rem;
     line-height: 1.35;
-    white-space: pre-wrap;
-    word-break: break-word;
-    color: #263b52;
-    background: #f4f8fc;
-    border: 1px solid #d8e2ee;
-    border-radius: 6px;
-    padding: 0.35rem 0.4rem;
-  }
-
-  :global(.item-actions) {
-    display: flex;
-    gap: 0.35rem;
-    align-items: center;
-    align-self: stretch;
-    justify-content: flex-end;
-    flex-wrap: wrap;
-  }
-
-  :global(.empty) {
-    padding: 0.5rem;
-    color: #607286;
-    font-size: 0.86rem;
+    overflow-wrap: anywhere;
   }
 
   .error {
     margin: 0;
-    color: #a61b1b;
+    color: var(--state-danger-text);
     font-size: 0.84rem;
-  }
-
-  :global(.hint) {
-    margin-top: 0.35rem;
-    font-size: 0.78rem;
-    color: #7c2d12;
   }
 
   .bottom-tabs {
@@ -699,8 +385,9 @@
     flex-shrink: 0;
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    background: #101d2e;
-    border-top: 1px solid #1d324e;
+    background: var(--bg-nav);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid var(--border-default);
     padding: 0.45rem 0.45rem calc(0.45rem + env(safe-area-inset-bottom));
     gap: 0.35rem;
     z-index: 1000;
@@ -708,10 +395,10 @@
   }
 
   .tab-button {
-    border: 1px solid #4f6785;
-    color: #d7e3f2;
-    background: #15283f;
-    border-radius: 8px;
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    background: transparent;
+    border-radius: var(--radius-sm);
     font-weight: 700;
     letter-spacing: 0.02em;
     font-size: 0.9rem;
@@ -723,9 +410,9 @@
   }
 
   .tab-button.active {
-    background: #d6e9ff;
-    color: #0d3668;
-    border-color: #d6e9ff;
+    background: var(--color-primary-soft);
+    color: var(--color-primary-strong);
+    border-color: var(--border-accent);
   }
 
   .sr-only {
@@ -741,20 +428,8 @@
   }
 
   @media (max-width: 640px) {
-    :global(.content) {
+    .content {
       padding: 0.7rem 0.6rem 0.7rem;
-    }
-
-    :global(form.settings) {
-      grid-template-columns: 1fr;
-    }
-
-    :global(.list-item) {
-      grid-template-columns: 1fr;
-    }
-
-    :global(.item-actions) {
-      justify-content: flex-start;
     }
   }
 </style>

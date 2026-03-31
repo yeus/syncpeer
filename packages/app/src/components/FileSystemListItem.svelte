@@ -62,3 +62,12 @@
     {@render actions?.()}
   </svelte:fragment>
 </ListRow>
+
+<style>
+  .item-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+</style>

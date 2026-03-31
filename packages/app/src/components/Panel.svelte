@@ -15,3 +15,9 @@
   {/if}
   {@render children?.()}
 </section>
+
+<style>
+  .heading {
+    margin-bottom: 0.45rem;
+  }
+</style>

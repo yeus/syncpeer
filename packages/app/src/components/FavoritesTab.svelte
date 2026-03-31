@@ -152,3 +152,21 @@
     </ul>
   {/if}
 </Panel>
+
+<style>
+  .actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-bottom: 0.45rem;
+    flex-wrap: wrap;
+  }
+
+  .heading-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: 0.6rem 0 0.45rem;
+    flex-wrap: wrap;
+  }
+</style>

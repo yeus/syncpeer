@@ -324,7 +324,7 @@
       {/if}
 
       <div class="actions">
-        <input id="folder-upload-input" type="file" style="display: none;" onchange={onHandleUploadSelected} />
+        <input id="folder-upload-input" class="upload-input" type="file" onchange={onHandleUploadSelected} />
         <button class="primary" onclick={() => document.getElementById("folder-upload-input")?.click()}>
           Upload
         </button>
@@ -335,3 +335,38 @@
     {/if}
   {/if}
 </Panel>
+
+<style>
+  .status-row {
+    display: flex;
+    gap: 0.45rem;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.45rem;
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.45rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .inline-input {
+    margin-top: 0.35rem;
+    max-width: 24rem;
+  }
+
+  .upload-input {
+    display: none;
+  }
+</style>

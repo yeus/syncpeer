@@ -57,7 +57,7 @@
           titleDisabled={!app.session.isConnected}
           metaLines={[`${favorite.folderId}:${favorite.path || "/"}`]}
         >
-          <svelte:fragment slot="actions">
+          {#snippet actions()}
             {#if favorite.kind === "file"}
               {#if app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`)}
                 <button
@@ -94,7 +94,7 @@
             <button class="icon icon-only" onclick={() => onRemoveFavorite(favorite)} aria-label="Remove favorite">
               <Star size={16} />
             </button>
-          </svelte:fragment>
+          {/snippet}
         </FileSystemListItem>
       {/each}
     {/if}
@@ -123,7 +123,7 @@
               `${formatBytes(file.sizeBytes)} | Cached ${formatModified(file.cachedAtMs)}`,
             ]}
           >
-            <svelte:fragment slot="actions">
+            {#snippet actions()}
               <button
                 class="ghost"
                 onclick={() => onOpenCachedFile(file.folderId, file.path)}
@@ -145,7 +145,7 @@
               >
                 Drop
               </button>
-            </svelte:fragment>
+            {/snippet}
           </FileSystemListItem>
         {/each}
       {/if}

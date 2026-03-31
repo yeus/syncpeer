@@ -8,6 +8,8 @@ export interface FolderInfo {
   encrypted?: boolean;
   needsPassword?: boolean;
   passwordError?: string;
+  localDevicePresentInFolder?: boolean;
+  stopReason?: number;
 }
 
 export interface AdvertisedDeviceInfo {
@@ -59,6 +61,8 @@ interface FolderState {
   encrypted: boolean;
   needsPassword: boolean;
   passwordError?: string;
+  localDevicePresentInFolder?: boolean;
+  stopReason?: number;
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
@@ -203,6 +207,8 @@ export class RemoteFs {
       encrypted: f.encrypted,
       needsPassword: f.needsPassword,
       passwordError: f.passwordError,
+      localDevicePresentInFolder: f.localDevicePresentInFolder,
+      stopReason: f.stopReason,
     }));
   }
 

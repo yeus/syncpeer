@@ -367,7 +367,7 @@
             },
           ]}
         >
-          <svelte:fragment slot="actions">
+          {#snippet actions()}
             {#if device.accepted}
               <button class="ghost" onclick={() => onUseSavedDevice(device.id)}>Use</button>
             {:else}
@@ -375,7 +375,7 @@
                 Approve
               </button>
             {/if}
-          </svelte:fragment>
+          {/snippet}
         </DeviceListItem>
       {/each}
     {/if}
@@ -441,7 +441,7 @@
               : []),
           ]}
         >
-          <svelte:fragment slot="actions">
+          {#snippet actions()}
             <button
               class="primary"
               onclick={() => onConnectToSavedDevice(device.id)}
@@ -462,7 +462,7 @@
             <button class="icon icon-only" onclick={() => onRemoveSavedDevice(device.id)} aria-label="Remove saved device">
               <Trash2 size={16} />
             </button>
-          </svelte:fragment>
+          {/snippet}
         </DeviceListItem>
       {/each}
     {/if}
@@ -485,7 +485,7 @@
             : "",
         ]}
       >
-        <svelte:fragment slot="actions">
+        {#snippet actions()}
           <button
             class="ghost"
             onclick={onRefreshOverview}
@@ -493,7 +493,7 @@
           >
             Refresh
           </button>
-        </svelte:fragment>
+        {/snippet}
       </DeviceListItem>
     {/if}
   </ul>

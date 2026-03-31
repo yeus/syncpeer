@@ -1289,6 +1289,7 @@ async function openSession(
   const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
     ? opts.timeoutMs
     : 15000;
+  const connectDeadline = Date.now() + totalTimeout;
   const perCandidateTimeout = Math.max(
     8000,
     Math.min(30000, Math.floor(totalTimeout / Math.max(directCandidates.length || 1, 1))),
@@ -1304,12 +1305,17 @@ async function openSession(
   const errors: string[] = [];
   if (directCandidates.length > 0) {
     for (const candidate of directCandidates) {
+      const remainingMs = Math.max(0, connectDeadline - Date.now());
+      if (remainingMs <= 0) {
+        break;
+      }
+      const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
       try {
         adapter.log?.("core.discovery.candidate.try", {
           address: candidate.address,
           host: candidate.host,
           port: candidate.port,
-          perCandidateTimeout,
+          perCandidateTimeout: candidateTimeoutMs,
           strategy: "sequential",
         });
         return await withTimeout(
@@ -1319,7 +1325,7 @@ async function openSession(
             candidate.host!,
             candidate.port!,
           ),
-          perCandidateTimeout,
+          candidateTimeoutMs,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1336,13 +1342,17 @@ async function openSession(
 
   if (opts.enableRelayFallback !== false) {
     for (const candidate of relayCandidates) {
+      const remainingMs = Math.max(0, connectDeadline - Date.now());
+      if (remainingMs <= 0) {
+        break;
+      }
       try {
         adapter.log?.("core.discovery.relay.try", {
           address: candidate.address,
         });
         return await withTimeout(
           openRelaySession(adapter, opts, candidate.address),
-          Math.max(10000, totalTimeout),
+          remainingMs,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1374,7 +1384,7 @@ export function createSyncpeerCoreClient(
   return {
     openSession: async (options: SyncpeerConnectOptions) => {
       try {
-        return await withTimeout(openSession(adapter, options), options.timeoutMs);
+        return await openSession(adapter, options);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (
@@ -1383,7 +1393,8 @@ export function createSyncpeerCoreClient(
           !isRemoteApprovalLikelyError(message)
         ) {
           throw new Error(
-            "Connection timed out. If this is a new pairing, the remote Syncthing instance may be waiting for you to accept this device. " +
+            "Connection timed out. This does not automatically mean approval is missing. " +
+              "Approval is mainly a first-pairing possibility; previously connected devices usually time out for network/path reasons. " +
               `Technical details: ${message}`,
           );
         }

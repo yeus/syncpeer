@@ -43,8 +43,10 @@ import {
   folderVersionKeyFromState,
   formatBytes,
   formatModified,
+  hasSuccessfulConnectionHistory,
   isIntroducerDevice,
   isSavedDeviceConnected,
+  directoryTotalPages,
   persistState,
   pushSessionLog,
   rootFolderEntries,
@@ -106,6 +108,7 @@ const clearDirectoryView = (state: AppState) => {
   state.session.currentPath = "";
   state.session.entries = [];
   state.session.currentFolderVersionKey = "";
+  state.session.directoryPage = 1;
 };
 
 const restoreOfflineSnapshot = (
@@ -443,7 +446,11 @@ export const createAppActions = (args: {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       state.ui.recentError = message;
-      if (attemptedDeviceId && shouldHintRemoteApprovalPending(message)) {
+      if (
+        attemptedDeviceId &&
+        !hasSuccessfulConnectionHistory(state, attemptedDeviceId) &&
+        shouldHintRemoteApprovalPending(message)
+      ) {
         setRemoteApprovalPending(state, attemptedDeviceId, true);
         state.approvals.pendingApprovalPromptDeviceId = attemptedDeviceId;
       }
@@ -646,7 +653,21 @@ export const createAppActions = (args: {
     state.ui.uploadMessage = "";
     await sessionStore.actions.goToRoot();
     applySessionState(state, sessionStore.getState());
+    state.session.directoryPage = 1;
     await refreshActiveView();
+  };
+
+  const setDirectoryPage = (page: number) => {
+    const maxPage = directoryTotalPages(state);
+    const nextPage = Math.min(maxPage, Math.max(1, Math.floor(page)));
+    state.session.directoryPage = nextPage;
+  };
+
+  const setDirectoryPageSize = (pageSize: number) => {
+    if (!Number.isFinite(pageSize)) return;
+    const normalized = Math.min(2000, Math.max(10, Math.floor(pageSize)));
+    state.ui.directoryPageSize = normalized;
+    state.session.directoryPage = 1;
   };
 
   const toggleFavorite = async (
@@ -1176,6 +1197,8 @@ export const createAppActions = (args: {
     openDirectory,
     goToBreadcrumb,
     goToRootView,
+    setDirectoryPage,
+    setDirectoryPageSize,
     toggleFavorite,
     removeFavorite,
     openFavorite,

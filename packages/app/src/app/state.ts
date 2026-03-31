@@ -32,6 +32,9 @@ import {
 const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
 const SESSION_LOG_LIMIT = 2000;
 const MAX_VISIBLE_CRUMBS = 4;
+const DEFAULT_DIRECTORY_PAGE_SIZE = 200;
+const MIN_DIRECTORY_PAGE_SIZE = 10;
+const MAX_DIRECTORY_PAGE_SIZE = 2000;
 
 const parseJson = <T,>(raw: string | null) => {
   if (!raw) return null;
@@ -59,7 +62,17 @@ export const loadPersistedState = () => {
     acceptedIntroducedFolderKeys?: string[];
     folderPasswords?: Record<string, string>;
     offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
+    directoryPageSize?: number;
   }>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
+};
+
+const normalizeDirectoryPageSize = (value: unknown) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return DEFAULT_DIRECTORY_PAGE_SIZE;
+  return Math.min(
+    MAX_DIRECTORY_PAGE_SIZE,
+    Math.max(MIN_DIRECTORY_PAGE_SIZE, Math.floor(numeric)),
+  );
 };
 
 export const persistState = (state: AppState) => {
@@ -74,6 +87,7 @@ export const persistState = (state: AppState) => {
       syncApprovedIntroducedFolderKeys: [...state.approvals.syncApprovedFolderKeys].sort(),
       folderPasswords: state.passwords.saved,
       offlineFolderSnapshots: state.offline.snapshots,
+      directoryPageSize: state.ui.directoryPageSize,
     }),
   );
 };
@@ -121,6 +135,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       activeConnectDeviceId: "",
       connectedSourceDeviceId: "",
       hasNonEmptyOverviewInSession: false,
+      directoryPage: 1,
     },
     favorites: {
       items: [] as Array<{
@@ -181,6 +196,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       uploadMessage: "",
       recentError: null as string | null,
       lastLoggedError: "",
+      directoryPageSize: normalizeDirectoryPageSize(persisted?.directoryPageSize),
     },
     logs: {
       nextId: 1,
@@ -281,6 +297,8 @@ export const setError = (
 };
 
 export const applySessionState = (state: AppState, next: SessionState) => {
+  const previousFolderId = state.session.currentFolderId;
+  const previousPath = state.session.currentPath;
   state.session.remoteFs = next.remoteFs;
   state.session.isConnected =
     next.phase === "connected" || next.phase === "refreshing";
@@ -292,6 +310,19 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.currentFolderId = next.currentFolderId;
   state.session.currentPath = next.currentPath;
   state.session.entries = next.entries;
+  if (
+    previousFolderId !== state.session.currentFolderId ||
+    previousPath !== state.session.currentPath
+  ) {
+    state.session.directoryPage = 1;
+  }
+  const totalPages = Math.max(
+    1,
+    Math.ceil(state.session.entries.length / state.ui.directoryPageSize),
+  );
+  if (state.session.directoryPage > totalPages) {
+    state.session.directoryPage = totalPages;
+  }
   state.session.currentFolderVersionKey = next.currentFolderVersionKey;
   state.session.remoteDevice = next.remoteDevice;
   state.session.connectionPath = next.connectionPath;
@@ -448,10 +479,47 @@ export const shouldHintRemoteApprovalPending = (message: string) => {
   );
 };
 
+export const hasSuccessfulConnectionHistory = (
+  state: AppState,
+  deviceId: string,
+) => {
+  const normalized = normalizeDeviceId(deviceId);
+  if (!normalized) return false;
+  return Boolean(state.offline.snapshots[normalized]);
+};
+
 export const connectionModeLabel = (state: AppState) =>
   state.connection.discoveryMode === "global"
     ? `Global discovery via ${state.connection.discoveryServer}`
     : `Direct ${state.connection.host || "127.0.0.1"}:${state.connection.port}`;
+
+export const connectTargetLabel = (state: AppState) => {
+  const targetId = normalizeDeviceId(
+    state.connection.remoteId || state.devices.selectedSavedDeviceId,
+  );
+  if (!targetId) return "";
+  const saved = state.devices.savedDevices.find((device) =>
+    sameDeviceId(device.id, targetId),
+  );
+  const savedName = saved?.name.trim() ?? "";
+  return savedName ? `${savedName} (${targetId})` : targetId;
+};
+
+export const directoryTotalPages = (state: AppState) =>
+  Math.max(1, Math.ceil(state.session.entries.length / state.ui.directoryPageSize));
+
+export const directoryCurrentPage = (state: AppState) =>
+  Math.min(
+    directoryTotalPages(state),
+    Math.max(1, Math.floor(state.session.directoryPage || 1)),
+  );
+
+export const paginatedDirectoryEntries = (state: AppState) => {
+  const pageSize = state.ui.directoryPageSize;
+  const page = directoryCurrentPage(state);
+  const start = (page - 1) * pageSize;
+  return state.session.entries.slice(start, start + pageSize);
+};
 
 export const folderVersionKeyFromState = (state: AppState, folderId: string) => {
   const syncState = state.session.folderSyncStates.find(

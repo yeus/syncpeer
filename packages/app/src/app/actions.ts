@@ -643,8 +643,9 @@ export const createAppActions = (args: {
   };
 
   const goToRootView = async () => {
-    clearDirectoryView(state);
     state.ui.uploadMessage = "";
+    await sessionStore.actions.goToRoot();
+    applySessionState(state, sessionStore.getState());
     await refreshActiveView();
   };
 

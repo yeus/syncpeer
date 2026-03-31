@@ -526,3 +526,94 @@
     </ul>
   </details>
 </Panel>
+
+<style>
+  .status-row {
+    display: flex;
+    gap: 0.45rem;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.45rem;
+  }
+
+  .identity-inline {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    align-items: flex-start;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.6rem;
+    background: var(--bg-surface);
+    margin-bottom: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .identity-inline .item-main {
+    min-width: 0;
+    flex: 1 1 18rem;
+  }
+
+  .identity-inline .item-actions {
+    display: flex;
+    gap: 0.35rem;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .saved-device-editor {
+    display: grid;
+    gap: 0.45rem;
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.45rem;
+    margin-top: 0.45rem;
+    flex-wrap: wrap;
+  }
+
+  form.settings {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.45rem;
+    margin-top: 0.45rem;
+  }
+
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .checkbox-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 42px;
+  }
+
+  .checkbox-row input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    margin: 0;
+  }
+
+  .inline-input {
+    margin-top: 0.35rem;
+    max-width: 24rem;
+  }
+
+  @media (max-width: 640px) {
+    form.settings {
+      grid-template-columns: 1fr;
+    }
+
+    .identity-inline {
+      flex-direction: column;
+    }
+  }
+</style>

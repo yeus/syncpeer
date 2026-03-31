@@ -33,3 +33,14 @@
     {/each}
   {/if}
 </div>
+
+<style>
+  .breadcrumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    margin-bottom: 0.5rem;
+    min-width: 0;
+  }
+</style>

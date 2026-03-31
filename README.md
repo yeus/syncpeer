@@ -1,17 +1,29 @@
 # syncpeer
 
-Minimal read-only Syncthing BEP client in TypeScript.
+`syncpeer` is an experimental lightweight Syncthing client project.
+It is intentionally built in TypeScript to make protocol-level sync tooling more accessible to a broader group of developers.
 
-## What is included
+## Interfaces
+
+- TypeScript library
+- CLI
+- Desktop app (Svelte + Tauri)
+- Android app (Svelte + Tauri)
+
+## Direction
+
+- Partial TypeScript implementation of Syncthing BEP/protocol behavior (in progress).
+- Lightweight client focus, inspired by the old [Syncthing Lite](https://github.com/syncthing/syncthing-lite) direction.
+- Practical and incremental: keep the surface small, then grow capability carefully.
+
+## Current capabilities
 
 - TLS connection using Syncthing-compatible cert/key pairs
-- BEP Hello framing
-- Post-auth BEP frame parsing
-- Remote folder listing
-- Tree view of indexed files
+- BEP hello/framing and post-auth frame parsing
+- Remote folder listing and indexed-file tree browsing
 - File download by path
-- Persisted local `cli-node` identity (`~/.config/syncpeer/cli-node`)
-- Local Syncthing test harness
+- Persisted local CLI identity (`~/.config/syncpeer/cli-node`)
+- Local automated Syncthing integration harness
 
 ## Quick start
 
@@ -21,28 +33,29 @@ npm run build
 node dist/cli/main.js --help
 ```
 
-## Local test setup
+Run the desktop app in dev mode:
 
-Download a pinned Syncthing binary:
+```bash
+npm run dev
+```
+
+## Local Syncthing test setup
+
+Download the pinned Syncthing binary:
 
 ```bash
 npm run download:syncthing
 ```
 
-Start two isolated local Syncthing instances and prepare a shared test folder:
+Run the local end-to-end harness:
 
 ```bash
 npm run test:local
 ```
 
-This is fully automated (no GUI steps). It:
+This flow is automated (no GUI steps): it creates two Syncthing homes, configures peers/shared folder, waits for sync, and runs client checks.
 
-- creates two Syncthing homes
-- configures peers + shared folder
-- waits for sync to complete
-- runs the TypeScript BEP client check against the second instance
-
-Use `npm run test:local:keep` to keep processes and temp files for debugging.
+Use `npm run test:local:keep` to keep temporary state for debugging.
 
 ## CLI usage
 
@@ -56,8 +69,21 @@ npx tsx src/cli/main.ts upload-test /path/to/peer-folder smoke.txt "hello from c
 npx tsx src/cli/main.ts local-id
 ```
 
-If `--cert`/`--key` are omitted, `syncpeer` uses a persisted local identity at `~/.config/syncpeer/cli-node` (or `$XDG_CONFIG_HOME/syncpeer/cli-node`).
+If `--cert`/`--key` are omitted, `syncpeer` uses the persisted identity at `~/.config/syncpeer/cli-node` (or `$XDG_CONFIG_HOME/syncpeer/cli-node`).
 
-## Notes
+## Android build helpers
 
-This is intentionally minimal. It does not implement full sync logic, uploads, or REST API usage.
+- `npm run android:dev`
+- `npm run build:android:dev`
+- `npm run build:android:prod`
+
+## For contributors
+
+- The project deliberately uses TypeScript across core logic and user-facing interfaces.
+- The goal is to open protocol/client development to people who may not work primarily in Go or C++.
+- Small, focused contributions are welcome.
+
+## Status
+
+This is an evolving prototype. Protocol coverage and sync behavior are not complete yet.
+If it remains lightweight while becoming more capable over time, that is the intended path.

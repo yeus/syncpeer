@@ -56,6 +56,12 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Initialize Tauri Android project
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+        run: npm run build:android:init
+
       - name: Write release keystore
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}

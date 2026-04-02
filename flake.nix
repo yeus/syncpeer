@@ -63,19 +63,23 @@
         };
         buildAppImageScript = pkgs.writeShellScriptBin "syncpeer-build-appimage" ''
           set -euo pipefail
+          umask 022
           repo_root="$PWD"
           shim_dir="$repo_root/.tmp/appimage-shim"
           mkdir -p "$repo_root/.tmp/appimage-tmp" "$repo_root/.tmp/appimage-cache"
           mkdir -p "$shim_dir"
+          if [ -d "$repo_root/packages/tauri-shell/src-tauri/target/.tauri" ]; then
+            chmod a+rx "$repo_root/packages/tauri-shell/src-tauri/target/.tauri"/* || true
+          fi
           cat > "$shim_dir/pkgconf" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "''${1:-}" == "--variable=schemasdir" && "''${2:-}" == "gio-2.0" ]]; then
-  schemas_dir="$(find ${pkgs.gsettings-desktop-schemas}/share -type d -path "*/glib-2.0/schemas" | head -n 1)"
-  if [[ -n "''$schemas_dir" ]]; then
-    echo "''$schemas_dir"
-    exit 0
-  fi
+  # On NixOS, returning a /nix/store schemas path makes linuxdeploy copy a read-only
+  # tree into AppDir and then fail when glib-compile-schemas writes gschemas.compiled.
+  # Use the FHS path so compilation happens in a writable AppDir/usr/share tree.
+  echo "/usr/share/glib-2.0/schemas"
+  exit 0
 fi
 exec ${pkgs.pkgconf}/bin/pkgconf "''$@"
 EOF

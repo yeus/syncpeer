@@ -66,11 +66,13 @@
           umask 022
           repo_root="$PWD"
           shim_dir="$repo_root/.tmp/appimage-shim"
-          mkdir -p "$repo_root/.tmp/appimage-tmp" "$repo_root/.tmp/appimage-cache"
+          tmp_dir="/tmp/syncpeer-appimage-tmp"
+          cache_dir="/tmp/syncpeer-appimage-cache"
+          home_dir="/tmp/syncpeer-appimage-home"
+          rustup_home="''${RUSTUP_HOME:-$HOME/.rustup}"
+          cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$tmp_dir" "$cache_dir" "$home_dir"
           mkdir -p "$shim_dir"
-          if [ -d "$repo_root/packages/tauri-shell/src-tauri/target/.tauri" ]; then
-            chmod a+rx "$repo_root/packages/tauri-shell/src-tauri/target/.tauri"/* || true
-          fi
           cat > "$shim_dir/pkgconf" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -85,7 +87,7 @@ exec ${pkgs.pkgconf}/bin/pkgconf "''$@"
 EOF
           chmod +x "$shim_dir/pkgconf"
           ln -sf "$shim_dir/pkgconf" "$shim_dir/pkg-config"
-          exec ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" TMPDIR=\"$repo_root/.tmp/appimage-tmp\" XDG_CACHE_HOME=\"$repo_root/.tmp/appimage-cache\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 npm run build -w @syncpeer/tauri-shell -- --verbose"
+          exec ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 npm run build -w @syncpeer/tauri-shell -- --verbose"
         '';
       in
       {

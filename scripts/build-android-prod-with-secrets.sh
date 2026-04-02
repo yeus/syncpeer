@@ -132,8 +132,11 @@ print_missing_guidance() {
 }
 
 needs_lookup=0
-[[ -n "${ANDROID_KEYSTORE_PATH:-}" ]] || needs_lookup=1
-[[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]] || needs_lookup=1
+has_keystore_material=0
+if [[ -n "${ANDROID_KEYSTORE_PATH:-}" || -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+  has_keystore_material=1
+fi
+(( has_keystore_material == 1 )) || needs_lookup=1
 [[ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ]] || needs_lookup=1
 [[ -n "${ANDROID_KEY_ALIAS:-}" ]] || needs_lookup=1
 [[ -n "${ANDROID_KEY_PASSWORD:-}" ]] || needs_lookup=1

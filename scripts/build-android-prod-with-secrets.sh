@@ -117,6 +117,72 @@ keyPassword=$ANDROID_KEY_PASSWORD
 EOF
 }
 
+find_apksigner() {
+  if command -v apksigner >/dev/null 2>&1; then
+    command -v apksigner
+    return 0
+  fi
+
+  local sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+  if [[ -n "$sdk_root" && -d "$sdk_root/build-tools" ]]; then
+    local selected=""
+    if [[ -n "${ANDROID_BUILD_TOOLS:-}" && -x "$sdk_root/build-tools/$ANDROID_BUILD_TOOLS/apksigner" ]]; then
+      selected="$sdk_root/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+    else
+      selected="$(
+        find "$sdk_root/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner 2>/dev/null \
+          | sort -V \
+          | tail -n 1
+      )"
+    fi
+    if [[ -n "$selected" && -x "$selected" ]]; then
+      echo "$selected"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+sign_unsigned_release_apk_if_needed() {
+  local root="$1"
+  local unsigned_candidates=(
+    "$root/packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+    "$root/packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+  )
+
+  local unsigned_apk=""
+  for candidate in "${unsigned_candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      unsigned_apk="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$unsigned_apk" ]]; then
+    return 0
+  fi
+
+  local signed_apk="${unsigned_apk%-unsigned.apk}.apk"
+  local apksigner_bin
+  if ! apksigner_bin="$(find_apksigner)"; then
+    echo "Found unsigned release APK but could not find apksigner on PATH or Android SDK build-tools." >&2
+    echo "Unsigned APK: $unsigned_apk" >&2
+    return 1
+  fi
+
+  cp "$unsigned_apk" "$signed_apk"
+  "$apksigner_bin" sign \
+    --ks "$ANDROID_KEYSTORE_PATH" \
+    --ks-key-alias "$ANDROID_KEY_ALIAS" \
+    --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+    --key-pass env:ANDROID_KEY_PASSWORD \
+    "$signed_apk"
+
+  "$apksigner_bin" verify "$signed_apk"
+  echo "Signed APK with apksigner fallback: $signed_apk"
+}
+
 print_missing_guidance() {
   local missing=("$@")
   echo "Missing required Android signing configuration." >&2
@@ -210,4 +276,5 @@ for path in "${temp_keystore_properties_paths[@]}"; do
 done
 echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
 npm run build:android:prod -w @syncpeer/tauri-shell
+sign_unsigned_release_apk_if_needed "$repo_root"
 node scripts/copy-android-apk.mjs release

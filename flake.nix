@@ -66,8 +66,9 @@
           umask 022
           repo_root="$PWD"
           shim_dir="$repo_root/.tmp/appimage-shim"
-          tmp_dir="/tmp/syncpeer-appimage-tmp"
-          cache_dir="/tmp/syncpeer-appimage-cache"
+          run_id="$(date +%s)"
+          tmp_dir="/tmp/syncpeer-appimage-tmp-$run_id"
+          cache_dir="/tmp/syncpeer-appimage-cache-$run_id"
           home_dir="/tmp/syncpeer-appimage-home"
           rustup_home="''${RUSTUP_HOME:-$HOME/.rustup}"
           cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
@@ -87,7 +88,7 @@ exec ${pkgs.pkgconf}/bin/pkgconf "''$@"
 EOF
           chmod +x "$shim_dir/pkgconf"
           ln -sf "$shim_dir/pkgconf" "$shim_dir/pkg-config"
-          exec ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 npm run build -w @syncpeer/tauri-shell -- --verbose"
+          exec ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$tmp_dir/cargo-target\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -lc 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] tauri=\$(command -v tauri || true)\"; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build -w @syncpeer/tauri-shell -- --verbose'"
         '';
       in
       {

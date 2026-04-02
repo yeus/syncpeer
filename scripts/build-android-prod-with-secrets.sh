@@ -44,14 +44,16 @@ decode_base64_to_file() {
 }
 
 temp_keystore_path=""
-temp_keystore_properties_path=""
+temp_keystore_properties_paths=()
 cleanup_temp_keystore() {
   if [[ -n "$temp_keystore_path" && -f "$temp_keystore_path" ]]; then
     rm -f "$temp_keystore_path"
   fi
-  if [[ -n "$temp_keystore_properties_path" && -f "$temp_keystore_properties_path" ]]; then
-    rm -f "$temp_keystore_properties_path"
-  fi
+  for path in "${temp_keystore_properties_paths[@]}"; do
+    if [[ -n "$path" && -f "$path" ]]; then
+      rm -f "$path"
+    fi
+  done
 }
 trap cleanup_temp_keystore EXIT
 
@@ -199,8 +201,13 @@ else
 fi
 
 cd "$repo_root"
-temp_keystore_properties_path="$repo_root/packages/tauri-shell/src-tauri/gen/android/keystore.properties"
-create_gradle_keystore_properties "$temp_keystore_properties_path"
-echo "Prepared temporary Gradle keystore.properties for release signing."
+temp_keystore_properties_paths=(
+  "$repo_root/packages/tauri-shell/src-tauri/gen/android/keystore.properties"
+  "$repo_root/packages/tauri-shell/src-tauri/gen/android/app/keystore.properties"
+)
+for path in "${temp_keystore_properties_paths[@]}"; do
+  create_gradle_keystore_properties "$path"
+done
+echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
 npm run build:android:prod -w @syncpeer/tauri-shell
 node scripts/copy-android-apk.mjs release

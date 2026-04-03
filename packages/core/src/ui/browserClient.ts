@@ -87,6 +87,8 @@ export interface CachedFileRecord {
 
 export interface SyncpeerPlatformAdapter {
   readTextFile?: (path: string) => Promise<string>;
+  readBinaryFile?: (path: string) => Promise<Uint8Array>;
+  pickUploadFile?: () => Promise<string | null | undefined>;
   readDefaultIdentity?: () => Promise<SyncpeerIdentityRecord>;
   listFavorites?: () => Promise<FavoriteRecord[]>;
   upsertFavorite?: (favorite: FavoriteRecord) => Promise<FavoriteRecord[]>;
@@ -152,6 +154,8 @@ export interface SyncpeerBrowserClient {
   restoreIdentityRecovery: (recoverySecret: string) => Promise<void>;
   getDefaultDeviceId: () => Promise<string>;
   regenerateDefaultIdentity: () => Promise<string>;
+  readBinaryFile: (path: string) => Promise<Uint8Array>;
+  pickUploadFile: () => Promise<string | null | undefined>;
 }
 
 const SYNCTHING_DISCOVERY_ORIGIN = "https://discovery.syncthing.net";
@@ -613,5 +617,13 @@ export const createSyncpeerBrowserClient = (
       cachedDefaultIdentity = null;
       return deviceId;
     },
+    readBinaryFile: async (path: string): Promise<Uint8Array> =>
+      platformAdapter.readBinaryFile
+        ? platformAdapter.readBinaryFile(path)
+        : throwMissingAdapter("readBinaryFile"),
+    pickUploadFile: async (): Promise<string | null | undefined> =>
+      platformAdapter.pickUploadFile
+        ? platformAdapter.pickUploadFile()
+        : undefined,
   };
 };

@@ -4,6 +4,8 @@ import {
   favoriteKey,
   folderPasswordScopedKey,
   getDefaultDiscoveryServer,
+  formatEta,
+  formatRate,
   isValidSyncthingDeviceId,
   normalizeDeviceId,
   normalizeDiscoveryServer,
@@ -945,7 +947,12 @@ export const createAppActions = (args: {
       { folderId, path },
     );
 
-  const downloadFile = async (folderId: string, path: string, name: string) => {
+  const downloadFile = async (
+    folderId: string,
+    path: string,
+    name: string,
+    options?: { openAfterDownload?: boolean },
+  ) => {
     if (!state.session.remoteFs || !state.session.isConnected || state.favorites.isDownloading) {
       return;
     }
@@ -982,6 +989,9 @@ export const createAppActions = (args: {
       state.favorites.activeDownloadText = "100% • Done";
       setDownloadNotice(`Downloaded ${name}`, 4000);
       maybeSystemDownloadNotice("Syncpeer download complete", name);
+      if (options?.openAfterDownload) {
+        await openCachedFile(folderId, path);
+      }
     } catch (error) {
       reportActionError(state, "download_file.failed", error, { folderId, path });
       setDownloadNotice(`Download failed: ${name}`, 6000);
@@ -993,6 +1003,14 @@ export const createAppActions = (args: {
         state.favorites.activeDownloadText = "";
       }
     }
+  };
+
+  const openOrDownloadFile = async (folderId: string, path: string, name: string) => {
+    if (cacheFileKeyExists(state, folderId, path)) {
+      await openCachedFile(folderId, path);
+      return;
+    }
+    await downloadFile(folderId, path, name, { openAfterDownload: true });
   };
 
   const updateFolderPasswordDraft = (folderId: string, password: string) => {
@@ -1271,46 +1289,96 @@ export const createAppActions = (args: {
     void refreshActiveView();
   };
 
-  const handleUploadSelected = (event: Event) => {
-    const startUpload = async (file: File) => {
-      if (!state.session.remoteFs || !state.session.isConnected) {
-        state.ui.uploadMessage = "Connect to a folder before uploading.";
-        return;
-      }
-      if (!state.session.currentFolderId) {
-        state.ui.uploadMessage = "Open a folder first, then upload into the current directory.";
-        return;
-      }
-      const relativePath = normalizePath(
-        [state.session.currentPath, file.name].filter(Boolean).join("/"),
-      );
-      if (!relativePath) {
-        state.ui.uploadMessage = "Invalid upload target path.";
-        return;
-      }
-      state.ui.uploadMessage = `Uploading ${file.name}...`;
-      try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        await state.session.remoteFs.writeFileFully(
-          state.session.currentFolderId,
-          relativePath,
-          bytes,
-          { modifiedMs: file.lastModified || Date.now() },
-        );
-        await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
-        applySessionState(state, sessionStore.getState());
-        await loadDirectorySideEffects(state, client);
-        state.ui.uploadMessage = `Uploaded ${file.name}.`;
-      } catch (error) {
-        reportActionError(state, "upload_file.failed", error, {
-          folderId: state.session.currentFolderId,
-          path: relativePath,
-          fileName: file.name,
-          sizeBytes: file.size,
-        });
+  const uploadPreparedFile = async (
+    fileName: string,
+    bytes: Uint8Array,
+    modifiedMs?: number,
+  ) => {
+    if (!state.session.remoteFs || !state.session.isConnected) {
+      state.ui.uploadMessage = "Connect to a folder before uploading.";
+      return;
+    }
+    if (!state.session.currentFolderId) {
+      state.ui.uploadMessage = "Open a folder first, then upload into the current directory.";
+      return;
+    }
+    const relativePath = normalizePath(
+      [state.session.currentPath, fileName].filter(Boolean).join("/"),
+    );
+    if (!relativePath) {
+      state.ui.uploadMessage = "Invalid upload target path.";
+      return;
+    }
+    state.ui.uploadProgressActive = true;
+    state.ui.uploadProgressPercent = 0;
+    state.ui.uploadProgressEta = "";
+    state.ui.uploadProgressRate = "";
+    state.ui.uploadMessage = `Uploading ${fileName}...`;
+    const startedAtMs = Date.now();
+    let lastAndroidProgressLoggedAtMs = 0;
+    const updateUploadProgress = (processedBytes: number, totalBytes: number) => {
+      const elapsedMs = Math.max(1, Date.now() - startedAtMs);
+      const safeTotal = Math.max(1, totalBytes);
+      const pct = Math.min(100, Math.floor((processedBytes / safeTotal) * 100));
+      const rateBps = processedBytes > 0 ? (processedBytes * 1000) / elapsedMs : 0;
+      const remainingBytes = Math.max(0, totalBytes - processedBytes);
+      const etaSeconds = rateBps > 0 ? remainingBytes / rateBps : 0;
+      state.ui.uploadProgressPercent = pct;
+      state.ui.uploadProgressRate = rateBps > 0 ? formatRate(rateBps) : "";
+      state.ui.uploadProgressEta = etaSeconds > 0 ? formatEta(etaSeconds) : "";
+      if (/android/i.test(navigator.userAgent || "")) {
+        const now = Date.now();
+        if (
+          now - lastAndroidProgressLoggedAtMs >= 1500 ||
+          pct === 100
+        ) {
+          lastAndroidProgressLoggedAtMs = now;
+          state.ui.downloadNotice = `Upload ${pct}%${state.ui.uploadProgressEta ? ` · ETA ${state.ui.uploadProgressEta}` : ""}`;
+        }
       }
     };
+    try {
+      await state.session.remoteFs.writeFileFully(
+        state.session.currentFolderId,
+        relativePath,
+        bytes,
+        {
+          modifiedMs: modifiedMs || Date.now(),
+          onProgress: (progress) => {
+            updateUploadProgress(progress.processedBytes, progress.totalBytes);
+          },
+        },
+      );
+      updateUploadProgress(bytes.length, bytes.length);
+      await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
+      applySessionState(state, sessionStore.getState());
+      await loadDirectorySideEffects(state, client);
+      state.ui.uploadMessage = `Uploaded ${fileName}.`;
+    } catch (error) {
+      reportActionError(state, "upload_file.failed", error, {
+        folderId: state.session.currentFolderId,
+        path: relativePath,
+        fileName,
+        sizeBytes: bytes.length,
+      });
+    } finally {
+      if (state.ui.uploadProgressPercent >= 100) {
+        window.setTimeout(() => {
+          state.ui.uploadProgressActive = false;
+          state.ui.uploadProgressPercent = 0;
+          state.ui.uploadProgressEta = "";
+          state.ui.uploadProgressRate = "";
+        }, 1200);
+      } else {
+        state.ui.uploadProgressActive = false;
+        state.ui.uploadProgressPercent = 0;
+        state.ui.uploadProgressEta = "";
+        state.ui.uploadProgressRate = "";
+      }
+    }
+  };
 
+  const handleUploadSelected = (event: Event) => {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) {
@@ -1318,8 +1386,15 @@ export const createAppActions = (args: {
       input.value = "";
       return;
     }
-    void startUpload(file);
+    void (async () => {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await uploadPreparedFile(file.name, bytes, file.lastModified || Date.now());
+    })();
     input.value = "";
+  };
+
+  const handleUploadClick = () => {
+    document.getElementById("folder-upload-input")?.click();
   };
 
   const setAutoConnectPaused = (paused: boolean) => {
@@ -1488,6 +1563,7 @@ export const createAppActions = (args: {
     openCachedFile,
     openCachedFileDirectory,
     openCachedDirectory,
+    openOrDownloadFile,
     downloadFile,
     updateFolderPasswordDraft,
     setFolderPasswordInputVisible,
@@ -1507,6 +1583,7 @@ export const createAppActions = (args: {
     copyIdentityBackupSecret,
     restoreIdentityRecovery,
     switchTab,
+    handleUploadClick,
     handleUploadSelected,
     setAutoConnectPaused,
     setAppVisibility,

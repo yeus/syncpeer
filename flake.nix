@@ -109,6 +109,8 @@ EOF
             webkitgtk_4_1
             libsoup_3
             glib
+            gsettings-desktop-schemas
+            dconf
             cairo
             pango
             gdk-pixbuf
@@ -129,6 +131,13 @@ EOF
 
           shellHook = ''
             export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+            export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.glib}/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+            gtk_schema_dir="$(echo ${pkgs.gtk3}/share/gsettings-schemas/*/glib-2.0/schemas | head -n1)"
+            if [ -d "$gtk_schema_dir" ] && [ -f "$gtk_schema_dir/gschemas.compiled" ]; then
+              export GSETTINGS_SCHEMA_DIR="$gtk_schema_dir"
+            else
+              unset GSETTINGS_SCHEMA_DIR
+            fi
 
             echo "Welcome to the Syncpeer development shell."
             echo "JAVA_HOME=$JAVA_HOME"

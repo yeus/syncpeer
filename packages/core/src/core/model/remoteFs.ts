@@ -55,6 +55,12 @@ export interface FileDownloadProgress {
 
 export interface FileUploadOptions {
   modifiedMs?: number;
+  onProgress?: (progress: {
+    processedBytes: number;
+    totalBytes: number;
+    elapsedMs: number;
+    phase: "preparing" | "publishing";
+  }) => void;
 }
 
 interface FolderState {

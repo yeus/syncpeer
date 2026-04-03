@@ -112,35 +112,193 @@ create_gradle_keystore_properties() {
   cat >"$destination" <<EOF
 storeFile=$ANDROID_KEYSTORE_PATH
 password=$ANDROID_KEYSTORE_PASSWORD
+storePassword=$ANDROID_KEYSTORE_PASSWORD
 keyAlias=$ANDROID_KEY_ALIAS
 keyPassword=$ANDROID_KEY_PASSWORD
 EOF
 }
 
+ensure_gradle_release_signing_config() {
+  local gradle_file="$repo_root/packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts"
+  [[ -f "$gradle_file" ]] || return 0
+
+  if rg -q "syncpeer-release-signing" "$gradle_file"; then
+    return 0
+  fi
+
+  cat >>"$gradle_file" <<'EOF'
+
+// syncpeer-release-signing: injected by scripts/build-android-prod-with-secrets.sh
+val syncpeerKeystoreProperties = Properties().apply {
+    val direct = file("keystore.properties")
+    val parent = file("../keystore.properties")
+    val source = when {
+        direct.exists() -> direct
+        parent.exists() -> parent
+        else -> null
+    }
+    if (source != null) {
+        source.inputStream().use { load(it) }
+    }
+}
+
+if (syncpeerKeystoreProperties.isNotEmpty()) {
+    android {
+        signingConfigs {
+            create("syncpeerRelease") {
+                val storeFilePath = syncpeerKeystoreProperties.getProperty("storeFile")
+                val storePasswordValue = syncpeerKeystoreProperties.getProperty("storePassword")
+                    ?: syncpeerKeystoreProperties.getProperty("password")
+                val keyAliasValue = syncpeerKeystoreProperties.getProperty("keyAlias")
+                val keyPasswordValue = syncpeerKeystoreProperties.getProperty("keyPassword")
+                if (!storeFilePath.isNullOrBlank()) storeFile = file(storeFilePath)
+                if (!storePasswordValue.isNullOrBlank()) storePassword = storePasswordValue
+                if (!keyAliasValue.isNullOrBlank()) keyAlias = keyAliasValue
+                if (!keyPasswordValue.isNullOrBlank()) keyPassword = keyPasswordValue
+            }
+        }
+        buildTypes {
+            getByName("release") {
+                signingConfig = signingConfigs.getByName("syncpeerRelease")
+            }
+        }
+    }
+}
+EOF
+}
+
 find_apksigner() {
+  if [[ -n "${SYNCPEER_APKSIGNER:-}" && -x "${SYNCPEER_APKSIGNER}" ]]; then
+    echo "${SYNCPEER_APKSIGNER}"
+    return 0
+  fi
+
   if command -v apksigner >/dev/null 2>&1; then
     command -v apksigner
     return 0
   fi
 
-  local sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-  if [[ -n "$sdk_root" && -d "$sdk_root/build-tools" ]]; then
-    local selected=""
-    if [[ -n "${ANDROID_BUILD_TOOLS:-}" && -x "$sdk_root/build-tools/$ANDROID_BUILD_TOOLS/apksigner" ]]; then
-      selected="$sdk_root/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
-    else
+  local sdk_root_from_gradle=""
+  local local_properties_candidates=(
+    "$repo_root/packages/tauri-shell/src-tauri/gen/android/local.properties"
+    "$repo_root/packages/tauri-shell/src-tauri/gen/android/app/local.properties"
+  )
+  local local_properties_path
+  for local_properties_path in "${local_properties_candidates[@]}"; do
+    [[ -f "$local_properties_path" ]] || continue
+    sdk_root_from_gradle="$(
+      sed -n 's/^sdk\.dir=//p' "$local_properties_path" \
+        | head -n 1 \
+        | sed 's#\\:#:#g' \
+        | sed 's#\\\\#/#g'
+    )"
+    if [[ -n "$sdk_root_from_gradle" ]]; then
+      break
+    fi
+  done
+
+  local roots=()
+  if [[ -n "$sdk_root_from_gradle" ]]; then roots+=("$sdk_root_from_gradle"); fi
+  if [[ -n "${ANDROID_HOME:-}" ]]; then roots+=("${ANDROID_HOME}"); fi
+  if [[ -n "${ANDROID_SDK_ROOT:-}" ]]; then roots+=("${ANDROID_SDK_ROOT}"); fi
+  if [[ -n "${ANDROID_SDK_HOME:-}" ]]; then roots+=("${ANDROID_SDK_HOME}"); fi
+  roots+=(
+    "$HOME/Android/Sdk"
+    "$HOME/Library/Android/sdk"
+    "/opt/android-sdk"
+    "/usr/lib/android-sdk"
+    "/nix/var/nix/profiles/per-user/$USER/profile/libexec/android-sdk"
+  )
+
+  local sdkmanager_bin
+  sdkmanager_bin="$(command -v sdkmanager 2>/dev/null || true)"
+  if [[ -n "$sdkmanager_bin" ]]; then
+    local sdkmanager_parent
+    sdkmanager_parent="$(cd "$(dirname "$sdkmanager_bin")/../.." 2>/dev/null && pwd || true)"
+    if [[ -n "$sdkmanager_parent" ]]; then roots+=("$sdkmanager_parent"); fi
+  fi
+
+  local seen=" "
+  local selected=""
+  for root in "${roots[@]}"; do
+    [[ -n "$root" ]] || continue
+    [[ "$seen" == *" $root "* ]] && continue
+    seen+=" $root "
+
+    local candidates=(
+      "$root"
+      "$root/libexec/android-sdk"
+      "$root/sdk"
+    )
+    for sdk_root in "${candidates[@]}"; do
+      [[ -d "$sdk_root/build-tools" ]] || continue
+      if [[ -n "${ANDROID_BUILD_TOOLS:-}" && -x "$sdk_root/build-tools/$ANDROID_BUILD_TOOLS/apksigner" ]]; then
+        echo "$sdk_root/build-tools/$ANDROID_BUILD_TOOLS/apksigner"
+        return 0
+      fi
       selected="$(
         find "$sdk_root/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner 2>/dev/null \
           | sort -V \
           | tail -n 1
       )"
-    fi
-    if [[ -n "$selected" && -x "$selected" ]]; then
-      echo "$selected"
-      return 0
-    fi
-  fi
+      if [[ -n "$selected" && -x "$selected" ]]; then
+        echo "$selected"
+        return 0
+      fi
+      selected="$(
+        find "$sdk_root" -type f -name apksigner 2>/dev/null \
+          | sort -V \
+          | tail -n 1
+      )"
+      if [[ -n "$selected" && -x "$selected" ]]; then
+        echo "$selected"
+        return 0
+      fi
+    done
+  done
 
+  return 1
+}
+
+describe_apksigner_search_roots() {
+  local roots=()
+  if [[ -n "${SYNCPEER_APKSIGNER:-}" ]]; then roots+=("SYNCPEER_APKSIGNER=$(dirname "$SYNCPEER_APKSIGNER")"); fi
+  if [[ -n "${ANDROID_HOME:-}" ]]; then roots+=("ANDROID_HOME=${ANDROID_HOME}"); fi
+  if [[ -n "${ANDROID_SDK_ROOT:-}" ]]; then roots+=("ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"); fi
+  if [[ -n "${ANDROID_SDK_HOME:-}" ]]; then roots+=("ANDROID_SDK_HOME=${ANDROID_SDK_HOME}"); fi
+  roots+=(
+    "$HOME/Android/Sdk"
+    "$HOME/Library/Android/sdk"
+    "/opt/android-sdk"
+    "/usr/lib/android-sdk"
+    "/nix/var/nix/profiles/per-user/$USER/profile/libexec/android-sdk"
+  )
+  printf '%s\n' "${roots[@]}"
+}
+
+ensure_apksigner_on_path() {
+  local apksigner_bin
+  if apksigner_bin="$(find_apksigner)"; then
+    local apksigner_dir
+    apksigner_dir="$(dirname "$apksigner_bin")"
+    case ":$PATH:" in
+      *":$apksigner_dir:"*) ;;
+      *) export PATH="$apksigner_dir:$PATH" ;;
+    esac
+    export SYNCPEER_APKSIGNER="$apksigner_bin"
+    echo "Using apksigner: $apksigner_bin"
+  fi
+}
+
+find_jarsigner() {
+  if command -v jarsigner >/dev/null 2>&1; then
+    command -v jarsigner
+    return 0
+  fi
+  if [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/jarsigner" ]]; then
+    echo "${JAVA_HOME}/bin/jarsigner"
+    return 0
+  fi
   return 1
 }
 
@@ -168,7 +326,25 @@ sign_unsigned_release_apk_if_needed() {
   if ! apksigner_bin="$(find_apksigner)"; then
     echo "Found unsigned release APK but could not find apksigner on PATH or Android SDK build-tools." >&2
     echo "Unsigned APK: $unsigned_apk" >&2
-    return 1
+    echo "Searched SDK roots:" >&2
+    describe_apksigner_search_roots | sed 's/^/  - /' >&2
+
+    local jarsigner_bin
+    if ! jarsigner_bin="$(find_jarsigner)"; then
+      echo "Could not find jarsigner either. Cannot sign APK locally." >&2
+      return 1
+    fi
+
+    cp "$unsigned_apk" "$signed_apk"
+    "$jarsigner_bin" \
+      -keystore "$ANDROID_KEYSTORE_PATH" \
+      -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+      -keypass "$ANDROID_KEY_PASSWORD" \
+      "$signed_apk" \
+      "$ANDROID_KEY_ALIAS"
+    "$jarsigner_bin" -verify "$signed_apk"
+    echo "Signed APK with jarsigner fallback: $signed_apk"
+    return 0
   fi
 
   cp "$unsigned_apk" "$signed_apk"
@@ -275,7 +451,9 @@ for path in "${temp_keystore_properties_paths[@]}"; do
   create_gradle_keystore_properties "$path"
 done
 echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
+ensure_gradle_release_signing_config
 npm run icons:ensure:android
+ensure_apksigner_on_path
 npm run build:android:prod -w @syncpeer/tauri-shell
 sign_unsigned_release_apk_if_needed "$repo_root"
 node scripts/copy-android-apk.mjs release

@@ -24,16 +24,7 @@
     align-items: center;
     align-self: stretch;
     justify-content: flex-end;
-    flex-wrap: wrap;
-  }
-
-  @media (max-width: 640px) {
-    .list-item {
-      grid-template-columns: 1fr;
-    }
-
-    .item-actions {
-      justify-content: flex-start;
-    }
+    flex-wrap: nowrap;
+    white-space: nowrap;
   }
 </style>

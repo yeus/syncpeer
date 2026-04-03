@@ -7,7 +7,6 @@
   import FileImage from "lucide-svelte/icons/file-image";
   import FileText from "lucide-svelte/icons/file-text";
   import FileVideo from "lucide-svelte/icons/file-video";
-  import FolderOpen from "lucide-svelte/icons/folder-open";
   import Folder from "lucide-svelte/icons/folder";
   import KeyRound from "lucide-svelte/icons/key-round";
   import Star from "lucide-svelte/icons/star";
@@ -95,6 +94,7 @@ export interface FavoriteItem {
     onOpenCachedFileDirectory?: (folderId: string, path: string) => void;
     onRemoveCachedFile?: (folderId: string, path: string) => void;
     onDownloadFile?: (folderId: string, path: string, name: string) => void;
+    onOpenOrDownloadFile?: (folderId: string, path: string, name: string) => void;
     onSetPasswordVisible?: (folderId: string, visible: boolean) => void;
     onUpdateFolderPasswordDraft?: (folderId: string, password: string) => void;
     onSaveFolderPassword?: (folderId: string) => void;
@@ -117,6 +117,7 @@ export interface FavoriteItem {
     onOpenCachedFileDirectory = () => {},
     onRemoveCachedFile = () => {},
     onDownloadFile = () => {},
+    onOpenOrDownloadFile = () => {},
     onSetPasswordVisible = () => {},
     onUpdateFolderPasswordDraft = () => {},
     onSaveFolderPassword = () => {},
@@ -130,27 +131,62 @@ export interface FavoriteItem {
     return value.name;
   };
 
-  const canClickTitle = (value: FileSystemItem) => {
+  const canClickMain = (value: FileSystemItem) => {
     if (value.kind === "root-folder") return !value.locked;
-    if (value.kind === "folder-entry") return value.entryType === "directory";
-    return value.kind === "favorite";
+    return true;
   };
 
-  const handleTitleClick = (value: FileSystemItem) => {
+  const handleMainClick = (value: FileSystemItem, event?: MouseEvent) => {
+    const target = event?.target instanceof HTMLElement ? event.target : null;
+    if (target?.closest("button,input,select,textarea,label,a")) return;
     if (value.kind === "root-folder") {
       onOpenFolderRoot(value.folderId);
       return;
     }
     if (value.kind === "folder-entry") {
-      if (value.entryType === "directory") onOpenDirectory(value.folderId, value.path);
+      if (value.entryType === "directory") {
+        onOpenDirectory(value.folderId, value.path);
+        return;
+      }
+      if (value.isCached) {
+        onOpenCachedFile(value.folderId, value.path);
+        return;
+      }
+      if (!value.invalid) {
+        onOpenOrDownloadFile(value.folderId, value.path, value.name);
+      }
       return;
     }
     if (value.kind === "favorite") {
+      if (value.favoriteKind === "file") {
+        if (value.isCached) {
+          onOpenCachedFile(value.folderId, value.path);
+          return;
+        }
+        if (value.connected) {
+          onOpenOrDownloadFile(value.folderId, value.path, value.name);
+          return;
+        }
+        onOpenFavorite({
+          folderId: value.folderId,
+          path: value.path,
+          kind: value.favoriteKind,
+        });
+        return;
+      }
+      if (value.isCached) {
+        onOpenCachedDirectory(value.folderId, value.path);
+        return;
+      }
       onOpenFavorite({
         folderId: value.folderId,
         path: value.path,
         kind: value.favoriteKind,
       });
+      return;
+    }
+    if (value.kind === "cached-file") {
+      onOpenCachedFile(value.folderId, value.path);
     }
   };
 
@@ -196,7 +232,90 @@ export interface FavoriteItem {
 </script>
 
 <ListRow>
-  <div class="item-title-row">
+  {#if canClickMain(item)}
+    <div
+      class="item-main-hit item-main-hit-clickable"
+      role="button"
+      tabindex={0}
+      onclick={(event) => handleMainClick(item, event)}
+      onkeydown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          handleMainClick(item);
+        }
+      }}
+    >
+      <div class="item-title-row">
+      <span class="item-icon" aria-hidden="true">
+        {#if leadingKind(item) === "folder"}
+          <Folder size={16} />
+        {:else if leadingKind(item) === "image"}
+          <FileImage size={16} />
+        {:else if leadingKind(item) === "audio"}
+          <FileAudio size={16} />
+        {:else if leadingKind(item) === "video"}
+          <FileVideo size={16} />
+        {:else if leadingKind(item) === "archive"}
+          <FileArchive size={16} />
+        {:else if leadingKind(item) === "text"}
+          <FileText size={16} />
+        {:else}
+          <File size={16} />
+        {/if}
+      </span>
+      <div class="item-title">{rowTitle(item)}</div>
+
+      {#if item.kind === "root-folder" && item.encrypted}
+        <StatusChip tone={item.locked ? "offline" : "online"} small>{item.lockLabel}</StatusChip>
+      {/if}
+      </div>
+
+      {#if item.kind === "root-folder"}
+        <div class="item-meta">{item.readOnly ? "read-only" : "read-write"}</div>
+        {#if item.encrypted}
+          <div class="item-meta">receive-encrypted | {item.lockLabel}</div>
+          {#if item.passwordError}
+            <div class="item-meta">{item.passwordError}</div>
+          {/if}
+          {#if item.passwordInputVisible}
+            <label class="inline-input">
+              <span>Folder Password</span>
+              <input
+                type="password"
+                value={item.passwordDraft || item.passwordSaved}
+                oninput={(event) =>
+                  onUpdateFolderPasswordDraft(
+                    item.folderId,
+                    event.currentTarget instanceof HTMLInputElement
+                      ? event.currentTarget.value
+                      : "",
+                  )}
+                placeholder="Syncthing folder encryption password"
+              />
+            </label>
+          {/if}
+        {/if}
+      {:else if item.kind === "folder-entry"}
+        <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+        {#if item.isDownloadingActive && item.downloadProgressText}
+          <div class="item-meta">Download: {item.downloadProgressText}</div>
+        {/if}
+        {#if item.invalid}
+          <div class="item-meta">Unavailable on remote (invalid)</div>
+        {/if}
+      {:else if item.kind === "favorite"}
+        <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
+        {#if item.isDownloadingActive && item.downloadProgressText}
+          <div class="item-meta">Download: {item.downloadProgressText}</div>
+        {/if}
+      {:else}
+        <div class="item-meta">{item.folderId}:{item.path}</div>
+        <div class="item-meta">{item.sizeText} | Cached {item.cachedAtText}</div>
+      {/if}
+    </div>
+  {:else}
+    <div class="item-main-hit">
+    <div class="item-title-row">
     <span class="item-icon" aria-hidden="true">
       {#if leadingKind(item) === "folder"}
         <Folder size={16} />
@@ -214,79 +333,75 @@ export interface FavoriteItem {
         <File size={16} />
       {/if}
     </span>
-    {#if canClickTitle(item)}
-      <button class="item-title" onclick={() => handleTitleClick(item)} disabled={item.kind === "root-folder" && item.locked}>
-        {rowTitle(item)}
-      </button>
-    {:else}
-      <div class="item-title">{rowTitle(item)}</div>
-    {/if}
+    <div class="item-title">{rowTitle(item)}</div>
 
     {#if item.kind === "root-folder" && item.encrypted}
       <StatusChip tone={item.locked ? "offline" : "online"} small>{item.lockLabel}</StatusChip>
     {/if}
-  </div>
+    </div>
 
-  {#if item.kind === "root-folder"}
-    <div class="item-meta">{item.readOnly ? "read-only" : "read-write"}</div>
-    {#if item.encrypted}
-      <div class="item-meta">receive-encrypted | {item.lockLabel}</div>
-      {#if item.passwordError}
-        <div class="item-meta">{item.passwordError}</div>
+    {#if item.kind === "root-folder"}
+      <div class="item-meta">{item.readOnly ? "read-only" : "read-write"}</div>
+      {#if item.encrypted}
+        <div class="item-meta">receive-encrypted | {item.lockLabel}</div>
+        {#if item.passwordError}
+          <div class="item-meta">{item.passwordError}</div>
+        {/if}
+        {#if item.passwordInputVisible}
+          <label class="inline-input">
+            <span>Folder Password</span>
+            <input
+              type="password"
+              value={item.passwordDraft || item.passwordSaved}
+              oninput={(event) =>
+                onUpdateFolderPasswordDraft(
+                  item.folderId,
+                  event.currentTarget instanceof HTMLInputElement
+                    ? event.currentTarget.value
+                    : "",
+                )}
+              placeholder="Syncthing folder encryption password"
+            />
+          </label>
+        {/if}
       {/if}
-      {#if item.passwordInputVisible}
-        <label class="inline-input">
-          <span>Folder Password</span>
-          <input
-            type="password"
-            value={item.passwordDraft || item.passwordSaved}
-            oninput={(event) =>
-              onUpdateFolderPasswordDraft(
-                item.folderId,
-                event.currentTarget instanceof HTMLInputElement
-                  ? event.currentTarget.value
-                  : "",
-              )}
-            placeholder="Syncthing folder encryption password"
-          />
-        </label>
+    {:else if item.kind === "folder-entry"}
+      <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+      {#if item.isDownloadingActive && item.downloadProgressText}
+        <div class="item-meta">Download: {item.downloadProgressText}</div>
       {/if}
+      {#if item.invalid}
+        <div class="item-meta">Unavailable on remote (invalid)</div>
+      {/if}
+    {:else if item.kind === "favorite"}
+      <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
+      {#if item.isDownloadingActive && item.downloadProgressText}
+        <div class="item-meta">Download: {item.downloadProgressText}</div>
+      {/if}
+    {:else}
+      <div class="item-meta">{item.folderId}:{item.path}</div>
+      <div class="item-meta">{item.sizeText} | Cached {item.cachedAtText}</div>
     {/if}
-  {:else if item.kind === "folder-entry"}
-    <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
-    {#if item.isDownloadingActive && item.downloadProgressText}
-      <div class="item-meta">Download: {item.downloadProgressText}</div>
-    {/if}
-    {#if item.invalid}
-      <div class="item-meta">Unavailable on remote (invalid)</div>
-    {/if}
-  {:else if item.kind === "favorite"}
-    <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
-    {#if item.isDownloadingActive && item.downloadProgressText}
-      <div class="item-meta">Download: {item.downloadProgressText}</div>
-    {/if}
-  {:else}
-    <div class="item-meta">{item.folderId}:{item.path}</div>
-    <div class="item-meta">{item.sizeText} | Cached {item.cachedAtText}</div>
+    </div>
   {/if}
 
-  <div slot="actions">
+  <div slot="actions" class="actions-col">
     {#if item.kind === "root-folder"}
       {#if item.encrypted}
         {#if !item.passwordInputVisible}
           <button
-            class="ghost icon-only"
+            class="row-action"
             onclick={() => onSetPasswordVisible(item.folderId, true)}
             aria-label="Edit folder password"
           >
             <KeyRound size={16} />
           </button>
         {/if}
-        <button class="ghost icon-only" onclick={() => onSaveFolderPassword(item.folderId)} aria-label="Unlock folder">
+        <button class="row-action" onclick={() => onSaveFolderPassword(item.folderId)} aria-label="Unlock folder">
           <Unlock size={16} />
         </button>
         <button
-          class="ghost icon-only"
+          class="row-action"
           onclick={() => onClearFolderPassword(item.folderId)}
           disabled={!item.passwordSaved}
           aria-label="Forget saved folder password"
@@ -296,7 +411,7 @@ export interface FavoriteItem {
       {/if}
       {#if item.hasCachedRoot}
         <button
-          class="ghost icon-only"
+          class="row-action"
           onclick={() => onOpenCachedDirectory(item.folderId, "")}
           disabled={isOpeningCachedFile}
           aria-label="Open local cached folder"
@@ -305,7 +420,7 @@ export interface FavoriteItem {
         </button>
       {/if}
       <button
-        class="icon icon-only"
+        class="row-action"
         onclick={() => onToggleFavorite(item.folderId, "", item.name, "folder")}
         aria-label="Toggle favorite"
       >
@@ -319,7 +434,7 @@ export interface FavoriteItem {
       {#if item.entryType === "directory"}
         {#if item.isCached}
           <button
-            class="ghost icon-only"
+            class="row-action"
             onclick={() => onOpenCachedDirectory(item.folderId, item.path)}
             disabled={isOpeningCachedFile}
             aria-label="Open local cached directory"
@@ -327,26 +442,9 @@ export interface FavoriteItem {
             <ExternalLink size={16} />
           </button>
         {/if}
-      {:else if item.isCached}
+      {:else if !item.isCached}
         <button
-          class="ghost icon-only"
-          onclick={() => onOpenCachedFile(item.folderId, item.path)}
-          disabled={isOpeningCachedFile}
-          aria-label="Open cached file"
-        >
-          <ExternalLink size={16} />
-        </button>
-        <button
-          class="ghost icon-only"
-          onclick={() => onOpenCachedFileDirectory(item.folderId, item.path)}
-          disabled={isOpeningCachedFile}
-          aria-label="Open cached file directory"
-        >
-          <FolderOpen size={16} />
-        </button>
-      {:else}
-        <button
-          class="ghost icon-only"
+          class="row-action"
           onclick={() => onDownloadFile(item.folderId, item.path, item.name)}
           disabled={isDownloading || item.invalid}
           title={item.downloadLabel}
@@ -356,7 +454,7 @@ export interface FavoriteItem {
         </button>
       {/if}
       <button
-        class="icon icon-only"
+        class="row-action"
         onclick={() =>
           onToggleFavorite(
             item.folderId,
@@ -373,49 +471,19 @@ export interface FavoriteItem {
         {/if}
       </button>
     {:else if item.kind === "favorite"}
-      {#if item.favoriteKind === "file"}
-        {#if item.isCached}
-          <button
-            class="ghost"
-            onclick={() => onOpenCachedFile(item.folderId, item.path)}
-            disabled={isOpeningCachedFile}
-          >
-            Open
-          </button>
-          <button
-            class="ghost"
-            onclick={() => onOpenCachedFileDirectory(item.folderId, item.path)}
-            disabled={isOpeningCachedFile}
-          >
-            Open Folder
-          </button>
-          <button
-            class="ghost"
-            onclick={() => onRemoveCachedFile(item.folderId, item.path)}
-            disabled={isRemovingCachedFile || isClearingCache}
-          >
-            Drop
-          </button>
-        {:else}
-          <button
-            class="ghost"
-            onclick={() => onDownloadFile(item.folderId, item.path, item.name)}
-            disabled={isDownloading || !item.connected}
-          >
-            {item.downloadLabel}
-          </button>
-        {/if}
-      {:else if item.isCached}
+      {#if item.favoriteKind === "file" && !item.isCached}
         <button
-          class="ghost"
-          onclick={() => onOpenCachedDirectory(item.folderId, item.path)}
-          disabled={isOpeningCachedFile}
+          class="row-action"
+          onclick={() => onDownloadFile(item.folderId, item.path, item.name)}
+          disabled={isDownloading || !item.connected}
+          title={item.downloadLabel}
+          aria-label={item.downloadLabel}
         >
-          Open
+          <Download size={16} />
         </button>
       {/if}
       <button
-        class="icon icon-only"
+        class="row-action"
         onclick={() =>
           onRemoveFavorite({
             key: item.key,
@@ -430,31 +498,44 @@ export interface FavoriteItem {
       </button>
     {:else if item.kind === "cached-file"}
       <button
-        class="ghost"
-        onclick={() => onOpenCachedFile(item.folderId, item.path)}
-        disabled={isOpeningCachedFile}
-      >
-        Open
-      </button>
-      <button
-        class="ghost"
-        onclick={() => onOpenCachedFileDirectory(item.folderId, item.path)}
-        disabled={isOpeningCachedFile}
-      >
-        Open Folder
-      </button>
-      <button
-        class="ghost"
+        class="row-action"
         onclick={() => onRemoveCachedFile(item.folderId, item.path)}
         disabled={isRemovingCachedFile || isClearingCache}
+        aria-label="Drop cached file"
       >
-        Drop
+        <Trash2 size={16} />
       </button>
     {/if}
   </div>
 </ListRow>
 
 <style>
+  .item-main-hit {
+    min-width: 0;
+    border-radius: var(--radius-sm);
+    transition:
+      background-color 120ms ease,
+      box-shadow 120ms ease,
+      transform 120ms ease;
+  }
+
+  .item-main-hit-clickable {
+    cursor: pointer;
+  }
+
+  .item-main-hit-clickable:hover {
+    background: var(--bg-surface-soft);
+  }
+
+  .item-main-hit-clickable:active {
+    transform: translateY(1px);
+    box-shadow: inset 0 0 0 999px rgba(15, 74, 147, 0.08);
+  }
+
+  .item-main-hit-clickable:focus-visible {
+    box-shadow: var(--focus-ring);
+  }
+
   .item-title-row {
     display: flex;
     align-items: center;
@@ -472,5 +553,41 @@ export interface FavoriteItem {
   .inline-input {
     margin-top: 0.35rem;
     max-width: 24rem;
+  }
+
+  .actions-col {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    justify-content: flex-end;
+    min-width: max-content;
+  }
+
+  .row-action {
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    padding: 0.2rem;
+    min-height: 1.9rem;
+    min-width: 1.9rem;
+    border-radius: var(--radius-xs);
+    transition:
+      background-color 120ms ease,
+      transform 120ms ease,
+      box-shadow 120ms ease;
+  }
+
+  .row-action:hover:not(:disabled) {
+    background: var(--bg-surface-soft);
+    border-color: transparent;
+  }
+
+  .row-action:active:not(:disabled) {
+    transform: translateY(1px);
+    box-shadow: inset 0 0 0 999px rgba(15, 74, 147, 0.08);
+  }
+
+  .row-action:focus-visible {
+    box-shadow: var(--focus-ring);
   }
 </style>

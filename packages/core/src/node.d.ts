@@ -45,6 +45,12 @@ export interface NodeRemoteFs {
   waitForFolderIndex(folderId: string, timeoutMs?: number, pollMs?: number): Promise<boolean>;
   readDir(folderId: string, path: string): Promise<Array<{ name: string; path: string; type: string }>>;
   readFileFully(folderId: string, path: string): Promise<Uint8Array>;
+  writeFileFully(
+    folderId: string,
+    path: string,
+    bytes: Uint8Array,
+    options?: { modifiedMs?: number },
+  ): Promise<void>;
 }
 
 export interface NodeSessionHandle {
@@ -106,4 +112,3 @@ export function resolveNodeGlobalDiscovery(options: {
 }): Promise<NodeDiscoveryResult>;
 export function createNodeSyncpeerClient(): NodeSyncpeerClient;
 export function createNodeSessionTransport(): NodeSessionTransport;
-

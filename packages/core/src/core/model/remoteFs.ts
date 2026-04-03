@@ -53,6 +53,10 @@ export interface FileDownloadProgress {
   totalBytes: number;
 }
 
+export interface FileUploadOptions {
+  modifiedMs?: number;
+}
+
 interface FolderState {
   id: string;
   label: string;
@@ -173,6 +177,12 @@ export class RemoteFs {
   private log?: (event: string, details?: Record<string, unknown>) => void;
   private remoteDevice?: RemoteDeviceInfo;
   private closeConnection?: () => void;
+  private publishFile?: (
+    folderId: string,
+    path: string,
+    bytes: Uint8Array,
+    options?: FileUploadOptions,
+  ) => Promise<void>;
 
   constructor(
     folders: Map<string, FolderState>,
@@ -186,12 +196,19 @@ export class RemoteFs {
     log?: (event: string, details?: Record<string, unknown>) => void,
     remoteDevice?: RemoteDeviceInfo,
     closeConnection?: () => void,
+    publishFile?: (
+      folderId: string,
+      path: string,
+      bytes: Uint8Array,
+      options?: FileUploadOptions,
+    ) => Promise<void>,
   ) {
     this.folders = folders;
     this.requestBlock = requestBlock;
     this.log = log;
     this.remoteDevice = remoteDevice;
     this.closeConnection = closeConnection;
+    this.publishFile = publishFile;
   }
 
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
@@ -496,6 +513,22 @@ export class RemoteFs {
       pos += chunk.length;
     }
     return out;
+  }
+
+  async writeFileFully(
+    folderId: string,
+    path: string,
+    bytes: Uint8Array,
+    options?: FileUploadOptions,
+  ): Promise<void> {
+    if (!this.publishFile) {
+      throw new Error("Upload is not supported by this session transport.");
+    }
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath) {
+      throw new Error("Upload path must not be empty.");
+    }
+    await this.publishFile(folderId, normalizedPath, bytes, options);
   }
 
   private async readEncryptedFileFully(

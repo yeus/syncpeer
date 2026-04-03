@@ -111,6 +111,14 @@
         ),
         isCached: app.favorites.cachedFileKeys.has(`${app.session.currentFolderId}:${entry.path}`),
         downloadLabel: downloadButtonLabel(app.session.currentFolderId, entry.path),
+        isDownloadingActive:
+          app.favorites.activeDownloadKey ===
+          `${app.session.currentFolderId}:${entry.path}`,
+        downloadProgressText:
+          app.favorites.activeDownloadKey ===
+          `${app.session.currentFolderId}:${entry.path}`
+            ? app.favorites.activeDownloadText
+            : "",
       }),
     ),
   );

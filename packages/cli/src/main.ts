@@ -23,6 +23,10 @@ interface CliOptions {
   folderPassword?: string[];
 }
 
+interface UploadCommandOptions {
+  serveMs?: number;
+}
+
 function normalizeRelativePath(input: string): string {
   const normalized = input.replaceAll("\\", "/").replace(/^\/+/, "");
   const parts = normalized.split("/").filter((part) => part.length > 0);
@@ -142,6 +146,11 @@ async function renderTree(
   return out;
 }
 
+function sleepMs(ms: number): Promise<void> {
+  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, Math.floor(ms)));
+}
+
 async function main() {
   const program = new Command();
   program
@@ -244,6 +253,35 @@ async function main() {
         const bytes = await remoteFs.readFileFully(folderId, remotePath);
         fs.writeFileSync(localPath, Buffer.from(bytes));
         console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
+      }),
+    );
+
+  program
+    .command("upload <folderId> <localPath> [remotePath]")
+    .description("Upload a local file to the remote peer folder")
+    .option(
+      "--serve-ms <ms>",
+      "Keep connection open after upload so remote peers can request blocks",
+      (value) => parseInt(value, 10),
+      0,
+    )
+    .action(async (folderId: string, localPath: string, remotePath: string | undefined, uploadOpts: UploadCommandOptions) =>
+      withSession(async (remoteFs) => {
+        const payload = fs.readFileSync(localPath);
+        const fileName = path.basename(localPath);
+        const targetPath = normalizeRelativePath(remotePath ?? fileName);
+        if (!targetPath) throw new Error("remotePath must not be empty");
+        await remoteFs.writeFileFully(folderId, targetPath, new Uint8Array(payload), {
+          modifiedMs: fs.statSync(localPath).mtimeMs,
+        });
+        console.log(`Uploaded ${payload.length} bytes to ${folderId}/${targetPath}`);
+        const serveMs = Number.isFinite(uploadOpts.serveMs)
+          ? Math.max(0, Number(uploadOpts.serveMs))
+          : 0;
+        if (serveMs > 0) {
+          console.log(`Serving upload blocks for ${serveMs} ms...`);
+          await sleepMs(serveMs);
+        }
       }),
     );
 

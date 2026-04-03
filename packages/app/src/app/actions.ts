@@ -1,4 +1,5 @@
 import {
+  createSyncpeerSessionStore,
   cachedFileKey,
   favoriteKey,
   folderPasswordScopedKey,
@@ -409,6 +410,45 @@ export const createAppActions = (args: {
   sessionStore: SyncpeerSessionStore;
 }) => {
   const { state, client, sessionStore } = args;
+  let downloadNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSystemDownloadNoticeAtMs = 0;
+  let requestedDownloadNotificationPermission = false;
+
+  const setDownloadNotice = (message: string, clearAfterMs = 0) => {
+    state.ui.downloadNotice = message;
+    if (downloadNoticeTimer) {
+      clearTimeout(downloadNoticeTimer);
+      downloadNoticeTimer = null;
+    }
+    if (clearAfterMs > 0 && typeof window !== "undefined") {
+      downloadNoticeTimer = window.setTimeout(() => {
+        state.ui.downloadNotice = "";
+        downloadNoticeTimer = null;
+      }, clearAfterMs);
+    }
+  };
+
+  const maybeSystemDownloadNotice = (title: string, body: string) => {
+    if (typeof Notification === "undefined") return;
+    if (
+      Notification.permission === "default" &&
+      !requestedDownloadNotificationPermission
+    ) {
+      requestedDownloadNotificationPermission = true;
+      void Notification.requestPermission();
+      return;
+    }
+    if (Notification.permission !== "granted") return;
+    const now = Date.now();
+    if (now - lastSystemDownloadNoticeAtMs < 2000) return;
+    lastSystemDownloadNoticeAtMs = now;
+    try {
+      const note = new Notification(title, { body, tag: "syncpeer-download-progress" });
+      setTimeout(() => note.close(), 2000);
+    } catch {
+      // Best-effort only.
+    }
+  };
 
   const canAttemptFolderSyncRecovery = () => {
     if (!state.session.isConnected) return false;
@@ -914,6 +954,8 @@ export const createAppActions = (args: {
     const downloadKey = cachedFileKey(folderId, path);
     state.favorites.activeDownloadKey = downloadKey;
     state.favorites.activeDownloadText = "0% • 0 B/s • ETA --";
+    setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
+    maybeSystemDownloadNotice("Syncpeer download", `Downloading ${name}`);
     try {
       const bytes = await state.session.remoteFs.readFileFully(
         folderId,
@@ -930,14 +972,20 @@ export const createAppActions = (args: {
             totalBytes,
             (Date.now() - startedAt) / 1000,
           );
+          setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
+          maybeSystemDownloadNotice("Syncpeer download", `${name}: ${state.favorites.activeDownloadText}`);
         },
       );
       await client.cacheFile(folderId, path, name, bytes);
       updateCachedKey(state, folderId, path, true);
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
       state.favorites.activeDownloadText = "100% • Done";
+      setDownloadNotice(`Downloaded ${name}`, 4000);
+      maybeSystemDownloadNotice("Syncpeer download complete", name);
     } catch (error) {
       reportActionError(state, "download_file.failed", error, { folderId, path });
+      setDownloadNotice(`Download failed: ${name}`, 6000);
+      maybeSystemDownloadNotice("Syncpeer download failed", name);
     } finally {
       state.favorites.isDownloading = false;
       if (state.favorites.activeDownloadKey === downloadKey) {
@@ -1224,11 +1272,53 @@ export const createAppActions = (args: {
   };
 
   const handleUploadSelected = (event: Event) => {
+    const startUpload = async (file: File) => {
+      if (!state.session.remoteFs || !state.session.isConnected) {
+        state.ui.uploadMessage = "Connect to a folder before uploading.";
+        return;
+      }
+      if (!state.session.currentFolderId) {
+        state.ui.uploadMessage = "Open a folder first, then upload into the current directory.";
+        return;
+      }
+      const relativePath = normalizePath(
+        [state.session.currentPath, file.name].filter(Boolean).join("/"),
+      );
+      if (!relativePath) {
+        state.ui.uploadMessage = "Invalid upload target path.";
+        return;
+      }
+      state.ui.uploadMessage = `Uploading ${file.name}...`;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await state.session.remoteFs.writeFileFully(
+          state.session.currentFolderId,
+          relativePath,
+          bytes,
+          { modifiedMs: file.lastModified || Date.now() },
+        );
+        await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
+        applySessionState(state, sessionStore.getState());
+        await loadDirectorySideEffects(state, client);
+        state.ui.uploadMessage = `Uploaded ${file.name}.`;
+      } catch (error) {
+        reportActionError(state, "upload_file.failed", error, {
+          folderId: state.session.currentFolderId,
+          path: relativePath,
+          fileName: file.name,
+          sizeBytes: file.size,
+        });
+      }
+    };
+
     const input = event.currentTarget as HTMLInputElement;
-    const fileName = input.files?.[0]?.name;
-    state.ui.uploadMessage = fileName
-      ? `Upload selected (${fileName}) but uploading is not available in this read-only BEP client yet.`
-      : "";
+    const file = input.files?.[0];
+    if (!file) {
+      state.ui.uploadMessage = "";
+      input.value = "";
+      return;
+    }
+    void startUpload(file);
     input.value = "";
   };
 
@@ -1241,6 +1331,12 @@ export const createAppActions = (args: {
   };
 
   const onNetworkOnline = async () => {
+    if (state.ui.autoConnectPaused) return;
+    if (state.session.isConnected || state.session.isConnecting) return;
+    await connect();
+  };
+
+  const onAppForeground = async () => {
     if (state.ui.autoConnectPaused) return;
     if (state.session.isConnected || state.session.isConnecting) return;
     await connect();
@@ -1286,11 +1382,67 @@ export const createAppActions = (args: {
     };
     test.description = "End-to-end folder/index/readDir diagnostics";
     test.timeoutMs = 90_000;
+    const uploadProbe: TaskyonTestFn = async () => {
+      const diagSession = createSyncpeerSessionStore({
+        transport: client,
+      });
+      await diagSession.actions.disconnect();
+      await diagSession.actions.connect(connectionDetails(state));
+      const connected = diagSession.getState();
+      const candidateFolder = connected.folders.find(
+        (folder) =>
+          !folder.encrypted &&
+          !folder.readOnly &&
+          !folder.needsPassword &&
+          Number(folder.stopReason ?? 0) === 0 &&
+          folder.localDevicePresentInFolder !== false,
+      );
+      if (!candidateFolder) {
+        return {
+          skipped: true,
+          reason:
+            "No writable non-encrypted folder available for upload probe.",
+        };
+      }
+      await diagSession.actions.openFolder(candidateFolder.id, connectionDetails(state));
+      const current = diagSession.getState();
+      if (!current.remoteFs?.writeFileFully) {
+        throw new Error("Session transport does not expose writeFileFully.");
+      }
+      const payload = `hello_from_syncpeer ${new Date().toISOString()}\n`;
+      const targetPath = normalizePath(
+        [current.currentPath, "hello_from_syncpeer.txt"].filter(Boolean).join("/"),
+      );
+      await current.remoteFs.writeFileFully(
+        candidateFolder.id,
+        targetPath,
+        new TextEncoder().encode(payload),
+        { modifiedMs: Date.now() },
+      );
+      await diagSession.actions.reloadCurrentDirectory(connectionDetails(state));
+      const after = diagSession.getState();
+      const listed = after.entries.some((entry) => entry.path === targetPath);
+      await diagSession.actions.disconnect();
+      return {
+        skipped: false,
+        folderId: candidateFolder.id,
+        targetPath,
+        listedAfterUpload: listed,
+        payloadBytes: payload.length,
+      };
+    };
+    uploadProbe.description = "Upload probe (hello_from_syncpeer.txt)";
+    uploadProbe.timeoutMs = 60_000;
     const registry = buildDiagnosticsRegistry({
       builtins: [
         {
           testName: "folderContentDiagnostics",
           func: test,
+          sourcePath: "packages/app/src/lib/folderDiagnostics.ts",
+        },
+        {
+          testName: "uploadProbeDiagnostics",
+          func: uploadProbe,
           sourcePath: "packages/app/src/lib/folderDiagnostics.ts",
         },
       ],
@@ -1359,6 +1511,7 @@ export const createAppActions = (args: {
     setAutoConnectPaused,
     setAppVisibility,
     onNetworkOnline,
+    onAppForeground,
     openDiagnosticsPage,
     closeDiagnosticsPage,
     runFolderDiagnosticsTest,

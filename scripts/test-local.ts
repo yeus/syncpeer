@@ -474,6 +474,46 @@ async function main() {
     await waitForSync(path.join(aRecvDir, "a.txt"), expectedA, 90_000);
     await waitForSync(path.join(aRecvDir, "subdir", "nested.txt"), "nested file\n", 90_000);
 
+    const uploadPayload = `hello_from_syncpeer ${new Date().toISOString()}\n`;
+    const uploadSourcePath = path.join(root, "hello_from_syncpeer.txt");
+    writeFile(uploadSourcePath, uploadPayload);
+    execCli([
+      "--host", "127.0.0.1",
+      "--port", "58300",
+      "--cert", path.join(cliNodeHome, "cert.pem"),
+      "--key", path.join(cliNodeHome, "key.pem"),
+      "--remote-id", aId,
+      "--timeout-ms", "20000",
+      "upload",
+      "--serve-ms", "45000",
+      folderId,
+      uploadSourcePath,
+      "cli-upload/hello_from_syncpeer.txt",
+    ], { stdio: "inherit" });
+    await waitForSync(
+      path.join(aRecvDir, "cli-upload", "hello_from_syncpeer.txt"),
+      uploadPayload,
+      90_000,
+    );
+    const uploadedRoundtripPath = path.join(root, "roundtrip-upload.txt");
+    execCli([
+      "--host", "127.0.0.1",
+      "--port", "58300",
+      "--cert", path.join(cliNodeHome, "cert.pem"),
+      "--key", path.join(cliNodeHome, "key.pem"),
+      "--remote-id", aId,
+      "--timeout-ms", "20000",
+      "download",
+      folderId,
+      "cli-upload/hello_from_syncpeer.txt",
+      uploadedRoundtripPath,
+    ], { stdio: "inherit" });
+    const uploadedRoundtrip = fs.readFileSync(uploadedRoundtripPath, "utf8");
+    if (uploadedRoundtrip !== uploadPayload) {
+      throw new Error(`Uploaded roundtrip mismatch: got "${uploadedRoundtrip}"`);
+    }
+    console.log("Remote upload smoke check passed.");
+
     const introduced = await waitForIntroducedDeviceAdvertisement({
       introducerHost: "127.0.0.1",
       introducerPort: 58300,

@@ -23,6 +23,12 @@ export interface RemoteFsLike {
     path: string,
     onProgress?: (progress: FileDownloadProgress) => void,
   ) => Promise<Uint8Array>;
+  writeFileFully: (
+    folderId: string,
+    path: string,
+    bytes: Uint8Array,
+    options?: { modifiedMs?: number },
+  ) => Promise<void>;
 }
 
 export interface ConnectionOverview {
@@ -490,6 +496,12 @@ export const createSyncpeerBrowserClient = (
       path: string,
       onProgress?: (progress: FileDownloadProgress) => void,
     ) => (await requireActiveSession()).remoteFs.readFileFully(folderId, path, onProgress),
+    writeFileFully: async (
+      folderId: string,
+      path: string,
+      bytes: Uint8Array,
+      options?: { modifiedMs?: number },
+    ) => (await requireActiveSession()).remoteFs.writeFileFully(folderId, path, bytes, options),
   };
 
   return {

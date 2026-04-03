@@ -196,6 +196,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       autoConnectPaused: false,
       isAppVisible: true,
       uploadMessage: "",
+      downloadNotice: "",
       recentError: null as string | null,
       lastLoggedError: "",
       directoryPageSize: normalizeDirectoryPageSize(persisted?.directoryPageSize),

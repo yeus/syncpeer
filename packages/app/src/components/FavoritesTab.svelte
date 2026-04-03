@@ -52,6 +52,12 @@
         connected: app.session.isConnected,
         isCached: app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`),
         downloadLabel: downloadLabel(favorite.folderId, favorite.path),
+        isDownloadingActive:
+          app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`,
+        downloadProgressText:
+          app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`
+            ? app.favorites.activeDownloadText
+            : "",
       }),
     ),
   );

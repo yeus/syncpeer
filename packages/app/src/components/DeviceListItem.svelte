@@ -1,69 +1,118 @@
 <script lang="ts">
-  import type { Snippet } from "svelte";
+  import Plus from "lucide-svelte/icons/plus";
+  import Trash2 from "lucide-svelte/icons/trash-2";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
 
-  export interface DeviceListItemBadge {
-    label: string;
-    tone?: "online" | "offline" | "";
-    small?: boolean;
-    title?: string;
+  export interface SavedDeviceRow {
+    kind: "saved";
+    id: string;
+    name: string;
+    deviceId: string;
+    isConnected: boolean;
+    isIntroducer: boolean;
+    awaitingApproval: boolean;
+    metaLines: string[];
   }
 
+  export interface AdvertisedDeviceRow {
+    kind: "advertised";
+    id: string;
+    name: string;
+    deviceId: string;
+    sourceFolderIds: string[];
+    metaLines: string[];
+  }
+
+  export type DeviceListRow = SavedDeviceRow | AdvertisedDeviceRow;
+
   interface Props {
-    title: string;
-    titleTooltip?: string;
-    deviceId?: string;
-    metaLines?: string[];
-    badges?: DeviceListItemBadge[];
-    onTitleClick?: (() => void) | undefined;
-    children?: Snippet;
-    actions?: Snippet;
+    row: DeviceListRow;
+    disableActions?: boolean;
+    onUseSavedDevice: (deviceId: string) => void;
+    onEditSavedDeviceName: (deviceId: string) => void;
+    onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
+    onRemoveSavedDevice: (deviceId: string) => void;
+    onAddAdvertisedDevice: (deviceId: string) => void;
   }
 
   let {
-    title,
-    titleTooltip = "",
-    deviceId = "",
-    metaLines = [],
-    badges = [],
-    onTitleClick = undefined,
-    children,
-    actions,
+    row,
+    disableActions = false,
+    onUseSavedDevice,
+    onEditSavedDeviceName,
+    onSetSavedDeviceIntroducer,
+    onRemoveSavedDevice,
+    onAddAdvertisedDevice,
   }: Props = $props();
 </script>
 
 <ListRow>
   <div class="item-title-row">
-    {#if onTitleClick}
-      <button class="item-title" onclick={onTitleClick} title={titleTooltip}>
-        {title}
-      </button>
-    {:else}
-      <div class="item-title" title={titleTooltip}>{title}</div>
-    {/if}
+    <div class="item-title">{row.name}</div>
 
-    {#each badges as badge, index (index)}
-      <StatusChip tone={badge.tone ?? ""} small={badge.small ?? true} title={badge.title ?? ""}>
-        {badge.label}
+    {#if row.kind === "saved" && row.isIntroducer}
+      <StatusChip small>introducer</StatusChip>
+    {/if}
+    {#if row.kind === "saved" && row.isConnected}
+      <StatusChip tone="online" small>online</StatusChip>
+    {/if}
+    {#if row.kind === "saved" && row.awaitingApproval}
+      <StatusChip tone="offline" small title="This peer may still need to approve your device on their Syncthing side.">
+        not approved yet
       </StatusChip>
-    {/each}
+    {/if}
+    {#if row.kind === "advertised"}
+      <StatusChip tone="offline" small>not approved</StatusChip>
+    {/if}
   </div>
 
-  {#if deviceId}
-    <div class="item-meta">{deviceId}</div>
-  {/if}
+  <div class="item-meta">{row.deviceId}</div>
 
-  {#each metaLines as line, index (index)}
+  {#each row.metaLines as line, index (index)}
     {#if line}
       <div class="item-meta">{line}</div>
     {/if}
   {/each}
 
-  {@render children?.()}
-
   <svelte:fragment slot="actions">
-    {@render actions?.()}
+    {#if row.kind === "saved"}
+      <button
+        class="primary"
+        onclick={() => onUseSavedDevice(row.deviceId)}
+        disabled={disableActions}
+      >
+        Use
+      </button>
+      <button
+        class="ghost"
+        onclick={() => onEditSavedDeviceName(row.deviceId)}
+      >
+        Edit
+      </button>
+      <button
+        class="ghost"
+        onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}
+      >
+        {row.isIntroducer ? "Intro On" : "Intro Off"}
+      </button>
+      <button
+        class="icon icon-only"
+        onclick={() => onRemoveSavedDevice(row.deviceId)}
+        aria-label="Remove saved device"
+      >
+        <Trash2 size={16} />
+      </button>
+    {:else}
+      <button
+        class="primary icon icon-only"
+        onclick={() => onAddAdvertisedDevice(row.deviceId)}
+        aria-label="Add advertised device"
+        title="Add advertised device"
+      >
+        <Plus size={16} />
+      </button>
+    {/if}
   </svelte:fragment>
 </ListRow>
 

@@ -19,7 +19,6 @@
   import {
     activeFolderPasswords,
     advertisedDevices,
-    advertisedFolders,
     applySessionState,
     connectTargetLabel,
     directoryCurrentPage,
@@ -42,7 +41,7 @@
     createInitialState,
   } from "./app/state.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
-  import Settings from "lucide-svelte/icons/settings";
+  import Smartphone from "lucide-svelte/icons/smartphone";
   import Star from "lucide-svelte/icons/star";
 
   let app = $state(createInitialState());
@@ -69,7 +68,6 @@
 
   let activePasswords = $derived(activeFolderPasswords(app));
   let currentAdvertisedDevices = $derived(advertisedDevices(app));
-  let currentAdvertisedFolders = $derived(advertisedFolders(app));
   let currentFavoriteKeys = $derived(favoriteKeys(app));
   let currentBreadcrumbs = $derived(visibleBreadcrumbs(app));
   let currentRootFolders = $derived(rootFolderEntries(app));
@@ -193,14 +191,11 @@
       {#if app.activeTab === "devices"}
         <DeviceTab
           {app}
-          connectionModeLabel={currentConnectionModeLabel}
           advertisedDevices={currentAdvertisedDevices}
-          advertisedFolders={currentAdvertisedFolders}
           isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
             isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
           currentSourceIsIntroducer={currentSourceIsIntroducer(app)}
-          onConnect={() => actions.connect()}
           onDisconnect={actions.disconnect}
           onUseSavedDevice={actions.useSavedDevice}
           onResetDiscoveryServer={actions.resetDiscoveryServer}
@@ -215,13 +210,9 @@
           onRestoreIdentityRecovery={actions.restoreIdentityRecovery}
           onAddSavedDevice={actions.addSavedDevice}
           onApproveAdvertisedDevice={actions.approveAdvertisedDevice}
-          onApproveFolderSync={actions.approveFolderSync}
-          onConnectToSavedDevice={(deviceId) => actions.connect(deviceId)}
           onEditSavedDeviceName={actions.editSavedDeviceName}
           onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
           onRemoveSavedDevice={actions.removeSavedDevice}
-          onRefreshOverview={actions.refreshOverview}
-          onOpenFolderRoot={actions.openFolderRoot}
         />
       {/if}
 
@@ -302,8 +293,8 @@
         class={`tab-button ${app.activeTab === "devices" ? "active" : ""}`}
         onclick={(event) => actions.switchTab("devices", event)}
       >
-        <Settings size={18} aria-hidden="true" />
-        <span class="sr-only">Settings</span>
+        <Smartphone size={18} aria-hidden="true" />
+        <span class="sr-only">Devices</span>
       </button>
     </nav>
   </div>

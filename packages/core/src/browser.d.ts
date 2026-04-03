@@ -47,6 +47,12 @@ export interface RemoteFsLike {
     path: string,
     onProgress?: (progress: { downloadedBytes: number; totalBytes: number }) => void,
   ) => Promise<Uint8Array>;
+  writeFileFully: (
+    folderId: string,
+    path: string,
+    bytes: Uint8Array,
+    options?: { modifiedMs?: number },
+  ) => Promise<void>;
 }
 
 export interface ConnectionOverview {

@@ -128,15 +128,30 @@
       const isVisible = document.visibilityState === "visible";
       actions.setAppVisibility(isVisible);
       if (isVisible) {
+        void actions.onAppForeground();
         void actions.refreshActiveView();
       }
     };
+    const handleFocus = () => {
+      actions.setAppVisibility(true);
+      void actions.onAppForeground();
+      void actions.refreshActiveView();
+    };
+    const handlePageShow = () => {
+      actions.setAppVisibility(document.visibilityState === "visible");
+      void actions.onAppForeground();
+      void actions.refreshActiveView();
+    };
     window.addEventListener("online", handleOnline);
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("pageshow", handlePageShow);
 
     return () => {
       window.removeEventListener("online", handleOnline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("pageshow", handlePageShow);
     };
   });
 
@@ -171,6 +186,11 @@
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
           <p class="error">{app.ui.recentError}</p>
+        </section>
+      {/if}
+      {#if app.ui.downloadNotice}
+        <section class="panel download-banner-panel">
+          <p class="hint">{app.ui.downloadNotice}</p>
         </section>
       {/if}
 
@@ -371,6 +391,11 @@
     padding: 0.5rem 0.6rem;
     border-color: var(--state-danger-border);
     background: var(--state-danger-bg);
+  }
+
+  .download-banner-panel {
+    margin-bottom: 0.5rem;
+    padding: 0.45rem 0.6rem;
   }
 
   .global-connect {

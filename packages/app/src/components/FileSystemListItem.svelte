@@ -33,7 +33,7 @@
     hasCachedRoot: boolean;
   }
 
-  export interface FolderEntryItem {
+export interface FolderEntryItem {
     kind: "folder-entry";
     folderId: string;
     name: string;
@@ -42,22 +42,26 @@
     sizeText: string;
     modifiedText: string;
     invalid: boolean;
-    isFavorite: boolean;
-    isCached: boolean;
-    downloadLabel: string;
-  }
+  isFavorite: boolean;
+  isCached: boolean;
+  downloadLabel: string;
+  isDownloadingActive: boolean;
+  downloadProgressText: string;
+}
 
-  export interface FavoriteItem {
+export interface FavoriteItem {
     kind: "favorite";
     key: string;
     folderId: string;
     name: string;
     path: string;
     favoriteKind: "folder" | "file";
-    connected: boolean;
-    isCached: boolean;
-    downloadLabel: string;
-  }
+  connected: boolean;
+  isCached: boolean;
+  downloadLabel: string;
+  isDownloadingActive: boolean;
+  downloadProgressText: string;
+}
 
   export interface CachedFileItem {
     kind: "cached-file";
@@ -250,11 +254,17 @@
     {/if}
   {:else if item.kind === "folder-entry"}
     <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+    {#if item.isDownloadingActive && item.downloadProgressText}
+      <div class="item-meta">Download: {item.downloadProgressText}</div>
+    {/if}
     {#if item.invalid}
       <div class="item-meta">Unavailable on remote (invalid)</div>
     {/if}
   {:else if item.kind === "favorite"}
     <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
+    {#if item.isDownloadingActive && item.downloadProgressText}
+      <div class="item-meta">Download: {item.downloadProgressText}</div>
+    {/if}
   {:else}
     <div class="item-meta">{item.folderId}:{item.path}</div>
     <div class="item-meta">{item.sizeText} | Cached {item.cachedAtText}</div>

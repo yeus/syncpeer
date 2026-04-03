@@ -6,10 +6,12 @@ import {
   Hello,
   ClusterConfig,
   Index,
+  IndexUpdate,
   FileInfo,
   Request,
+  Response,
 } from "./core/protocol/bep.ts";
-import { RemoteFs } from "./core/model/remoteFs.ts";
+import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.ts";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.ts";
 import {
   decryptEncryptedFilename,
@@ -137,6 +139,20 @@ interface FolderState {
   files: Map<string, { indexFile: any; request?: { encryptedName: string; fileKey: Uint8Array; encryptedBlocks: any[] } }>;
 }
 
+interface UploadedBlock {
+  offset: number;
+  size: number;
+  hash: Uint8Array;
+}
+
+interface UploadedFileRecord {
+  path: string;
+  bytes: Uint8Array;
+  blocks: UploadedBlock[];
+  modifiedMs: number;
+  sequence: number;
+}
+
 interface PendingRequestMeta {
   id: number;
   folder: string;
@@ -208,6 +224,12 @@ function decodeBase64(raw: string): Uint8Array {
   ).Buffer;
   if (ctor) return new Uint8Array(ctor.from(raw, "base64"));
   throw new Error("No base64 decoder available in this runtime");
+}
+
+function normalizePathValue(input: string): string {
+  return String(input ?? "")
+    .replaceAll("\\", "/")
+    .replace(/^\/+|\/+$/g, "");
 }
 
 function parseFirstCertificateDer(pem: string): Uint8Array {
@@ -468,7 +490,10 @@ class BepSession {
   private echoedClusterConfig = false;
   private localIndexId: string;
   private localIndexIdsByFolder = new Map<string, string>();
+  private localSequencesByFolder = new Map<string, number>();
+  private uploadedFilesByFolder = new Map<string, Map<string, UploadedFileRecord>>();
   private readonly folderPasswords: Map<string, string>;
+  private readonly localVersionCounterId: string;
   private socket: SyncpeerTlsSocket;
   private adapter: SyncpeerHostAdapter;
   private localDeviceId: Uint8Array;
@@ -493,11 +518,23 @@ class BepSession {
       this.readyResolve = resolve;
     });
     this.localIndexId = "1";
+    this.localVersionCounterId = this.computeLocalVersionCounterId();
     this.folderPasswords = new Map(
       Object.entries(folderPasswords ?? {})
         .map(([folderId, password]) => [folderId.trim(), password.trim()] as const)
         .filter(([folderId, password]) => folderId !== "" && password !== ""),
     );
+  }
+
+  private computeLocalVersionCounterId(): string {
+    const view = new DataView(
+      this.localDeviceId.buffer,
+      this.localDeviceId.byteOffset,
+      Math.min(this.localDeviceId.byteLength, 8),
+    );
+    const high = BigInt(view.getUint32(0, false));
+    const low = BigInt(view.getUint32(4, false));
+    return ((high << 32n) | low).toString();
   }
 
   async initialize(leftover: Uint8Array): Promise<void> {
@@ -573,6 +610,7 @@ class BepSession {
         isClusterConfig: type === MessageTypeValues.CLUSTER_CONFIG,
         isIndex: type === MessageTypeValues.INDEX,
         isIndexUpdate: type === MessageTypeValues.INDEX_UPDATE,
+        isRequest: type === MessageTypeValues.REQUEST,
         isResponse: type === MessageTypeValues.RESPONSE,
       });
     }
@@ -586,6 +624,9 @@ class BepSession {
         break;
       case MessageTypeValues.RESPONSE:
         this.handleResponse(msg);
+        break;
+      case MessageTypeValues.REQUEST:
+        void this.handleRequest(msg);
         break;
       case MessageTypeValues.CLOSE: {
         const reason =
@@ -717,6 +758,13 @@ class BepSession {
           : new Map(),
       };
       this.folders.set(folderId, state);
+      const knownSequence = Number.isFinite(Number(remoteMaxSequence))
+        ? Number(remoteMaxSequence)
+        : 0;
+      const previousSequence = this.localSequencesByFolder.get(folderId) ?? 0;
+      if (knownSequence > previousSequence) {
+        this.localSequencesByFolder.set(folderId, knownSequence);
+      }
       if (encrypted) {
         this.log("untrusted.folder.state", {
           folderId,
@@ -948,6 +996,186 @@ class BepSession {
     }
   }
 
+  private getUploadedFile(folderId: string, path: string): UploadedFileRecord | null {
+    const folder = this.uploadedFilesByFolder.get(folderId);
+    if (!folder) return null;
+    const normalizedPath = normalizePathValue(path);
+    return folder.get(normalizedPath) ?? null;
+  }
+
+  private storeUploadedFile(folderId: string, record: UploadedFileRecord): void {
+    const normalizedPath = normalizePathValue(record.path);
+    if (!this.uploadedFilesByFolder.has(folderId)) {
+      this.uploadedFilesByFolder.set(folderId, new Map());
+    }
+    this.uploadedFilesByFolder.get(folderId)?.set(normalizedPath, {
+      ...record,
+      path: normalizedPath,
+      bytes: new Uint8Array(record.bytes),
+      blocks: record.blocks.map((block) => ({
+        offset: block.offset,
+        size: block.size,
+        hash: new Uint8Array(block.hash),
+      })),
+    });
+  }
+
+  private nextFolderSequence(folderId: string): number {
+    const current = this.localSequencesByFolder.get(folderId) ?? 0;
+    const next = current + 1;
+    this.localSequencesByFolder.set(folderId, next);
+    return next;
+  }
+
+  private async handleRequest(req: any): Promise<void> {
+    const id = Number(req?.id ?? 0);
+    const folderId = String(req?.folder ?? "").trim();
+    const path = String(req?.name ?? "");
+    const offset = Math.max(0, Number(req?.offset ?? 0));
+    const size = Math.max(0, Number(req?.size ?? 0));
+    const record = this.getUploadedFile(folderId, path);
+    let code = 0;
+    let data = new Uint8Array(0);
+    try {
+      if (!record) {
+        code = 2;
+      } else if (offset > record.bytes.length) {
+        code = 2;
+      } else {
+        const end = Math.min(record.bytes.length, offset + size);
+        data = record.bytes.slice(offset, end);
+      }
+    } catch (error) {
+      code = 1;
+      this.log("upload.request.failed", {
+        id,
+        folderId,
+        path,
+        offset,
+        size,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const responseFrame = encodeMessageFrame(
+      MessageTypeValues.RESPONSE,
+      Response,
+      { id, data, code },
+      0,
+    );
+    try {
+      await this.socket.write(responseFrame);
+      this.log("upload.request.responded", {
+        id,
+        folderId,
+        path,
+        offset,
+        size,
+        responseCode: code,
+        responseBytes: data.length,
+      });
+    } catch (error) {
+      this.log("upload.response.write_failed", {
+        id,
+        folderId,
+        path,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async publishFile(
+    folderId: string,
+    path: string,
+    bytes: Uint8Array,
+    options?: FileUploadOptions,
+  ): Promise<void> {
+    const folder = this.folders.get(folderId);
+    if (!folder) {
+      throw new Error(`Unknown folder: ${folderId}`);
+    }
+    if (folder.readOnly) {
+      throw new Error(`Folder ${folderId} is read-only for this client.`);
+    }
+    if (folder.stopReason !== 0) {
+      throw new Error(`Folder ${folderId} is stopped on remote (stopReason=${folder.stopReason}).`);
+    }
+    if (folder.encrypted) {
+      throw new Error(`Upload is not supported for encrypted folder ${folderId}.`);
+    }
+    const normalizedPath = normalizePathValue(path);
+    if (!normalizedPath) {
+      throw new Error("Upload path must not be empty.");
+    }
+    const blockSize = 128 * 1024;
+    const blocks: UploadedBlock[] = [];
+    for (let offset = 0; offset < bytes.length; offset += blockSize) {
+      const end = Math.min(bytes.length, offset + blockSize);
+      const chunk = bytes.slice(offset, end);
+      const hash = await this.adapter.sha256(chunk);
+      blocks.push({
+        offset,
+        size: chunk.length,
+        hash: hash instanceof Uint8Array ? hash : new Uint8Array(hash),
+      });
+    }
+    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
+    const sequence = this.nextFolderSequence(folderId);
+    const fileInfo = {
+      name: normalizedPath,
+      type: 0,
+      size: bytes.length,
+      permissions: 0o644,
+      modified_s: Math.floor(modifiedMs / 1000),
+      modified_ns: (modifiedMs % 1000) * 1_000_000,
+      modified_by: this.localVersionCounterId,
+      deleted: false,
+      invalid: false,
+      no_permissions: false,
+      version: {
+        counters: [
+          {
+            id: this.localVersionCounterId,
+            value: String(sequence),
+          },
+        ],
+      },
+      sequence,
+      block_size: blockSize,
+      blocks: blocks.map((block) => ({
+        offset: block.offset,
+        size: block.size,
+        hash: block.hash,
+      })),
+    };
+    folder.files.set(normalizedPath, { indexFile: fileInfo });
+    this.storeUploadedFile(folderId, {
+      path: normalizedPath,
+      bytes,
+      blocks,
+      modifiedMs,
+      sequence,
+    });
+    const frame = encodeMessageFrame(
+      MessageTypeValues.INDEX_UPDATE,
+      IndexUpdate,
+      {
+        folder: folderId,
+        files: [fileInfo],
+        last_sequence: sequence,
+        prev_sequence: Math.max(0, sequence - 1),
+      },
+      0,
+    );
+    await this.socket.write(frame);
+    this.log("upload.index_update.sent", {
+      folderId,
+      path: normalizedPath,
+      sizeBytes: bytes.length,
+      blockCount: blocks.length,
+      sequence,
+    });
+  }
+
   async waitForReady(): Promise<void> {
     await this.readyPromise;
     if (this.readyState !== "ready") {
@@ -1032,6 +1260,8 @@ class BepSession {
       () => {
         void this.close();
       },
+      (folderId, path, bytes, options) =>
+        this.publishFile(folderId, path, bytes, options),
     );
   }
 

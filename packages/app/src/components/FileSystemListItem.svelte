@@ -1,7 +1,14 @@
 <script lang="ts">
   import Download from "lucide-svelte/icons/download";
   import ExternalLink from "lucide-svelte/icons/external-link";
+  import File from "lucide-svelte/icons/file";
+  import FileArchive from "lucide-svelte/icons/file-archive";
+  import FileAudio from "lucide-svelte/icons/file-audio";
+  import FileImage from "lucide-svelte/icons/file-image";
+  import FileText from "lucide-svelte/icons/file-text";
+  import FileVideo from "lucide-svelte/icons/file-video";
   import FolderOpen from "lucide-svelte/icons/folder-open";
+  import Folder from "lucide-svelte/icons/folder";
   import KeyRound from "lucide-svelte/icons/key-round";
   import Star from "lucide-svelte/icons/star";
   import StarOff from "lucide-svelte/icons/star-off";
@@ -142,10 +149,67 @@
       });
     }
   };
+
+  const extensionOf = (name: string, path: string) => {
+    const source = (path || name || "").split("/").pop() || "";
+    const parts = source.toLowerCase().split(".");
+    if (parts.length <= 1) return "";
+    return parts.pop() || "";
+  };
+
+  const fileIconKind = (name: string, path: string) => {
+    const ext = extensionOf(name, path);
+    if (["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "ico", "heic"].includes(ext)) {
+      return "image";
+    }
+    if (["mp3", "wav", "flac", "aac", "ogg", "m4a"].includes(ext)) {
+      return "audio";
+    }
+    if (["mp4", "mkv", "mov", "avi", "webm", "m4v"].includes(ext)) {
+      return "video";
+    }
+    if (["zip", "tar", "gz", "bz2", "xz", "7z", "rar"].includes(ext)) {
+      return "archive";
+    }
+    if (["txt", "md", "pdf", "rtf", "doc", "docx"].includes(ext)) {
+      return "text";
+    }
+    return "generic";
+  };
+
+  const leadingKind = (value: FileSystemItem) => {
+    if (value.kind === "root-folder") return "folder";
+    if (value.kind === "folder-entry") {
+      if (value.entryType === "directory") return "folder";
+      return fileIconKind(value.name, value.path);
+    }
+    if (value.kind === "favorite") {
+      if (value.favoriteKind === "folder") return "folder";
+      return fileIconKind(value.name, value.path);
+    }
+    return fileIconKind(value.name, value.path);
+  };
 </script>
 
 <ListRow>
   <div class="item-title-row">
+    <span class="item-icon" aria-hidden="true">
+      {#if leadingKind(item) === "folder"}
+        <Folder size={16} />
+      {:else if leadingKind(item) === "image"}
+        <FileImage size={16} />
+      {:else if leadingKind(item) === "audio"}
+        <FileAudio size={16} />
+      {:else if leadingKind(item) === "video"}
+        <FileVideo size={16} />
+      {:else if leadingKind(item) === "archive"}
+        <FileArchive size={16} />
+      {:else if leadingKind(item) === "text"}
+        <FileText size={16} />
+      {:else}
+        <File size={16} />
+      {/if}
+    </span>
     {#if canClickTitle(item)}
       <button class="item-title" onclick={() => handleTitleClick(item)} disabled={item.kind === "root-folder" && item.locked}>
         {rowTitle(item)}
@@ -386,6 +450,13 @@
     align-items: center;
     gap: 0.4rem;
     flex-wrap: wrap;
+  }
+
+  .item-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-muted);
+    flex: 0 0 auto;
   }
 
   .inline-input {

@@ -61,6 +61,21 @@ import {
 } from "./suggestedNames.ts";
 
 const nowTime = () => new Date().toLocaleTimeString();
+const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
+const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
+
+const folderSignature = (folders: FolderInfo[]) =>
+  folders
+    .map((folder) =>
+      [
+        folder.id,
+        folder.label,
+        folder.stopReason ?? 0,
+        folder.localDevicePresentInFolder ? 1 : 0,
+      ].join(":"),
+    )
+    .sort()
+    .join("|");
 
 const updateCachedKey = (
   state: AppState,
@@ -378,6 +393,16 @@ const loadDirectorySideEffects = async (
   state.session.lastUpdatedAt = nowTime();
 };
 
+const updateOverviewSyncTracking = (state: AppState) => {
+  const nextSignature = folderSignature(state.session.folders);
+  const now = Date.now();
+  state.sync.lastOverviewAtMs = now;
+  if (state.sync.folderSignature !== nextSignature) {
+    state.sync.folderSignature = nextSignature;
+    state.sync.folderSignatureChangedAtMs = now;
+  }
+};
+
 export const createAppActions = (args: {
   state: AppState;
   client: SyncpeerBrowserClient;
@@ -385,9 +410,67 @@ export const createAppActions = (args: {
 }) => {
   const { state, client, sessionStore } = args;
 
+  const canAttemptFolderSyncRecovery = () => {
+    if (!state.session.isConnected) return false;
+    if (!state.ui.isAppVisible) return false;
+    if (state.sync.isRecoveringFolderSync) return false;
+    if (
+      state.session.isConnecting ||
+      state.session.isRefreshing ||
+      state.session.isLoadingDirectory
+    ) {
+      return false;
+    }
+    const now = Date.now();
+    if (
+      state.sync.lastRecoveryReconnectAtMs > 0 &&
+      now - state.sync.lastRecoveryReconnectAtMs < FOLDER_SYNC_RECOVERY_THROTTLE_MS
+    ) {
+      return false;
+    }
+    if (!state.sync.folderSignatureChangedAtMs) return false;
+    return now - state.sync.folderSignatureChangedAtMs >= FOLDER_SYNC_STALE_MS;
+  };
+
+  const recoverFolderSyncByReconnect = async () => {
+    if (!canAttemptFolderSyncRecovery()) return;
+    state.sync.isRecoveringFolderSync = true;
+    state.sync.lastRecoveryReconnectAtMs = Date.now();
+    pushSessionLog(
+      state,
+      "info",
+      "folder_sync.recovery.reconnect.start",
+      "Starting conservative reconnect to recover folder list updates.",
+    );
+    try {
+      await sessionStore.actions.connect(connectionDetails(state));
+      const session = sessionStore.getState();
+      applySessionState(state, session);
+      await refreshFolderRootCachedStatuses(
+        state,
+        client,
+        session.folders.map((folder) => folder.id),
+      );
+      updateOverviewSyncTracking(state);
+      state.session.lastUpdatedAt = nowTime();
+      pushSessionLog(
+        state,
+        "info",
+        "folder_sync.recovery.reconnect.done",
+        "Conservative reconnect completed.",
+        { folderCount: session.folders.length },
+      );
+    } catch (error) {
+      reportActionError(state, "folder_sync.recovery.reconnect.failed", error);
+    } finally {
+      state.sync.isRecoveringFolderSync = false;
+    }
+  };
+
   const connect = async (targetDeviceId?: string) => {
     state.ui.recentError = null;
     state.ui.uploadMessage = "";
+    state.ui.autoConnectPaused = false;
     if (!ensureClientName(state)) {
       state.session.activeConnectDeviceId = "";
       return;
@@ -443,6 +526,7 @@ export const createAppActions = (args: {
       });
       applyAutoApprovals(state);
       state.session.lastUpdatedAt = nowTime();
+      updateOverviewSyncTracking(state);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       state.ui.recentError = message;
@@ -457,6 +541,7 @@ export const createAppActions = (args: {
       reportUiError("connect.failed", error, connectionDetails(state));
       resetRuntimeState(state);
       restoreOfflineSnapshot(state, attemptedDeviceId, "connect_failed");
+      updateOverviewSyncTracking(state);
     } finally {
       state.session.activeConnectDeviceId = "";
     }
@@ -523,6 +608,7 @@ export const createAppActions = (args: {
         }
       }
       state.session.lastUpdatedAt = nowTime();
+      updateOverviewSyncTracking(state);
     } catch (error) {
       reportActionError(state, "refresh_overview.failed", error, connectionDetails(state));
     }
@@ -530,6 +616,7 @@ export const createAppActions = (args: {
 
   const refreshActiveView = async () => {
     await refreshOverview();
+    await recoverFolderSyncByReconnect();
   };
 
   const hydrate = async () => {
@@ -553,6 +640,7 @@ export const createAppActions = (args: {
 
   const disconnect = async () => {
     if (state.session.isConnecting) return;
+    state.ui.autoConnectPaused = true;
     try {
       await sessionStore.actions.disconnect();
     } catch (error) {
@@ -562,6 +650,7 @@ export const createAppActions = (args: {
       clearDirectoryView(state);
       restoreOfflineSnapshot(state, undefined, "disconnect");
       state.ui.recentError = null;
+      updateOverviewSyncTracking(state);
     }
   };
 
@@ -968,7 +1057,9 @@ export const createAppActions = (args: {
     state.connection.remoteId = deviceId;
     if (!state.session.isConnected) {
       restoreOfflineSnapshot(state, deviceId, "use_saved_device");
+      return;
     }
+    void refreshActiveView();
   };
 
   const setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean) => {
@@ -1129,6 +1220,7 @@ export const createAppActions = (args: {
     if (state.activeTab === tab) return;
     state.activeTab = tab;
     pushSessionLog(state, "info", "ui.tab.switch", `Switched tab to ${tab}`);
+    void refreshActiveView();
   };
 
   const handleUploadSelected = (event: Event) => {
@@ -1138,6 +1230,20 @@ export const createAppActions = (args: {
       ? `Upload selected (${fileName}) but uploading is not available in this read-only BEP client yet.`
       : "";
     input.value = "";
+  };
+
+  const setAutoConnectPaused = (paused: boolean) => {
+    state.ui.autoConnectPaused = paused;
+  };
+
+  const setAppVisibility = (isVisible: boolean) => {
+    state.ui.isAppVisible = isVisible;
+  };
+
+  const onNetworkOnline = async () => {
+    if (state.ui.autoConnectPaused) return;
+    if (state.session.isConnected || state.session.isConnecting) return;
+    await connect();
   };
 
   const openDiagnosticsPage = () => {
@@ -1250,6 +1356,9 @@ export const createAppActions = (args: {
     restoreIdentityRecovery,
     switchTab,
     handleUploadSelected,
+    setAutoConnectPaused,
+    setAppVisibility,
+    onNetworkOnline,
     openDiagnosticsPage,
     closeDiagnosticsPage,
     runFolderDiagnosticsTest,

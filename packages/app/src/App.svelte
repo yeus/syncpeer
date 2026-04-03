@@ -118,14 +118,48 @@
     void actions.hydrate();
     void actions.refreshCurrentDeviceId();
     actions.restoreOfflineSnapshot(undefined, "startup");
+    actions.setAppVisibility(document.visibilityState === "visible");
+
+    const handleOnline = () => {
+      void actions.onNetworkOnline();
+      void actions.refreshActiveView();
+    };
+    const handleVisibilityChange = () => {
+      const isVisible = document.visibilityState === "visible";
+      actions.setAppVisibility(isVisible);
+      if (isVisible) {
+        void actions.refreshActiveView();
+      }
+    };
+    window.addEventListener("online", handleOnline);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   });
 
-  const refreshTimer = setInterval(() => {
-    void actions.refreshActiveView();
-  }, 3000);
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+  $effect(() => {
+    if (app.currentPage !== "main") return;
+    const intervalMs = app.activeTab === "folders" ? 15000 : 60000;
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(() => {
+      void actions.refreshActiveView();
+    }, intervalMs);
+    return () => {
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = null;
+    };
+  });
 
   onDestroy(() => {
-    clearInterval(refreshTimer);
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
     unsubscribe();
     void client.disconnect();
   });
@@ -172,21 +206,27 @@
         </section>
       {/if}
 
-      {#if !app.session.isConnected}
-        <div class="global-connect">
-          <button class="primary" onclick={() => actions.connect()} disabled={app.session.isConnecting}>
-            {app.session.isConnecting ? "Connecting..." : "Connect"}
-          </button>
-          <div class="global-connect-meta">
-            {#if currentConnectTargetLabel}
-              <p>Target: {currentConnectTargetLabel}</p>
-            {/if}
-            {#if currentConnectionModeLabel}
-              <p>{currentConnectionModeLabel}</p>
-            {/if}
-          </div>
+      <div class="global-connect compact">
+        <button
+          class="ghost compact-connect"
+          onclick={() => (app.session.isConnected ? actions.disconnect() : actions.connect())}
+          disabled={app.session.isConnecting}
+        >
+          {app.session.isConnecting
+            ? "Connecting..."
+            : app.session.isConnected
+              ? "Disconnect"
+              : "Connect"}
+        </button>
+        <div class="global-connect-meta">
+          {#if currentConnectTargetLabel}
+            <p>Target: {currentConnectTargetLabel}</p>
+          {/if}
+          {#if currentConnectionModeLabel}
+            <p>{currentConnectionModeLabel}</p>
+          {/if}
         </div>
-      {/if}
+      </div>
 
       {#if app.activeTab === "devices"}
         <DeviceTab
@@ -196,7 +236,6 @@
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
             isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
           currentSourceIsIntroducer={currentSourceIsIntroducer(app)}
-          onDisconnect={actions.disconnect}
           onUseSavedDevice={actions.useSavedDevice}
           onResetDiscoveryServer={actions.resetDiscoveryServer}
           onClearAllCache={actions.clearAllCache}
@@ -223,6 +262,7 @@
           onOpenFavorite={actions.openFavorite}
           onOpenCachedFile={actions.openCachedFile}
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
+          onOpenCachedDirectory={actions.openCachedDirectory}
           onRemoveCachedFile={actions.removeCachedFile}
           onDownloadFile={actions.downloadFile}
           onRemoveFavorite={actions.removeFavorite}
@@ -238,7 +278,6 @@
           breadcrumbs={currentBreadcrumbs}
           rootFolders={currentRootFolders}
           favoriteKeys={currentFavoriteKeys}
-          onRefreshActiveView={actions.refreshActiveView}
           onGoToRootView={actions.goToRootView}
           onGoToBreadcrumb={actions.goToBreadcrumb}
           onOpenFolderRoot={actions.openFolderRoot}
@@ -344,6 +383,12 @@
     flex-wrap: wrap;
     align-items: flex-start;
     gap: 0.55rem;
+  }
+
+  .compact-connect {
+    min-height: 30px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.79rem;
   }
 
   .global-connect button {

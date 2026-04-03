@@ -10,7 +10,6 @@
     isSavedDeviceConnected: (deviceId: string) => boolean;
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
     currentSourceIsIntroducer: boolean;
-    onDisconnect: () => void;
     onUseSavedDevice: (deviceId: string) => void;
     onResetDiscoveryServer: () => void;
     onClearAllCache: () => void;
@@ -35,7 +34,6 @@
     isSavedDeviceConnected,
     isSavedDeviceAwaitingRemoteApproval,
     currentSourceIsIntroducer,
-    onDisconnect,
     onUseSavedDevice,
     onResetDiscoveryServer,
     onClearAllCache,
@@ -143,11 +141,6 @@
       Settings
     </button>
     <button class="ghost small" onclick={onOpenDiagnosticsPage}>Diagnostics</button>
-    {#if app.session.isConnected}
-      <button class="ghost small" onclick={onDisconnect} disabled={app.session.isConnecting}>
-        Disconnect
-      </button>
-    {/if}
   </div>
 
   <div class="this-device-summary">

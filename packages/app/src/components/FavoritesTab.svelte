@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Star from "lucide-svelte/icons/star";
+  import type { CachedFileItem, FavoriteItem } from "./FileSystemListItem.svelte";
   import FileSystemListItem from "./FileSystemListItem.svelte";
   import Panel from "./Panel.svelte";
 
@@ -9,6 +9,7 @@
     onOpenFavorite: (favorite: any) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
+    onOpenCachedDirectory: (folderId: string, path: string) => void;
     onRemoveCachedFile: (folderId: string, path: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
     onRemoveFavorite: (favorite: any) => void;
@@ -23,6 +24,7 @@
     onOpenFavorite,
     onOpenCachedFile,
     onOpenCachedFileDirectory,
+    onOpenCachedDirectory,
     onRemoveCachedFile,
     onDownloadFile,
     onRemoveFavorite,
@@ -30,6 +32,43 @@
     formatBytes,
     formatModified,
   }: Props = $props();
+
+  const downloadLabel = (folderId: string, path: string) => {
+    const key = `${folderId}:${path}`;
+    return key === app.favorites.activeDownloadKey
+      ? app.favorites.activeDownloadText || "Downloading..."
+      : "Download";
+  };
+
+  let favoriteRows = $derived.by(() =>
+    app.favorites.items.map(
+      (favorite: any): FavoriteItem => ({
+        kind: "favorite",
+        key: favorite.key,
+        folderId: favorite.folderId,
+        name: favorite.name,
+        path: favorite.path,
+        favoriteKind: favorite.kind,
+        connected: app.session.isConnected,
+        isCached: app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`),
+        downloadLabel: downloadLabel(favorite.folderId, favorite.path),
+      }),
+    ),
+  );
+
+  let downloadedRows = $derived.by(() =>
+    app.favorites.downloadedFiles.map(
+      (file: any): CachedFileItem => ({
+        kind: "cached-file",
+        key: file.key,
+        folderId: file.folderId,
+        name: file.name,
+        path: file.path,
+        sizeText: formatBytes(file.sizeBytes),
+        cachedAtText: formatModified(file.cachedAtMs),
+      }),
+    ),
+  );
 </script>
 
 <Panel title="Favorites">
@@ -47,55 +86,24 @@
   {/if}
 
   <ul class="list">
-    {#if app.favorites.items.length === 0}
+    {#if favoriteRows.length === 0}
       <li class="empty">No favorites yet. Tap a star on folders/files to add them.</li>
     {:else}
-      {#each app.favorites.items as favorite (favorite.key)}
+      {#each favoriteRows as item (item.key)}
         <FileSystemListItem
-          title={favorite.name}
-          onTitleClick={() => onOpenFavorite(favorite)}
-          titleDisabled={!app.session.isConnected}
-          metaLines={[`${favorite.folderId}:${favorite.path || "/"}`]}
-        >
-          {#snippet actions()}
-            {#if favorite.kind === "file"}
-              {#if app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`)}
-                <button
-                  class="ghost"
-                  onclick={() => onOpenCachedFile(favorite.folderId, favorite.path)}
-                  disabled={app.favorites.isOpeningCachedFile}
-                >
-                  Open
-                </button>
-                <button
-                  class="ghost"
-                  onclick={() => onOpenCachedFileDirectory(favorite.folderId, favorite.path)}
-                  disabled={app.favorites.isOpeningCachedFile}
-                >
-                  Open Folder
-                </button>
-                <button
-                  class="ghost"
-                  onclick={() => onRemoveCachedFile(favorite.folderId, favorite.path)}
-                  disabled={app.favorites.isRemovingCachedFile || app.favorites.isClearingCache}
-                >
-                  Drop
-                </button>
-              {:else}
-                <button
-                  class="ghost"
-                  onclick={() => onDownloadFile(favorite.folderId, favorite.path, favorite.name)}
-                  disabled={app.favorites.isDownloading}
-                >
-                  Download
-                </button>
-              {/if}
-            {/if}
-            <button class="icon icon-only" onclick={() => onRemoveFavorite(favorite)} aria-label="Remove favorite">
-              <Star size={16} />
-            </button>
-          {/snippet}
-        </FileSystemListItem>
+          {item}
+          isOpeningCachedFile={app.favorites.isOpeningCachedFile}
+          isRemovingCachedFile={app.favorites.isRemovingCachedFile}
+          isClearingCache={app.favorites.isClearingCache}
+          isDownloading={app.favorites.isDownloading}
+          onOpenFavorite={onOpenFavorite}
+          onOpenCachedFile={onOpenCachedFile}
+          onOpenCachedFileDirectory={onOpenCachedFileDirectory}
+          onOpenCachedDirectory={onOpenCachedDirectory}
+          onRemoveCachedFile={onRemoveCachedFile}
+          onDownloadFile={onDownloadFile}
+          onRemoveFavorite={onRemoveFavorite}
+        />
       {/each}
     {/if}
   </ul>
@@ -112,41 +120,20 @@
       </button>
     </div>
     <ul class="list">
-      {#if app.favorites.downloadedFiles.length === 0}
+      {#if downloadedRows.length === 0}
         <li class="empty">No downloaded files in local cache yet.</li>
       {:else}
-        {#each app.favorites.downloadedFiles as file (file.key)}
+        {#each downloadedRows as item (item.key)}
           <FileSystemListItem
-            title={file.name}
-            metaLines={[
-              `${file.folderId}:${file.path}`,
-              `${formatBytes(file.sizeBytes)} | Cached ${formatModified(file.cachedAtMs)}`,
-            ]}
-          >
-            {#snippet actions()}
-              <button
-                class="ghost"
-                onclick={() => onOpenCachedFile(file.folderId, file.path)}
-                disabled={app.favorites.isOpeningCachedFile}
-              >
-                Open
-              </button>
-              <button
-                class="ghost"
-                onclick={() => onOpenCachedFileDirectory(file.folderId, file.path)}
-                disabled={app.favorites.isOpeningCachedFile}
-              >
-                Open Folder
-              </button>
-              <button
-                class="ghost"
-                onclick={() => onRemoveCachedFile(file.folderId, file.path)}
-                disabled={app.favorites.isRemovingCachedFile || app.favorites.isClearingCache}
-              >
-                Drop
-              </button>
-            {/snippet}
-          </FileSystemListItem>
+            {item}
+            isOpeningCachedFile={app.favorites.isOpeningCachedFile}
+            isRemovingCachedFile={app.favorites.isRemovingCachedFile}
+            isClearingCache={app.favorites.isClearingCache}
+            isDownloading={app.favorites.isDownloading}
+            onOpenCachedFile={onOpenCachedFile}
+            onOpenCachedFileDirectory={onOpenCachedFileDirectory}
+            onRemoveCachedFile={onRemoveCachedFile}
+          />
         {/each}
       {/if}
     </ul>

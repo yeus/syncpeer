@@ -284,6 +284,7 @@
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
           onOpenCachedDirectory={actions.openCachedDirectory}
           onRemoveCachedFile={actions.removeCachedFile}
+          onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
           onRemoveFavorite={actions.removeFavorite}
           onClearAllCache={actions.clearAllCache}
@@ -307,6 +308,7 @@
           onOpenCachedDirectory={actions.openCachedDirectory}
           onOpenCachedFile={actions.openCachedFile}
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
+          onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
           onToggleFavorite={actions.toggleFavorite}
           onSetPasswordVisible={actions.setFolderPasswordInputVisible}
@@ -325,6 +327,7 @@
           directoryPageSize={app.ui.directoryPageSize}
           {formatBytes}
           {formatModified}
+          onHandleUploadClick={actions.handleUploadClick}
           onHandleUploadSelected={actions.handleUploadSelected}
         />
       {/if}

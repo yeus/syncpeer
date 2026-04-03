@@ -151,6 +151,12 @@ struct ReadTextFileRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ReadBinaryFileRequest {
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TlsOpenRequest {
     host: String,
     port: u16,
@@ -1208,6 +1214,12 @@ fn perform_ca_validated_discovery_request(
 async fn syncpeer_read_text_file(request: ReadTextFileRequest) -> Result<String, String> {
     let path = PathBuf::from(request.path);
     fs::read_to_string(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))
+}
+
+#[tauri::command]
+async fn syncpeer_read_binary_file(request: ReadBinaryFileRequest) -> Result<Vec<u8>, String> {
+    let path = PathBuf::from(request.path);
+    fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))
 }
 
 #[tauri::command]
@@ -2383,6 +2395,7 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .invoke_handler(tauri::generate_handler![
             syncpeer_read_text_file,
+            syncpeer_read_binary_file,
             syncpeer_read_default_cli_identity,
             syncpeer_export_identity_recovery,
             syncpeer_get_default_device_id,

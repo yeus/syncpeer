@@ -252,6 +252,12 @@ export const createTauriAdapters = (
   const platformAdapter: SyncpeerPlatformAdapter = {
     readTextFile: async (path: string): Promise<string> =>
       invokeWithLogging<string>("syncpeer_read_text_file", { request: { path } }),
+    readBinaryFile: async (path: string): Promise<Uint8Array> => {
+      const bytes = await invokeWithLogging<number[]>("syncpeer_read_binary_file", {
+        request: { path },
+      });
+      return new Uint8Array(bytes);
+    },
     readDefaultIdentity: async (): Promise<CliNodeIdentityResponse> =>
       invokeWithLogging<CliNodeIdentityResponse>("syncpeer_read_default_cli_identity"),
     listFavorites: async (): Promise<FavoriteRecord[]> =>

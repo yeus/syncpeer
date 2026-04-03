@@ -15,6 +15,9 @@ import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.ts";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.ts";
 import {
   decryptEncryptedFilename,
+  encryptUntrustedBlockHash,
+  encryptUntrustedBytes,
+  encryptUntrustedFilename,
   decryptUntrustedBytes,
   deriveUntrustedFileKey,
   deriveUntrustedFolderCrypto,
@@ -143,6 +146,7 @@ interface UploadedBlock {
   offset: number;
   size: number;
   hash: Uint8Array;
+  encryptedData?: Uint8Array;
 }
 
 interface UploadedFileRecord {
@@ -151,6 +155,7 @@ interface UploadedFileRecord {
   blocks: UploadedBlock[];
   modifiedMs: number;
   sequence: number;
+  encryptedName?: string;
 }
 
 interface PendingRequestMeta {
@@ -230,6 +235,22 @@ function normalizePathValue(input: string): string {
   return String(input ?? "")
     .replaceAll("\\", "/")
     .replace(/^\/+|\/+$/g, "");
+}
+
+function padBytesWithRandom(
+  input: Uint8Array,
+  targetLength: number,
+  randomBytes: Uint8Array,
+): Uint8Array {
+  if (input.length >= targetLength) return input;
+  const padded = new Uint8Array(targetLength);
+  padded.set(input, 0);
+  padded.set(randomBytes.slice(0, targetLength - input.length), input.length);
+  return padded;
+}
+
+function toUint8Array(input: Uint8Array | ArrayBuffer): Uint8Array {
+  return input instanceof Uint8Array ? input : new Uint8Array(input);
 }
 
 function parseFirstCertificateDer(pem: string): Uint8Array {
@@ -1008,7 +1029,7 @@ class BepSession {
     if (!this.uploadedFilesByFolder.has(folderId)) {
       this.uploadedFilesByFolder.set(folderId, new Map());
     }
-    this.uploadedFilesByFolder.get(folderId)?.set(normalizedPath, {
+    const storedRecord: UploadedFileRecord = {
       ...record,
       path: normalizedPath,
       bytes: new Uint8Array(record.bytes),
@@ -1016,8 +1037,18 @@ class BepSession {
         offset: block.offset,
         size: block.size,
         hash: new Uint8Array(block.hash),
+        encryptedData: block.encryptedData
+          ? new Uint8Array(block.encryptedData)
+          : undefined,
       })),
-    });
+    };
+    this.uploadedFilesByFolder.get(folderId)?.set(normalizedPath, storedRecord);
+    if (record.encryptedName) {
+      const encryptedName = normalizePathValue(record.encryptedName);
+      if (encryptedName) {
+        this.uploadedFilesByFolder.get(folderId)?.set(encryptedName, storedRecord);
+      }
+    }
   }
 
   private nextFolderSequence(folderId: string): number {
@@ -1039,6 +1070,51 @@ class BepSession {
     try {
       if (!record) {
         code = 2;
+      } else if (
+        record.encryptedName &&
+        normalizePathValue(path) === normalizePathValue(record.encryptedName)
+      ) {
+        if (offset < 0 || size < 0) {
+          code = 2;
+        } else {
+          const chunks: Uint8Array[] = [];
+          let remaining = size;
+          let cursor = offset;
+          for (const block of record.blocks) {
+            const encryptedData = block.encryptedData;
+            if (!encryptedData) continue;
+            const blockStart = block.offset;
+            const blockEnd = block.offset + block.size;
+            if (cursor >= blockEnd) continue;
+            if (cursor < blockStart && chunks.length === 0) {
+              // Requested an offset that is between known block boundaries.
+              code = 2;
+              break;
+            }
+            const startInBlock = Math.max(0, cursor - blockStart);
+            const available = block.size - startInBlock;
+            if (available <= 0) continue;
+            const sliceSize = Math.min(remaining, available);
+            chunks.push(encryptedData.slice(startInBlock, startInBlock + sliceSize));
+            cursor += sliceSize;
+            remaining -= sliceSize;
+            if (remaining <= 0) break;
+          }
+          if (code === 0) {
+            if (chunks.length === 0) {
+              code = 2;
+            } else {
+              const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+              const merged = new Uint8Array(total);
+              let cursorOut = 0;
+              for (const chunk of chunks) {
+                merged.set(chunk, cursorOut);
+                cursorOut += chunk.length;
+              }
+              data = merged;
+            }
+          }
+        }
       } else if (offset > record.bytes.length) {
         code = 2;
       } else {
@@ -1099,24 +1175,172 @@ class BepSession {
     if (folder.stopReason !== 0) {
       throw new Error(`Folder ${folderId} is stopped on remote (stopReason=${folder.stopReason}).`);
     }
-    if (folder.encrypted) {
-      throw new Error(`Upload is not supported for encrypted folder ${folderId}.`);
-    }
     const normalizedPath = normalizePathValue(path);
     if (!normalizedPath) {
       throw new Error("Upload path must not be empty.");
     }
     const blockSize = 128 * 1024;
-    const blocks: UploadedBlock[] = [];
-    for (let offset = 0; offset < bytes.length; offset += blockSize) {
-      const end = Math.min(bytes.length, offset + blockSize);
-      const chunk = bytes.slice(offset, end);
-      const hash = await this.adapter.sha256(chunk);
-      blocks.push({
-        offset,
-        size: chunk.length,
-        hash: hash instanceof Uint8Array ? hash : new Uint8Array(hash),
+    const uploadStartedAtMs = Date.now();
+    const notifyProgress = (
+      processedBytes: number,
+      phase: "preparing" | "publishing",
+    ) => {
+      options?.onProgress?.({
+        processedBytes: Math.min(bytes.length, Math.max(0, processedBytes)),
+        totalBytes: bytes.length,
+        elapsedMs: Math.max(1, Date.now() - uploadStartedAtMs),
+        phase,
       });
+    };
+    const blocks: UploadedBlock[] = [];
+    let encryptedName: string | undefined;
+    if (!folder.encrypted) {
+      for (let offset = 0; offset < bytes.length; offset += blockSize) {
+        const end = Math.min(bytes.length, offset + blockSize);
+        const chunk = bytes.slice(offset, end);
+        const hash = await this.adapter.sha256(chunk);
+        blocks.push({
+          offset,
+          size: chunk.length,
+          hash: toUint8Array(hash),
+        });
+        notifyProgress(end, "preparing");
+      }
+    } else {
+      if (!folder.folderCrypto || folder.needsPassword) {
+        throw new Error(`Folder ${folderId} requires a valid encryption password before upload.`);
+      }
+      const fileKey = deriveUntrustedFileKey(folder.folderCrypto.folderKey, normalizedPath);
+      encryptedName = await encryptUntrustedFilename(
+        folder.folderCrypto.folderKey,
+        normalizedPath,
+      );
+      let encryptedOffset = 0;
+      const originalBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
+      const fakeBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
+      for (let offset = 0; offset < bytes.length; offset += blockSize) {
+        const end = Math.min(bytes.length, offset + blockSize);
+        const chunk = bytes.slice(offset, end);
+        const hashPlain = toUint8Array(await this.adapter.sha256(chunk));
+        const isLastBlock = end >= bytes.length;
+        const paddedChunk =
+          isLastBlock && chunk.length < 1024
+            ? padBytesWithRandom(
+                chunk,
+                1024,
+                toUint8Array(await this.adapter.randomBytes(1024 - chunk.length)),
+              )
+            : chunk;
+        const nonce = toUint8Array(await this.adapter.randomBytes(24));
+        const encryptedData = encryptUntrustedBytes(fileKey, paddedChunk, nonce);
+        const encryptedHash = encryptUntrustedBlockHash(fileKey, hashPlain);
+        originalBlocks.push({ offset, size: chunk.length, hash: hashPlain });
+        fakeBlocks.push({
+          offset: encryptedOffset,
+          size: encryptedData.length,
+          hash: encryptedHash,
+        });
+        blocks.push({
+          offset: encryptedOffset,
+          size: encryptedData.length,
+          hash: encryptedHash,
+          encryptedData,
+        });
+        encryptedOffset += encryptedData.length;
+        notifyProgress(end, "preparing");
+      }
+      const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
+      const sequence = this.nextFolderSequence(folderId);
+      const baseVersion = {
+        counters: [{ id: this.localVersionCounterId, value: String(sequence) }],
+      };
+      const originalFileInfo = {
+        name: normalizedPath,
+        type: 0,
+        size: bytes.length,
+        permissions: 0o644,
+        modified_s: Math.floor(modifiedMs / 1000),
+        modified_ns: (modifiedMs % 1000) * 1_000_000,
+        modified_by: this.localVersionCounterId,
+        deleted: false,
+        invalid: false,
+        no_permissions: false,
+        version: baseVersion,
+        sequence,
+        block_size: blockSize,
+        blocks: originalBlocks.map((block) => ({
+          offset: block.offset,
+          size: block.size,
+          hash: block.hash,
+        })),
+      };
+      const encryptedMetadata = encryptUntrustedBytes(
+        fileKey,
+        FileInfo.encode(originalFileInfo).finish(),
+        toUint8Array(await this.adapter.randomBytes(24)),
+      );
+      const advertisedFileInfo = {
+        name: encryptedName,
+        type: 0,
+        size: fakeBlocks.reduce((sum, block) => sum + block.size, 0),
+        permissions: 0o644,
+        modified_s: 1_234_567_890,
+        modified_ns: 0,
+        modified_by: this.localVersionCounterId,
+        deleted: false,
+        invalid: false,
+        no_permissions: false,
+        version: baseVersion,
+        sequence,
+        block_size: blockSize + 40,
+        blocks: fakeBlocks.map((block) => ({
+          offset: block.offset,
+          size: block.size,
+          hash: block.hash,
+        })),
+        encrypted: encryptedMetadata,
+      };
+      folder.files.set(normalizedPath, {
+        indexFile: advertisedFileInfo,
+        request: {
+          encryptedName,
+          fileKey,
+          encryptedBlocks: fakeBlocks.map((block) => ({
+            offset: block.offset,
+            size: block.size,
+            hash: block.hash,
+          })),
+        },
+      });
+      this.storeUploadedFile(folderId, {
+        path: normalizedPath,
+        bytes,
+        blocks,
+        modifiedMs,
+        sequence,
+        encryptedName,
+      });
+      const frame = encodeMessageFrame(
+        MessageTypeValues.INDEX_UPDATE,
+        IndexUpdate,
+        {
+          folder: folderId,
+          files: [advertisedFileInfo],
+        },
+        0,
+      );
+      await this.socket.write(frame);
+      notifyProgress(bytes.length, "publishing");
+      this.log("upload.index_update.sent", {
+        folderId,
+        path: normalizedPath,
+        encrypted: true,
+        encryptedName,
+        sizeBytes: bytes.length,
+        blockCount: blocks.length,
+        sequence,
+      });
+      return;
     }
     const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
     const sequence = this.nextFolderSequence(folderId);
@@ -1161,15 +1385,15 @@ class BepSession {
       {
         folder: folderId,
         files: [fileInfo],
-        last_sequence: sequence,
-        prev_sequence: Math.max(0, sequence - 1),
       },
       0,
     );
     await this.socket.write(frame);
+    notifyProgress(bytes.length, "publishing");
     this.log("upload.index_update.sent", {
       folderId,
       path: normalizedPath,
+      encrypted: false,
       sizeBytes: bytes.length,
       blockCount: blocks.length,
       sequence,

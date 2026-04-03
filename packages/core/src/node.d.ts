@@ -49,7 +49,15 @@ export interface NodeRemoteFs {
     folderId: string,
     path: string,
     bytes: Uint8Array,
-    options?: { modifiedMs?: number },
+    options?: {
+      modifiedMs?: number;
+      onProgress?: (progress: {
+        processedBytes: number;
+        totalBytes: number;
+        elapsedMs: number;
+        phase: "preparing" | "publishing";
+      }) => void;
+    },
   ): Promise<void>;
 }
 

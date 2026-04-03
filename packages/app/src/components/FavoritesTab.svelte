@@ -11,6 +11,7 @@
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
     onOpenCachedDirectory: (folderId: string, path: string) => void;
     onRemoveCachedFile: (folderId: string, path: string) => void;
+    onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
     onRemoveFavorite: (favorite: any) => void;
     onClearAllCache: () => void;
@@ -26,6 +27,7 @@
     onOpenCachedFileDirectory,
     onOpenCachedDirectory,
     onRemoveCachedFile,
+    onOpenOrDownloadFile,
     onDownloadFile,
     onRemoveFavorite,
     onClearAllCache,
@@ -107,6 +109,7 @@
           onOpenCachedFileDirectory={onOpenCachedFileDirectory}
           onOpenCachedDirectory={onOpenCachedDirectory}
           onRemoveCachedFile={onRemoveCachedFile}
+          onOpenOrDownloadFile={onOpenOrDownloadFile}
           onDownloadFile={onDownloadFile}
           onRemoveFavorite={onRemoveFavorite}
         />

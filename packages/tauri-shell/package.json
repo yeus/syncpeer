@@ -15,8 +15,8 @@
     "build:bundle:deb": "npm run icons:ensure && tauri build --bundles deb",
     "android:dev": "tauri android dev",
     "android:init": "tauri android init",
-    "build:android:dev": "npm run icons:ensure:android && tauri android build --debug --apk --target aarch64",
-    "build:android:prod": "npm run icons:ensure:android && tauri android build --apk --target aarch64",
+    "build:android:dev": "bash -lc 'set -euo pipefail; sdk=\"${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}\"; if [ -n \"$sdk\" ] && [ -d \"$sdk/build-tools\" ]; then bt=\"$(ls -1 \"$sdk/build-tools\" | sort -V | tail -n1)\"; if [ -n \"$bt\" ] && [ -x \"$sdk/build-tools/$bt/apksigner\" ]; then export PATH=\"$sdk/build-tools/$bt:$PATH\"; fi; fi; tauri android build --debug --apk --target aarch64'",
+    "build:android:prod": "bash -lc 'set -euo pipefail; sdk=\"${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}\"; if [ -n \"$sdk\" ] && [ -d \"$sdk/build-tools\" ]; then bt=\"$(ls -1 \"$sdk/build-tools\" | sort -V | tail -n1)\"; if [ -n \"$bt\" ] && [ -x \"$sdk/build-tools/$bt/apksigner\" ]; then export PATH=\"$sdk/build-tools/$bt:$PATH\"; fi; fi; tauri android build --apk --target aarch64'",
     "build:android": "npm run build:android:prod"
   },
   "devDependencies": {

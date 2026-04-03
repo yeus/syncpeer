@@ -19,6 +19,7 @@
     onOpenCachedDirectory: (folderId: string, path: string) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
+    onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
     onToggleFavorite: (folderId: string, path: string, name: string, kind: "folder" | "file") => void;
     onSetPasswordVisible: (folderId: string, visible: boolean) => void;
@@ -37,6 +38,7 @@
     directoryPageSize: number;
     formatBytes: (value: number) => string;
     formatModified: (value: number) => string;
+    onHandleUploadClick: () => void;
     onHandleUploadSelected: (event: Event) => void;
   }
 
@@ -54,6 +56,7 @@
     onOpenCachedDirectory,
     onOpenCachedFile,
     onOpenCachedFileDirectory,
+    onOpenOrDownloadFile,
     onDownloadFile,
     onToggleFavorite,
     onSetPasswordVisible,
@@ -72,6 +75,7 @@
     directoryPageSize,
     formatBytes,
     formatModified,
+    onHandleUploadClick,
     onHandleUploadSelected,
   }: Props = $props();
 
@@ -150,6 +154,27 @@
       onSelect={onGoToBreadcrumb}
     />
 
+    {#if app.session.currentFolderId}
+      <div class="actions">
+        <input id="folder-upload-input" class="upload-input" type="file" onchange={onHandleUploadSelected} />
+        <button class="primary" onclick={onHandleUploadClick}>
+          Upload
+        </button>
+      </div>
+      {#if app.ui.uploadProgressActive}
+        <div class="upload-progress-wrap">
+          <progress max="100" value={app.ui.uploadProgressPercent}></progress>
+          <span class="item-meta">
+            {app.ui.uploadProgressPercent}%{app.ui.uploadProgressRate ? ` · ${app.ui.uploadProgressRate}` : ""}
+            {app.ui.uploadProgressEta ? ` · ETA ${app.ui.uploadProgressEta}` : ""}
+          </span>
+        </div>
+      {/if}
+      {#if app.ui.uploadMessage}
+        <div class="hint">{app.ui.uploadMessage}</div>
+      {/if}
+    {/if}
+
     {#if !app.session.currentFolderId}
       <ul class="list">
         {#if rootRows.length === 0}
@@ -195,6 +220,7 @@
               onOpenCachedDirectory={onOpenCachedDirectory}
               onOpenCachedFile={onOpenCachedFile}
               onOpenCachedFileDirectory={onOpenCachedFileDirectory}
+              onOpenOrDownloadFile={onOpenOrDownloadFile}
               onDownloadFile={onDownloadFile}
               onToggleFavorite={onToggleFavorite}
             />
@@ -238,15 +264,6 @@
         </div>
       {/if}
 
-      <div class="actions">
-        <input id="folder-upload-input" class="upload-input" type="file" onchange={onHandleUploadSelected} />
-        <button class="primary" onclick={() => document.getElementById("folder-upload-input")?.click()}>
-          Upload
-        </button>
-      </div>
-      {#if app.ui.uploadMessage}
-        <div class="hint">{app.ui.uploadMessage}</div>
-      {/if}
     {/if}
   {/if}
 </Panel>
@@ -278,5 +295,17 @@
 
   .upload-input {
     display: none;
+  }
+
+  .upload-progress-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-top: 0.35rem;
+    max-width: 22rem;
+  }
+
+  .upload-progress-wrap progress {
+    width: 100%;
   }
 </style>

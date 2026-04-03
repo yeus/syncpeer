@@ -51,7 +51,15 @@ export interface RemoteFsLike {
     folderId: string,
     path: string,
     bytes: Uint8Array,
-    options?: { modifiedMs?: number },
+    options?: {
+      modifiedMs?: number;
+      onProgress?: (progress: {
+        processedBytes: number;
+        totalBytes: number;
+        elapsedMs: number;
+        phase: "preparing" | "publishing";
+      }) => void;
+    },
   ) => Promise<void>;
 }
 
@@ -68,6 +76,8 @@ export interface SyncpeerBrowserClient {
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   disconnect: () => Promise<void>;
+  readBinaryFile: (path: string) => Promise<Uint8Array>;
+  pickUploadFile: () => Promise<string | null | undefined>;
 }
 
 export interface UiLogEntry {

@@ -49,6 +49,24 @@ function decodeBase32NoPadding(value: string): Uint8Array {
   return new Uint8Array(output);
 }
 
+function encodeBase32NoPadding(value: Uint8Array): string {
+  let bits = 0;
+  let current = 0;
+  let out = "";
+  for (const byte of value) {
+    current = (current << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32_ALPHABET[(current >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    out += BASE32_ALPHABET[(current << (5 - bits)) & 31];
+  }
+  return out;
+}
+
 function normalizeEncryptedName(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length === 0) {
@@ -114,6 +132,24 @@ export async function decryptEncryptedFilename(
   return textDecoder.decode(plaintext);
 }
 
+export async function encryptUntrustedFilename(
+  folderKey: Uint8Array,
+  plaintextName: string,
+): Promise<string> {
+  const sealed = aessiv(folderKey, EMPTY_AAD).encrypt(textEncoder.encode(plaintextName));
+  const base32 = encodeBase32NoPadding(sealed);
+  const first = base32.slice(0, 1);
+  const secondThird = base32.slice(1, 3);
+  const rest = base32.slice(3);
+  const chunks: string[] = [];
+  for (let offset = 0; offset < rest.length; offset += 200) {
+    chunks.push(rest.slice(offset, offset + 200));
+  }
+  return [`${first}${ENCRYPTED_DIR_EXTENSION}`, secondThird, ...chunks.filter(Boolean)]
+    .filter(Boolean)
+    .join("/");
+}
+
 export function deriveUntrustedFileKey(
   folderKey: Uint8Array,
   plaintextName: string,
@@ -125,6 +161,25 @@ export function deriveUntrustedFileKey(
     new Uint8Array(0),
     32,
   );
+}
+
+export function encryptUntrustedBlockHash(
+  fileKey: Uint8Array,
+  hash: Uint8Array,
+): Uint8Array {
+  return aessiv(fileKey, EMPTY_AAD).encrypt(hash);
+}
+
+export function encryptUntrustedBytes(
+  fileKey: Uint8Array,
+  payload: Uint8Array,
+  nonce: Uint8Array,
+): Uint8Array {
+  if (nonce.length !== XCHACHA_NONCE_SIZE) {
+    throw new Error(`Invalid XChaCha nonce length: expected ${XCHACHA_NONCE_SIZE}, got ${nonce.length}`);
+  }
+  const encrypted = xchacha20poly1305(fileKey, nonce).encrypt(payload);
+  return concatBytes(nonce, encrypted);
 }
 
 export function decryptUntrustedBytes(

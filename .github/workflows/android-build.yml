@@ -62,6 +62,9 @@ jobs:
           NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
         run: npm run build:android:init
 
+      - name: Generate Tauri icons
+        run: npm run icons:generate
+
       - name: Write release keystore
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}

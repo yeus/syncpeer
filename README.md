@@ -89,6 +89,8 @@ If `--cert`/`--key` are omitted, `syncpeer` uses the persisted identity at `~/.c
 - `npm run android:dev`
 - `npm run build:android:dev`
 - `npm run build:android:prod`
+- `npm run icons:generate` (always regenerate all platform icons from `icon.svg`)
+- `npm run icons:ensure:android` (generate icons only if Android/desktop icon assets are missing)
 
 ## For contributors
 

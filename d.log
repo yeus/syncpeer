@@ -1,0 +1,701 @@
+{
+  "summary": {
+    "runAtIso": "2026-04-02T22:10:18.241Z",
+    "allPassed": true,
+    "passed": 1,
+    "failed": 0
+  },
+  "results": [
+    {
+      "name": "Folder Content Diagnostics",
+      "ok": true,
+      "details": {
+        "startedAtIso": "2026-04-02T22:10:15.382Z",
+        "finishedAtIso": "2026-04-02T22:10:18.241Z",
+        "durationMs": 2859,
+        "connection": {
+          "discoveryMode": "global",
+          "remoteId": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+          "host": "",
+          "port": 22000
+        },
+        "overview": {
+          "connectedVia": "tcp://192.168.188.76:22000",
+          "transportKind": "direct-tcp",
+          "folderCount": 5,
+          "folderIds": [
+            "efv9x-mx6v1",
+            "gtny2-gxawg",
+            "nj3te-ke9wz",
+            "nokia_72_2dht-photos",
+            "sg5g0-59q45"
+          ],
+          "folderSyncStates": [
+            {
+              "folderId": "efv9x-mx6v1",
+              "remoteIndexId": "6310985190659240000",
+              "remoteMaxSequence": "536",
+              "indexReceived": true
+            },
+            {
+              "folderId": "gtny2-gxawg",
+              "remoteIndexId": "3525126913606817000",
+              "remoteMaxSequence": "16041",
+              "indexReceived": true
+            },
+            {
+              "folderId": "nj3te-ke9wz",
+              "remoteIndexId": "8175445600443121000",
+              "remoteMaxSequence": "2083",
+              "indexReceived": true
+            },
+            {
+              "folderId": "nokia_72_2dht-photos",
+              "remoteIndexId": "1264931650767561500",
+              "remoteMaxSequence": "21833",
+              "indexReceived": true
+            },
+            {
+              "folderId": "sg5g0-59q45",
+              "remoteIndexId": "15656572271363013000",
+              "remoteMaxSequence": "46123",
+              "indexReceived": true
+            }
+          ]
+        },
+        "polling": [
+          {
+            "attempt": 1,
+            "atIso": "2026-04-02T22:10:17.713Z",
+            "folderSyncStates": [
+              {
+                "folderId": "efv9x-mx6v1",
+                "remoteIndexId": "6310985190659240000",
+                "remoteMaxSequence": "536",
+                "indexReceived": true
+              },
+              {
+                "folderId": "gtny2-gxawg",
+                "remoteIndexId": "3525126913606817000",
+                "remoteMaxSequence": "16041",
+                "indexReceived": false
+              },
+              {
+                "folderId": "nj3te-ke9wz",
+                "remoteIndexId": "8175445600443121000",
+                "remoteMaxSequence": "2083",
+                "indexReceived": false
+              },
+              {
+                "folderId": "nokia_72_2dht-photos",
+                "remoteIndexId": "1264931650767561500",
+                "remoteMaxSequence": "21833",
+                "indexReceived": false
+              },
+              {
+                "folderId": "sg5g0-59q45",
+                "remoteIndexId": "15656572271363013000",
+                "remoteMaxSequence": "46123",
+                "indexReceived": false
+              }
+            ]
+          },
+          {
+            "attempt": 2,
+            "atIso": "2026-04-02T22:10:17.969Z",
+            "folderSyncStates": [
+              {
+                "folderId": "efv9x-mx6v1",
+                "remoteIndexId": "6310985190659240000",
+                "remoteMaxSequence": "536",
+                "indexReceived": true
+              },
+              {
+                "folderId": "gtny2-gxawg",
+                "remoteIndexId": "3525126913606817000",
+                "remoteMaxSequence": "16041",
+                "indexReceived": true
+              },
+              {
+                "folderId": "nj3te-ke9wz",
+                "remoteIndexId": "8175445600443121000",
+                "remoteMaxSequence": "2083",
+                "indexReceived": false
+              },
+              {
+                "folderId": "nokia_72_2dht-photos",
+                "remoteIndexId": "1264931650767561500",
+                "remoteMaxSequence": "21833",
+                "indexReceived": true
+              },
+              {
+                "folderId": "sg5g0-59q45",
+                "remoteIndexId": "15656572271363013000",
+                "remoteMaxSequence": "46123",
+                "indexReceived": false
+              }
+            ]
+          },
+          {
+            "attempt": 3,
+            "atIso": "2026-04-02T22:10:18.227Z",
+            "folderSyncStates": [
+              {
+                "folderId": "efv9x-mx6v1",
+                "remoteIndexId": "6310985190659240000",
+                "remoteMaxSequence": "536",
+                "indexReceived": true
+              },
+              {
+                "folderId": "gtny2-gxawg",
+                "remoteIndexId": "3525126913606817000",
+                "remoteMaxSequence": "16041",
+                "indexReceived": true
+              },
+              {
+                "folderId": "nj3te-ke9wz",
+                "remoteIndexId": "8175445600443121000",
+                "remoteMaxSequence": "2083",
+                "indexReceived": true
+              },
+              {
+                "folderId": "nokia_72_2dht-photos",
+                "remoteIndexId": "1264931650767561500",
+                "remoteMaxSequence": "21833",
+                "indexReceived": true
+              },
+              {
+                "folderId": "sg5g0-59q45",
+                "remoteIndexId": "15656572271363013000",
+                "remoteMaxSequence": "46123",
+                "indexReceived": true
+              }
+            ]
+          }
+        ],
+        "timeline": [
+          {
+            "atIso": "2026-04-02T22:10:15.382Z",
+            "level": "info",
+            "event": "diag.connect.start",
+            "message": "Opening session via sessionStore.connect.",
+            "details": {
+              "discoveryMode": "global",
+              "host": "",
+              "port": 22000,
+              "remoteId": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ"
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:17.709Z",
+            "level": "info",
+            "event": "diag.connect.ready",
+            "message": "sessionStore.connect returned with state.",
+            "details": {
+              "folderCount": 5,
+              "connectedVia": "tcp://192.168.188.76:22000",
+              "transportKind": "direct-tcp"
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:17.713Z",
+            "level": "info",
+            "event": "diag.folder_versions.poll",
+            "message": "Polled folder sync states.",
+            "details": {
+              "attempt": 1,
+              "count": 5,
+              "pendingFolderIds": [
+                "gtny2-gxawg",
+                "nj3te-ke9wz",
+                "nokia_72_2dht-photos",
+                "sg5g0-59q45"
+              ]
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:17.969Z",
+            "level": "info",
+            "event": "diag.folder_versions.poll",
+            "message": "Polled folder sync states.",
+            "details": {
+              "attempt": 2,
+              "count": 5,
+              "pendingFolderIds": [
+                "nj3te-ke9wz",
+                "sg5g0-59q45"
+              ]
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.227Z",
+            "level": "info",
+            "event": "diag.folder_versions.poll",
+            "message": "Polled folder sync states.",
+            "details": {
+              "attempt": 3,
+              "count": 5,
+              "pendingFolderIds": []
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.227Z",
+            "level": "info",
+            "event": "diag.folder.start",
+            "message": "Processing folder diagnostics.",
+            "details": {
+              "folderId": "efv9x-mx6v1",
+              "label": "Downloads",
+              "encrypted": false,
+              "needsPassword": false,
+              "localDevicePresentInFolder": true,
+              "stopReason": 0
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.231Z",
+            "level": "info",
+            "event": "diag.folder.start",
+            "message": "Processing folder diagnostics.",
+            "details": {
+              "folderId": "gtny2-gxawg",
+              "label": "company",
+              "encrypted": false,
+              "needsPassword": false,
+              "localDevicePresentInFolder": true,
+              "stopReason": 0
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.234Z",
+            "level": "info",
+            "event": "diag.folder.start",
+            "message": "Processing folder diagnostics.",
+            "details": {
+              "folderId": "nj3te-ke9wz",
+              "label": "joulios",
+              "encrypted": false,
+              "needsPassword": false,
+              "localDevicePresentInFolder": true,
+              "stopReason": 0
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.235Z",
+            "level": "info",
+            "event": "diag.folder.start",
+            "message": "Processing folder diagnostics.",
+            "details": {
+              "folderId": "nokia_72_2dht-photos",
+              "label": "Android Camera",
+              "encrypted": false,
+              "needsPassword": false,
+              "localDevicePresentInFolder": true,
+              "stopReason": 0
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.235Z",
+            "level": "info",
+            "event": "diag.folder.start",
+            "message": "Processing folder diagnostics.",
+            "details": {
+              "folderId": "sg5g0-59q45",
+              "label": "Phonemedia",
+              "encrypted": false,
+              "needsPassword": false,
+              "localDevicePresentInFolder": true,
+              "stopReason": 0
+            }
+          },
+          {
+            "atIso": "2026-04-02T22:10:18.241Z",
+            "level": "info",
+            "event": "diag.advertised_devices.known_present",
+            "message": "All known device IDs are present in advertised devices.",
+            "details": {
+              "knownDeviceIds": [
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA"
+              ],
+              "uniqueAdvertisedIds": [
+                "4SNU647Q46HS3UXEBRCXJBUC455FO3YJKTIIHA7C4NJYEHOVNEMA",
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA"
+              ]
+            }
+          }
+        ],
+        "folders": [
+          {
+            "folderId": "efv9x-mx6v1",
+            "label": "Downloads",
+            "encrypted": false,
+            "needsPassword": false,
+            "localDevicePresentInFolder": true,
+            "stopReason": 0,
+            "indexReceived": true,
+            "remoteIndexId": "6310985190659240000",
+            "remoteMaxSequence": "536",
+            "readDirCount": 23,
+            "readDirSample": [
+              "Adobe Acrobat",
+              "check24",
+              "DuckDuckGo",
+              "1631533a-0c78-414b-abe6-f25fcc236db1.67d85e8fc805573dd50a91bb925ca235-3401389258.jpeg",
+              "1754962781284.jpg",
+              "1754962800288.mp4",
+              "20250801_rose_family_projected_income.pdf",
+              "Appell zum KI-Gipfel 2026_1771263798745.pdf",
+              "appointments.ics",
+              "camera-access-barebones.html",
+              "Coast Starlight.pdf",
+              "Evelyn_1754958458463.HEIC (1).heif",
+              "fam meschede xmas 25_1766948766387.pdf",
+              "israelische-siedler-im.webp",
+              "KidSafe_release_v1.1.apk",
+              "L-G-0003846095-0002367570.pdf",
+              "Main - Taskyon.mht",
+              "Meschede Thomas 202510290205410511_1761718025370.pdf",
+              "ReceiptFromYourDentistOffice_1753895988214.pdf",
+              "Rose enrollment chages 09-01_1756175064197.pdf"
+            ],
+            "indexPollAttempts": [],
+            "readDirAttempts": [
+              {
+                "attempt": 1,
+                "atIso": "2026-04-02T22:10:18.231Z",
+                "entryCount": 23
+              }
+            ]
+          },
+          {
+            "folderId": "gtny2-gxawg",
+            "label": "company",
+            "encrypted": false,
+            "needsPassword": false,
+            "localDevicePresentInFolder": true,
+            "stopReason": 0,
+            "indexReceived": true,
+            "remoteIndexId": "3525126913606817000",
+            "remoteMaxSequence": "16041",
+            "readDirCount": 40,
+            "readDirSample": [
+              "archive",
+              "bookkeeping",
+              "brand",
+              "brg_energies",
+              "bugs",
+              "business plan",
+              "chats",
+              "cloud",
+              "competition",
+              "coworking",
+              "employees",
+              "events",
+              "finances",
+              "freelance profile",
+              "history",
+              "hr",
+              "investors",
+              "IP",
+              "legal",
+              "letters"
+            ],
+            "indexPollAttempts": [],
+            "readDirAttempts": [
+              {
+                "attempt": 1,
+                "atIso": "2026-04-02T22:10:18.234Z",
+                "entryCount": 40
+              }
+            ]
+          },
+          {
+            "folderId": "nj3te-ke9wz",
+            "label": "joulios",
+            "encrypted": false,
+            "needsPassword": false,
+            "localDevicePresentInFolder": true,
+            "stopReason": 0,
+            "indexReceived": true,
+            "remoteIndexId": "8175445600443121000",
+            "remoteMaxSequence": "2083",
+            "readDirCount": 6,
+            "readDirSample": [
+              "Accounts",
+              "Backend",
+              "research",
+              ".DS_Store",
+              "BRG Energies - Executive Summary.pdf",
+              "BRG Energies & Taskyon - Tech Stack.pdf"
+            ],
+            "indexPollAttempts": [],
+            "readDirAttempts": [
+              {
+                "attempt": 1,
+                "atIso": "2026-04-02T22:10:18.235Z",
+                "entryCount": 6
+              }
+            ]
+          },
+          {
+            "folderId": "nokia_72_2dht-photos",
+            "label": "Android Camera",
+            "encrypted": false,
+            "needsPassword": false,
+            "localDevicePresentInFolder": true,
+            "stopReason": 0,
+            "indexReceived": true,
+            "remoteIndexId": "1264931650767561500",
+            "remoteMaxSequence": "21833",
+            "readDirCount": 11,
+            "readDirSample": [
+              "100ANDRO",
+              "Camera",
+              "ClassDojo",
+              "eBay Kleinanzeigen",
+              "GIF",
+              "ID-Photo-Prints",
+              "ID-Photos",
+              "OpenCamera",
+              "PlantNet",
+              "Screenshots",
+              "Videocaptures"
+            ],
+            "indexPollAttempts": [],
+            "readDirAttempts": [
+              {
+                "attempt": 1,
+                "atIso": "2026-04-02T22:10:18.235Z",
+                "entryCount": 11
+              }
+            ]
+          },
+          {
+            "folderId": "sg5g0-59q45",
+            "label": "Phonemedia",
+            "encrypted": false,
+            "needsPassword": false,
+            "localDevicePresentInFolder": true,
+            "stopReason": 0,
+            "indexReceived": true,
+            "remoteIndexId": "15656572271363013000",
+            "remoteMaxSequence": "46123",
+            "readDirCount": 926,
+            "readDirSample": [
+              "Apps",
+              "backrounds",
+              "books",
+              "docs",
+              "GifStudio",
+              "Markup",
+              "print",
+              "RAW",
+              "recordings",
+              "Scans",
+              "Screenshots",
+              "Sensor Blue",
+              "Signal",
+              "090.09 Thomas 1. Schultag, Fam. Meschede.jpg",
+              "242B75C6-1B72-4227-93BF-C5B8F91C34CC-1.jpg",
+              "242B75C6-1B72-4227-93BF-C5B8F91C34CC.jpg",
+              "55672A17-3561-4DE5-9160-A4558D2186FF.jpg",
+              "65114-PH-BG1-102.jpg",
+              "65114-PH-BG1-146.jpg",
+              "65114-PH-BG2-063.jpg"
+            ],
+            "indexPollAttempts": [],
+            "readDirAttempts": [
+              {
+                "attempt": 1,
+                "atIso": "2026-04-02T22:10:18.240Z",
+                "entryCount": 926
+              }
+            ]
+          }
+        ],
+        "advertisedDevices": {
+          "byFolder": [
+            {
+              "folderId": "efv9x-mx6v1",
+              "label": "Downloads",
+              "encrypted": false,
+              "localDevicePresentInFolder": true,
+              "deviceIds": [
+                "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA",
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ"
+              ],
+              "devices": [
+                {
+                  "id": "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                  "name": "Tuxedo"
+                },
+                {
+                  "id": "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                  "name": "pixel 7 lite"
+                },
+                {
+                  "id": "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                  "name": "tom_cell"
+                },
+                {
+                  "id": "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA",
+                  "name": "Pixel 7"
+                },
+                {
+                  "id": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                  "name": "tomspiron"
+                }
+              ]
+            },
+            {
+              "folderId": "gtny2-gxawg",
+              "label": "company",
+              "encrypted": false,
+              "localDevicePresentInFolder": true,
+              "deviceIds": [
+                "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ"
+              ],
+              "devices": [
+                {
+                  "id": "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                  "name": "Tuxedo"
+                },
+                {
+                  "id": "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                  "name": "pixel 7 lite"
+                },
+                {
+                  "id": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                  "name": "tomspiron"
+                }
+              ]
+            },
+            {
+              "folderId": "nj3te-ke9wz",
+              "label": "joulios",
+              "encrypted": false,
+              "localDevicePresentInFolder": true,
+              "deviceIds": [
+                "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ"
+              ],
+              "devices": [
+                {
+                  "id": "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                  "name": "Tuxedo"
+                },
+                {
+                  "id": "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                  "name": "pixel 7 lite"
+                },
+                {
+                  "id": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                  "name": "tomspiron"
+                }
+              ]
+            },
+            {
+              "folderId": "nokia_72_2dht-photos",
+              "label": "Android Camera",
+              "encrypted": false,
+              "localDevicePresentInFolder": true,
+              "deviceIds": [
+                "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA",
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ"
+              ],
+              "devices": [
+                {
+                  "id": "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                  "name": "Tuxedo"
+                },
+                {
+                  "id": "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                  "name": "pixel 7 lite"
+                },
+                {
+                  "id": "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                  "name": "tom_cell"
+                },
+                {
+                  "id": "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA",
+                  "name": "Pixel 7"
+                },
+                {
+                  "id": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                  "name": "tomspiron"
+                }
+              ]
+            },
+            {
+              "folderId": "sg5g0-59q45",
+              "label": "Phonemedia",
+              "encrypted": false,
+              "localDevicePresentInFolder": true,
+              "deviceIds": [
+                "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA",
+                "4SNU647Q46HS3UXEBRCXJBUC455FO3YJKTIIHA7C4NJYEHOVNEMA",
+                "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ"
+              ],
+              "devices": [
+                {
+                  "id": "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+                  "name": "Tuxedo"
+                },
+                {
+                  "id": "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+                  "name": "pixel 7 lite"
+                },
+                {
+                  "id": "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+                  "name": "tom_cell"
+                },
+                {
+                  "id": "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA",
+                  "name": "Pixel 7"
+                },
+                {
+                  "id": "4SNU647Q46HS3UXEBRCXJBUC455FO3YJKTIIHA7C4NJYEHOVNEMA",
+                  "name": "Chromebook"
+                },
+                {
+                  "id": "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+                  "name": "tomspiron"
+                }
+              ]
+            }
+          ],
+          "uniqueDeviceIds": [
+            "4SNU647Q46HS3UXEBRCXJBUC455FO3YJKTIIHA7C4NJYEHOVNEMA",
+            "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+            "EW7JUUYLQPNJAX3MON7H33FENI3SZOGQIN3IWXG4BURSSANM6NPQ",
+            "GE2DVHY7WHYZQU5SSIA5TZPIZO4T3S67C5BKQVRKLLJXA2EQTTXQ",
+            "J4ATFMITAHVZQNNTQAMC37OJJWNIDDWPP2HPIAXJAJFD3YTAKDOQ",
+            "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA"
+          ],
+          "knownDeviceIds": [
+            "5QDEUH3TPXHR55NB3OFFSNFRK7X7KGTCL6UQ6IBVKKCHTLFR7CNQ",
+            "R4QSNCM2UT2QKZBUZ2X6PMOO3TK6FIA3B6WQHYSM7WHFVBDUIJPA"
+          ],
+          "missingKnownDeviceIds": []
+        }
+      }
+    }
+  ]
+}

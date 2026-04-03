@@ -275,6 +275,7 @@ for path in "${temp_keystore_properties_paths[@]}"; do
   create_gradle_keystore_properties "$path"
 done
 echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
+npm run icons:ensure:android
 npm run build:android:prod -w @syncpeer/tauri-shell
 sign_unsigned_release_apk_if_needed "$repo_root"
 node scripts/copy-android-apk.mjs release

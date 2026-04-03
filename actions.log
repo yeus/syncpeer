@@ -1,0 +1,54 @@
+   Compiling tauri-shell v0.1.0 (/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri)
+   Compiling tauri-runtime-wry v2.10.1
+    Finished `release` profile [optimized] target(s) in 28.17s
+        Info symlinking lib "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/target/aarch64-linux-android/release/libtauri_shell_lib.so" in jniLibs dir "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a"
+        Info "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/target/aarch64-linux-android/release/libtauri_shell_lib.so" requires shared lib "libandroid.so"
+        Info "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/target/aarch64-linux-android/release/libtauri_shell_lib.so" requires shared lib "libdl.so"
+        Info "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/target/aarch64-linux-android/release/libtauri_shell_lib.so" requires shared lib "liblog.so"
+        Info "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/target/aarch64-linux-android/release/libtauri_shell_lib.so" requires shared lib "libm.so"
+        Info "/home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/target/aarch64-linux-android/release/libtauri_shell_lib.so" requires shared lib "libc.so"
+w: file:///home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-2.10.3/mobile/android/src/main/java/app/tauri/AppPlugin.kt:35:37 'onBackPressed(): Unit' is deprecated. Deprecated in Java
+w: file:///home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-2.10.3/mobile/android/src/main/java/app/tauri/plugin/PluginMethodData.kt:11:23 Parameter 'methodDecorator' is never used
+Java compiler version 21 has deprecated support for compiling with source/target version 8.
+Try one of the following options:
+    1. [Recommended] Use Java toolchain with a lower language version
+    2. Set a higher source/target version
+    3. Use a lower version of the JDK running the build (if you're not using Java toolchain)
+For more details on how to configure these settings, see https://developer.android.com/build/jdks.
+To suppress this warning, set android.javaCompile.suppressSourceTargetDeprecationWarning=true in gradle.properties.
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+3 warnings
+Supplied consumer proguard configuration does not exist: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-plugin-opener-2.5.3/android/consumer-rules.pro
+Supplied consumer proguard configuration does not exist: /home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/consumer-rules.pro
+w: file:///home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/gen/android/app/src/main/java/dev/syncpeer/app/generated/RustWebView.kt:26:18 'setter for databaseEnabled: Boolean' is deprecated. Deprecated in Java
+w: file:///home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/gen/android/app/src/main/java/dev/syncpeer/app/generated/WryActivity.kt:34:42 'onBackPressed(): Unit' is deprecated. This method has been deprecated in favor of using the
+      {@link OnBackPressedDispatcher} via {@link #getOnBackPressedDispatcher()}.
+      The OnBackPressedDispatcher controls how back button events are dispatched
+      to one or more {@link OnBackPressedCallback} objects.
+Java compiler version 21 has deprecated support for compiling with source/target version 8.
+Try one of the following options:
+    1. [Recommended] Use Java toolchain with a lower language version
+    2. Set a higher source/target version
+    3. Use a lower version of the JDK running the build (if you're not using Java toolchain)
+For more details on how to configure these settings, see https://developer.android.com/build/jdks.
+To suppress this warning, set android.javaCompile.suppressSourceTargetDeprecationWarning=true in gradle.properties.
+warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+3 warnings
+[Incubating] Problems report is available at: file:///home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/gen/android/build/reports/problems/problems-report.html
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+For more on this, please refer to https://docs.gradle.org/8.14.3/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+    Finished 1 APK at:
+        /home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+Found only unsigned release APK. Android will reject it with 'App not installed'.
+Configure release signing vars before running build:android:prod:
+  - ANDROID_KEYSTORE_PATH
+  - ANDROID_KEYSTORE_PASSWORD
+  - ANDROID_KEY_ALIAS
+  - ANDROID_KEY_PASSWORD
+Unsigned APK found at: /home/runner/work/syncpeer/syncpeer/packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+Error: Process completed with exit code 1.

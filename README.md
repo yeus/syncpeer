@@ -39,6 +39,19 @@ Run the desktop app in dev mode:
 npm run dev
 ```
 
+Build desktop binaries without Linux package bundling (default):
+
+```bash
+npm run build:tauri
+```
+
+Build Linux bundles only when explicitly requested:
+
+```bash
+npm run build:tauri:bundle:appimage
+npm run build:tauri:bundle:deb
+```
+
 ## Local Syncthing test setup
 
 Download the pinned Syncthing binary:

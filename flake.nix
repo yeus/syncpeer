@@ -103,6 +103,7 @@ EOF
             pkg-config
             openssl
             tcpdump
+            ripgrep
 
             gtk3
             webkitgtk_4_1

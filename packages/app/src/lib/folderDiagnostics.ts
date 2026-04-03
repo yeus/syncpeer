@@ -4,7 +4,10 @@ import type {
   SessionTraceEvent,
   SyncpeerBrowserClient,
 } from "@syncpeer/core/browser";
-import { createSyncpeerSessionStore as createSessionStore } from "@syncpeer/core/browser";
+import {
+  createSyncpeerSessionStore as createSessionStore,
+  normalizeDeviceId,
+} from "@syncpeer/core/browser";
 
 interface FolderDiagnosticsLogEvent {
   atIso: string;
@@ -55,11 +58,28 @@ export interface FolderDiagnosticsReport {
   }>;
   timeline: FolderDiagnosticsLogEvent[];
   folders: FolderDiagnosticsFolderResult[];
+  advertisedDevices: {
+    byFolder: Array<{
+      folderId: string;
+      label: string;
+      encrypted: boolean;
+      localDevicePresentInFolder: boolean;
+      deviceIds: string[];
+      devices: Array<{ id: string; name: string }>;
+    }>;
+    uniqueDeviceIds: string[];
+    knownDeviceIds: string[];
+    missingKnownDeviceIds: string[];
+    expectedDeviceIds: string[];
+    missingExpectedDeviceIds: string[];
+  };
 }
 
 export async function runFolderContentDiagnostics(args: {
   client: SyncpeerBrowserClient;
   options: ConnectOptions;
+  knownDeviceIds?: string[];
+  expectedDeviceIds?: string[];
   maxPollAttempts?: number;
   pollIntervalMs?: number;
 }): Promise<FolderDiagnosticsReport> {
@@ -205,6 +225,93 @@ export async function runFolderContentDiagnostics(args: {
     folderResults.push(result);
   }
 
+  const advertisedByFolder = foldersToCheck.map((folder) => {
+    const devices = Array.isArray(folder.advertisedDevices)
+      ? folder.advertisedDevices
+      : [];
+    const normalizedDevices = devices
+      .map((device) => {
+        const id = normalizeDeviceId(String(device.id ?? ""));
+        if (!id) return null;
+        return {
+          id,
+          name: String(device.name ?? "").trim(),
+        };
+      })
+      .filter((entry): entry is { id: string; name: string } => entry !== null);
+    return {
+      folderId: folder.id,
+      label: folder.label || folder.id,
+      encrypted: Boolean(folder.encrypted),
+      localDevicePresentInFolder: folder.localDevicePresentInFolder !== false,
+      deviceIds: normalizedDevices.map((entry) => entry.id),
+      devices: normalizedDevices,
+    };
+  });
+  const uniqueAdvertisedIds = [...new Set(
+    advertisedByFolder.flatMap((folder) => folder.deviceIds),
+  )].sort();
+  const knownDeviceIds = [...new Set(
+    (args.knownDeviceIds ?? [])
+      .map((deviceId) => normalizeDeviceId(String(deviceId ?? "")))
+      .filter((deviceId) => deviceId !== ""),
+  )].sort();
+  const missingKnownDeviceIds = knownDeviceIds.filter(
+    (deviceId) => !uniqueAdvertisedIds.includes(deviceId),
+  );
+  const expectedDeviceIds = [...new Set(
+    (args.expectedDeviceIds ?? [])
+      .map((deviceId) => normalizeDeviceId(String(deviceId ?? "")))
+      .filter((deviceId) => deviceId !== ""),
+  )].sort();
+  const missingExpectedDeviceIds = expectedDeviceIds.filter(
+    (deviceId) => !uniqueAdvertisedIds.includes(deviceId),
+  );
+  if (missingKnownDeviceIds.length > 0) {
+    log(
+      "warning",
+      "diag.advertised_devices.known_missing",
+      "Some known device IDs are not present in advertised devices.",
+      {
+        missingKnownDeviceIds,
+        knownDeviceIds,
+        uniqueAdvertisedIds,
+      },
+    );
+  } else {
+    log(
+      "info",
+      "diag.advertised_devices.known_present",
+      "All known device IDs are present in advertised devices.",
+      {
+        knownDeviceIds,
+        uniqueAdvertisedIds,
+      },
+    );
+  }
+  if (expectedDeviceIds.length > 0 && missingExpectedDeviceIds.length > 0) {
+    log(
+      "warning",
+      "diag.advertised_devices.expected_missing",
+      "Some expected device IDs are not present in advertised devices.",
+      {
+        expectedDeviceIds,
+        missingExpectedDeviceIds,
+        uniqueAdvertisedIds,
+      },
+    );
+  } else if (expectedDeviceIds.length > 0) {
+    log(
+      "info",
+      "diag.advertised_devices.expected_present",
+      "All expected device IDs are present in advertised devices.",
+      {
+        expectedDeviceIds,
+        uniqueAdvertisedIds,
+      },
+    );
+  }
+
   const finishedAtMs = Date.now();
   return {
     startedAtIso,
@@ -226,5 +333,13 @@ export async function runFolderContentDiagnostics(args: {
     polling,
     timeline,
     folders: folderResults,
+    advertisedDevices: {
+      byFolder: advertisedByFolder,
+      uniqueDeviceIds: uniqueAdvertisedIds,
+      knownDeviceIds,
+      missingKnownDeviceIds,
+      expectedDeviceIds,
+      missingExpectedDeviceIds,
+    },
   };
 }

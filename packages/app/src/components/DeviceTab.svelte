@@ -85,17 +85,38 @@
         ({app.session.connectionPath})
       </span>
     {/if}
+    {#if !app.session.isConnected}
+      <button
+        class="primary"
+        onclick={onConnect}
+        disabled={app.session.isConnecting}
+      >
+        {app.session.isConnecting
+          ? "Connecting..."
+          : "Connect Using Last Settings"}
+      </button>
+    {:else}
+      <button
+        class="ghost"
+        onclick={onDisconnect}
+        disabled={app.session.isConnecting}
+      >
+        Disconnect
+      </button>
+    {/if}
   </div>
 
   <div class="identity-inline">
     <div class="item-main">
       <div class="item-title-row">
-        <span class="item-title">This Device ID</span>
+        <span class="item-title">This Device</span>
         {#if app.devices.isLoadingCurrentDeviceId}
           <StatusChip small>loading...</StatusChip>
         {/if}
       </div>
-      <div class="item-meta">{app.devices.currentDeviceId || "Unavailable"}</div>
+      <div class="item-meta">
+        {app.devices.currentDeviceId || "Unavailable"}
+      </div>
       <div class="item-meta">
         Advertised name: {app.connection.deviceName.trim() || "syncpeer-ui"}
       </div>
@@ -106,21 +127,17 @@
     <div class="item-actions">
       <button class="ghost" onclick={onCopyCurrentDeviceId}>Copy ID</button>
       <button class="ghost" onclick={onEditLocalDeviceName}>Edit Name</button>
-      <button class="ghost" onclick={onRegenerateDeviceId} disabled={app.devices.isRegeneratingDeviceId}>
-        {app.devices.isRegeneratingDeviceId ? "Generating..." : "Generate New ID"}
+      <button
+        class="ghost"
+        onclick={onRegenerateDeviceId}
+        disabled={app.devices.isRegeneratingDeviceId}
+      >
+        {app.devices.isRegeneratingDeviceId
+          ? "Generating..."
+          : "Generate New ID"}
       </button>
     </div>
   </div>
-
-  {#if !app.session.isConnected}
-    <button class="primary" onclick={onConnect} disabled={app.session.isConnecting}>
-      {app.session.isConnecting ? "Connecting..." : "Connect Using Last Settings"}
-    </button>
-  {:else}
-    <button class="ghost" onclick={onDisconnect} disabled={app.session.isConnecting}>
-      Disconnect
-    </button>
-  {/if}
 
   <details bind:open={app.ui.isSettingsExpanded}>
     <summary>Connection Settings</summary>
@@ -149,16 +166,27 @@
       {#if app.connection.discoveryMode === "direct"}
         <label>
           Host
-          <input type="text" bind:value={app.connection.host} placeholder="127.0.0.1" />
+          <input
+            type="text"
+            bind:value={app.connection.host}
+            placeholder="127.0.0.1"
+          />
         </label>
 
         <label>
           Port
-          <input type="number" bind:value={app.connection.port} min="1" max="65535" />
+          <input
+            type="number"
+            bind:value={app.connection.port}
+            min="1"
+            max="65535"
+          />
         </label>
       {:else}
         <div class="hint">
-          Global discovery ignores manual host/port. The official Syncthing discovery server pin is applied automatically when you use discovery.syncthing.net.
+          Global discovery ignores manual host/port. The official Syncthing
+          discovery server pin is applied automatically when you use
+          discovery.syncthing.net.
         </div>
       {/if}
 
@@ -205,21 +233,35 @@
 
       <label>
         Timeout (ms)
-        <input type="number" bind:value={app.connection.timeoutMs} min="1000" step="1000" />
+        <input
+          type="number"
+          bind:value={app.connection.timeoutMs}
+          min="1000"
+          step="1000"
+        />
       </label>
 
       <label class="checkbox-row">
-        <input type="checkbox" bind:checked={app.connection.enableRelayFallback} />
+        <input
+          type="checkbox"
+          bind:checked={app.connection.enableRelayFallback}
+        />
         <span>Enable relay fallback (Syncthing relay://)</span>
       </label>
 
       <label class="checkbox-row">
-        <input type="checkbox" bind:checked={app.connection.autoAcceptNewDevices} />
+        <input
+          type="checkbox"
+          bind:checked={app.connection.autoAcceptNewDevices}
+        />
         <span>Auto-accept newly advertised devices</span>
       </label>
 
       <label class="checkbox-row">
-        <input type="checkbox" bind:checked={app.connection.autoAcceptIntroducedFolders} />
+        <input
+          type="checkbox"
+          bind:checked={app.connection.autoAcceptIntroducedFolders}
+        />
         <span>Auto-approve folder sync for introduced folders</span>
       </label>
     </form>
@@ -241,7 +283,12 @@
       >
         Use Official Discovery Server
       </button>
-      <button type="button" class="ghost" onclick={onClearAllCache} disabled={app.favorites.isClearingCache}>
+      <button
+        type="button"
+        class="ghost"
+        onclick={onClearAllCache}
+        disabled={app.favorites.isClearingCache}
+      >
         {app.favorites.isClearingCache ? "Clearing Cache..." : "Clear Cache"}
       </button>
       <button type="button" class="ghost" onclick={onClearOfflineFolderState}>
@@ -252,22 +299,27 @@
       </button>
     </div>
   </details>
-</Panel>
-
-<Panel>
   <details bind:open={app.ui.isDeviceBackupExpanded}>
     <summary>Device ID Backup</summary>
-    <p class="hint">Keep a backup secret to restore this exact device ID after reinstall.</p>
-    <div class="item-meta">Device ID: {app.devices.currentDeviceId || "Unavailable"}</div>
+    <p class="hint">
+      Keep a backup secret to restore this exact device ID after reinstall.
+    </p>
+    <div class="item-meta">
+      Device ID: {app.devices.currentDeviceId || "Unavailable"}
+    </div>
     <div class="actions">
-      <button type="button" class="primary" onclick={onCopyCurrentDeviceId}>Copy Device ID</button>
+      <button type="button" class="primary" onclick={onCopyCurrentDeviceId}
+        >Copy Device ID</button
+      >
       <button
         type="button"
         class="primary"
         onclick={onCopyIdentityBackupSecret}
         disabled={app.devices.isExportingIdentityRecovery}
       >
-        {app.devices.isExportingIdentityRecovery ? "Copying..." : "Copy Backup Secret"}
+        {app.devices.isExportingIdentityRecovery
+          ? "Copying..."
+          : "Copy Backup Secret"}
       </button>
       <button
         type="button"
@@ -277,7 +329,9 @@
           app.ui.recentError = null;
         }}
       >
-        {app.ui.showRestoreFromBackup ? "Hide Restore" : "Restore From Backup Secret"}
+        {app.ui.showRestoreFromBackup
+          ? "Hide Restore"
+          : "Restore From Backup Secret"}
       </button>
     </div>
 
@@ -297,7 +351,9 @@
           onclick={onRestoreIdentityRecovery}
           disabled={app.devices.isRestoringIdentityRecovery}
         >
-          {app.devices.isRestoringIdentityRecovery ? "Restoring..." : "Restore Device ID"}
+          {app.devices.isRestoringIdentityRecovery
+            ? "Restoring..."
+            : "Restore Device ID"}
         </button>
         <button
           type="button"
@@ -319,12 +375,19 @@
   <div class="saved-device-editor">
     <label>
       Device ID
-      <input type="text" bind:value={app.devices.newSavedDeviceId} placeholder="ABCD123-..." />
+      <input
+        type="text"
+        bind:value={app.devices.newSavedDeviceId}
+        placeholder="ABCD123-..."
+      />
     </label>
     {#if app.devices.newSavedDeviceId.trim()}
       <p class="hint">
-        Saved as <strong>{app.devices.newSavedDeviceCustomName.trim() || app.devices.newSavedDeviceId}</strong>.
-        We’ll switch to the device’s advertised name after first connection unless you set a custom name.
+        Saved as <strong
+          >{app.devices.newSavedDeviceCustomName.trim() ||
+            app.devices.newSavedDeviceId}</strong
+        >. We’ll switch to the device’s advertised name after first connection
+        unless you set a custom name.
       </p>
     {/if}
     <label>
@@ -336,106 +399,58 @@
       />
     </label>
     <label class="checkbox-row">
-      <input type="checkbox" bind:checked={app.devices.newSavedDeviceIsIntroducer} />
+      <input
+        type="checkbox"
+        bind:checked={app.devices.newSavedDeviceIsIntroducer}
+      />
       <span>Treat as introducer</span>
     </label>
     <div class="actions">
-      <button type="button" class="primary" onclick={onAddSavedDevice}>Add Device</button>
+      <button type="button" class="primary" onclick={onAddSavedDevice}
+        >Add Device</button
+      >
     </div>
   </div>
 </Panel>
 
-<Panel title="Advertised Devices">
-  {#if app.session.isConnected && !currentSourceIsIntroducer}
-    <p class="hint">
-      Introductions are only trusted from introducer peers. Mark this connected device as introducer to review/accept advertised devices.
-    </p>
-  {/if}
+<Panel title="Devices">
   <ul class="list">
-    {#if advertisedDevices.length === 0}
-      <li class="empty">No introduced devices pending from the current introducer peer.</li>
-    {:else}
-      {#each advertisedDevices as device (device.id)}
-        <DeviceListItem
-          title={device.name}
-          deviceId={device.id}
-          metaLines={[`Seen in folders: ${device.sourceFolderIds.join(", ")}`]}
-          badges={[
-            {
-              label: device.accepted ? "accepted" : "non-accepted",
-              tone: device.accepted ? "online" : "offline",
-            },
-          ]}
-        >
-          {#snippet actions()}
-            {#if device.accepted}
-              <button class="ghost" onclick={() => onUseSavedDevice(device.id)}>Use</button>
-            {:else}
-              <button class="primary" onclick={() => onApproveAdvertisedDevice(device)}>
-                Approve
-              </button>
-            {/if}
-          {/snippet}
-        </DeviceListItem>
-      {/each}
+    {#if app.session.isConnected && !currentSourceIsIntroducer}
+      <p class="hint">
+        Introductions are only trusted from introducer peers. Mark this
+        connected device as introducer to review/accept advertised devices.
+      </p>
     {/if}
-  </ul>
-</Panel>
-
-<Panel title="Folder Sync Approvals">
-  {#if app.session.isConnected && !currentSourceIsIntroducer}
-    <p class="hint">Introduced folder sync can only be approved from introducer peers.</p>
-  {/if}
-  <ul class="list">
-    {#if advertisedFolders.length === 0}
-      <li class="empty">No introduced folder sync approvals pending from the current introducer peer.</li>
-    {:else}
-      {#each advertisedFolders as folder (folder.key)}
-        <ListRow>
-          <div class="item-title-row">
-            <div class="item-title">{folder.label}</div>
-            <StatusChip tone={folder.syncApproved ? "online" : "offline"} small>
-              {folder.syncApproved ? "sync approved" : "sync not approved"}
-            </StatusChip>
-          </div>
-          <div class="item-meta">Folder ID: {folder.folderId}</div>
-          <div class="item-meta">Introduced by: {folder.sourceDeviceId}</div>
-          <svelte:fragment slot="actions">
-            {#if folder.syncApproved}
-              <button class="ghost" onclick={() => onOpenFolderRoot(folder.folderId)} disabled={!app.session.isConnected}>
-                Open
-              </button>
-            {:else}
-              <button class="primary" onclick={() => onApproveFolderSync(folder)}>
-                Approve Sync
-              </button>
-            {/if}
-          </svelte:fragment>
-        </ListRow>
-      {/each}
-    {/if}
-  </ul>
-</Panel>
-
-<Panel title="Saved Devices">
-  <ul class="list">
     {#if app.devices.savedDevices.length === 0}
-      <li class="empty">No saved devices yet. Add one from Connection Settings.</li>
+      <li class="empty">Add one from Connection Settings.</li>
     {:else}
       {#each app.devices.savedDevices as device (device.id)}
         <DeviceListItem
           title={device.name}
           deviceId={device.id}
           onTitleClick={() => onUseSavedDevice(device.id)}
+          metaLines={[
+            ...(isSavedDeviceConnected(device.id)
+              ? [
+                  `${app.session.remoteDevice.clientName}${app.session.remoteDevice.clientVersion}`,
+                  app.session.connectionPath
+                    ? `Connected via ${app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}: ${app.session.connectionPath}`
+                    : "",
+                ]
+              : []),
+          ]}
           badges={[
             ...(device.isIntroducer ? [{ label: "introducer" }] : []),
-            ...(isSavedDeviceConnected(device.id) ? [{ label: "online", tone: "online" as const }] : []),
+            ...(isSavedDeviceConnected(device.id)
+              ? [{ label: "online", tone: "online" as const }]
+              : []),
             ...(isSavedDeviceAwaitingRemoteApproval(device.id)
               ? [
                   {
                     label: "not approved yet",
                     tone: "offline" as const,
-                    title: "This peer may still need to approve your device on their Syncthing side.",
+                    title:
+                      "This peer may still need to approve your device on their Syncthing side.",
                   },
                 ]
               : []),
@@ -447,54 +462,61 @@
               onclick={() => onConnectToSavedDevice(device.id)}
               disabled={app.session.isConnecting}
             >
-              {app.session.isConnecting && app.session.activeConnectDeviceId === device.id
+              {app.session.isConnecting &&
+              app.session.activeConnectDeviceId === device.id
                 ? "Connecting..."
                 : "Connect"}
             </button>
-            <button class="ghost" onclick={() => onUseSavedDevice(device.id)}>Use</button>
-            <button class="ghost" onclick={() => onEditSavedDeviceName(device.id)}>Edit Name</button>
+            <button class="ghost" onclick={() => onUseSavedDevice(device.id)}
+              >Use</button
+            >
             <button
               class="ghost"
-              onclick={() => onSetSavedDeviceIntroducer(device.id, !device.isIntroducer)}
+              onclick={() => onEditSavedDeviceName(device.id)}>Edit Name</button
+            >
+            <button
+              class="ghost"
+              onclick={() =>
+                onSetSavedDeviceIntroducer(device.id, !device.isIntroducer)}
             >
               {device.isIntroducer ? "Unset Introducer" : "Set Introducer"}
             </button>
-            <button class="icon icon-only" onclick={() => onRemoveSavedDevice(device.id)} aria-label="Remove saved device">
+            <button
+              class="icon icon-only"
+              onclick={() => onRemoveSavedDevice(device.id)}
+              aria-label="Remove saved device"
+            >
               <Trash2 size={16} />
             </button>
           {/snippet}
         </DeviceListItem>
       {/each}
-    {/if}
-  </ul>
-</Panel>
-
-<Panel title="Active Remote Device">
-  <ul class="list">
-    {#if !app.session.remoteDevice}
-      <li class="empty">No remote device metadata yet. Connect to a saved device.</li>
-    {:else}
-      <DeviceListItem
-        title={app.session.remoteDevice.deviceName}
-        titleTooltip={app.session.remoteDevice.deviceName}
-        deviceId={app.session.remoteDevice.id}
-        metaLines={[
-          `${app.session.remoteDevice.clientName}${app.session.remoteDevice.clientVersion}`,
-          app.session.connectionPath
-            ? `Connected via ${app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}: ${app.session.connectionPath}`
-            : "",
-        ]}
-      >
-        {#snippet actions()}
-          <button
-            class="ghost"
-            onclick={onRefreshOverview}
-            disabled={!app.session.isConnected || app.session.isRefreshing || app.session.isConnecting}
+      {#each advertisedDevices as device (device.id)}
+        {#if !device.accepted}
+          <DeviceListItem
+            title={device.name}
+            deviceId={device.id}
+            metaLines={[
+              `Seen in folders: ${device.sourceFolderIds.join(", ")}`,
+            ]}
+            badges={[
+              {
+                label: device.accepted ? "accepted" : "non-accepted",
+                tone: device.accepted ? "online" : "offline",
+              },
+            ]}
           >
-            Refresh
-          </button>
-        {/snippet}
-      </DeviceListItem>
+            {#snippet actions()}
+              <button
+                class="primary"
+                onclick={() => onApproveAdvertisedDevice(device)}
+              >
+                Approve
+              </button>
+            {/snippet}
+          </DeviceListItem>
+        {/if}
+      {/each}
     {/if}
   </ul>
 </Panel>
@@ -503,7 +525,9 @@
   <details bind:open={app.ui.isLogPanelExpanded}>
     <summary>View logs ({app.logs.items.length})</summary>
     <div class="actions">
-      <button type="button" class="ghost" onclick={onCopySessionLogs}>Copy Logs</button>
+      <button type="button" class="ghost" onclick={onCopySessionLogs}
+        >Copy Logs</button
+      >
     </div>
     <ul class="list">
       {#if app.logs.items.length === 0}
@@ -512,13 +536,20 @@
         {#each app.logs.items as item (item.id)}
           <ListRow>
             <div class="item-meta">
-              {new Date(item.timestampMs).toLocaleTimeString()} | {item.level.toUpperCase()} | {item.event}
+              {new Date(item.timestampMs).toLocaleTimeString()} | {item.level.toUpperCase()}
+              | {item.event}
             </div>
-            <div class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}>
+            <div
+              class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}
+            >
               {item.message}
             </div>
             {#if item.details !== undefined}
-              <pre class="log-details">{JSON.stringify(item.details, null, 2)}</pre>
+              <pre class="log-details">{JSON.stringify(
+                  item.details,
+                  null,
+                  2,
+                )}</pre>
             {/if}
           </ListRow>
         {/each}

@@ -6,7 +6,10 @@
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
-    "build": "tauri build",
+    "build": "tauri build --no-bundle",
+    "build:bundle": "tauri build",
+    "build:bundle:appimage": "tauri build --bundles appimage",
+    "build:bundle:deb": "tauri build --bundles deb",
     "android:dev": "tauri android dev",
     "android:init": "tauri android init",
     "build:android:dev": "tauri android build --debug --apk --target aarch64",

@@ -21,6 +21,7 @@ const bEncryptedShareDir = path.join(root, "share-b-encrypted");
 const cliConfigHome = path.join(root, "xdg-config");
 const cliNodeHome = path.join(cliConfigHome, "syncpeer", "cli-node");
 const cliUntrustedHome = path.join(root, "cli-untrusted-node");
+const cliObserverHome = path.join(root, "cli-observer-node");
 const encryptedFolderPassword = "correct horse battery staple";
 const toolsDir = path.resolve(".tools");
 const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
@@ -387,6 +388,7 @@ async function main() {
   ensureDir(bShareDir);
   ensureDir(bEncryptedShareDir);
   ensureDir(cliUntrustedHome);
+  ensureDir(cliObserverHome);
 
   const expectedA = "hello from syncthing test\n";
   const expectedEncrypted = "super secret from encrypted folder\n";
@@ -411,6 +413,8 @@ async function main() {
   const cliNodeId = readDeviceId(cliNodeHome);
   execFileSync(syncthingBin, ["generate", "--home", cliUntrustedHome], { stdio: "inherit" });
   const cliUntrustedId = readDeviceId(cliUntrustedHome);
+  execFileSync(syncthingBin, ["generate", "--home", cliObserverHome], { stdio: "inherit" });
+  const cliObserverId = readDeviceId(cliObserverHome);
 
   configureHome(aHome, {
     guiAddress: A_GUI_ADDR,
@@ -436,6 +440,7 @@ async function main() {
       { id: aId, name: "syncpeer-a", address: A_SYNC_ADDR },
       { id: cliNodeId, name: "syncpeer-cli-node", address: "dynamic" },
       { id: cliUntrustedId, name: "syncpeer-cli-untrusted", address: "dynamic", untrusted: true },
+      { id: cliObserverId, name: "syncpeer-cli-observer", address: "dynamic", untrusted: true },
     ],
     folders: [
       {
@@ -450,9 +455,10 @@ async function main() {
         label: encryptedFolderId,
         path: bEncryptedShareDir,
         type: "sendonly",
-        deviceIds: [bId, cliUntrustedId],
+        deviceIds: [bId, cliUntrustedId, cliObserverId],
         encryptionPasswords: {
           [cliUntrustedId]: encryptedFolderPassword,
+          [cliObserverId]: encryptedFolderPassword,
         },
       },
     ],
@@ -485,6 +491,24 @@ async function main() {
       );
     }
     console.log("Introducer advertisement check passed.");
+
+    const untrustedIntroduced = await waitForIntroducedDeviceAdvertisement({
+      introducerHost: "127.0.0.1",
+      introducerPort: 58301,
+      introducerDeviceId: bId,
+      localCertPath: path.join(cliObserverHome, "cert.pem"),
+      localKeyPath: path.join(cliObserverHome, "key.pem"),
+      localDeviceName: "syncpeer-cli-untrusted-probe",
+      expectedFolderId: encryptedFolderId,
+      expectedIntroducedDeviceId: cliUntrustedId,
+      timeoutMs: 60_000,
+    });
+    if (untrustedIntroduced.introducedDeviceId !== normalizeDeviceId(cliUntrustedId)) {
+      throw new Error(
+        `Untrusted advertisement device ID mismatch: expected ${normalizeDeviceId(cliUntrustedId)}, got ${untrustedIntroduced.introducedDeviceId}`,
+      );
+    }
+    console.log("Untrusted introduced-device advertisement check passed.");
 
     console.log("");
     console.log("=== Running core session-store parity checks ===");
@@ -771,6 +795,7 @@ async function main() {
     console.log(`B device ID: ${bId}`);
     console.log(`CLI node ID: ${cliNodeId}`);
     console.log(`CLI untrusted ID: ${cliUntrustedId}`);
+    console.log(`CLI observer ID: ${cliObserverId}`);
     console.log("");
     if (keep) {
       console.log("--keep flag used; leaving temp files in place.");

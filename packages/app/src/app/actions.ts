@@ -1148,14 +1148,36 @@ export const createAppActions = (args: {
     state.currentPage = "main";
   };
 
-  const runFolderDiagnosticsTest = async () => {
-    const test: TaskyonTestFn = async () =>
-      runFolderContentDiagnostics({
+  const runFolderDiagnosticsTest = async (args?: {
+    expectedAdvertisedDeviceIds?: string[];
+    failOnExpectedMissing?: boolean;
+  }) => {
+    const localDeviceId = normalizeDeviceId(state.devices.currentDeviceId);
+    const knownDeviceIds = state.devices.savedDevices
+      .map((device) => normalizeDeviceId(device.id))
+      .filter((deviceId) => deviceId !== "" && deviceId !== localDeviceId);
+    const expectedDeviceIds = (args?.expectedAdvertisedDeviceIds ?? [])
+      .map((deviceId) => normalizeDeviceId(String(deviceId ?? "")))
+      .filter((deviceId) => deviceId !== "");
+    const test: TaskyonTestFn = async () => {
+      const report = await runFolderContentDiagnostics({
         client,
         options: connectionDetails(state),
+        knownDeviceIds,
+        expectedDeviceIds,
         maxPollAttempts: 16,
         pollIntervalMs: 250,
       });
+      if (
+        args?.failOnExpectedMissing &&
+        report.advertisedDevices.missingExpectedDeviceIds.length > 0
+      ) {
+        throw new Error(
+          `Expected advertised device IDs missing: ${report.advertisedDevices.missingExpectedDeviceIds.join(", ")}`,
+        );
+      }
+      return report;
+    };
     test.description = "End-to-end folder/index/readDir diagnostics";
     test.timeoutMs = 90_000;
     const registry = buildDiagnosticsRegistry({

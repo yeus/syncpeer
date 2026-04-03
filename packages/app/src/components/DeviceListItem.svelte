@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Pencil from "lucide-svelte/icons/pencil";
   import Plus from "lucide-svelte/icons/plus";
   import Trash2 from "lucide-svelte/icons/trash-2";
   import ListRow from "./ListRow.svelte";
@@ -49,7 +50,19 @@
 
 <ListRow>
   <div class="item-title-row">
-    <div class="item-title">{row.name}</div>
+    <div class="item-name-wrap">
+      <div class="item-title">{row.name}</div>
+      {#if row.kind === "saved"}
+        <button
+          class="name-edit-button"
+          onclick={() => onEditSavedDeviceName(row.deviceId)}
+          aria-label="Edit saved device name"
+          title="Edit device name"
+        >
+          <Pencil size={12} />
+        </button>
+      {/if}
+    </div>
 
     {#if row.kind === "saved" && row.isIntroducer}
       <StatusChip small>introducer</StatusChip>
@@ -86,12 +99,6 @@
       </button>
       <button
         class="ghost"
-        onclick={() => onEditSavedDeviceName(row.deviceId)}
-      >
-        Edit
-      </button>
-      <button
-        class="ghost"
         onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}
       >
         {row.isIntroducer ? "Intro On" : "Intro Off"}
@@ -122,5 +129,28 @@
     align-items: center;
     gap: 0.4rem;
     flex-wrap: wrap;
+  }
+
+  .item-name-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+
+  .name-edit-button {
+    border: none;
+    background: transparent;
+    min-height: 1rem;
+    width: 1rem;
+    min-width: 1rem;
+    padding: 0;
+    color: var(--text-muted);
+    border-radius: var(--radius-xs);
+  }
+
+  .name-edit-button:hover:not(:disabled) {
+    border-color: transparent;
+    background: var(--button-hover-bg);
   }
 </style>

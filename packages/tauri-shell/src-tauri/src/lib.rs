@@ -2392,6 +2392,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_syncpeer_android::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .invoke_handler(tauri::generate_handler![
             syncpeer_read_text_file,

@@ -22,6 +22,12 @@ import {
   type SyncpeerBrowserClient,
   type SyncpeerSessionStore,
 } from "@syncpeer/core/browser";
+import {
+  isPermissionGranted as isNativeNotificationPermissionGranted,
+  requestPermission as requestNativeNotificationPermission,
+  sendNotification as sendNativeNotification,
+  removeActive as removeActiveNativeNotifications,
+} from "@tauri-apps/plugin-notification";
 import { reportUiError } from "../lib/tauriAdapters.js";
 import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
 import {
@@ -66,6 +72,8 @@ import {
 const nowTime = () => new Date().toLocaleTimeString();
 const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
 const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
+const DOWNLOAD_NOTIFICATION_ID = 11001;
+const UPLOAD_NOTIFICATION_ID = 11002;
 
 const folderSignature = (folders: FolderInfo[]) =>
   folders
@@ -308,6 +316,19 @@ const reportActionError = (
   reportUiError(event, error, details);
 };
 
+const elapsedMsSince = (startedAtMs: number) => Math.max(1, Date.now() - startedAtMs);
+
+const averageRateBps = (bytes: number, elapsedMs: number) =>
+  bytes > 0 ? (bytes * 1000) / Math.max(1, elapsedMs) : 0;
+
+const formatRateSafe = (bytesPerSecond: number) => {
+  try {
+    return formatRate(bytesPerSecond);
+  } catch {
+    return `${Math.max(0, Math.round(bytesPerSecond))} B/s`;
+  }
+};
+
 const copyText = async (text: string) => {
   if (!text.trim()) throw new Error("Nothing to copy.");
   if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
@@ -413,8 +434,8 @@ export const createAppActions = (args: {
 }) => {
   const { state, client, sessionStore } = args;
   let downloadNoticeTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastSystemDownloadNoticeAtMs = 0;
-  let requestedDownloadNotificationPermission = false;
+  let lastTransferNotificationAtMs = 0;
+  let notificationPermissionRequested = false;
 
   const setDownloadNotice = (message: string, clearAfterMs = 0) => {
     state.ui.downloadNotice = message;
@@ -430,23 +451,47 @@ export const createAppActions = (args: {
     }
   };
 
-  const maybeSystemDownloadNotice = (title: string, body: string) => {
-    if (typeof Notification === "undefined") return;
-    if (
-      Notification.permission === "default" &&
-      !requestedDownloadNotificationPermission
-    ) {
-      requestedDownloadNotificationPermission = true;
-      void Notification.requestPermission();
-      return;
-    }
-    if (Notification.permission !== "granted") return;
-    const now = Date.now();
-    if (now - lastSystemDownloadNoticeAtMs < 2000) return;
-    lastSystemDownloadNoticeAtMs = now;
+  const ensureNativeNotificationPermission = async () => {
     try {
-      const note = new Notification(title, { body, tag: "syncpeer-download-progress" });
-      setTimeout(() => note.close(), 2000);
+      const alreadyGranted = await isNativeNotificationPermissionGranted();
+      if (alreadyGranted) return true;
+      if (notificationPermissionRequested) return false;
+      notificationPermissionRequested = true;
+      const permission = await requestNativeNotificationPermission();
+      return permission === "granted";
+    } catch {
+      return false;
+    }
+  };
+
+  const maybeTransferNotification = async (
+    id: number,
+    title: string,
+    body: string,
+    options?: { ongoing?: boolean; force?: boolean },
+  ) => {
+    const now = Date.now();
+    if (!options?.force && now - lastTransferNotificationAtMs < 2000) return;
+    const granted = await ensureNativeNotificationPermission();
+    if (!granted) return;
+    lastTransferNotificationAtMs = now;
+    try {
+      sendNativeNotification({
+        id,
+        title,
+        body,
+        ongoing: options?.ongoing ?? true,
+        autoCancel: !(options?.ongoing ?? true),
+        silent: true,
+      });
+    } catch {
+      // Best-effort only.
+    }
+  };
+
+  const clearTransferNotification = async (id: number) => {
+    try {
+      await removeActiveNativeNotifications([{ id }]);
     } catch {
       // Best-effort only.
     }
@@ -587,6 +632,31 @@ export const createAppActions = (args: {
     } finally {
       state.session.activeConnectDeviceId = "";
     }
+  };
+
+  const ensureConnectedForTransfer = async (
+    transferKind: "download" | "upload",
+  ): Promise<boolean> => {
+    if (state.session.isConnected && state.session.remoteFs) return true;
+    pushSessionLog(
+      state,
+      "info",
+      "transfer.reconnect.start",
+      `Reconnecting before ${transferKind}.`,
+      { transferKind },
+    );
+    await connect();
+    const connected = state.session.isConnected && !!state.session.remoteFs;
+    if (!connected) {
+      pushSessionLog(
+        state,
+        "warning",
+        "transfer.reconnect.failed",
+        `Could not reconnect before ${transferKind}.`,
+        { transferKind },
+      );
+    }
+    return connected;
   };
 
   const refreshOverview = async () => {
@@ -953,18 +1023,30 @@ export const createAppActions = (args: {
     name: string,
     options?: { openAfterDownload?: boolean },
   ) => {
-    if (!state.session.remoteFs || !state.session.isConnected || state.favorites.isDownloading) {
-      return;
-    }
+    if (state.favorites.isDownloading) return;
+    const connected = await ensureConnectedForTransfer("download");
+    if (!connected || !state.session.remoteFs) return;
     state.favorites.isDownloading = true;
     const startedAt = Date.now();
+    let lastTransferLogAtMs = 0;
     const downloadKey = cachedFileKey(folderId, path);
+    const remoteFs = state.session.remoteFs;
     state.favorites.activeDownloadKey = downloadKey;
     state.favorites.activeDownloadText = "0% • 0 B/s • ETA --";
     setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
-    maybeSystemDownloadNotice("Syncpeer download", `Downloading ${name}`);
+    void maybeTransferNotification(
+      DOWNLOAD_NOTIFICATION_ID,
+      "Syncpeer download",
+      `Downloading ${name}: 0%`,
+      { ongoing: true, force: true },
+    );
+    pushSessionLog(state, "info", "download.start", `Downloading ${name}`, {
+      folderId,
+      path,
+      fileName: name,
+    });
     try {
-      const bytes = await state.session.remoteFs.readFileFully(
+      const bytes = await remoteFs.readFileFully(
         folderId,
         path,
         ({
@@ -974,33 +1056,78 @@ export const createAppActions = (args: {
           downloadedBytes: number;
           totalBytes: number;
         }) => {
+          const elapsedMs = elapsedMsSince(startedAt);
+          const rateBps = averageRateBps(downloadedBytes, elapsedMs);
           state.favorites.activeDownloadText = downloadProgressText(
             downloadedBytes,
             totalBytes,
-            (Date.now() - startedAt) / 1000,
+            elapsedMs / 1000,
           );
           setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
-          maybeSystemDownloadNotice("Syncpeer download", `${name}: ${state.favorites.activeDownloadText}`);
+          void maybeTransferNotification(
+            DOWNLOAD_NOTIFICATION_ID,
+            "Syncpeer download",
+            `${name}: ${state.favorites.activeDownloadText}`,
+            { ongoing: true },
+          );
+          const now = Date.now();
+          if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
+            lastTransferLogAtMs = now;
+            pushSessionLog(state, "info", "download.progress", `Downloading ${name}`, {
+              folderId,
+              path,
+              downloadedBytes,
+              totalBytes,
+              elapsedMs,
+              rateBps: Math.round(rateBps),
+              rate: formatRateSafe(rateBps),
+            });
+          }
         },
       );
+      const elapsedMs = elapsedMsSince(startedAt);
+      const rateBps = averageRateBps(bytes.length, elapsedMs);
       await client.cacheFile(folderId, path, name, bytes);
       updateCachedKey(state, folderId, path, true);
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
       state.favorites.activeDownloadText = "100% • Done";
       setDownloadNotice(`Downloaded ${name}`, 4000);
-      maybeSystemDownloadNotice("Syncpeer download complete", name);
+      void maybeTransferNotification(
+        DOWNLOAD_NOTIFICATION_ID,
+        "Syncpeer download complete",
+        name,
+        { ongoing: false, force: true },
+      );
+      pushSessionLog(state, "info", "download.complete", `Downloaded ${name}`, {
+        folderId,
+        path,
+        sizeBytes: bytes.length,
+        elapsedMs,
+        rateBps: Math.round(rateBps),
+        rate: formatRateSafe(rateBps),
+      });
       if (options?.openAfterDownload) {
         await openCachedFile(folderId, path);
       }
     } catch (error) {
       reportActionError(state, "download_file.failed", error, { folderId, path });
       setDownloadNotice(`Download failed: ${name}`, 6000);
-      maybeSystemDownloadNotice("Syncpeer download failed", name);
+      void maybeTransferNotification(
+        DOWNLOAD_NOTIFICATION_ID,
+        "Syncpeer download failed",
+        name,
+        { ongoing: false, force: true },
+      );
     } finally {
       state.favorites.isDownloading = false;
       if (state.favorites.activeDownloadKey === downloadKey) {
         state.favorites.activeDownloadKey = "";
         state.favorites.activeDownloadText = "";
+      }
+      if (state.favorites.activeDownloadText === "100% • Done") {
+        window.setTimeout(() => {
+          void clearTransferNotification(DOWNLOAD_NOTIFICATION_ID);
+        }, 2500);
       }
     }
   };
@@ -1294,10 +1421,12 @@ export const createAppActions = (args: {
     bytes: Uint8Array,
     modifiedMs?: number,
   ) => {
-    if (!state.session.remoteFs || !state.session.isConnected) {
+    const connected = await ensureConnectedForTransfer("upload");
+    if (!connected || !state.session.remoteFs) {
       state.ui.uploadMessage = "Connect to a folder before uploading.";
       return;
     }
+    const remoteFs = state.session.remoteFs;
     if (!state.session.currentFolderId) {
       state.ui.uploadMessage = "Open a folder first, then upload into the current directory.";
       return;
@@ -1315,30 +1444,55 @@ export const createAppActions = (args: {
     state.ui.uploadProgressRate = "";
     state.ui.uploadMessage = `Uploading ${fileName}...`;
     const startedAtMs = Date.now();
-    let lastAndroidProgressLoggedAtMs = 0;
+    let lastTransferLogAtMs = 0;
+    void maybeTransferNotification(
+      UPLOAD_NOTIFICATION_ID,
+      "Syncpeer upload",
+      `Uploading ${fileName}: 0%`,
+      { ongoing: true, force: true },
+    );
+    pushSessionLog(state, "info", "upload.start", `Uploading ${fileName}`, {
+      folderId: state.session.currentFolderId,
+      path: relativePath,
+      fileName,
+      sizeBytes: bytes.length,
+    });
     const updateUploadProgress = (processedBytes: number, totalBytes: number) => {
-      const elapsedMs = Math.max(1, Date.now() - startedAtMs);
+      const elapsedMs = elapsedMsSince(startedAtMs);
       const safeTotal = Math.max(1, totalBytes);
       const pct = Math.min(100, Math.floor((processedBytes / safeTotal) * 100));
-      const rateBps = processedBytes > 0 ? (processedBytes * 1000) / elapsedMs : 0;
+      const rateBps = averageRateBps(processedBytes, elapsedMs);
       const remainingBytes = Math.max(0, totalBytes - processedBytes);
       const etaSeconds = rateBps > 0 ? remainingBytes / rateBps : 0;
       state.ui.uploadProgressPercent = pct;
-      state.ui.uploadProgressRate = rateBps > 0 ? formatRate(rateBps) : "";
+      state.ui.uploadProgressRate = rateBps > 0 ? formatRateSafe(rateBps) : "";
       state.ui.uploadProgressEta = etaSeconds > 0 ? formatEta(etaSeconds) : "";
-      if (/android/i.test(navigator.userAgent || "")) {
-        const now = Date.now();
-        if (
-          now - lastAndroidProgressLoggedAtMs >= 1500 ||
-          pct === 100
-        ) {
-          lastAndroidProgressLoggedAtMs = now;
-          state.ui.downloadNotice = `Upload ${pct}%${state.ui.uploadProgressEta ? ` · ETA ${state.ui.uploadProgressEta}` : ""}`;
-        }
+      const now = Date.now();
+      if (now - lastTransferLogAtMs >= 2000 || pct === 100) {
+        lastTransferLogAtMs = now;
+        pushSessionLog(state, "info", "upload.progress", `Uploading ${fileName}`, {
+          folderId: state.session.currentFolderId,
+          path: relativePath,
+          processedBytes,
+          totalBytes,
+          percent: pct,
+          elapsedMs,
+          rateBps: Math.round(rateBps),
+          rate: formatRateSafe(rateBps),
+          etaSeconds: Math.max(0, Math.round(etaSeconds)),
+        });
       }
+      const uploadNotice = `Upload ${pct}%${state.ui.uploadProgressEta ? ` · ETA ${state.ui.uploadProgressEta}` : ""}`;
+      setDownloadNotice(uploadNotice);
+      void maybeTransferNotification(
+        UPLOAD_NOTIFICATION_ID,
+        "Syncpeer upload",
+        `${fileName}: ${uploadNotice}`,
+        { ongoing: pct < 100 },
+      );
     };
     try {
-      await state.session.remoteFs.writeFileFully(
+      await remoteFs.writeFileFully(
         state.session.currentFolderId,
         relativePath,
         bytes,
@@ -1354,6 +1508,23 @@ export const createAppActions = (args: {
       applySessionState(state, sessionStore.getState());
       await loadDirectorySideEffects(state, client);
       state.ui.uploadMessage = `Uploaded ${fileName}.`;
+      setDownloadNotice(`Uploaded ${fileName}`, 4000);
+      void maybeTransferNotification(
+        UPLOAD_NOTIFICATION_ID,
+        "Syncpeer upload complete",
+        fileName,
+        { ongoing: false, force: true },
+      );
+      const elapsedMs = elapsedMsSince(startedAtMs);
+      const rateBps = averageRateBps(bytes.length, elapsedMs);
+      pushSessionLog(state, "info", "upload.complete", `Uploaded ${fileName}`, {
+        folderId: state.session.currentFolderId,
+        path: relativePath,
+        sizeBytes: bytes.length,
+        elapsedMs,
+        rateBps: Math.round(rateBps),
+        rate: formatRateSafe(rateBps),
+      });
     } catch (error) {
       reportActionError(state, "upload_file.failed", error, {
         folderId: state.session.currentFolderId,
@@ -1361,6 +1532,13 @@ export const createAppActions = (args: {
         fileName,
         sizeBytes: bytes.length,
       });
+      setDownloadNotice(`Upload failed: ${fileName}`, 6000);
+      void maybeTransferNotification(
+        UPLOAD_NOTIFICATION_ID,
+        "Syncpeer upload failed",
+        fileName,
+        { ongoing: false, force: true },
+      );
     } finally {
       if (state.ui.uploadProgressPercent >= 100) {
         window.setTimeout(() => {
@@ -1374,6 +1552,11 @@ export const createAppActions = (args: {
         state.ui.uploadProgressPercent = 0;
         state.ui.uploadProgressEta = "";
         state.ui.uploadProgressRate = "";
+      }
+      if (state.ui.uploadProgressPercent >= 100) {
+        window.setTimeout(() => {
+          void clearTransferNotification(UPLOAD_NOTIFICATION_ID);
+        }, 2500);
       }
     }
   };

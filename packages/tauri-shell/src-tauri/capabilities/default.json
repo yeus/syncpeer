@@ -5,6 +5,7 @@
   "windows": ["*"],
   "permissions": [
     "core:default",
+    "notification:default",
     "core:webview:allow-internal-toggle-devtools",
     {
       "identifier": "opener:allow-open-path",

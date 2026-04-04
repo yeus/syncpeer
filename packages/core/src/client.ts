@@ -1181,6 +1181,17 @@ class BepSession {
     }
     const blockSize = 128 * 1024;
     const uploadStartedAtMs = Date.now();
+    const uploadRateBps = (processedBytes: number) =>
+      processedBytes > 0
+        ? Math.floor((processedBytes * 1000) / Math.max(1, Date.now() - uploadStartedAtMs))
+        : 0;
+    this.log("upload.start", {
+      folderId,
+      path: normalizedPath,
+      encrypted: folder.encrypted,
+      sizeBytes: bytes.length,
+      blockSize,
+    });
     const notifyProgress = (
       processedBytes: number,
       phase: "preparing" | "publishing",
@@ -1279,6 +1290,15 @@ class BepSession {
         FileInfo.encode(originalFileInfo).finish(),
         toUint8Array(await this.adapter.randomBytes(24)),
       );
+      this.log("upload.prepared", {
+        folderId,
+        path: normalizedPath,
+        encrypted: true,
+        sizeBytes: bytes.length,
+        blockCount: blocks.length,
+        elapsedMs: Date.now() - uploadStartedAtMs,
+        avgRateBps: uploadRateBps(bytes.length),
+      });
       const advertisedFileInfo = {
         name: encryptedName,
         type: 0,
@@ -1340,6 +1360,15 @@ class BepSession {
         blockCount: blocks.length,
         sequence,
       });
+      this.log("upload.complete", {
+        folderId,
+        path: normalizedPath,
+        encrypted: true,
+        sizeBytes: bytes.length,
+        blockCount: blocks.length,
+        elapsedMs: Date.now() - uploadStartedAtMs,
+        avgRateBps: uploadRateBps(bytes.length),
+      });
       return;
     }
     const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
@@ -1372,6 +1401,15 @@ class BepSession {
       })),
     };
     folder.files.set(normalizedPath, { indexFile: fileInfo });
+    this.log("upload.prepared", {
+      folderId,
+      path: normalizedPath,
+      encrypted: false,
+      sizeBytes: bytes.length,
+      blockCount: blocks.length,
+      elapsedMs: Date.now() - uploadStartedAtMs,
+      avgRateBps: uploadRateBps(bytes.length),
+    });
     this.storeUploadedFile(folderId, {
       path: normalizedPath,
       bytes,
@@ -1397,6 +1435,15 @@ class BepSession {
       sizeBytes: bytes.length,
       blockCount: blocks.length,
       sequence,
+    });
+    this.log("upload.complete", {
+      folderId,
+      path: normalizedPath,
+      encrypted: false,
+      sizeBytes: bytes.length,
+      blockCount: blocks.length,
+      elapsedMs: Date.now() - uploadStartedAtMs,
+      avgRateBps: uploadRateBps(bytes.length),
     });
   }
 

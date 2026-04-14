@@ -80,6 +80,10 @@ export interface SyncpeerHostAdapter {
     input: string | URL,
     init?: SyncpeerDiscoveryFetchInit,
   ) => Promise<SyncpeerDiscoveryResponse>;
+  discoverLocalCandidates?: (options: {
+    expectedDeviceId: string;
+    timeoutMs?: number;
+  }) => Promise<DiscoveredCandidate[]>;
   log?: (event: string, details?: Record<string, unknown>) => void;
 }
 
@@ -320,6 +324,30 @@ function isImmediateRemoteCloseLikeError(message: string): boolean {
     normalized.includes("socket hang up") ||
     normalized.includes("eof")
   );
+}
+
+function isTransientRelayError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("unexpected-eof") ||
+    normalized.includes("close_notify") ||
+    normalized.includes("broken pipe") ||
+    normalized.includes("connection reset") ||
+    normalized.includes("eof")
+  );
+}
+
+function waitMs(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function formatClientVersion(value: string | undefined): string {
+  const raw = (value ?? "").trim();
+  if (raw === "") return "syncpeer/0.1.0";
+  return /^syncpeer\b/i.test(raw) ? raw : `syncpeer/${raw}`;
 }
 
 function maybeConnectionHint(
@@ -836,17 +864,20 @@ class BepSession {
           localDeviceInserted: true,
         });
         if (state?.encrypted) {
+          const sourceType = Number(folder.type ?? 0);
           this.log("untrusted.folder.echo_config", {
             folderId: folder.id,
-            sourceType: Number(folder.type ?? 0),
-            echoedType: state?.encrypted ? 3 : Number(folder.type ?? 0),
+            sourceType,
+            echoedType: sourceType,
             localTokenLength: 0,
             localTokenSuppressed: true,
           });
         }
         return {
           ...folder,
-          type: state?.encrypted ? 3 : folder.type,
+          // Keep remote-advertised folder type unchanged to avoid triggering
+          // compatibility disconnects on strict peers.
+          type: folder.type,
           devices,
         };
       });
@@ -1624,7 +1655,7 @@ async function openBepSessionOnSocket(
   const helloFrame = encodeHelloFrame({
     device_name: opts.deviceName,
     client_name: opts.clientName ?? "syncpeer",
-    client_version: opts.clientVersion ?? "0.1.0",
+    client_version: formatClientVersion(opts.clientVersion),
   });
   await socket.write(helloFrame);
   const { hello, leftover } = await readRemoteHello(socket);
@@ -1762,12 +1793,69 @@ async function openSession(
     return openDirectSession(adapter, opts, opts.host, opts.port);
   }
 
-  const discovery = await resolveGlobalDiscoveryInternal(adapter, {
+  const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
+    ? opts.timeoutMs
+    : 15000;
+  const localDiscoveryTimeoutMs = Math.max(
+    250,
+    Math.min(2000, Math.floor(totalTimeout * 0.15)),
+  );
+  const globalDiscoveryPromise = resolveGlobalDiscoveryInternal(adapter, {
     expectedDeviceId: opts.expectedDeviceId ?? "",
     discoveryServer: opts.discoveryServer,
   });
+  const localDiscoveryPromise = adapter.discoverLocalCandidates
+    ? adapter.discoverLocalCandidates({
+        expectedDeviceId: opts.expectedDeviceId ?? "",
+        timeoutMs: localDiscoveryTimeoutMs,
+      })
+    : Promise.resolve([]);
+  const [globalDiscoveryResult, localDiscoveryResult] = await Promise.allSettled([
+    globalDiscoveryPromise,
+    localDiscoveryPromise,
+  ]);
+  const globalCandidates = globalDiscoveryResult.status === "fulfilled"
+    ? globalDiscoveryResult.value.candidates
+    : [];
+  const localCandidates = localDiscoveryResult.status === "fulfilled"
+    ? localDiscoveryResult.value
+    : [];
 
-  const ordered = [...discovery.candidates].sort(
+  if (localCandidates.length > 0) {
+    adapter.log?.("core.discovery.local_response", {
+      timeoutMs: localDiscoveryTimeoutMs,
+      candidates: localCandidates,
+    });
+  }
+  if (localDiscoveryResult.status === "rejected") {
+    adapter.log?.("core.discovery.local_failed", {
+      timeoutMs: localDiscoveryTimeoutMs,
+      message:
+        localDiscoveryResult.reason instanceof Error
+          ? localDiscoveryResult.reason.message
+          : String(localDiscoveryResult.reason),
+    });
+  }
+
+  const mergedCandidates = dedupeCandidates([
+    ...localCandidates,
+    ...globalCandidates,
+  ]);
+  if (
+    globalDiscoveryResult.status === "rejected" &&
+    mergedCandidates.length === 0
+  ) {
+    throw globalDiscoveryResult.reason instanceof Error
+      ? globalDiscoveryResult.reason
+      : new Error(String(globalDiscoveryResult.reason));
+  }
+  if (mergedCandidates.length === 0) {
+    throw new Error(
+      "No discovery candidates available from global or local discovery.",
+    );
+  }
+
+  const ordered = [...mergedCandidates].sort(
     (a, b) => scoreCandidate(b) - scoreCandidate(a),
   );
 
@@ -1787,10 +1875,12 @@ async function openSession(
     relayCandidates,
   });
 
-  const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
-    ? opts.timeoutMs
-    : 15000;
   const connectDeadline = Date.now() + totalTimeout;
+  const relayEnabled = opts.enableRelayFallback !== false;
+  const relayBudgetMs = relayEnabled && relayCandidates.length > 0
+    ? Math.max(1500, Math.min(5000, Math.floor(totalTimeout * 0.4)))
+    : 0;
+  const directDeadline = connectDeadline - relayBudgetMs;
   const perCandidateTimeout = Math.max(
     8000,
     Math.min(30000, Math.floor(totalTimeout / Math.max(directCandidates.length || 1, 1))),
@@ -1798,6 +1888,7 @@ async function openSession(
   adapter.log?.("core.discovery.connect_strategy", {
     totalTimeout,
     perCandidateTimeout,
+    relayBudgetMs,
     directCandidateCount: directCandidates.length,
     relayCandidateCount: relayCandidates.length,
     orderedCandidates: ordered.map((candidate) => describeCandidate(candidate)),
@@ -1806,8 +1897,9 @@ async function openSession(
   const errors: string[] = [];
   if (directCandidates.length > 0) {
     for (const candidate of directCandidates) {
-      const remainingMs = Math.max(0, connectDeadline - Date.now());
+      const remainingMs = Math.max(0, directDeadline - Date.now());
       if (remainingMs <= 0) {
+        errors.push("Direct candidate phase exhausted its timeout budget");
         break;
       }
       const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
@@ -1841,27 +1933,49 @@ async function openSession(
     }
   }
 
-  if (opts.enableRelayFallback !== false) {
+  if (relayEnabled) {
+    const relayMaxAttempts = 2;
     for (const candidate of relayCandidates) {
-      const remainingMs = Math.max(0, connectDeadline - Date.now());
-      if (remainingMs <= 0) {
-        break;
-      }
-      try {
-        adapter.log?.("core.discovery.relay.try", {
-          address: candidate.address,
-        });
-        return await withTimeout(
-          openRelaySession(adapter, opts, candidate.address),
-          remainingMs,
+      for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
+        const remainingMs = Math.max(0, connectDeadline - Date.now());
+        if (remainingMs <= 0) {
+          break;
+        }
+        const attemptTimeoutMs = Math.max(
+          1000,
+          Math.floor(remainingMs / (relayMaxAttempts - attempt + 1)),
         );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        adapter.log?.("core.discovery.relay.failed", {
-          address: candidate.address,
-          message,
-        });
-        errors.push(`${candidate.address}: ${message}`);
+        try {
+          adapter.log?.("core.discovery.relay.try", {
+            address: candidate.address,
+            attempt,
+            attemptsTotal: relayMaxAttempts,
+            timeoutMs: attemptTimeoutMs,
+          });
+          return await withTimeout(
+            openRelaySession(adapter, opts, candidate.address),
+            attemptTimeoutMs,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          adapter.log?.("core.discovery.relay.failed", {
+            address: candidate.address,
+            attempt,
+            attemptsTotal: relayMaxAttempts,
+            message,
+          });
+          errors.push(
+            `${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`,
+          );
+          const isLastAttempt = attempt >= relayMaxAttempts;
+          const shouldRetry =
+            !isLastAttempt &&
+            (isTimeoutLikeError(message) || isTransientRelayError(message));
+          if (!shouldRetry) {
+            break;
+          }
+          await waitMs(250);
+        }
       }
     }
   } else if (relayCandidates.length > 0) {

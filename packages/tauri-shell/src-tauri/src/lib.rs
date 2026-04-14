@@ -1,6 +1,7 @@
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use prost::Message;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::IpAddr;
-use std::net::{Shutdown, TcpStream};
+use std::net::{Ipv6Addr, Shutdown, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -258,6 +259,38 @@ struct DiscoveryFetchResponse {
     body: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryLocalRequest {
+    expected_device_id: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryLocalCandidate {
+    address: String,
+    protocol: String,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryLocalResponse {
+    candidates: Vec<DiscoveryLocalCandidate>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LocalDiscoveryAnnounce {
+    #[prost(bytes = "vec", tag = "1")]
+    id: Vec<u8>,
+    #[prost(string, repeated, tag = "2")]
+    addresses: Vec<String>,
+    #[prost(int64, tag = "3")]
+    instance_id: i64,
+}
+
 struct TlsSession {
     stream: StreamOwned<ClientConnection, TcpStream>,
 }
@@ -271,6 +304,8 @@ struct TlsSessionStore {
 type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
 
 const RELAY_MAGIC: u32 = 0x9E79_BC40;
+const LOCAL_DISCOVERY_MAGIC: u32 = 0x2EA7_D90B;
+const LOCAL_DISCOVERY_PORT: u16 = 21027;
 const RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST: u32 = 3;
 const RELAY_MESSAGE_TYPE_RESPONSE: u32 = 4;
 const RELAY_MESSAGE_TYPE_CONNECT_REQUEST: u32 = 5;
@@ -1086,6 +1121,153 @@ fn parse_http_response(raw: &[u8]) -> Result<DiscoveryFetchResponse, String> {
     Ok(DiscoveryFetchResponse { status, body })
 }
 
+fn normalize_local_discovery_address(address: &str, source_ip: &str) -> Option<String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains("://") {
+        return Some(format!("tcp://{source_ip}:{trimmed}"));
+    }
+    if !trimmed.starts_with("tcp://") {
+        return Some(trimmed.to_string());
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    let port = parsed.port()?;
+    let host = parsed.host_str().unwrap_or("");
+    let normalized_host = if host == "0.0.0.0" || host == "::" || host.is_empty() {
+        source_ip
+    } else {
+        host
+    };
+    Some(format!("tcp://{normalized_host}:{port}"))
+}
+
+fn parse_local_discovery_candidate(address: &str) -> Option<DiscoveryLocalCandidate> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("relay://") {
+        let parsed = Url::parse(trimmed).ok()?;
+        return Some(DiscoveryLocalCandidate {
+            address: trimmed.to_string(),
+            protocol: "relay".to_string(),
+            host: parsed.host_str().map(|value| value.to_string()),
+            port: parsed.port(),
+        });
+    }
+    if trimmed.starts_with("tcp://") {
+        let parsed = Url::parse(trimmed).ok()?;
+        return Some(DiscoveryLocalCandidate {
+            address: trimmed.to_string(),
+            protocol: "tcp".to_string(),
+            host: parsed.host_str().map(|value| value.to_string()),
+            port: parsed.port(),
+        });
+    }
+    Some(DiscoveryLocalCandidate {
+        address: trimmed.to_string(),
+        protocol: "unknown".to_string(),
+        host: None,
+        port: None,
+    })
+}
+
+fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Vec<DiscoveryLocalCandidate>, String> {
+    let timeout_ms = request
+        .timeout_ms
+        .unwrap_or(1200)
+        .clamp(100, 30_000);
+    let expected = request
+        .expected_device_id
+        .as_deref()
+        .map(canonical_device_id)
+        .unwrap_or_default();
+
+    let mut sockets: Vec<(&'static str, UdpSocket)> = Vec::new();
+    let mut bind_errors: Vec<String> = Vec::new();
+
+    match UdpSocket::bind(("0.0.0.0", LOCAL_DISCOVERY_PORT)) {
+        Ok(socket) => {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
+            sockets.push(("udp4", socket));
+        }
+        Err(error) => bind_errors.push(format!("udp4 bind failed: {error}")),
+    }
+
+    match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, LOCAL_DISCOVERY_PORT)) {
+        Ok(socket) => {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
+            let _ = socket.join_multicast_v6(&Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), 0);
+            sockets.push(("udp6", socket));
+        }
+        Err(error) => bind_errors.push(format!("udp6 bind failed: {error}")),
+    }
+
+    if sockets.is_empty() {
+        return Err(format!(
+            "Local discovery could not bind UDP {} ({}).",
+            LOCAL_DISCOVERY_PORT,
+            bind_errors.join(" | ")
+        ));
+    }
+
+    let started = SystemTime::now();
+    let mut candidates = HashMap::<String, DiscoveryLocalCandidate>::new();
+    let mut buf = vec![0u8; 4096];
+    loop {
+        for (_label, socket) in sockets.iter() {
+            match socket.recv_from(&mut buf) {
+                Ok((size, source)) => {
+                    if size < 5 {
+                        continue;
+                    }
+                    let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    if magic != LOCAL_DISCOVERY_MAGIC {
+                        continue;
+                    }
+                    let announce = match LocalDiscoveryAnnounce::decode(&buf[4..size]) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    if announce.id.is_empty() {
+                        continue;
+                    }
+                    let got_id = canonical_device_id(&base32_no_padding(&announce.id));
+                    if !expected.is_empty() && got_id != expected {
+                        continue;
+                    }
+                    let source_ip = source.ip().to_string();
+                    for address in announce.addresses {
+                        let Some(normalized) = normalize_local_discovery_address(&address, &source_ip) else {
+                            continue;
+                        };
+                        if let Some(candidate) = parse_local_discovery_candidate(&normalized) {
+                            candidates.insert(candidate.address.clone(), candidate);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut {
+                        // continue scanning until timeout window expires
+                    } else {
+                        return Err(format!("Local discovery UDP read failed: {error}"));
+                    }
+                }
+            }
+        }
+        let elapsed = SystemTime::now()
+            .duration_since(started)
+            .unwrap_or(Duration::from_millis(timeout_ms));
+        if elapsed >= Duration::from_millis(timeout_ms) {
+            break;
+        }
+    }
+
+    Ok(candidates.into_values().collect())
+}
+
 fn read_all_from_stream(
     stream: &mut StreamOwned<ClientConnection, TcpStream>,
 ) -> Result<Vec<u8>, String> {
@@ -1380,6 +1562,18 @@ async fn syncpeer_discovery_fetch(
     })
     .await
     .map_err(|error| format!("Discovery fetch task join error: {error}"))?
+}
+
+#[tauri::command]
+async fn syncpeer_discovery_local(
+    request: DiscoveryLocalRequest,
+) -> Result<DiscoveryLocalResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let candidates = discover_local_candidates(&request)?;
+        Ok(DiscoveryLocalResponse { candidates })
+    })
+    .await
+    .map_err(|error| format!("Local discovery task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -2403,6 +2597,7 @@ pub fn run() {
             syncpeer_regenerate_default_cli_identity,
             syncpeer_restore_identity_recovery,
             syncpeer_discovery_fetch,
+            syncpeer_discovery_local,
             syncpeer_tls_open,
             syncpeer_relay_open,
             syncpeer_tls_read,

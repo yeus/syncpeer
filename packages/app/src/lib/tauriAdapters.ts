@@ -50,6 +50,22 @@ interface DiscoveryFetchResponsePayload {
   body: string;
 }
 
+interface DiscoveryLocalRequestPayload {
+  expectedDeviceId?: string | null;
+  timeoutMs?: number | null;
+}
+
+interface DiscoveryLocalCandidatePayload {
+  address: string;
+  protocol: "tcp" | "relay" | "unknown" | string;
+  host?: string | null;
+  port?: number | null;
+}
+
+interface DiscoveryLocalResponsePayload {
+  candidates: DiscoveryLocalCandidatePayload[];
+}
+
 export interface UiLogEntry {
   timestampMs: number;
   level: "info" | "error";
@@ -245,6 +261,25 @@ export const createTauriAdapters = (
         },
       });
       return createDiscoveryResponseFromPayload(payload);
+    },
+    discoverLocalCandidates: async ({ expectedDeviceId, timeoutMs }) => {
+      const payload = await invokeWithLogging<DiscoveryLocalResponsePayload>("syncpeer_discovery_local", {
+        request: {
+          expectedDeviceId: expectedDeviceId || null,
+          timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : null,
+        } as DiscoveryLocalRequestPayload,
+      });
+      return (payload.candidates ?? [])
+        .filter((candidate) => typeof candidate?.address === "string" && candidate.address.trim() !== "")
+        .map((candidate) => ({
+          address: candidate.address.trim(),
+          protocol:
+            candidate.protocol === "tcp" || candidate.protocol === "relay"
+              ? candidate.protocol
+              : "unknown",
+          host: candidate.host ?? undefined,
+          port: Number.isFinite(candidate.port) ? Number(candidate.port) : undefined,
+        }));
     },
     log: (event, details) => logUi(options, event, details),
   };

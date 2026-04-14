@@ -29,10 +29,9 @@ export interface SyncpeerConnectOptions {
 
 export interface NodeDiscoveryCandidate {
   address: string;
-  host: string;
-  port: number;
-  protocol: "tcp" | "relay";
-  score: number;
+  host?: string;
+  port?: number;
+  protocol: "tcp" | "relay" | "unknown";
 }
 
 export interface NodeDiscoveryResult {
@@ -117,6 +116,12 @@ export function createNodeHostAdapter(): unknown;
 export function resolveNodeGlobalDiscovery(options: {
   expectedDeviceId: string;
   discoveryServer?: string;
+}): Promise<NodeDiscoveryResult>;
+export function resolveNodeLocalDiscovery(options?: {
+  expectedDeviceId?: string;
+  timeoutMs?: number;
+  listenPort?: number;
+  signal?: AbortSignal;
 }): Promise<NodeDiscoveryResult>;
 export function createNodeSyncpeerClient(): NodeSyncpeerClient;
 export function createNodeSessionTransport(): NodeSessionTransport;

@@ -1,9 +1,13 @@
 import crypto from "node:crypto";
+import dgram from "node:dgram";
+import os from "node:os";
 import { readFile } from "node:fs/promises";
 import https from "node:https";
 import tls from "node:tls";
+import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
+  type DiscoveredCandidate,
   resolveGlobalDiscovery,
   type SyncpeerDiscoveryFetchInit,
   type SyncpeerDiscoveryResponse,
@@ -16,6 +20,13 @@ import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/brow
 import type { SessionTransport } from "./ui/sessionTypes.ts";
 
 type ByteBuffer = Buffer<ArrayBufferLike>;
+const LOCAL_DISCOVERY_MAGIC = 0x2ea7d90b;
+const LOCAL_DISCOVERY_PORT = 21027;
+
+const LocalDiscoveryAnnounce = new protobuf.Type("Announce")
+  .add(new protobuf.Field("id", 1, "bytes"))
+  .add(new protobuf.Field("addresses", 2, "string", "repeated"))
+  .add(new protobuf.Field("instance_id", 3, "int64"));
 
 class NodeTlsSocket implements SyncpeerTlsSocket {
   private queue: Uint8Array[] = [];
@@ -156,6 +167,285 @@ function base32NoPadding(input: Uint8Array): string {
 function computeDeviceIdFromDer(certDer: Uint8Array): string {
   const digest = crypto.createHash("sha256").update(Buffer.from(certDer)).digest();
   return base32NoPadding(new Uint8Array(digest));
+}
+
+function isWildcardAddress(host: string): boolean {
+  return host === "0.0.0.0" || host === "::" || host === "";
+}
+
+function normalizeAnnounceAddress(
+  address: string,
+  fallbackHost: string,
+): string | null {
+  const trimmed = address.trim();
+  if (trimmed === "") return null;
+  if (!trimmed.includes("://")) {
+    return `tcp://${fallbackHost}:${trimmed}`;
+  }
+  if (!trimmed.startsWith("tcp://")) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    if (!parsed.port) return null;
+    const host = isWildcardAddress(parsed.hostname)
+      ? fallbackHost
+      : parsed.hostname;
+    return `tcp://${host}:${parsed.port}`;
+  } catch {
+    return null;
+  }
+}
+
+function tryParseLocalDiscoveryPacket(
+  packet: Uint8Array,
+): { deviceId: string; addresses: string[] } | null {
+  if (packet.length < 4) return null;
+  const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+  const magic = view.getUint32(0, false);
+  if (magic !== LOCAL_DISCOVERY_MAGIC) return null;
+  let decoded: any;
+  try {
+    decoded = LocalDiscoveryAnnounce.decode(packet.slice(4));
+  } catch {
+    return null;
+  }
+  const id = decoded?.id instanceof Uint8Array
+    ? decoded.id
+    : decoded?.id?.buffer
+      ? new Uint8Array(decoded.id)
+      : null;
+  if (!id || id.length === 0) return null;
+  const addresses = Array.isArray(decoded?.addresses)
+    ? decoded.addresses
+      .filter((entry: unknown): entry is string => typeof entry === "string")
+    : [];
+  return {
+    deviceId: canonicalDeviceId(base32NoPadding(id)),
+    addresses,
+  };
+}
+
+interface ResolveNodeLocalDiscoveryOptions {
+  expectedDeviceId?: string;
+  timeoutMs?: number;
+  listenPort?: number;
+  signal?: AbortSignal;
+}
+
+export async function resolveNodeLocalDiscovery(
+  options: ResolveNodeLocalDiscoveryOptions = {},
+): Promise<{ payload: unknown; candidates: DiscoveredCandidate[] }> {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs && options.timeoutMs > 0
+    ? Math.min(30000, Math.floor(options.timeoutMs))
+    : 5000;
+  const listenPort = Number.isFinite(options.listenPort) && options.listenPort && options.listenPort > 0
+    ? Math.floor(options.listenPort)
+    : LOCAL_DISCOVERY_PORT;
+  const expectedId = options.expectedDeviceId
+    ? canonicalDeviceId(options.expectedDeviceId)
+    : "";
+  const candidatesByAddress = new Map<string, DiscoveredCandidate>();
+  const seenAnnouncements = new Map<string, { from: string; addresses: string[] }>();
+  let boundCount = 0;
+  let blockedCount = 0;
+  const bindErrors: Array<{ socket: "udp4" | "udp6"; code: string; message: string }> = [];
+  const multicastMembership: Array<{
+    socket: "udp6";
+    iface: string;
+    joined: boolean;
+    error?: string;
+  }> = [];
+  const stats = {
+    packetsReceived: 0,
+    packetsBySocket: { udp4: 0, udp6: 0 },
+    packetsMagicMismatch: 0,
+    packetsDecodeFailed: 0,
+    packetsMissingId: 0,
+    packetsFilteredByExpectedId: 0,
+    announcementsAccepted: 0,
+    announcementsWithNoAddresses: 0,
+    uniqueSources: new Set<string>(),
+  };
+  const sockets: dgram.Socket[] = [];
+  const abortSignal = options.signal;
+  const processMessage = (
+    socketType: "udp4" | "udp6",
+    message: Buffer<ArrayBufferLike>,
+    sourceAddress: string,
+  ) => {
+    stats.packetsReceived += 1;
+    stats.packetsBySocket[socketType] += 1;
+    stats.uniqueSources.add(sourceAddress);
+    const decoded = tryParseLocalDiscoveryPacket(new Uint8Array(message));
+    if (!decoded) {
+      if (message.length < 4) {
+        stats.packetsDecodeFailed += 1;
+        return;
+      }
+      const view = new DataView(message.buffer, message.byteOffset, message.byteLength);
+      const magic = view.getUint32(0, false);
+      if (magic !== LOCAL_DISCOVERY_MAGIC) {
+        stats.packetsMagicMismatch += 1;
+      } else {
+        stats.packetsDecodeFailed += 1;
+      }
+      return;
+    }
+    if (!decoded.deviceId) {
+      stats.packetsMissingId += 1;
+      return;
+    }
+    if (expectedId && canonicalDeviceId(decoded.deviceId) !== expectedId) {
+      stats.packetsFilteredByExpectedId += 1;
+      return;
+    }
+    const normalizedAddresses = decoded.addresses
+      .map((address) => normalizeAnnounceAddress(address, sourceAddress))
+      .filter((entry): entry is string => entry !== null);
+    if (normalizedAddresses.length === 0) {
+      stats.announcementsWithNoAddresses += 1;
+    }
+    stats.announcementsAccepted += 1;
+    seenAnnouncements.set(decoded.deviceId, {
+      from: sourceAddress,
+      addresses: normalizedAddresses,
+    });
+    for (const address of normalizedAddresses) {
+      let parsed: URL;
+      try {
+        parsed = new URL(address);
+      } catch {
+        continue;
+      }
+      if (parsed.protocol === "tcp:" && parsed.hostname && parsed.port) {
+        candidatesByAddress.set(address, {
+          address,
+          protocol: "tcp",
+          host: parsed.hostname,
+          port: Number(parsed.port),
+        });
+      }
+    }
+  };
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let onAbort: (() => void) | null = null;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (onAbort && abortSignal) {
+        abortSignal.removeEventListener("abort", onAbort);
+      }
+      for (const socket of sockets) {
+        socket.removeAllListeners("message");
+        socket.removeAllListeners("error");
+        socket.close();
+      }
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => finish(), timeoutMs);
+    if (abortSignal) {
+      onAbort = () => {
+        clearTimeout(timer);
+        finish();
+      };
+      if (abortSignal.aborted) {
+        onAbort();
+        return;
+      }
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
+    const onSocketError = (type: "udp4" | "udp6", error: NodeJS.ErrnoException) => {
+      bindErrors.push({
+        socket: type,
+        code: error.code ?? "UNKNOWN",
+        message: error.message,
+      });
+      if (error.code === "EADDRINUSE" || error.code === "EPERM") {
+        blockedCount += 1;
+        if (blockedCount >= 2 && boundCount === 0) {
+          clearTimeout(timer);
+          finish();
+        }
+        return;
+      }
+      clearTimeout(timer);
+      finish(error);
+    };
+    const openSocket = (type: "udp4" | "udp6", host: string) => {
+      const socket = dgram.createSocket({ type, reuseAddr: true });
+      sockets.push(socket);
+      socket.on("error", (error) => onSocketError(type, error));
+      socket.on("message", (message, rinfo) => {
+        processMessage(type, message, rinfo.address);
+      });
+      socket.once("listening", () => {
+        boundCount += 1;
+        if (type === "udp6") {
+          for (const ifaceName of Object.keys(os.networkInterfaces())) {
+            try {
+              socket.addMembership("ff12::8384", ifaceName);
+              multicastMembership.push({
+                socket: "udp6",
+                iface: ifaceName,
+                joined: true,
+              });
+            } catch {
+              multicastMembership.push({
+                socket: "udp6",
+                iface: ifaceName,
+                joined: false,
+                error: "addMembership failed",
+              });
+            }
+          }
+        }
+      });
+      socket.bind(listenPort, host);
+    };
+    openSocket("udp4", "0.0.0.0");
+    openSocket("udp6", "::");
+  });
+  return {
+    payload: {
+      source: "local-udp",
+      timeoutMs,
+      listenPort,
+      socketsAttempted: 2,
+      socketsBound: boundCount,
+      bindErrors,
+      multicastMembership,
+      stats: {
+        packetsReceived: stats.packetsReceived,
+        packetsBySocket: stats.packetsBySocket,
+        packetsMagicMismatch: stats.packetsMagicMismatch,
+        packetsDecodeFailed: stats.packetsDecodeFailed,
+        packetsMissingId: stats.packetsMissingId,
+        packetsFilteredByExpectedId: stats.packetsFilteredByExpectedId,
+        announcementsAccepted: stats.announcementsAccepted,
+        announcementsWithNoAddresses: stats.announcementsWithNoAddresses,
+        uniqueSources: [...stats.uniqueSources],
+      },
+      announcements: [...seenAnnouncements.entries()].map(([deviceId, entry]) => ({
+        deviceId,
+        from: entry.from,
+        addresses: entry.addresses,
+      })),
+    },
+    candidates: [...candidatesByAddress.values()],
+  };
+}
+
+async function discoverNodeLocalCandidates(options: {
+  expectedDeviceId: string;
+  timeoutMs?: number;
+}): Promise<DiscoveredCandidate[]> {
+  if (!options.expectedDeviceId) return [];
+  const result = await resolveNodeLocalDiscovery({
+    expectedDeviceId: options.expectedDeviceId,
+    timeoutMs: options.timeoutMs ?? 1200,
+  });
+  return result.candidates;
 }
 
 function createDiscoveryResponse(
@@ -326,6 +616,7 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
       return new Uint8Array(crypto.randomBytes(length));
     },
     discoveryFetch: nodeDiscoveryFetch,
+    discoverLocalCandidates: discoverNodeLocalCandidates,
     log: enableLogs
       ? (event, details) => {
           if (details === undefined) {

@@ -322,6 +322,7 @@ export async function resolveNodeLocalDiscovery(
           protocol: "tcp",
           host: parsed.hostname,
           port: Number(parsed.port),
+          deviceId: decoded.deviceId,
         });
       }
     }
@@ -440,7 +441,6 @@ async function discoverNodeLocalCandidates(options: {
   expectedDeviceId: string;
   timeoutMs?: number;
 }): Promise<DiscoveredCandidate[]> {
-  if (!options.expectedDeviceId) return [];
   const result = await resolveNodeLocalDiscovery({
     expectedDeviceId: options.expectedDeviceId,
     timeoutMs: options.timeoutMs ?? 1200,

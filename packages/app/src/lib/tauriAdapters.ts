@@ -60,10 +60,28 @@ interface DiscoveryLocalCandidatePayload {
   protocol: "tcp" | "relay" | "unknown" | string;
   host?: string | null;
   port?: number | null;
+  deviceId?: string | null;
 }
 
 interface DiscoveryLocalResponsePayload {
   candidates: DiscoveryLocalCandidatePayload[];
+  diagnostics?: {
+    timeoutMs?: number;
+    socketsBound?: number;
+    bindErrors?: string[];
+    packetsReceived?: number;
+    packetsBySocketUdp4?: number;
+    packetsBySocketUdp6?: number;
+    packetsMagicMismatch?: number;
+    packetsDecodeFailed?: number;
+    packetsMissingId?: number;
+    packetsFilteredExpectedId?: number;
+    announcementsAccepted?: number;
+    discoveredDeviceIds?: string[];
+    fallbackSource?: string | null;
+    fallbackError?: string | null;
+    fallbackCandidateCount?: number;
+  };
 }
 
 export interface UiLogEntry {
@@ -202,6 +220,7 @@ export const createTauriAdapters = (
   options?: CreateTauriAdaptersOptions,
 ): { hostAdapter: SyncpeerHostAdapter; platformAdapter: SyncpeerPlatformAdapter } => {
   let invoke: InvokeFn | null = null;
+  let multicastLockPrepared = false;
   const invokeWithLogging: InvokeFn = <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
     if (!invoke) {
       invoke = createLoggedInvoke(resolveInvoke(), options);
@@ -263,11 +282,37 @@ export const createTauriAdapters = (
       return createDiscoveryResponseFromPayload(payload);
     },
     discoverLocalCandidates: async ({ expectedDeviceId, timeoutMs }) => {
+      if (!multicastLockPrepared) {
+        multicastLockPrepared = true;
+        try {
+          await invokeWithLogging<boolean>("syncpeer_android_enable_multicast_lock");
+        } catch {
+          // Best-effort on Android; command returns false on non-Android.
+        }
+      }
       const payload = await invokeWithLogging<DiscoveryLocalResponsePayload>("syncpeer_discovery_local", {
         request: {
           expectedDeviceId: expectedDeviceId || null,
           timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : null,
         } as DiscoveryLocalRequestPayload,
+      });
+      logUi(options, "tauri.discovery.local.result", {
+        timeoutMs: payload.diagnostics?.timeoutMs ?? timeoutMs ?? null,
+        socketsBound: payload.diagnostics?.socketsBound ?? null,
+        bindErrors: payload.diagnostics?.bindErrors ?? [],
+        packetsReceived: payload.diagnostics?.packetsReceived ?? 0,
+        packetsBySocketUdp4: payload.diagnostics?.packetsBySocketUdp4 ?? 0,
+        packetsBySocketUdp6: payload.diagnostics?.packetsBySocketUdp6 ?? 0,
+        packetsMagicMismatch: payload.diagnostics?.packetsMagicMismatch ?? 0,
+        packetsDecodeFailed: payload.diagnostics?.packetsDecodeFailed ?? 0,
+        packetsMissingId: payload.diagnostics?.packetsMissingId ?? 0,
+        packetsFilteredExpectedId: payload.diagnostics?.packetsFilteredExpectedId ?? 0,
+        announcementsAccepted: payload.diagnostics?.announcementsAccepted ?? 0,
+        discoveredDeviceIds: payload.diagnostics?.discoveredDeviceIds ?? [],
+        fallbackSource: payload.diagnostics?.fallbackSource ?? null,
+        fallbackError: payload.diagnostics?.fallbackError ?? null,
+        fallbackCandidateCount: payload.diagnostics?.fallbackCandidateCount ?? 0,
+        candidateCount: payload.candidates?.length ?? 0,
       });
       return (payload.candidates ?? [])
         .filter((candidate) => typeof candidate?.address === "string" && candidate.address.trim() !== "")
@@ -279,6 +324,10 @@ export const createTauriAdapters = (
               : "unknown",
           host: candidate.host ?? undefined,
           port: Number.isFinite(candidate.port) ? Number(candidate.port) : undefined,
+          deviceId:
+            typeof candidate.deviceId === "string" && candidate.deviceId.trim() !== ""
+              ? candidate.deviceId.trim()
+              : undefined,
         }));
     },
     log: (event, details) => logUi(options, event, details),

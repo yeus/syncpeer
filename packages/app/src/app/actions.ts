@@ -129,6 +129,14 @@ const saveOfflineSnapshot = (
   };
 };
 
+const hasAutoConnectTarget = (state: AppState) => {
+  const remoteTarget = normalizeDeviceId(state.connection.remoteId);
+  if (remoteTarget) return true;
+  const selected = normalizeDeviceId(state.devices.selectedSavedDeviceId);
+  if (!selected) return false;
+  return !state.devices.lanDiscoveredDeviceIds.has(selected);
+};
+
 const clearDirectoryView = (state: AppState) => {
   state.session.currentFolderId = "";
   state.session.currentPath = "";
@@ -194,6 +202,11 @@ const setRemoteApprovalPending = (
 
 const sortByName = <T extends { name: string }>(items: T[]) =>
   [...items].sort((left, right) => left.name.localeCompare(right.name));
+
+const normalizeCandidateDeviceId = (deviceId: string) => normalizeDeviceId(deviceId);
+
+const normalizeCandidateAddresses = (addresses: string[]) =>
+  [...new Set(addresses.map((item) => String(item ?? "").trim()).filter(Boolean))].sort();
 
 const suggestedSavedDeviceName = (state: AppState, deviceId: string) => {
   const normalized = normalizeDeviceId(deviceId);
@@ -775,6 +788,45 @@ export const createAppActions = (args: {
       reportActionError(state, "device_id.read.failed", error);
     } finally {
       state.devices.isLoadingCurrentDeviceId = false;
+    }
+  };
+
+  const discoverLocalDevices = async (options?: { timeoutMs?: number }) => {
+    if (state.devices.isDiscoveringLanDevices) return;
+    state.devices.isDiscoveringLanDevices = true;
+    try {
+      const localDeviceId = normalizeDeviceId(state.devices.currentDeviceId);
+      const discovered = await client.discoverLocalDevices({
+        timeoutMs: options?.timeoutMs ?? 1400,
+      });
+      const nextSeenIds = new Set<string>();
+      const nextByDeviceId: Record<
+        string,
+        { addresses: string[]; lastSeenAtMs: number }
+      > = {};
+      for (const candidate of discovered) {
+        const candidateDeviceId = normalizeCandidateDeviceId(candidate.deviceId);
+        if (!candidateDeviceId) continue;
+        if (candidateDeviceId === localDeviceId) continue;
+        const addresses = normalizeCandidateAddresses(candidate.addresses);
+        nextSeenIds.add(candidateDeviceId);
+        nextByDeviceId[candidateDeviceId] = {
+          addresses,
+          lastSeenAtMs: Date.now(),
+        };
+        upsertSavedDevice(
+          state,
+          candidateDeviceId,
+          suggestedSavedDeviceName(state, candidateDeviceId),
+          { customName: false },
+        );
+      }
+      state.devices.lanDiscoveredDeviceIds = nextSeenIds;
+      state.devices.lanDiscoveryByDeviceId = nextByDeviceId;
+    } catch (error) {
+      reportActionError(state, "lan_discovery.failed", error, options);
+    } finally {
+      state.devices.isDiscoveringLanDevices = false;
     }
   };
 
@@ -1590,12 +1642,16 @@ export const createAppActions = (args: {
 
   const onNetworkOnline = async () => {
     if (state.ui.autoConnectPaused) return;
+    await discoverLocalDevices({ timeoutMs: 1200 });
+    if (!hasAutoConnectTarget(state)) return;
     if (state.session.isConnected || state.session.isConnecting) return;
     await connect();
   };
 
   const onAppForeground = async () => {
     if (state.ui.autoConnectPaused) return;
+    await discoverLocalDevices({ timeoutMs: 1200 });
+    if (!hasAutoConnectTarget(state)) return;
     if (state.session.isConnected || state.session.isConnecting) return;
     await connect();
   };
@@ -1729,6 +1785,7 @@ export const createAppActions = (args: {
     refreshOverview,
     refreshActiveView,
     refreshCurrentDeviceId,
+    discoverLocalDevices,
     copyCurrentDeviceId,
     copySessionLogs,
     openFolderRoot,

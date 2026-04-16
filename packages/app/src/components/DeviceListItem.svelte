@@ -5,12 +5,13 @@
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
 
-  export interface SavedDeviceRow {
+export interface SavedDeviceRow {
     kind: "saved";
     id: string;
     name: string;
     deviceId: string;
     isConnected: boolean;
+    isLanDetected: boolean;
     isIntroducer: boolean;
     awaitingApproval: boolean;
     metaLines: string[];
@@ -69,6 +70,9 @@
     {/if}
     {#if row.kind === "saved" && row.isConnected}
       <StatusChip tone="online" small>online</StatusChip>
+    {/if}
+    {#if row.kind === "saved" && row.isLanDetected}
+      <StatusChip small>lan</StatusChip>
     {/if}
     {#if row.kind === "saved" && row.awaitingApproval}
       <StatusChip tone="offline" small title="This peer may still need to approve your device on their Syncthing side.">

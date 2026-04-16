@@ -31,6 +31,7 @@
     folderLockLabel,
     folderState,
     isFolderPasswordInputVisible,
+    isLanDiscoveredDevice,
     isSavedDeviceAwaitingRemoteApproval,
     isSavedDeviceConnected,
     paginatedDirectoryEntries,
@@ -88,7 +89,10 @@
         (device) => device.id === app.devices.selectedSavedDeviceId,
       )
     ) {
-      app.devices.selectedSavedDeviceId = app.devices.savedDevices[0].id;
+      const firstNonLanDiscovered = app.devices.savedDevices.find(
+        (device) => !app.devices.lanDiscoveredDeviceIds.has(device.id),
+      );
+      app.devices.selectedSavedDeviceId = firstNonLanDiscovered?.id ?? "";
     } else if (app.devices.savedDevices.length === 0) {
       app.devices.selectedSavedDeviceId = "";
     }
@@ -117,6 +121,7 @@
   onMount(() => {
     void actions.hydrate();
     void actions.refreshCurrentDeviceId();
+    void actions.discoverLocalDevices();
     actions.restoreOfflineSnapshot(undefined, "startup");
     actions.setAppVisibility(document.visibilityState === "visible");
 
@@ -156,6 +161,7 @@
   });
 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let localDiscoveryTimer: ReturnType<typeof setInterval> | null = null;
 
   $effect(() => {
     if (app.currentPage !== "main") return;
@@ -170,10 +176,26 @@
     };
   });
 
+  $effect(() => {
+    if (app.currentPage !== "main") return;
+    if (localDiscoveryTimer) clearInterval(localDiscoveryTimer);
+    localDiscoveryTimer = setInterval(() => {
+      void actions.discoverLocalDevices();
+    }, 15000);
+    return () => {
+      if (localDiscoveryTimer) clearInterval(localDiscoveryTimer);
+      localDiscoveryTimer = null;
+    };
+  });
+
   onDestroy(() => {
     if (refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = null;
+    }
+    if (localDiscoveryTimer) {
+      clearInterval(localDiscoveryTimer);
+      localDiscoveryTimer = null;
     }
     unsubscribe();
     void client.disconnect();
@@ -255,6 +277,7 @@
           isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
             isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
+          isLanDiscoveredDevice={(deviceId) => isLanDiscoveredDevice(app, deviceId)}
           currentSourceIsIntroducer={currentSourceIsIntroducer(app)}
           onUseSavedDevice={actions.useSavedDevice}
           onResetDiscoveryServer={actions.resetDiscoveryServer}

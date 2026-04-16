@@ -114,6 +114,7 @@ export interface DiscoveredCandidate {
   protocol: "tcp" | "relay" | "unknown";
   host?: string;
   port?: number;
+  deviceId?: string;
 }
 
 export interface SyncpeerGlobalDiscoveryResult {

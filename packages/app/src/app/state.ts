@@ -171,6 +171,12 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       isExportingIdentityRecovery: false,
       isRestoringIdentityRecovery: false,
       identityRecoverySecret: "",
+      lanDiscoveredDeviceIds: new Set<string>(),
+      lanDiscoveryByDeviceId: {} as Record<
+        string,
+        { addresses: string[]; lastSeenAtMs: number }
+      >,
+      isDiscoveringLanDevices: false,
     },
     approvals: {
       syncApprovedFolderKeys: normalizeSyncApprovedIntroducedFolderKeys(
@@ -441,6 +447,9 @@ export const advertisedFolders = (state: AppState) =>
 export const isSavedDeviceConnected = (state: AppState, deviceId: string) =>
   state.session.isConnected &&
   sameDeviceId(state.session.remoteDevice?.id ?? state.connection.remoteId, deviceId);
+
+export const isLanDiscoveredDevice = (state: AppState, deviceId: string) =>
+  state.devices.lanDiscoveredDeviceIds.has(normalizeDeviceId(deviceId));
 
 export const isSavedDeviceAwaitingRemoteApproval = (
   state: AppState,

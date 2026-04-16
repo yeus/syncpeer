@@ -81,6 +81,7 @@ export type {
   CreateSyncpeerBrowserClientOptions,
   FavoriteRecord,
   IdentityRecoveryExportResponse,
+  LocalDiscoveredDevice,
   RemoteFsLike,
   SyncpeerBrowserClient,
   SyncpeerIdentityRecord,

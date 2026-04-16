@@ -71,10 +71,16 @@ export interface ConnectionOverview {
   transportKind: "direct-tcp" | "relay";
 }
 
+export interface LocalDiscoveredDevice {
+  deviceId: string;
+  addresses: string[];
+}
+
 export interface SyncpeerBrowserClient {
   connectAndSync: (options: ConnectOptions) => Promise<RemoteFsLike>;
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
+  discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<LocalDiscoveredDevice[]>;
   disconnect: () => Promise<void>;
   readBinaryFile: (path: string) => Promise<Uint8Array>;
   pickUploadFile: () => Promise<string | null | undefined>;

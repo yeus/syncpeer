@@ -32,6 +32,7 @@ export interface NodeDiscoveryCandidate {
   host?: string;
   port?: number;
   protocol: "tcp" | "relay" | "unknown";
+  deviceId?: string;
 }
 
 export interface NodeDiscoveryResult {

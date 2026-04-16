@@ -20,6 +20,7 @@
     "build:tauri:bundle": "npm run build:bundle -w @syncpeer/tauri-shell",
     "build:tauri:bundle:appimage": "npm run build:bundle:appimage -w @syncpeer/tauri-shell",
     "build:tauri:bundle:deb": "npm run build:bundle:deb -w @syncpeer/tauri-shell",
+    "typecheck:app": "npm run typecheck -w @syncpeer/app",
     "build:android:init": "npm run android:init -w @syncpeer/tauri-shell",
     "build:android": "npm run build:android:prod",
     "build:android:prod": "scripts/build-android-prod-with-secrets.sh",

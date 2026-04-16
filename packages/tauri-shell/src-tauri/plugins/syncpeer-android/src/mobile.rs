@@ -24,6 +24,14 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct SyncpeerAndroid<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> SyncpeerAndroid<R> {
+  pub fn enable_multicast_lock(&self) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>("enableMulticastLock", json!({}))
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
   pub fn open_with_chooser(
     &self,
     path: &str,

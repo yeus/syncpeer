@@ -9,6 +9,7 @@
     advertisedDevices: any[];
     isSavedDeviceConnected: (deviceId: string) => boolean;
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
+    isLanDiscoveredDevice: (deviceId: string) => boolean;
     currentSourceIsIntroducer: boolean;
     onUseSavedDevice: (deviceId: string) => void;
     onResetDiscoveryServer: () => void;
@@ -33,6 +34,7 @@
     advertisedDevices,
     isSavedDeviceConnected,
     isSavedDeviceAwaitingRemoteApproval,
+    isLanDiscoveredDevice,
     currentSourceIsIntroducer,
     onUseSavedDevice,
     onResetDiscoveryServer,
@@ -61,6 +63,11 @@
   let deviceRows = $derived.by(() => {
     const savedRows = app.devices.savedDevices.map((device: any) => {
       const isConnected = isSavedDeviceConnected(device.id);
+      const isLanDetected = isLanDiscoveredDevice(device.id);
+      const lanMeta =
+        app.devices.lanDiscoveryByDeviceId?.[device.id]?.addresses?.length > 0
+          ? `LAN: ${app.devices.lanDiscoveryByDeviceId[device.id].addresses.join(", ")}`
+          : "";
       const clientName = String(app.session.remoteDevice?.clientName ?? "").trim();
       const clientVersion = String(app.session.remoteDevice?.clientVersion ?? "").trim();
       const clientLabel = `${clientName} ${clientVersion}`.trim();
@@ -70,14 +77,16 @@
             app.session.connectionPath
               ? `Connected via ${app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}: ${app.session.connectionPath}`
               : "",
+            lanMeta,
           ].filter((line: string) => line !== "")
-        : [];
+        : [lanMeta].filter((line: string) => line !== "");
       return {
         kind: "saved" as const,
         id: `saved:${device.id}`,
         name: device.name,
         deviceId: device.id,
         isConnected,
+        isLanDetected,
         isIntroducer: device.isIntroducer === true,
         awaitingApproval: isSavedDeviceAwaitingRemoteApproval(device.id),
         metaLines,

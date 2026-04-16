@@ -4,6 +4,7 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 use prost::Message;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -273,12 +274,34 @@ struct DiscoveryLocalCandidate {
     protocol: String,
     host: Option<String>,
     port: Option<u16>,
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DiscoveryLocalResponse {
     candidates: Vec<DiscoveryLocalCandidate>,
+    diagnostics: DiscoveryLocalDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryLocalDiagnostics {
+    timeout_ms: u64,
+    sockets_bound: usize,
+    bind_errors: Vec<String>,
+    packets_received: u64,
+    packets_by_socket_udp4: u64,
+    packets_by_socket_udp6: u64,
+    packets_magic_mismatch: u64,
+    packets_decode_failed: u64,
+    packets_missing_id: u64,
+    packets_filtered_expected_id: u64,
+    announcements_accepted: u64,
+    discovered_device_ids: Vec<String>,
+    fallback_source: Option<String>,
+    fallback_error: Option<String>,
+    fallback_candidate_count: usize,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1143,11 +1166,12 @@ fn normalize_local_discovery_address(address: &str, source_ip: &str) -> Option<S
     Some(format!("tcp://{normalized_host}:{port}"))
 }
 
-fn parse_local_discovery_candidate(address: &str) -> Option<DiscoveryLocalCandidate> {
+fn parse_local_discovery_candidate(address: &str, device_id: Option<&str>) -> Option<DiscoveryLocalCandidate> {
     let trimmed = address.trim();
     if trimmed.is_empty() {
         return None;
     }
+    let normalized_device_id = device_id.map(|value| value.to_string());
     if trimmed.starts_with("relay://") {
         let parsed = Url::parse(trimmed).ok()?;
         return Some(DiscoveryLocalCandidate {
@@ -1155,6 +1179,7 @@ fn parse_local_discovery_candidate(address: &str) -> Option<DiscoveryLocalCandid
             protocol: "relay".to_string(),
             host: parsed.host_str().map(|value| value.to_string()),
             port: parsed.port(),
+            device_id: normalized_device_id,
         });
     }
     if trimmed.starts_with("tcp://") {
@@ -1164,6 +1189,7 @@ fn parse_local_discovery_candidate(address: &str) -> Option<DiscoveryLocalCandid
             protocol: "tcp".to_string(),
             host: parsed.host_str().map(|value| value.to_string()),
             port: parsed.port(),
+            device_id: normalized_device_id,
         });
     }
     Some(DiscoveryLocalCandidate {
@@ -1171,10 +1197,91 @@ fn parse_local_discovery_candidate(address: &str) -> Option<DiscoveryLocalCandid
         protocol: "unknown".to_string(),
         host: None,
         port: None,
+        device_id: normalized_device_id,
     })
 }
 
-fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Vec<DiscoveryLocalCandidate>, String> {
+fn discover_local_candidates_from_syncthing_cache(
+    expected: &str,
+) -> Result<(Vec<DiscoveryLocalCandidate>, String), String> {
+    let endpoints = [
+        "http://127.0.0.1:8384/rest/system/discovery",
+        "http://localhost:8384/rest/system/discovery",
+        "http://127.0.0.1:58384/rest/system/discovery",
+    ];
+    let api_key_env = std::env::var("SYNCTHING_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let api_keys: Vec<Option<String>> = if let Some(key) = api_key_env {
+        vec![Some(key), None]
+    } else {
+        vec![None]
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(900))
+        .build()
+        .map_err(|error| format!("Could not build fallback HTTP client: {error}"))?;
+    let mut last_error: Option<String> = None;
+    for endpoint in endpoints {
+        for api_key in &api_keys {
+            let mut request = client.get(endpoint);
+            if let Some(key) = api_key {
+                request = request.header("X-API-Key", key);
+            }
+            let response = match request.send() {
+                Ok(value) => value,
+                Err(error) => {
+                    last_error = Some(format!("{endpoint}: {error}"));
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                last_error = Some(format!("{endpoint}: HTTP {}", response.status()));
+                continue;
+            }
+            let payload: Value = response
+                .json()
+                .map_err(|error| format!("{endpoint}: Invalid discovery JSON: {error}"))?;
+            let Some(obj) = payload.as_object() else {
+                last_error = Some(format!("{endpoint}: Discovery response is not an object"));
+                continue;
+            };
+            let mut candidates_by_address: HashMap<String, DiscoveryLocalCandidate> = HashMap::new();
+            for (device_id_raw, addresses_raw) in obj {
+                let normalized_id = canonical_device_id(device_id_raw);
+                if !expected.is_empty() && normalized_id != expected {
+                    continue;
+                }
+                let Some(addresses) = addresses_raw.as_array() else {
+                    continue;
+                };
+                for address_value in addresses {
+                    let Some(address_str) = address_value.as_str() else {
+                        continue;
+                    };
+                    let Some(normalized) =
+                        normalize_local_discovery_address(address_str, "127.0.0.1")
+                    else {
+                        continue;
+                    };
+                    if let Some(candidate) =
+                        parse_local_discovery_candidate(&normalized, Some(&normalized_id))
+                    {
+                        candidates_by_address.insert(candidate.address.clone(), candidate);
+                    }
+                }
+            }
+            return Ok((
+                candidates_by_address.into_values().collect(),
+                endpoint.to_string(),
+            ));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "No fallback endpoint responded".to_string()))
+}
+
+fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<DiscoveryLocalResponse, String> {
     let timeout_ms = request
         .timeout_ms
         .unwrap_or(1200)
@@ -1187,13 +1294,28 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Vec<Disc
 
     let mut sockets: Vec<(&'static str, UdpSocket)> = Vec::new();
     let mut bind_errors: Vec<String> = Vec::new();
+    let mut bind_kinds: Vec<ErrorKind> = Vec::new();
+    let mut packets_received = 0_u64;
+    let mut packets_by_socket_udp4 = 0_u64;
+    let mut packets_by_socket_udp6 = 0_u64;
+    let mut packets_magic_mismatch = 0_u64;
+    let mut packets_decode_failed = 0_u64;
+    let mut packets_missing_id = 0_u64;
+    let mut packets_filtered_expected_id = 0_u64;
+    let mut announcements_accepted = 0_u64;
+    let mut fallback_source: Option<String> = None;
+    let mut fallback_error: Option<String> = None;
+    let mut fallback_candidate_count = 0_usize;
 
     match UdpSocket::bind(("0.0.0.0", LOCAL_DISCOVERY_PORT)) {
         Ok(socket) => {
             let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
             sockets.push(("udp4", socket));
         }
-        Err(error) => bind_errors.push(format!("udp4 bind failed: {error}")),
+        Err(error) => {
+            bind_kinds.push(error.kind());
+            bind_errors.push(format!("udp4 bind failed: {error}"));
+        }
     }
 
     match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, LOCAL_DISCOVERY_PORT)) {
@@ -1202,10 +1324,55 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Vec<Disc
             let _ = socket.join_multicast_v6(&Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), 0);
             sockets.push(("udp6", socket));
         }
-        Err(error) => bind_errors.push(format!("udp6 bind failed: {error}")),
+        Err(error) => {
+            bind_kinds.push(error.kind());
+            bind_errors.push(format!("udp6 bind failed: {error}"));
+        }
     }
 
     if sockets.is_empty() {
+        let only_addr_in_use_or_permission = !bind_kinds.is_empty()
+            && bind_kinds.iter().all(|kind| {
+                *kind == ErrorKind::AddrInUse || *kind == ErrorKind::PermissionDenied
+            });
+        if only_addr_in_use_or_permission {
+            tauri_log(&format!(
+                "local_discovery.bind_unavailable port={} reason={} -> returning empty candidate list",
+                LOCAL_DISCOVERY_PORT,
+                bind_errors.join(" | ")
+            ));
+            let (fallback_candidates, source, error) =
+                match discover_local_candidates_from_syncthing_cache(&expected) {
+                    Ok((candidates, source)) => (candidates, Some(source), None),
+                    Err(error) => (Vec::new(), None, Some(error)),
+                };
+            fallback_candidate_count = fallback_candidates.len();
+            fallback_source = source;
+            fallback_error = error;
+            return Ok(DiscoveryLocalResponse {
+                candidates: fallback_candidates.clone(),
+                diagnostics: DiscoveryLocalDiagnostics {
+                    timeout_ms,
+                    sockets_bound: 0,
+                    bind_errors,
+                    packets_received: 0,
+                    packets_by_socket_udp4: 0,
+                    packets_by_socket_udp6: 0,
+                    packets_magic_mismatch: 0,
+                    packets_decode_failed: 0,
+                    packets_missing_id: 0,
+                    packets_filtered_expected_id: 0,
+                    announcements_accepted: 0,
+                    discovered_device_ids: fallback_candidates
+                        .iter()
+                        .filter_map(|candidate| candidate.device_id.clone())
+                        .collect(),
+                    fallback_source,
+                    fallback_error,
+                    fallback_candidate_count,
+                },
+            });
+        }
         return Err(format!(
             "Local discovery could not bind UDP {} ({}).",
             LOCAL_DISCOVERY_PORT,
@@ -1217,33 +1384,49 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Vec<Disc
     let mut candidates = HashMap::<String, DiscoveryLocalCandidate>::new();
     let mut buf = vec![0u8; 4096];
     loop {
-        for (_label, socket) in sockets.iter() {
+        for (label, socket) in sockets.iter() {
             match socket.recv_from(&mut buf) {
                 Ok((size, source)) => {
+                    packets_received += 1;
+                    if *label == "udp4" {
+                        packets_by_socket_udp4 += 1;
+                    } else if *label == "udp6" {
+                        packets_by_socket_udp6 += 1;
+                    }
                     if size < 5 {
+                        packets_decode_failed += 1;
                         continue;
                     }
                     let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                     if magic != LOCAL_DISCOVERY_MAGIC {
+                        packets_magic_mismatch += 1;
                         continue;
                     }
                     let announce = match LocalDiscoveryAnnounce::decode(&buf[4..size]) {
                         Ok(value) => value,
-                        Err(_) => continue,
+                        Err(_) => {
+                            packets_decode_failed += 1;
+                            continue;
+                        }
                     };
                     if announce.id.is_empty() {
+                        packets_missing_id += 1;
                         continue;
                     }
                     let got_id = canonical_device_id(&base32_no_padding(&announce.id));
                     if !expected.is_empty() && got_id != expected {
+                        packets_filtered_expected_id += 1;
                         continue;
                     }
+                    announcements_accepted += 1;
                     let source_ip = source.ip().to_string();
                     for address in announce.addresses {
                         let Some(normalized) = normalize_local_discovery_address(&address, &source_ip) else {
                             continue;
                         };
-                        if let Some(candidate) = parse_local_discovery_candidate(&normalized) {
+                        if let Some(candidate) =
+                            parse_local_discovery_candidate(&normalized, Some(&got_id))
+                        {
                             candidates.insert(candidate.address.clone(), candidate);
                         }
                     }
@@ -1265,7 +1448,47 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Vec<Disc
         }
     }
 
-    Ok(candidates.into_values().collect())
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    if candidates.is_empty() {
+        match discover_local_candidates_from_syncthing_cache(&expected) {
+            Ok((fallback_candidates, source)) => {
+                fallback_source = Some(source);
+                fallback_candidate_count = fallback_candidates.len();
+                if !fallback_candidates.is_empty() {
+                    candidates = fallback_candidates;
+                }
+            }
+            Err(error) => {
+                fallback_error = Some(error);
+            }
+        }
+    }
+    let mut discovered_device_ids = candidates
+        .iter()
+        .filter_map(|candidate| candidate.device_id.clone())
+        .collect::<Vec<_>>();
+    discovered_device_ids.sort();
+    discovered_device_ids.dedup();
+    Ok(DiscoveryLocalResponse {
+        diagnostics: DiscoveryLocalDiagnostics {
+            timeout_ms,
+            sockets_bound: sockets.len(),
+            bind_errors,
+            packets_received,
+            packets_by_socket_udp4,
+            packets_by_socket_udp6,
+            packets_magic_mismatch,
+            packets_decode_failed,
+            packets_missing_id,
+            packets_filtered_expected_id,
+            announcements_accepted,
+            discovered_device_ids,
+            fallback_source,
+            fallback_error,
+            fallback_candidate_count,
+        },
+        candidates,
+    })
 }
 
 fn read_all_from_stream(
@@ -1568,10 +1791,7 @@ async fn syncpeer_discovery_fetch(
 async fn syncpeer_discovery_local(
     request: DiscoveryLocalRequest,
 ) -> Result<DiscoveryLocalResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let candidates = discover_local_candidates(&request)?;
-        Ok(DiscoveryLocalResponse { candidates })
-    })
+    tauri::async_runtime::spawn_blocking(move || discover_local_candidates(&request))
     .await
     .map_err(|error| format!("Local discovery task join error: {error}"))?
 }
@@ -2211,6 +2431,25 @@ async fn syncpeer_android_list_persisted_saf_uris(
 }
 
 #[tauri::command]
+async fn syncpeer_android_enable_multicast_lock(
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        app
+            .syncpeer_android()
+            .enable_multicast_lock()
+            .map_err(|error| format!("Could not enable multicast lock: {error}"))?;
+        return Ok(true);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(false)
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_get_android_saf_tree_uri(
     app: tauri::AppHandle,
 ) -> Result<Option<String>, String> {
@@ -2612,6 +2851,7 @@ pub fn run() {
             syncpeer_android_write_saf_file,
             syncpeer_android_pick_saf_directory,
             syncpeer_android_list_persisted_saf_uris,
+            syncpeer_android_enable_multicast_lock,
             syncpeer_get_android_saf_tree_uri,
             syncpeer_set_android_saf_tree_uri,
             syncpeer_list_cached_files,

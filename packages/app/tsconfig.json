@@ -1,10 +1,12 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "module": "NodeNext",
     "lib": ["DOM", "ES2022"],
     "types": ["svelte"],
     "allowJs": true,
     "allowImportingTsExtensions": true,
+    "noEmit": true,
     "baseUrl": "./",
     "paths": {
       "@syncpeer/*": ["../core/src/*"]

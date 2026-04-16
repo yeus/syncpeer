@@ -12,6 +12,10 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct SyncpeerAndroid<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> SyncpeerAndroid<R> {
+  pub fn enable_multicast_lock(&self) -> crate::Result<()> {
+    Err(crate::Error::UnsupportedPlatform("enable_multicast_lock".into()))
+  }
+
   pub fn open_with_chooser(
     &self,
     _path: &str,

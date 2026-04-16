@@ -15,6 +15,11 @@ export interface ConnectOptions {
   folderPasswords?: Record<string, string>;
 }
 
+export interface LocalDiscoveredDevice {
+  deviceId: string;
+  addresses: string[];
+}
+
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
   readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
@@ -128,6 +133,7 @@ export interface SyncpeerBrowserClient {
   connectAndSync: (options: ConnectOptions) => Promise<RemoteFsLike>;
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
+  discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<LocalDiscoveredDevice[]>;
   disconnect: () => Promise<void>;
   listFavorites: () => Promise<FavoriteRecord[]>;
   upsertFavorite: (favorite: FavoriteRecord) => Promise<FavoriteRecord[]>;
@@ -524,6 +530,32 @@ export const createSyncpeerBrowserClient = (
     ): Promise<FolderSyncState[]> => {
       const session = await getSessionForPolling(connectOptions);
       return Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []);
+    },
+    discoverLocalDevices: async (discoverOptions?: { timeoutMs?: number }) => {
+      if (!coreAdapter.discoverLocalCandidates) return [];
+      const candidates = await coreAdapter.discoverLocalCandidates({
+        expectedDeviceId: "",
+        timeoutMs: discoverOptions?.timeoutMs,
+      });
+      const devices = new Map<string, Set<string>>();
+      for (const candidate of candidates) {
+        const normalizedId = (candidate.deviceId ?? "")
+          .replace(/[^A-Z2-7]/gi, "")
+          .toUpperCase();
+        if (!normalizedId) continue;
+        if (!devices.has(normalizedId)) {
+          devices.set(normalizedId, new Set<string>());
+        }
+        if (candidate.address.trim()) {
+          devices.get(normalizedId)?.add(candidate.address.trim());
+        }
+      }
+      return [...devices.entries()]
+        .map(([deviceId, addresses]) => ({
+          deviceId,
+          addresses: [...addresses].sort(),
+        }))
+        .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
     },
     disconnect: async (): Promise<void> => {
       await closeActiveSession();

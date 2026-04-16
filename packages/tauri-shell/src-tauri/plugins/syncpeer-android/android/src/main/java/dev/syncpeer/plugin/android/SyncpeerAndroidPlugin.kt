@@ -3,8 +3,10 @@ package dev.syncpeer.plugin.android
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.webkit.MimeTypeMap
 import android.app.Activity
+import android.content.Context
 import androidx.activity.result.ActivityResult
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
@@ -40,6 +42,32 @@ class SafPathArgs {
 
 @TauriPlugin
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
+  private var multicastLock: WifiManager.MulticastLock? = null
+
+  @Command
+  fun enableMulticastLock(invoke: Invoke) {
+    try {
+      val wifiManager =
+        activity.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+      if (wifiManager == null) {
+        invoke.reject("WifiManager is unavailable.")
+        return
+      }
+      val lock =
+        multicastLock
+          ?: wifiManager.createMulticastLock("${activity.packageName}:syncpeer-lan").apply {
+            setReferenceCounted(false)
+          }
+      if (!lock.isHeld) {
+        lock.acquire()
+      }
+      multicastLock = lock
+      invoke.resolveObject(mapOf("enabled" to true))
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not enable multicast lock.")
+    }
+  }
+
   @Command
   fun openWithChooser(invoke: Invoke) {
     try {

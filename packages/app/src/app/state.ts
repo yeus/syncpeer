@@ -217,6 +217,16 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       folderSignatureChangedAtMs: 0,
       lastRecoveryReconnectAtMs: 0,
       isRecoveringFolderSync: false,
+      isSyncingStarredFiles: false,
+      starredFileSyncState: {} as Record<
+        string,
+        {
+          lastLocalHash: string;
+          lastRemoteModifiedMs: number;
+          lastSyncAtMs: number;
+          lastDirection: "upload" | "download" | "baseline";
+        }
+      >,
     },
     logs: {
       nextId: 1,

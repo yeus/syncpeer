@@ -342,6 +342,23 @@ const formatRateSafe = (bytesPerSecond: number) => {
   }
 };
 
+const splitPath = (value: string) => {
+  const normalized = normalizePath(value);
+  if (!normalized) return { parent: "", name: "" };
+  const parts = normalized.split("/");
+  return {
+    parent: normalizePath(parts.slice(0, -1).join("/")),
+    name: parts[parts.length - 1] ?? "",
+  };
+};
+
+const digestBytesHex = async (bytes: Uint8Array): Promise<string> => {
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+};
+
 const copyText = async (text: string) => {
   if (!text.trim()) throw new Error("Nothing to copy.");
   if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
@@ -742,6 +759,7 @@ export const createAppActions = (args: {
   const refreshActiveView = async () => {
     await refreshOverview();
     await recoverFolderSyncByReconnect();
+    await syncStarredFiles();
   };
 
   const hydrate = async () => {
@@ -760,6 +778,190 @@ export const createAppActions = (args: {
       }
     } catch (error) {
       reportActionError(state, "hydrate_state.failed", error);
+    }
+  };
+
+  const syncStarredFiles = async () => {
+    if (state.sync.isSyncingStarredFiles) return;
+    if (!state.ui.isAppVisible) return;
+    if (!state.session.isConnected || !state.session.remoteFs) return;
+    if (
+      state.session.isConnecting ||
+      state.session.isRefreshing ||
+      state.session.isLoadingDirectory
+    ) {
+      return;
+    }
+    const starredFiles = state.favorites.items.filter((item) => item.kind === "file");
+    if (starredFiles.length === 0) return;
+
+    state.sync.isSyncingStarredFiles = true;
+    const startedAtMs = Date.now();
+    let uploaded = 0;
+    let downloaded = 0;
+    let conflicts = 0;
+
+    try {
+      const remoteFs = state.session.remoteFs;
+      const cachedFiles = await client.listCachedFiles();
+      const cachedByKey = new Map(cachedFiles.map((item) => [item.key, item]));
+      const dirCache = new Map<string, import("@syncpeer/core/browser").FileEntry[]>();
+
+      for (const favorite of starredFiles) {
+        const targetPath = normalizePath(favorite.path);
+        if (!targetPath) continue;
+        const { parent, name } = splitPath(targetPath);
+        if (!name) continue;
+        const dirKey = `${favorite.folderId}::${parent}`;
+        if (!dirCache.has(dirKey)) {
+          dirCache.set(dirKey, await remoteFs.readDir(favorite.folderId, parent));
+        }
+        const remoteEntry = dirCache
+          .get(dirKey)
+          ?.find((entry) => entry.type === "file" && normalizePath(entry.path) === targetPath);
+        if (!remoteEntry) continue;
+
+        const key = cachedFileKey(favorite.folderId, targetPath);
+        const cached = cachedByKey.get(key);
+
+        if (!cached) {
+          const bytes = await remoteFs.readFileFully(favorite.folderId, targetPath);
+          await client.cacheFile(
+            favorite.folderId,
+            targetPath,
+            favorite.name,
+            bytes,
+            remoteEntry.modifiedMs || Date.now(),
+          );
+          state.sync.starredFileSyncState[key] = {
+            lastLocalHash: await digestBytesHex(bytes),
+            lastRemoteModifiedMs: remoteEntry.modifiedMs || Date.now(),
+            lastSyncAtMs: Date.now(),
+            lastDirection: "download",
+          };
+          downloaded += 1;
+          continue;
+        }
+
+        let localBytes: Uint8Array | null = null;
+        if (cached.localPath) {
+          try {
+            localBytes = await client.readBinaryFile(cached.localPath);
+          } catch {
+            localBytes = null;
+          }
+        }
+        const remoteModifiedMs = remoteEntry.modifiedMs || 0;
+        const previous = state.sync.starredFileSyncState[key];
+
+        if (!previous) {
+          const baselineHash = localBytes ? await digestBytesHex(localBytes) : "";
+          state.sync.starredFileSyncState[key] = {
+            lastLocalHash: baselineHash,
+            lastRemoteModifiedMs: remoteModifiedMs,
+            lastSyncAtMs: Date.now(),
+            lastDirection: "baseline",
+          };
+          continue;
+        }
+
+        const localHash = localBytes ? await digestBytesHex(localBytes) : previous.lastLocalHash;
+        const localChanged = Boolean(localBytes) && localHash !== previous.lastLocalHash;
+        const remoteChanged = remoteModifiedMs > previous.lastRemoteModifiedMs;
+
+        if (remoteChanged && !localChanged) {
+          const bytes = await remoteFs.readFileFully(favorite.folderId, targetPath);
+          await client.cacheFile(
+            favorite.folderId,
+            targetPath,
+            favorite.name,
+            bytes,
+            remoteModifiedMs || Date.now(),
+          );
+          state.sync.starredFileSyncState[key] = {
+            lastLocalHash: await digestBytesHex(bytes),
+            lastRemoteModifiedMs: remoteModifiedMs || Date.now(),
+            lastSyncAtMs: Date.now(),
+            lastDirection: "download",
+          };
+          downloaded += 1;
+          continue;
+        }
+
+        if (localChanged && !remoteChanged && localBytes) {
+          const uploadModifiedMs = Date.now();
+          await remoteFs.writeFileFully(
+            favorite.folderId,
+            targetPath,
+            localBytes,
+            { modifiedMs: uploadModifiedMs },
+          );
+          await client.cacheFile(
+            favorite.folderId,
+            targetPath,
+            favorite.name,
+            localBytes,
+            uploadModifiedMs,
+          );
+          state.sync.starredFileSyncState[key] = {
+            lastLocalHash: localHash,
+            lastRemoteModifiedMs: uploadModifiedMs,
+            lastSyncAtMs: Date.now(),
+            lastDirection: "upload",
+          };
+          uploaded += 1;
+          continue;
+        }
+
+        if (localChanged && remoteChanged) {
+          const bytes = await remoteFs.readFileFully(favorite.folderId, targetPath);
+          await client.cacheFile(
+            favorite.folderId,
+            targetPath,
+            favorite.name,
+            bytes,
+            remoteModifiedMs || Date.now(),
+          );
+          state.sync.starredFileSyncState[key] = {
+            lastLocalHash: await digestBytesHex(bytes),
+            lastRemoteModifiedMs: remoteModifiedMs || Date.now(),
+            lastSyncAtMs: Date.now(),
+            lastDirection: "download",
+          };
+          conflicts += 1;
+          downloaded += 1;
+          continue;
+        }
+
+        state.sync.starredFileSyncState[key] = {
+          ...previous,
+          lastLocalHash: localHash,
+          lastRemoteModifiedMs: Math.max(previous.lastRemoteModifiedMs, remoteModifiedMs),
+          lastSyncAtMs: previous.lastSyncAtMs,
+        };
+      }
+
+      if (uploaded > 0 || downloaded > 0 || conflicts > 0) {
+        pushSessionLog(
+          state,
+          "info",
+          "starred.sync.complete",
+          `Starred sync finished: uploaded=${uploaded}, downloaded=${downloaded}, conflicts=${conflicts}.`,
+          {
+            uploaded,
+            downloaded,
+            conflicts,
+            durationMs: elapsedMsSince(startedAtMs),
+            fileCount: starredFiles.length,
+          },
+        );
+      }
+    } catch (error) {
+      reportActionError(state, "starred.sync.failed", error, {
+        durationMs: elapsedMsSince(startedAtMs),
+      });
+    } finally {
+      state.sync.isSyncingStarredFiles = false;
     }
   };
 

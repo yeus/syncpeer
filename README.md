@@ -28,10 +28,7 @@ It is intentionally built in TypeScript to make protocol-level sync tooling more
 ## Releases
 
 - Releases page: <https://github.com/yeus/syncpeer/releases>
-- Always latest release: <https://github.com/yeus/syncpeer/releases/latest>
-- Always latest assets (known names):
-  - Android release APK: <https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-android-release-arm64-v8a.apk>
-  - Android debug APK: <https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-android-debug-arm64-v8a.apk>
+- Latest release page: <https://github.com/yeus/syncpeer/releases/latest>
 
 ## Quick start (users)
 

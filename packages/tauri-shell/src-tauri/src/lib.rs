@@ -1240,8 +1240,10 @@ fn discover_local_candidates_from_syncthing_cache(
                 last_error = Some(format!("{endpoint}: HTTP {}", response.status()));
                 continue;
             }
-            let payload: Value = response
-                .json()
+            let response_body = response
+                .text()
+                .map_err(|error| format!("{endpoint}: Could not read discovery response body: {error}"))?;
+            let payload: Value = serde_json::from_str(&response_body)
                 .map_err(|error| format!("{endpoint}: Invalid discovery JSON: {error}"))?;
             let Some(obj) = payload.as_object() else {
                 last_error = Some(format!("{endpoint}: Discovery response is not an object"));

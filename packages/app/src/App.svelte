@@ -328,6 +328,9 @@
           onOpenDirectory={actions.openDirectory}
           onSetDirectoryPage={actions.setDirectoryPage}
           onSetDirectoryPageSize={actions.setDirectoryPageSize}
+          onSetDirectoryViewMode={(mode) => {
+            app.ui.directoryViewMode = mode;
+          }}
           onOpenCachedDirectory={actions.openCachedDirectory}
           onOpenCachedFile={actions.openCachedFile}
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
@@ -348,6 +351,7 @@
           directoryPage={currentDirectoryPage}
           directoryTotalPages={currentDirectoryTotalPages}
           directoryPageSize={app.ui.directoryPageSize}
+          directoryViewMode={app.ui.directoryViewMode}
           {formatBytes}
           {formatModified}
           onHandleUploadClick={actions.handleUploadClick}

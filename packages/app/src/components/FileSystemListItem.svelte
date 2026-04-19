@@ -1,16 +1,20 @@
 <script lang="ts">
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import Download from "lucide-svelte/icons/download";
   import ExternalLink from "lucide-svelte/icons/external-link";
   import File from "lucide-svelte/icons/file";
   import FileArchive from "lucide-svelte/icons/file-archive";
   import FileAudio from "lucide-svelte/icons/file-audio";
+  import FileCode2 from "lucide-svelte/icons/file-code-2";
   import FileImage from "lucide-svelte/icons/file-image";
+  import FileJson from "lucide-svelte/icons/file-json";
+  import FileSpreadsheet from "lucide-svelte/icons/file-spreadsheet";
+  import FileSymlink from "lucide-svelte/icons/file-symlink";
   import FileText from "lucide-svelte/icons/file-text";
   import FileVideo from "lucide-svelte/icons/file-video";
   import Folder from "lucide-svelte/icons/folder";
   import KeyRound from "lucide-svelte/icons/key-round";
   import Star from "lucide-svelte/icons/star";
-  import StarOff from "lucide-svelte/icons/star-off";
   import Trash2 from "lucide-svelte/icons/trash-2";
   import Unlock from "lucide-svelte/icons/unlock";
   import ListRow from "./ListRow.svelte";
@@ -32,7 +36,7 @@
     hasCachedRoot: boolean;
   }
 
-export interface FolderEntryItem {
+  export interface FolderEntryItem {
     kind: "folder-entry";
     folderId: string;
     name: string;
@@ -41,26 +45,28 @@ export interface FolderEntryItem {
     sizeText: string;
     modifiedText: string;
     invalid: boolean;
-  isFavorite: boolean;
-  isCached: boolean;
-  downloadLabel: string;
-  isDownloadingActive: boolean;
-  downloadProgressText: string;
-}
+    isFavorite: boolean;
+    isCached: boolean;
+    thumbnailPath?: string | null;
+    downloadLabel: string;
+    isDownloadingActive: boolean;
+    downloadProgressText: string;
+  }
 
-export interface FavoriteItem {
+  export interface FavoriteItem {
     kind: "favorite";
     key: string;
     folderId: string;
     name: string;
     path: string;
     favoriteKind: "folder" | "file";
-  connected: boolean;
-  isCached: boolean;
-  downloadLabel: string;
-  isDownloadingActive: boolean;
-  downloadProgressText: string;
-}
+    connected: boolean;
+    isCached: boolean;
+    thumbnailPath?: string | null;
+    downloadLabel: string;
+    isDownloadingActive: boolean;
+    downloadProgressText: string;
+  }
 
   export interface CachedFileItem {
     kind: "cached-file";
@@ -70,6 +76,7 @@ export interface FavoriteItem {
     path: string;
     sizeText: string;
     cachedAtText: string;
+    thumbnailPath?: string | null;
   }
 
   export type FileSystemItem =
@@ -84,6 +91,7 @@ export interface FavoriteItem {
     isRemovingCachedFile: boolean;
     isClearingCache: boolean;
     isDownloading: boolean;
+    viewMode?: "list" | "grid";
     onOpenFolderRoot?: (folderId: string) => void;
     onOpenDirectory?: (folderId: string, path: string) => void;
     onOpenFavorite?: (favorite: { folderId: string; path: string; kind: "folder" | "file" }) => void;
@@ -107,6 +115,7 @@ export interface FavoriteItem {
     isRemovingCachedFile,
     isClearingCache,
     isDownloading,
+    viewMode = "list",
     onOpenFolderRoot = () => {},
     onOpenDirectory = () => {},
     onOpenFavorite = () => {},
@@ -211,6 +220,41 @@ export interface FavoriteItem {
     if (["zip", "tar", "gz", "bz2", "xz", "7z", "rar"].includes(ext)) {
       return "archive";
     }
+    if (["json", "jsonc", "geojson"].includes(ext)) {
+      return "json";
+    }
+    if (
+      [
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "mjs",
+        "cjs",
+        "py",
+        "rb",
+        "go",
+        "rs",
+        "java",
+        "c",
+        "h",
+        "cpp",
+        "hpp",
+        "cs",
+        "swift",
+        "kt",
+        "kts",
+        "php",
+        "sh",
+        "bash",
+        "zsh",
+      ].includes(ext)
+    ) {
+      return "code";
+    }
+    if (["csv", "tsv", "xls", "xlsx", "ods"].includes(ext)) {
+      return "spreadsheet";
+    }
     if (["txt", "md", "pdf", "rtf", "doc", "docx"].includes(ext)) {
       return "text";
     }
@@ -221,6 +265,7 @@ export interface FavoriteItem {
     if (value.kind === "root-folder") return "folder";
     if (value.kind === "folder-entry") {
       if (value.entryType === "directory") return "folder";
+      if (value.entryType === "symlink") return "symlink";
       return fileIconKind(value.name, value.path);
     }
     if (value.kind === "favorite") {
@@ -229,6 +274,20 @@ export interface FavoriteItem {
     }
     return fileIconKind(value.name, value.path);
   };
+
+  const localPathForThumbnail = (value: FileSystemItem) => {
+    if (value.kind === "root-folder") return null;
+    const thumbnailPath = value.thumbnailPath?.trim();
+    if (!thumbnailPath) return null;
+    try {
+      return convertFileSrc(thumbnailPath);
+    } catch {
+      return null;
+    }
+  };
+
+  const thumbnailSrc = (value: FileSystemItem) =>
+    leadingKind(value) === "image" ? localPathForThumbnail(value) : null;
 </script>
 
 <ListRow>
@@ -246,17 +305,30 @@ export interface FavoriteItem {
       }}
     >
       <div class="item-title-row">
-      <span class="item-icon" aria-hidden="true">
+      <span class={`item-icon ${viewMode === "grid" ? "item-icon-grid" : ""}`} aria-hidden="true">
         {#if leadingKind(item) === "folder"}
           <Folder size={16} />
+        {:else if leadingKind(item) === "symlink"}
+          <FileSymlink size={16} />
         {:else if leadingKind(item) === "image"}
-          <FileImage size={16} />
+          {@const imageSrc = thumbnailSrc(item)}
+          {#if imageSrc}
+            <img class="item-thumbnail" src={imageSrc} alt="" loading="lazy" />
+          {:else}
+            <FileImage size={16} />
+          {/if}
         {:else if leadingKind(item) === "audio"}
           <FileAudio size={16} />
         {:else if leadingKind(item) === "video"}
           <FileVideo size={16} />
         {:else if leadingKind(item) === "archive"}
           <FileArchive size={16} />
+        {:else if leadingKind(item) === "json"}
+          <FileJson size={16} />
+        {:else if leadingKind(item) === "code"}
+          <FileCode2 size={16} />
+        {:else if leadingKind(item) === "spreadsheet"}
+          <FileSpreadsheet size={16} />
         {:else if leadingKind(item) === "text"}
           <FileText size={16} />
         {:else}
@@ -316,17 +388,30 @@ export interface FavoriteItem {
   {:else}
     <div class="item-main-hit">
     <div class="item-title-row">
-    <span class="item-icon" aria-hidden="true">
+    <span class={`item-icon ${viewMode === "grid" ? "item-icon-grid" : ""}`} aria-hidden="true">
       {#if leadingKind(item) === "folder"}
         <Folder size={16} />
+      {:else if leadingKind(item) === "symlink"}
+        <FileSymlink size={16} />
       {:else if leadingKind(item) === "image"}
-        <FileImage size={16} />
+        {@const imageSrc = thumbnailSrc(item)}
+        {#if imageSrc}
+          <img class="item-thumbnail" src={imageSrc} alt="" loading="lazy" />
+        {:else}
+          <FileImage size={16} />
+        {/if}
       {:else if leadingKind(item) === "audio"}
         <FileAudio size={16} />
       {:else if leadingKind(item) === "video"}
         <FileVideo size={16} />
       {:else if leadingKind(item) === "archive"}
         <FileArchive size={16} />
+      {:else if leadingKind(item) === "json"}
+        <FileJson size={16} />
+      {:else if leadingKind(item) === "code"}
+        <FileCode2 size={16} />
+      {:else if leadingKind(item) === "spreadsheet"}
+        <FileSpreadsheet size={16} />
       {:else if leadingKind(item) === "text"}
         <FileText size={16} />
       {:else}
@@ -425,9 +510,9 @@ export interface FavoriteItem {
         aria-label="Toggle favorite"
       >
         {#if item.isFavorite}
-          <Star size={16} />
+          <Star size={16} class="favorite-star-on" fill="currentColor" />
         {:else}
-          <StarOff size={16} />
+          <Star size={16} class="favorite-star-off" />
         {/if}
       </button>
     {:else if item.kind === "folder-entry"}
@@ -465,9 +550,9 @@ export interface FavoriteItem {
         aria-label="Toggle favorite"
       >
         {#if item.isFavorite}
-          <Star size={16} />
+          <Star size={16} class="favorite-star-on" fill="currentColor" />
         {:else}
-          <StarOff size={16} />
+          <Star size={16} class="favorite-star-off" />
         {/if}
       </button>
     {:else if item.kind === "favorite"}
@@ -494,7 +579,7 @@ export interface FavoriteItem {
           })}
         aria-label="Remove favorite"
       >
-        <Star size={16} />
+        <Star size={16} class="favorite-star-on" fill="currentColor" />
       </button>
     {:else if item.kind === "cached-file"}
       <button
@@ -546,8 +631,26 @@ export interface FavoriteItem {
   .item-icon {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     color: var(--text-muted);
     flex: 0 0 auto;
+    width: 1.15rem;
+    height: 1.15rem;
+  }
+
+  .item-icon-grid {
+    width: 2.3rem;
+    height: 2.3rem;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-xs);
+    background: var(--bg-surface-soft);
+  }
+
+  .item-thumbnail {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: calc(var(--radius-xs) - 1px);
   }
 
   .inline-input {
@@ -589,5 +692,14 @@ export interface FavoriteItem {
 
   .row-action:focus-visible {
     box-shadow: var(--focus-ring);
+  }
+
+  .favorite-star-off {
+    color: var(--text-muted);
+    fill: transparent;
+  }
+
+  .favorite-star-on {
+    color: var(--state-star);
   }
 </style>

@@ -1,4 +1,7 @@
 <script lang="ts">
+  import LayoutGrid from "lucide-svelte/icons/layout-grid";
+  import List from "lucide-svelte/icons/list";
+  import FolderOpen from "lucide-svelte/icons/folder-open";
   import type { FolderEntryItem, RootFolderItem } from "./FileSystemListItem.svelte";
   import Breadcrumbs from "./Breadcrumbs.svelte";
   import FileSystemListItem from "./FileSystemListItem.svelte";
@@ -16,6 +19,7 @@
     onOpenDirectory: (path: string) => void;
     onSetDirectoryPage: (page: number) => void;
     onSetDirectoryPageSize: (size: number) => void;
+    onSetDirectoryViewMode: (mode: "list" | "grid") => void;
     onOpenCachedDirectory: (folderId: string, path: string) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
@@ -36,6 +40,7 @@
     directoryPage: number;
     directoryTotalPages: number;
     directoryPageSize: number;
+    directoryViewMode: "list" | "grid";
     formatBytes: (value: number) => string;
     formatModified: (value: number) => string;
     onHandleUploadClick: () => void;
@@ -53,6 +58,7 @@
     onOpenDirectory,
     onSetDirectoryPage,
     onSetDirectoryPageSize,
+    onSetDirectoryViewMode,
     onOpenCachedDirectory,
     onOpenCachedFile,
     onOpenCachedFileDirectory,
@@ -73,11 +79,44 @@
     directoryPage,
     directoryTotalPages,
     directoryPageSize,
+    directoryViewMode,
     formatBytes,
     formatModified,
     onHandleUploadClick,
     onHandleUploadSelected,
   }: Props = $props();
+
+  const hasCachedDirectory = (
+    cachedFileKeys: Set<string>,
+    folderId: string,
+    path: string,
+  ) => {
+    const normalizedPath = path.trim();
+    const exactKey = `${folderId}:${normalizedPath}`;
+    if (cachedFileKeys.has(exactKey)) return true;
+    if (!normalizedPath) {
+      if (cachedFileKeys.has(`${folderId}:`)) return true;
+      for (const key of cachedFileKeys) {
+        if (key.startsWith(`${folderId}:`)) return true;
+      }
+      return false;
+    }
+    const prefix = `${folderId}:${normalizedPath}/`;
+    for (const key of cachedFileKeys) {
+      if (key.startsWith(prefix)) return true;
+    }
+    return false;
+  };
+
+  const cachedLocalPathByKey = (files: any[]) =>
+    new Map(
+      files
+        .filter((file) => typeof file.localPath === "string" && file.localPath.trim() !== "")
+        .map((file) => [`${file.folderId}:${file.path}`, file.localPath] as const),
+    );
+  let downloadedLocalPaths = $derived.by(() =>
+    cachedLocalPathByKey(app.favorites.downloadedFiles),
+  );
 
   let rootRows = $derived.by(() =>
     rootFolders.map(
@@ -114,6 +153,7 @@
           `${entry.type === "directory" ? "folder" : "file"}:${app.session.currentFolderId}:${entry.path}`,
         ),
         isCached: app.favorites.cachedFileKeys.has(`${app.session.currentFolderId}:${entry.path}`),
+        thumbnailPath: downloadedLocalPaths.get(`${app.session.currentFolderId}:${entry.path}`) ?? null,
         downloadLabel: downloadButtonLabel(app.session.currentFolderId, entry.path),
         isDownloadingActive:
           app.favorites.activeDownloadKey ===
@@ -131,6 +171,15 @@
     if (folderId !== app.session.currentFolderId) return;
     onOpenDirectory(path);
   };
+
+  let canOpenCurrentDirectoryLocally = $derived.by(() => {
+    if (!app.session.currentFolderId) return false;
+    return hasCachedDirectory(
+      app.favorites.cachedFileKeys,
+      app.session.currentFolderId,
+      app.session.currentPath,
+    );
+  });
 </script>
 
 <Panel title="Folders">
@@ -160,6 +209,35 @@
         <button class="primary" onclick={onHandleUploadClick}>
           Upload
         </button>
+        <button
+          class="ghost"
+          onclick={() => onOpenCachedDirectory(app.session.currentFolderId, app.session.currentPath)}
+          disabled={!canOpenCurrentDirectoryLocally || app.favorites.isOpeningCachedFile}
+          title="Open current directory from local cache"
+        >
+          <FolderOpen size={16} />
+          Open Local
+        </button>
+        <div class="view-toggle" role="group" aria-label="Directory view mode">
+          <button
+            class={`ghost compact-toggle ${directoryViewMode === "list" ? "active" : ""}`}
+            onclick={() => onSetDirectoryViewMode("list")}
+            aria-pressed={directoryViewMode === "list"}
+            title="List view"
+          >
+            <List size={15} />
+            List
+          </button>
+          <button
+            class={`ghost compact-toggle ${directoryViewMode === "grid" ? "active" : ""}`}
+            onclick={() => onSetDirectoryViewMode("grid")}
+            aria-pressed={directoryViewMode === "grid"}
+            title="Grid view"
+          >
+            <LayoutGrid size={15} />
+            Grid
+          </button>
+        </div>
       </div>
       {#if app.ui.uploadProgressActive}
         <div class="upload-progress-wrap">
@@ -199,7 +277,7 @@
         {/if}
       </ul>
     {:else}
-      <ul class="list">
+      <ul class={`list ${directoryViewMode === "grid" ? "list-grid" : ""}`}>
         {#if isFolderLocked(app.session.currentFolderId)}
           <li class="empty">
             This receive-encrypted folder is locked. Use the unlock button in the folder list to browse or download files.
@@ -223,6 +301,7 @@
               onOpenOrDownloadFile={onOpenOrDownloadFile}
               onDownloadFile={onDownloadFile}
               onToggleFavorite={onToggleFavorite}
+              viewMode={directoryViewMode}
             />
           {/each}
         {/if}
@@ -285,6 +364,40 @@
     margin-top: 0.45rem;
     align-items: center;
     flex-wrap: wrap;
+  }
+
+  .view-toggle {
+    display: inline-flex;
+    gap: 0.35rem;
+    margin-left: auto;
+  }
+
+  .compact-toggle {
+    min-height: 2rem;
+    padding: 0.35rem 0.6rem;
+    gap: 0.3rem;
+  }
+
+  .compact-toggle.active {
+    background: var(--color-primary-soft);
+    border-color: var(--border-accent);
+    color: var(--color-primary-strong);
+  }
+
+  .list-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+    gap: 0.45rem;
+    border: none;
+    background: transparent;
+    overflow: visible;
+  }
+
+  .list-grid :global(.list-item) {
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    padding: 0.5rem;
   }
 
   label {

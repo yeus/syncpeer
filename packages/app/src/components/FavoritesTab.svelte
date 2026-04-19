@@ -42,6 +42,16 @@
       : "Download";
   };
 
+  const cachedLocalPathByKey = (files: any[]) =>
+    new Map(
+      files
+        .filter((file) => typeof file.localPath === "string" && file.localPath.trim() !== "")
+        .map((file) => [`${file.folderId}:${file.path}`, file.localPath] as const),
+    );
+  let downloadedLocalPaths = $derived.by(() =>
+    cachedLocalPathByKey(app.favorites.downloadedFiles),
+  );
+
   let favoriteRows = $derived.by(() =>
     app.favorites.items.map(
       (favorite: any): FavoriteItem => ({
@@ -53,6 +63,7 @@
         favoriteKind: favorite.kind,
         connected: app.session.isConnected,
         isCached: app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`),
+        thumbnailPath: downloadedLocalPaths.get(`${favorite.folderId}:${favorite.path}`) ?? null,
         downloadLabel: downloadLabel(favorite.folderId, favorite.path),
         isDownloadingActive:
           app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`,
@@ -74,6 +85,7 @@
         path: file.path,
         sizeText: formatBytes(file.sizeBytes),
         cachedAtText: formatModified(file.cachedAtMs),
+        thumbnailPath: file.localPath ?? null,
       }),
     ),
   );

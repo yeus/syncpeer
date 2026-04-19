@@ -53,10 +53,14 @@
             (pkgs.lib.getOutput "out" glib)
             (pkgs.lib.getOutput "bin" glib)
             gsettings-desktop-schemas
+            adwaita-icon-theme
+            hicolor-icon-theme
             cairo
             pango
             gdk-pixbuf
+            librsvg
             atk
+            libdecor
             xdg-utils
           ];
           runScript = "bash";
@@ -88,7 +92,7 @@ exec ${pkgs.pkgconf}/bin/pkgconf "''$@"
 EOF
           chmod +x "$shim_dir/pkgconf"
           ln -sf "$shim_dir/pkgconf" "$shim_dir/pkg-config"
-          exec ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$tmp_dir/cargo-target\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -lc 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] tauri=\$(command -v tauri || true)\"; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build -w @syncpeer/tauri-shell -- --verbose'"
+          exec ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$tmp_dir/cargo-target\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share\" WINIT_WAYLAND_CSD_THEME=light LIBDECOR_PLUGIN_DIR=\"${pkgs.libdecor}/lib/libdecor/plugins-1\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -lc 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] tauri=\$(command -v tauri || true)\"; echo \"[appimage-debug] WINIT_WAYLAND_CSD_THEME=\$WINIT_WAYLAND_CSD_THEME\"; echo \"[appimage-debug] LIBDECOR_PLUGIN_DIR=\$LIBDECOR_PLUGIN_DIR\"; gdk_cache=\"/tmp/syncpeer-appimage-gdk-pixbuf-loaders.cache\"; ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so > \"\$gdk_cache\" 2>/dev/null || true; if [ -s \"\$gdk_cache\" ]; then export GDK_PIXBUF_MODULE_FILE=\"\$gdk_cache\"; fi; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build -w @syncpeer/tauri-shell -- --verbose'"
         '';
       in
       {
@@ -110,11 +114,15 @@ EOF
             libsoup_3
             glib
             gsettings-desktop-schemas
+            adwaita-icon-theme
+            hicolor-icon-theme
             dconf
             cairo
             pango
             gdk-pixbuf
+            librsvg
             atk
+            libdecor
             xdg-utils
 
             jdk
@@ -131,7 +139,17 @@ EOF
 
           shellHook = ''
             export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
-            export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.glib}/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+            export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.glib}/share:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+            export WINIT_WAYLAND_CSD_THEME=light
+            export LIBDECOR_PLUGIN_DIR="${pkgs.libdecor}/lib/libdecor/plugins-1"
+            gdk_cache="/tmp/syncpeer-gdk-pixbuf-loaders.cache"
+            ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders \
+              ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+              ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+              > "$gdk_cache" 2>/dev/null || true
+            if [ -s "$gdk_cache" ]; then
+              export GDK_PIXBUF_MODULE_FILE="$gdk_cache"
+            fi
             gtk_schema_dir="$(echo ${pkgs.gtk3}/share/gsettings-schemas/*/glib-2.0/schemas | head -n1)"
             if [ -d "$gtk_schema_dir" ] && [ -f "$gtk_schema_dir/gschemas.compiled" ]; then
               export GSETTINGS_SCHEMA_DIR="$gtk_schema_dir"

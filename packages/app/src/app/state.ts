@@ -63,6 +63,7 @@ export const loadPersistedState = () => {
     folderPasswords?: Record<string, string>;
     offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
     directoryPageSize?: number;
+    directoryViewMode?: "list" | "grid";
   }>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
 };
 
@@ -74,6 +75,9 @@ const normalizeDirectoryPageSize = (value: unknown) => {
     Math.max(MIN_DIRECTORY_PAGE_SIZE, Math.floor(numeric)),
   );
 };
+
+const normalizeDirectoryViewMode = (value: unknown): "list" | "grid" =>
+  value === "grid" ? "grid" : "list";
 
 export const persistState = (state: AppState) => {
   if (typeof window === "undefined") return;
@@ -88,6 +92,7 @@ export const persistState = (state: AppState) => {
       folderPasswords: state.passwords.saved,
       offlineFolderSnapshots: state.offline.snapshots,
       directoryPageSize: state.ui.directoryPageSize,
+      directoryViewMode: state.ui.directoryViewMode,
     }),
   );
 };
@@ -210,6 +215,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       recentError: null as string | null,
       lastLoggedError: "",
       directoryPageSize: normalizeDirectoryPageSize(persisted?.directoryPageSize),
+      directoryViewMode: normalizeDirectoryViewMode(persisted?.directoryViewMode),
     },
     sync: {
       lastOverviewAtMs: 0,

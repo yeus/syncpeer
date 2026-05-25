@@ -384,6 +384,18 @@ export const createTauriAdapters = (
       }),
     listAndroidPersistedSafUris: async (): Promise<string[]> =>
       invokeWithLogging<string[]>("syncpeer_android_list_persisted_saf_uris"),
+    listAndroidContacts: async () =>
+      invokeWithLogging("syncpeer_android_list_contacts"),
+    upsertAndroidContact: async (input) =>
+      invokeWithLogging("syncpeer_android_upsert_contact", { request: input }),
+    deleteAndroidContact: async (contactId: string) =>
+      invokeWithLogging("syncpeer_android_delete_contact", { request: { contactId } }),
+    listAndroidCalendarEvents: async (args) =>
+      invokeWithLogging("syncpeer_android_list_calendar_events", { request: args ?? {} }),
+    upsertAndroidCalendarEvent: async (input) =>
+      invokeWithLogging("syncpeer_android_upsert_calendar_event", { request: input }),
+    deleteAndroidCalendarEvent: async (eventId: string) =>
+      invokeWithLogging("syncpeer_android_delete_calendar_event", { request: { eventId } }),
     exportIdentityRecovery: async (): Promise<IdentityRecoveryExportResponse> =>
       invokeWithLogging<IdentityRecoveryExportResponse>("syncpeer_export_identity_recovery"),
     restoreIdentityRecovery: async (recoverySecret: string): Promise<void> => {

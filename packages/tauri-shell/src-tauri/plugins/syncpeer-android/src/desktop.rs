@@ -63,4 +63,52 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       "list_persisted_saf_tree_uris".into(),
     ))
   }
+
+  pub fn list_contacts(&self) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform("list_contacts".into()))
+  }
+
+  pub fn upsert_contact(
+    &self,
+    _contact_id: Option<&str>,
+    _display_name: &str,
+    _note: Option<&str>,
+    _phones: &[String],
+    _emails: &[String],
+  ) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform("upsert_contact".into()))
+  }
+
+  pub fn delete_contact(&self, _contact_id: &str) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform("delete_contact".into()))
+  }
+
+  pub fn list_calendar_events(
+    &self,
+    _start_ms: Option<i64>,
+    _end_ms: Option<i64>,
+  ) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform("list_calendar_events".into()))
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub fn upsert_calendar_event(
+    &self,
+    _event_id: Option<&str>,
+    _calendar_id: Option<&str>,
+    _title: &str,
+    _description: Option<&str>,
+    _location: Option<&str>,
+    _start_ms: i64,
+    _end_ms: i64,
+    _all_day: bool,
+  ) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform(
+      "upsert_calendar_event".into(),
+    ))
+  }
+
+  pub fn delete_calendar_event(&self, _event_id: &str) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform("delete_calendar_event".into()))
+  }
 }

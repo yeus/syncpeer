@@ -90,6 +90,25 @@ export interface CachedFileRecord {
   modifiedMs?: number;
 }
 
+export interface AndroidContactRecord {
+  contactId: string;
+  displayName: string;
+  lookupKey: string;
+  phones: string[];
+  emails: string[];
+}
+
+export interface AndroidCalendarEventRecord {
+  eventId: string;
+  calendarId: string;
+  title: string;
+  description?: string | null;
+  location?: string | null;
+  startMs: number;
+  endMs: number;
+  allDay: boolean;
+}
+
 export interface SyncpeerPlatformAdapter {
   readTextFile?: (path: string) => Promise<string>;
   readBinaryFile?: (path: string) => Promise<Uint8Array>;
@@ -116,6 +135,30 @@ export interface SyncpeerPlatformAdapter {
   pickAndroidSafDirectory?: () => Promise<string>;
   setAndroidSafTreeUri?: (treeUri?: string | null) => Promise<string | null>;
   listAndroidPersistedSafUris?: () => Promise<string[]>;
+  listAndroidContacts?: () => Promise<AndroidContactRecord[]>;
+  upsertAndroidContact?: (input: {
+    contactId?: string | null;
+    displayName: string;
+    note?: string | null;
+    phones: string[];
+    emails: string[];
+  }) => Promise<{ contactId: string }>;
+  deleteAndroidContact?: (contactId: string) => Promise<{ deleted: boolean }>;
+  listAndroidCalendarEvents?: (args?: {
+    startMs?: number | null;
+    endMs?: number | null;
+  }) => Promise<AndroidCalendarEventRecord[]>;
+  upsertAndroidCalendarEvent?: (input: {
+    eventId?: string | null;
+    calendarId?: string | null;
+    title: string;
+    description?: string | null;
+    location?: string | null;
+    startMs: number;
+    endMs: number;
+    allDay: boolean;
+  }) => Promise<{ eventId: string }>;
+  deleteAndroidCalendarEvent?: (eventId: string) => Promise<{ deleted: boolean }>;
   exportIdentityRecovery?: () => Promise<IdentityRecoveryExportResponse>;
   restoreIdentityRecovery?: (recoverySecret: string) => Promise<void>;
   getDefaultDeviceId?: () => Promise<string>;
@@ -156,6 +199,30 @@ export interface SyncpeerBrowserClient {
   pickAndroidSafDirectory: () => Promise<string>;
   setAndroidSafTreeUri: (treeUri?: string | null) => Promise<string | null>;
   listAndroidPersistedSafUris: () => Promise<string[]>;
+  listAndroidContacts: () => Promise<AndroidContactRecord[]>;
+  upsertAndroidContact: (input: {
+    contactId?: string | null;
+    displayName: string;
+    note?: string | null;
+    phones: string[];
+    emails: string[];
+  }) => Promise<{ contactId: string }>;
+  deleteAndroidContact: (contactId: string) => Promise<{ deleted: boolean }>;
+  listAndroidCalendarEvents: (args?: {
+    startMs?: number | null;
+    endMs?: number | null;
+  }) => Promise<AndroidCalendarEventRecord[]>;
+  upsertAndroidCalendarEvent: (input: {
+    eventId?: string | null;
+    calendarId?: string | null;
+    title: string;
+    description?: string | null;
+    location?: string | null;
+    startMs: number;
+    endMs: number;
+    allDay: boolean;
+  }) => Promise<{ eventId: string }>;
+  deleteAndroidCalendarEvent: (eventId: string) => Promise<{ deleted: boolean }>;
   exportIdentityRecovery: () => Promise<IdentityRecoveryExportResponse>;
   restoreIdentityRecovery: (recoverySecret: string) => Promise<void>;
   getDefaultDeviceId: () => Promise<string>;
@@ -626,6 +693,30 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.listAndroidPersistedSafUris
         ? platformAdapter.listAndroidPersistedSafUris()
         : throwMissingAdapter("listAndroidPersistedSafUris"),
+    listAndroidContacts: async (): Promise<AndroidContactRecord[]> =>
+      platformAdapter.listAndroidContacts
+        ? platformAdapter.listAndroidContacts()
+        : throwMissingAdapter("listAndroidContacts"),
+    upsertAndroidContact: async (input): Promise<{ contactId: string }> =>
+      platformAdapter.upsertAndroidContact
+        ? platformAdapter.upsertAndroidContact(input)
+        : throwMissingAdapter("upsertAndroidContact"),
+    deleteAndroidContact: async (contactId: string): Promise<{ deleted: boolean }> =>
+      platformAdapter.deleteAndroidContact
+        ? platformAdapter.deleteAndroidContact(contactId)
+        : throwMissingAdapter("deleteAndroidContact"),
+    listAndroidCalendarEvents: async (args): Promise<AndroidCalendarEventRecord[]> =>
+      platformAdapter.listAndroidCalendarEvents
+        ? platformAdapter.listAndroidCalendarEvents(args)
+        : throwMissingAdapter("listAndroidCalendarEvents"),
+    upsertAndroidCalendarEvent: async (input): Promise<{ eventId: string }> =>
+      platformAdapter.upsertAndroidCalendarEvent
+        ? platformAdapter.upsertAndroidCalendarEvent(input)
+        : throwMissingAdapter("upsertAndroidCalendarEvent"),
+    deleteAndroidCalendarEvent: async (eventId: string): Promise<{ deleted: boolean }> =>
+      platformAdapter.deleteAndroidCalendarEvent
+        ? platformAdapter.deleteAndroidCalendarEvent(eventId)
+        : throwMissingAdapter("deleteAndroidCalendarEvent"),
     exportIdentityRecovery: async (): Promise<IdentityRecoveryExportResponse> =>
       platformAdapter.exportIdentityRecovery
         ? platformAdapter.exportIdentityRecovery()

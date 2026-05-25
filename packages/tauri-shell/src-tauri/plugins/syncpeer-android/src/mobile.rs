@@ -134,4 +134,95 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .run_mobile_plugin("listPersistedSafTreeUris", json!({}))
       .map_err(Into::into)
   }
+
+  pub fn list_contacts(&self) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>("listContacts", json!({}))
+      .map_err(Into::into)
+  }
+
+  pub fn upsert_contact(
+    &self,
+    contact_id: Option<&str>,
+    display_name: &str,
+    note: Option<&str>,
+    phones: &[String],
+    emails: &[String],
+  ) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin(
+        "upsertContact",
+        json!({
+          "contactId": contact_id,
+          "displayName": display_name,
+          "note": note,
+          "phones": phones,
+          "emails": emails
+        }),
+      )
+      .map_err(Into::into)
+  }
+
+  pub fn delete_contact(&self, contact_id: &str) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin("deleteContact", json!({ "contactId": contact_id }))
+      .map_err(Into::into)
+  }
+
+  pub fn list_calendar_events(
+    &self,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+  ) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin(
+        "listCalendarEvents",
+        json!({
+          "startMs": start_ms,
+          "endMs": end_ms
+        }),
+      )
+      .map_err(Into::into)
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub fn upsert_calendar_event(
+    &self,
+    event_id: Option<&str>,
+    calendar_id: Option<&str>,
+    title: &str,
+    description: Option<&str>,
+    location: Option<&str>,
+    start_ms: i64,
+    end_ms: i64,
+    all_day: bool,
+  ) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin(
+        "upsertCalendarEvent",
+        json!({
+          "eventId": event_id,
+          "calendarId": calendar_id,
+          "title": title,
+          "description": description,
+          "location": location,
+          "startMs": start_ms,
+          "endMs": end_ms,
+          "allDay": all_day
+        }),
+      )
+      .map_err(Into::into)
+  }
+
+  pub fn delete_calendar_event(&self, event_id: &str) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin("deleteCalendarEvent", json!({ "eventId": event_id }))
+      .map_err(Into::into)
+  }
 }

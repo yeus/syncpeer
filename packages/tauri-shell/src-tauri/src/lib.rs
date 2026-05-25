@@ -140,6 +140,89 @@ struct SetAndroidSafTreeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AndroidContactRecord {
+    contact_id: String,
+    display_name: String,
+    lookup_key: String,
+    phones: Vec<String>,
+    emails: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidContactUpsertRequest {
+    contact_id: Option<String>,
+    display_name: String,
+    note: Option<String>,
+    phones: Vec<String>,
+    emails: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidContactUpsertResponse {
+    contact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidContactDeleteRequest {
+    contact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidDeleteResponse {
+    deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidCalendarEventRecord {
+    event_id: String,
+    calendar_id: String,
+    title: String,
+    description: Option<String>,
+    location: Option<String>,
+    start_ms: i64,
+    end_ms: i64,
+    all_day: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidCalendarListRequest {
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidCalendarUpsertRequest {
+    event_id: Option<String>,
+    calendar_id: Option<String>,
+    title: String,
+    description: Option<String>,
+    location: Option<String>,
+    start_ms: i64,
+    end_ms: i64,
+    all_day: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidCalendarUpsertResponse {
+    event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidCalendarDeleteRequest {
+    event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoveCachedFileRequest {
     folder_id: String,
     path: String,
@@ -2433,6 +2516,165 @@ async fn syncpeer_android_list_persisted_saf_uris(
 }
 
 #[tauri::command]
+async fn syncpeer_android_list_contacts(
+    app: tauri::AppHandle,
+) -> Result<Vec<AndroidContactRecord>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let value = app
+            .syncpeer_android()
+            .list_contacts()
+            .map_err(|error| format!("Could not list contacts: {error}"))?;
+        return serde_json::from_value::<Vec<AndroidContactRecord>>(value)
+            .map_err(|error| format!("Could not parse contacts response: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_upsert_contact(
+    app: tauri::AppHandle,
+    request: AndroidContactUpsertRequest,
+) -> Result<AndroidContactUpsertResponse, String> {
+    #[cfg(target_os = "android")]
+    {
+        let display_name = request.display_name.trim();
+        if display_name.is_empty() {
+            return Err("displayName is required.".to_string());
+        }
+        let value = app
+            .syncpeer_android()
+            .upsert_contact(
+                request.contact_id.as_deref(),
+                display_name,
+                request.note.as_deref(),
+                &request.phones,
+                &request.emails,
+            )
+            .map_err(|error| format!("Could not upsert contact: {error}"))?;
+        return serde_json::from_value::<AndroidContactUpsertResponse>(value)
+            .map_err(|error| format!("Could not parse upsert contact response: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_delete_contact(
+    app: tauri::AppHandle,
+    request: AndroidContactDeleteRequest,
+) -> Result<AndroidDeleteResponse, String> {
+    #[cfg(target_os = "android")]
+    {
+        let contact_id = request.contact_id.trim();
+        if contact_id.is_empty() {
+            return Err("contactId is required.".to_string());
+        }
+        let value = app
+            .syncpeer_android()
+            .delete_contact(contact_id)
+            .map_err(|error| format!("Could not delete contact: {error}"))?;
+        return serde_json::from_value::<AndroidDeleteResponse>(value)
+            .map_err(|error| format!("Could not parse delete contact response: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_list_calendar_events(
+    app: tauri::AppHandle,
+    request: AndroidCalendarListRequest,
+) -> Result<Vec<AndroidCalendarEventRecord>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let value = app
+            .syncpeer_android()
+            .list_calendar_events(request.start_ms, request.end_ms)
+            .map_err(|error| format!("Could not list calendar events: {error}"))?;
+        return serde_json::from_value::<Vec<AndroidCalendarEventRecord>>(value)
+            .map_err(|error| format!("Could not parse list calendar events response: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_upsert_calendar_event(
+    app: tauri::AppHandle,
+    request: AndroidCalendarUpsertRequest,
+) -> Result<AndroidCalendarUpsertResponse, String> {
+    #[cfg(target_os = "android")]
+    {
+        let title = request.title.trim();
+        if title.is_empty() {
+            return Err("title is required.".to_string());
+        }
+        if request.start_ms <= 0 || request.end_ms <= 0 || request.end_ms < request.start_ms {
+            return Err("startMs/endMs are invalid.".to_string());
+        }
+        let value = app
+            .syncpeer_android()
+            .upsert_calendar_event(
+                request.event_id.as_deref(),
+                request.calendar_id.as_deref(),
+                title,
+                request.description.as_deref(),
+                request.location.as_deref(),
+                request.start_ms,
+                request.end_ms,
+                request.all_day,
+            )
+            .map_err(|error| format!("Could not upsert calendar event: {error}"))?;
+        return serde_json::from_value::<AndroidCalendarUpsertResponse>(value)
+            .map_err(|error| format!("Could not parse upsert calendar event response: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_delete_calendar_event(
+    app: tauri::AppHandle,
+    request: AndroidCalendarDeleteRequest,
+) -> Result<AndroidDeleteResponse, String> {
+    #[cfg(target_os = "android")]
+    {
+        let event_id = request.event_id.trim();
+        if event_id.is_empty() {
+            return Err("eventId is required.".to_string());
+        }
+        let value = app
+            .syncpeer_android()
+            .delete_calendar_event(event_id)
+            .map_err(|error| format!("Could not delete calendar event: {error}"))?;
+        return serde_json::from_value::<AndroidDeleteResponse>(value)
+            .map_err(|error| format!("Could not parse delete calendar response: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_enable_multicast_lock(
     app: tauri::AppHandle,
 ) -> Result<bool, String> {
@@ -2853,6 +3095,12 @@ pub fn run() {
             syncpeer_android_write_saf_file,
             syncpeer_android_pick_saf_directory,
             syncpeer_android_list_persisted_saf_uris,
+            syncpeer_android_list_contacts,
+            syncpeer_android_upsert_contact,
+            syncpeer_android_delete_contact,
+            syncpeer_android_list_calendar_events,
+            syncpeer_android_upsert_calendar_event,
+            syncpeer_android_delete_calendar_event,
             syncpeer_android_enable_multicast_lock,
             syncpeer_get_android_saf_tree_uri,
             syncpeer_set_android_saf_tree_uri,

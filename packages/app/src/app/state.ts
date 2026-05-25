@@ -64,6 +64,17 @@ export const loadPersistedState = () => {
     offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
     directoryPageSize?: number;
     directoryViewMode?: "list" | "grid";
+    pim?: {
+      enabled?: boolean;
+      contactsEnabled?: boolean;
+      calendarEnabled?: boolean;
+      syncFolderMode?: "choose" | "create";
+      syncFolderPath?: string;
+      standardsMode?: "one_entry_per_file";
+      autoMergeSilent?: boolean;
+      androidContactsIntegration?: boolean;
+      androidCalendarIntegration?: boolean;
+    };
   }>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
 };
 
@@ -93,6 +104,7 @@ export const persistState = (state: AppState) => {
       offlineFolderSnapshots: state.offline.snapshots,
       directoryPageSize: state.ui.directoryPageSize,
       directoryViewMode: state.ui.directoryViewMode,
+      pim: state.pim,
     }),
   );
 };
@@ -233,6 +245,17 @@ export const createInitialState = (persisted = loadPersistedState()) => {
           lastDirection: "upload" | "download" | "baseline";
         }
       >,
+    },
+    pim: {
+      enabled: persisted?.pim?.enabled ?? false,
+      contactsEnabled: persisted?.pim?.contactsEnabled ?? true,
+      calendarEnabled: persisted?.pim?.calendarEnabled ?? true,
+      syncFolderMode: persisted?.pim?.syncFolderMode === "create" ? "create" : "choose",
+      syncFolderPath: String(persisted?.pim?.syncFolderPath ?? "").trim(),
+      standardsMode: "one_entry_per_file" as const,
+      autoMergeSilent: persisted?.pim?.autoMergeSilent ?? true,
+      androidContactsIntegration: persisted?.pim?.androidContactsIntegration ?? true,
+      androidCalendarIntegration: persisted?.pim?.androidCalendarIntegration ?? true,
     },
     logs: {
       nextId: 1,

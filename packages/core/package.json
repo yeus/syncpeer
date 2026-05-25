@@ -7,6 +7,10 @@
       "import": "./src/index.ts",
       "types": "./src/index.d.ts"
     },
+    "./pim": {
+      "import": "./src/pim/index.ts",
+      "types": "./src/pim/index.ts"
+    },
     "./node": {
       "import": "./src/node.ts",
       "types": "./src/node.d.ts"

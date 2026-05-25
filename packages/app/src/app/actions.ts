@@ -15,6 +15,10 @@ import {
   type BreadcrumbSegment,
 } from "@syncpeer/core/browser";
 import {
+  sidecarManifestPath,
+  sidecarOpPath,
+} from "../../../core/src/pim/index.ts";
+import {
   FOLDER_PASSWORD_SCOPE_SEPARATOR,
   type CachedFileRecord,
   type FolderInfo,
@@ -391,6 +395,112 @@ const ensureClientName = (state: AppState) => {
   }
   state.connection.deviceName = normalized;
   return true;
+};
+
+const normalizePimRoot = (raw: string) => {
+  const normalized = normalizePath(raw);
+  return normalized || "syncpeer-pim";
+};
+
+const joinPath = (...parts: string[]) =>
+  normalizePath(parts.map((part) => String(part ?? "").trim()).filter(Boolean).join("/"));
+
+const parseVcard = (text: string) => {
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  const fieldValue = (prefix: string) =>
+    lines.find((line) => line.toUpperCase().startsWith(prefix))?.split(":").slice(1).join(":").trim() ?? "";
+  const phoneValues = lines
+    .filter((line) => line.toUpperCase().startsWith("TEL"))
+    .map((line) => line.split(":").slice(1).join(":").trim())
+    .filter(Boolean);
+  const emailValues = lines
+    .filter((line) => line.toUpperCase().startsWith("EMAIL"))
+    .map((line) => line.split(":").slice(1).join(":").trim())
+    .filter(Boolean);
+  return {
+    displayName: fieldValue("FN:"),
+    phones: [...new Set(phoneValues)],
+    emails: [...new Set(emailValues)],
+  };
+};
+
+const splitVcards = (text: string): string[] => {
+  const matches = text.match(/BEGIN:VCARD[\s\S]*?END:VCARD/gim);
+  if (!matches || matches.length === 0) return [];
+  return matches.map((item) => item.trim()).filter(Boolean);
+};
+
+const toVcard = (args: { uid: string; displayName: string; phones: string[]; emails: string[] }) =>
+  [
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    `UID:${args.uid}`,
+    `FN:${args.displayName || "Unnamed Contact"}`,
+    ...args.phones.map((phone) => `TEL;TYPE=CELL:${phone}`),
+    ...args.emails.map((email) => `EMAIL;TYPE=OTHER:${email}`),
+    "END:VCARD",
+    "",
+  ].join("\n");
+
+const parseIcsUtcToMs = (value: string): number => {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (!match) return 0;
+  const [, y, m, d, hh, mm, ss] = match;
+  return Date.UTC(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss));
+};
+
+const toIcsUtc = (ms: number) => {
+  const date = new Date(ms);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
+};
+
+const parseIcsEvent = (text: string) => {
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  const readValue = (prefix: string) =>
+    lines.find((line) => line.toUpperCase().startsWith(prefix))?.split(":").slice(1).join(":").trim() ?? "";
+  const title = readValue("SUMMARY:");
+  const startMs = parseIcsUtcToMs(readValue("DTSTART:"));
+  const endMs = parseIcsUtcToMs(readValue("DTEND:"));
+  return { title, startMs, endMs };
+};
+
+const splitIcsEvents = (text: string): string[] => {
+  const matches = text.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/gim);
+  if (!matches || matches.length === 0) return [];
+  return matches.map((item) => item.trim()).filter(Boolean);
+};
+
+const toIcsEvent = (args: { uid: string; title: string; startMs: number; endMs: number }) =>
+  [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Syncpeer//PIM//EN",
+    "BEGIN:VEVENT",
+    `UID:${args.uid}`,
+    `DTSTAMP:${toIcsUtc(Date.now())}`,
+    `DTSTART:${toIcsUtc(args.startMs)}`,
+    `DTEND:${toIcsUtc(args.endMs)}`,
+    `SUMMARY:${args.title || "Untitled Event"}`,
+    "END:VEVENT",
+    "END:VCALENDAR",
+    "",
+  ].join("\n");
+
+const readDirectoryEntriesRecursively = async (
+  remoteFs: NonNullable<AppState["session"]["remoteFs"]>,
+  folderId: string,
+  dirPath: string,
+  depthLeft: number,
+): Promise<import("@syncpeer/core/browser").FileEntry[]> => {
+  if (depthLeft < 0) return [];
+  const entries = await remoteFs.readDir(folderId, dirPath);
+  const nested = await Promise.all(
+    entries
+      .filter((entry) => entry.type === "directory")
+      .map((entry) => readDirectoryEntriesRecursively(remoteFs, folderId, entry.path, depthLeft - 1)),
+  );
+  return [...entries, ...nested.flat()];
 };
 
 const remoteHasUnapprovedFolderShare = (
@@ -1842,6 +1952,320 @@ export const createAppActions = (args: {
     state.ui.isAppVisible = isVisible;
   };
 
+  const pickAndroidPimDirectory = async () => {
+    try {
+      const treeUri = await client.pickAndroidSafDirectory();
+      await client.setAndroidSafTreeUri(treeUri);
+      state.pim.syncFolderMode = "choose";
+      state.pim.syncFolderPath = treeUri;
+      state.devices.identityNotice = "Android PIM directory selected.";
+    } catch (error) {
+      reportActionError(state, "pim.android.pick_directory.failed", error);
+    }
+  };
+
+  const initializePimFolder = async () => {
+    if (!state.pim.enabled) {
+      state.ui.uploadMessage = "Enable Contacts + Calendar Sync first.";
+      return;
+    }
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      state.ui.uploadMessage = "Connect first to initialize PIM structure.";
+      return;
+    }
+    const folderId = state.session.currentFolderId;
+    if (!folderId) {
+      state.ui.uploadMessage = "Open a folder first, then initialize PIM structure.";
+      return;
+    }
+    if (!state.session.remoteFs.writeFileFully) {
+      state.ui.uploadMessage = "Current connection does not support writing files.";
+      return;
+    }
+    try {
+      const root = normalizePimRoot(state.pim.syncFolderPath);
+      const encoder = new TextEncoder();
+      const now = Date.now();
+      const epoch = new Date(now).toISOString().slice(0, 7);
+      const contactsCollection = "default";
+      const calendarCollection = "default";
+      const contactsManifestPath = `${root}/${sidecarManifestPath("contacts", contactsCollection)}`;
+      const calendarManifestPath = `${root}/${sidecarManifestPath("calendar", calendarCollection)}`;
+      const contactsOpPath = `${root}/${sidecarOpPath({
+        domain: "contacts",
+        collectionId: contactsCollection,
+        epoch,
+        opId: `bootstrap-${now}`,
+      })}`;
+      const calendarOpPath = `${root}/${sidecarOpPath({
+        domain: "calendar",
+        collectionId: calendarCollection,
+        epoch,
+        opId: `bootstrap-${now}`,
+      })}`;
+      const contactsManifest = JSON.stringify(
+        {
+          schemaVersion: 1,
+          domain: "contacts",
+          collectionId: contactsCollection,
+          canonical: "one_entry_per_file_vcf",
+          silentMerge: true,
+          initializedAtMs: now,
+        },
+        null,
+        2,
+      );
+      const calendarManifest = JSON.stringify(
+        {
+          schemaVersion: 1,
+          domain: "calendar",
+          collectionId: calendarCollection,
+          canonical: "one_entry_per_file_ics",
+          silentMerge: true,
+          initializedAtMs: now,
+        },
+        null,
+        2,
+      );
+      const bootstrapContactPath = `${root}/syncpeer/pim/contacts/collections/${contactsCollection}/entries/bootstrap-contact.vcf`;
+      const bootstrapEventPath = `${root}/syncpeer/pim/calendar/collections/${calendarCollection}/entries/bootstrap-event.ics`;
+      const bootstrapContact = `BEGIN:VCARD\nVERSION:3.0\nUID:bootstrap-contact\nFN:Syncpeer Contact Bootstrap\nEND:VCARD\n`;
+      const bootstrapEvent = `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Syncpeer//PIM//EN\nBEGIN:VEVENT\nUID:bootstrap-event\nDTSTAMP:20260101T000000Z\nDTSTART:20260101T090000Z\nDTEND:20260101T093000Z\nSUMMARY:Syncpeer Calendar Bootstrap\nEND:VEVENT\nEND:VCALENDAR\n`;
+      await state.session.remoteFs.writeFileFully(
+        folderId,
+        contactsManifestPath,
+        encoder.encode(contactsManifest),
+        { modifiedMs: now },
+      );
+      await state.session.remoteFs.writeFileFully(
+        folderId,
+        calendarManifestPath,
+        encoder.encode(calendarManifest),
+        { modifiedMs: now },
+      );
+      await state.session.remoteFs.writeFileFully(
+        folderId,
+        contactsOpPath,
+        encoder.encode(JSON.stringify({ kind: "bootstrap", createdAtMs: now })),
+        { modifiedMs: now },
+      );
+      await state.session.remoteFs.writeFileFully(
+        folderId,
+        calendarOpPath,
+        encoder.encode(JSON.stringify({ kind: "bootstrap", createdAtMs: now })),
+        { modifiedMs: now },
+      );
+      await state.session.remoteFs.writeFileFully(
+        folderId,
+        bootstrapContactPath,
+        encoder.encode(bootstrapContact),
+        { modifiedMs: now },
+      );
+      await state.session.remoteFs.writeFileFully(
+        folderId,
+        bootstrapEventPath,
+        encoder.encode(bootstrapEvent),
+        { modifiedMs: now },
+      );
+      state.ui.uploadMessage = "Initialized contacts/calendar structure in current folder.";
+      await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
+    } catch (error) {
+      reportActionError(state, "pim.initialize_folder.failed", error, {
+        folderId: state.session.currentFolderId,
+      });
+    }
+  };
+
+  const syncAndroidPimNow = async () => {
+    if (!state.pim.enabled) {
+      state.ui.uploadMessage = "Enable Contacts + Calendar Sync first.";
+      return;
+    }
+    if (!state.session.isConnected || !state.session.remoteFs || !state.session.currentFolderId) {
+      state.ui.uploadMessage = "Connect and open a folder first.";
+      return;
+    }
+    if (!state.session.remoteFs.writeFileFully) {
+      state.ui.uploadMessage = "Current connection does not support writing files.";
+      return;
+    }
+    const folderId = state.session.currentFolderId;
+    const remoteFs = state.session.remoteFs;
+    const root = normalizePimRoot(state.pim.syncFolderPath);
+    const contactsEntriesDir = `${root}/syncpeer/pim/contacts/collections/default/entries`;
+    const calendarEntriesDir = `${root}/syncpeer/pim/calendar/collections/default/entries`;
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    try {
+      let writtenContacts = 0;
+      let writtenEvents = 0;
+      let importedContacts = 0;
+      let importedEvents = 0;
+
+      if (state.pim.contactsEnabled && state.pim.androidContactsIntegration) {
+        const androidContacts = await client.listAndroidContacts();
+        for (const contact of androidContacts) {
+          const filePath = joinPath(contactsEntriesDir, `android-${contact.contactId}.vcf`);
+          const payload = toVcard({
+            uid: `android-${contact.contactId}`,
+            displayName: contact.displayName,
+            phones: contact.phones ?? [],
+            emails: contact.emails ?? [],
+          });
+          await remoteFs.writeFileFully(folderId, filePath, encoder.encode(payload), { modifiedMs: Date.now() });
+          writtenContacts += 1;
+        }
+
+        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, contactsEntriesDir, 3);
+        for (const entry of entries) {
+          if (entry.type !== "file" || !entry.path.endsWith(".vcf")) continue;
+          const name = entry.path.split("/").pop() ?? "";
+          if (!name.startsWith("android-")) continue;
+          const contactId = name.replace(/^android-/, "").replace(/\.vcf$/i, "");
+          if (!contactId.trim()) continue;
+          const bytes = await remoteFs.readFileFully(folderId, entry.path);
+          const parsed = parseVcard(decoder.decode(bytes));
+          if (!parsed.displayName) continue;
+          await client.upsertAndroidContact({
+            contactId,
+            displayName: parsed.displayName,
+            phones: parsed.phones,
+            emails: parsed.emails,
+          });
+          importedContacts += 1;
+        }
+      }
+
+      if (state.pim.calendarEnabled && state.pim.androidCalendarIntegration) {
+        const androidEvents = await client.listAndroidCalendarEvents({});
+        for (const event of androidEvents) {
+          const filePath = joinPath(calendarEntriesDir, `android-${event.eventId}.ics`);
+          const payload = toIcsEvent({
+            uid: `android-${event.eventId}`,
+            title: event.title,
+            startMs: event.startMs,
+            endMs: event.endMs,
+          });
+          await remoteFs.writeFileFully(folderId, filePath, encoder.encode(payload), { modifiedMs: Date.now() });
+          writtenEvents += 1;
+        }
+
+        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, calendarEntriesDir, 3);
+        for (const entry of entries) {
+          if (entry.type !== "file" || !entry.path.endsWith(".ics")) continue;
+          const name = entry.path.split("/").pop() ?? "";
+          if (!name.startsWith("android-")) continue;
+          const eventId = name.replace(/^android-/, "").replace(/\.ics$/i, "");
+          if (!eventId.trim()) continue;
+          const bytes = await remoteFs.readFileFully(folderId, entry.path);
+          const parsed = parseIcsEvent(decoder.decode(bytes));
+          if (!parsed.title || parsed.startMs <= 0 || parsed.endMs <= 0) continue;
+          await client.upsertAndroidCalendarEvent({
+            eventId,
+            title: parsed.title,
+            startMs: parsed.startMs,
+            endMs: parsed.endMs,
+            allDay: false,
+          });
+          importedEvents += 1;
+        }
+      }
+
+      state.ui.uploadMessage =
+        `PIM sync complete. Wrote ${writtenContacts} contacts + ${writtenEvents} events; imported ${importedContacts} contacts + ${importedEvents} events.`;
+      await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
+    } catch (error) {
+      reportActionError(state, "pim.android.sync_now.failed", error, {
+        folderId: state.session.currentFolderId,
+      });
+    }
+  };
+
+  const importProviderPimFromSyncthingFolder = async () => {
+    if (!state.pim.enabled) {
+      state.ui.uploadMessage = "Enable Contacts + Calendar Sync first.";
+      return;
+    }
+    if (!state.session.isConnected || !state.session.remoteFs || !state.session.currentFolderId) {
+      state.ui.uploadMessage = "Connect and open a folder first.";
+      return;
+    }
+    const folderId = state.session.currentFolderId;
+    const remoteFs = state.session.remoteFs;
+    const root = normalizePimRoot(state.pim.syncFolderPath);
+    const contactsEntriesDir = `${root}/syncpeer/pim/contacts/collections/default/entries`;
+    const calendarEntriesDir = `${root}/syncpeer/pim/calendar/collections/default/entries`;
+    const decoder = new TextDecoder();
+    try {
+      let importedContacts = 0;
+      let importedEvents = 0;
+
+      if (state.pim.contactsEnabled && state.pim.androidContactsIntegration) {
+        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, contactsEntriesDir, 3);
+        for (const entry of entries) {
+          if (entry.type !== "file" || !entry.path.endsWith(".vcf")) continue;
+          const name = entry.path.split("/").pop() ?? "";
+          if (name.startsWith("android-")) continue;
+          const bytes = await remoteFs.readFileFully(folderId, entry.path);
+          const vcards = splitVcards(decoder.decode(bytes));
+          for (const vcardText of vcards) {
+            const parsed = parseVcard(vcardText);
+            if (!parsed.displayName) continue;
+            await client.upsertAndroidContact({
+              displayName: parsed.displayName,
+              phones: parsed.phones,
+              emails: parsed.emails,
+            });
+            importedContacts += 1;
+          }
+        }
+      }
+
+      if (state.pim.calendarEnabled && state.pim.androidCalendarIntegration) {
+        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, calendarEntriesDir, 3);
+        for (const entry of entries) {
+          if (entry.type !== "file" || !entry.path.endsWith(".ics")) continue;
+          const name = entry.path.split("/").pop() ?? "";
+          if (name.startsWith("android-")) continue;
+          const bytes = await remoteFs.readFileFully(folderId, entry.path);
+          const text = decoder.decode(bytes);
+          const eventBlocks = splitIcsEvents(text);
+          if (eventBlocks.length === 0) {
+            const parsedSingle = parseIcsEvent(text);
+            if (parsedSingle.title && parsedSingle.startMs > 0 && parsedSingle.endMs > 0) {
+              await client.upsertAndroidCalendarEvent({
+                title: parsedSingle.title,
+                startMs: parsedSingle.startMs,
+                endMs: parsedSingle.endMs,
+                allDay: false,
+              });
+              importedEvents += 1;
+            }
+            continue;
+          }
+          for (const eventText of eventBlocks) {
+            const parsed = parseIcsEvent(eventText);
+            if (!parsed.title || parsed.startMs <= 0 || parsed.endMs <= 0) continue;
+            await client.upsertAndroidCalendarEvent({
+              title: parsed.title,
+              startMs: parsed.startMs,
+              endMs: parsed.endMs,
+              allDay: false,
+            });
+            importedEvents += 1;
+          }
+        }
+      }
+
+      state.ui.uploadMessage =
+        `Provider import complete. Imported ${importedContacts} contacts and ${importedEvents} events into Android.`;
+    } catch (error) {
+      reportActionError(state, "pim.provider_import.failed", error, {
+        folderId: state.session.currentFolderId,
+      });
+    }
+  };
+
   const onNetworkOnline = async () => {
     if (state.ui.autoConnectPaused) return;
     await discoverLocalDevices({ timeoutMs: 1200 });
@@ -2031,6 +2455,10 @@ export const createAppActions = (args: {
     setAppVisibility,
     onNetworkOnline,
     onAppForeground,
+    pickAndroidPimDirectory,
+    initializePimFolder,
+    syncAndroidPimNow,
+    importProviderPimFromSyncthingFolder,
     openDiagnosticsPage,
     closeDiagnosticsPage,
     runFolderDiagnosticsTest,

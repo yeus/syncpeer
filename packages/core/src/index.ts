@@ -17,6 +17,17 @@ export {
 export { RemoteFs } from "./core/model/remoteFs.ts";
 export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.ts";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.ts";
+export {
+  canonicalRecordPath,
+  collectionRootPath,
+  extensionForFormat,
+  formatForDomain,
+  sidecarManifestPath,
+  sidecarOpPath,
+  sidecarTombstonePath,
+  createEmptySnapshot,
+  mergeOperationIntoSnapshot,
+} from "./pim/index.ts";
 export type {
   SessionPendingState,
   SessionPhase,
@@ -28,3 +39,12 @@ export type {
   SessionTransport,
   SyncpeerSessionStore,
 } from "./ui/sessionTypes.ts";
+export type {
+  PimDomain,
+  PimMergeResult,
+  PimOperationEnvelope,
+  PimRecordFormat,
+  PimRecordRef,
+  PimRecordSnapshot,
+  PimRecordVersion,
+} from "./pim/index.ts";

@@ -284,6 +284,10 @@
           onClearAllCache={actions.clearAllCache}
           onClearOfflineFolderState={actions.clearOfflineFolderState}
           onOpenDiagnosticsPage={actions.openDiagnosticsPage}
+          onPickAndroidPimDirectory={actions.pickAndroidPimDirectory}
+          onInitializePimFolder={actions.initializePimFolder}
+          onSyncAndroidPimNow={actions.syncAndroidPimNow}
+          onImportProviderPimFromFolder={actions.importProviderPimFromSyncthingFolder}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
           onCopySessionLogs={actions.copySessionLogs}
           onEditLocalDeviceName={actions.editLocalDeviceName}

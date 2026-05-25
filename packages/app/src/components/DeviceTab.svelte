@@ -16,6 +16,10 @@
     onClearAllCache: () => void;
     onClearOfflineFolderState: () => void;
     onOpenDiagnosticsPage: () => void;
+    onPickAndroidPimDirectory: () => void;
+    onInitializePimFolder: () => void;
+    onSyncAndroidPimNow: () => void;
+    onImportProviderPimFromFolder: () => void;
     onCopyCurrentDeviceId: () => void;
     onCopySessionLogs: () => void;
     onEditLocalDeviceName: () => void;
@@ -41,6 +45,10 @@
     onClearAllCache,
     onClearOfflineFolderState,
     onOpenDiagnosticsPage,
+    onPickAndroidPimDirectory,
+    onInitializePimFolder,
+    onSyncAndroidPimNow,
+    onImportProviderPimFromFolder,
     onCopyCurrentDeviceId,
     onCopySessionLogs,
     onEditLocalDeviceName,
@@ -360,6 +368,87 @@
           />
           <span>Auto-approve folder sync for introduced folders</span>
         </label>
+
+        <div class="settings-divider"></div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" bind:checked={app.pim.enabled} />
+          <span>Enable Contacts + Calendar Sync (PIM)</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input
+            type="checkbox"
+            bind:checked={app.pim.contactsEnabled}
+            disabled={!app.pim.enabled}
+          />
+          <span>Sync Contacts</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input
+            type="checkbox"
+            bind:checked={app.pim.calendarEnabled}
+            disabled={!app.pim.enabled}
+          />
+          <span>Sync Calendar</span>
+        </label>
+
+        <label>
+          PIM Sync Folder Mode
+          <select bind:value={app.pim.syncFolderMode} disabled={!app.pim.enabled}>
+            <option value="choose">Choose existing Syncthing folder</option>
+            <option value="create">Create dedicated Syncthing folder</option>
+          </select>
+        </label>
+
+        <label>
+          PIM Folder Path / Folder ID
+          <input
+            type="text"
+            bind:value={app.pim.syncFolderPath}
+            placeholder={app.pim.syncFolderMode === "create"
+              ? "e.g. syncpeer-pim"
+              : "e.g. /storage/emulated/0/Sync/pim or existing folder ID"}
+            disabled={!app.pim.enabled}
+          />
+        </label>
+
+        <label>
+          Standards Storage Mode
+          <select bind:value={app.pim.standardsMode} disabled>
+            <option value="one_entry_per_file">
+              One entry per file (.vcf/.ics canonical)
+            </option>
+          </select>
+        </label>
+
+        <label class="checkbox-row">
+          <input
+            type="checkbox"
+            bind:checked={app.pim.autoMergeSilent}
+            disabled={!app.pim.enabled}
+          />
+          <span>Silent auto-merge (no user conflict prompts)</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input
+            type="checkbox"
+            bind:checked={app.pim.androidContactsIntegration}
+            disabled={!app.pim.enabled || !app.pim.contactsEnabled}
+          />
+          <span>Android Contacts integration</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input
+            type="checkbox"
+            bind:checked={app.pim.androidCalendarIntegration}
+            disabled={!app.pim.enabled || !app.pim.calendarEnabled}
+          />
+          <span>Android Calendar integration</span>
+        </label>
       </form>
 
       <div class="actions">
@@ -389,6 +478,38 @@
         </button>
         <button type="button" class="ghost" onclick={onClearOfflineFolderState}>
           Clear Offline Folder State
+        </button>
+        <button
+          type="button"
+          class="ghost"
+          onclick={onPickAndroidPimDirectory}
+          disabled={!app.pim.enabled}
+        >
+          Pick Android PIM Directory
+        </button>
+        <button
+          type="button"
+          class="ghost"
+          onclick={onInitializePimFolder}
+          disabled={!app.pim.enabled || !app.session.isConnected || !app.session.currentFolderId}
+        >
+          Initialize PIM In Open Folder
+        </button>
+        <button
+          type="button"
+          class="ghost"
+          onclick={onSyncAndroidPimNow}
+          disabled={!app.pim.enabled || !app.session.isConnected || !app.session.currentFolderId}
+        >
+          Sync Android PIM Now
+        </button>
+        <button
+          type="button"
+          class="ghost"
+          onclick={onImportProviderPimFromFolder}
+          disabled={!app.pim.enabled || !app.session.isConnected || !app.session.currentFolderId}
+        >
+          Import Provider Files To Android
         </button>
       </div>
     </div>
@@ -541,6 +662,12 @@
   .saved-device-editor {
     display: grid;
     gap: 0.45rem;
+  }
+
+  .settings-divider {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--border-default);
+    margin: 0.25rem 0;
   }
 
   .actions {

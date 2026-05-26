@@ -6,8 +6,8 @@ export {
   sidecarManifestPath,
   sidecarOpPath,
   sidecarTombstonePath,
-} from "./paths.ts";
-export { createEmptySnapshot, mergeOperationIntoSnapshot } from "./merge.ts";
+} from "./paths.js";
+export { createEmptySnapshot, mergeOperationIntoSnapshot } from "./merge.js";
 export type {
   PimDomain,
   PimMergeResult,
@@ -16,5 +16,5 @@ export type {
   PimRecordRef,
   PimRecordSnapshot,
   PimRecordVersion,
-} from "./types.ts";
+} from "./types.js";
 

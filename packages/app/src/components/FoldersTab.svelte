@@ -348,6 +348,14 @@
 </Panel>
 
 <style>
+  .list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 0.45rem;
+  }
+
   .status-row {
     display: flex;
     gap: 0.45rem;
@@ -386,7 +394,7 @@
 
   .list-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
     gap: 0.45rem;
     border: none;
     background: transparent;
@@ -394,10 +402,34 @@
   }
 
   .list-grid :global(.list-item) {
+    grid-template-columns: minmax(0, 1fr) auto;
     border: 1px solid var(--border-soft);
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
-    padding: 0.5rem;
+    padding: 0.45rem;
+    min-height: 6.2rem;
+  }
+
+  .list-grid :global(.item-actions) {
+    align-self: start;
+    padding-top: 0.1rem;
+  }
+
+  .list-grid :global(.item-title) {
+    font-size: 0.95rem;
+    line-height: 1.2;
+    word-break: break-word;
+  }
+
+  .list-grid :global(.item-meta) {
+    font-size: 0.78rem;
+    line-height: 1.2;
+  }
+
+  @media (min-width: 900px) {
+    .list-grid {
+      grid-template-columns: repeat(auto-fill, minmax(12.5rem, 1fr));
+    }
   }
 
   label {

@@ -9,6 +9,7 @@
   import DeviceTab from "./components/DeviceTab.svelte";
   import FavoritesTab from "./components/FavoritesTab.svelte";
   import FoldersTab from "./components/FoldersTab.svelte";
+  import PimTab from "./components/PimTab.svelte";
   import { createTauriAdapters } from "./lib/tauriAdapters.js";
   import {
     createAppActions,
@@ -44,6 +45,7 @@
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
   import Star from "lucide-svelte/icons/star";
+  import CalendarDays from "lucide-svelte/icons/calendar-days";
 
   let app = $state(createInitialState());
 
@@ -284,10 +286,6 @@
           onClearAllCache={actions.clearAllCache}
           onClearOfflineFolderState={actions.clearOfflineFolderState}
           onOpenDiagnosticsPage={actions.openDiagnosticsPage}
-          onPickAndroidPimDirectory={actions.pickAndroidPimDirectory}
-          onInitializePimFolder={actions.initializePimFolder}
-          onSyncAndroidPimNow={actions.syncAndroidPimNow}
-          onImportProviderPimFromFolder={actions.importProviderPimFromSyncthingFolder}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
           onCopySessionLogs={actions.copySessionLogs}
           onEditLocalDeviceName={actions.editLocalDeviceName}
@@ -299,6 +297,17 @@
           onEditSavedDeviceName={actions.editSavedDeviceName}
           onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
           onRemoveSavedDevice={actions.removeSavedDevice}
+          onConnectLocalCandidate={actions.connectViaLanAnonymousCandidate}
+        />
+      {/if}
+
+      {#if app.activeTab === "pim"}
+        <PimTab
+          {app}
+          onPickAndroidPimDirectory={actions.pickAndroidPimDirectory}
+          onInitializePimFolder={actions.initializePimFolder}
+          onSyncAndroidPimNow={actions.syncAndroidPimNow}
+          onImportProviderPimFromFolder={actions.importProviderPimFromSyncthingFolder}
         />
       {/if}
 
@@ -389,12 +398,22 @@
         <Smartphone size={18} aria-hidden="true" />
         <span class="sr-only">Devices</span>
       </button>
+      <button
+        type="button"
+        class={`tab-button ${app.activeTab === "pim" ? "active" : ""}`}
+        onclick={(event) => actions.switchTab("pim", event)}
+      >
+        <CalendarDays size={18} aria-hidden="true" />
+        <span class="sr-only">PIM</span>
+      </button>
     </nav>
   </div>
 {:else}
   <DiagnosticsPage
     onBack={actions.closeDiagnosticsPage}
-    onRun={actions.runFolderDiagnosticsTest}
+    onLoadCatalog={actions.loadDiagnosticsCatalog}
+    onRunTest={actions.runDiagnosticsTestById}
+    onRunCategory={actions.runDiagnosticsCategory}
   />
 {/if}
 
@@ -479,7 +498,7 @@
     position: relative;
     flex-shrink: 0;
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     background: var(--bg-nav);
     backdrop-filter: blur(12px);
     border-top: 1px solid var(--border-default);

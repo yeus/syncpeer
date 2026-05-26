@@ -1,4 +1,4 @@
-import type { PimDomain, PimRecordFormat, PimRecordRef } from "./types.ts";
+import type { PimDomain, PimRecordFormat, PimRecordRef } from "./types.js";
 
 const ROOT = "syncpeer/pim";
 

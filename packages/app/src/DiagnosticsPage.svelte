@@ -7,14 +7,37 @@
     failOnExpectedMissing?: boolean;
   }
 
-  interface Props {
-    onBack: () => void;
-    onRun: (args?: RunDiagnosticsArgs) => Promise<unknown>;
+  interface DiagnosticsCategory {
+    id: string;
+    name: string;
+    description: string;
   }
 
-  let { onBack, onRun }: Props = $props();
+  interface DiagnosticsTest {
+    id: string;
+    name: string;
+    description: string;
+    categoryId: string;
+  }
+
+  interface DiagnosticsCatalog {
+    categories: DiagnosticsCategory[];
+    tests: DiagnosticsTest[];
+  }
+
+  interface Props {
+    onBack: () => void;
+    onLoadCatalog: () => Promise<DiagnosticsCatalog>;
+    onRunTest: (testId: string, args?: RunDiagnosticsArgs) => Promise<unknown>;
+    onRunCategory: (categoryId: string, args?: RunDiagnosticsArgs) => Promise<unknown>;
+  }
+
+  let { onBack, onLoadCatalog, onRunTest, onRunCategory }: Props = $props();
 
   let isRunning = $state(false);
+  let isCatalogLoading = $state(false);
+  let catalog = $state<DiagnosticsCatalog>({ categories: [], tests: [] });
+  let selectedCategoryId = $state("");
   let lastRunAt = $state("");
   let resultJson = $state("");
   let runError = $state<string | null>(null);
@@ -28,14 +51,55 @@
       .filter((token) => token.length > 0),
   )];
 
-  const runDiagnostics = async (): Promise<void> => {
+  let visibleTests = $derived.by(() =>
+    catalog.tests.filter((item) => item.categoryId === selectedCategoryId),
+  );
+
+  const loadCatalog = async (): Promise<void> => {
+    if (isCatalogLoading) return;
+    isCatalogLoading = true;
+    runError = null;
+    try {
+      const next = await onLoadCatalog();
+      catalog = next;
+      if (!next.categories.some((item) => item.id === selectedCategoryId)) {
+        selectedCategoryId = next.categories[0]?.id ?? "";
+      }
+    } catch (error) {
+      runError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isCatalogLoading = false;
+    }
+  };
+
+  const runSingleTest = async (testId: string): Promise<void> => {
     if (isRunning) return;
     isRunning = true;
     runError = null;
     copiedNotice = "";
     try {
       const expectedAdvertisedDeviceIds = parseExpectedDeviceIds(expectedIdsInput);
-      const result = await onRun({
+      const result = await onRunTest(testId, {
+        expectedAdvertisedDeviceIds,
+        failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
+      });
+      resultJson = JSON.stringify(result, null, 2);
+      lastRunAt = new Date().toLocaleString();
+    } catch (error) {
+      runError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isRunning = false;
+    }
+  };
+
+  const runSelectedCategory = async (): Promise<void> => {
+    if (isRunning || !selectedCategoryId) return;
+    isRunning = true;
+    runError = null;
+    copiedNotice = "";
+    try {
+      const expectedAdvertisedDeviceIds = parseExpectedDeviceIds(expectedIdsInput);
+      const result = await onRunCategory(selectedCategoryId, {
         expectedAdvertisedDeviceIds,
         failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
       });
@@ -58,6 +122,8 @@
     await navigator.clipboard.writeText(resultJson);
     copiedNotice = "Copied diagnostics to clipboard.";
   };
+
+  void loadCatalog();
 </script>
 
 <main class="diagnostics-page">
@@ -68,8 +134,23 @@
 
   <section class="panel diagnostics-panel">
     <p class="hint">
-      Runs folder/index diagnostics and advertised-device checks. Add specific device IDs below to assert they are advertised.
+      Run diagnostics by category or single test. Add expected device IDs to enforce discovery checks.
     </p>
+    <label class="field-label" for="diagnostics-category">Category</label>
+    <select
+      id="diagnostics-category"
+      bind:value={selectedCategoryId}
+      disabled={isCatalogLoading || catalog.categories.length === 0}
+    >
+      {#each catalog.categories as category (category.id)}
+        <option value={category.id}>{category.name}</option>
+      {/each}
+    </select>
+    {#if selectedCategoryId}
+      <div class="meta">
+        {catalog.categories.find((item) => item.id === selectedCategoryId)?.description ?? ""}
+      </div>
+    {/if}
     <label class="field-label" for="expected-device-ids">Expected Advertised Device IDs (optional)</label>
     <textarea
       id="expected-device-ids"
@@ -81,13 +162,33 @@
       placeholder="Paste one or more device IDs (comma/space/newline separated)."
     ></textarea>
     <div class="actions">
-      <button class="primary" onclick={runDiagnostics} disabled={isRunning}>
-        {isRunning ? "Running..." : "Run Folder Diagnostics Test"}
+      <button class="primary" onclick={runSelectedCategory} disabled={isRunning || !selectedCategoryId}>
+        {isRunning ? "Running..." : "Run Selected Category"}
+      </button>
+      <button class="ghost" onclick={loadCatalog} disabled={isCatalogLoading || isRunning}>
+        {isCatalogLoading ? "Refreshing..." : "Refresh Catalog"}
       </button>
       <button class="ghost" onclick={copyResults} disabled={!resultJson}>
         Copy Results
       </button>
     </div>
+    <ul class="list">
+      {#if visibleTests.length === 0}
+        <li class="empty">No tests in this category.</li>
+      {:else}
+        {#each visibleTests as test (test.id)}
+          <li class="test-item">
+            <div class="test-meta">
+              <strong>{test.name}</strong>
+              <span>{test.description}</span>
+            </div>
+            <button class="ghost small" onclick={() => runSingleTest(test.id)} disabled={isRunning}>
+              Run Test
+            </button>
+          </li>
+        {/each}
+      {/if}
+    </ul>
     {#if lastRunAt}
       <div class="meta">Last run: {lastRunAt}</div>
     {/if}
@@ -132,6 +233,40 @@
     display: flex;
     gap: 0.5rem;
     flex-wrap: wrap;
+  }
+  .list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 0.4rem;
+  }
+  .test-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    align-items: center;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.6rem;
+    background: var(--bg-surface);
+  }
+  .test-meta {
+    display: grid;
+    gap: 0.15rem;
+  }
+  .test-meta span {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+  }
+  .small {
+    min-height: 30px;
+    padding: 0.15rem 0.45rem;
+    font-size: 0.8rem;
+  }
+  .empty {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
   }
   .hint,
   .meta {

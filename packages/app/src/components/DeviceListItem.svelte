@@ -26,7 +26,15 @@ export interface SavedDeviceRow {
     metaLines: string[];
   }
 
-  export type DeviceListRow = SavedDeviceRow | AdvertisedDeviceRow;
+  export interface LocalCandidateRow {
+    kind: "local-candidate";
+    id: string;
+    name: string;
+    deviceId: string;
+    metaLines: string[];
+  }
+
+  export type DeviceListRow = SavedDeviceRow | AdvertisedDeviceRow | LocalCandidateRow;
 
   interface Props {
     row: DeviceListRow;
@@ -36,6 +44,7 @@ export interface SavedDeviceRow {
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
     onAddAdvertisedDevice: (deviceId: string) => void;
+    onConnectLocalCandidate: (candidateId: string) => void;
   }
 
   let {
@@ -46,6 +55,7 @@ export interface SavedDeviceRow {
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
     onAddAdvertisedDevice,
+    onConnectLocalCandidate,
   }: Props = $props();
 </script>
 
@@ -82,6 +92,9 @@ export interface SavedDeviceRow {
     {#if row.kind === "advertised"}
       <StatusChip tone="offline" small>not approved</StatusChip>
     {/if}
+    {#if row.kind === "local-candidate"}
+      <StatusChip small>local candidate</StatusChip>
+    {/if}
   </div>
 
   <div class="item-meta">{row.deviceId}</div>
@@ -114,7 +127,7 @@ export interface SavedDeviceRow {
       >
         <Trash2 size={16} />
       </button>
-    {:else}
+    {:else if row.kind === "advertised"}
       <button
         class="primary icon icon-only"
         onclick={() => onAddAdvertisedDevice(row.deviceId)}
@@ -122,6 +135,14 @@ export interface SavedDeviceRow {
         title="Add advertised device"
       >
         <Plus size={16} />
+      </button>
+    {:else}
+      <button
+        class="primary"
+        onclick={() => onConnectLocalCandidate(row.deviceId)}
+        disabled={disableActions}
+      >
+        Connect
       </button>
     {/if}
   </svelte:fragment>

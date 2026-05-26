@@ -10,9 +10,9 @@ import {
   FileInfo,
   Request,
   Response,
-} from "./core/protocol/bep.ts";
-import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.ts";
-import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.ts";
+} from "./core/protocol/bep.js";
+import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.js";
+import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
 import {
   decryptEncryptedFilename,
   encryptUntrustedBlockHash,
@@ -23,7 +23,7 @@ import {
   deriveUntrustedFolderCrypto,
   verifyUntrustedPasswordToken,
   type UntrustedFolderCrypto,
-} from "./core/model/untrusted.ts";
+} from "./core/model/untrusted.js";
 
 export interface SyncpeerTlsConnectOptions {
   host: string;

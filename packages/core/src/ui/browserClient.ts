@@ -1,5 +1,5 @@
-import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "../client.ts";
-import type { FileDownloadProgress, FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.ts";
+import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "../client.js";
+import type { FileDownloadProgress, FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.js";
 
 export interface ConnectOptions {
   host: string;
@@ -18,6 +18,7 @@ export interface ConnectOptions {
 export interface LocalDiscoveredDevice {
   deviceId: string;
   addresses: string[];
+  anonymous?: boolean;
 }
 
 export interface RemoteFsLike {
@@ -605,24 +606,38 @@ export const createSyncpeerBrowserClient = (
         timeoutMs: discoverOptions?.timeoutMs,
       });
       const devices = new Map<string, Set<string>>();
+      const anonymousAddresses = new Set<string>();
       for (const candidate of candidates) {
         const normalizedId = (candidate.deviceId ?? "")
           .replace(/[^A-Z2-7]/gi, "")
           .toUpperCase();
-        if (!normalizedId) continue;
+        const normalizedAddress = candidate.address.trim();
+        if (!normalizedId) {
+          if (normalizedAddress) anonymousAddresses.add(normalizedAddress);
+          continue;
+        }
         if (!devices.has(normalizedId)) {
           devices.set(normalizedId, new Set<string>());
         }
-        if (candidate.address.trim()) {
-          devices.get(normalizedId)?.add(candidate.address.trim());
+        if (normalizedAddress) {
+          devices.get(normalizedId)?.add(normalizedAddress);
         }
       }
-      return [...devices.entries()]
+      const known = [...devices.entries()]
         .map(([deviceId, addresses]) => ({
           deviceId,
           addresses: [...addresses].sort(),
+          anonymous: false,
         }))
         .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+      const anonymous = [...anonymousAddresses]
+        .sort()
+        .map((address, index) => ({
+          deviceId: `LAN-UNKNOWN-${index + 1}`,
+          addresses: [address],
+          anonymous: true,
+        }));
+      return [...known, ...anonymous];
     },
     disconnect: async (): Promise<void> => {
       await closeActiveSession();

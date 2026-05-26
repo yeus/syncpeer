@@ -74,6 +74,7 @@ export interface ConnectionOverview {
 export interface LocalDiscoveredDevice {
   deviceId: string;
   addresses: string[];
+  anonymous?: boolean;
 }
 
 export interface SyncpeerBrowserClient {

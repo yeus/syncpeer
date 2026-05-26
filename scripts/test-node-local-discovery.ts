@@ -1,5 +1,33 @@
-import { resolveNodeLocalDiscovery } from "../packages/core/src/node.ts";
 import { setTimeout as sleep } from "node:timers/promises";
+import fs from "node:fs";
+
+type ResolveNodeLocalDiscovery = (args: {
+  expectedDeviceId?: string;
+  timeoutMs?: number;
+  listenPort?: number;
+  signal?: AbortSignal;
+}) => Promise<{
+  candidates: unknown[];
+  payload?: Record<string, unknown>;
+}>;
+
+const loadResolveNodeLocalDiscovery = async (): Promise<ResolveNodeLocalDiscovery> => {
+  try {
+    const mod = (await import("../packages/core/dist/node.js")) as {
+      resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
+    };
+    if (typeof mod.resolveNodeLocalDiscovery === "function") {
+      return mod.resolveNodeLocalDiscovery;
+    }
+  } catch {}
+  const mod = (await import("../packages/core/src/node.ts")) as {
+    resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
+  };
+  if (typeof mod.resolveNodeLocalDiscovery !== "function") {
+    throw new Error("resolveNodeLocalDiscovery export not found");
+  }
+  return mod.resolveNodeLocalDiscovery;
+};
 
 function parseArgs(argv: string[]): {
   expectedDeviceId?: string;
@@ -10,6 +38,8 @@ function parseArgs(argv: string[]): {
   apiUrl: string;
   apiKey?: string;
   debug: boolean;
+  configPath?: string;
+  preferCache: boolean;
 } {
   const out: {
     expectedDeviceId?: string;
@@ -17,12 +47,18 @@ function parseArgs(argv: string[]): {
     listenPort?: number;
     once: boolean;
     idleLogMs: number;
+    apiUrl: string;
+    apiKey?: string;
+    debug: boolean;
+    configPath?: string;
+    preferCache: boolean;
   } = {
     scanMs: 5000,
     once: false,
     idleLogMs: 5000,
     apiUrl: "http://127.0.0.1:8384",
     debug: false,
+    preferCache: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -63,12 +99,41 @@ function parseArgs(argv: string[]): {
       i += 1;
       continue;
     }
+    if (arg === "--config") {
+      out.configPath = String(argv[i + 1] ?? "").trim();
+      i += 1;
+      continue;
+    }
+    if (arg === "--prefer-cache") {
+      out.preferCache = true;
+      continue;
+    }
     if (arg === "--debug") {
       out.debug = true;
     }
   }
   if (!out.apiKey) {
     out.apiKey = process.env.SYNCTHING_API_KEY?.trim();
+  }
+  if (!out.apiKey) {
+    const candidates = [
+      out.configPath,
+      process.env.SYNCTHING_CONFIG,
+      process.env.HOME ? `${process.env.HOME}/.local/state/syncthing/config.xml` : "",
+      process.env.HOME ? `${process.env.HOME}/.config/syncthing/config.xml` : "",
+      process.env.HOME ? `${process.env.HOME}/Library/Application Support/Syncthing/config.xml` : "",
+      process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Syncthing\\config.xml` : "",
+    ].filter((value): value is string => Boolean(value));
+    for (const candidate of candidates) {
+      if (!fs.existsSync(candidate)) continue;
+      const xml = fs.readFileSync(candidate, "utf8");
+      const match = xml.match(/<apikey>([^<]+)<\/apikey>/i);
+      const key = match?.[1]?.trim();
+      if (key) {
+        out.apiKey = key;
+        break;
+      }
+    }
   }
   return out;
 }
@@ -98,6 +163,7 @@ async function readSyncthingDiscoveryCache(args: {
 }
 
 async function main(): Promise<void> {
+  const resolveNodeLocalDiscovery = await loadResolveNodeLocalDiscovery();
   const args = parseArgs(process.argv.slice(2));
   let stopping = false;
   let activeController: AbortController | null = null;
@@ -151,7 +217,8 @@ async function main(): Promise<void> {
     };
     let announcements = payload.announcements ?? [];
     const bindInUse = (payload.bindErrors ?? []).some((entry) => entry.code === "EADDRINUSE");
-    if (bindInUse) {
+    const shouldUseCache = bindInUse || args.preferCache || announcements.length === 0;
+    if (shouldUseCache) {
       try {
         const cacheAnnouncements = await readSyncthingDiscoveryCache({
           apiUrl: args.apiUrl,
@@ -211,7 +278,9 @@ async function main(): Promise<void> {
       const bindSummary = (payload.bindErrors ?? [])
         .map((error) => `${error.socket}:${error.code}`)
         .join(",");
-      const mode = bindInUse ? "cache-fallback" : "udp-listen";
+      const mode = shouldUseCache
+        ? (bindInUse ? "cache-fallback(bind-in-use)" : "cache-fallback(no-udp-match)")
+        : "udp-listen";
       console.log(
         `[${startedAt}] scan#${loop} no new devices (mode=${mode}, announcements=${announcements.length}, knownDevices=${seen.size}, socketsBound=${payload.socketsBound ?? "?"}${bindSummary ? `, bindErrors=${bindSummary}` : ""})`,
       );

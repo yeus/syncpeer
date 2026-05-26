@@ -4,9 +4,8 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 use prost::Message;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::IpAddr;
@@ -382,9 +381,9 @@ struct DiscoveryLocalDiagnostics {
     packets_filtered_expected_id: u64,
     announcements_accepted: u64,
     discovered_device_ids: Vec<String>,
-    fallback_source: Option<String>,
-    fallback_error: Option<String>,
-    fallback_candidate_count: usize,
+    syncthing_lan_available: bool,
+    syncpeer_lan_active: bool,
+    status_message: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -395,6 +394,22 @@ struct LocalDiscoveryAnnounce {
     addresses: Vec<String>,
     #[prost(int64, tag = "3")]
     instance_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncpeerProbePacket {
+    version: u8,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncpeerReplyPacket {
+    version: u8,
+    request_id: String,
+    device_id: Option<String>,
+    port: u16,
 }
 
 struct TlsSession {
@@ -412,6 +427,11 @@ type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
 const RELAY_MAGIC: u32 = 0x9E79_BC40;
 const LOCAL_DISCOVERY_MAGIC: u32 = 0x2EA7_D90B;
 const LOCAL_DISCOVERY_PORT: u16 = 21027;
+const SYNCPEER_DISCOVERY_MAGIC: u32 = 0x5359_4E43;
+const SYNCPEER_DISCOVERY_PORT: u16 = 21037;
+const SYNCPEER_DISCOVERY_KIND_PROBE: u8 = 1;
+const SYNCPEER_DISCOVERY_KIND_REPLY: u8 = 2;
+const SYNCPEER_SYNC_PORT: u16 = 22000;
 const RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST: u32 = 3;
 const RELAY_MESSAGE_TYPE_RESPONSE: u32 = 4;
 const RELAY_MESSAGE_TYPE_CONNECT_REQUEST: u32 = 5;
@@ -1284,86 +1304,43 @@ fn parse_local_discovery_candidate(address: &str, device_id: Option<&str>) -> Op
     })
 }
 
-fn discover_local_candidates_from_syncthing_cache(
-    expected: &str,
-) -> Result<(Vec<DiscoveryLocalCandidate>, String), String> {
-    let endpoints = [
-        "http://127.0.0.1:8384/rest/system/discovery",
-        "http://localhost:8384/rest/system/discovery",
-        "http://127.0.0.1:58384/rest/system/discovery",
-    ];
-    let api_key_env = std::env::var("SYNCTHING_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let api_keys: Vec<Option<String>> = if let Some(key) = api_key_env {
-        vec![Some(key), None]
-    } else {
-        vec![None]
+fn make_syncpeer_packet(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(5 + body.len());
+    packet.extend_from_slice(&SYNCPEER_DISCOVERY_MAGIC.to_be_bytes());
+    packet.push(kind);
+    packet.extend_from_slice(body);
+    packet
+}
+
+fn send_syncpeer_probe(udp4: Option<&UdpSocket>, udp6: Option<&UdpSocket>, request_id: &str) {
+    let probe = SyncpeerProbePacket {
+        version: 1,
+        request_id: request_id.to_string(),
     };
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(900))
-        .build()
-        .map_err(|error| format!("Could not build fallback HTTP client: {error}"))?;
-    let mut last_error: Option<String> = None;
-    for endpoint in endpoints {
-        for api_key in &api_keys {
-            let mut request = client.get(endpoint);
-            if let Some(key) = api_key {
-                request = request.header("X-API-Key", key);
-            }
-            let response = match request.send() {
-                Ok(value) => value,
-                Err(error) => {
-                    last_error = Some(format!("{endpoint}: {error}"));
-                    continue;
-                }
-            };
-            if !response.status().is_success() {
-                last_error = Some(format!("{endpoint}: HTTP {}", response.status()));
-                continue;
-            }
-            let response_body = response
-                .text()
-                .map_err(|error| format!("{endpoint}: Could not read discovery response body: {error}"))?;
-            let payload: Value = serde_json::from_str(&response_body)
-                .map_err(|error| format!("{endpoint}: Invalid discovery JSON: {error}"))?;
-            let Some(obj) = payload.as_object() else {
-                last_error = Some(format!("{endpoint}: Discovery response is not an object"));
-                continue;
-            };
-            let mut candidates_by_address: HashMap<String, DiscoveryLocalCandidate> = HashMap::new();
-            for (device_id_raw, addresses_raw) in obj {
-                let normalized_id = canonical_device_id(device_id_raw);
-                if !expected.is_empty() && normalized_id != expected {
-                    continue;
-                }
-                let Some(addresses) = addresses_raw.as_array() else {
-                    continue;
-                };
-                for address_value in addresses {
-                    let Some(address_str) = address_value.as_str() else {
-                        continue;
-                    };
-                    let Some(normalized) =
-                        normalize_local_discovery_address(address_str, "127.0.0.1")
-                    else {
-                        continue;
-                    };
-                    if let Some(candidate) =
-                        parse_local_discovery_candidate(&normalized, Some(&normalized_id))
-                    {
-                        candidates_by_address.insert(candidate.address.clone(), candidate);
-                    }
-                }
-            }
-            return Ok((
-                candidates_by_address.into_values().collect(),
-                endpoint.to_string(),
-            ));
-        }
+    let Ok(body) = serde_json::to_vec(&probe) else {
+        return;
+    };
+    let packet = make_syncpeer_packet(SYNCPEER_DISCOVERY_KIND_PROBE, &body);
+    if let Some(socket) = udp4 {
+        let _ = socket.send_to(&packet, ("255.255.255.255", SYNCPEER_DISCOVERY_PORT));
     }
-    Err(last_error.unwrap_or_else(|| "No fallback endpoint responded".to_string()))
+    if let Some(socket) = udp6 {
+        let _ = socket.send_to(
+            &packet,
+            (Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), SYNCPEER_DISCOVERY_PORT),
+        );
+    }
+}
+
+fn parse_syncpeer_packet(packet: &[u8]) -> Option<(u8, &[u8])> {
+    if packet.len() < 6 {
+        return None;
+    }
+    let magic = u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    if magic != SYNCPEER_DISCOVERY_MAGIC {
+        return None;
+    }
+    Some((packet[4], &packet[5..]))
 }
 
 fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<DiscoveryLocalResponse, String> {
@@ -1388,14 +1365,14 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
     let mut packets_missing_id = 0_u64;
     let mut packets_filtered_expected_id = 0_u64;
     let mut announcements_accepted = 0_u64;
-    let mut fallback_source: Option<String> = None;
-    let mut fallback_error: Option<String> = None;
-    let mut fallback_candidate_count = 0_usize;
+    let mut syncthing_lan_available = false;
+    let mut syncpeer_lan_active = false;
 
     match UdpSocket::bind(("0.0.0.0", LOCAL_DISCOVERY_PORT)) {
         Ok(socket) => {
             let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
             sockets.push(("udp4", socket));
+            syncthing_lan_available = true;
         }
         Err(error) => {
             bind_kinds.push(error.kind());
@@ -1408,67 +1385,66 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
             let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
             let _ = socket.join_multicast_v6(&Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), 0);
             sockets.push(("udp6", socket));
+            syncthing_lan_available = true;
         }
         Err(error) => {
             bind_kinds.push(error.kind());
             bind_errors.push(format!("udp6 bind failed: {error}"));
         }
     }
-
-    if sockets.is_empty() {
-        let only_addr_in_use_or_permission = !bind_kinds.is_empty()
-            && bind_kinds.iter().all(|kind| {
-                *kind == ErrorKind::AddrInUse || *kind == ErrorKind::PermissionDenied
-            });
-        if only_addr_in_use_or_permission {
-            tauri_log(&format!(
-                "local_discovery.bind_unavailable port={} reason={} -> returning empty candidate list",
-                LOCAL_DISCOVERY_PORT,
-                bind_errors.join(" | ")
-            ));
-            let (fallback_candidates, source, error) =
-                match discover_local_candidates_from_syncthing_cache(&expected) {
-                    Ok((candidates, source)) => (candidates, Some(source), None),
-                    Err(error) => (Vec::new(), None, Some(error)),
-                };
-            fallback_candidate_count = fallback_candidates.len();
-            fallback_source = source;
-            fallback_error = error;
-            return Ok(DiscoveryLocalResponse {
-                candidates: fallback_candidates.clone(),
-                diagnostics: DiscoveryLocalDiagnostics {
-                    timeout_ms,
-                    sockets_bound: 0,
-                    bind_errors,
-                    packets_received: 0,
-                    packets_by_socket_udp4: 0,
-                    packets_by_socket_udp6: 0,
-                    packets_magic_mismatch: 0,
-                    packets_decode_failed: 0,
-                    packets_missing_id: 0,
-                    packets_filtered_expected_id: 0,
-                    announcements_accepted: 0,
-                    discovered_device_ids: fallback_candidates
-                        .iter()
-                        .filter_map(|candidate| candidate.device_id.clone())
-                        .collect(),
-                    fallback_source,
-                    fallback_error,
-                    fallback_candidate_count,
-                },
-            });
+    let syncpeer_udp4 = match UdpSocket::bind(("0.0.0.0", SYNCPEER_DISCOVERY_PORT)) {
+        Ok(socket) => {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
+            let _ = socket.set_broadcast(true);
+            syncpeer_lan_active = true;
+            Some(socket)
         }
-        return Err(format!(
-            "Local discovery could not bind UDP {} ({}).",
-            LOCAL_DISCOVERY_PORT,
-            bind_errors.join(" | ")
-        ));
+        Err(error) => {
+            bind_errors.push(format!("syncpeer udp4 bind failed: {error}"));
+            None
+        }
+    };
+    let syncpeer_udp6 = match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, SYNCPEER_DISCOVERY_PORT)) {
+        Ok(socket) => {
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
+            let _ = socket.join_multicast_v6(&Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), 0);
+            syncpeer_lan_active = true;
+            Some(socket)
+        }
+        Err(error) => {
+            bind_errors.push(format!("syncpeer udp6 bind failed: {error}"));
+            None
+        }
+    };
+    if sockets.is_empty() && syncpeer_udp4.is_none() && syncpeer_udp6.is_none() {
+        return Err(format!("Local discovery sockets unavailable ({}).", bind_errors.join(" | ")));
     }
 
     let started = SystemTime::now();
     let mut candidates = HashMap::<String, DiscoveryLocalCandidate>::new();
+    let mut seen_ids = HashSet::<String>::new();
+    let request_id = format!(
+        "{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_millis(),
+        std::process::id()
+    );
+    let mut last_probe_at = started
+        .checked_sub(Duration::from_millis(500))
+        .unwrap_or(started);
     let mut buf = vec![0u8; 4096];
     loop {
+        let now = SystemTime::now();
+        if now
+            .duration_since(last_probe_at)
+            .unwrap_or(Duration::from_millis(0))
+            >= Duration::from_millis(450)
+        {
+            send_syncpeer_probe(syncpeer_udp4.as_ref(), syncpeer_udp6.as_ref(), &request_id);
+            last_probe_at = now;
+        }
         for (label, socket) in sockets.iter() {
             match socket.recv_from(&mut buf) {
                 Ok((size, source)) => {
@@ -1525,6 +1501,90 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
                 }
             }
         }
+        for socket in [syncpeer_udp4.as_ref(), syncpeer_udp6.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            match socket.recv_from(&mut buf) {
+                Ok((size, source)) => {
+                    packets_received += 1;
+                    let Some((kind, body)) = parse_syncpeer_packet(&buf[..size]) else {
+                        packets_magic_mismatch += 1;
+                        continue;
+                    };
+                    if kind == SYNCPEER_DISCOVERY_KIND_PROBE {
+                        let Ok(probe) = serde_json::from_slice::<SyncpeerProbePacket>(body) else {
+                            packets_decode_failed += 1;
+                            continue;
+                        };
+                        if probe.version != 1 {
+                            packets_decode_failed += 1;
+                            continue;
+                        }
+                        let reply = SyncpeerReplyPacket {
+                            version: 1,
+                            request_id: probe.request_id,
+                            device_id: None,
+                            port: SYNCPEER_SYNC_PORT,
+                        };
+                        let Ok(reply_body) = serde_json::to_vec(&reply) else {
+                            continue;
+                        };
+                        let reply_packet =
+                            make_syncpeer_packet(SYNCPEER_DISCOVERY_KIND_REPLY, &reply_body);
+                        let _ = socket.send_to(&reply_packet, source);
+                        continue;
+                    }
+                    if kind != SYNCPEER_DISCOVERY_KIND_REPLY {
+                        packets_decode_failed += 1;
+                        continue;
+                    }
+                    let Ok(reply) = serde_json::from_slice::<SyncpeerReplyPacket>(body) else {
+                        packets_decode_failed += 1;
+                        continue;
+                    };
+                    if reply.version != 1 || reply.request_id != request_id {
+                        packets_filtered_expected_id += 1;
+                        continue;
+                    }
+                    let source_ip = source.ip().to_string();
+                    let normalized_id = reply
+                        .device_id
+                        .as_deref()
+                        .map(canonical_device_id)
+                        .unwrap_or_default();
+                    if !expected.is_empty() && normalized_id != expected {
+                        packets_filtered_expected_id += 1;
+                        continue;
+                    }
+                    if !normalized_id.is_empty() {
+                        if !seen_ids.insert(normalized_id.clone()) {
+                            // allow multiple addresses but keep id set for diagnostics
+                        }
+                    }
+                    let candidate = DiscoveryLocalCandidate {
+                        address: format!("tcp://{}:{}", source_ip, reply.port),
+                        protocol: "tcp".to_string(),
+                        host: Some(source_ip),
+                        port: Some(reply.port),
+                        device_id: if normalized_id.is_empty() {
+                            None
+                        } else {
+                            Some(normalized_id)
+                        },
+                    };
+                    announcements_accepted += 1;
+                    candidates.insert(candidate.address.clone(), candidate);
+                }
+                Err(error) => {
+                    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut {
+                        // continue scanning until timeout window expires
+                    } else {
+                        return Err(format!("SyncPeer discovery UDP read failed: {error}"));
+                    }
+                }
+            }
+        }
         let elapsed = SystemTime::now()
             .duration_since(started)
             .unwrap_or(Duration::from_millis(timeout_ms));
@@ -1532,28 +1592,20 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
             break;
         }
     }
-
-    let mut candidates = candidates.into_values().collect::<Vec<_>>();
-    if candidates.is_empty() {
-        match discover_local_candidates_from_syncthing_cache(&expected) {
-            Ok((fallback_candidates, source)) => {
-                fallback_source = Some(source);
-                fallback_candidate_count = fallback_candidates.len();
-                if !fallback_candidates.is_empty() {
-                    candidates = fallback_candidates;
-                }
-            }
-            Err(error) => {
-                fallback_error = Some(error);
-            }
-        }
-    }
+    let candidates = candidates.into_values().collect::<Vec<_>>();
     let mut discovered_device_ids = candidates
         .iter()
         .filter_map(|candidate| candidate.device_id.clone())
         .collect::<Vec<_>>();
     discovered_device_ids.sort();
     discovered_device_ids.dedup();
+    let status_message = if syncthing_lan_available {
+        "LAN discovery active".to_string()
+    } else if syncpeer_lan_active {
+        "LAN discovery active (Syncthing port in use; using SyncPeer discovery)".to_string()
+    } else {
+        "LAN discovery degraded".to_string()
+    };
     Ok(DiscoveryLocalResponse {
         diagnostics: DiscoveryLocalDiagnostics {
             timeout_ms,
@@ -1568,9 +1620,9 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
             packets_filtered_expected_id,
             announcements_accepted,
             discovered_device_ids,
-            fallback_source,
-            fallback_error,
-            fallback_candidate_count,
+            syncthing_lan_available,
+            syncpeer_lan_active,
+            status_message,
         },
         candidates,
     })
@@ -3115,4 +3167,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syncpeer_packet_roundtrip_probe() {
+        let probe = SyncpeerProbePacket {
+            version: 1,
+            request_id: "test-request".to_string(),
+        };
+        let body = serde_json::to_vec(&probe).expect("probe should serialize");
+        let packet = make_syncpeer_packet(SYNCPEER_DISCOVERY_KIND_PROBE, &body);
+        let parsed = parse_syncpeer_packet(&packet).expect("packet should parse");
+        assert_eq!(parsed.0, SYNCPEER_DISCOVERY_KIND_PROBE);
+        let decoded: SyncpeerProbePacket =
+            serde_json::from_slice(parsed.1).expect("probe should deserialize");
+        assert_eq!(decoded.request_id, "test-request");
+        assert_eq!(decoded.version, 1);
+    }
+
+    #[test]
+    fn syncpeer_packet_rejects_invalid_magic() {
+        let invalid = vec![0_u8, 1, 2, 3, SYNCPEER_DISCOVERY_KIND_REPLY, 1, 2, 3];
+        assert!(parse_syncpeer_packet(&invalid).is_none());
+    }
 }

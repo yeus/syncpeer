@@ -13,6 +13,8 @@
     "test:local-discovery": "node --experimental-strip-types scripts/test-node-local-discovery.ts",
     "test:local-discovery:once": "node --experimental-strip-types scripts/test-node-local-discovery.ts --once",
     "test:local-discovery:self": "node --experimental-strip-types scripts/test-node-local-discovery-selftest.ts",
+    "test:syncthing-diagnostics": "node --experimental-strip-types scripts/test-syncthing-client-diagnostics.ts",
+    "test:tauri-local-discovery": "node --experimental-strip-types scripts/test-tauri-local-discovery.ts",
     "build": "npm run build:cli && npm run build:app && npm run build:tauri",
     "build:cli": "npm run build -w @syncpeer/cli",
     "build:app": "npm run build -w @syncpeer/app",

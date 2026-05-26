@@ -1,4 +1,4 @@
-import type { AdvertisedDeviceInfo, FolderInfo } from "../core/model/remoteFs.ts";
+import type { AdvertisedDeviceInfo, FolderInfo } from "../core/model/remoteFs.js";
 
 export interface BreadcrumbSegment {
   key: string;
@@ -219,7 +219,7 @@ export const collectAdvertisedDevices = (
   sourceDeviceId: string,
   sourceIsIntroducer: boolean,
 ): AdvertisedDeviceItem[] => {
-  if (!sourceIsIntroducer || !sourceDeviceId) return [];
+  if (!sourceDeviceId) return [];
   const savedIds = new Set(knownDevices.map((device) => normalizeDeviceId(device.id)));
   const map = new Map<string, AdvertisedDeviceItem>();
   for (const folder of availableFolders) {

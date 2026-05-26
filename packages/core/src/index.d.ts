@@ -1,3 +1,3 @@
-export * from "./browser.d.ts";
-export * from "./node.d.ts";
+export * from "./browser.d.js";
+export * from "./node.d.js";
 

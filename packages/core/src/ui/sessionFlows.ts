@@ -1,5 +1,5 @@
-import type { ConnectOptions, RemoteFsLike } from "./browserClient.ts";
-import type { FileEntry, FolderSyncState } from "../core/model/remoteFs.ts";
+import type { ConnectOptions, RemoteFsLike } from "./browserClient.js";
+import type { FileEntry, FolderSyncState } from "../core/model/remoteFs.js";
 
 export interface FlowDeps {
   sleep: (ms: number) => Promise<void>;

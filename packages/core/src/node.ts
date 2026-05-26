@@ -15,9 +15,9 @@ import {
   type SyncpeerHostAdapter,
   type SyncpeerTlsConnectOptions,
   type SyncpeerTlsSocket,
-} from "./client.ts";
-import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.ts";
-import type { SessionTransport } from "./ui/sessionTypes.ts";
+} from "./client.js";
+import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.js";
+import type { SessionTransport } from "./ui/sessionTypes.js";
 
 type ByteBuffer = Buffer<ArrayBufferLike>;
 const LOCAL_DISCOVERY_MAGIC = 0x2ea7d90b;

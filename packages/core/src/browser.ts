@@ -1,4 +1,4 @@
-export { createSyncpeerCoreClient } from "./client.ts";
+export { createSyncpeerCoreClient } from "./client.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
@@ -8,8 +8,8 @@ export type {
   SyncpeerSessionHandle,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
-} from "./client.ts";
-export { RemoteFs } from "./core/model/remoteFs.ts";
+} from "./client.js";
+export { RemoteFs } from "./core/model/remoteFs.js";
 export type {
   AdvertisedDeviceInfo,
   FileBlock,
@@ -18,16 +18,16 @@ export type {
   FolderInfo,
   FolderSyncState,
   RemoteDeviceInfo,
-} from "./core/model/remoteFs.ts";
+} from "./core/model/remoteFs.js";
 export {
   buildConnectionDetails,
   fromConnectionSettings,
   toConnectionSettings,
-} from "./ui/connectionState.ts";
+} from "./ui/connectionState.js";
 export type {
   DiscoveryMode,
   StoredConnectionSettingsLike,
-} from "./ui/connectionState.ts";
+} from "./ui/connectionState.js";
 export {
   breadcrumbSegments,
   cachedFileKey,
@@ -47,32 +47,32 @@ export {
   resolveDirectoryPath,
   sleep,
   syncApprovedFolderKey,
-} from "./ui/helpers.ts";
+} from "./ui/helpers.js";
 export {
   FOLDER_PASSWORD_SCOPE_SEPARATOR,
   folderPasswordScopedKey,
   isScopedFolderPasswordKey,
   resolveFolderPasswordsForDevice,
-} from "./ui/sessionPasswords.ts";
+} from "./ui/sessionPasswords.js";
 export type {
   AdvertisedDeviceItem,
   AdvertisedFolderItem,
   BreadcrumbSegment,
   SavedDeviceLike,
-} from "./ui/helpers.ts";
+} from "./ui/helpers.js";
 export {
   createSyncpeerBrowserClient,
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
   reportClientError,
-} from "./ui/browserClient.ts";
-export { createSyncpeerSessionStore } from "./ui/sessionStore.ts";
+} from "./ui/browserClient.js";
+export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export {
   makeReadDirWithRetryFlow,
   makeWaitForFolderIndexToArriveFlow,
   makeWaitForFoldersToPopulateFlow,
-} from "./ui/sessionFlows.ts";
-export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.ts";
+} from "./ui/sessionFlows.js";
+export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.js";
 export type {
   CachedFileRecord,
   CachedFileStatus,
@@ -87,7 +87,7 @@ export type {
   SyncpeerIdentityRecord,
   SyncpeerPlatformAdapter,
   UiLogEntry,
-} from "./ui/browserClient.ts";
+} from "./ui/browserClient.js";
 export type {
   SessionPendingState,
   SessionPhase,
@@ -98,5 +98,5 @@ export type {
   SessionTraceEvent,
   SessionTransport,
   SyncpeerSessionStore,
-} from "./ui/sessionTypes.ts";
-export type { FolderIndexPollAttempt, ReadDirAttempt } from "./ui/sessionFlows.ts";
+} from "./ui/sessionTypes.js";
+export type { FolderIndexPollAttempt, ReadDirAttempt } from "./ui/sessionFlows.js";

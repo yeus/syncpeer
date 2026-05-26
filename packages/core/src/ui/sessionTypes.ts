@@ -1,5 +1,5 @@
-import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.ts";
-import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./browserClient.ts";
+import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.js";
+import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./browserClient.js";
 
 export type SessionPhase = "idle" | "connecting" | "connected" | "refreshing" | "error";
 

@@ -78,9 +78,9 @@ interface DiscoveryLocalResponsePayload {
     packetsFilteredExpectedId?: number;
     announcementsAccepted?: number;
     discoveredDeviceIds?: string[];
-    fallbackSource?: string | null;
-    fallbackError?: string | null;
-    fallbackCandidateCount?: number;
+    syncthingLanAvailable?: boolean;
+    syncpeerLanActive?: boolean;
+    statusMessage?: string;
   };
 }
 
@@ -309,9 +309,9 @@ export const createTauriAdapters = (
         packetsFilteredExpectedId: payload.diagnostics?.packetsFilteredExpectedId ?? 0,
         announcementsAccepted: payload.diagnostics?.announcementsAccepted ?? 0,
         discoveredDeviceIds: payload.diagnostics?.discoveredDeviceIds ?? [],
-        fallbackSource: payload.diagnostics?.fallbackSource ?? null,
-        fallbackError: payload.diagnostics?.fallbackError ?? null,
-        fallbackCandidateCount: payload.diagnostics?.fallbackCandidateCount ?? 0,
+        syncthingLanAvailable: payload.diagnostics?.syncthingLanAvailable ?? false,
+        syncpeerLanActive: payload.diagnostics?.syncpeerLanActive ?? false,
+        statusMessage: payload.diagnostics?.statusMessage ?? "LAN discovery status unknown",
         candidateCount: payload.candidates?.length ?? 0,
       });
       return (payload.candidates ?? [])

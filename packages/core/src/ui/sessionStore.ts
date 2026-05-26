@@ -1,4 +1,4 @@
-import type { ConnectOptions } from "./browserClient.ts";
+import type { ConnectOptions } from "./browserClient.js";
 import {
   applyOverviewToState,
   createInitialSessionState,
@@ -6,19 +6,19 @@ import {
   folderVersionKey,
   setCurrentLocation,
   withUpdatedFolderPasswords,
-} from "./sessionPolicies.ts";
+} from "./sessionPolicies.js";
 import {
   makeReadDirWithRetryFlow,
   makeWaitForFolderIndexToArriveFlow,
   makeWaitForFoldersToPopulateFlow,
-} from "./sessionFlows.ts";
+} from "./sessionFlows.js";
 import type {
   SessionRuntimeDeps,
   SessionState,
   SessionTraceEvent,
   SyncpeerSessionStore,
-} from "./sessionTypes.ts";
-import { normalizePath } from "./helpers.ts";
+} from "./sessionTypes.js";
+import { normalizePath } from "./helpers.js";
 
 const resolveErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);

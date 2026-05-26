@@ -1,7 +1,32 @@
 import crypto from "node:crypto";
 import dgram from "node:dgram";
 import protobuf from "protobufjs";
-import { resolveNodeLocalDiscovery } from "../packages/core/src/node.ts";
+
+type ResolveNodeLocalDiscovery = (args: {
+  expectedDeviceId?: string;
+  timeoutMs?: number;
+  listenPort?: number;
+}) => Promise<{
+  candidates: Array<{ protocol?: string; host?: string; port?: number }>;
+}>;
+
+const loadResolveNodeLocalDiscovery = async (): Promise<ResolveNodeLocalDiscovery> => {
+  try {
+    const mod = (await import("../packages/core/dist/node.js")) as {
+      resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
+    };
+    if (typeof mod.resolveNodeLocalDiscovery === "function") {
+      return mod.resolveNodeLocalDiscovery;
+    }
+  } catch {}
+  const mod = (await import("../packages/core/src/node.ts")) as {
+    resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
+  };
+  if (typeof mod.resolveNodeLocalDiscovery !== "function") {
+    throw new Error("resolveNodeLocalDiscovery export not found");
+  }
+  return mod.resolveNodeLocalDiscovery;
+};
 
 const MAGIC = 0x2ea7d90b;
 const ANNOUNCE = new protobuf.Type("Announce")
@@ -57,6 +82,7 @@ async function sendOnce(port: number, packet: Uint8Array): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const resolveNodeLocalDiscovery = await loadResolveNodeLocalDiscovery();
   const listenPort = 32127;
   const idBytes = crypto.randomBytes(32);
   const expectedDeviceId = base32NoPadding(idBytes);

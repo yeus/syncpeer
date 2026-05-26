@@ -15,6 +15,7 @@ import {
   type BreadcrumbSegment,
 } from "@syncpeer/core/browser";
 import {
+  canonicalRecordPath,
   sidecarManifestPath,
   sidecarOpPath,
 } from "../../../core/src/pim/index.ts";
@@ -211,6 +212,21 @@ const normalizeCandidateDeviceId = (deviceId: string) => normalizeDeviceId(devic
 
 const normalizeCandidateAddresses = (addresses: string[]) =>
   [...new Set(addresses.map((item) => String(item ?? "").trim()).filter(Boolean))].sort();
+
+const parseTcpAddress = (
+  address: string,
+): { host: string; port: number } | null => {
+  const trimmed = String(address ?? "").trim();
+  if (!trimmed.startsWith("tcp://")) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const port = Number(parsed.port);
+    if (!parsed.hostname || !Number.isFinite(port) || port <= 0) return null;
+    return { host: parsed.hostname, port };
+  } catch {
+    return null;
+  }
+};
 
 const suggestedSavedDeviceName = (state: AppState, deviceId: string) => {
   const normalized = normalizeDeviceId(deviceId);
@@ -503,6 +519,45 @@ const readDirectoryEntriesRecursively = async (
   return [...entries, ...nested.flat()];
 };
 
+const ensurePimFolderFavorite = async (
+  state: AppState,
+  client: SyncpeerBrowserClient,
+  folderId: string,
+  pimRoot: string,
+) => {
+  const path = normalizePath(pimRoot);
+  const key = favoriteKey(folderId, path, "folder");
+  const exists = state.favorites.items.some((item) => item.key === key);
+  if (!exists) {
+    const next = await client.upsertFavorite({
+      key,
+      folderId,
+      path,
+      name: "PIM (Contacts & Calendar)",
+      kind: "folder",
+    });
+    state.favorites.items = next;
+  }
+};
+
+const cachePimTreeOffline = async (
+  state: AppState,
+  client: SyncpeerBrowserClient,
+  folderId: string,
+  remoteFs: NonNullable<AppState["session"]["remoteFs"]>,
+  pimRoot: string,
+) => {
+  const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, pimRoot, 8);
+  const files = entries.filter((entry) => entry.type === "file");
+  for (const entry of files) {
+    const bytes = await remoteFs.readFileFully(folderId, entry.path);
+    const name = entry.path.split("/").pop() ?? "file";
+    await client.cacheFile(folderId, entry.path, name, bytes, entry.modifiedMs);
+    updateCachedKey(state, folderId, entry.path, true);
+  }
+  await refreshFolderRootCachedStatuses(state, client, [folderId]);
+};
+
 const remoteHasUnapprovedFolderShare = (
   folders: Array<{ localDevicePresentInFolder?: boolean }>,
 ) => folders.some((folder) => folder.localDevicePresentInFolder === false);
@@ -572,6 +627,29 @@ export const createAppActions = (args: {
   client: SyncpeerBrowserClient;
   sessionStore: SyncpeerSessionStore;
 }) => {
+  interface DiagnosticsCategory {
+    id: string;
+    name: string;
+    description: string;
+  }
+
+  interface DiagnosticsTestItem {
+    id: string;
+    name: string;
+    description: string;
+    categoryId: string;
+  }
+
+  interface DiagnosticsCatalog {
+    categories: DiagnosticsCategory[];
+    tests: DiagnosticsTestItem[];
+  }
+
+  interface DiagnosticsDefinition {
+    test: DiagnosticsTestItem;
+    fn: TaskyonTestFn;
+  }
+
   const { state, client, sessionStore } = args;
   let downloadNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let lastTransferNotificationAtMs = 0;
@@ -1116,11 +1194,26 @@ export const createAppActions = (args: {
         string,
         { addresses: string[]; lastSeenAtMs: number }
       > = {};
+      const nextAnonymous: Array<{
+        id: string;
+        addresses: string[];
+        lastSeenAtMs: number;
+      }> = [];
       for (const candidate of discovered) {
+        const addresses = normalizeCandidateAddresses(candidate.addresses);
+        if (candidate.anonymous) {
+          if (addresses.length > 0) {
+            nextAnonymous.push({
+              id: candidate.deviceId,
+              addresses,
+              lastSeenAtMs: Date.now(),
+            });
+          }
+          continue;
+        }
         const candidateDeviceId = normalizeCandidateDeviceId(candidate.deviceId);
         if (!candidateDeviceId) continue;
         if (candidateDeviceId === localDeviceId) continue;
-        const addresses = normalizeCandidateAddresses(candidate.addresses);
         nextSeenIds.add(candidateDeviceId);
         nextByDeviceId[candidateDeviceId] = {
           addresses,
@@ -1135,11 +1228,35 @@ export const createAppActions = (args: {
       }
       state.devices.lanDiscoveredDeviceIds = nextSeenIds;
       state.devices.lanDiscoveryByDeviceId = nextByDeviceId;
+      state.devices.lanAnonymousCandidates = nextAnonymous;
     } catch (error) {
       reportActionError(state, "lan_discovery.failed", error, options);
     } finally {
       state.devices.isDiscoveringLanDevices = false;
     }
+  };
+
+  const connectViaLanAnonymousCandidate = async (candidateId: string) => {
+    const candidate = state.devices.lanAnonymousCandidates.find(
+      (entry) => entry.id === candidateId,
+    );
+    if (!candidate) {
+      state.ui.recentError = "LAN candidate not found.";
+      return;
+    }
+    const parsed = candidate.addresses
+      .map((entry) => parseTcpAddress(entry))
+      .find((entry): entry is { host: string; port: number } => !!entry);
+    if (!parsed) {
+      state.ui.recentError = "LAN candidate has no usable tcp:// address.";
+      return;
+    }
+    state.connection.discoveryMode = "direct";
+    state.connection.host = parsed.host;
+    state.connection.port = parsed.port;
+    state.connection.remoteId = "";
+    state.devices.selectedSavedDeviceId = "";
+    await connect();
   };
 
   const copyCurrentDeviceId = async () => {
@@ -1586,6 +1703,8 @@ export const createAppActions = (args: {
     });
     state.devices.selectedSavedDeviceId = normalized;
     state.connection.remoteId = normalized;
+    state.connection.discoveryMode = "global";
+    state.connection.host = "";
     state.devices.newSavedDeviceId = "";
     state.devices.newSavedDeviceCustomName = "";
     state.devices.newSavedDeviceIsIntroducer = false;
@@ -1612,6 +1731,8 @@ export const createAppActions = (args: {
   const useSavedDevice = (deviceId: string) => {
     state.devices.selectedSavedDeviceId = deviceId;
     state.connection.remoteId = deviceId;
+    state.connection.discoveryMode = "global";
+    state.connection.host = "";
     if (!state.session.isConnected) {
       restoreOfflineSnapshot(state, deviceId, "use_saved_device");
       return;
@@ -1666,6 +1787,8 @@ export const createAppActions = (args: {
     upsertSavedDevice(state, device.id, device.name, { customName: false });
     state.devices.selectedSavedDeviceId = device.id;
     state.connection.remoteId = device.id;
+    state.connection.discoveryMode = "global";
+    state.connection.host = "";
     state.ui.recentError = null;
   };
 
@@ -2067,6 +2190,9 @@ export const createAppActions = (args: {
         encoder.encode(bootstrapEvent),
         { modifiedMs: now },
       );
+      const pimTreeRoot = `${root}/syncpeer/pim`;
+      await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
+      await cachePimTreeOffline(state, client, folderId, state.session.remoteFs, pimTreeRoot);
       state.ui.uploadMessage = "Initialized contacts/calendar structure in current folder.";
       await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
     } catch (error) {
@@ -2171,6 +2297,10 @@ export const createAppActions = (args: {
         }
       }
 
+      const pimTreeRoot = `${root}/syncpeer/pim`;
+      await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
+      await cachePimTreeOffline(state, client, folderId, remoteFs, pimTreeRoot);
+
       state.ui.uploadMessage =
         `PIM sync complete. Wrote ${writtenContacts} contacts + ${writtenEvents} events; imported ${importedContacts} contacts + ${importedEvents} events.`;
       await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
@@ -2256,6 +2386,10 @@ export const createAppActions = (args: {
           }
         }
       }
+
+      const pimTreeRoot = `${root}/syncpeer/pim`;
+      await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
+      await cachePimTreeOffline(state, client, folderId, remoteFs, pimTreeRoot);
 
       state.ui.uploadMessage =
         `Provider import complete. Imported ${importedContacts} contacts and ${importedEvents} events into Android.`;
@@ -2404,6 +2538,254 @@ export const createAppActions = (args: {
     };
   };
 
+  const diagnosticsCategories: DiagnosticsCategory[] = [
+    {
+      id: "core",
+      name: "Core Connectivity",
+      description: "Folder/index diagnostics and upload probe checks.",
+    },
+    {
+      id: "pim",
+      name: "PIM",
+      description: "Canonical path and basic .vcf/.ics serialization checks.",
+    },
+    {
+      id: "syncthing",
+      name: "Syncthing",
+      description: "PIM folder favorite/offline pinning and write/read probes.",
+    },
+    {
+      id: "android",
+      name: "Android",
+      description: "Android provider bridge smoke tests.",
+    },
+  ];
+
+  const buildDiagnosticsDefinitions = (args?: {
+    expectedAdvertisedDeviceIds?: string[];
+    failOnExpectedMissing?: boolean;
+  }): DiagnosticsDefinition[] => [
+    {
+      test: {
+        id: "core.folder_diagnostics",
+        name: "Folder Diagnostics",
+        description: "Runs folder/index diagnostics plus upload probe.",
+        categoryId: "core",
+      },
+      fn: async () => runFolderDiagnosticsTest(args),
+    },
+    {
+      test: {
+        id: "pim.canonical_paths",
+        name: "PIM Canonical Paths",
+        description: "Verifies one-entry-per-file .vcf/.ics and sidecar path layout.",
+        categoryId: "pim",
+      },
+      fn: async () => {
+        const contactPath = canonicalRecordPath({
+          domain: "contacts",
+          collectionId: "default",
+          recordId: "alice",
+        });
+        const eventPath = canonicalRecordPath({
+          domain: "calendar",
+          collectionId: "default",
+          recordId: "event-1",
+        });
+        const manifest = sidecarManifestPath("contacts", "default");
+        const opPath = sidecarOpPath({
+          domain: "calendar",
+          collectionId: "default",
+          epoch: "2026-05",
+          opId: "devA-1",
+        });
+        return { contactPath, eventPath, manifest, opPath };
+      },
+    },
+    {
+      test: {
+        id: "pim.vcf_roundtrip",
+        name: "PIM VCF Roundtrip",
+        description: "Serializes and parses contact payload fields.",
+        categoryId: "pim",
+      },
+      fn: async () => {
+        const payload = toVcard({
+          uid: "test-contact",
+          displayName: "Alice Example",
+          phones: ["+1-555-1234"],
+          emails: ["alice@example.com"],
+        });
+        return { parsed: parseVcard(payload) };
+      },
+    },
+    {
+      test: {
+        id: "pim.ics_roundtrip",
+        name: "PIM ICS Roundtrip",
+        description: "Serializes and parses basic event payload fields.",
+        categoryId: "pim",
+      },
+      fn: async () => {
+        const payload = toIcsEvent({
+          uid: "test-event",
+          title: "Example Meeting",
+          startMs: Date.UTC(2026, 0, 1, 9, 0, 0),
+          endMs: Date.UTC(2026, 0, 1, 10, 0, 0),
+        });
+        return { parsed: parseIcsEvent(payload) };
+      },
+    },
+    {
+      test: {
+        id: "syncthing.pim_favorite_cached",
+        name: "PIM Favorite + Cache Status",
+        description: "Checks whether PIM root is favorited and cached offline.",
+        categoryId: "syncthing",
+      },
+      fn: async () => {
+        const folderId = state.session.currentFolderId;
+        if (!state.session.isConnected || !folderId) {
+          return { skipped: true, reason: "Connect and open a folder first." };
+        }
+        const root = normalizePimRoot(state.pim.syncFolderPath);
+        const pimTreeRoot = `${root}/syncpeer/pim`;
+        const key = favoriteKey(folderId, normalizePath(pimTreeRoot), "folder");
+        const favorited = state.favorites.items.some((item) => item.key === key);
+        const statuses = await client.getCachedStatuses(folderId, [pimTreeRoot]);
+        return { favorited, statuses };
+      },
+    },
+    {
+      test: {
+        id: "syncthing.pim_write_read_probe",
+        name: "PIM Write/Read Probe",
+        description: "Writes a probe vCard file and reads it back.",
+        categoryId: "syncthing",
+      },
+      fn: async () => {
+        const folderId = state.session.currentFolderId;
+        const remoteFs = state.session.remoteFs;
+        if (!state.session.isConnected || !folderId || !remoteFs?.writeFileFully) {
+          return { skipped: true, reason: "Writable connected folder required." };
+        }
+        const root = normalizePimRoot(state.pim.syncFolderPath);
+        const probePath = joinPath(
+          root,
+          "syncpeer/pim/contacts/collections/default/entries/probe-contact.vcf",
+        );
+        const payload = toVcard({
+          uid: "probe-contact",
+          displayName: "Probe Contact",
+          phones: ["+1-555-0000"],
+          emails: ["probe@example.com"],
+        });
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+        await remoteFs.writeFileFully(folderId, probePath, encoder.encode(payload), {
+          modifiedMs: Date.now(),
+        });
+        const readBack = decoder.decode(await remoteFs.readFileFully(folderId, probePath));
+        return { probePath, parsed: parseVcard(readBack) };
+      },
+    },
+    {
+      test: {
+        id: "android.contacts_list_smoke",
+        name: "Android Contacts List Smoke",
+        description: "Calls Android contacts provider bridge list endpoint.",
+        categoryId: "android",
+      },
+      fn: async () => {
+        try {
+          const contacts = await client.listAndroidContacts();
+          return { supported: true, count: contacts.length };
+        } catch (error) {
+          return {
+            supported: false,
+            skipped: true,
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+    },
+    {
+      test: {
+        id: "android.calendar_list_smoke",
+        name: "Android Calendar List Smoke",
+        description: "Calls Android calendar provider bridge list endpoint.",
+        categoryId: "android",
+      },
+      fn: async () => {
+        try {
+          const events = await client.listAndroidCalendarEvents({});
+          return { supported: true, count: events.length };
+        } catch (error) {
+          return {
+            supported: false,
+            skipped: true,
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+    },
+  ];
+
+  const loadDiagnosticsCatalog = async (): Promise<DiagnosticsCatalog> => ({
+    categories: diagnosticsCategories,
+    tests: buildDiagnosticsDefinitions().map((item) => item.test),
+  });
+
+  const runDiagnosticsTestById = async (
+    testId: string,
+    args?: { expectedAdvertisedDeviceIds?: string[]; failOnExpectedMissing?: boolean },
+  ) => {
+    const definition = buildDiagnosticsDefinitions(args).find((item) => item.test.id === testId);
+    if (!definition) throw new Error(`Unknown diagnostics test: ${testId}`);
+    const results = await runDiagnosticsTests({ [definition.test.name]: definition.fn }, { details: true });
+    const passed = results.filter((item) => item.ok).length;
+    return {
+      summary: {
+        runAtIso: new Date().toISOString(),
+        mode: "single",
+        testId,
+        allPassed: passed === results.length,
+        passed,
+        failed: results.length - passed,
+      },
+      results,
+    };
+  };
+
+  const runDiagnosticsCategory = async (
+    categoryId: string,
+    args?: { expectedAdvertisedDeviceIds?: string[]; failOnExpectedMissing?: boolean },
+  ) => {
+    const definitions = buildDiagnosticsDefinitions(args).filter(
+      (item) => item.test.categoryId === categoryId,
+    );
+    if (definitions.length === 0) {
+      throw new Error(`No diagnostics tests found for category: ${categoryId}`);
+    }
+    const tests: Record<string, TaskyonTestFn> = {};
+    for (const definition of definitions) {
+      tests[definition.test.name] = definition.fn;
+    }
+    const results = await runDiagnosticsTests(tests, { details: true });
+    const passed = results.filter((item) => item.ok).length;
+    return {
+      summary: {
+        runAtIso: new Date().toISOString(),
+        mode: "category",
+        categoryId,
+        allPassed: passed === results.length,
+        passed,
+        failed: results.length - passed,
+      },
+      results,
+    };
+  };
+
   return {
     hydrate,
     connect,
@@ -2412,6 +2794,7 @@ export const createAppActions = (args: {
     refreshActiveView,
     refreshCurrentDeviceId,
     discoverLocalDevices,
+    connectViaLanAnonymousCandidate,
     copyCurrentDeviceId,
     copySessionLogs,
     openFolderRoot,
@@ -2462,6 +2845,9 @@ export const createAppActions = (args: {
     openDiagnosticsPage,
     closeDiagnosticsPage,
     runFolderDiagnosticsTest,
+    loadDiagnosticsCatalog,
+    runDiagnosticsTestById,
+    runDiagnosticsCategory,
     persist: () => persistState(state),
     restoreOfflineSnapshot: (deviceId?: string, reason?: string) =>
       restoreOfflineSnapshot(state, deviceId, reason),

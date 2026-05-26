@@ -16,10 +16,6 @@
     onClearAllCache: () => void;
     onClearOfflineFolderState: () => void;
     onOpenDiagnosticsPage: () => void;
-    onPickAndroidPimDirectory: () => void;
-    onInitializePimFolder: () => void;
-    onSyncAndroidPimNow: () => void;
-    onImportProviderPimFromFolder: () => void;
     onCopyCurrentDeviceId: () => void;
     onCopySessionLogs: () => void;
     onEditLocalDeviceName: () => void;
@@ -31,6 +27,7 @@
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
+    onConnectLocalCandidate: (candidateId: string) => void;
   }
 
   let {
@@ -45,10 +42,6 @@
     onClearAllCache,
     onClearOfflineFolderState,
     onOpenDiagnosticsPage,
-    onPickAndroidPimDirectory,
-    onInitializePimFolder,
-    onSyncAndroidPimNow,
-    onImportProviderPimFromFolder,
     onCopyCurrentDeviceId,
     onCopySessionLogs,
     onEditLocalDeviceName,
@@ -60,6 +53,7 @@
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
+    onConnectLocalCandidate,
   }: Props = $props();
 
   let advertisedById = $derived.by(() => new Map(
@@ -120,7 +114,25 @@
         metaLines: [`Seen in folders: ${device.sourceFolderIds.join(", ")}`],
       }));
 
-    return [...connected, ...savedNotConnected, ...notApproved];
+    const localCandidates = app.devices.lanAnonymousCandidates.map((candidate: any) => {
+      const firstAddress = String(candidate.addresses?.[0] ?? "");
+      const isLocalHost =
+        firstAddress.includes("127.0.0.1") || firstAddress.includes("localhost");
+      return {
+        kind: "local-candidate" as const,
+        id: `local-candidate:${candidate.id}`,
+        name: isLocalHost ? "Local Syncthing/Peer on this device" : "Local LAN peer candidate",
+        deviceId: candidate.id,
+        metaLines: [
+          candidate.addresses?.length > 0
+            ? `Addresses: ${candidate.addresses.join(", ")}`
+            : "",
+          "No device ID advertised. You can still try direct connect.",
+        ].filter((line: string) => line !== ""),
+      };
+    });
+
+    return [...connected, ...savedNotConnected, ...notApproved, ...localCandidates];
   });
 
   const addAdvertisedDevice = (deviceId: string) => {
@@ -369,86 +381,6 @@
           <span>Auto-approve folder sync for introduced folders</span>
         </label>
 
-        <div class="settings-divider"></div>
-
-        <label class="checkbox-row">
-          <input type="checkbox" bind:checked={app.pim.enabled} />
-          <span>Enable Contacts + Calendar Sync (PIM)</span>
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.pim.contactsEnabled}
-            disabled={!app.pim.enabled}
-          />
-          <span>Sync Contacts</span>
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.pim.calendarEnabled}
-            disabled={!app.pim.enabled}
-          />
-          <span>Sync Calendar</span>
-        </label>
-
-        <label>
-          PIM Sync Folder Mode
-          <select bind:value={app.pim.syncFolderMode} disabled={!app.pim.enabled}>
-            <option value="choose">Choose existing Syncthing folder</option>
-            <option value="create">Create dedicated Syncthing folder</option>
-          </select>
-        </label>
-
-        <label>
-          PIM Folder Path / Folder ID
-          <input
-            type="text"
-            bind:value={app.pim.syncFolderPath}
-            placeholder={app.pim.syncFolderMode === "create"
-              ? "e.g. syncpeer-pim"
-              : "e.g. /storage/emulated/0/Sync/pim or existing folder ID"}
-            disabled={!app.pim.enabled}
-          />
-        </label>
-
-        <label>
-          Standards Storage Mode
-          <select bind:value={app.pim.standardsMode} disabled>
-            <option value="one_entry_per_file">
-              One entry per file (.vcf/.ics canonical)
-            </option>
-          </select>
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.pim.autoMergeSilent}
-            disabled={!app.pim.enabled}
-          />
-          <span>Silent auto-merge (no user conflict prompts)</span>
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.pim.androidContactsIntegration}
-            disabled={!app.pim.enabled || !app.pim.contactsEnabled}
-          />
-          <span>Android Contacts integration</span>
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.pim.androidCalendarIntegration}
-            disabled={!app.pim.enabled || !app.pim.calendarEnabled}
-          />
-          <span>Android Calendar integration</span>
-        </label>
       </form>
 
       <div class="actions">
@@ -478,38 +410,6 @@
         </button>
         <button type="button" class="ghost" onclick={onClearOfflineFolderState}>
           Clear Offline Folder State
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={onPickAndroidPimDirectory}
-          disabled={!app.pim.enabled}
-        >
-          Pick Android PIM Directory
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={onInitializePimFolder}
-          disabled={!app.pim.enabled || !app.session.isConnected || !app.session.currentFolderId}
-        >
-          Initialize PIM In Open Folder
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={onSyncAndroidPimNow}
-          disabled={!app.pim.enabled || !app.session.isConnected || !app.session.currentFolderId}
-        >
-          Sync Android PIM Now
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={onImportProviderPimFromFolder}
-          disabled={!app.pim.enabled || !app.session.isConnected || !app.session.currentFolderId}
-        >
-          Import Provider Files To Android
         </button>
       </div>
     </div>
@@ -579,6 +479,7 @@
           onSetSavedDeviceIntroducer={onSetSavedDeviceIntroducer}
           onRemoveSavedDevice={onRemoveSavedDevice}
           onAddAdvertisedDevice={addAdvertisedDevice}
+          onConnectLocalCandidate={onConnectLocalCandidate}
         />
       {/each}
     {/if}
@@ -586,13 +487,13 @@
 </Panel>
 
 <Panel title="Session Logs">
+  <div class="actions">
+    <button type="button" class="ghost" onclick={onCopySessionLogs}
+      >Copy Logs</button
+    >
+  </div>
   <details bind:open={app.ui.isLogPanelExpanded}>
     <summary>View logs ({app.logs.items.length})</summary>
-    <div class="actions">
-      <button type="button" class="ghost" onclick={onCopySessionLogs}
-        >Copy Logs</button
-      >
-    </div>
     <ul class="list">
       {#if app.logs.items.length === 0}
         <li class="empty">No session logs yet.</li>

@@ -1,6 +1,6 @@
-import type { ConnectionOverview, ConnectOptions } from "./browserClient.ts";
-import type { SessionState } from "./sessionTypes.ts";
-import { normalizeDeviceId, normalizePath } from "./helpers.ts";
+import type { ConnectionOverview, ConnectOptions } from "./browserClient.js";
+import type { SessionState } from "./sessionTypes.js";
+import { normalizeDeviceId, normalizePath } from "./helpers.js";
 
 export const createInitialSessionState = (): SessionState => ({
   phase: "idle",

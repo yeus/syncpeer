@@ -1,4 +1,4 @@
-import { normalizeDeviceId } from "./helpers.ts";
+import { normalizeDeviceId } from "./helpers.js";
 
 export const FOLDER_PASSWORD_SCOPE_SEPARATOR = ":";
 

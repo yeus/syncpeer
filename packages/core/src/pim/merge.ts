@@ -4,7 +4,7 @@ import type {
   PimRecordRef,
   PimRecordSnapshot,
   PimRecordVersion,
-} from "./types.ts";
+} from "./types.js";
 
 function recordRefFromOp(op: PimOperationEnvelope): PimRecordRef {
   return {

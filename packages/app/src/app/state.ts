@@ -48,7 +48,7 @@ const parseJson = <T,>(raw: string | null) => {
 export const loadPersistedState = () => {
   if (typeof window === "undefined") return null;
   return parseJson<{
-    activeTab?: "favorites" | "folders" | "devices";
+    activeTab?: "favorites" | "folders" | "devices" | "pim";
     selectedSavedDeviceId?: string;
     connection?: StoredConnectionSettingsLike;
     savedDevices?: Array<{
@@ -114,7 +114,9 @@ export const createInitialState = (persisted = loadPersistedState()) => {
   const savedDevices = normalizeSavedDevices(persisted?.savedDevices);
   return {
     activeTab:
-      persisted?.activeTab === "devices" || persisted?.activeTab === "folders"
+      persisted?.activeTab === "devices" ||
+      persisted?.activeTab === "folders" ||
+      persisted?.activeTab === "pim"
         ? persisted.activeTab
         : ("favorites" as const),
     currentPage: "main" as "main" | "diagnostics",
@@ -193,6 +195,11 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         string,
         { addresses: string[]; lastSeenAtMs: number }
       >,
+      lanAnonymousCandidates: [] as Array<{
+        id: string;
+        addresses: string[];
+        lastSeenAtMs: number;
+      }>,
       isDiscoveringLanDevices: false,
     },
     approvals: {

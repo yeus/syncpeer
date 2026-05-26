@@ -1,4 +1,4 @@
-import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.ts";
+import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
 
 export interface FolderInfo {
   id: string;

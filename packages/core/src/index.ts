@@ -1,4 +1,4 @@
-export { createSyncpeerCoreClient } from "./client.ts";
+export { createSyncpeerCoreClient } from "./client.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
@@ -7,16 +7,16 @@ export type {
   SyncpeerSessionHandle,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
-} from "./client.ts";
+} from "./client.js";
 export {
   createNodeHostAdapter,
   createNodeSessionTransport,
   createNodeSyncpeerClient,
   resolveNodeLocalDiscovery,
-} from "./node.ts";
-export { RemoteFs } from "./core/model/remoteFs.ts";
-export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.ts";
-export { createSyncpeerSessionStore } from "./ui/sessionStore.ts";
+} from "./node.js";
+export { RemoteFs } from "./core/model/remoteFs.js";
+export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
+export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export {
   canonicalRecordPath,
   collectionRootPath,
@@ -27,7 +27,7 @@ export {
   sidecarTombstonePath,
   createEmptySnapshot,
   mergeOperationIntoSnapshot,
-} from "./pim/index.ts";
+} from "./pim/index.js";
 export type {
   SessionPendingState,
   SessionPhase,
@@ -38,7 +38,7 @@ export type {
   SessionTraceEvent,
   SessionTransport,
   SyncpeerSessionStore,
-} from "./ui/sessionTypes.ts";
+} from "./ui/sessionTypes.js";
 export type {
   PimDomain,
   PimMergeResult,
@@ -47,4 +47,4 @@ export type {
   PimRecordRef,
   PimRecordSnapshot,
   PimRecordVersion,
-} from "./pim/index.ts";
+} from "./pim/index.js";

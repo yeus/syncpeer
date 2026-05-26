@@ -1,4 +1,4 @@
-import { getDefaultDiscoveryServer, normalizeDiscoveryServer, type ConnectOptions } from "./browserClient.ts";
+import { getDefaultDiscoveryServer, normalizeDiscoveryServer, type ConnectOptions } from "./browserClient.js";
 
 export type DiscoveryMode = "global" | "direct";
 

@@ -27,6 +27,10 @@ const cloneState = (state: SessionState): SessionState => ({
   ...state,
   folders: [...state.folders],
   folderSyncStates: [...state.folderSyncStates],
+  directory: {
+    ...state.directory,
+    entries: [...state.directory.entries],
+  },
   entries: [...state.entries],
   snapshot: { ...state.snapshot },
   pending: { ...state.pending },
@@ -44,6 +48,11 @@ const sameStringRecord = (
     if ((right ?? {})[key] !== value) return false;
   }
   return true;
+};
+
+const directoryIsLocked = (state: SessionState): boolean => {
+  const folder = state.folders.find((entry) => entry.id === state.directory.folderId);
+  return Boolean(folder?.encrypted && folder.needsPassword);
 };
 
 export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): SyncpeerSessionStore => {
@@ -99,6 +108,18 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       setState((current) => ({
         ...current,
         phase: "connecting",
+        directory: current.directory.folderId
+          ? {
+              ...current.directory,
+              entries: [],
+              status: "loading",
+              versionKey: "",
+              error: null,
+              requestSeq: current.directory.requestSeq + 1,
+            }
+          : current.directory,
+        entries: current.directory.folderId ? [] : current.entries,
+        currentFolderVersionKey: current.directory.folderId ? "" : current.currentFolderVersionKey,
         pending: {
           ...current.pending,
           connecting: true,
@@ -149,6 +170,13 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
             };
           },
         });
+        if (
+          state.directory.folderId &&
+          state.folders.some((folder) => folder.id === state.directory.folderId) &&
+          !directoryIsLocked(state)
+        ) {
+          await actions.reloadCurrentDirectory(options);
+        }
       } catch (error) {
         const message = resolveErrorMessage(error);
         setState((current) => ({
@@ -175,6 +203,12 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           ...current,
           phase: "idle",
           remoteFs: null,
+          directory: {
+            ...current.directory,
+            status: "idle",
+            versionKey: "",
+            error: null,
+          },
           currentFolderVersionKey: "",
           pending: {
             connecting: false,
@@ -196,14 +230,37 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       }));
       try {
         const overview = await depsInput.transport.connectAndGetOverview(resolved);
+        let shouldReloadDirectory = false;
         setState((current) => {
           const applied = applyOverviewToState(current, overview, resolved);
-          return ensureCurrentFolderStillExists({
+          const nextState = ensureCurrentFolderStillExists({
             ...applied.nextState,
             phase: "connected",
             pending: { ...applied.nextState.pending, refreshingOverview: false },
           });
+          const nextVersionKey = nextState.directory.folderId
+            ? folderVersionKey(nextState, nextState.directory.folderId)
+            : "";
+          const versionChanged =
+            nextState.directory.folderId !== "" &&
+            nextState.directory.status === "ready" &&
+            nextVersionKey !== "" &&
+            nextVersionKey !== nextState.directory.versionKey;
+          shouldReloadDirectory = versionChanged || directoryIsLocked(nextState);
+          if (!versionChanged) return nextState;
+          return {
+            ...nextState,
+            directory: {
+              ...nextState.directory,
+              status: "stale",
+              versionKey: nextState.directory.versionKey,
+              error: null,
+            },
+          };
         });
+        if (shouldReloadDirectory && state.directory.folderId && !directoryIsLocked(state)) {
+          await actions.reloadCurrentDirectory(resolved);
+        }
       } catch (error) {
         const message = resolveErrorMessage(error);
         setState((current) => ({
@@ -219,6 +276,15 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     goToRoot: async (): Promise<void> => {
       setState((current) => ({
         ...current,
+        directory: {
+          ...current.directory,
+          folderId: "",
+          path: "",
+          entries: [],
+          status: "idle",
+          versionKey: "",
+          error: null,
+        },
         currentFolderId: "",
         currentPath: "",
         entries: [],
@@ -235,7 +301,17 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     openPath: async (path: string, options?: ConnectOptions): Promise<void> => {
       setState((current) => ({
         ...current,
+        directory: {
+          ...current.directory,
+          path: normalizePath(path),
+          entries: [],
+          status: current.directory.folderId ? "loading" : "idle",
+          versionKey: "",
+          error: null,
+        },
         currentPath: normalizePath(path),
+        entries: [],
+        currentFolderVersionKey: "",
       }));
       await actions.reloadCurrentDirectory(options);
     },
@@ -252,23 +328,40 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     reloadCurrentDirectory: async (options?: ConnectOptions): Promise<void> => {
       const resolved = resolveOptions(options);
       const current = state;
-      if (!current.remoteFs || !current.currentFolderId) return;
-      const folder = current.folders.find((entry) => entry.id === current.currentFolderId);
+      const folderId = current.directory.folderId || current.currentFolderId;
+      if (!current.remoteFs || !folderId) return;
+      const folder = current.folders.find((entry) => entry.id === folderId);
       if (folder?.encrypted && folder.needsPassword) {
-        setState((next) => ({ ...next, entries: [] }));
+        setState((next) => ({
+          ...next,
+          directory: {
+            ...next.directory,
+            entries: [],
+            status: "locked",
+            error: null,
+          },
+          entries: [],
+          pending: { ...next.pending, loadingDirectory: false },
+        }));
         return;
       }
       const targetEpoch = current.requestEpoch;
-      const requestSeq = current.directoryLoadSeq + 1;
+      const requestSeq = current.directory.requestSeq + 1;
       setState((next) => ({
         ...next,
         directoryLoadSeq: requestSeq,
+        directory: {
+          ...next.directory,
+          status: "loading",
+          error: null,
+          requestSeq,
+        },
         pending: { ...next.pending, loadingDirectory: true },
         lastError: null,
       }));
       try {
         const indexResult = await waitForFolderIndexToArrive({
-          folderId: current.currentFolderId,
+          folderId,
           connectOptions: resolved,
           initialFolderSyncStates: state.folderSyncStates,
           fetchFolderVersions: depsInput.transport.connectAndGetFolderVersions,
@@ -281,16 +374,16 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           emitTrace(
             "warning",
             "session.flow.folder_index.not_received",
-            `Folder index not received yet for ${current.currentFolderId}.`,
-            { folderId: current.currentFolderId },
+            `Folder index not received yet for ${folderId}.`,
+            { folderId },
           );
         }
 
-        const path = normalizePath(state.currentPath);
-        const latestFolder = state.folders.find((entry) => entry.id === state.currentFolderId);
+        const path = normalizePath(state.directory.path || state.currentPath);
+        const latestFolder = state.folders.find((entry) => entry.id === folderId);
         const readResult = await readDirWithRetry({
           fs: state.remoteFs!,
-          folderId: state.currentFolderId,
+          folderId,
           path,
           encrypted: Boolean(latestFolder?.encrypted),
           locked: Boolean(latestFolder?.needsPassword),
@@ -299,11 +392,24 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         });
         setState((next) => {
           if (next.requestEpoch !== targetEpoch) return next;
-          if (next.directoryLoadSeq !== requestSeq) return next;
+          if (next.directory.requestSeq !== requestSeq) return next;
+          const versionKey = folderVersionKey(next, folderId);
           return {
             ...next,
+            directory: {
+              ...next.directory,
+              folderId,
+              path,
+              entries: readResult.entries,
+              status: "ready",
+              versionKey,
+              loadedAtMs: now(),
+              error: null,
+            },
             entries: readResult.entries,
-            currentFolderVersionKey: folderVersionKey(next, next.currentFolderId),
+            currentFolderId: folderId,
+            currentPath: path,
+            currentFolderVersionKey: versionKey,
             phase: "connected",
             pending: { ...next.pending, loadingDirectory: false },
           };
@@ -313,6 +419,11 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         setState((next) => ({
           ...next,
           phase: "error",
+          directory: {
+            ...next.directory,
+            status: "error",
+            error: message,
+          },
           pending: { ...next.pending, loadingDirectory: false },
           lastError: message,
         }));
@@ -338,6 +449,13 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         return {
           ...current,
           connectOptions: nextConnectOptions,
+          directory: current.directory.folderId
+            ? {
+                ...current.directory,
+                status: "stale",
+                error: null,
+              }
+            : current.directory,
         };
       });
     },

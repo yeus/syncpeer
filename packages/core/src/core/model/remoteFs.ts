@@ -261,11 +261,16 @@ export class RemoteFs {
     const normalized = normalizePath(path);
     for (const [key, value] of folder.files) {
       const keyPath = normalizePath(key);
-      if (keyPath === normalized) return toEntry(keyPath, value.indexFile);
+      const entry = toEntry(keyPath, value.indexFile);
+      if (keyPath === normalized && !entry.deleted) return entry;
     }
     const prefix = normalized ? normalized + "/" : "";
     for (const key of folder.files.keys()) {
+      const stored = folder.files.get(key);
+      if (!stored) continue;
       const keyPath = normalizePath(key);
+      const entry = toEntry(keyPath, stored.indexFile);
+      if (entry.deleted) continue;
       if (!prefix || keyPath.startsWith(prefix)) {
         return {
           name: normalized.split("/").filter(Boolean).at(-1) ?? "",
@@ -282,6 +287,12 @@ export class RemoteFs {
   async readDir(folderId: string, path: string): Promise<FileEntry[]> {
     const folder = this.folders.get(folderId);
     if (!folder) return [];
+    if (folder.files.size === 0 && !folder.indexReceived) {
+      const deadline = Date.now() + 6000;
+      while (folder.files.size === 0 && !folder.indexReceived && Date.now() < deadline) {
+        await sleep(120);
+      }
+    }
     if (
       folder.encrypted &&
       folder.files.size === 0 &&
@@ -304,11 +315,13 @@ export class RemoteFs {
     for (const [key, value] of folder.files) {
       const keyPath = normalizePath(key);
       if (normalized && !keyPath.startsWith(prefix)) continue;
+      const entry = toEntry(keyPath, value.indexFile);
+      if (entry.deleted) continue;
       const rest = normalized ? keyPath.slice(prefix.length) : keyPath;
       if (!rest) continue;
       const firstSlash = rest.indexOf("/");
       if (firstSlash === -1) {
-        out.set(rest, toEntry(keyPath, value.indexFile));
+        out.set(rest, entry);
       } else {
         const childName = rest.slice(0, firstSlash);
         const childPath = normalized ? `${normalized}/${childName}` : childName;

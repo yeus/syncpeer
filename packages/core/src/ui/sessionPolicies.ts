@@ -11,6 +11,16 @@ export const createInitialSessionState = (): SessionState => ({
   connectionTransport: "",
   folders: [],
   folderSyncStates: [],
+  directory: {
+    folderId: "",
+    path: "",
+    entries: [],
+    status: "idle",
+    versionKey: "",
+    loadedAtMs: 0,
+    error: null,
+    requestSeq: 0,
+  },
   currentFolderId: "",
   currentPath: "",
   entries: [],
@@ -100,13 +110,22 @@ export const applyOverviewToState = (
 };
 
 export const ensureCurrentFolderStillExists = (state: SessionState): SessionState => {
-  if (!state.currentFolderId) return state;
+  if (!state.directory.folderId) return state;
   if (state.folders.length === 0) return state;
-  if (state.folders.some((folder) => folder.id === state.currentFolderId)) {
+  if (state.folders.some((folder) => folder.id === state.directory.folderId)) {
     return state;
   }
   return {
     ...state,
+    directory: {
+      ...state.directory,
+      folderId: "",
+      path: "",
+      entries: [],
+      status: "idle",
+      versionKey: "",
+      error: null,
+    },
     currentFolderId: "",
     currentPath: "",
     entries: [],
@@ -126,8 +145,20 @@ export const setCurrentLocation = (
   path: string,
 ): SessionState => ({
   ...state,
+  directory: {
+    ...state.directory,
+    folderId,
+    path: normalizePath(path),
+    entries: [],
+    status: folderId ? "loading" : "idle",
+    versionKey: "",
+    error: null,
+    requestSeq: state.directory.requestSeq,
+  },
   currentFolderId: folderId,
   currentPath: normalizePath(path),
+  entries: [],
+  currentFolderVersionKey: "",
 });
 
 export const withUpdatedFolderPasswords = (

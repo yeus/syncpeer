@@ -219,7 +219,8 @@ export const collectAdvertisedDevices = (
   sourceDeviceId: string,
   sourceIsIntroducer: boolean,
 ): AdvertisedDeviceItem[] => {
-  if (!sourceDeviceId) return [];
+  void sourceDeviceId;
+  void sourceIsIntroducer;
   const savedIds = new Set(knownDevices.map((device) => normalizeDeviceId(device.id)));
   const map = new Map<string, AdvertisedDeviceItem>();
   for (const folder of availableFolders) {

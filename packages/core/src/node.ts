@@ -701,6 +701,12 @@ export const createNodeSessionTransport = (): SessionTransport => {
       }
       return activeSession.remoteFs.readFileFully(folderId, path, onProgress);
     },
+    writeFileFully: async (folderId, path, bytes, options) => {
+      if (!activeSession || activeSession.isClosed()) {
+        throw new Error("No active connection. Connect first.");
+      }
+      return activeSession.remoteFs.writeFileFully(folderId, path, bytes, options);
+    },
   });
 
   const ensureSession = async (options: ConnectOptions) => {

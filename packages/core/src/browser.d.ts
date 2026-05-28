@@ -121,6 +121,16 @@ export interface SessionState {
   connectionTransport: "direct-tcp" | "relay" | "";
   folders: FolderInfo[];
   folderSyncStates: FolderSyncState[];
+  directory: {
+    folderId: string;
+    path: string;
+    entries: FileEntry[];
+    status: "idle" | "loading" | "ready" | "stale" | "locked" | "error";
+    versionKey: string;
+    loadedAtMs: number;
+    error: string | null;
+    requestSeq: number;
+  };
   currentFolderId: string;
   currentPath: string;
   entries: FileEntry[];

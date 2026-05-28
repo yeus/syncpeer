@@ -146,6 +146,16 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       connectionTransport: "" as "direct-tcp" | "relay" | "",
       folders: [] as FolderInfo[],
       folderSyncStates: [] as FolderSyncState[],
+      directory: {
+        folderId: "",
+        path: "",
+        entries: [] as FileEntry[],
+        status: "idle" as SessionState["directory"]["status"],
+        versionKey: "",
+        loadedAtMs: 0,
+        error: null as string | null,
+        requestSeq: 0,
+      },
       currentFolderId: "",
       currentPath: "",
       entries: [] as FileEntry[],
@@ -373,9 +383,13 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.isLoadingDirectory = next.pending.loadingDirectory;
   state.session.folders = next.folders;
   state.session.folderSyncStates = next.folderSyncStates;
-  state.session.currentFolderId = next.currentFolderId;
-  state.session.currentPath = next.currentPath;
-  state.session.entries = next.entries;
+  state.session.directory = {
+    ...next.directory,
+    entries: [...next.directory.entries],
+  };
+  state.session.currentFolderId = next.directory.folderId;
+  state.session.currentPath = next.directory.path;
+  state.session.entries = next.directory.entries;
   if (
     previousFolderId !== state.session.currentFolderId ||
     previousPath !== state.session.currentPath
@@ -389,7 +403,7 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   if (state.session.directoryPage > totalPages) {
     state.session.directoryPage = totalPages;
   }
-  state.session.currentFolderVersionKey = next.currentFolderVersionKey;
+  state.session.currentFolderVersionKey = next.directory.versionKey;
   state.session.remoteDevice = next.remoteDevice;
   state.session.connectionPath = next.connectionPath;
   state.session.connectionTransport = next.connectionTransport;

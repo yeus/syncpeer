@@ -1,5 +1,12 @@
 import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "../client.js";
-import type { FileDownloadProgress, FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.js";
+import type {
+  FileDownloadProgress,
+  FileEntry,
+  FileUploadOptions,
+  FolderInfo,
+  FolderSyncState,
+  RemoteDeviceInfo,
+} from "../core/model/remoteFs.js";
 
 export interface ConnectOptions {
   host: string;
@@ -33,7 +40,7 @@ export interface RemoteFsLike {
     folderId: string,
     path: string,
     bytes: Uint8Array,
-    options?: { modifiedMs?: number },
+    options?: FileUploadOptions,
   ) => Promise<void>;
 }
 

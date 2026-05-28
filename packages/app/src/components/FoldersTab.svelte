@@ -282,8 +282,12 @@
           <li class="empty">
             This receive-encrypted folder is locked. Use the unlock button in the folder list to browse or download files.
           </li>
-        {:else if app.session.isLoadingDirectory}
+        {:else if app.session.directory?.status === "loading" || app.session.isLoadingDirectory}
           <li class="empty">Loading folder contents...</li>
+        {:else if app.session.directory?.status === "stale"}
+          <li class="empty">Updating folder contents...</li>
+        {:else if app.session.directory?.status === "error"}
+          <li class="empty">{app.session.directory.error || "Could not load folder contents."}</li>
         {:else if entryRows.length === 0}
           <li class="empty">Folder is empty.</li>
         {:else}

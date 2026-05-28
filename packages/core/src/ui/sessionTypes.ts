@@ -2,6 +2,18 @@ import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from ".
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./browserClient.js";
 
 export type SessionPhase = "idle" | "connecting" | "connected" | "refreshing" | "error";
+export type DirectoryStatus = "idle" | "loading" | "ready" | "stale" | "locked" | "error";
+
+export interface SessionDirectoryState {
+  folderId: string;
+  path: string;
+  entries: FileEntry[];
+  status: DirectoryStatus;
+  versionKey: string;
+  loadedAtMs: number;
+  error: string | null;
+  requestSeq: number;
+}
 
 export interface SessionSnapshotState {
   active: boolean;
@@ -25,6 +37,7 @@ export interface SessionState {
   connectionTransport: "direct-tcp" | "relay" | "";
   folders: FolderInfo[];
   folderSyncStates: FolderSyncState[];
+  directory: SessionDirectoryState;
   currentFolderId: string;
   currentPath: string;
   entries: FileEntry[];

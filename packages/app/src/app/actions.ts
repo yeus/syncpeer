@@ -143,6 +143,15 @@ const hasAutoConnectTarget = (state: AppState) => {
 };
 
 const clearDirectoryView = (state: AppState) => {
+  state.session.directory = {
+    ...state.session.directory,
+    folderId: "",
+    path: "",
+    entries: [],
+    status: "idle",
+    versionKey: "",
+    error: null,
+  };
   state.session.currentFolderId = "";
   state.session.currentPath = "";
   state.session.entries = [];
@@ -186,6 +195,12 @@ const restoreOfflineSnapshot = (
 const resetRuntimeState = (state: AppState) => {
   state.session.isConnected = false;
   state.session.remoteFs = null;
+  state.session.directory = {
+    ...state.session.directory,
+    entries: [],
+    status: "idle",
+    error: null,
+  };
   state.session.entries = [];
   state.session.activeConnectDeviceId = "";
   state.session.connectedSourceDeviceId = "";
@@ -562,6 +577,29 @@ const remoteHasUnapprovedFolderShare = (
   folders: Array<{ localDevicePresentInFolder?: boolean }>,
 ) => folders.some((folder) => folder.localDevicePresentInFolder === false);
 
+const migrateActiveLegacyFolderPasswords = (state: AppState) => {
+  const sourceDeviceId = activeFolderPasswordScopeDeviceId(state);
+  const normalizedSource = normalizeDeviceId(sourceDeviceId);
+  if (!normalizedSource) return;
+  const next = { ...state.passwords.saved };
+  let changed = false;
+  for (const [storedKey, password] of Object.entries(state.passwords.saved)) {
+    if (storedKey.includes(FOLDER_PASSWORD_SCOPE_SEPARATOR)) continue;
+    const folderId = storedKey.trim();
+    if (!folderId || !password.trim()) continue;
+    const scopedKey = folderPasswordScopedKey(normalizedSource, folderId);
+    if (!scopedKey) continue;
+    if (!next[scopedKey]) {
+      next[scopedKey] = password;
+    }
+    delete next[storedKey];
+    changed = true;
+  }
+  if (changed) {
+    state.passwords.saved = next;
+  }
+};
+
 const validateConnection = (state: AppState) => {
   if (
     state.connection.discoveryMode === "global" &&
@@ -651,7 +689,7 @@ export const createAppActions = (args: {
   }
 
   const { state, client, sessionStore } = args;
-  let downloadNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let downloadNoticeTimer: number | null = null;
   let lastTransferNotificationAtMs = 0;
   let notificationPermissionRequested = false;
 
@@ -793,10 +831,13 @@ export const createAppActions = (args: {
     );
     restoreOfflineSnapshot(state, attemptedDeviceId, "connect_start");
     try {
+      migrateActiveLegacyFolderPasswords(state);
       await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
       await sessionStore.actions.connect(connectionDetails(state));
       const session = sessionStore.getState();
       applySessionState(state, session);
+      migrateActiveLegacyFolderPasswords(state);
+      await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
       await refreshFolderRootCachedStatuses(
         state,
         client,
@@ -917,25 +958,12 @@ export const createAppActions = (args: {
         transportKind: session.connectionTransport,
       });
       applyAutoApprovals(state);
-      if (state.activeTab === "folders" && state.session.currentFolderId) {
-        if (folderIsLocked(state, state.session.currentFolderId)) {
-          state.session.entries = [];
-          state.session.currentFolderVersionKey = "";
-        } else {
-          const nextVersionKey = folderVersionKeyFromState(
-            state,
-            state.session.currentFolderId,
-          );
-          if (
-            state.session.entries.length === 0 ||
-            !state.session.currentFolderVersionKey ||
-            state.session.currentFolderVersionKey !== nextVersionKey
-          ) {
-            await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
-            applySessionState(state, sessionStore.getState());
-            await loadDirectorySideEffects(state, client);
-          }
-        }
+      if (
+        state.activeTab === "folders" &&
+        state.session.currentFolderId &&
+        state.session.directory.status === "ready"
+      ) {
+        await loadDirectorySideEffects(state, client);
       }
       state.session.lastUpdatedAt = nowTime();
       updateOverviewSyncTracking(state);
@@ -1637,6 +1665,7 @@ export const createAppActions = (args: {
 
   const saveFolderPassword = async (folderId: string) => {
     const password = (state.passwords.drafts[folderId] ?? "").trim();
+    migrateActiveLegacyFolderPasswords(state);
     const scopedKey = folderPasswordScopedKey(
       activeFolderPasswordScopeDeviceId(state),
       folderId,
@@ -1665,6 +1694,7 @@ export const createAppActions = (args: {
   };
 
   const clearFolderPassword = async (folderId: string) => {
+    migrateActiveLegacyFolderPasswords(state);
     const scopedKey = folderPasswordScopedKey(
       activeFolderPasswordScopeDeviceId(state),
       folderId,

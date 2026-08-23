@@ -1,6 +1,7 @@
 import {
   createSyncpeerSessionStore,
   cachedFileKey,
+  downloadRemoteFile,
   favoriteKey,
   folderPasswordScopedKey,
   getDefaultDiscoveryServer,
@@ -35,6 +36,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { reportUiError } from "../lib/tauriAdapters.js";
 import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
+import { detectRuntimeEnvironment, detectRuntimeSurface } from "../lib/runtimeInfo.ts";
 import {
   buildDiagnosticsRegistry,
   runDiagnosticsTests,
@@ -99,6 +101,12 @@ const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
 const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
 const DOWNLOAD_NOTIFICATION_ID = 11001;
 const UPLOAD_NOTIFICATION_ID = 11002;
+const appVersion = __SYNCPEER_APP_VERSION__ || "0.0.0";
+const buildCommit = __SYNCPEER_BUILD_COMMIT__ || "unknown";
+const buildTimeUtc = __SYNCPEER_BUILD_TIME_UTC__ || "unknown";
+const runtimeEnvironment = detectRuntimeEnvironment();
+const runtimeSurface = detectRuntimeSurface();
+const appBuildMode = import.meta.env.DEV ? "development" : "production";
 const sortByName = <T extends { name: string }>(items: T[]) =>
   [...items].sort((left, right) => left.name.localeCompare(right.name));
 
@@ -490,6 +498,7 @@ export const createAppActions = (args: {
   let downloadNoticeTimer: number | null = null;
   let lastTransferNotificationAtMs = 0;
   let notificationPermissionRequested = false;
+  let connectInFlight: Promise<void> | null = null;
 
   const setDownloadNotice = (message: string, clearAfterMs = 0) => {
     state.ui.downloadNotice = message;
@@ -551,9 +560,15 @@ export const createAppActions = (args: {
     }
   };
 
+  const transferInProgress = () =>
+    state.favorites.isDownloading ||
+    state.ui.uploadProgressActive ||
+    state.sync.isSyncingStarredFiles;
+
   const canAttemptFolderSyncRecovery = () => {
     if (!state.session.isConnected) return false;
     if (!state.ui.isAppVisible) return false;
+    if (transferInProgress()) return false;
     if (state.sync.isRecoveringFolderSync) return false;
     if (
       state.session.isConnecting ||
@@ -609,6 +624,11 @@ export const createAppActions = (args: {
   };
 
   const connect = async (targetDeviceId?: string) => {
+    if (connectInFlight) {
+      await connectInFlight;
+      return;
+    }
+    connectInFlight = (async () => {
     state.ui.recentError = null;
     state.ui.uploadMessage = "";
     state.ui.autoConnectPaused = false;
@@ -689,6 +709,12 @@ export const createAppActions = (args: {
     } finally {
       state.session.activeConnectDeviceId = "";
     }
+    })();
+    try {
+      await connectInFlight;
+    } finally {
+      connectInFlight = null;
+    }
   };
 
   const ensureConnectedForTransfer = async (
@@ -726,6 +752,7 @@ export const createAppActions = (args: {
     ) {
       return;
     }
+    if (transferInProgress()) return;
     try {
       await sessionStore.actions.refreshOverview(connectionDetails(state));
       const session = sessionStore.getState();
@@ -771,12 +798,21 @@ export const createAppActions = (args: {
   };
 
   const refreshActiveView = async () => {
+    if (transferInProgress()) return;
     await refreshOverview();
     await recoverFolderSyncByReconnect();
     await syncStarredFiles();
   };
 
   const hydrate = async () => {
+    pushSessionLog(state, "info", "app.build.info", "Build metadata", {
+      appVersion,
+      buildCommit,
+      buildTimeUtc,
+      buildMode: appBuildMode,
+      runtimeEnvironment,
+      runtimeSurface,
+    });
     try {
       state.favorites.items = await client.listFavorites();
       const fileFavorites = new Map<string, string[]>();
@@ -1008,6 +1044,7 @@ export const createAppActions = (args: {
   };
 
   const discoverLocalDevices = async (options?: { timeoutMs?: number }) => {
+    if (transferInProgress()) return;
     if (state.devices.isDiscoveringLanDevices) return;
     state.devices.isDiscoveringLanDevices = true;
     try {
@@ -1098,7 +1135,7 @@ export const createAppActions = (args: {
   };
 
   const copySessionLogs = async () => {
-    const text = state.logs.items
+    const logBody = state.logs.items
       .slice()
       .reverse()
       .map((item) => {
@@ -1108,8 +1145,20 @@ export const createAppActions = (args: {
           : `${base}\n${JSON.stringify(item.details, null, 2)}`;
       })
       .join("\n\n");
+    const metadata = [
+      "# Syncpeer Log Export Metadata",
+      `app_version: ${appVersion}`,
+      `build_commit: ${buildCommit}`,
+      `build_time_utc: ${buildTimeUtc}`,
+      `build_mode: ${appBuildMode}`,
+      `runtime_environment: ${runtimeEnvironment}`,
+      `runtime_surface: ${runtimeSurface}`,
+      "",
+      "# Session Logs",
+    ].join("\n");
+    const text = `${metadata}\n${logBody || "No session logs yet."}`;
     try {
-      await copyText(text || "No session logs yet.");
+      await copyText(text);
     } catch (error) {
       reportActionError(state, "logs.copy.failed", error);
     }
@@ -1353,10 +1402,10 @@ export const createAppActions = (args: {
       fileName: name,
     });
     try {
-      const bytes = await remoteFs.readFileFully(
+      const bytes = await downloadRemoteFile(remoteFs, {
         folderId,
         path,
-        ({
+        onProgress: ({
           downloadedBytes,
           totalBytes,
         }: {
@@ -1391,7 +1440,7 @@ export const createAppActions = (args: {
             });
           }
         },
-      );
+      });
       const elapsedMs = elapsedMsSince(startedAt);
       const rateBps = averageRateBps(bytes.length, elapsedMs);
       await client.cacheFile(folderId, path, name, bytes);

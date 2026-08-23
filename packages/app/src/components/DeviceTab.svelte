@@ -3,6 +3,7 @@
   import Panel from "./Panel.svelte";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
+  import { detectRuntimeEnvironment, detectRuntimeSurface } from "../lib/runtimeInfo.ts";
 
   interface Props {
     app: any;
@@ -55,6 +56,18 @@
     onRemoveSavedDevice,
     onConnectLocalCandidate,
   }: Props = $props();
+
+  const appVersion = __SYNCPEER_APP_VERSION__ || "0.0.0";
+  const buildCommit = __SYNCPEER_BUILD_COMMIT__ || "unknown";
+  const buildTimeUtc = __SYNCPEER_BUILD_TIME_UTC__ || "";
+  const runtimeEnvironment = detectRuntimeEnvironment();
+  const runtimeSurface = detectRuntimeSurface();
+  const buildMode = import.meta.env.DEV ? "development" : "production";
+  const buildTimeLocalLabel = (() => {
+    const parsed = buildTimeUtc ? new Date(buildTimeUtc) : null;
+    if (!parsed || Number.isNaN(parsed.getTime())) return "unknown";
+    return parsed.toLocaleString();
+  })();
 
   let advertisedById = $derived.by(() => new Map(
     advertisedDevices
@@ -182,6 +195,15 @@
     <div class="item-meta">{app.devices.currentDeviceId || "Unavailable"}</div>
     <div class="item-meta">
       Advertised name: {app.connection.deviceName.trim() || "syncpeer-ui"}
+    </div>
+    <div class="item-meta">
+      Version: {appVersion}
+    </div>
+    <div class="item-meta">
+      Commit: <code>{buildCommit}</code>
+    </div>
+    <div class="item-meta">
+      Built (local): {buildTimeLocalLabel}
     </div>
     {#if app.devices.identityNotice}
       <div class="item-meta">{app.devices.identityNotice}</div>
@@ -381,6 +403,10 @@
           <span>Auto-approve folder sync for introduced folders</span>
         </label>
 
+        <div class="hint version-meta">
+          Version: <strong>{appVersion}</strong> | Commit: <code>{buildCommit}</code> | Built (local): {buildTimeLocalLabel} | Mode: {buildMode} | Runtime: {runtimeEnvironment}/{runtimeSurface}
+        </div>
+
       </form>
 
       <div class="actions">
@@ -558,6 +584,11 @@
 
   .settings-block {
     margin-top: 0.5rem;
+  }
+
+  .version-meta {
+    margin-top: 0.35rem;
+    line-height: 1.4;
   }
 
   .saved-device-editor {

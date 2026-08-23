@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   createNodeSyncpeerClient,
+  downloadRemoteFile,
   resolveNodeGlobalDiscovery,
 } from "@syncpeer/core/node";
 import { ensureCliNodeIdentity } from "./identity.js";
@@ -250,7 +251,10 @@ async function main() {
     .description("Download a file from the remote peer")
     .action(async (folderId: string, remotePath: string, localPath: string) =>
       withSession(async (remoteFs) => {
-        const bytes = await remoteFs.readFileFully(folderId, remotePath);
+        const bytes = await downloadRemoteFile(remoteFs, {
+          folderId,
+          path: remotePath,
+        });
         fs.writeFileSync(localPath, Buffer.from(bytes));
         console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
       }),

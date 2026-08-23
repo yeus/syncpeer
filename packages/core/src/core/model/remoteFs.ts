@@ -189,6 +189,8 @@ export class RemoteFs {
     bytes: Uint8Array,
     options?: FileUploadOptions,
   ) => Promise<void>;
+  private requestFolderIndexUpdate: (folderId: string) => Promise<void>;
+  private setFocusedFolderId: (folderId: string | null) => void;
 
   constructor(
     folders: Map<string, FolderState>,
@@ -199,6 +201,8 @@ export class RemoteFs {
       length: number,
       options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
     ) => Promise<Uint8Array>,
+    requestFolderIndexUpdate: (folderId: string) => Promise<void>,
+    setFocusedFolderId: (folderId: string | null) => void,
     log?: (event: string, details?: Record<string, unknown>) => void,
     remoteDevice?: RemoteDeviceInfo,
     closeConnection?: () => void,
@@ -215,6 +219,8 @@ export class RemoteFs {
     this.remoteDevice = remoteDevice;
     this.closeConnection = closeConnection;
     this.publishFile = publishFile;
+    this.requestFolderIndexUpdate = requestFolderIndexUpdate;
+    this.setFocusedFolderId = setFocusedFolderId;
   }
 
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
@@ -255,6 +261,20 @@ export class RemoteFs {
     };
   }
 
+  async requestFolderIndex(folderId: string): Promise<void> {
+    const normalizedFolderId = String(folderId ?? "").trim();
+    if (!normalizedFolderId) return;
+    if (!this.folders.has(normalizedFolderId)) {
+      throw new Error(`Unknown folder: ${normalizedFolderId}`);
+    }
+    await this.requestFolderIndexUpdate(normalizedFolderId);
+  }
+
+  setFocusedFolder(folderId: string | null): void {
+    const normalizedFolderId = String(folderId ?? "").trim();
+    this.setFocusedFolderId(normalizedFolderId || null);
+  }
+
   async stat(folderId: string, path: string): Promise<FileEntry | null> {
     const folder = this.folders.get(folderId);
     if (!folder) return null;
@@ -287,12 +307,7 @@ export class RemoteFs {
   async readDir(folderId: string, path: string): Promise<FileEntry[]> {
     const folder = this.folders.get(folderId);
     if (!folder) return [];
-    if (folder.files.size === 0 && !folder.indexReceived) {
-      const deadline = Date.now() + 6000;
-      while (folder.files.size === 0 && !folder.indexReceived && Date.now() < deadline) {
-        await sleep(120);
-      }
-    }
+    if (!folder.indexReceived) await this.waitForFolderIndex(folderId, 6000, 120);
     if (
       folder.encrypted &&
       folder.files.size === 0 &&
@@ -352,7 +367,9 @@ export class RemoteFs {
   async waitForFolderIndex(folderId: string, timeoutMs = 3000, pollMs = 100): Promise<boolean> {
     const folder = this.folders.get(folderId);
     if (!folder) return false;
+    this.setFocusedFolder(folderId);
     if (folder.indexReceived) return true;
+    await this.requestFolderIndex(folderId);
 
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (Date.now() < deadline) {
@@ -369,6 +386,7 @@ export class RemoteFs {
   ): Promise<Uint8Array> {
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
+    if (!folder.indexReceived) await this.waitForFolderIndex(folderId, 6000, 120);
     const storedFile = resolveStoredFile(folder, path);
     if (folder.encrypted) {
       return this.readEncryptedFileFully(folder, path, storedFile, onProgress);
@@ -381,10 +399,11 @@ export class RemoteFs {
       options?: { hash?: Uint8Array; blockNo?: number },
     ): Promise<Uint8Array> => {
       const requestModes: Array<{ fromTemporary: boolean; includeBlockMetadata: boolean }> = [
-        { fromTemporary: true, includeBlockMetadata: true },
+        // Prefer non-temporary requests first; some peers reject temporary pulls for normal files.
         { fromTemporary: false, includeBlockMetadata: true },
-        { fromTemporary: true, includeBlockMetadata: false },
+        { fromTemporary: true, includeBlockMetadata: true },
         { fromTemporary: false, includeBlockMetadata: false },
+        { fromTemporary: true, includeBlockMetadata: false },
       ];
       let lastError: unknown = null;
       for (const mode of requestModes) {
@@ -512,7 +531,7 @@ export class RemoteFs {
     }
     let total = 0;
     const totalBytes = entry.size > 0 ? entry.size : entry.blocks.reduce((sum, block) => sum + block.size, 0);
-    const chunks = await mapConcurrent(entry.blocks.length, 6, async (index) => {
+    const chunks = await mapConcurrent(entry.blocks.length, 2, async (index) => {
       const block = entry.blocks![index];
       const chunk = await requestWithTemporaryFallback(block.offset, block.size, {
         hash: block.hash,

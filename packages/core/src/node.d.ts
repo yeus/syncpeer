@@ -42,6 +42,8 @@ export interface NodeDiscoveryResult {
 
 export interface NodeRemoteFs {
   listFolders(): Promise<Array<{ id: string; label: string; readOnly: boolean }>>;
+  requestFolderIndex(folderId: string): Promise<void>;
+  setFocusedFolder(folderId: string | null): void;
   waitForFolderIndex(folderId: string, timeoutMs?: number, pollMs?: number): Promise<boolean>;
   readDir(folderId: string, path: string): Promise<Array<{ name: string; path: string; type: string }>>;
   readFileFully(folderId: string, path: string): Promise<Uint8Array>;
@@ -118,6 +120,26 @@ export function resolveNodeGlobalDiscovery(options: {
   expectedDeviceId: string;
   discoveryServer?: string;
 }): Promise<NodeDiscoveryResult>;
+export function downloadRemoteFile(
+  remoteFs: {
+    readFileFully: (
+      folderId: string,
+      path: string,
+      onProgress?: (progress: {
+        downloadedBytes: number;
+        totalBytes: number;
+      }) => void,
+    ) => Promise<Uint8Array>;
+  },
+  args: {
+    folderId: string;
+    path: string;
+    onProgress?: (progress: {
+      downloadedBytes: number;
+      totalBytes: number;
+    }) => void;
+  },
+): Promise<Uint8Array>;
 export function resolveNodeLocalDiscovery(options?: {
   expectedDeviceId?: string;
   timeoutMs?: number;

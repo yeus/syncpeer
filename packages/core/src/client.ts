@@ -14,6 +14,10 @@ import {
 import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.js";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
 import {
+  coalescePendingIndexFrame,
+  type PendingIndexFrame,
+} from "./core/protocol/indexQueue.js";
+import {
   decryptEncryptedFilename,
   encryptUntrustedBlockHash,
   encryptUntrustedBytes,
@@ -453,6 +457,9 @@ function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidat
   return out;
 }
 
+const isActiveFolderId = (activeFolderIds: Set<string>, folderId: string): boolean =>
+  activeFolderIds.has(String(folderId ?? "").trim());
+
 function extractDiscoveryAuth(url: URL): {
   pinServerDeviceId?: string;
   allowInsecureTls: boolean;
@@ -541,9 +548,12 @@ class BepSession {
   private localIndexId: string;
   private localIndexIdsByFolder = new Map<string, string>();
   private localSequencesByFolder = new Map<string, number>();
+  private pendingIndexByFolder = new Map<string, PendingIndexFrame>();
+  private indexApplyInFlight = new Set<string>();
   private uploadedFilesByFolder = new Map<string, Map<string, UploadedFileRecord>>();
   private readonly folderPasswords: Map<string, string>;
   private readonly localVersionCounterId: string;
+  private activeFolderIds = new Set<string>();
   private socket: SyncpeerTlsSocket;
   private adapter: SyncpeerHostAdapter;
   private localDeviceId: Uint8Array;
@@ -654,7 +664,11 @@ class BepSession {
   }
 
   private onFrame(type: number, msg: any): void {
-    if (type !== MessageTypeValues.PING) {
+    if (
+      type !== MessageTypeValues.PING &&
+      type !== MessageTypeValues.INDEX &&
+      type !== MessageTypeValues.INDEX_UPDATE
+    ) {
       this.log("frame.received", {
         type,
         isClusterConfig: type === MessageTypeValues.CLUSTER_CONFIG,
@@ -670,7 +684,7 @@ class BepSession {
         break;
       case MessageTypeValues.INDEX:
       case MessageTypeValues.INDEX_UPDATE:
-        void this.handleIndex(msg);
+        this.enqueueIndex(type, msg);
         break;
       case MessageTypeValues.RESPONSE:
         this.handleResponse(msg);
@@ -690,6 +704,68 @@ class BepSession {
       default:
         break;
     }
+  }
+
+  private enqueueIndex(type: number, index: any): void {
+    const folderId = String(index?.folder ?? "").trim();
+    if (!folderId) {
+      void this.handleIndex(index);
+      return;
+    }
+    const incoming: PendingIndexFrame = {
+      kind: type === MessageTypeValues.INDEX ? "index" : "update",
+      index,
+    };
+    const pending = this.pendingIndexByFolder.get(folderId);
+    this.pendingIndexByFolder.set(
+      folderId,
+      pending ? coalescePendingIndexFrame(pending, incoming) : incoming,
+    );
+    if (this.indexApplyInFlight.has(folderId)) return;
+    void this.drainIndexQueue(folderId);
+  }
+
+  private async drainIndexQueue(folderId: string): Promise<void> {
+    this.indexApplyInFlight.add(folderId);
+    try {
+      while (!this.closed) {
+        const next = this.pendingIndexByFolder.get(folderId);
+        if (!next) break;
+        this.pendingIndexByFolder.delete(folderId);
+        await this.handleIndex(next.index);
+      }
+    } finally {
+      this.indexApplyInFlight.delete(folderId);
+    }
+  }
+
+  private async requestFolderIndex(folderId: string): Promise<void> {
+    const normalizedFolderId = String(folderId ?? "").trim();
+    if (!normalizedFolderId) return;
+    this.activeFolderIds = new Set([normalizedFolderId]);
+    const folder = this.folders.get(normalizedFolderId);
+    if (!folder) throw new Error(`Unknown folder: ${normalizedFolderId}`);
+    const stopReason = Number(folder.stopReason ?? 0);
+    if (stopReason !== 0) {
+      this.log("index.bootstrap.skipped", {
+        folderId: normalizedFolderId,
+        stopReason,
+        reason: "folder_stopped_by_peer",
+      });
+      return;
+    }
+    const indexFrame = encodeMessageFrame(
+      MessageTypeValues.INDEX,
+      Index,
+      { folder: normalizedFolderId, files: [], last_sequence: 0 },
+      0,
+    );
+    await this.socket.write(indexFrame);
+    this.log("index.bootstrap.sent", {
+      folderId: normalizedFolderId,
+      bytes: indexFrame.length,
+      mode: "lazy",
+    });
   }
 
   private async handleClusterConfig(cfg: any): Promise<void> {
@@ -851,7 +927,7 @@ class BepSession {
           name: this.localDeviceName,
           addresses: ["dynamic"],
           compression: 0,
-          max_sequence: 0,
+          max_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
           index_id: localFolderIndexId,
           // Compatibility: some peers reject our cluster config if we advertise that
           // we also have encrypted-at-rest data for the same folder.
@@ -897,30 +973,10 @@ class BepSession {
           folderCount: folders.length,
           bytes: frame.length,
         });
-        for (const folder of folders) {
-          const folderId = String(folder?.id ?? "").trim();
-          if (!folderId) continue;
-          const stopReason = Number(folder?.stop_reason ?? 0);
-          if (stopReason !== 0) {
-            this.log("index.bootstrap.skipped", {
-              folderId,
-              stopReason,
-              reason: "folder_stopped_by_peer",
-            });
-            continue;
-          }
-          const indexFrame = encodeMessageFrame(
-            MessageTypeValues.INDEX,
-            Index,
-            { folder: folderId, files: [], last_sequence: 0 },
-            0,
-          );
-          await this.socket.write(indexFrame);
-          this.log("index.bootstrap.sent", {
-            folderId,
-            bytes: indexFrame.length,
-          });
-        }
+        this.log("index.bootstrap.deferred", {
+          reason: "lazy_on_folder_open",
+          folderCount: folders.length,
+        });
       } catch (error) {
         this.log("cluster.echo.send.failed", {
           message: error instanceof Error ? error.message : String(error),
@@ -937,6 +993,11 @@ class BepSession {
     const folderId = index.folder;
     const state = this.folders.get(folderId);
     if (!state) return;
+    const isActiveFolder = isActiveFolderId(this.activeFolderIds, folderId);
+    if (!isActiveFolder) {
+      state.indexReceived = false;
+      return;
+    }
     const files = Array.isArray(index.files) ? index.files : [];
     this.log("index.received", {
       folderId,
@@ -1531,14 +1592,16 @@ class BepSession {
       0,
     );
     return new Promise<Uint8Array>((resolve, reject) => {
+      const timeoutMs = 20_000;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         this.log("request.timeout", {
           ...meta,
+          timeoutMs,
           durationMs: Date.now() - meta.startedAtMs,
         });
         reject(new Error(`Request timeout for ${name} at offset ${offset}`));
-      }, 20000);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, meta });
       this.socket.write(frame).catch((error) => {
         clearTimeout(timer);
@@ -1558,6 +1621,11 @@ class BepSession {
       this.folders,
       (folder, name, offset, size, options) =>
         this.requestBlock(folder, name, offset, size, options),
+      (folderId) => this.requestFolderIndex(folderId),
+      (folderId) => {
+        const normalized = folderId ? String(folderId).trim() || null : null;
+        this.activeFolderIds = normalized ? new Set([normalized]) : new Set();
+      },
       (event, details) => this.log(event.replace(/^core\./, ""), details),
       metadata,
       () => {
@@ -1571,8 +1639,10 @@ class BepSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    for (const { timer } of this.pending.values()) {
+    const closeError = this.closeReason ?? new Error("Connection closed");
+    for (const { timer, reject } of this.pending.values()) {
       clearTimeout(timer);
+      reject(closeError);
     }
     this.pending.clear();
     await this.socket.close();

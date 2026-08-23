@@ -30,6 +30,9 @@ export interface LocalDiscoveredDevice {
 
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
+  requestFolderIndex: (folderId: string) => Promise<void>;
+  setFocusedFolder: (folderId: string | null) => void;
+  waitForFolderIndex: (folderId: string, timeoutMs?: number, pollMs?: number) => Promise<boolean>;
   readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
   readFileFully: (
     folderId: string,
@@ -414,7 +417,10 @@ export const createSyncpeerBrowserClient = (
   const coreAdapter: SyncpeerHostAdapter = {
     ...options.hostAdapter,
     log: (event, details) => {
-      options.hostAdapter.log?.(event, details);
+      if (options.hostAdapter.log) {
+        options.hostAdapter.log(event, details);
+        return;
+      }
       logClient(options.onLog, event, details);
     },
   };
@@ -574,6 +580,16 @@ export const createSyncpeerBrowserClient = (
 
   const remoteFsLike: RemoteFsLike = {
     listFolders: async () => (await requireActiveSession()).remoteFs.listFolders(),
+    requestFolderIndex: async (folderId: string) =>
+      (await requireActiveSession()).remoteFs.requestFolderIndex(folderId),
+    setFocusedFolder: (folderId: string | null) => {
+      if (!activeSession || activeSession.isClosed()) {
+        throw new Error("No active connection. Connect first.");
+      }
+      activeSession.remoteFs.setFocusedFolder(folderId);
+    },
+    waitForFolderIndex: async (folderId: string, timeoutMs?: number, pollMs?: number) =>
+      (await requireActiveSession()).remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
     readDir: async (folderId: string, path: string) =>
       (await requireActiveSession()).remoteFs.readDir(folderId, path),
     readFileFully: async (

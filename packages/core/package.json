@@ -2,6 +2,9 @@
   "name": "@syncpeer/core",
   "version": "0.1.0",
   "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
   "exports": {
     ".": {
       "import": "./src/index.ts",
@@ -12,8 +15,8 @@
       "types": "./src/pim/index.ts"
     },
     "./node": {
-      "import": "./src/node.ts",
-      "types": "./src/node.d.ts"
+      "import": "./dist/node.js",
+      "types": "./dist/node.d.ts"
     },
     "./browser": {
       "import": "./src/browser.ts",

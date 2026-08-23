@@ -10,13 +10,27 @@ import { createHash } from "node:crypto";
  */
 
 const keep = process.argv.includes("--keep");
+const skipEncryptedChecks = process.argv.includes("--skip-encrypted");
+const parseDownloadIterations = (): number => {
+  const index = process.argv.indexOf("--download-iterations");
+  if (index < 0) return 1;
+  const value = Number(process.argv[index + 1]);
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : 1;
+};
+const downloadIterations = parseDownloadIterations();
 const root = path.resolve(".tmp/syncpeer-test");
 const aHome = path.join(root, "st-a");
 const bHome = path.join(root, "st-b");
 const folderId = "syncpeer-test";
+const noiseFolderAId = "syncpeer-noise-a";
+const noiseFolderBId = "syncpeer-noise-b";
 const encryptedFolderId = "syncpeer-encrypted";
 const bShareDir = path.join(root, "share-b");
 const aRecvDir = path.join(root, "share-a");
+const bNoiseShareADir = path.join(root, "share-b-noise-a");
+const aNoiseRecvADir = path.join(root, "share-a-noise-a");
+const bNoiseShareBDir = path.join(root, "share-b-noise-b");
+const aNoiseRecvBDir = path.join(root, "share-a-noise-b");
 const bEncryptedShareDir = path.join(root, "share-b-encrypted");
 const cliConfigHome = path.join(root, "xdg-config");
 const cliNodeHome = path.join(cliConfigHome, "syncpeer", "cli-node");
@@ -251,6 +265,27 @@ function execCli(args, options = {}) {
   return execFileSync("node", [cliEntry, ...args], options);
 }
 
+function execCliAsync(args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("node", [cliEntry, ...args], {
+      stdio: "inherit",
+      env,
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(
+        new Error(
+          `CLI exited with ${signal ? `signal ${signal}` : `code ${String(code)}`}`,
+        ),
+      );
+    });
+  });
+}
+
 function normalizeDeviceId(value) {
   return String(value ?? "")
     .trim()
@@ -276,7 +311,10 @@ async function waitForIntroducedDeviceAdvertisement(options) {
   while (Date.now() < deadline) {
     let session = null;
     try {
-      const { createNodeSyncpeerClient } = await import("../packages/core/src/node.ts");
+      const nodeModule = await import("../packages/core/dist/node.js").catch(() =>
+        import("../packages/core/src/node.ts")
+      );
+      const { createNodeSyncpeerClient } = nodeModule;
       const certPem = fs.readFileSync(localCertPath, "utf8");
       const keyPem = fs.readFileSync(localKeyPath, "utf8");
       const client = createNodeSyncpeerClient();
@@ -349,6 +387,35 @@ async function waitForCliDownload(args, outPath, expectedContent, timeoutMs) {
   throw new Error(`Timed out waiting for CLI download to match expected content: ${String(lastErr)}`);
 }
 
+function sha256File(filePath) {
+  return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+async function runBackgroundFolderChurn(options) {
+  const { dirs, durationMs, intervalMs, shouldContinue } = options;
+  const startMs = Date.now();
+  let tick = 0;
+  while (Date.now() - startMs < durationMs && shouldContinue()) {
+    for (const dir of dirs) {
+      const base = `noise-${tick}-${Math.floor(Math.random() * 100000)}`;
+      writeFile(path.join(dir, `${base}.txt`), `tick=${tick}\nnow=${Date.now()}\n`);
+      if (tick % 3 === 0) {
+        const entries = fs.readdirSync(dir).filter((name) => name.startsWith(`noise-${Math.max(0, tick - 3)}-`));
+        for (const entry of entries) {
+          try {
+            fs.rmSync(path.join(dir, entry), { force: true });
+          } catch {
+            // best effort
+          }
+        }
+      }
+    }
+    tick += 1;
+    await sleep(intervalMs);
+  }
+  return tick;
+}
+
 async function waitForCliOutputContains(args, expectedText, timeoutMs, options = {}) {
   const deadline = Date.now() + timeoutMs;
   let lastOutput = "";
@@ -386,6 +453,10 @@ async function main() {
   ensureDir(bHome);
   ensureDir(aRecvDir);
   ensureDir(bShareDir);
+  ensureDir(aNoiseRecvADir);
+  ensureDir(bNoiseShareADir);
+  ensureDir(aNoiseRecvBDir);
+  ensureDir(bNoiseShareBDir);
   ensureDir(bEncryptedShareDir);
   ensureDir(cliUntrustedHome);
   ensureDir(cliObserverHome);
@@ -395,6 +466,8 @@ async function main() {
   writeFile(path.join(bShareDir, "a.txt"), expectedA);
   writeFile(path.join(bShareDir, "subdir", "nested.txt"), "nested file\n");
   writeFile(path.join(bShareDir, "blob.bin"), randomBuffer(300 * 1024));
+  writeFile(path.join(bNoiseShareADir, "seed.txt"), "seed noise a\n");
+  writeFile(path.join(bNoiseShareBDir, "seed.txt"), "seed noise b\n");
   writeFile(path.join(bEncryptedShareDir, "secret.txt"), expectedEncrypted);
 
   console.log("Building CLI packages...");
@@ -431,6 +504,20 @@ async function main() {
         type: "sendreceive",
         deviceIds: [aId, bId, cliNodeId],
       },
+      {
+        id: noiseFolderAId,
+        label: noiseFolderAId,
+        path: aNoiseRecvADir,
+        type: "sendreceive",
+        deviceIds: [aId, bId, cliNodeId],
+      },
+      {
+        id: noiseFolderBId,
+        label: noiseFolderBId,
+        path: aNoiseRecvBDir,
+        type: "sendreceive",
+        deviceIds: [aId, bId, cliNodeId],
+      },
     ],
   });
   configureHome(bHome, {
@@ -447,6 +534,20 @@ async function main() {
         id: folderId,
         label: folderId,
         path: bShareDir,
+        type: "sendonly",
+        deviceIds: [bId, aId, cliNodeId],
+      },
+      {
+        id: noiseFolderAId,
+        label: noiseFolderAId,
+        path: bNoiseShareADir,
+        type: "sendonly",
+        deviceIds: [bId, aId, cliNodeId],
+      },
+      {
+        id: noiseFolderBId,
+        label: noiseFolderBId,
+        path: bNoiseShareBDir,
         type: "sendonly",
         deviceIds: [bId, aId, cliNodeId],
       },
@@ -473,6 +574,8 @@ async function main() {
     await sleep(3000);
     await waitForSync(path.join(aRecvDir, "a.txt"), expectedA, 90_000);
     await waitForSync(path.join(aRecvDir, "subdir", "nested.txt"), "nested file\n", 90_000);
+    await waitForSync(path.join(aNoiseRecvADir, "seed.txt"), "seed noise a\n", 90_000);
+    await waitForSync(path.join(aNoiseRecvBDir, "seed.txt"), "seed noise b\n", 90_000);
 
     const uploadPayload = `hello_from_syncpeer ${new Date().toISOString()}\n`;
     const uploadSourcePath = path.join(root, "hello_from_syncpeer.txt");
@@ -555,7 +658,9 @@ async function main() {
     const {
       createNodeSessionTransport,
       createSyncpeerSessionStore,
-    } = await import("../packages/core/src/index.ts");
+    } = await import("../packages/core/dist/index.js").catch(() =>
+      import("../packages/core/src/index.ts")
+    );
     const sessionTransport = createNodeSessionTransport();
     const sessionTraceEvents = [];
     const sessionStore = createSyncpeerSessionStore({
@@ -606,6 +711,26 @@ async function main() {
         `Session-store reconnect listing missing a.txt. Entries: ${[...reconnectEntryPaths].join(", ")}`,
       );
     }
+
+    const staleProbeName = `stale-probe-${Date.now()}.txt`;
+    const staleProbeContent = `probe ${new Date().toISOString()}\n`;
+    writeFile(path.join(bShareDir, staleProbeName), staleProbeContent);
+    await sessionStore.actions.refreshOverview(sessionOptions);
+    const staleDeadline = Date.now() + 20_000;
+    let staleReady = false;
+    while (Date.now() < staleDeadline) {
+      await sessionStore.actions.reloadCurrentDirectory(sessionOptions);
+      sessionState = sessionStore.getState();
+      const hasProbe = sessionState.entries.some((entry) => entry.path === staleProbeName);
+      if (sessionState.directory.status === "ready" && hasProbe) {
+        staleReady = true;
+        break;
+      }
+      await sleep(300);
+    }
+    if (!staleReady) {
+      throw new Error("Session-store stale->ready flow did not settle with new file visible.");
+    }
     await sessionStore.actions.disconnect();
     console.log(`Core session-store parity check passed (${sessionTraceEvents.length} trace events).`);
 
@@ -655,28 +780,69 @@ async function main() {
     }
     console.log("Persisted cli-node list check passed.");
 
-    const downloadOutPath = path.join(root, "downloaded-nested.txt");
-    execCli([
+    for (let iteration = 1; iteration <= downloadIterations; iteration += 1) {
+      const downloadOutPath = path.join(root, `downloaded-nested-${iteration}.txt`);
+      execCli([
+        "--host", "127.0.0.1",
+        "--port", "58301",
+        "--remote-id", bId,
+        "--timeout-ms", "20000",
+        "download",
+        folderId,
+        "a.txt",
+        downloadOutPath,
+      ], {
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          XDG_CONFIG_HOME: cliConfigHome,
+          SYNCTHING_BIN: syncthingBin,
+        },
+      });
+      const downloaded = fs.readFileSync(downloadOutPath, "utf8");
+      if (downloaded !== expectedA) {
+        throw new Error(`Downloaded content mismatch on iteration ${iteration}: got "${downloaded}"`);
+      }
+    }
+    const stressedOutPath = path.join(root, "downloaded-stress-blob.bin");
+    const stressStartedAt = Date.now();
+    let downloadInFlight = true;
+    const downloadPromise = execCliAsync([
       "--host", "127.0.0.1",
       "--port", "58301",
       "--remote-id", bId,
       "--timeout-ms", "20000",
       "download",
       folderId,
-      "a.txt",
-      downloadOutPath,
+      "blob.bin",
+      stressedOutPath,
     ], {
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        XDG_CONFIG_HOME: cliConfigHome,
-        SYNCTHING_BIN: syncthingBin,
-      },
+      ...process.env,
+      XDG_CONFIG_HOME: cliConfigHome,
+      SYNCTHING_BIN: syncthingBin,
+    }).finally(() => {
+      downloadInFlight = false;
     });
-    const downloaded = fs.readFileSync(downloadOutPath, "utf8");
-    if (downloaded !== expectedA) {
-      throw new Error(`Downloaded content mismatch: got "${downloaded}"`);
+    const [, churnTicks] = await Promise.all([
+      downloadPromise,
+      runBackgroundFolderChurn({
+        dirs: [bNoiseShareADir, bNoiseShareBDir],
+        durationMs: 18_000,
+        intervalMs: 120,
+        shouldContinue: () => downloadInFlight,
+      }),
+    ]);
+    if (churnTicks < 2) {
+      throw new Error("Metadata churn did not continue while the download process ran.");
     }
+    const stressElapsedMs = Date.now() - stressStartedAt;
+    const sourceHash = sha256File(path.join(bShareDir, "blob.bin"));
+    const downloadedHash = sha256File(stressedOutPath);
+    if (sourceHash !== downloadedHash) {
+      throw new Error("Stressed download integrity mismatch for blob.bin.");
+    }
+    console.log(`Download-under-index-churn check passed (${stressElapsedMs} ms).`);
+
     const persistedDeviceIdPath = path.join(cliNodeHome, "device-id.txt");
     if (!fs.existsSync(persistedDeviceIdPath)) {
       throw new Error(`Persisted device-id file missing: ${persistedDeviceIdPath}`);
@@ -703,84 +869,88 @@ async function main() {
       SYNCTHING_BIN: syncthingBin,
     };
 
-    try {
-      let encryptedDownloadFailed = false;
+    if (!skipEncryptedChecks) {
       try {
+        let encryptedDownloadFailed = false;
+        try {
+          execCli([
+            "--host", "127.0.0.1",
+            "--port", "58301",
+            "--cert", path.join(cliUntrustedHome, "cert.pem"),
+            "--key", path.join(cliUntrustedHome, "key.pem"),
+            "--remote-id", bId,
+            "--timeout-ms", "20000",
+            "download",
+            encryptedFolderId,
+            "secret.txt",
+            path.join(root, "encrypted-without-password.txt"),
+          ], {
+            stdio: "pipe",
+            env: {
+              ...process.env,
+              XDG_CONFIG_HOME: cliConfigHome,
+              SYNCTHING_BIN: syncthingBin,
+            },
+          });
+        } catch {
+          encryptedDownloadFailed = true;
+        }
+        if (!encryptedDownloadFailed) {
+          throw new Error("Encrypted folder download unexpectedly succeeded without a folder password.");
+        }
+
+        const encryptedFilesOutput = execCli([
+          ...encryptedCliBaseArgs,
+          "files",
+          encryptedFolderId,
+        ], {
+          encoding: "utf8",
+          env: encryptedCliEnv,
+        });
+        if (!encryptedFilesOutput.includes("\tsecret.txt")) {
+          throw new Error(`Encrypted folder listing missing decrypted file name:\n${encryptedFilesOutput}`);
+        }
+
+        const encryptedDownloadOutPath = path.join(root, "downloaded-encrypted-secret.txt");
         execCli([
-          "--host", "127.0.0.1",
-          "--port", "58301",
-          "--cert", path.join(cliUntrustedHome, "cert.pem"),
-          "--key", path.join(cliUntrustedHome, "key.pem"),
-          "--remote-id", bId,
-          "--timeout-ms", "20000",
+          ...encryptedCliBaseArgs,
           "download",
           encryptedFolderId,
           "secret.txt",
-          path.join(root, "encrypted-without-password.txt"),
+          encryptedDownloadOutPath,
         ], {
-          stdio: "pipe",
-          env: {
-            ...process.env,
-            XDG_CONFIG_HOME: cliConfigHome,
-            SYNCTHING_BIN: syncthingBin,
-          },
+          stdio: "inherit",
+          env: encryptedCliEnv,
         });
-      } catch {
-        encryptedDownloadFailed = true;
-      }
-      if (!encryptedDownloadFailed) {
-        throw new Error("Encrypted folder download unexpectedly succeeded without a folder password.");
-      }
-
-      const encryptedFilesOutput = execCli([
-        ...encryptedCliBaseArgs,
-        "files",
-        encryptedFolderId,
-      ], {
-        encoding: "utf8",
-        env: encryptedCliEnv,
-      });
-      if (!encryptedFilesOutput.includes("\tsecret.txt")) {
-        throw new Error(`Encrypted folder listing missing decrypted file name:\n${encryptedFilesOutput}`);
+        const encryptedDownloaded = fs.readFileSync(encryptedDownloadOutPath, "utf8");
+        if (encryptedDownloaded !== expectedEncrypted) {
+          throw new Error(`Encrypted downloaded content mismatch: got "${encryptedDownloaded}"`);
+        }
+        console.log("Encrypted folder password gating check passed.");
+        console.log("Encrypted folder download check passed.");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log("Encrypted folder compatibility probe did not pass.");
+        console.log(`Known limitation: ${message}`);
       }
 
-      const encryptedDownloadOutPath = path.join(root, "downloaded-encrypted-secret.txt");
-      execCli([
-        ...encryptedCliBaseArgs,
-        "download",
-        encryptedFolderId,
+      // Additional strict regression guard for encrypted browse listing.
+      await waitForCliOutputContains(
+        [...encryptedCliBaseArgs, "files", encryptedFolderId],
+        "\tsecret.txt",
+        60_000,
+        { env: encryptedCliEnv },
+      );
+      await waitForCliOutputContains(
+        [...encryptedCliBaseArgs, "tree", encryptedFolderId],
         "secret.txt",
-        encryptedDownloadOutPath,
-      ], {
-        stdio: "inherit",
-        env: encryptedCliEnv,
-      });
-      const encryptedDownloaded = fs.readFileSync(encryptedDownloadOutPath, "utf8");
-      if (encryptedDownloaded !== expectedEncrypted) {
-        throw new Error(`Encrypted downloaded content mismatch: got "${encryptedDownloaded}"`);
-      }
-      console.log("Encrypted folder password gating check passed.");
-      console.log("Encrypted folder download check passed.");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.log("Encrypted folder compatibility probe did not pass.");
-      console.log(`Known limitation: ${message}`);
+        60_000,
+        { env: encryptedCliEnv },
+      );
+      console.log("Encrypted folder browse regression check passed.");
+    } else {
+      console.log("Skipping encrypted-folder checks (--skip-encrypted).");
     }
-
-    // Additional strict regression guard for encrypted browse listing.
-    await waitForCliOutputContains(
-      [...encryptedCliBaseArgs, "files", encryptedFolderId],
-      "\tsecret.txt",
-      60_000,
-      { env: encryptedCliEnv },
-    );
-    await waitForCliOutputContains(
-      [...encryptedCliBaseArgs, "tree", encryptedFolderId],
-      "secret.txt",
-      60_000,
-      { env: encryptedCliEnv },
-    );
-    console.log("Encrypted folder browse regression check passed.");
 
     const filesOutput = execCli(["files-local", bShareDir], {
       encoding: "utf8",

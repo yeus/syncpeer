@@ -41,6 +41,9 @@ export interface FolderSyncState {
 
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
+  requestFolderIndex: (folderId: string) => Promise<void>;
+  setFocusedFolder: (folderId: string | null) => void;
+  waitForFolderIndex: (folderId: string, timeoutMs?: number, pollMs?: number) => Promise<boolean>;
   readDir: (folderId: string, path: string) => Promise<FileEntry[]>;
   readFileFully: (
     folderId: string,

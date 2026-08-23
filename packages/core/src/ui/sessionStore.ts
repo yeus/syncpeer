@@ -12,6 +12,15 @@ import {
   makeWaitForFolderIndexToArriveFlow,
   makeWaitForFoldersToPopulateFlow,
 } from "./sessionFlows.js";
+import {
+  directoryToError,
+  directoryToIdle,
+  directoryToLoading,
+  directoryToLocked,
+  directoryToReady,
+  directoryToStale,
+  directoryToStaleKeepingVersion,
+} from "./sessionTransitions.js";
 import type {
   SessionRuntimeDeps,
   SessionState,
@@ -110,12 +119,8 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         phase: "connecting",
         directory: current.directory.folderId
           ? {
-              ...current.directory,
-              entries: [],
-              status: "loading",
+              ...directoryToLoading(current, current.directory.requestSeq + 1).directory,
               versionKey: "",
-              error: null,
-              requestSeq: current.directory.requestSeq + 1,
             }
           : current.directory,
         entries: current.directory.folderId ? [] : current.entries,
@@ -203,12 +208,10 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           ...current,
           phase: "idle",
           remoteFs: null,
-          directory: {
-            ...current.directory,
-            status: "idle",
-            versionKey: "",
-            error: null,
-          },
+        directory: {
+          ...directoryToIdle(current).directory,
+          versionKey: "",
+        },
           currentFolderVersionKey: "",
           pending: {
             connecting: false,
@@ -226,6 +229,11 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       setState((current) => ({
         ...current,
         phase: "refreshing",
+        directory: (
+          current.directory.folderId && current.directory.status === "ready"
+            ? directoryToStale(current)
+            : current
+        ).directory,
         pending: { ...current.pending, refreshingOverview: true },
       }));
       try {
@@ -241,22 +249,20 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           const nextVersionKey = nextState.directory.folderId
             ? folderVersionKey(nextState, nextState.directory.folderId)
             : "";
+          const hasSelectedFolder = nextState.directory.folderId !== "";
           const versionChanged =
-            nextState.directory.folderId !== "" &&
-            nextState.directory.status === "ready" &&
+            hasSelectedFolder &&
             nextVersionKey !== "" &&
             nextVersionKey !== nextState.directory.versionKey;
-          shouldReloadDirectory = versionChanged || directoryIsLocked(nextState);
+          const staleNeedsReload =
+            hasSelectedFolder &&
+            nextState.directory.status === "stale";
+          shouldReloadDirectory =
+            versionChanged ||
+            staleNeedsReload ||
+            directoryIsLocked(nextState);
           if (!versionChanged) return nextState;
-          return {
-            ...nextState,
-            directory: {
-              ...nextState.directory,
-              status: "stale",
-              versionKey: nextState.directory.versionKey,
-              error: null,
-            },
-          };
+          return directoryToStaleKeepingVersion(nextState, nextState.directory.versionKey);
         });
         if (shouldReloadDirectory && state.directory.folderId && !directoryIsLocked(state)) {
           await actions.reloadCurrentDirectory(resolved);
@@ -274,16 +280,15 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     },
 
     goToRoot: async (): Promise<void> => {
+      state.remoteFs?.setFocusedFolder(null);
       setState((current) => ({
         ...current,
         directory: {
-          ...current.directory,
+          ...directoryToIdle(current).directory,
           folderId: "",
           path: "",
           entries: [],
-          status: "idle",
           versionKey: "",
-          error: null,
         },
         currentFolderId: "",
         currentPath: "",
@@ -294,6 +299,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
     },
 
     openFolder: async (folderId: string, options?: ConnectOptions): Promise<void> => {
+      state.remoteFs?.setFocusedFolder(folderId);
       setState((current) => setCurrentLocation(current, folderId, ""));
       await actions.reloadCurrentDirectory(options);
     },
@@ -302,12 +308,11 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       setState((current) => ({
         ...current,
         directory: {
-          ...current.directory,
+          ...directoryToLoading(current, current.directory.requestSeq).directory,
           path: normalizePath(path),
           entries: [],
           status: current.directory.folderId ? "loading" : "idle",
           versionKey: "",
-          error: null,
         },
         currentPath: normalizePath(path),
         entries: [],
@@ -321,6 +326,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       path: string,
       options?: ConnectOptions,
     ): Promise<void> => {
+      state.remoteFs?.setFocusedFolder(folderId);
       setState((current) => setCurrentLocation(current, folderId, path));
       await actions.reloadCurrentDirectory(options);
     },
@@ -330,36 +336,18 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       const current = state;
       const folderId = current.directory.folderId || current.currentFolderId;
       if (!current.remoteFs || !folderId) return;
+      current.remoteFs.setFocusedFolder(folderId);
+      const readPath = normalizePath(current.directory.path || current.currentPath);
       const folder = current.folders.find((entry) => entry.id === folderId);
       if (folder?.encrypted && folder.needsPassword) {
-        setState((next) => ({
-          ...next,
-          directory: {
-            ...next.directory,
-            entries: [],
-            status: "locked",
-            error: null,
-          },
-          entries: [],
-          pending: { ...next.pending, loadingDirectory: false },
-        }));
+        setState((next) => directoryToLocked(next));
         return;
       }
       const targetEpoch = current.requestEpoch;
       const requestSeq = current.directory.requestSeq + 1;
-      setState((next) => ({
-        ...next,
-        directoryLoadSeq: requestSeq,
-        directory: {
-          ...next.directory,
-          status: "loading",
-          error: null,
-          requestSeq,
-        },
-        pending: { ...next.pending, loadingDirectory: true },
-        lastError: null,
-      }));
+      setState((next) => directoryToLoading(next, requestSeq));
       try {
+        await current.remoteFs.requestFolderIndex(folderId);
         const indexResult = await waitForFolderIndexToArrive({
           folderId,
           connectOptions: resolved,
@@ -379,12 +367,11 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           );
         }
 
-        const path = normalizePath(state.directory.path || state.currentPath);
         const latestFolder = state.folders.find((entry) => entry.id === folderId);
         const readResult = await readDirWithRetry({
-          fs: state.remoteFs!,
+          fs: current.remoteFs,
           folderId,
-          path,
+          path: readPath,
           encrypted: Boolean(latestFolder?.encrypted),
           locked: Boolean(latestFolder?.needsPassword),
           retryIntervalMs: 200,
@@ -394,39 +381,18 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           if (next.requestEpoch !== targetEpoch) return next;
           if (next.directory.requestSeq !== requestSeq) return next;
           const versionKey = folderVersionKey(next, folderId);
-          return {
-            ...next,
-            directory: {
-              ...next.directory,
-              folderId,
-              path,
-              entries: readResult.entries,
-              status: "ready",
-              versionKey,
-              loadedAtMs: now(),
-              error: null,
-            },
-            entries: readResult.entries,
-            currentFolderId: folderId,
-            currentPath: path,
-            currentFolderVersionKey: versionKey,
-            phase: "connected",
-            pending: { ...next.pending, loadingDirectory: false },
-          };
+          return directoryToReady(
+            next,
+            folderId,
+            readPath,
+            readResult.entries,
+            versionKey,
+            now(),
+          );
         });
       } catch (error) {
         const message = resolveErrorMessage(error);
-        setState((next) => ({
-          ...next,
-          phase: "error",
-          directory: {
-            ...next.directory,
-            status: "error",
-            error: message,
-          },
-          pending: { ...next.pending, loadingDirectory: false },
-          lastError: message,
-        }));
+        setState((next) => directoryToError(next, message));
         throw error;
       }
     },
@@ -449,13 +415,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         return {
           ...current,
           connectOptions: nextConnectOptions,
-          directory: current.directory.folderId
-            ? {
-                ...current.directory,
-                status: "stale",
-                error: null,
-              }
-            : current.directory,
+          directory: (current.directory.folderId ? directoryToStale(current) : current).directory,
         };
       });
     },

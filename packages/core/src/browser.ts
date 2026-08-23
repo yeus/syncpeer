@@ -73,6 +73,7 @@ export {
   makeWaitForFoldersToPopulateFlow,
 } from "./ui/sessionFlows.js";
 export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.js";
+export { downloadRemoteFile } from "./transfer/download.js";
 export type {
   CachedFileRecord,
   CachedFileStatus,

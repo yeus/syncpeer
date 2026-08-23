@@ -18,6 +18,7 @@ import {
 } from "./client.js";
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.js";
 import type { SessionTransport } from "./ui/sessionTypes.js";
+export { downloadRemoteFile } from "./transfer/download.js";
 
 type ByteBuffer = Buffer<ArrayBufferLike>;
 const LOCAL_DISCOVERY_MAGIC = 0x2ea7d90b;
@@ -682,30 +683,29 @@ export const createNodeSessionTransport = (): SessionTransport => {
       keyPem,
     });
 
+  const requireActiveSession = () => {
+    if (!activeSession || activeSession.isClosed()) {
+      throw new Error("No active connection. Connect first.");
+    }
+    return activeSession;
+  };
+
   const asRemoteFsLike = (): RemoteFsLike => ({
-    listFolders: async () => {
-      if (!activeSession || activeSession.isClosed()) {
-        throw new Error("No active connection. Connect first.");
-      }
-      return activeSession.remoteFs.listFolders();
-    },
+    listFolders: async () => requireActiveSession().remoteFs.listFolders(),
+    requestFolderIndex: async (folderId) =>
+      requireActiveSession().remoteFs.requestFolderIndex(folderId),
+    setFocusedFolder: (folderId) =>
+      requireActiveSession().remoteFs.setFocusedFolder(folderId),
+    waitForFolderIndex: async (folderId, timeoutMs, pollMs) =>
+      requireActiveSession().remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
     readDir: async (folderId, path) => {
-      if (!activeSession || activeSession.isClosed()) {
-        throw new Error("No active connection. Connect first.");
-      }
-      return activeSession.remoteFs.readDir(folderId, path);
+      return requireActiveSession().remoteFs.readDir(folderId, path);
     },
     readFileFully: async (folderId, path, onProgress) => {
-      if (!activeSession || activeSession.isClosed()) {
-        throw new Error("No active connection. Connect first.");
-      }
-      return activeSession.remoteFs.readFileFully(folderId, path, onProgress);
+      return requireActiveSession().remoteFs.readFileFully(folderId, path, onProgress);
     },
     writeFileFully: async (folderId, path, bytes, options) => {
-      if (!activeSession || activeSession.isClosed()) {
-        throw new Error("No active connection. Connect first.");
-      }
-      return activeSession.remoteFs.writeFileFully(folderId, path, bytes, options);
+      return requireActiveSession().remoteFs.writeFileFully(folderId, path, bytes, options);
     },
   });
 

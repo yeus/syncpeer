@@ -17,6 +17,7 @@ export {
 export { RemoteFs } from "./core/model/remoteFs.js";
 export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
+export { downloadRemoteFile } from "./transfer/download.js";
 export {
   canonicalRecordPath,
   collectionRootPath,

@@ -71,245 +71,43 @@ import {
 } from "./state.ts";
 import {
   suggestedClientName,
-  temporarySavedDeviceName,
 } from "./suggestedNames.ts";
+import {
+  clearDirectoryViewState,
+  resetRuntimeSessionState,
+} from "./sessionViewPolicies.ts";
+import { updateCachedKey } from "./downloadPolicies.ts";
+import {
+  folderSignature,
+  hasAutoConnectTarget,
+  restoreOfflineSnapshot,
+  saveOfflineSnapshot,
+  setRemoteApprovalPending,
+} from "./syncPolicies.ts";
+import {
+  applyAutoApprovals,
+  normalizeCandidateAddresses,
+  normalizeCandidateDeviceId,
+  parseTcpAddress,
+  suggestedSavedDeviceName,
+  syncConnectedDeviceSavedName,
+  upsertSavedDevice,
+} from "./devicePolicies.ts";
 
 const nowTime = () => new Date().toLocaleTimeString();
 const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
 const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
 const DOWNLOAD_NOTIFICATION_ID = 11001;
 const UPLOAD_NOTIFICATION_ID = 11002;
-
-const folderSignature = (folders: FolderInfo[]) =>
-  folders
-    .map((folder) =>
-      [
-        folder.id,
-        folder.label,
-        folder.stopReason ?? 0,
-        folder.localDevicePresentInFolder ? 1 : 0,
-      ].join(":"),
-    )
-    .sort()
-    .join("|");
-
-const updateCachedKey = (
-  state: AppState,
-  folderId: string,
-  path: string,
-  available: boolean,
-) => {
-  const next = new Set(state.favorites.cachedFileKeys);
-  const key = cachedFileKey(folderId, path);
-  if (available) next.add(key);
-  else next.delete(key);
-  state.favorites.cachedFileKeys = next;
-};
-
-const saveOfflineSnapshot = (
-  state: AppState,
-  sourceDeviceId: string,
-  snapshot: {
-    folders: FolderInfo[];
-    remoteDevice: RemoteDeviceInfo | null;
-    folderSyncStates: import("@syncpeer/core/browser").FolderSyncState[];
-    connectedVia: string;
-    transportKind: "direct-tcp" | "relay" | "";
-  },
-) => {
-  const deviceId = normalizeDeviceId(sourceDeviceId);
-  if (!deviceId) return;
-  if (snapshot.folders.length === 0 && snapshot.folderSyncStates.length === 0) return;
-  state.offline.snapshots = {
-    ...state.offline.snapshots,
-    [deviceId]: {
-      deviceId,
-      remoteDevice: snapshot.remoteDevice,
-      folders: snapshot.folders,
-      folderSyncStates: snapshot.folderSyncStates,
-      connectedVia: snapshot.connectedVia,
-      transportKind: snapshot.transportKind,
-      lastSeenAtMs: Date.now(),
-    },
-  };
-};
-
-const hasAutoConnectTarget = (state: AppState) => {
-  const remoteTarget = normalizeDeviceId(state.connection.remoteId);
-  if (remoteTarget) return true;
-  const selected = normalizeDeviceId(state.devices.selectedSavedDeviceId);
-  if (!selected) return false;
-  return !state.devices.lanDiscoveredDeviceIds.has(selected);
-};
-
-const clearDirectoryView = (state: AppState) => {
-  state.session.directory = {
-    ...state.session.directory,
-    folderId: "",
-    path: "",
-    entries: [],
-    status: "idle",
-    versionKey: "",
-    error: null,
-  };
-  state.session.currentFolderId = "";
-  state.session.currentPath = "";
-  state.session.entries = [];
-  state.session.currentFolderVersionKey = "";
-  state.session.directoryPage = 1;
-};
-
-const restoreOfflineSnapshot = (
-  state: AppState,
-  preferredDeviceId?: string,
-  reason = "restore",
-) => {
-  const preferred = normalizeDeviceId(preferredDeviceId ?? activeSourceDeviceId(state));
-  const snapshots = Object.values(state.offline.snapshots).sort(
-    (left, right) => right.lastSeenAtMs - left.lastSeenAtMs,
-  );
-  const snapshot =
-    (preferred ? state.offline.snapshots[preferred] : null) ?? snapshots[0];
-  if (!snapshot) return false;
-  state.session.folders = snapshot.folders;
-  state.session.folderSyncStates = snapshot.folderSyncStates;
-  state.session.remoteDevice = snapshot.remoteDevice;
-  state.session.connectionPath = snapshot.connectedVia;
-  state.session.connectionTransport = snapshot.transportKind;
-  if (
-    state.session.currentFolderId &&
-    !snapshot.folders.some((folder) => folder.id === state.session.currentFolderId)
-  ) {
-    clearDirectoryView(state);
-  }
-  pushSessionLog(
-    state,
-    "info",
-    "offline.snapshot.restored",
-    `Restored offline snapshot (${reason}) for ${snapshot.deviceId}.`,
-    { deviceId: snapshot.deviceId, folderCount: snapshot.folders.length },
-  );
-  return true;
-};
-
-const resetRuntimeState = (state: AppState) => {
-  state.session.isConnected = false;
-  state.session.remoteFs = null;
-  state.session.directory = {
-    ...state.session.directory,
-    entries: [],
-    status: "idle",
-    error: null,
-  };
-  state.session.entries = [];
-  state.session.activeConnectDeviceId = "";
-  state.session.connectedSourceDeviceId = "";
-  state.session.hasNonEmptyOverviewInSession = false;
-};
-
-const setRemoteApprovalPending = (
-  state: AppState,
-  deviceId: string,
-  pending: boolean,
-) => {
-  const normalized = normalizeDeviceId(deviceId);
-  if (!normalized) return;
-  const next = new Set(state.approvals.remoteApprovalPendingIds);
-  if (pending) next.add(normalized);
-  else next.delete(normalized);
-  state.approvals.remoteApprovalPendingIds = next;
-};
-
 const sortByName = <T extends { name: string }>(items: T[]) =>
   [...items].sort((left, right) => left.name.localeCompare(right.name));
 
-const normalizeCandidateDeviceId = (deviceId: string) => normalizeDeviceId(deviceId);
-
-const normalizeCandidateAddresses = (addresses: string[]) =>
-  [...new Set(addresses.map((item) => String(item ?? "").trim()).filter(Boolean))].sort();
-
-const parseTcpAddress = (
-  address: string,
-): { host: string; port: number } | null => {
-  const trimmed = String(address ?? "").trim();
-  if (!trimmed.startsWith("tcp://")) return null;
-  try {
-    const parsed = new URL(trimmed);
-    const port = Number(parsed.port);
-    if (!parsed.hostname || !Number.isFinite(port) || port <= 0) return null;
-    return { host: parsed.hostname, port };
-  } catch {
-    return null;
-  }
+const clearDirectoryView = (state: AppState) => {
+  state.session = clearDirectoryViewState(state.session);
 };
 
-const suggestedSavedDeviceName = (state: AppState, deviceId: string) => {
-  const normalized = normalizeDeviceId(deviceId);
-  if (!normalized) return "";
-  const advertised = advertisedDevices(state).find((item) => sameDeviceId(item.id, normalized));
-  if (advertised?.name.trim()) return advertised.name.trim();
-  const existing = state.devices.savedDevices.find((item) => sameDeviceId(item.id, normalized));
-  if (existing?.name.trim()) return existing.name.trim();
-  return temporarySavedDeviceName(normalized);
-};
-
-const upsertSavedDevice = (
-  state: AppState,
-  deviceId: string,
-  name?: string,
-  options?: { customName?: boolean; isIntroducer?: boolean },
-) => {
-  const normalized = normalizeDeviceId(deviceId);
-  if (!normalized) return false;
-  const existing = state.devices.savedDevices.find((item) => item.id === normalized);
-  const nextEntry = {
-    id: normalized,
-    name: (name ?? "").trim() || temporarySavedDeviceName(normalized),
-    createdAtMs: existing?.createdAtMs ?? Date.now(),
-    isIntroducer: options?.isIntroducer ?? existing?.isIntroducer ?? false,
-    customName: options?.customName ?? existing?.customName ?? false,
-  };
-  state.devices.savedDevices = sortByName(
-    existing
-      ? state.devices.savedDevices.map((item) =>
-          item.id === normalized ? nextEntry : item,
-        )
-      : [...state.devices.savedDevices, nextEntry],
-  );
-  return true;
-};
-
-const syncConnectedDeviceSavedName = (
-  state: AppState,
-  deviceId: string,
-  advertisedName?: string,
-) => {
-  const normalized = normalizeDeviceId(deviceId);
-  const nextName = (advertisedName ?? "").trim();
-  if (!normalized || !nextName) return;
-  const existing = state.devices.savedDevices.find((item) =>
-    sameDeviceId(item.id, normalized),
-  );
-  if (!existing || existing.customName || existing.name.trim() === nextName) return;
-  upsertSavedDevice(state, normalized, nextName, { customName: false });
-};
-
-const applyAutoApprovals = (state: AppState) => {
-  const sourceDeviceId = currentSourceDeviceId(state);
-  const sourceIsIntroducer = isIntroducerDevice(state, sourceDeviceId);
-  if (state.connection.autoAcceptNewDevices) {
-    for (const device of advertisedDevices(state)) {
-      if (device.accepted || !isValidSyncthingDeviceId(device.id)) continue;
-      upsertSavedDevice(state, device.id, device.name);
-    }
-  }
-  if (state.connection.autoAcceptIntroducedFolders && sourceIsIntroducer) {
-    const next = new Set(state.approvals.syncApprovedFolderKeys);
-    for (const folder of advertisedFolders(state)) {
-      next.add(folder.key);
-    }
-    state.approvals.syncApprovedFolderKeys = next;
-  }
+const resetRuntimeState = (state: AppState) => {
+  state.session = resetRuntimeSessionState(state.session);
 };
 
 const refreshCachedStatuses = async (
@@ -829,7 +627,7 @@ export const createAppActions = (args: {
     const attemptedDeviceId = normalizeDeviceId(
       targetDeviceId || state.connection.remoteId || state.devices.selectedSavedDeviceId,
     );
-    restoreOfflineSnapshot(state, attemptedDeviceId, "connect_start");
+    restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_start");
     try {
       migrateActiveLegacyFolderPasswords(state);
       await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
@@ -870,7 +668,7 @@ export const createAppActions = (args: {
         connectedVia: session.connectionPath,
         transportKind: session.connectionTransport,
       });
-      applyAutoApprovals(state);
+      applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       state.session.lastUpdatedAt = nowTime();
       updateOverviewSyncTracking(state);
     } catch (error) {
@@ -886,7 +684,7 @@ export const createAppActions = (args: {
       }
       reportUiError("connect.failed", error, connectionDetails(state));
       resetRuntimeState(state);
-      restoreOfflineSnapshot(state, attemptedDeviceId, "connect_failed");
+      restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_failed");
       updateOverviewSyncTracking(state);
     } finally {
       state.session.activeConnectDeviceId = "";
@@ -957,7 +755,7 @@ export const createAppActions = (args: {
         connectedVia: session.connectionPath,
         transportKind: session.connectionTransport,
       });
-      applyAutoApprovals(state);
+      applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       if (
         state.activeTab === "folders" &&
         state.session.currentFolderId &&
@@ -1191,7 +989,7 @@ export const createAppActions = (args: {
     } finally {
       resetRuntimeState(state);
       clearDirectoryView(state);
-      restoreOfflineSnapshot(state, undefined, "disconnect");
+      restoreOfflineSnapshot(state, clearDirectoryView, undefined, "disconnect");
       state.ui.recentError = null;
       updateOverviewSyncTracking(state);
     }
@@ -1764,7 +1562,7 @@ export const createAppActions = (args: {
     state.connection.discoveryMode = "global";
     state.connection.host = "";
     if (!state.session.isConnected) {
-      restoreOfflineSnapshot(state, deviceId, "use_saved_device");
+      restoreOfflineSnapshot(state, clearDirectoryView, deviceId, "use_saved_device");
       return;
     }
     void refreshActiveView();
@@ -2880,7 +2678,7 @@ export const createAppActions = (args: {
     runDiagnosticsCategory,
     persist: () => persistState(state),
     restoreOfflineSnapshot: (deviceId?: string, reason?: string) =>
-      restoreOfflineSnapshot(state, deviceId, reason),
+      restoreOfflineSnapshot(state, clearDirectoryView, deviceId, reason),
   };
 };
 

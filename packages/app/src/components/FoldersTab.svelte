@@ -180,6 +180,23 @@
       app.session.currentPath,
     );
   });
+
+  let directoryStatusText = $derived.by(() => {
+    const status = app.session.directory?.status;
+    if (!app.session.currentFolderId) return "";
+    if (app.session.isRefreshing) return "Refreshing folder contents...";
+    if (status === "loading" || app.session.isLoadingDirectory) return "Loading folder contents...";
+    if (status === "stale") return "Refreshing folder contents...";
+    if (status === "error") return app.session.directory?.error || "Could not load folder contents.";
+    if (status === "locked") return "Folder is locked and needs a password.";
+    return "";
+  });
+
+  let showDirectoryUpdating = $derived.by(() => {
+    if (!app.session.currentFolderId) return false;
+    const status = app.session.directory?.status;
+    return app.session.isRefreshing || app.session.isLoadingDirectory || status === "loading" || status === "stale";
+  });
 </script>
 
 <Panel title="Folders">
@@ -202,6 +219,10 @@
       onRoot={onGoToRootView}
       onSelect={onGoToBreadcrumb}
     />
+
+    {#if directoryStatusText}
+      <div class="directory-status-banner">{directoryStatusText}</div>
+    {/if}
 
     {#if app.session.currentFolderId}
       <div class="actions">
@@ -277,6 +298,12 @@
         {/if}
       </ul>
     {:else}
+      {#if showDirectoryUpdating}
+        <div class="directory-live-indicator">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Updating directory…</span>
+        </div>
+      {/if}
       <ul class={`list ${directoryViewMode === "grid" ? "list-grid" : ""}`}>
         {#if isFolderLocked(app.session.currentFolderId)}
           <li class="empty">
@@ -456,5 +483,44 @@
 
   .upload-progress-wrap progress {
     width: 100%;
+  }
+
+  .directory-status-banner {
+    margin-top: 0.45rem;
+    margin-bottom: 0.2rem;
+    padding: 0.4rem 0.55rem;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 0.83rem;
+  }
+
+  .directory-live-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin: 0.35rem 0 0.65rem;
+    padding: 0.42rem 0.6rem;
+    border-radius: 0.6rem;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border-soft));
+    background: color-mix(in srgb, var(--bg-surface) 86%, var(--accent) 14%);
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+
+  .spinner {
+    width: 0.72rem;
+    height: 0.72rem;
+    border-radius: 999px;
+    border: 2px solid color-mix(in srgb, var(--accent) 28%, transparent);
+    border-top-color: var(--accent);
+    animation: spin 0.9s linear infinite;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
   }
 </style>

@@ -124,6 +124,7 @@ EOF
             atk
             libdecor
             xdg-utils
+            xvfb-run
 
             jdk
             androidSdk

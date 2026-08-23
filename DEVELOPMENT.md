@@ -194,6 +194,63 @@ Keep temporary test state for debugging:
 npm run test:local:keep
 ```
 
+## Two-Computer LAN Harness
+
+This harness runs a real Tauri Syncpeer client against an isolated Syncthing
+fixture on another computer. Enter the flake development shell on both
+computers first; it provides the GTK/WebKit runtime and `xvfb-run` for
+headless Tauri tests.
+
+Both checkouts must be on the same clean commit. Then run this command on both
+computers:
+
+```bash
+yarn test:lan
+```
+
+Multicast discovery pairs the two processes and chooses one computer as the
+Syncthing fixture server. The other builds the test-only Tauri binary and runs
+the WebdriverIO suite. The coordinator and Syncthing fixture stay on the
+fixture computer; the client receives fixture metadata and sends phase, action,
+and result requests over the LAN.
+
+If multicast is unavailable, choose the roles and peer addresses explicitly.
+Replace the example address with the other computer's LAN address:
+
+On the fixture computer:
+
+```bash
+SYNCPEER_LAN_ROLE=server \
+  SYNCPEER_LAN_PEER=192.168.1.22 \
+  yarn test:lan
+```
+
+On the Tauri computer:
+
+```bash
+SYNCPEER_LAN_ROLE=client \
+  SYNCPEER_LAN_PEER=192.168.1.21 \
+  yarn test:lan
+```
+
+Use `SYNCPEER_LAN_PAIR=my-pair` when more than one pair is being tested on
+the same network. `yarn test:lan:self` runs the same coordinator and Tauri
+client locally for development, but does not prove that the LAN path works.
+Add `--keep` to preserve the isolated Syncthing homes and logs under
+`.tmp/syncpeer-lan/` after a run.
+
+The Tauri suite uses the embedded WebDriver by default. On Linux, if the
+installed WebKitGTK runtime reports an unsupported JavaScript result, retry the
+client with the external driver:
+
+```bash
+SYNCPEER_LAN_DRIVER=external \
+  yarn test:lan
+```
+
+That fallback installs `tauri-driver` through Cargo when needed and uses the
+WebKitWebDriver supplied by the flake.
+
 ## CLI Quick Examples
 
 ```bash

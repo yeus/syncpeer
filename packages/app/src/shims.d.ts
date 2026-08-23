@@ -16,3 +16,4 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+declare const __SYNCPEER_LAN_E2E__: boolean;

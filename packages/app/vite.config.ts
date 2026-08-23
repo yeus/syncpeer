@@ -23,6 +23,7 @@ export default defineConfig(({ mode }) => ({
     __SYNCPEER_APP_VERSION__: JSON.stringify(APP_VERSION),
     __SYNCPEER_BUILD_COMMIT__: JSON.stringify(BUILD_COMMIT),
     __SYNCPEER_BUILD_TIME_UTC__: JSON.stringify(BUILD_TIME_UTC),
+    __SYNCPEER_LAN_E2E__: JSON.stringify(mode === "lan-e2e"),
   },
   resolve: {
     alias: [

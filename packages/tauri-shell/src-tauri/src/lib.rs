@@ -3118,7 +3118,7 @@ async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_syncpeer_android::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -3164,7 +3164,14 @@ pub fn run() {
             syncpeer_resolve_cached_directory,
             syncpeer_remove_cached_file,
             syncpeer_clear_cache
-        ])
+        ]);
+
+    #[cfg(feature = "lan-e2e")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio::init())
+        .plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

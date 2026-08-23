@@ -929,10 +929,15 @@ class BepSession {
           compression: 0,
           max_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
           index_id: localFolderIndexId,
-          // Compatibility: some peers reject our cluster config if we advertise that
-          // we also have encrypted-at-rest data for the same folder.
-          encryption_password_token: undefined,
+          // A Syncthing untrusted peer expects its side of the folder to be
+          // receive-encrypted. Echo the password token after validating it so
+          // the peer keeps the connection in encrypted mode.
+          encryption_password_token: state?.encrypted
+            ? state.folderCrypto?.passwordToken
+            : undefined,
         });
+        const sourceType = Number(folder.type ?? 0);
+        const echoedType = state?.encrypted ? 3 : sourceType;
         this.log("cluster.echo.folder.prepared", {
           folderId: String(folder.id ?? ""),
           stopReason: Number(folder.stop_reason ?? 0),
@@ -941,20 +946,17 @@ class BepSession {
           localDeviceInserted: true,
         });
         if (state?.encrypted) {
-          const sourceType = Number(folder.type ?? 0);
           this.log("untrusted.folder.echo_config", {
             folderId: folder.id,
             sourceType,
-            echoedType: sourceType,
-            localTokenLength: 0,
-            localTokenSuppressed: true,
+            echoedType,
+            localTokenLength: state.folderCrypto?.passwordToken.length ?? 0,
+            localTokenIncluded: !!state.folderCrypto,
           });
         }
         return {
           ...folder,
-          // Keep remote-advertised folder type unchanged to avoid triggering
-          // compatibility disconnects on strict peers.
-          type: folder.type,
+          type: echoedType,
           devices,
         };
       });

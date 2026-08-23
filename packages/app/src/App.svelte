@@ -252,6 +252,7 @@
 
       <div class="global-connect compact">
         <button
+          data-testid="global-connect-button"
           class="ghost compact-connect"
           onclick={() => (app.session.isConnected ? actions.disconnect() : actions.connect())}
           disabled={app.session.isConnecting}
@@ -383,6 +384,7 @@
         <span class="sr-only">Favorites</span>
       </button>
       <button
+        data-testid="tab-folders"
         type="button"
         class={`tab-button ${app.activeTab === "folders" ? "active" : ""}`}
         onclick={(event) => actions.switchTab("folders", event)}
@@ -391,6 +393,7 @@
         <span class="sr-only">Folders</span>
       </button>
       <button
+        data-testid="tab-devices"
         type="button"
         class={`tab-button ${app.activeTab === "devices" ? "active" : ""}`}
         onclick={(event) => actions.switchTab("devices", event)}

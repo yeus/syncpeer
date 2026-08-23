@@ -175,6 +175,7 @@
   <div class="top-actions">
     <button
       class="ghost small"
+      data-testid="connection-settings-toggle"
       onclick={() => {
         app.ui.isSettingsExpanded = !app.ui.isSettingsExpanded;
       }}
@@ -192,7 +193,7 @@
         <StatusChip small>loading...</StatusChip>
       {/if}
     </div>
-    <div class="item-meta">{app.devices.currentDeviceId || "Unavailable"}</div>
+    <div class="item-meta" data-testid="current-device-id">{app.devices.currentDeviceId || "Unavailable"}</div>
     <div class="item-meta">
       Advertised name: {app.connection.deviceName.trim() || "syncpeer-ui"}
     </div>
@@ -288,7 +289,7 @@
       >
         <label>
           Discovery Method
-          <select bind:value={app.connection.discoveryMode}>
+          <select data-testid="connection-discovery-mode" bind:value={app.connection.discoveryMode}>
             <option value="global">Global Discovery (default)</option>
             <option value="direct">Direct Host/Port</option>
           </select>
@@ -297,7 +298,7 @@
         {#if app.connection.discoveryMode === "global"}
           <label>
             Discovery Server
-            <input type="text" bind:value={app.connection.discoveryServer} />
+            <input data-testid="connection-discovery-server" type="text" bind:value={app.connection.discoveryServer} />
           </label>
         {/if}
 
@@ -305,6 +306,7 @@
           <label>
             Host
             <input
+              data-testid="connection-host"
               type="text"
               bind:value={app.connection.host}
               placeholder="127.0.0.1"
@@ -314,6 +316,7 @@
           <label>
             Port
             <input
+              data-testid="connection-port"
               type="number"
               bind:value={app.connection.port}
               min="1"
@@ -341,6 +344,7 @@
         <label>
           Remote Device ID
           <input
+            data-testid="connection-remote-id"
             type="text"
             bind:value={app.connection.remoteId}
             placeholder="ABCD123-... (required for global discovery)"
@@ -354,6 +358,7 @@
         <label>
           TLS Certificate (optional)
           <input
+            data-testid="connection-cert"
             type="text"
             bind:value={app.connection.cert}
             placeholder="Auto uses persisted cli-node cert.pem"
@@ -363,6 +368,7 @@
         <label>
           TLS Key (optional)
           <input
+            data-testid="connection-key"
             type="text"
             bind:value={app.connection.key}
             placeholder="Auto uses persisted cli-node key.pem"
@@ -372,6 +378,7 @@
         <label>
           Timeout (ms)
           <input
+            data-testid="connection-timeout"
             type="number"
             bind:value={app.connection.timeoutMs}
             min="1000"
@@ -381,6 +388,7 @@
 
         <label class="checkbox-row">
           <input
+            data-testid="connection-relay-fallback"
             type="checkbox"
             bind:checked={app.connection.enableRelayFallback}
           />
@@ -410,7 +418,7 @@
       </form>
 
       <div class="actions">
-        <button
+      <button
           type="button"
           class="ghost"
           onclick={() => onUseSavedDevice(app.devices.selectedSavedDeviceId)}

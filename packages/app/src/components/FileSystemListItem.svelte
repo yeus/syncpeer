@@ -353,6 +353,7 @@
             <label class="inline-input">
               <span>Folder Password</span>
               <input
+                data-testid={`folder-password-${item.folderId}`}
                 type="password"
                 value={item.passwordDraft || item.passwordSaved}
                 oninput={(event) =>
@@ -436,6 +437,7 @@
           <label class="inline-input">
             <span>Folder Password</span>
             <input
+              data-testid={`folder-password-${item.folderId}`}
               type="password"
               value={item.passwordDraft || item.passwordSaved}
               oninput={(event) =>
@@ -476,13 +478,19 @@
         {#if !item.passwordInputVisible}
           <button
             class="row-action"
+            data-testid={`edit-folder-password-${item.folderId}`}
             onclick={() => onSetPasswordVisible(item.folderId, true)}
             aria-label="Edit folder password"
           >
             <KeyRound size={16} />
           </button>
         {/if}
-        <button class="row-action" onclick={() => onSaveFolderPassword(item.folderId)} aria-label="Unlock folder">
+        <button
+          class="row-action"
+          data-testid={`unlock-folder-${item.folderId}`}
+          onclick={() => onSaveFolderPassword(item.folderId)}
+          aria-label="Unlock folder"
+        >
           <Unlock size={16} />
         </button>
         <button

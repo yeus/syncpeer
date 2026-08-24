@@ -1,4 +1,5 @@
 import dgram from "node:dgram";
+import os from "node:os";
 import type { PeerCandidate, PeerHello, RoleAssignment } from "./protocol.ts";
 import {
   assignRoles,
@@ -21,9 +22,10 @@ export interface DiscoverySocket {
   off(event: "error", listener: (error: Error) => void): this;
 }
 
-interface DiscoverCandidatesOptions {
+export interface DiscoverCandidatesOptions {
   timeoutMs?: number;
   socketFactory?: () => Promise<DiscoverySocket>;
+  signal?: AbortSignal;
 }
 
 const encodeHello = (hello: PeerHello): Buffer =>
@@ -90,8 +92,15 @@ export const discoverCandidates = async (
         finished = true;
         if (settleTimer) clearTimeout(settleTimer);
         if (timeoutTimer) clearTimeout(timeoutTimer);
+        options.signal?.removeEventListener("abort", abortListener);
         resolve();
       };
+      const abortListener = () => finish();
+      if (options.signal?.aborted) {
+        finish();
+        return;
+      }
+      options.signal?.addEventListener("abort", abortListener, { once: true });
       socket.on("message", (packet, remote) => {
         const remoteHello = decodeHello(packet);
         if (!remoteHello || !isCompatiblePeer(hello, remoteHello)) return;
@@ -174,4 +183,14 @@ export const resolveLocalAddress = async (peerAddress: string): Promise<string> 
     throw new Error("Could not determine the LAN address for the paired peer.");
   }
   return address.address;
+};
+
+export const resolveAdvertisedAddress = (): string => {
+  const addresses = Object.values(os.networkInterfaces()).flatMap((entries) => entries ?? []);
+  const candidate = addresses.find((entry) =>
+    entry.family === "IPv4" &&
+    !entry.internal &&
+    !entry.address.startsWith("169.254."),
+  );
+  return candidate?.address ?? "127.0.0.1";
 };

@@ -3,7 +3,12 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { spawn, execFileSync } from "node:child_process";
 import { createPeerHello, deriveManualPairToken, derivePairToken, roleForPeer, LAN_COORDINATOR_PORT, type PeerHello, type RoleAssignment } from "./lan-test/protocol.ts";
-import { discoverRoleAssignment, resolveLocalAddress } from "./lan-test/discovery.ts";
+import {
+  discoverCandidates,
+  discoverRoleAssignment,
+  resolveAdvertisedAddress,
+  resolveLocalAddress,
+} from "./lan-test/discovery.ts";
 import { LanCoordinator, coordinatorRequest } from "./lan-test/coordinator.ts";
 import { readSourceState, requireCleanSource } from "./lan-test/source.ts";
 import {
@@ -155,6 +160,16 @@ const runServer = async (args: {
     console.log("Syncthing server device ID: " + serverIdentity.deviceId);
     console.log("Start the client with --client and enter this ID there.");
   }
+  const discoveryAbort = args.explicitIds ? new AbortController() : null;
+  const discoveryPromise = args.explicitIds
+    ? discoverCandidates(args.hello, {
+        timeoutMs: 900000,
+        signal: discoveryAbort?.signal,
+      }).catch((error) => {
+        console.error("LAN server discovery failed: " + String(error));
+        return [];
+      })
+    : null;
   const child = args.self
     ? spawn(nodePath, ["--experimental-strip-types", process.argv[1], "--self-client"], {
       stdio: "inherit",
@@ -223,6 +238,8 @@ const runServer = async (args: {
     const status = await coordinator.waitForFinalStatus(900000);
     return status === "passed" ? 0 : 1;
   } finally {
+    discoveryAbort?.abort();
+    await discoveryPromise;
     await fixture?.stop().catch((error) => console.error("Fixture cleanup failed: " + String(error)));
     await coordinator.close().catch(() => undefined);
     if (child) {
@@ -267,24 +284,25 @@ const main = async (): Promise<number> => {
       capabilities: { client: true, server: true },
     });
     const token = deriveManualPairToken(hello);
-    const serverHost = explicitRole === "server"
-      ? process.env.SYNCPEER_LAN_HOST?.trim() || "127.0.0.1"
-      : manualPeer;
-    if (!serverHost) {
-      throw new Error("The client needs SYNCPEER_LAN_PEER set to the server hostname or IP.");
-    }
-    const coordinatorUrl = coordinatorUrlFor(serverHost);
     if (explicitRole === "client") {
+      const discovered = manualPeer
+        ? null
+        : await discoverRoleAssignment({ hello });
+      const serverHost = manualPeer ?? discovered?.assignment.server.address;
+      if (!serverHost) {
+        throw new Error("Could not discover the LAN test server.");
+      }
       return runClient({
-        coordinatorUrl,
+        coordinatorUrl: coordinatorUrlFor(serverHost),
         token,
-        assignment: {} as RoleAssignment,
+        assignment: discovered?.assignment ?? ({} as RoleAssignment),
         hello,
         explicitIds: true,
       });
     }
+    const serverHost = process.env.SYNCPEER_LAN_HOST?.trim() || resolveAdvertisedAddress();
     return runServer({
-      coordinatorUrl,
+      coordinatorUrl: coordinatorUrlFor(serverHost),
       token,
       serverHost,
       assignment: {} as RoleAssignment,

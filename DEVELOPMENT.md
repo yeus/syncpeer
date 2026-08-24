@@ -229,22 +229,23 @@ For a deliberate server-first run, use explicit roles. The server prints its
 random Syncthing device ID; enter it at the client prompt. The client prints
 its test identity and asks you to copy the Tauri app's `This Device` ID back to
 the server prompt. The server then adds those IDs to its Syncthing config.
-`SYNCPEER_LAN_HOST` is the server's reachable hostname or IP, and the client
-uses the same value as `SYNCPEER_LAN_PEER`:
+On the same LAN, no address variables are required:
 
 On the server:
 
 ```bash
-SYNCPEER_LAN_HOST=server.example.com \
-  npm run test:lan:server
+npm run test:lan:server
 ```
 
 On the client:
 
 ```bash
-SYNCPEER_LAN_PEER=server.example.com \
-  npm run test:lan:client
+npm run test:lan:client
 ```
+
+On the same LAN, multicast discovery finds the server automatically. For a
+remote run, set `SYNCPEER_LAN_HOST` on the server and
+`SYNCPEER_LAN_PEER` on the client as address overrides.
 
 The test exercises direct TCP, Syncthing LAN discovery, official global
 discovery, and the standard Syncthing relay pool. Global discovery uses

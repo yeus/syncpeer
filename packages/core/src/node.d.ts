@@ -21,7 +21,7 @@ export interface SyncpeerConnectOptions {
   expectedDeviceId?: string;
   deviceName: string;
   timeoutMs?: number;
-  discoveryMode?: "global" | "direct";
+  discoveryMode?: "global" | "lan" | "direct";
   discoveryServer?: string;
   enableRelayFallback?: boolean;
   folderPasswords?: Record<string, string>;
@@ -76,7 +76,7 @@ export interface NodeSessionTransport {
   connectAndSync: (options: {
     host: string;
     port: number;
-    discoveryMode?: "global" | "direct";
+    discoveryMode?: "global" | "lan" | "direct";
     discoveryServer?: string;
     cert?: string;
     key?: string;
@@ -89,7 +89,7 @@ export interface NodeSessionTransport {
   connectAndGetOverview: (options: {
     host: string;
     port: number;
-    discoveryMode?: "global" | "direct";
+    discoveryMode?: "global" | "lan" | "direct";
     discoveryServer?: string;
     cert?: string;
     key?: string;
@@ -102,7 +102,7 @@ export interface NodeSessionTransport {
   connectAndGetFolderVersions: (options: {
     host: string;
     port: number;
-    discoveryMode?: "global" | "direct";
+    discoveryMode?: "global" | "lan" | "direct";
     discoveryServer?: string;
     cert?: string;
     key?: string;

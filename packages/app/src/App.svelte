@@ -102,7 +102,8 @@
 
   $effect(() => {
     if (
-      app.connection.discoveryMode === "global" &&
+      (app.connection.discoveryMode === "global" ||
+        app.connection.discoveryMode === "lan") &&
       app.connection.host === "127.0.0.1"
     ) {
       app.connection.host = "";

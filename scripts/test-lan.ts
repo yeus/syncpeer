@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline/promises";
 import { spawn, execFileSync } from "node:child_process";
 import { createPeerHello, deriveManualPairToken, derivePairToken, roleForPeer, LAN_COORDINATOR_PORT, type PeerHello, type RoleAssignment } from "./lan-test/protocol.ts";
 import { discoverRoleAssignment, resolveLocalAddress } from "./lan-test/discovery.ts";
@@ -13,7 +14,12 @@ import {
 
 const selfMode = process.argv.includes("--self");
 const selfClientMode = process.argv.includes("--self-client");
+const explicitServerMode = process.argv.includes("--server");
+const explicitClientMode = process.argv.includes("--client");
 const keep = process.argv.includes("--keep");
+if (explicitServerMode && explicitClientMode) {
+  throw new Error("Choose either --server or --client, not both.");
+}
 const source = readSourceState();
 if (!selfMode && !selfClientMode) requireCleanSource(source);
 
@@ -28,8 +34,25 @@ if (manualRoleValue && manualRoleValue !== "server" && manualRoleValue !== "clie
 const manualRole = manualRoleValue as "server" | "client" | undefined;
 const manualPeer = process.env.SYNCPEER_LAN_PEER?.trim() || undefined;
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const canonicalDeviceId = (value: string): string =>
+  value.replace(/[^A-Z2-7]/gi, "").toUpperCase();
+
+const prompt = async (message: string): Promise<string> => {
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await terminal.question(message)).trim();
+  } finally {
+    terminal.close();
+  }
+};
+
+const readDeviceIdPrompt = async (message: string): Promise<string> => {
+  const deviceId = canonicalDeviceId(await prompt(message));
+  if (deviceId.length !== 52 && deviceId.length !== 56) {
+    throw new Error("Expected a 52- or 56-character Syncthing device ID.");
+  }
+  return deviceId;
+};
 
 const runChild = (command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> =>
   new Promise((resolve, reject) => {
@@ -52,15 +75,25 @@ const runClient = async (args: {
   token: string;
   assignment: RoleAssignment;
   hello: PeerHello;
+  explicitIds?: boolean;
 }): Promise<number> => {
   console.log("LAN role: Syncpeer client");
   console.log("Coordinator: " + args.coordinatorUrl);
+  let remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim() ?? "";
+  if (args.explicitIds) {
+    remoteDeviceId = await readDeviceIdPrompt("Enter the Syncthing server device ID: ");
+    console.log("Server device ID accepted: " + remoteDeviceId);
+  }
   buildLanApp();
   const clientRoot = path.join(root, "client");
   fs.mkdirSync(clientRoot, { recursive: true });
   const untrustedIdentity = generateSyncthingIdentity(
     path.join(clientRoot, "untrusted-identity"),
   );
+  if (args.explicitIds) {
+    console.log("Untrusted test identity ID: " + untrustedIdentity.deviceId);
+    console.log("After the app opens, copy its This Device ID to the server terminal.");
+  }
   const wdioBin = path.resolve("node_modules", "@wdio", "cli", "bin", "wdio.js");
   const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
   const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
@@ -84,6 +117,8 @@ const runClient = async (args: {
       SYNCPEER_LAN_UNTRUSTED_DEVICE_ID: untrustedIdentity.deviceId,
       SYNCPEER_LAN_UNTRUSTED_CERT: untrustedIdentity.certPath,
       SYNCPEER_LAN_UNTRUSTED_KEY: untrustedIdentity.keyPath,
+      SYNCPEER_LAN_REMOTE_DEVICE_ID: remoteDeviceId,
+      SYNCPEER_LAN_MANUAL_IDS: args.explicitIds ? "1" : "",
     },
   );
   await coordinatorRequest({
@@ -105,12 +140,21 @@ const runServer = async (args: {
   assignment: RoleAssignment;
   hello: PeerHello;
   self: boolean;
+  explicitIds?: boolean;
 }): Promise<number> => {
   console.log("LAN role: Syncthing fixture server");
   console.log("Server address: " + args.serverHost);
   const coordinator = new LanCoordinator(args.token);
   await coordinator.start("0.0.0.0", coordinatorPort);
   coordinator.setAdvertisedBase(args.coordinatorUrl);
+  const serverHome = path.join(root, "server", "syncthing");
+  const serverIdentity = args.explicitIds
+    ? generateSyncthingIdentity(serverHome)
+    : null;
+  if (serverIdentity) {
+    console.log("Syncthing server device ID: " + serverIdentity.deviceId);
+    console.log("Start the client with --client and enter this ID there.");
+  }
   const child = args.self
     ? spawn(nodePath, ["--experimental-strip-types", process.argv[1], "--self-client"], {
       stdio: "inherit",
@@ -145,26 +189,36 @@ const runServer = async (args: {
     throw new Error("Unknown LAN fixture action: " + action);
   });
   try {
-    const profile = await Promise.race([
-      coordinator.waitForProfile("trusted", 180000),
-      child
-        ? new Promise<never>((_resolve, reject) => {
-          child.once("exit", (code, signal) => {
-            reject(new Error(
-              "LAN client exited before registering (code=" + String(code) + ", signal=" + String(signal) + ").",
-            ));
-          });
-        })
-        : new Promise<never>(() => undefined),
-    ]);
+    const profile = args.explicitIds
+      ? {
+          deviceId: await readDeviceIdPrompt("Enter the trusted client device ID: "),
+        }
+      : await Promise.race([
+          coordinator.waitForProfile("trusted", 180000),
+          child
+            ? new Promise<never>((_resolve, reject) => {
+              child.once("exit", (code, signal) => {
+                reject(new Error(
+                  "LAN client exited before registering (code=" + String(code) + ", signal=" + String(signal) + ").",
+                ));
+              });
+            })
+            : new Promise<never>(() => undefined),
+        ]);
+    if (!profile.deviceId) throw new Error("A trusted client device ID is required.");
+    const untrustedDeviceId = args.explicitIds
+      ? await readDeviceIdPrompt("Enter the untrusted test identity ID: ")
+      : undefined;
     fixture = await createLanFixture({
       root: path.join(root, "server"),
       serverHost: args.serverHost,
-      trustedDeviceId: profile.deviceId,
+      trustedDeviceId: canonicalDeviceId(profile.deviceId),
+      untrustedDeviceId: untrustedDeviceId || undefined,
+      home: serverHome,
     });
     coordinator.setFixture(fixture.fixture);
-    console.log("Private discovery: " + fixture.fixture.discoveryServer);
-    console.log("Remote device ID: " + fixture.fixture.remoteDeviceId);
+    console.log("Global discovery: " + fixture.fixture.discoveryServer);
+    console.log("Syncthing server device ID: " + fixture.fixture.remoteDeviceId);
     console.log("Waiting for the Syncpeer client result...");
     const status = await coordinator.waitForFinalStatus(900000);
     return status === "passed" ? 0 : 1;
@@ -201,6 +255,42 @@ const main = async (): Promise<number> => {
       token,
       assignment: {} as RoleAssignment,
       hello: {} as PeerHello,
+      explicitIds: false,
+    });
+  }
+
+  const explicitRole = explicitServerMode ? "server" : explicitClientMode ? "client" : undefined;
+  if (explicitRole) {
+    const hello = createPeerHello({
+      commit: source.commit,
+      pairCode: process.env.SYNCPEER_LAN_PAIR,
+      capabilities: { client: true, server: true },
+    });
+    const token = deriveManualPairToken(hello);
+    const serverHost = explicitRole === "server"
+      ? process.env.SYNCPEER_LAN_HOST?.trim() || "127.0.0.1"
+      : manualPeer;
+    if (!serverHost) {
+      throw new Error("The client needs SYNCPEER_LAN_PEER set to the server hostname or IP.");
+    }
+    const coordinatorUrl = coordinatorUrlFor(serverHost);
+    if (explicitRole === "client") {
+      return runClient({
+        coordinatorUrl,
+        token,
+        assignment: {} as RoleAssignment,
+        hello,
+        explicitIds: true,
+      });
+    }
+    return runServer({
+      coordinatorUrl,
+      token,
+      serverHost,
+      assignment: {} as RoleAssignment,
+      hello,
+      self: false,
+      explicitIds: true,
     });
   }
 

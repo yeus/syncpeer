@@ -1,6 +1,6 @@
 import { getDefaultDiscoveryServer, normalizeDiscoveryServer, type ConnectOptions } from "./browserClient.js";
 
-export type DiscoveryMode = "global" | "direct";
+export type DiscoveryMode = "global" | "lan" | "direct";
 
 export interface StoredConnectionSettingsLike {
   host: string;
@@ -21,7 +21,9 @@ export const fromConnectionSettings = (
   stored: StoredConnectionSettingsLike | null,
 ): StoredConnectionSettingsLike => {
   const discoveryMode: DiscoveryMode =
-    stored?.discoveryMode === "direct" ? "direct" : "global";
+    stored?.discoveryMode === "direct" || stored?.discoveryMode === "lan"
+      ? stored.discoveryMode
+      : "global";
 
   if (!stored) {
     return {

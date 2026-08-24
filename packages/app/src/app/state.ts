@@ -571,10 +571,13 @@ export const hasSuccessfulConnectionHistory = (
   return Boolean(state.offline.snapshots[normalized]);
 };
 
-export const connectionModeLabel = (state: AppState) =>
-  state.connection.discoveryMode === "global"
-    ? `Global discovery via ${state.connection.discoveryServer}`
-    : `Direct ${state.connection.host || "127.0.0.1"}:${state.connection.port}`;
+export const connectionModeLabel = (state: AppState) => {
+  if (state.connection.discoveryMode === "global") {
+    return `Global discovery via ${state.connection.discoveryServer}`;
+  }
+  if (state.connection.discoveryMode === "lan") return "LAN discovery";
+  return `Direct ${state.connection.host || "127.0.0.1"}:${state.connection.port}`;
+};
 
 export const connectTargetLabel = (state: AppState) => {
   const targetId = normalizeDeviceId(

@@ -35,8 +35,8 @@ export interface RoleAssignment {
 export type LanPhase =
   | "direct"
   | "lan-discovery"
-  | "private-global"
-  | "private-relay"
+  | "global"
+  | "relay"
   | "public-smoke"
   | "encrypted-direct";
 

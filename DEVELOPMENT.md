@@ -205,39 +205,55 @@ Both checkouts must be on the same clean commit. Then run this command on both
 computers:
 
 ```bash
-yarn test:lan
+npm run test:lan
 ```
 
 Multicast discovery pairs the two processes and chooses one computer as the
 Syncthing fixture server. The other builds the test-only Tauri binary and runs
 the WebdriverIO suite. The coordinator and Syncthing fixture stay on the
 fixture computer; the client receives fixture metadata and sends phase, action,
-and result requests over the LAN.
+and result requests over the LAN. The data connection itself is a normal
+Syncthing connection.
 
-If multicast is unavailable, choose the roles and peer addresses explicitly.
-Replace the example address with the other computer's LAN address:
-
-On the fixture computer:
-
-```bash
-SYNCPEER_LAN_ROLE=server \
-  SYNCPEER_LAN_PEER=192.168.1.22 \
-  yarn test:lan
-```
-
-On the Tauri computer:
-
-```bash
-SYNCPEER_LAN_ROLE=client \
-  SYNCPEER_LAN_PEER=192.168.1.21 \
-  yarn test:lan
-```
+Each process keeps announcing and listening for up to 60 seconds when the
+other process has not started yet, then settles for 2 seconds after finding a
+compatible peer.
 
 Use `SYNCPEER_LAN_PAIR=my-pair` when more than one pair is being tested on
-the same network. `yarn test:lan:self` runs the same coordinator and Tauri
+the same network. `npm run test:lan:self` runs the same coordinator and Tauri
 client locally for development, but does not prove that the LAN path works.
 Add `--keep` to preserve the isolated Syncthing homes and logs under
 `.tmp/syncpeer-lan/` after a run.
+
+For a deliberate server-first run, use explicit roles. The server prints its
+random Syncthing device ID; enter it at the client prompt. The client prints
+its test identity and asks you to copy the Tauri app's `This Device` ID back to
+the server prompt. The server then adds those IDs to its Syncthing config.
+`SYNCPEER_LAN_HOST` is the server's reachable hostname or IP, and the client
+uses the same value as `SYNCPEER_LAN_PEER`:
+
+On the server:
+
+```bash
+SYNCPEER_LAN_HOST=server.example.com \
+  npm run test:lan:server
+```
+
+On the client:
+
+```bash
+SYNCPEER_LAN_PEER=server.example.com \
+  npm run test:lan:client
+```
+
+The test exercises direct TCP, Syncthing LAN discovery, official global
+discovery, and the standard Syncthing relay pool. Global discovery uses
+`https://discovery.syncthing.net/v2/`; the server and client device IDs are
+generated per run and are never hard-coded.
+
+For an internet/NAT run, the coordinator port (`38378` by default) still needs
+to be reachable at `SYNCPEER_LAN_HOST`; Syncthing's device traffic can then
+use global discovery, NAT traversal, or the relay pool.
 
 The Tauri suite uses the embedded WebDriver by default. On Linux, if the
 installed WebKitGTK runtime reports an unsupported JavaScript result, retry the
@@ -245,7 +261,7 @@ client with the external driver:
 
 ```bash
 SYNCPEER_LAN_DRIVER=external \
-  yarn test:lan
+  npm run test:lan
 ```
 
 That fallback installs `tauri-driver` through Cargo when needed and uses the

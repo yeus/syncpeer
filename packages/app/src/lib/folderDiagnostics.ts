@@ -39,7 +39,7 @@ export interface FolderDiagnosticsReport {
   finishedAtIso: string;
   durationMs: number;
   connection: {
-    discoveryMode?: "global" | "direct";
+    discoveryMode?: "global" | "lan" | "direct";
     remoteId?: string;
     host: string;
     port: number;

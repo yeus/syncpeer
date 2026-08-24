@@ -26,7 +26,7 @@ const request = <T>(method: "GET" | "POST", pathname: string, body?: unknown) =>
   coordinatorRequest<T>({ baseUrl, token, method, pathname, body });
 
 const reportPhase = async (
-  phase: "direct" | "private-global" | "private-relay" | "public-smoke" | "encrypted-direct",
+  phase: "direct" | "lan-discovery" | "global" | "relay" | "public-smoke" | "encrypted-direct",
   status: "running" | "passed" | "failed" | "skipped",
   details?: unknown,
 ): Promise<void> => {
@@ -78,7 +78,7 @@ const setValue = async (testId: string, value: string): Promise<void> => {
   await element.setValue(value);
 };
 
-const chooseDiscoveryMode = async (mode: "direct" | "global"): Promise<void> => {
+const chooseDiscoveryMode = async (mode: "direct" | "lan" | "global"): Promise<void> => {
   const select = $("[data-testid='connection-discovery-mode']");
   await select.selectByAttribute("value", mode);
 };
@@ -90,20 +90,23 @@ const clickItemTitle = async (name: string): Promise<void> => {
 
 const connect = async (
   currentFixture: LanFixture,
-  mode: "direct" | "global",
+  mode: "direct" | "lan" | "global",
   identity?: { cert: string; key: string },
 ): Promise<void> => {
   await clickTestId("tab-devices");
   const settings = $("[data-testid='connection-settings-toggle']");
   if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
   await chooseDiscoveryMode(mode);
+  const remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim()
+    || currentFixture.remoteDeviceId;
+  await setValue("connection-remote-id", remoteDeviceId);
   if (mode === "direct") {
     await setValue("connection-host", currentFixture.serverHost);
     await setValue("connection-port", String(currentFixture.directPort));
-  } else {
+  } else if (mode === "global") {
     await setValue("connection-discovery-server", currentFixture.discoveryServer);
-    await setValue("connection-remote-id", currentFixture.remoteDeviceId);
   }
+  await setValue("connection-timeout", "60000");
   await setValue("connection-cert", identity?.cert ?? "");
   await setValue("connection-key", identity?.key ?? "");
   await clickTestId("global-connect-button");
@@ -153,7 +156,9 @@ describe("Syncpeer LAN integration", () => {
     await waitForText("This Device", 60_000);
     const deviceId = await $("[data-testid='current-device-id']").getText();
     assert.match(deviceId, /^[A-Z2-7-]{40,}$/);
-    await request("POST", "/v1/register", { profile: "trusted", deviceId });
+    if (process.env.SYNCPEER_LAN_MANUAL_IDS !== "1") {
+      await request("POST", "/v1/register", { profile: "trusted", deviceId });
+    }
     currentFixture = await fixture();
   });
 
@@ -193,15 +198,22 @@ describe("Syncpeer LAN integration", () => {
     });
   });
 
-  it("connects through private global discovery", async () => {
-    await runPhase("private-global", async () => {
+  it("connects through LAN discovery", async () => {
+    await runPhase("lan-discovery", async () => {
+      await disconnect();
+      await connect(currentFixture, "lan");
+    });
+  });
+
+  it("connects through official global discovery", async () => {
+    await runPhase("global", async () => {
       await disconnect();
       await connect(currentFixture, "global");
     });
   });
 
-  it("falls back through the private relay", async () => {
-    await runPhase("private-relay", async () => {
+  it("falls back through the standard relay pool", async () => {
+    await runPhase("relay", async () => {
       await request("POST", "/v1/action", { action: "switch-to-relay" });
       await disconnect();
       await connect(currentFixture, "global");
@@ -212,14 +224,16 @@ describe("Syncpeer LAN integration", () => {
   it("browses and downloads a receive-encrypted folder", async () => {
     await runPhase("encrypted-direct", async () => {
       assert.ok(untrustedIdentity.deviceId && untrustedIdentity.cert && untrustedIdentity.key);
-      await request("POST", "/v1/action", {
-        action: "add-untrusted",
-        details: { deviceId: untrustedIdentity.deviceId },
-      });
-      await request("POST", "/v1/register", {
-        profile: "untrusted",
-        deviceId: untrustedIdentity.deviceId,
-      });
+      if (process.env.SYNCPEER_LAN_MANUAL_IDS !== "1") {
+        await request("POST", "/v1/action", {
+          action: "add-untrusted",
+          details: { deviceId: untrustedIdentity.deviceId },
+        });
+        await request("POST", "/v1/register", {
+          profile: "untrusted",
+          deviceId: untrustedIdentity.deviceId,
+        });
+      }
       await disconnect();
       await connect(currentFixture, "direct", untrustedIdentity);
       await openFolders();

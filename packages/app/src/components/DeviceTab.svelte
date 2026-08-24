@@ -291,6 +291,7 @@
           Discovery Method
           <select data-testid="connection-discovery-mode" bind:value={app.connection.discoveryMode}>
             <option value="global">Global Discovery (default)</option>
+            <option value="lan">LAN Discovery</option>
             <option value="direct">Direct Host/Port</option>
           </select>
         </label>
@@ -300,6 +301,13 @@
             Discovery Server
             <input data-testid="connection-discovery-server" type="text" bind:value={app.connection.discoveryServer} />
           </label>
+        {/if}
+
+        {#if app.connection.discoveryMode === "lan"}
+          <p class="hint">
+            LAN discovery uses Syncthing's local UDP discovery. Both devices must
+            be on the same LAN or multicast-capable network.
+          </p>
         {/if}
 
         {#if app.connection.discoveryMode === "direct"}
@@ -323,7 +331,7 @@
               max="65535"
             />
           </label>
-        {:else}
+        {:else if app.connection.discoveryMode === "global"}
           <div class="hint">
             Global discovery ignores manual host/port. The official Syncthing
             discovery server pin is applied automatically when you use
@@ -347,7 +355,7 @@
             data-testid="connection-remote-id"
             type="text"
             bind:value={app.connection.remoteId}
-            placeholder="ABCD123-... (required for global discovery)"
+            placeholder="ABCD123-... (required for discovery modes)"
             spellcheck="false"
             autocapitalize="characters"
             autocomplete="off"

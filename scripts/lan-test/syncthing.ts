@@ -4,7 +4,9 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import type { LanFixture } from "./protocol.ts";
-import { PrivateDiscoveryServer } from "./discovery-server.ts";
+
+export const SYNCTHING_GLOBAL_DISCOVERY_SERVER = "https://discovery.syncthing.net/v2/";
+const SYNCTHING_RELAY_POOL = "dynamic+https://relays.syncthing.net/endpoint";
 
 const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
 const relayVersion = process.env.SYNCTHING_RELAY_VERSION ?? "v2.1.3";
@@ -189,7 +191,6 @@ const configureHome = (home: string, args: {
   guiPort: number;
   syncPort: number;
   discoveryServer: string;
-  relayAddress: string;
   direct: boolean;
   localAnnounce: boolean;
   trustedDeviceId: string;
@@ -207,14 +208,14 @@ const configureHome = (home: string, args: {
     (_match, prefix, suffix) => prefix + "127.0.0.1:" + args.guiPort + suffix,
   );
   const addresses = args.direct
-    ? ["tcp4://0.0.0.0:" + args.syncPort, args.relayAddress]
-    : [args.relayAddress];
+    ? ["tcp4://0.0.0.0:" + args.syncPort]
+    : [SYNCTHING_RELAY_POOL];
   xml = replaceRepeatedTag(xml, "listenAddress", addresses);
   xml = replaceRepeatedTag(xml, "globalAnnounceServer", [args.discoveryServer]);
   xml = replaceTag(xml, "globalAnnounceEnabled", "true");
   xml = replaceTag(xml, "localAnnounceEnabled", String(args.localAnnounce));
   xml = replaceTag(xml, "relaysEnabled", "true");
-  xml = replaceTag(xml, "natEnabled", "false");
+  xml = replaceTag(xml, "natEnabled", "true");
   xml = addDevice(xml, args.trustedDeviceId, "syncpeer-lan-client");
   if (args.untrustedDeviceId) xml = addDevice(xml, args.untrustedDeviceId, "syncpeer-lan-untrusted", true);
   xml = addFolder(xml, {
@@ -309,43 +310,24 @@ export const createLanFixture = async (args: {
   root: string;
   serverHost: string;
   trustedDeviceId: string;
+  untrustedDeviceId?: string;
+  home?: string;
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
   const root = args.root;
-  const home = path.join(root, "syncthing");
-  const discoveryDir = path.join(root, "discovery");
-  const relayDir = path.join(root, "relay");
+  const home = args.home ?? path.join(root, "syncthing");
   const sharePath = path.join(root, "share");
   const encryptedSharePath = path.join(root, "encrypted-share");
   ensureDir(root);
-  ensureDir(discoveryDir);
-  ensureDir(relayDir);
   ensureDir(sharePath);
   ensureDir(encryptedSharePath);
-  execFileSync(binaryPath("syncthing"), ["generate", "--home", home], { stdio: "ignore" });
+  if (!fs.existsSync(path.join(home, "cert.pem"))) {
+    execFileSync(binaryPath("syncthing"), ["generate", "--home", home], { stdio: "ignore" });
+  }
   const serverDeviceId = readDeviceId(home);
-  const discoveryPort = await freePort();
-  const relayPort = await freePort();
   const syncPort = await freePort();
   const guiPort = await freePort();
-  const discoveryServerProcess = await PrivateDiscoveryServer.start({
-    host: "0.0.0.0",
-    port: discoveryPort,
-    root: discoveryDir,
-  });
-  discoveryServerProcess.hostForUrl = args.serverHost;
-  const relayProcess = startProcess(binaryPath("strelaysrv"), [
-    "-listen=" + args.serverHost + ":" + relayPort,
-    "-ext-address=" + args.serverHost + ":" + relayPort,
-    "-keys=" + relayDir,
-    "-pools=",
-    "-status-srv=",
-    "-protocol=tcp4",
-  ], root, path.join(root, "relay.log"));
-  await waitForFile(path.join(relayDir, "cert.pem"), 30000, "private relay certificate");
-  const relayDeviceId = readDeviceId(relayDir);
-  const discoveryServer = discoveryServerProcess.url;
-  const relayAddress = "relay://" + args.serverHost + ":" + relayPort + "/?id=" + relayDeviceId;
+  const discoveryServer = SYNCTHING_GLOBAL_DISCOVERY_SERVER;
   const folderId = "syncpeer-lan";
   const encryptedFolderId = "syncpeer-lan-encrypted";
   const encryptedPassword = "correct horse battery staple";
@@ -364,7 +346,6 @@ export const createLanFixture = async (args: {
     guiPort,
     syncPort,
     discoveryServer,
-    relayAddress,
     direct,
     localAnnounce,
     trustedDeviceId: args.trustedDeviceId,
@@ -382,12 +363,8 @@ export const createLanFixture = async (args: {
     ], root, path.join(root, "syncthing.log"));
     await waitForTcp("127.0.0.1", guiPort, 30000, "Syncthing GUI");
   };
-  configure(true, true);
+  configure(true, true, args.untrustedDeviceId);
   await start();
-  discoveryServerProcess.publish(serverDeviceId, [
-    "tcp://" + args.serverHost + ":" + syncPort,
-    relayAddress,
-  ]);
   const apiKey = apiKeyFor(home);
   const syncGuiUrl = "http://127.0.0.1:" + guiPort;
   const expectedFiles = ["hello.txt", "nested/file.txt", "blob.bin"].map((relativePath) => ({
@@ -446,8 +423,6 @@ export const createLanFixture = async (args: {
     },
     stop: async () => {
       await stopProcess(syncthingProcess);
-      await discoveryServerProcess.close();
-      await stopProcess(relayProcess);
     },
   };
 };

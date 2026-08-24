@@ -102,7 +102,7 @@ export interface SyncpeerConnectOptions {
   clientName?: string;
   clientVersion?: string;
   timeoutMs?: number;
-  discoveryMode?: "global" | "direct";
+  discoveryMode?: "global" | "lan" | "direct";
   discoveryServer?: string;
   enableRelayFallback?: boolean;
   folderPasswords?: Record<string, string>;
@@ -1862,22 +1862,25 @@ async function openSession(
 ): Promise<SyncpeerSessionHandle> {
   const discoveryMode = opts.discoveryMode ?? "direct";
 
-  if (discoveryMode !== "global") {
+  if (discoveryMode === "direct") {
     return openDirectSession(adapter, opts, opts.host, opts.port);
   }
 
   const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
     ? opts.timeoutMs
     : 15000;
-  const localDiscoveryTimeoutMs = Math.max(
-    250,
-    Math.min(2000, Math.floor(totalTimeout * 0.15)),
-  );
-  const globalDiscoveryPromise = resolveGlobalDiscoveryInternal(adapter, {
-    expectedDeviceId: opts.expectedDeviceId ?? "",
-    discoveryServer: opts.discoveryServer,
-  });
-  const localDiscoveryPromise = adapter.discoverLocalCandidates
+  const localDiscoveryTimeoutMs = discoveryMode === "lan"
+    ? totalTimeout
+    : Math.max(250, Math.min(2000, Math.floor(totalTimeout * 0.15)));
+  const globalDiscoveryPromise = discoveryMode === "lan"
+    ? Promise.resolve({ payload: null, candidates: [] } as SyncpeerGlobalDiscoveryResult)
+    : resolveGlobalDiscoveryInternal(adapter, {
+        expectedDeviceId: opts.expectedDeviceId ?? "",
+        discoveryServer: opts.discoveryServer,
+      });
+  const localDiscoveryPromise = discoveryMode === "global"
+    ? Promise.resolve([])
+    : adapter.discoverLocalCandidates
     ? adapter.discoverLocalCandidates({
         expectedDeviceId: opts.expectedDeviceId ?? "",
         timeoutMs: localDiscoveryTimeoutMs,
@@ -1914,7 +1917,13 @@ async function openSession(
     ...localCandidates,
     ...globalCandidates,
   ]);
+  if (discoveryMode === "lan" && localDiscoveryResult.status === "rejected") {
+    throw localDiscoveryResult.reason instanceof Error
+      ? localDiscoveryResult.reason
+      : new Error(String(localDiscoveryResult.reason));
+  }
   if (
+    discoveryMode === "global" &&
     globalDiscoveryResult.status === "rejected" &&
     mergedCandidates.length === 0
   ) {
@@ -1924,7 +1933,9 @@ async function openSession(
   }
   if (mergedCandidates.length === 0) {
     throw new Error(
-      "No discovery candidates available from global or local discovery.",
+      discoveryMode === "lan"
+        ? "No LAN discovery candidates available."
+        : "No global discovery candidates available.",
     );
   }
 

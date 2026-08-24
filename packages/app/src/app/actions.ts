@@ -408,22 +408,25 @@ const migrateActiveLegacyFolderPasswords = (state: AppState) => {
 
 const validateConnection = (state: AppState) => {
   if (
-    state.connection.discoveryMode === "global" &&
+    (state.connection.discoveryMode === "global" ||
+      state.connection.discoveryMode === "lan") &&
     !normalizeDeviceId(state.connection.remoteId) &&
     state.devices.selectedSavedDeviceId
   ) {
     state.connection.remoteId = state.devices.selectedSavedDeviceId;
   }
   if (
-    state.connection.discoveryMode === "global" &&
+    (state.connection.discoveryMode === "global" ||
+      state.connection.discoveryMode === "lan") &&
     !normalizeDeviceId(state.connection.remoteId)
   ) {
     throw new Error(
-      "Global discovery requires a Remote Device ID. Add/select a saved device first.",
+      "Discovery requires a Remote Device ID. Add/select a saved device first.",
     );
   }
   if (
-    state.connection.discoveryMode === "global" &&
+    (state.connection.discoveryMode === "global" ||
+      state.connection.discoveryMode === "lan") &&
     !isValidSyncthingDeviceId(state.connection.remoteId)
   ) {
     throw new Error(

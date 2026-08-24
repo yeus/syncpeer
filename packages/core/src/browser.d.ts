@@ -1,7 +1,7 @@
 export interface ConnectOptions {
   host: string;
   port: number;
-  discoveryMode?: "global" | "direct";
+  discoveryMode?: "global" | "lan" | "direct";
   discoveryServer?: string;
   cert?: string;
   key?: string;

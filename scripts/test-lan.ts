@@ -6,6 +6,7 @@ import { createPeerHello, deriveManualPairToken, derivePairToken, roleForPeer, L
 import {
   discoverCandidates,
   discoverRoleAssignment,
+  LAN_ROLE_DISCOVERY_TIMEOUT_MS,
   resolveAdvertisedAddress,
   resolveLocalAddress,
 } from "./lan-test/discovery.ts";
@@ -163,7 +164,7 @@ const runServer = async (args: {
   const discoveryAbort = args.explicitIds ? new AbortController() : null;
   const discoveryPromise = args.explicitIds
     ? discoverCandidates(args.hello, {
-        timeoutMs: 900000,
+        timeoutMs: LAN_ROLE_DISCOVERY_TIMEOUT_MS,
         signal: discoveryAbort?.signal,
       }).catch((error) => {
         console.error("LAN server discovery failed: " + String(error));
@@ -285,9 +286,27 @@ const main = async (): Promise<number> => {
     });
     const token = deriveManualPairToken(hello);
     if (explicitRole === "client") {
-      const discovered = manualPeer
+      console.log(
+        manualPeer
+          ? "Using SYNCPEER_LAN_PEER=" + manualPeer + "."
+          : "Searching for the LAN test server via multicast (up to 15 minutes)...",
+      );
+      const progress = manualPeer
         ? null
-        : await discoverRoleAssignment({ hello });
+        : setInterval(() => {
+            console.log("Still searching for the LAN test server...");
+          }, 10000);
+      let discovered: Awaited<ReturnType<typeof discoverRoleAssignment>> | null = null;
+      try {
+        discovered = manualPeer
+          ? null
+          : await discoverRoleAssignment({
+              hello,
+              timeoutMs: LAN_ROLE_DISCOVERY_TIMEOUT_MS,
+            });
+      } finally {
+        if (progress) clearInterval(progress);
+      }
       const serverHost = manualPeer ?? discovered?.assignment.server.address;
       if (!serverHost) {
         throw new Error("Could not discover the LAN test server.");

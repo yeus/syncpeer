@@ -11,6 +11,7 @@ import {
 const ANNOUNCE_INTERVAL_MS = 500;
 const SETTLE_WINDOW_MS = 2_000;
 export const LAN_DISCOVERY_TIMEOUT_MS = 60_000;
+export const LAN_ROLE_DISCOVERY_TIMEOUT_MS = 15 * 60_000;
 
 export interface DiscoverySocket {
   close(): void;
@@ -127,6 +128,7 @@ export const discoverRoleAssignment = async (args: {
   hello: PeerHello;
   manualPeer?: string;
   manualRole?: "server" | "client";
+  timeoutMs?: number;
 }): Promise<{ assignment: RoleAssignment; localAddress: string }> => {
   if (Boolean(args.manualPeer) !== Boolean(args.manualRole)) {
     throw new Error(
@@ -159,11 +161,14 @@ export const discoverRoleAssignment = async (args: {
     };
   }
 
-  const candidates = await discoverCandidates(args.hello);
+  const candidates = await discoverCandidates(args.hello, {
+    timeoutMs: args.timeoutMs ?? LAN_DISCOVERY_TIMEOUT_MS,
+  });
   if (candidates.length !== 1) {
     throw new Error(
       `LAN pairing found ${candidates.length} compatible peers; expected one. ` +
-      "Use SYNCPEER_LAN_ROLE and SYNCPEER_LAN_PEER when multicast is unavailable.",
+      "Ensure the server is running on the same multicast-capable LAN, or " +
+      "set SYNCPEER_LAN_PEER when multicast is unavailable.",
     );
   }
   const local: PeerCandidate = { hello: args.hello, address: "", port: 0 };

@@ -4,6 +4,7 @@ export interface SyncpeerTlsConnectOptions {
   certPem: string;
   keyPem: string;
   caPem?: string;
+  timeoutMs?: number;
 }
 
 export interface SyncpeerTlsSocket {

@@ -9,6 +9,7 @@ export interface ConnectOptions {
   deviceName: string;
   timeoutMs?: number;
   enableRelayFallback?: boolean;
+  relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
 }
 

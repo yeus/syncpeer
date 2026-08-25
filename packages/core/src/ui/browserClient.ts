@@ -1,4 +1,9 @@
-import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "../client.js";
+import {
+  createSyncpeerCoreClient,
+  type SyncpeerHostAdapter,
+  type SyncpeerSessionHandle,
+  withRecoveringSession,
+} from "../client.js";
 import type {
   FileDownloadProgress,
   FileEntry,
@@ -19,6 +24,7 @@ export interface ConnectOptions {
   deviceName: string;
   timeoutMs?: number;
   enableRelayFallback?: boolean;
+  relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
 }
 
@@ -318,6 +324,7 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   deviceName: options.deviceName,
   timeoutMs: options.timeoutMs,
   enableRelayFallback: options.enableRelayFallback ?? true,
+  relayOnly: options.relayOnly === true,
   folderPasswords: Object.fromEntries(
     Object.entries(options.folderPasswords ?? {})
       .map(([folderId, password]) => [folderId.trim(), password.trim()])
@@ -367,6 +374,7 @@ const serializeConnectionKey = (
     deviceName: options.deviceName,
     certPem,
     keyPem,
+    relayOnly: options.relayOnly === true,
     folderPasswords: options.folderPasswords ?? {},
   });
 
@@ -431,6 +439,8 @@ export const createSyncpeerBrowserClient = (
   let activeConnectionKey: string | null = null;
   let openingSession: Promise<SyncpeerSessionHandle> | null = null;
   let openingConnectionKey: string | null = null;
+  let activeConnectOptions: ConnectOptions | null = null;
+  let focusedFolderId: string | null = null;
 
   const closeActiveSession = async (): Promise<void> => {
     const previous = activeSession;
@@ -543,6 +553,7 @@ export const createSyncpeerBrowserClient = (
         deviceName: normalized.deviceName,
         timeoutMs: normalized.timeoutMs,
         enableRelayFallback: normalized.enableRelayFallback,
+        relayOnly: normalized.relayOnly,
         folderPasswords: normalized.folderPasswords,
       });
       activeSession = session;
@@ -564,63 +575,95 @@ export const createSyncpeerBrowserClient = (
     }
   };
 
-  const requireActiveSession = async (): Promise<SyncpeerSessionHandle> => {
-    if (!activeSession) throw new Error("No active connection. Connect first.");
-    return activeSession;
-  };
-
-  const getSessionForPolling = async (
-    connectOptions: ConnectOptions,
-  ): Promise<SyncpeerSessionHandle> => {
-    if (activeSession && !activeSession.isClosed()) {
-      return activeSession;
-    }
-    return ensureSession(connectOptions);
-  };
-
   const remoteFsLike: RemoteFsLike = {
-    listFolders: async () => (await requireActiveSession()).remoteFs.listFolders(),
-    requestFolderIndex: async (folderId: string) =>
-      (await requireActiveSession()).remoteFs.requestFolderIndex(folderId),
+    listFolders: () =>
+      withRecoveringSession(
+        activeConnectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.listFolders(),
+      ),
+    requestFolderIndex: (folderId: string) =>
+      withRecoveringSession(
+        activeConnectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.requestFolderIndex(folderId),
+      ),
     setFocusedFolder: (folderId: string | null) => {
-      if (!activeSession || activeSession.isClosed()) {
-        throw new Error("No active connection. Connect first.");
+      focusedFolderId = folderId;
+      if (activeSession && !activeSession.isClosed()) {
+        activeSession.remoteFs.setFocusedFolder(folderId);
       }
-      activeSession.remoteFs.setFocusedFolder(folderId);
     },
-    waitForFolderIndex: async (folderId: string, timeoutMs?: number, pollMs?: number) =>
-      (await requireActiveSession()).remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
-    readDir: async (folderId: string, path: string) =>
-      (await requireActiveSession()).remoteFs.readDir(folderId, path),
-    readFileFully: async (
+    waitForFolderIndex: (folderId: string, timeoutMs?: number, pollMs?: number) =>
+      withRecoveringSession(
+        activeConnectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
+      ),
+    readDir: (folderId: string, path: string) =>
+      withRecoveringSession(
+        activeConnectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.readDir(folderId, path),
+      ),
+    readFileFully: (
       folderId: string,
       path: string,
       onProgress?: (progress: FileDownloadProgress) => void,
-    ) => (await requireActiveSession()).remoteFs.readFileFully(folderId, path, onProgress),
-    writeFileFully: async (
+    ) =>
+      withRecoveringSession(
+        activeConnectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.readFileFully(folderId, path, onProgress),
+      ),
+    writeFileFully: (
       folderId: string,
       path: string,
       bytes: Uint8Array,
       options?: { modifiedMs?: number },
-    ) => (await requireActiveSession()).remoteFs.writeFileFully(folderId, path, bytes, options),
+    ) =>
+      withRecoveringSession(
+        activeConnectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.writeFileFully(folderId, path, bytes, options),
+      ),
   };
 
   return {
     connectAndSync: async (connectOptions: ConnectOptions): Promise<RemoteFsLike> => {
       await ensureSession(connectOptions);
+      activeConnectOptions = connectOptions;
       return remoteFsLike;
     },
     connectAndGetOverview: async (
       connectOptions: ConnectOptions,
     ): Promise<ConnectionOverview> => {
-      const session = await ensureSession(connectOptions);
-      return toConnectionOverview(session);
+      const overview = await withRecoveringSession(
+        connectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => toConnectionOverview(session),
+      );
+      activeConnectOptions = connectOptions;
+      return overview;
     },
     connectAndGetFolderVersions: async (
       connectOptions: ConnectOptions,
     ): Promise<FolderSyncState[]> => {
-      const session = await getSessionForPolling(connectOptions);
-      return Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []);
+      const states = await withRecoveringSession(
+        connectOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
+      );
+      activeConnectOptions = connectOptions;
+      return states;
     },
     discoverLocalDevices: async (discoverOptions?: { timeoutMs?: number }) => {
       if (!coreAdapter.discoverLocalCandidates) return [];
@@ -663,6 +706,8 @@ export const createSyncpeerBrowserClient = (
       return [...known, ...anonymous];
     },
     disconnect: async (): Promise<void> => {
+      activeConnectOptions = null;
+      focusedFolderId = null;
       await closeActiveSession();
     },
     listFavorites: async (): Promise<FavoriteRecord[]> =>

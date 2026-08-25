@@ -42,6 +42,7 @@ export const IndexUpdate = lookupTypeAny("IndexUpdate", "bep.IndexUpdate");
 export const FileInfo = lookupTypeAny("FileInfo", "bep.FileInfo");
 export const Request = lookupTypeAny("Request", "bep.Request");
 export const Response = lookupTypeAny("Response", "bep.Response");
+export const Ping = lookupTypeAny("Ping", "bep.Ping");
 export const Close = lookupTypeAny("Close", "bep.Close");
 export const MessageTypeEnum = lookupEnumAny("MessageType", "bep.MessageType");
 export const MessageCompressionEnum = lookupEnumAny("MessageCompression", "bep.MessageCompression");
@@ -127,6 +128,7 @@ export class FrameParser {
         case MessageTypeValues.INDEX_UPDATE: message = IndexUpdate.decode(messageBuf); break;
         case MessageTypeValues.REQUEST: message = Request.decode(messageBuf); break;
         case MessageTypeValues.RESPONSE: message = Response.decode(messageBuf); break;
+        case MessageTypeValues.PING: message = Ping.decode(messageBuf); break;
         case MessageTypeValues.CLOSE: message = Close.decode(messageBuf); break;
         default: message = messageBuf; break;
       }

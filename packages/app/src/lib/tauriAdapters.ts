@@ -193,7 +193,11 @@ const createDiscoveryResponseFromPayload = (
   },
 });
 
-const createTlsSocket = (invoke: InvokeFn, sessionId: number, peerCertificateDer: Uint8Array): SyncpeerTlsSocket => ({
+const createTlsSocket = (
+  invoke: InvokeFn,
+  sessionId: number,
+  peerCertificateDer: Uint8Array,
+): SyncpeerTlsSocket => ({
   peerCertificateDer: async () => peerCertificateDer,
   read: async (maxBytes?: number) => {
     const response = await invoke<TlsReadResponse>("syncpeer_tls_read", {
@@ -229,9 +233,16 @@ export const createTauriAdapters = (
   };
 
   const hostAdapter: SyncpeerHostAdapter = {
-    connectTls: async ({ host, port, certPem, keyPem, caPem }) => {
+    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs }) => {
       const opened = await invokeWithLogging<TlsOpenResponse>("syncpeer_tls_open", {
-        request: { host, port, certPem, keyPem, caPem: caPem ?? null },
+        request: {
+          host,
+          port,
+          certPem,
+          keyPem,
+          caPem: caPem ?? null,
+          timeoutMs: timeoutMs ?? null,
+        },
       });
       const sessionId = Number(opened.sessionId);
       return createTlsSocket(
@@ -240,7 +251,7 @@ export const createTauriAdapters = (
         new Uint8Array(opened.peerCertificateDer),
       );
     },
-    connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem }) => {
+    connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs }) => {
       const opened = await invokeWithLogging<RelayOpenResponse>("syncpeer_relay_open", {
         request: {
           relayAddress,
@@ -248,6 +259,7 @@ export const createTauriAdapters = (
           certPem,
           keyPem,
           caPem: caPem ?? null,
+          timeoutMs: timeoutMs ?? null,
         },
       });
       const sessionId = Number(opened.sessionId);

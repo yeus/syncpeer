@@ -8,6 +8,7 @@ import tls from "node:tls";
 import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
+  withRecoveringSession,
   type DiscoveredCandidate,
   type SyncpeerRelayConnectOptions,
   type SyncpeerRelayConnectResult,
@@ -886,6 +887,8 @@ export const createNodeSessionTransport = (): SessionTransport => {
   let activeSession: Awaited<ReturnType<typeof coreClient.openSession>> | null = null;
   let activeKey = "";
   let opening: Promise<Awaited<ReturnType<typeof coreClient.openSession>>> | null = null;
+  let activeOptions: ConnectOptions | null = null;
+  let focusedFolderId: string | null = null;
 
   const keyFor = (options: ConnectOptions, certPem: string, keyPem: string): string =>
     JSON.stringify({
@@ -897,35 +900,61 @@ export const createNodeSessionTransport = (): SessionTransport => {
       deviceName: options.deviceName,
       timeoutMs: options.timeoutMs ?? 0,
       enableRelayFallback: options.enableRelayFallback ?? true,
+      relayOnly: options.relayOnly ?? false,
       folderPasswords: options.folderPasswords ?? {},
       certPem,
       keyPem,
     });
 
-  const requireActiveSession = () => {
-    if (!activeSession || activeSession.isClosed()) {
-      throw new Error("No active connection. Connect first.");
-    }
-    return activeSession;
-  };
-
   const asRemoteFsLike = (): RemoteFsLike => ({
-    listFolders: async () => requireActiveSession().remoteFs.listFolders(),
-    requestFolderIndex: async (folderId) =>
-      requireActiveSession().remoteFs.requestFolderIndex(folderId),
-    setFocusedFolder: (folderId) =>
-      requireActiveSession().remoteFs.setFocusedFolder(folderId),
-    waitForFolderIndex: async (folderId, timeoutMs, pollMs) =>
-      requireActiveSession().remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
-    readDir: async (folderId, path) => {
-      return requireActiveSession().remoteFs.readDir(folderId, path);
+    listFolders: () =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.listFolders(),
+      ),
+    requestFolderIndex: (folderId) =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.requestFolderIndex(folderId),
+      ),
+    setFocusedFolder: (folderId) => {
+      focusedFolderId = folderId;
+      if (activeSession && !activeSession.isClosed()) {
+        activeSession.remoteFs.setFocusedFolder(folderId);
+      }
     },
-    readFileFully: async (folderId, path, onProgress) => {
-      return requireActiveSession().remoteFs.readFileFully(folderId, path, onProgress);
-    },
-    writeFileFully: async (folderId, path, bytes, options) => {
-      return requireActiveSession().remoteFs.writeFileFully(folderId, path, bytes, options);
-    },
+    waitForFolderIndex: (folderId, timeoutMs, pollMs) =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
+      ),
+    readDir: (folderId, path) =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.readDir(folderId, path),
+      ),
+    readFileFully: (folderId, path, onProgress) =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.readFileFully(folderId, path, onProgress),
+      ),
+    writeFileFully: (folderId, path, bytes, options) =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.writeFileFully(folderId, path, bytes, options),
+      ),
   });
 
   const ensureSession = async (options: ConnectOptions) => {
@@ -957,6 +986,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
       timeoutMs: options.timeoutMs,
       enableRelayFallback: options.enableRelayFallback,
       folderPasswords: options.folderPasswords,
+      relayOnly: options.relayOnly,
     });
     const session = await opening;
     opening = null;
@@ -968,33 +998,51 @@ export const createNodeSessionTransport = (): SessionTransport => {
   return {
     connectAndSync: async (options: ConnectOptions): Promise<RemoteFsLike> => {
       await ensureSession(options);
+      activeOptions = options;
       return asRemoteFsLike();
     },
     connectAndGetOverview: async (options: ConnectOptions): Promise<ConnectionOverview> => {
-      const session = await ensureSession(options);
-      const [folders, device, folderSyncStates] = await Promise.all([
-        session.remoteFs.listFolders(),
-        Promise.resolve(session.remoteFs.getRemoteDeviceInfo?.() ?? null),
-        Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
-      ]);
-      return {
-        folders,
-        device,
-        folderSyncStates,
-        connectedVia: session.connectedVia,
-        transportKind: session.transportKind,
-      };
+      const overview = await withRecoveringSession(
+        options,
+        ensureSession,
+        focusedFolderId,
+        async (session) => {
+          const [folders, device, folderSyncStates] = await Promise.all([
+            session.remoteFs.listFolders(),
+            Promise.resolve(session.remoteFs.getRemoteDeviceInfo?.() ?? null),
+            Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
+          ]);
+          return {
+            folders,
+            device,
+            folderSyncStates,
+            connectedVia: session.connectedVia,
+            transportKind: session.transportKind,
+          };
+        },
+      );
+      activeOptions = options;
+      return overview;
     },
     connectAndGetFolderVersions: async (options: ConnectOptions) => {
-      const session = activeSession && !activeSession.isClosed()
-        ? activeSession
-        : await ensureSession(options);
-      return Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []);
+      const versions = await withRecoveringSession(
+        options,
+        ensureSession,
+        focusedFolderId,
+        async (session) => {
+          const states = session.remoteFs.listFolderSyncStates?.();
+          return Promise.resolve(states ?? []);
+        },
+      );
+      activeOptions = options;
+      return versions;
     },
     disconnect: async () => {
       const previous = activeSession;
       activeSession = null;
       activeKey = "";
+      activeOptions = null;
+      focusedFolderId = null;
       if (previous) {
         await previous.close();
       }

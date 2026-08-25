@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::IpAddr;
-use std::net::{Ipv6Addr, Shutdown, TcpStream, UdpSocket};
+use std::net::{Ipv6Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 #[cfg(target_os = "android")]
@@ -247,6 +248,7 @@ struct TlsOpenRequest {
     cert_pem: String,
     key_pem: String,
     ca_pem: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +259,7 @@ struct RelayOpenRequest {
     cert_pem: String,
     key_pem: String,
     ca_pem: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,14 +415,28 @@ struct SyncpeerReplyPacket {
     port: u16,
 }
 
+enum TlsCommand {
+    Read {
+        max_bytes: usize,
+        response: mpsc::Sender<Result<TlsReadResponse, String>>,
+    },
+    Write {
+        bytes: Vec<u8>,
+        response: mpsc::Sender<Result<(), String>>,
+    },
+    Close {
+        response: mpsc::Sender<()>,
+    },
+}
+
 struct TlsSession {
-    stream: StreamOwned<ClientConnection, TcpStream>,
+    commands: mpsc::Sender<TlsCommand>,
 }
 
 #[derive(Default)]
 struct TlsSessionStore {
     next_id: u64,
-    sessions: HashMap<u64, Arc<Mutex<TlsSession>>>,
+    sessions: HashMap<u64, Arc<TlsSession>>,
 }
 
 type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
@@ -911,10 +928,152 @@ fn open_file_with_system(app: &tauri::AppHandle, path: &Path) -> Result<(), Stri
     }
 }
 
+fn tls_write_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn write_tls_bytes(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + tls_write_timeout();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => return Err("TLS write returned zero bytes".to_string()),
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("TLS write timed out".to_string());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("TLS write failed: {error}")),
+        }
+    }
+    loop {
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("TLS flush timed out".to_string());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("TLS flush failed: {error}")),
+        }
+    }
+}
+
+fn run_tls_session(
+    mut stream: StreamOwned<ClientConnection, TcpStream>,
+    commands: mpsc::Receiver<TlsCommand>,
+) {
+    if stream.get_ref().set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut pending_read: Option<(
+        Vec<u8>,
+        mpsc::Sender<Result<TlsReadResponse, String>>,
+    )> = None;
+    loop {
+        if pending_read.is_none() {
+            match commands.recv_timeout(Duration::from_millis(10)) {
+                Ok(command) => {
+                    if handle_tls_command(command, &mut stream, &mut pending_read) {
+                        return;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            while let Ok(command) = commands.try_recv() {
+                if handle_tls_command(command, &mut stream, &mut pending_read) {
+                    return;
+                }
+            }
+        }
+
+        let Some((buffer, response)) = pending_read.as_mut() else {
+            continue;
+        };
+        match stream.read(buffer) {
+            Ok(0) => {
+                let _ = response.send(Ok(TlsReadResponse {
+                    bytes: Vec::new(),
+                    eof: true,
+                }));
+                return;
+            }
+            Ok(read) => {
+                buffer.truncate(read);
+                let result = TlsReadResponse {
+                    bytes: std::mem::take(buffer),
+                    eof: false,
+                };
+                let _ = response.send(Ok(result));
+                pending_read = None;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                let _ = response.send(Err(format!("TLS read failed: {error}")));
+                return;
+            }
+        }
+    }
+}
+
+fn handle_tls_command(
+    command: TlsCommand,
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    pending_read: &mut Option<(
+        Vec<u8>,
+        mpsc::Sender<Result<TlsReadResponse, String>>,
+    )>,
+) -> bool {
+    match command {
+        TlsCommand::Read { max_bytes, response } => {
+            if pending_read.is_some() {
+                let _ = response.send(Err("Concurrent TLS read is not supported".to_string()));
+            } else {
+                *pending_read = Some((vec![0; max_bytes], response));
+            }
+            false
+        }
+        TlsCommand::Write { bytes, response } => {
+            let result = write_tls_bytes(stream, &bytes);
+            let _ = response.send(result);
+            false
+        }
+        TlsCommand::Close { response } => {
+            if let Some((_, read_response)) = pending_read.take() {
+                let _ = read_response.send(Err("Connection closed".to_string()));
+            }
+            let _ = stream.get_mut().shutdown(Shutdown::Both);
+            let _ = response.send(());
+            true
+        }
+    }
+}
+
+fn create_tls_session(
+    stream: StreamOwned<ClientConnection, TcpStream>,
+) -> Result<Arc<TlsSession>, String> {
+    let (commands, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("syncpeer-tls".to_string())
+        .spawn(move || run_tls_session(stream, receiver))
+        .map_err(|error| format!("Could not start TLS worker: {error}"))?;
+    Ok(Arc::new(TlsSession { commands }))
+}
+
 fn get_tls_session(
     store: &tauri::State<SharedTlsStore>,
     session_id: u64,
-) -> Result<Arc<Mutex<TlsSession>>, String> {
+) -> Result<Arc<TlsSession>, String> {
     let guard = store
         .lock()
         .map_err(|_| "TLS session store lock poisoned".to_string())?;
@@ -977,6 +1136,12 @@ fn create_identity_in_dir(cli_node_dir: &Path) -> Result<CliNodeIdentityResponse
 }
 
 fn resolve_default_identity_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
+        let configured = PathBuf::from(path.trim());
+        if !configured.as_os_str().is_empty() {
+            return Ok(configured);
+        }
+    }
     if let Ok(path) = app.path().app_data_dir() {
         return Ok(path.join("syncpeer").join("cli-node"));
     }
@@ -1752,6 +1917,36 @@ fn perform_ca_validated_discovery_request(
     Ok(DiscoveryFetchResponse { status, body })
 }
 
+fn tcp_connect_timeout(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1))
+}
+
+fn connect_tcp_with_timeout(
+    address: &str,
+    timeout_ms: Option<u64>,
+) -> Result<TcpStream, String> {
+    let timeout = tcp_connect_timeout(timeout_ms);
+    let mut resolved = false;
+    let mut last_error = None;
+    for socket_address in address
+        .to_socket_addrs()
+        .map_err(|error| format!("Could not resolve {address}: {error}"))?
+    {
+        resolved = true;
+        match TcpStream::connect_timeout(&socket_address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if !resolved {
+        return Err(format!("Could not resolve {address}: no addresses found"));
+    }
+    Err(format!(
+        "TCP connect to {address} failed: {}",
+        last_error.expect("resolved address must have a connection result")
+    ))
+}
+
 #[tauri::command]
 async fn syncpeer_read_text_file(request: ReadTextFileRequest) -> Result<String, String> {
     let path = PathBuf::from(request.path);
@@ -1769,6 +1964,12 @@ async fn syncpeer_read_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<CliNodeIdentityResponse, String> {
     let mut existing_candidate_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
+        let configured = PathBuf::from(path.trim());
+        if !configured.as_os_str().is_empty() {
+            existing_candidate_dirs.push(configured);
+        }
+    }
     if let Ok(path) = app.path().config_dir() {
         existing_candidate_dirs.push(path.join("syncpeer").join("cli-node"));
     }
@@ -1787,6 +1988,12 @@ async fn syncpeer_read_default_cli_identity(
     }
 
     let mut create_targets: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
+        let configured = PathBuf::from(path.trim());
+        if !configured.as_os_str().is_empty() {
+            create_targets.push(configured);
+        }
+    }
     if let Ok(path) = app.path().app_data_dir() {
         create_targets.push(path.join("syncpeer").join("cli-node"));
     }
@@ -1977,8 +2184,7 @@ async fn syncpeer_tls_open(
         let config = Arc::new(config);
 
         tauri_log(&format!("tls.open.tcp_connect.start address={}", address));
-        let tcp = TcpStream::connect(&address)
-            .map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
+        let tcp = connect_tcp_with_timeout(&address, request.timeout_ms)?;
         tcp.set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
         tcp.set_write_timeout(Some(Duration::from_secs(10)))
@@ -2020,7 +2226,7 @@ async fn syncpeer_tls_open(
         guard.next_id = next_id;
         guard
             .sessions
-            .insert(next_id, Arc::new(Mutex::new(TlsSession { stream })));
+            .insert(next_id, create_tls_session(stream)?);
         tauri_log(&format!(
             "tls.open.ready address={} sessionId={}",
             address, next_id
@@ -2087,8 +2293,7 @@ async fn syncpeer_relay_open(
         let relay_config = Arc::new(relay_config);
 
         let relay_address = format!("{relay_host}:{relay_port}");
-        let relay_tcp = TcpStream::connect(&relay_address)
-            .map_err(|error| format!("Relay TCP connect to {relay_address} failed: {error}"))?;
+        let relay_tcp = connect_tcp_with_timeout(&relay_address, request.timeout_ms)?;
         relay_tcp
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|error| format!("Could not set relay read timeout: {error}"))?;
@@ -2174,9 +2379,10 @@ async fn syncpeer_relay_open(
             session_key.len()
         ));
 
-        let session_tcp = TcpStream::connect(&relay_session_endpoint).map_err(|error| {
-            format!("Relay session TCP connect to {relay_session_endpoint} failed: {error}")
-        })?;
+        let session_tcp = connect_tcp_with_timeout(
+            &relay_session_endpoint,
+            request.timeout_ms,
+        )?;
         session_tcp
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|error| format!("Could not set relay session read timeout: {error}"))?;
@@ -2246,7 +2452,7 @@ async fn syncpeer_relay_open(
         guard.next_id = next_id;
         guard.sessions.insert(
             next_id,
-            Arc::new(Mutex::new(TlsSession { stream: bep_stream })),
+            create_tls_session(bep_stream)?,
         );
         Ok(TlsOpenResponse {
             session_id: next_id,
@@ -2269,39 +2475,18 @@ async fn syncpeer_tls_read(
     request: TlsReadRequest,
 ) -> Result<TlsReadResponse, String> {
     let session = get_tls_session(&store, request.session_id)?;
+    let (response, result) = mpsc::channel();
+    session
+        .commands
+        .send(TlsCommand::Read {
+            max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
+            response,
+        })
+        .map_err(|_| "TLS worker stopped".to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = session
-            .lock()
-            .map_err(|_| "TLS session lock poisoned".to_string())?;
-        let max_bytes = request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024);
-        guard
-            .stream
-            .get_ref()
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
-        let mut buf = vec![0u8; max_bytes];
-        match guard.stream.read(&mut buf) {
-            Ok(0) => Ok(TlsReadResponse {
-                bytes: Vec::new(),
-                eof: true,
-            }),
-            Ok(read) => {
-                buf.truncate(read);
-                Ok(TlsReadResponse {
-                    bytes: buf,
-                    eof: false,
-                })
-            }
-            Err(error)
-                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
-            {
-                Ok(TlsReadResponse {
-                    bytes: Vec::new(),
-                    eof: false,
-                })
-            }
-            Err(error) => Err(format!("TLS read failed: {error}")),
-        }
+        result
+            .recv()
+            .map_err(|_| "TLS worker stopped".to_string())?
     })
     .await
     .map_err(|error| format!("TLS read task join error: {error}"))?
@@ -2313,19 +2498,18 @@ async fn syncpeer_tls_write(
     request: TlsWriteRequest,
 ) -> Result<(), String> {
     let session = get_tls_session(&store, request.session_id)?;
+    let (response, result) = mpsc::channel();
+    session
+        .commands
+        .send(TlsCommand::Write {
+            bytes: request.bytes,
+            response,
+        })
+        .map_err(|_| "TLS worker stopped".to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut guard = session
-            .lock()
-            .map_err(|_| "TLS session lock poisoned".to_string())?;
-        guard
-            .stream
-            .write_all(&request.bytes)
-            .map_err(|error| format!("TLS write failed: {error}"))?;
-        guard
-            .stream
-            .flush()
-            .map_err(|error| format!("TLS flush failed: {error}"))?;
-        Ok(())
+        result
+            .recv()
+            .map_err(|_| "TLS worker stopped".to_string())?
     })
     .await
     .map_err(|error| format!("TLS write task join error: {error}"))?
@@ -2343,11 +2527,15 @@ async fn syncpeer_tls_close(
         guard.sessions.remove(&request.session_id)
     };
     if let Some(session) = removed {
+        let (response, result) = mpsc::channel();
+        session
+            .commands
+            .send(TlsCommand::Close { response })
+            .map_err(|_| "TLS worker stopped".to_string())?;
         tauri::async_runtime::spawn_blocking(move || {
-            if let Ok(mut guard) = session.lock() {
-                let _ = guard.stream.get_mut().shutdown(Shutdown::Both);
-            }
-            Ok::<(), String>(())
+            result
+                .recv()
+                .map_err(|_| "TLS worker stopped".to_string())
         })
         .await
         .map_err(|error| format!("TLS close task join error: {error}"))??;
@@ -3200,5 +3388,12 @@ mod tests {
     fn syncpeer_packet_rejects_invalid_magic() {
         let invalid = vec![0_u8, 1, 2, 3, SYNCPEER_DISCOVERY_KIND_REPLY, 1, 2, 3];
         assert!(parse_syncpeer_packet(&invalid).is_none());
+    }
+
+    #[test]
+    fn tcp_connect_timeout_uses_requested_duration() {
+        assert_eq!(tcp_connect_timeout(None), Duration::from_secs(10));
+        assert_eq!(tcp_connect_timeout(Some(250)), Duration::from_millis(250));
+        assert_eq!(tcp_connect_timeout(Some(0)), Duration::from_millis(1));
     }
 }

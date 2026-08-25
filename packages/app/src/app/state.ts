@@ -516,8 +516,10 @@ export const isSavedDeviceAwaitingRemoteApproval = (
   deviceId: string,
 ) => state.approvals.remoteApprovalPendingIds.has(normalizeDeviceId(deviceId));
 
-export const connectionDetails = (state: AppState) =>
-  buildConnectionDetails(state.connection, activeFolderPasswords(state));
+export const connectionDetails = (state: AppState) => ({
+  ...buildConnectionDetails(state.connection, activeFolderPasswords(state)),
+  relayOnly: __SYNCPEER_LAN_E2E__,
+});
 
 export const downloadButtonLabel = (
   state: AppState,

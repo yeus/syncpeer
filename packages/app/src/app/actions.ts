@@ -210,6 +210,10 @@ const copyText = async (text: string) => {
 
 const ensureClientName = (state: AppState) => {
   const currentName = state.connection.deviceName.trim();
+  if (__SYNCPEER_LAN_E2E__ && currentName === "syncpeer-ui") {
+    state.connection.deviceName = "syncpeer-ui-e2e";
+    return true;
+  }
   if (currentName && currentName !== "syncpeer-ui") {
     state.connection.deviceName = currentName;
     return true;

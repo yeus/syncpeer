@@ -17,7 +17,7 @@ export const config = {
     process.env.SYNCPEER_LAN_SPEC ?? "scripts/lan-test/spec.ts",
   )],
   maxInstances: 1,
-  logLevel: "warn",
+  logLevel: process.env.SYNCPEER_LAN_LOG_LEVEL ?? "warn",
   baseUrl: "about:blank",
   services: [
     ["tauri", {
@@ -25,6 +25,8 @@ export const config = {
       driverProvider,
       captureBackendLogs: captureLogs,
       captureFrontendLogs: captureLogs,
+      backendLogLevel: "info",
+      frontendLogLevel: "info",
       ...(driverProvider === "external"
         ? { autoInstallTauriDriver: true }
         : {}),
@@ -40,5 +42,8 @@ export const config = {
   reporters: ["spec"],
   mochaOpts: {
     timeout: Number(process.env.SYNCPEER_LAN_MOCHA_TIMEOUT ?? 180_000),
+    ...(process.env.SYNCPEER_LAN_GREP
+      ? { grep: new RegExp(process.env.SYNCPEER_LAN_GREP) }
+      : {}),
   },
 } satisfies Options.Testrunner & { capabilities: unknown };

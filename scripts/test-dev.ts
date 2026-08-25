@@ -118,23 +118,41 @@ const readServerDeviceId = async (clientRoot: string): Promise<string> => {
   return deviceId;
 };
 
-const runClient = async (clientRoot: string): Promise<number> => {
+const runClient = async (clientRoot: string, uiSmoke = false): Promise<number> => {
   const serverDeviceId = await readServerDeviceId(clientRoot);
   console.log("Using Syncthing server device ID: " + serverDeviceId);
   buildLanApp();
+  const configuredHome = process.env.SYNCPEER_DEV_CLIENT_CONFIG_HOME?.trim();
+  const clientEnvironment = configuredHome
+    ? {
+        XDG_CONFIG_HOME: path.resolve(configuredHome),
+        SYNCPEER_DEFAULT_IDENTITY_DIR: path.resolve(
+          configuredHome,
+          "syncpeer",
+          "cli-node",
+        ),
+      }
+    : {};
   return runLanWdio({
-    SYNCPEER_LAN_SPEC: "scripts/lan-test/dev-spec.ts",
+    SYNCPEER_LAN_SPEC: uiSmoke
+      ? "scripts/lan-test/ui-smoke-spec.ts"
+      : "scripts/lan-test/dev-spec.ts",
     SYNCPEER_LAN_CLIENT_ROOT: clientRoot,
-    SYNCPEER_LAN_MOCHA_TIMEOUT: String(15 * 60_000),
+    SYNCPEER_LAN_MOCHA_TIMEOUT: String((uiSmoke ? 8 : 15) * 60_000),
     SYNCPEER_DEV_SERVER_DEVICE_ID: serverDeviceId,
+    ...clientEnvironment,
   });
 };
 
 const main = async (): Promise<number> => {
   const serverMode = process.argv.includes("--server");
   const clientMode = process.argv.includes("--client");
+  const uiSmokeMode = process.argv.includes("--ui-smoke");
   if (serverMode === clientMode) {
     throw new Error("Choose exactly one of --server or --client.");
+  }
+  if (uiSmokeMode && !clientMode) {
+    throw new Error("The --ui-smoke option requires --client.");
   }
   if (serverMode) {
     const serverRoot = path.resolve(
@@ -145,7 +163,7 @@ const main = async (): Promise<number> => {
   const clientRoot = path.resolve(
     process.env.SYNCPEER_DEV_CLIENT_ROOT ?? ".tmp/syncpeer-dev-client",
   );
-  return runClient(clientRoot);
+  return runClient(clientRoot, uiSmokeMode);
 };
 
 main().then((code) => {

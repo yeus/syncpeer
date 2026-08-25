@@ -228,6 +228,46 @@ verifies `hello.txt`, and uploads a test file. The server remains running for
 later client builds until Ctrl-C. The Syncthing Web UI is optional and remains
 bound to localhost.
 
+For a shorter UI-focused run against the same long-running server, use:
+
+```bash
+npm run test:ui
+```
+
+This launches the real Tauri application and checks the native identity and
+connection controls, a live global-discovery connection and disconnect, and a
+folder download verified through Tauri's local cache API. It uses the saved
+server device ID and client identity, so the server must already have approved
+this client.
+
+To run the complete development verification sequence, keep the server
+running and use one command on the client computer:
+
+```bash
+export SYNCPEER_DEV_SERVER_DEVICE_ID=...
+export SYNCPEER_DEV_CLIENT_CONFIG_HOME=.tmp/syncpeer-e2e-new
+npm run test:dev:all
+```
+
+The command runs the local CLI/Syncthing regression suite first, then remote
+CLI diagnostics through global discovery and the relay, and finally the full
+Tauri UI smoke suite. The remote CLI checks identity, discovery, folder listing,
+folder browsing, small and large downloads, upload/download round trips, and
+repeated reconnects. The UI checks native discovery and relay commands,
+connection controls, reconnects, folder browsing, cache downloads, a large
+download, and an upload workflow.
+
+The approved client identity must be selected with
+`SYNCPEER_DEV_CLIENT_CONFIG_HOME` when it is not the default CLI identity. The
+command writes structured reports to
+`.tmp/syncpeer-dev-client/diagnostics/`. Use `--skip-local`, `--skip-cli`, or
+`--skip-ui` when isolating one phase. The long-running server remains a
+separate process and is never started or stopped by this command.
+
+The shared diagnostics runner follows Taskyon's registry, metadata, progress,
+timeout, structured-result, and abort conventions so the same diagnostics can
+later be reused by a Taskyon Syncthing storage backend.
+
 ## Two-Computer LAN Harness
 
 This harness runs a real Tauri Syncpeer client against an isolated Syncthing

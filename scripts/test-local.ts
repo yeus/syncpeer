@@ -177,7 +177,7 @@ function addFolder(xml, id, label, folderPath, type, deviceIds, options = {}) {
             <encryptionPassword>${escapeXml(options.encryptionPasswords?.[deviceId] ?? "")}</encryptionPassword>
         </device>`)
     .join("\n");
-  const block = `    <folder id="${escapeXml(id)}" label="${escapeXml(label)}" path="${escapeXml(folderPath)}" type="${escapeXml(type)}" rescanIntervalS="30" fsWatcherEnabled="false" fsWatcherDelayS="10" fsWatcherTimeoutS="0" ignorePerms="false" autoNormalize="true">
+  const block = `    <folder id="${escapeXml(id)}" label="${escapeXml(label)}" path="${escapeXml(folderPath)}" type="${escapeXml(type)}" rescanIntervalS="1" fsWatcherEnabled="false" fsWatcherDelayS="10" fsWatcherTimeoutS="0" ignorePerms="false" autoNormalize="true">
         <filesystemType>basic</filesystemType>
 ${deviceBlocks}
         <minDiskFree unit="%">1</minDiskFree>
@@ -586,6 +586,7 @@ async function main() {
       "--cert", path.join(cliNodeHome, "cert.pem"),
       "--key", path.join(cliNodeHome, "key.pem"),
       "--remote-id", aId,
+      "--discovery-mode", "direct",
       "--timeout-ms", "20000",
       "upload",
       "--serve-ms", "45000",
@@ -605,6 +606,7 @@ async function main() {
       "--cert", path.join(cliNodeHome, "cert.pem"),
       "--key", path.join(cliNodeHome, "key.pem"),
       "--remote-id", aId,
+      "--discovery-mode", "direct",
       "--timeout-ms", "20000",
       "download",
       folderId,
@@ -744,6 +746,7 @@ async function main() {
     const baseArgs = [
       "--host", "127.0.0.1",
       "--port", "58301",
+      "--discovery-mode", "direct",
       "--cert", path.join(cliNodeHome, "cert.pem"),
       "--key", path.join(cliNodeHome, "key.pem"),
       "--remote-id", bId,
@@ -761,6 +764,7 @@ async function main() {
     const persistedListOutput = execCli([
       "--host", "127.0.0.1",
       "--port", "58301",
+      "--discovery-mode", "direct",
       "--remote-id", bId,
       "--timeout-ms", "20000",
       "list",
@@ -785,6 +789,7 @@ async function main() {
       execCli([
         "--host", "127.0.0.1",
         "--port", "58301",
+        "--discovery-mode", "direct",
         "--remote-id", bId,
         "--timeout-ms", "20000",
         "download",
@@ -810,6 +815,7 @@ async function main() {
     const downloadPromise = execCliAsync([
       "--host", "127.0.0.1",
       "--port", "58301",
+      "--discovery-mode", "direct",
       "--remote-id", bId,
       "--timeout-ms", "20000",
       "download",
@@ -857,6 +863,7 @@ async function main() {
     const encryptedCliBaseArgs = [
       "--host", "127.0.0.1",
       "--port", "58301",
+      "--discovery-mode", "direct",
       "--cert", path.join(cliUntrustedHome, "cert.pem"),
       "--key", path.join(cliUntrustedHome, "key.pem"),
       "--remote-id", bId,
@@ -876,6 +883,7 @@ async function main() {
           execCli([
             "--host", "127.0.0.1",
             "--port", "58301",
+            "--discovery-mode", "direct",
             "--cert", path.join(cliUntrustedHome, "cert.pem"),
             "--key", path.join(cliUntrustedHome, "key.pem"),
             "--remote-id", bId,
@@ -978,6 +986,7 @@ async function main() {
       [
         "--host", "127.0.0.1",
         "--port", "58301",
+        "--discovery-mode", "direct",
         "--cert", path.join(cliNodeHome, "cert.pem"),
         "--key", path.join(cliNodeHome, "key.pem"),
         "--remote-id", bId,

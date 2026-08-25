@@ -105,6 +105,7 @@ export interface SyncpeerConnectOptions {
   discoveryMode?: "global" | "lan" | "direct";
   discoveryServer?: string;
   enableRelayFallback?: boolean;
+  relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
 }
 
@@ -1943,7 +1944,7 @@ async function openSession(
     (a, b) => scoreCandidate(b) - scoreCandidate(a),
   );
 
-  const directCandidates = ordered.filter(
+  const directCandidates = opts.relayOnly ? [] : ordered.filter(
     (candidate) =>
       candidate.protocol === "tcp" &&
       candidate.host &&
@@ -1962,7 +1963,9 @@ async function openSession(
   const connectDeadline = Date.now() + totalTimeout;
   const relayEnabled = opts.enableRelayFallback !== false;
   const relayBudgetMs = relayEnabled && relayCandidates.length > 0
-    ? Math.max(1500, Math.min(5000, Math.floor(totalTimeout * 0.4)))
+    ? opts.relayOnly
+      ? totalTimeout
+      : Math.max(1500, Math.min(5000, Math.floor(totalTimeout * 0.4)))
     : 0;
   const directDeadline = connectDeadline - relayBudgetMs;
   const perCandidateTimeout = Math.max(
@@ -1979,6 +1982,9 @@ async function openSession(
   });
 
   const errors: string[] = [];
+  if (opts.relayOnly && relayCandidates.length === 0) {
+    throw new Error("Relay-only mode requires a relay address from global discovery.");
+  }
   if (directCandidates.length > 0) {
     for (const candidate of directCandidates) {
       const remainingMs = Math.max(0, directDeadline - Date.now());

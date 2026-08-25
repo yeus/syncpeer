@@ -16,6 +16,7 @@ interface CliOptions {
   host: string;
   port: number;
   discoveryMode: "global" | "lan" | "direct";
+  relayOnly: boolean;
   cert?: string;
   key?: string;
   remoteId?: string;
@@ -122,6 +123,7 @@ async function openRemoteFs(opts: CliOptions) {
     discoveryMode: opts.discoveryMode,
     discoveryServer: opts.discoveryServer,
     enableRelayFallback: true,
+    relayOnly: opts.relayOnly,
     folderPasswords: parseFolderPasswords(opts.folderPassword),
   });
 }
@@ -185,6 +187,11 @@ async function main() {
       new Option("--discovery-mode <mode>", "Connection discovery mode")
         .choices(["global", "lan", "direct"])
         .default("global"),
+    )
+    .option(
+      "--relay-only",
+      "Use only the relay candidate returned by global discovery",
+      false,
     )
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option(

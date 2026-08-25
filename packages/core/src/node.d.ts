@@ -24,6 +24,7 @@ export interface SyncpeerConnectOptions {
   discoveryMode?: "global" | "lan" | "direct";
   discoveryServer?: string;
   enableRelayFallback?: boolean;
+  relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
 }
 

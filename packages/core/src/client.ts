@@ -4,12 +4,14 @@ import {
   FrameParser,
   MessageTypeValues,
   Hello,
+  Close,
   ClusterConfig,
   Index,
   IndexUpdate,
   FileInfo,
   Request,
   Response,
+  Ping,
 } from "./core/protocol/bep.js";
 import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.js";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
@@ -35,6 +37,7 @@ export interface SyncpeerTlsConnectOptions {
   certPem: string;
   keyPem: string;
   caPem?: string;
+  timeoutMs?: number;
 }
 
 export interface SyncpeerTlsSocket {
@@ -50,6 +53,7 @@ export interface SyncpeerRelayConnectOptions {
   certPem: string;
   keyPem: string;
   caPem?: string;
+  timeoutMs?: number;
 }
 
 export interface SyncpeerRelayConnectResult {
@@ -107,6 +111,10 @@ export interface SyncpeerConnectOptions {
   enableRelayFallback?: boolean;
   relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
+  keepalive?: {
+    pingIntervalMs?: number;
+    receiveTimeoutMs?: number;
+  };
 }
 
 export interface SyncpeerGlobalDiscoveryOptions {
@@ -133,6 +141,27 @@ export interface SyncpeerSessionHandle {
   transportKind: "direct-tcp" | "relay";
   isClosed: () => boolean;
   close: () => Promise<void>;
+}
+
+export async function withRecoveringSession<TOptions, TResult>(
+  options: TOptions | null,
+  ensureSession: (options: TOptions) => Promise<SyncpeerSessionHandle>,
+  focusedFolderId: string | null,
+  operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
+): Promise<TResult> {
+  if (options === null) {
+    throw new Error("No active connection. Connect first.");
+  }
+  const session = await ensureSession(options);
+  if (focusedFolderId) session.remoteFs.setFocusedFolder(focusedFolderId);
+  try {
+    return await operation(session);
+  } catch (error) {
+    if (!session.isClosed()) throw error;
+    const recovered = await ensureSession(options);
+    if (focusedFolderId) recovered.remoteFs.setFocusedFolder(focusedFolderId);
+    return operation(recovered);
+  }
 }
 
 interface FolderState {
@@ -335,11 +364,23 @@ function isImmediateRemoteCloseLikeError(message: string): boolean {
 function isTransientRelayError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
+    normalized.includes("not found") ||
     normalized.includes("unexpected-eof") ||
     normalized.includes("close_notify") ||
     normalized.includes("broken pipe") ||
     normalized.includes("connection reset") ||
     normalized.includes("eof")
+  );
+}
+
+function isTransientDiscoveryError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    isTimeoutLikeError(message) ||
+    isTransientRelayError(message) ||
+    normalized.includes("no global discovery candidates") ||
+    normalized.includes("global discovery did not find") ||
+    normalized.includes("connection closed before bep hello")
   );
 }
 
@@ -458,9 +499,6 @@ function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidat
   return out;
 }
 
-const isActiveFolderId = (activeFolderIds: Set<string>, folderId: string): boolean =>
-  activeFolderIds.has(String(folderId ?? "").trim());
-
 function extractDiscoveryAuth(url: URL): {
   pinServerDeviceId?: string;
   allowInsecureTls: boolean;
@@ -560,6 +598,13 @@ class BepSession {
   private localDeviceId: Uint8Array;
   private localDeviceName: string;
   private remoteDeviceId?: Uint8Array;
+  private readonly pingIntervalMs: number;
+  private readonly receiveTimeoutMs: number;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private keepaliveInFlight = false;
+  private lastReadAt = Date.now();
+  private lastWriteAt = Date.now();
+  private writeChain = Promise.resolve();
 
   constructor(
     socket: SyncpeerTlsSocket,
@@ -568,12 +613,18 @@ class BepSession {
     localDeviceName: string,
     folderPasswords?: Record<string, string>,
     remoteDeviceId?: Uint8Array,
+    keepalive?: SyncpeerConnectOptions["keepalive"],
   ) {
     this.socket = socket;
     this.adapter = adapter;
     this.localDeviceId = localDeviceId;
     this.localDeviceName = localDeviceName;
     this.remoteDeviceId = remoteDeviceId;
+    this.pingIntervalMs = Math.max(1, keepalive?.pingIntervalMs ?? 90_000);
+    this.receiveTimeoutMs = Math.max(
+      this.pingIntervalMs,
+      keepalive?.receiveTimeoutMs ?? 300_000,
+    );
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
@@ -610,7 +661,13 @@ class BepSession {
     if (leftover.length > 0) {
       this.parser.feed(leftover);
     }
+    this.lastReadAt = Date.now();
+    this.lastWriteAt = Date.now();
     void this.readLoop();
+    this.keepaliveTimer = setInterval(
+      () => void this.checkKeepalive(),
+      Math.max(1, Math.floor(this.pingIntervalMs / 2)),
+    );
   }
 
   private log(event: string, details?: Record<string, unknown>): void {
@@ -641,6 +698,7 @@ class BepSession {
         if (chunk.length === 0) {
           continue;
         }
+        this.lastReadAt = Date.now();
         this.parser.feed(chunk);
       }
     } catch (error) {
@@ -655,6 +713,7 @@ class BepSession {
     this.closed = true;
     this.readyState = "closed";
     this.closeReason = error;
+    this.stopKeepalive();
     this.log("socket.closed", { message: error.message });
     for (const { reject, timer } of this.pending.values()) {
       clearTimeout(timer);
@@ -662,6 +721,54 @@ class BepSession {
     }
     this.pending.clear();
     this.readyResolve();
+    void this.socket.close().catch(() => undefined);
+  }
+
+  private async checkKeepalive(): Promise<void> {
+    if (this.closed || this.keepaliveInFlight) return;
+    const now = Date.now();
+    if (now - this.lastReadAt > this.receiveTimeoutMs) {
+      this.onSocketClosed(new Error("BEP receive timeout"));
+      return;
+    }
+    if (now - this.lastWriteAt < this.pingIntervalMs) return;
+    this.keepaliveInFlight = true;
+    try {
+      await this.writeFrame(
+        encodeMessageFrame(
+          MessageTypeValues.PING,
+          Ping,
+          {},
+          0,
+        ),
+      );
+      this.log("keepalive.ping.sent");
+    } catch {
+      // writeFrame closes the session and records the transport error.
+    } finally {
+      this.keepaliveInFlight = false;
+    }
+  }
+
+  private writeFrame(data: Uint8Array, allowClosed = false): Promise<void> {
+    const write = this.writeChain.then(async () => {
+      if (this.closed && !allowClosed) {
+        throw this.closeReason ?? new Error("Connection closed");
+      }
+      await this.socket.write(data);
+      this.lastWriteAt = Date.now();
+    });
+    this.writeChain = write.catch(() => undefined);
+    write.catch((error) => {
+      this.onSocketClosed(error instanceof Error ? error : new Error(String(error)));
+    });
+    return write;
+  }
+
+  private stopKeepalive(): void {
+    if (!this.keepaliveTimer) return;
+    clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = null;
   }
 
   private onFrame(type: number, msg: any): void {
@@ -761,7 +868,7 @@ class BepSession {
       { folder: normalizedFolderId, files: [], last_sequence: 0 },
       0,
     );
-    await this.socket.write(indexFrame);
+    await this.writeFrame(indexFrame);
     this.log("index.bootstrap.sent", {
       folderId: normalizedFolderId,
       bytes: indexFrame.length,
@@ -971,7 +1078,7 @@ class BepSession {
         folderCount: folders.length,
       });
       try {
-        await this.socket.write(frame);
+        await this.writeFrame(frame);
         this.log("cluster.echo.send.done", {
           folderCount: folders.length,
           bytes: frame.length,
@@ -996,11 +1103,9 @@ class BepSession {
     const folderId = index.folder;
     const state = this.folders.get(folderId);
     if (!state) return;
-    const isActiveFolder = isActiveFolderId(this.activeFolderIds, folderId);
-    if (!isActiveFolder) {
-      state.indexReceived = false;
-      return;
-    }
+    // Syncthing may send the initial index before the UI opens this folder.
+    // Keep that authoritative snapshot; an empty INDEX frame from the client
+    // does not make Syncthing resend an unchanged index.
     const files = Array.isArray(index.files) ? index.files : [];
     this.log("index.received", {
       folderId,
@@ -1235,7 +1340,7 @@ class BepSession {
       0,
     );
     try {
-      await this.socket.write(responseFrame);
+      await this.writeFrame(responseFrame);
       this.log("upload.request.responded", {
         id,
         folderId,
@@ -1445,7 +1550,7 @@ class BepSession {
         },
         0,
       );
-      await this.socket.write(frame);
+      await this.writeFrame(frame);
       notifyProgress(bytes.length, "publishing");
       this.log("upload.index_update.sent", {
         folderId,
@@ -1522,7 +1627,7 @@ class BepSession {
       },
       0,
     );
-    await this.socket.write(frame);
+    await this.writeFrame(frame);
     notifyProgress(bytes.length, "publishing");
     this.log("upload.index_update.sent", {
       folderId,
@@ -1606,7 +1711,7 @@ class BepSession {
         reject(new Error(`Request timeout for ${name} at offset ${offset}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, meta });
-      this.socket.write(frame).catch((error) => {
+      this.writeFrame(frame).catch((error) => {
         clearTimeout(timer);
         this.pending.delete(id);
         this.log("request.write_failed", {
@@ -1642,12 +1747,28 @@ class BepSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.stopKeepalive();
     const closeError = this.closeReason ?? new Error("Connection closed");
     for (const { timer, reject } of this.pending.values()) {
       clearTimeout(timer);
       reject(closeError);
     }
     this.pending.clear();
+    try {
+      await this.writeFrame(
+        encodeMessageFrame(
+          MessageTypeValues.CLOSE,
+          Close,
+          { reason: "Client closed" },
+          0,
+        ),
+        true,
+      );
+    } catch (error) {
+      this.log("close.frame_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     await this.socket.close();
   }
 
@@ -1755,6 +1876,7 @@ async function openBepSessionOnSocket(
     opts.deviceName,
     opts.folderPasswords,
     remoteDeviceIdBytes,
+    opts.keepalive,
   );
   await session.initialize(leftover);
   adapter.log?.("core.bep.cluster_config.wait", {
@@ -1781,6 +1903,7 @@ async function openDirectSession(
   opts: SyncpeerConnectOptions,
   host: string,
   port: number,
+  timeoutMs?: number,
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.direct.connect.start", {
     host,
@@ -1794,6 +1917,7 @@ async function openDirectSession(
     certPem: opts.certPem,
     keyPem: opts.keyPem,
     caPem: opts.caPem,
+    timeoutMs,
   });
   adapter.log?.("core.direct.connect.tls_ready", {
     host,
@@ -1836,6 +1960,7 @@ async function openRelaySession(
     certPem: opts.certPem,
     keyPem: opts.keyPem,
     caPem: opts.caPem,
+    timeoutMs: opts.timeoutMs,
   });
   adapter.log?.("core.relay.connect.tunnel_ready", {
     relayAddress,
@@ -1857,19 +1982,12 @@ async function openRelaySession(
   return session;
 }
 
-async function openSession(
+async function openSessionAttempt(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
+  totalTimeout: number,
 ): Promise<SyncpeerSessionHandle> {
   const discoveryMode = opts.discoveryMode ?? "direct";
-
-  if (discoveryMode === "direct") {
-    return openDirectSession(adapter, opts, opts.host, opts.port);
-  }
-
-  const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
-    ? opts.timeoutMs
-    : 15000;
   const localDiscoveryTimeoutMs = discoveryMode === "lan"
     ? totalTimeout
     : Math.max(250, Math.min(2000, Math.floor(totalTimeout * 0.15)));
@@ -2007,6 +2125,7 @@ async function openSession(
             opts,
             candidate.host!,
             candidate.port!,
+            candidateTimeoutMs,
           ),
           candidateTimeoutMs,
         );
@@ -2031,9 +2150,12 @@ async function openSession(
         if (remainingMs <= 0) {
           break;
         }
-        const attemptTimeoutMs = Math.max(
-          1000,
-          Math.floor(remainingMs / (relayMaxAttempts - attempt + 1)),
+        const attemptTimeoutMs = Math.min(
+          remainingMs,
+          Math.max(
+            1000,
+            Math.min(10000, Math.floor(remainingMs / (relayMaxAttempts - attempt + 1))),
+          ),
         );
         try {
           adapter.log?.("core.discovery.relay.try", {
@@ -2075,6 +2197,47 @@ async function openSession(
   const hint = maybeConnectionHint(opts, errors);
   const technical = `Could not connect using discovered candidates. ${errors.join(" | ")}`;
   throw new Error(hint ? `${hint} Technical details: ${technical}` : technical);
+}
+
+async function openSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+): Promise<SyncpeerSessionHandle> {
+  const discoveryMode = opts.discoveryMode ?? "direct";
+  if (discoveryMode === "direct") {
+    return openDirectSession(adapter, opts, opts.host, opts.port, opts.timeoutMs);
+  }
+
+  const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
+    ? opts.timeoutMs
+    : 15000;
+  const deadline = Date.now() + totalTimeout;
+  let lastError: Error | null = null;
+
+  while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
+    try {
+      return await openSessionAttempt(
+        adapter,
+        { ...opts, timeoutMs: remainingMs },
+        remainingMs,
+      );
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      lastError = normalized;
+      if (!isTransientDiscoveryError(normalized.message)) throw normalized;
+      const waitForMs = Math.min(1000, Math.max(0, deadline - Date.now()));
+      if (waitForMs <= 0) break;
+      adapter.log?.("core.discovery.retry", {
+        remainingMs: deadline - Date.now(),
+        message: normalized.message,
+        waitMs: waitForMs,
+      });
+      await waitMs(waitForMs);
+    }
+  }
+
+  throw lastError ?? new Error("Connection timed out while discovering the remote device.");
 }
 
 export interface SyncpeerCoreClient {

@@ -156,6 +156,7 @@ export const makeReadDirWithRetryFlow =
     path: string;
     encrypted: boolean;
     locked: boolean;
+    retryEmpty?: boolean;
     retryTimeoutMs?: number;
     retryIntervalMs?: number;
   }): Promise<{ entries: FileEntry[]; attempts: ReadDirAttempt[] }> => {
@@ -168,7 +169,7 @@ export const makeReadDirWithRetryFlow =
       atIso: new Date().toISOString(),
       entryCount: entries.length,
     });
-    if (entries.length > 0 || !args.encrypted || args.locked) {
+    if (entries.length > 0 || !args.retryEmpty || args.locked) {
       return { entries, attempts };
     }
     const deadline = Date.now() + retryTimeoutMs;
@@ -185,4 +186,3 @@ export const makeReadDirWithRetryFlow =
     }
     return { entries, attempts };
   };
-

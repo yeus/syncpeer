@@ -374,6 +374,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           path: readPath,
           encrypted: Boolean(latestFolder?.encrypted),
           locked: Boolean(latestFolder?.needsPassword),
+          retryEmpty: !indexResult.received,
           retryIntervalMs: 200,
           retryTimeoutMs: 4000,
         });

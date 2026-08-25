@@ -418,6 +418,7 @@
     onLoadCatalog={actions.loadDiagnosticsCatalog}
     onRunTest={actions.runDiagnosticsTestById}
     onRunCategory={actions.runDiagnosticsCategory}
+    onRunAll={actions.runAllDiagnostics}
   />
 {/if}
 

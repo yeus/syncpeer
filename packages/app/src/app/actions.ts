@@ -2666,6 +2666,28 @@ export const createAppActions = (args: {
     };
   };
 
+  const runAllDiagnostics = async (
+    args?: { expectedAdvertisedDeviceIds?: string[]; failOnExpectedMissing?: boolean },
+  ) => {
+    const definitions = buildDiagnosticsDefinitions(args);
+    const tests: Record<string, TaskyonTestFn> = {};
+    for (const definition of definitions) {
+      tests[definition.test.name] = definition.fn;
+    }
+    const results = await runDiagnosticsTests(tests, { details: true });
+    const passed = results.filter((item) => item.ok).length;
+    return {
+      summary: {
+        runAtIso: new Date().toISOString(),
+        mode: "all",
+        allPassed: passed === results.length,
+        passed,
+        failed: results.length - passed,
+      },
+      results,
+    };
+  };
+
   return {
     hydrate,
     connect,
@@ -2728,6 +2750,7 @@ export const createAppActions = (args: {
     loadDiagnosticsCatalog,
     runDiagnosticsTestById,
     runDiagnosticsCategory,
+    runAllDiagnostics,
     persist: () => persistState(state),
     restoreOfflineSnapshot: (deviceId?: string, reason?: string) =>
       restoreOfflineSnapshot(state, clearDirectoryView, deviceId, reason),

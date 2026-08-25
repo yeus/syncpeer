@@ -30,9 +30,10 @@
     onLoadCatalog: () => Promise<DiagnosticsCatalog>;
     onRunTest: (testId: string, args?: RunDiagnosticsArgs) => Promise<unknown>;
     onRunCategory: (categoryId: string, args?: RunDiagnosticsArgs) => Promise<unknown>;
+    onRunAll: (args?: RunDiagnosticsArgs) => Promise<unknown>;
   }
 
-  let { onBack, onLoadCatalog, onRunTest, onRunCategory }: Props = $props();
+  let { onBack, onLoadCatalog, onRunTest, onRunCategory, onRunAll }: Props = $props();
 
   let isRunning = $state(false);
   let isCatalogLoading = $state(false);
@@ -112,6 +113,26 @@
     }
   };
 
+  const runAllDiagnostics = async (): Promise<void> => {
+    if (isRunning) return;
+    isRunning = true;
+    runError = null;
+    copiedNotice = "";
+    try {
+      const expectedAdvertisedDeviceIds = parseExpectedDeviceIds(expectedIdsInput);
+      const result = await onRunAll({
+        expectedAdvertisedDeviceIds,
+        failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
+      });
+      resultJson = JSON.stringify(result, null, 2);
+      lastRunAt = new Date().toLocaleString();
+    } catch (error) {
+      runError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isRunning = false;
+    }
+  };
+
   const copyResults = async (): Promise<void> => {
     copiedNotice = "";
     if (!resultJson.trim()) return;
@@ -164,6 +185,9 @@
     <div class="actions">
       <button class="primary" onclick={runSelectedCategory} disabled={isRunning || !selectedCategoryId}>
         {isRunning ? "Running..." : "Run Selected Category"}
+      </button>
+      <button class="primary" onclick={runAllDiagnostics} disabled={isRunning || catalog.tests.length === 0}>
+        {isRunning ? "Running..." : "Run All Diagnostics"}
       </button>
       <button class="ghost" onclick={loadCatalog} disabled={isCatalogLoading || isRunning}>
         {isCatalogLoading ? "Refreshing..." : "Refresh Catalog"}

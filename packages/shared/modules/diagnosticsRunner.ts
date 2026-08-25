@@ -1,8 +1,26 @@
+export type DiagnosticsTestContext = {
+  tyauth?: string
+  allowLongRun?: boolean
+  isCypress?: boolean
+  selectedApi?: string
+  model?: string
+  llmSettings?: unknown
+  toolchainConfig?: unknown
+  providerKey?: string
+  providerAccessToken?: string
+  accountId?: string
+}
+
 export interface TaskyonTestFn {
-  (opts?: { tyauth?: string; isCypress?: boolean }): unknown
+  (opts?: DiagnosticsTestContext): unknown
+  setup?: (opts?: DiagnosticsTestContext) => unknown
   description?: string
   gui?: boolean
   experimental?: boolean
+  requiresLargeTokens?: boolean
+  requiresLongRun?: boolean
+  requiresAuth?: boolean
+  modelBased?: boolean
   helper?: boolean
   timeoutMs?: number
 }
@@ -13,6 +31,7 @@ export type DiagnosticsRegistry = {
   tests: TestRecord
   guiTests: TestRecord
   experimentalTests: TestRecord
+  modelBasedTests: TestRecord
   testsByFolder: Record<string, TestRecord>
   testsByFile: Record<string, TestRecord>
 }
@@ -31,6 +50,7 @@ export type DiagnosticsBuiltinTest = {
 export type DiagnosticsRunResult = {
   name: string
   ok: boolean
+  modelBased: boolean
   details?: unknown
   error?: unknown
 }
@@ -70,14 +90,24 @@ export function buildDiagnosticsRegistry(args: {
   const tests: TestRecord = {}
   const guiTests: TestRecord = {}
   const experimentalTests: TestRecord = {}
+  const modelBasedTests: TestRecord = {}
   const testsByFolder: Record<string, TestRecord> = {}
   const testsByFile: Record<string, TestRecord> = {}
+  const registeredSources = new Map<string, string>()
 
   const registerTest = (testName: string, func: TaskyonTestFn, sourcePath: string) => {
     const name = camelToNormal(String(testName))
-    if ('helper' in func) return
-    if ('gui' in func) guiTests[name] = func
-    else if ('experimental' in func) experimentalTests[name] = func
+    if (func.helper === true) return
+    const existingSource = registeredSources.get(name)
+    if (existingSource) {
+      throw new Error(
+        `Duplicate diagnostic name "${name}" from "${existingSource}" and "${sourcePath}"`,
+      )
+    }
+    registeredSources.set(name, sourcePath)
+    if (func.gui === true) guiTests[name] = func
+    else if (func.experimental === true) experimentalTests[name] = func
+    else if (func.modelBased === true) modelBasedTests[name] = func
     else tests[name] = func
 
     addToGroup(testsByFile, name, func, sourcePath)
@@ -100,6 +130,7 @@ export function buildDiagnosticsRegistry(args: {
     tests,
     guiTests,
     experimentalTests,
+    modelBasedTests,
     testsByFolder,
     testsByFile,
   }
@@ -112,6 +143,7 @@ export async function runDiagnosticsTests(
     tyauth?: string
     timeoutMs?: number
     isCypress?: boolean
+    context?: DiagnosticsTestContext
     onProgress?: (progress: {
       phase: 'start' | 'finish'
       test: string
@@ -150,19 +182,42 @@ export async function runDiagnosticsTests(
     }
     opts?.onProgress?.({ phase: 'start', test: name })
     try {
-      let testOpts: { tyauth?: string; isCypress?: boolean } | undefined
-      if (opts?.tyauth !== undefined || opts?.isCypress !== undefined) {
-        testOpts = {}
-        if (opts?.tyauth !== undefined) testOpts.tyauth = opts.tyauth
-        if (opts?.isCypress !== undefined) testOpts.isCypress = opts.isCypress
+      const fallbackContext: DiagnosticsTestContext | undefined =
+        opts?.tyauth !== undefined || opts?.isCypress !== undefined
+          ? {
+              ...(opts?.tyauth !== undefined ? { tyauth: opts.tyauth } : {}),
+              ...(opts?.isCypress !== undefined ? { isCypress: opts.isCypress } : {}),
+            }
+          : undefined
+      const testOpts = opts?.context ?? fallbackContext
+      const unavailable =
+        testFn.requiresAuth === true && !testOpts?.tyauth
+          ? {
+              skipped: true,
+              reason: 'Requires an authenticated Taskyon user session.',
+            }
+          : testFn.requiresLongRun === true && testOpts?.allowLongRun !== true
+            ? {
+                skipped: true,
+                reason: 'Requires explicit permission for long-running diagnostics.',
+              }
+            : undefined
+      if (!unavailable && typeof testFn.setup === 'function') {
+        await Promise.resolve(testFn.setup(testOpts))
       }
       const timeoutMs = testFn.timeoutMs ?? defaultTimeoutMs
       const run = () => Promise.resolve(testFn(testOpts))
-      const result = timeoutMs !== undefined ? await withTimeout(name, timeoutMs, run) : await run()
+      const result = unavailable ?? await withTimeout(name, timeoutMs, run)
+      const skipped =
+        typeof result === 'object' &&
+        result !== null &&
+        'skipped' in result &&
+        result.skipped === true
       out.push({
         name,
         ok: true,
-        details: details ? result : undefined,
+        modelBased: testFn.modelBased === true,
+        details: details || skipped ? result : undefined,
       })
       opts?.onResult?.(out[out.length - 1]!)
       opts?.onProgress?.({ phase: 'finish', test: name, ok: true })
@@ -174,6 +229,7 @@ export async function runDiagnosticsTests(
       out.push({
         name,
         ok: false,
+        modelBased: testFn.modelBased === true,
         error: normalizedError,
       })
       opts?.onResult?.(out[out.length - 1]!)

@@ -11,7 +11,10 @@ if (driverProvider !== "embedded" && driverProvider !== "external") {
 
 export const config = {
   runner: "local",
-  specs: [path.resolve(process.cwd(), "scripts/lan-test/spec.ts")],
+  specs: [path.resolve(
+    process.cwd(),
+    process.env.SYNCPEER_LAN_SPEC ?? "scripts/lan-test/spec.ts",
+  )],
   maxInstances: 1,
   logLevel: "warn",
   baseUrl: "about:blank",
@@ -33,6 +36,6 @@ export const config = {
   framework: "mocha",
   reporters: ["spec"],
   mochaOpts: {
-    timeout: 180_000,
+    timeout: Number(process.env.SYNCPEER_LAN_MOCHA_TIMEOUT ?? 180_000),
   },
 } satisfies Options.Testrunner & { capabilities: unknown };

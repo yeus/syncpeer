@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   createPeerHello,
   deriveManualPairToken,
@@ -33,6 +33,7 @@ import {
   installFirewallSignalCleanup,
   type TemporaryNixosFirewall,
 } from "./lan-test/firewall.ts";
+import { buildLanApp, runLanWdio } from "./lan-test/tauri-runner.ts";
 
 const selfMode = process.argv.includes("--self");
 const selfClientMode = process.argv.includes("--self-client");
@@ -46,7 +47,6 @@ if (explicitServerMode && explicitClientMode) {
 const source = readSourceState();
 if (!selfMode && !selfClientMode) requireCleanSource(source);
 
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const nodePath = process.execPath;
 const root = path.resolve(".tmp", "syncpeer-lan", new Date().toISOString().replace(/[:.]/g, "-"));
 const coordinatorPort = Number(process.env.SYNCPEER_LAN_COORDINATOR_PORT ?? LAN_COORDINATOR_PORT);
@@ -75,22 +75,6 @@ const readDeviceIdPrompt = async (message: string): Promise<string> => {
     throw new Error("Expected a 52- or 56-character Syncthing device ID.");
   }
   return deviceId;
-};
-
-const runChild = (command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> =>
-  new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit", env });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
-  });
-
-const findAppBinary = (): string =>
-  path.resolve("packages", "tauri-shell", "src-tauri", "target", "debug", "tauri-shell");
-
-const buildLanApp = (): void => {
-  execFileSync(npmCommand, ["run", "build:lan", "-w", "@syncpeer/tauri-shell"], {
-    stdio: "inherit",
-  });
 };
 
 const runClient = async (args: {
@@ -131,33 +115,16 @@ const runClient = async (args: {
       console.log("Untrusted test identity ID: " + untrustedIdentity.deviceId);
       console.log("After the app opens, copy its This Device ID to the server terminal.");
     }
-    const wdioBin = path.resolve("node_modules", "@wdio", "cli", "bin", "wdio.js");
-    const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
-    const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
-    const useXvfb = process.platform === "linux" && !process.env.DISPLAY;
-    if (useXvfb) {
-      try {
-        execFileSync("which", ["xvfb-run"], { stdio: "ignore" });
-      } catch {
-        throw new Error("No DISPLAY is available and xvfb-run is missing. Enter the Nix flake shell first.");
-      }
-    }
-    const exitCode = await runChild(
-      useXvfb ? "xvfb-run" : nodePath,
-      useXvfb ? ["-a", nodePath, ...wdioArgs] : wdioArgs,
-      {
-        ...process.env,
+    const exitCode = await runLanWdio({
         SYNCPEER_LAN_COORDINATOR_URL: args.coordinatorUrl,
         SYNCPEER_LAN_COORDINATOR_TOKEN: coordinatorToken,
-        SYNCPEER_LAN_APP_BINARY: findAppBinary(),
         SYNCPEER_LAN_CLIENT_ROOT: clientRoot,
         SYNCPEER_LAN_UNTRUSTED_DEVICE_ID: untrustedIdentity.deviceId,
         SYNCPEER_LAN_UNTRUSTED_CERT: untrustedIdentity.certPath,
         SYNCPEER_LAN_UNTRUSTED_KEY: untrustedIdentity.keyPath,
         SYNCPEER_LAN_REMOTE_DEVICE_ID: remoteDeviceId,
         SYNCPEER_LAN_MANUAL_IDS: args.explicitIds ? "1" : "",
-      },
-    );
+    });
     await coordinatorRequest({
       baseUrl: args.coordinatorUrl,
       token: coordinatorToken,
@@ -290,6 +257,7 @@ const runServer = async (args: {
       trustedDeviceId: canonicalDeviceId(profile.deviceId),
       untrustedDeviceId: untrustedDeviceId || undefined,
       home: serverHome,
+      mode: "direct",
     });
     if (args.openFirewall) {
       firewall.open({ protocol: "tcp", port: fixture.fixture.directPort });

@@ -194,6 +194,39 @@ Keep temporary test state for debugging:
 npm run test:local:keep
 ```
 
+## Long-Running Development Test Server
+
+For iterative development against a real Syncthing peer, start the persistent
+fixture server on one computer:
+
+```bash
+npm run test:server
+```
+
+The server immediately starts Syncthing, prints its stable device ID and local
+Web UI address, and then waits for pending clients. It uses official global
+discovery and relay-only device traffic, so it does not require an inbound
+firewall rule or the test coordinator. Its identity, approved clients, fixture
+folders, and logs persist under `.tmp/syncpeer-dev-server/` across restarts.
+
+On the development computer, run:
+
+```bash
+npm run test:client
+```
+
+Enter the printed server device ID on the first run. The client remembers it
+under `.tmp/syncpeer-dev-client/` and prints its own persistent device ID while
+attempting a normal Syncthing connection. The server terminal then shows the
+pending ID. Compare it with the client output and enter `y` to approve it as a
+trusted fixture client. Enter `u` only for a receive-encrypted test identity.
+Unknown devices are never accepted automatically.
+
+After approval, the client reconnects, browses the fixture, downloads and
+verifies `hello.txt`, and uploads a test file. The server remains running for
+later client builds until Ctrl-C. The Syncthing Web UI is optional and remains
+bound to localhost.
+
 ## Two-Computer LAN Harness
 
 This harness runs a real Tauri Syncpeer client against an isolated Syncthing

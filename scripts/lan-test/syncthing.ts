@@ -4,8 +4,21 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import type { LanFixture } from "./protocol.ts";
+import {
+  LAN_FIXTURE_ENCRYPTED_FOLDER_ID,
+  LAN_FIXTURE_ENCRYPTED_PASSWORD,
+  LAN_FIXTURE_FOLDER_ID,
+  LAN_FIXTURE_HELLO_CONTENT,
+  SYNCTHING_GLOBAL_DISCOVERY_SERVER,
+} from "./fixture-data.ts";
+import {
+  approvePendingDevice,
+  listPendingDevices,
+  waitForPendingDeviceChange,
+  type PendingSyncthingDevice,
+  type SyncthingApiCall,
+} from "./approval.ts";
 
-export const SYNCTHING_GLOBAL_DISCOVERY_SERVER = "https://discovery.syncthing.net/v2/";
 export const SYNCTHING_LOCAL_DISCOVERY_PORT = 21027;
 const SYNCTHING_RELAY_POOL = "dynamic+https://relays.syncthing.net/endpoint";
 
@@ -194,7 +207,7 @@ const configureHome = (home: string, args: {
   discoveryServer: string;
   direct: boolean;
   localAnnounce: boolean;
-  trustedDeviceId: string;
+  trustedDeviceId?: string;
   untrustedDeviceId?: string;
   sharePath: string;
   encryptedSharePath: string;
@@ -218,18 +231,22 @@ const configureHome = (home: string, args: {
   xml = replaceTag(xml, "localAnnouncePort", String(SYNCTHING_LOCAL_DISCOVERY_PORT));
   xml = replaceTag(xml, "relaysEnabled", "true");
   xml = replaceTag(xml, "natEnabled", "true");
-  xml = addDevice(xml, args.trustedDeviceId, "syncpeer-lan-client");
+  if (args.trustedDeviceId) {
+    xml = addDevice(xml, args.trustedDeviceId, "syncpeer-lan-client");
+  }
   if (args.untrustedDeviceId) xml = addDevice(xml, args.untrustedDeviceId, "syncpeer-lan-untrusted", true);
   xml = addFolder(xml, {
     id: args.folderId,
     folderPath: args.sharePath,
-    deviceIds: [readDeviceId(home), args.trustedDeviceId],
+    deviceIds: [readDeviceId(home), ...(args.trustedDeviceId ? [args.trustedDeviceId] : [])],
   });
-  if (args.untrustedDeviceId) xml = addFolder(xml, {
+  xml = addFolder(xml, {
     id: args.encryptedFolderId,
     folderPath: args.encryptedSharePath,
-    deviceIds: [readDeviceId(home), args.untrustedDeviceId],
-    encryptionPasswords: { [args.untrustedDeviceId]: args.password },
+    deviceIds: [readDeviceId(home), ...(args.untrustedDeviceId ? [args.untrustedDeviceId] : [])],
+    encryptionPasswords: args.untrustedDeviceId
+      ? { [args.untrustedDeviceId]: args.password }
+      : undefined,
     type: "sendonly",
   });
   fs.writeFileSync(configPath, xml);
@@ -254,16 +271,19 @@ const startProcess = (
 
 const stopProcess = async (child: ChildProcess | null): Promise<void> => {
   if (!child || child.exitCode !== null) return;
-  child.kill("SIGTERM");
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
+    let timer: NodeJS.Timeout;
+    const finish = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
       child.kill("SIGKILL");
       resolve();
     }, 5000);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
+    child.once("exit", finish);
+    child.kill("SIGTERM");
+    if (child.exitCode !== null) finish();
   });
 };
 
@@ -274,18 +294,28 @@ const apiKeyFor = (home: string): string => {
   return match[1];
 };
 
-const apiRequest = async (
+const apiRequest = async <T = unknown>(
   baseUrl: string,
   apiKey: string,
-  pathname: string,
-  method = "GET",
-): Promise<unknown> => {
-  const response = await fetch(baseUrl + pathname, {
-    method,
-    headers: { "X-API-Key": apiKey },
+  call: SyncthingApiCall,
+): Promise<T> => {
+  const response = await fetch(baseUrl + call.pathname, {
+    method: call.method ?? "GET",
+    headers: {
+      "X-API-Key": apiKey,
+      ...(call.body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    body: call.body === undefined ? undefined : JSON.stringify(call.body),
+    signal: call.signal,
   });
-  if (!response.ok) throw new Error("Syncthing API " + method + " " + pathname + " failed: " + response.status);
-  return response.json();
+  if (!response.ok) {
+    throw new Error(
+      "Syncthing API " + (call.method ?? "GET") + " " + call.pathname +
+      " failed: " + response.status,
+    );
+  }
+  const text = await response.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 };
 
 const hashFile = (filePath: string): { sha256: string; size: number } => {
@@ -305,15 +335,25 @@ export interface RunningLanFixture {
   addUntrustedProfile: (deviceId: string) => Promise<void>;
   verifyUploadedFile: () => Promise<{ sha256: string; size: number }>;
   churn: (durationMs: number) => Promise<number>;
+  listPendingDevices: () => Promise<PendingSyncthingDevice[]>;
+  waitForPendingDeviceChange: (
+    since: number,
+    signal?: AbortSignal,
+  ) => Promise<number>;
+  approveDevice: (args: {
+    deviceId: string;
+    untrusted?: boolean;
+  }) => Promise<void>;
   stop: () => Promise<void>;
 }
 
 export const createLanFixture = async (args: {
   root: string;
   serverHost: string;
-  trustedDeviceId: string;
+  trustedDeviceId?: string;
   untrustedDeviceId?: string;
   home?: string;
+  mode: "direct" | "relay";
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
   const root = args.root;
@@ -323,17 +363,17 @@ export const createLanFixture = async (args: {
   ensureDir(root);
   ensureDir(sharePath);
   ensureDir(encryptedSharePath);
-  if (!fs.existsSync(path.join(home, "cert.pem"))) {
+  if (!fs.existsSync(path.join(home, "config.xml"))) {
     execFileSync(binaryPath("syncthing"), ["generate", "--home", home], { stdio: "ignore" });
   }
   const serverDeviceId = readDeviceId(home);
   const syncPort = await freePort();
   const guiPort = await freePort();
   const discoveryServer = SYNCTHING_GLOBAL_DISCOVERY_SERVER;
-  const folderId = "syncpeer-lan";
-  const encryptedFolderId = "syncpeer-lan-encrypted";
-  const encryptedPassword = "correct horse battery staple";
-  fs.writeFileSync(path.join(sharePath, "hello.txt"), "hello from the LAN fixture\n");
+  const folderId = LAN_FIXTURE_FOLDER_ID;
+  const encryptedFolderId = LAN_FIXTURE_ENCRYPTED_FOLDER_ID;
+  const encryptedPassword = LAN_FIXTURE_ENCRYPTED_PASSWORD;
+  fs.writeFileSync(path.join(sharePath, "hello.txt"), LAN_FIXTURE_HELLO_CONTENT);
   fs.mkdirSync(path.join(sharePath, "nested"), { recursive: true });
   fs.writeFileSync(path.join(sharePath, "nested", "file.txt"), "nested LAN file\n");
   const blob = Buffer.alloc(12 * 1024 * 1024);
@@ -365,27 +405,29 @@ export const createLanFixture = async (args: {
     ], root, path.join(root, "syncthing.log"));
     await waitForTcp("127.0.0.1", guiPort, 30000, "Syncthing GUI");
   };
-  configure(true, true, args.untrustedDeviceId);
+  configure(args.mode !== "relay", args.mode !== "relay", args.untrustedDeviceId);
   await start();
   const apiKey = apiKeyFor(home);
   const syncGuiUrl = "http://127.0.0.1:" + guiPort;
+  const request = <T>(call: SyncthingApiCall): Promise<T> =>
+    apiRequest<T>(syncGuiUrl, apiKey, call);
   const expectedFiles = ["hello.txt", "nested/file.txt", "blob.bin"].map((relativePath) => ({
     path: relativePath,
     ...hashFile(path.join(sharePath, relativePath)),
   }));
+  const status = await request<{ myID?: string }>({ pathname: "/rest/system/status" });
   const fixture: LanFixture = {
     runId: path.basename(root),
     serverHost: args.serverHost,
     directPort: syncPort,
     discoveryServer,
-    remoteDeviceId: serverDeviceId,
+    remoteDeviceId: status.myID ?? serverDeviceId,
     folderId,
     expectedFiles,
     encryptedFolderId,
     encryptedPassword,
     encryptedExpected,
   };
-  await apiRequest(syncGuiUrl, apiKey, "/rest/system/status");
   return {
     fixture,
     root,
@@ -417,11 +459,28 @@ export const createLanFixture = async (args: {
       while (Date.now() < deadline) {
         const relativePath = "churn-" + (ticks % 4) + ".txt";
         fs.writeFileSync(path.join(sharePath, relativePath), String(ticks) + "\n");
-        await apiRequest(syncGuiUrl, apiKey, "/rest/db/scan?folder=" + encodeURIComponent(folderId), "POST");
+        await request({
+          pathname: "/rest/db/scan?folder=" + encodeURIComponent(folderId),
+          method: "POST",
+        });
         ticks += 1;
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       return ticks;
+    },
+    listPendingDevices: () => listPendingDevices(request),
+    waitForPendingDeviceChange: (since, signal) =>
+      waitForPendingDeviceChange(since, request, signal),
+    approveDevice: async ({ deviceId, untrusted = false }) => {
+      await approvePendingDevice({
+        deviceId,
+        deviceName: untrusted
+          ? "Syncpeer encrypted test client"
+          : "Syncpeer development client",
+        folderId: untrusted ? encryptedFolderId : folderId,
+        untrusted,
+        encryptionPassword: untrusted ? encryptedPassword : "",
+      }, request);
     },
     stop: async () => {
       await stopProcess(syncthingProcess);

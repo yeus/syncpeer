@@ -2,7 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { spawn, execFileSync } from "node:child_process";
-import { createPeerHello, deriveManualPairToken, derivePairToken, roleForPeer, LAN_COORDINATOR_PORT, type PeerHello, type RoleAssignment } from "./lan-test/protocol.ts";
+import {
+  createPeerHello,
+  deriveManualPairToken,
+  derivePairToken,
+  deriveServerCoordinatorToken,
+  roleForPeer,
+  LAN_COORDINATOR_PORT,
+  LAN_DISCOVERY_PORT,
+  type PeerHello,
+  type RoleAssignment,
+} from "./lan-test/protocol.ts";
 import {
   discoverCandidates,
   discoverRoleAssignment,
@@ -15,13 +25,20 @@ import { readSourceState, requireCleanSource } from "./lan-test/source.ts";
 import {
   createLanFixture,
   generateSyncthingIdentity,
+  SYNCTHING_LOCAL_DISCOVERY_PORT,
   type RunningLanFixture,
 } from "./lan-test/syncthing.ts";
+import {
+  createTemporaryNixosFirewall,
+  installFirewallSignalCleanup,
+  type TemporaryNixosFirewall,
+} from "./lan-test/firewall.ts";
 
 const selfMode = process.argv.includes("--self");
 const selfClientMode = process.argv.includes("--self-client");
 const explicitServerMode = process.argv.includes("--server");
 const explicitClientMode = process.argv.includes("--client");
+const openFirewall = process.argv.includes("--open-firewall");
 const keep = process.argv.includes("--keep");
 if (explicitServerMode && explicitClientMode) {
   throw new Error("Choose either --server or --client, not both.");
@@ -82,61 +99,80 @@ const runClient = async (args: {
   assignment: RoleAssignment;
   hello: PeerHello;
   explicitIds?: boolean;
+  openFirewall: boolean;
+  firewall?: TemporaryNixosFirewall;
 }): Promise<number> => {
-  console.log("LAN role: Syncpeer client");
-  console.log("Coordinator: " + args.coordinatorUrl);
-  let remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim() ?? "";
-  if (args.explicitIds) {
-    remoteDeviceId = await readDeviceIdPrompt("Enter the Syncthing server device ID: ");
-    console.log("Server device ID accepted: " + remoteDeviceId);
-  }
-  buildLanApp();
-  const clientRoot = path.join(root, "client");
-  fs.mkdirSync(clientRoot, { recursive: true });
-  const untrustedIdentity = generateSyncthingIdentity(
-    path.join(clientRoot, "untrusted-identity"),
-  );
-  if (args.explicitIds) {
-    console.log("Untrusted test identity ID: " + untrustedIdentity.deviceId);
-    console.log("After the app opens, copy its This Device ID to the server terminal.");
-  }
-  const wdioBin = path.resolve("node_modules", "@wdio", "cli", "bin", "wdio.js");
-  const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
-  const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
-  const useXvfb = process.platform === "linux" && !process.env.DISPLAY;
-  if (useXvfb) {
-    try {
-      execFileSync("which", ["xvfb-run"], { stdio: "ignore" });
-    } catch {
-      throw new Error("No DISPLAY is available and xvfb-run is missing. Enter the Nix flake shell first.");
+  const firewall = args.firewall ?? createTemporaryNixosFirewall(args.openFirewall);
+  const closeFirewall = args.firewall ? null : installFirewallSignalCleanup(firewall);
+  try {
+    if (args.openFirewall) {
+      firewall.open({ protocol: "udp", port: LAN_DISCOVERY_PORT });
+      firewall.open({ protocol: "udp", port: SYNCTHING_LOCAL_DISCOVERY_PORT });
     }
+    console.log("LAN role: Syncpeer client");
+    console.log("Coordinator: " + args.coordinatorUrl);
+    let coordinatorToken = args.token;
+    let remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim() ?? "";
+    if (args.explicitIds) {
+      remoteDeviceId = await readDeviceIdPrompt("Enter the Syncthing server device ID: ");
+      coordinatorToken = deriveServerCoordinatorToken(
+        remoteDeviceId,
+        process.env.SYNCPEER_LAN_PAIR,
+      );
+      console.log("Server device ID accepted: " + remoteDeviceId);
+    }
+    buildLanApp();
+    const clientRoot = path.join(root, "client");
+    fs.mkdirSync(clientRoot, { recursive: true });
+    const untrustedIdentity = generateSyncthingIdentity(
+      path.join(clientRoot, "untrusted-identity"),
+    );
+    if (args.explicitIds) {
+      console.log("Untrusted test identity ID: " + untrustedIdentity.deviceId);
+      console.log("After the app opens, copy its This Device ID to the server terminal.");
+    }
+    const wdioBin = path.resolve("node_modules", "@wdio", "cli", "bin", "wdio.js");
+    const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
+    const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
+    const useXvfb = process.platform === "linux" && !process.env.DISPLAY;
+    if (useXvfb) {
+      try {
+        execFileSync("which", ["xvfb-run"], { stdio: "ignore" });
+      } catch {
+        throw new Error("No DISPLAY is available and xvfb-run is missing. Enter the Nix flake shell first.");
+      }
+    }
+    const exitCode = await runChild(
+      useXvfb ? "xvfb-run" : nodePath,
+      useXvfb ? ["-a", nodePath, ...wdioArgs] : wdioArgs,
+      {
+        ...process.env,
+        SYNCPEER_LAN_COORDINATOR_URL: args.coordinatorUrl,
+        SYNCPEER_LAN_COORDINATOR_TOKEN: coordinatorToken,
+        SYNCPEER_LAN_APP_BINARY: findAppBinary(),
+        SYNCPEER_LAN_CLIENT_ROOT: clientRoot,
+        SYNCPEER_LAN_UNTRUSTED_DEVICE_ID: untrustedIdentity.deviceId,
+        SYNCPEER_LAN_UNTRUSTED_CERT: untrustedIdentity.certPath,
+        SYNCPEER_LAN_UNTRUSTED_KEY: untrustedIdentity.keyPath,
+        SYNCPEER_LAN_REMOTE_DEVICE_ID: remoteDeviceId,
+        SYNCPEER_LAN_MANUAL_IDS: args.explicitIds ? "1" : "",
+      },
+    );
+    await coordinatorRequest({
+      baseUrl: args.coordinatorUrl,
+      token: coordinatorToken,
+      method: "POST",
+      pathname: "/v1/finalize",
+      body: { status: exitCode === 0 ? "passed" : "failed" },
+    }).catch((error) => {
+      console.error("Could not publish client result: " + String(error));
+    });
+    return exitCode;
+  } finally {
+    await closeFirewall?.().catch((error) => {
+      console.error("Firewall cleanup failed: " + String(error));
+    });
   }
-  const exitCode = await runChild(
-    useXvfb ? "xvfb-run" : nodePath,
-    useXvfb ? ["-a", nodePath, ...wdioArgs] : wdioArgs,
-    {
-      ...process.env,
-      SYNCPEER_LAN_COORDINATOR_URL: args.coordinatorUrl,
-      SYNCPEER_LAN_COORDINATOR_TOKEN: args.token,
-      SYNCPEER_LAN_APP_BINARY: findAppBinary(),
-      SYNCPEER_LAN_CLIENT_ROOT: clientRoot,
-      SYNCPEER_LAN_UNTRUSTED_DEVICE_ID: untrustedIdentity.deviceId,
-      SYNCPEER_LAN_UNTRUSTED_CERT: untrustedIdentity.certPath,
-      SYNCPEER_LAN_UNTRUSTED_KEY: untrustedIdentity.keyPath,
-      SYNCPEER_LAN_REMOTE_DEVICE_ID: remoteDeviceId,
-      SYNCPEER_LAN_MANUAL_IDS: args.explicitIds ? "1" : "",
-    },
-  );
-  await coordinatorRequest({
-    baseUrl: args.coordinatorUrl,
-    token: args.token,
-    method: "POST",
-    pathname: "/v1/finalize",
-    body: { status: exitCode === 0 ? "passed" : "failed" },
-  }).catch((error) => {
-    console.error("Could not publish client result: " + String(error));
-  });
-  return exitCode;
 };
 
 const runServer = async (args: {
@@ -147,16 +183,39 @@ const runServer = async (args: {
   hello: PeerHello;
   self: boolean;
   explicitIds?: boolean;
+  openFirewall: boolean;
 }): Promise<number> => {
   console.log("LAN role: Syncthing fixture server");
-  console.log("Server address: " + args.serverHost);
-  const coordinator = new LanCoordinator(args.token);
-  await coordinator.start("0.0.0.0", coordinatorPort);
-  coordinator.setAdvertisedBase(args.coordinatorUrl);
+  console.log("Server address: " + args.serverHost + ":" + coordinatorPort);
   const serverHome = path.join(root, "server", "syncthing");
   const serverIdentity = args.explicitIds
     ? generateSyncthingIdentity(serverHome)
     : null;
+  const firewall = createTemporaryNixosFirewall(args.openFirewall);
+  const closeFirewall = installFirewallSignalCleanup(firewall);
+  try {
+    if (args.openFirewall) {
+      console.log("Temporarily opening the NixOS firewall for this test.");
+      firewall.open({ protocol: "tcp", port: coordinatorPort });
+      firewall.open({ protocol: "udp", port: LAN_DISCOVERY_PORT });
+      firewall.open({ protocol: "udp", port: SYNCTHING_LOCAL_DISCOVERY_PORT });
+    }
+  } catch (error) {
+    await closeFirewall().catch(() => undefined);
+    throw error;
+  }
+  const coordinatorToken = serverIdentity
+    ? deriveServerCoordinatorToken(serverIdentity.deviceId, process.env.SYNCPEER_LAN_PAIR)
+    : args.token;
+  const coordinator = new LanCoordinator(coordinatorToken);
+  try {
+    await coordinator.start("0.0.0.0", coordinatorPort);
+  } catch (error) {
+    await closeFirewall().catch(() => undefined);
+    throw error;
+  }
+  coordinator.setAdvertisedBase(args.coordinatorUrl);
+  console.log("Test coordinator: " + args.coordinatorUrl);
   if (serverIdentity) {
     console.log("Syncthing server device ID: " + serverIdentity.deviceId);
     console.log("Start the client with --client and enter this ID there.");
@@ -177,7 +236,7 @@ const runServer = async (args: {
       env: {
         ...process.env,
         SYNCPEER_LAN_COORDINATOR_URL: args.coordinatorUrl,
-        SYNCPEER_LAN_COORDINATOR_TOKEN: args.token,
+        SYNCPEER_LAN_COORDINATOR_TOKEN: coordinatorToken,
       },
     })
     : undefined;
@@ -232,7 +291,15 @@ const runServer = async (args: {
       untrustedDeviceId: untrustedDeviceId || undefined,
       home: serverHome,
     });
+    if (args.openFirewall) {
+      firewall.open({ protocol: "tcp", port: fixture.fixture.directPort });
+    }
     coordinator.setFixture(fixture.fixture);
+    console.log(
+      "Syncthing data endpoint: tcp://" +
+      args.serverHost + ":" + fixture.fixture.directPort,
+    );
+    console.log("Syncthing Web UI: " + fixture.syncGuiUrl);
     console.log("Global discovery: " + fixture.fixture.discoveryServer);
     console.log("Syncthing server device ID: " + fixture.fixture.remoteDeviceId);
     console.log("Waiting for the Syncpeer client result...");
@@ -257,6 +324,9 @@ const runServer = async (args: {
     } else {
       console.log("LAN artifacts kept at " + root);
     }
+    await closeFirewall().catch((error) => {
+      console.error("Firewall cleanup failed: " + String(error));
+    });
   }
 };
 
@@ -274,6 +344,7 @@ const main = async (): Promise<number> => {
       assignment: {} as RoleAssignment,
       hello: {} as PeerHello,
       explicitIds: false,
+      openFirewall,
     });
   }
 
@@ -286,38 +357,56 @@ const main = async (): Promise<number> => {
     });
     const token = deriveManualPairToken(hello);
     if (explicitRole === "client") {
-      console.log(
-        manualPeer
-          ? "Using SYNCPEER_LAN_PEER=" + manualPeer + "."
-          : "Searching for the LAN test server via multicast (up to 15 minutes)...",
-      );
-      const progress = manualPeer
-        ? null
-        : setInterval(() => {
-            console.log("Still searching for the LAN test server...");
-          }, 10000);
-      let discovered: Awaited<ReturnType<typeof discoverRoleAssignment>> | null = null;
+      const discoveryFirewall = openFirewall
+        ? createTemporaryNixosFirewall(true)
+        : undefined;
+      const closeDiscoveryFirewall = discoveryFirewall
+        ? installFirewallSignalCleanup(discoveryFirewall)
+        : null;
       try {
-        discovered = manualPeer
+        if (discoveryFirewall) {
+          discoveryFirewall.open({ protocol: "udp", port: LAN_DISCOVERY_PORT });
+          discoveryFirewall.open({ protocol: "udp", port: SYNCTHING_LOCAL_DISCOVERY_PORT });
+        }
+        console.log(
+          manualPeer
+            ? "Using SYNCPEER_LAN_PEER=" + manualPeer + "."
+            : "Searching for the LAN test server via multicast (up to 15 minutes)...",
+        );
+        const progress = manualPeer
           ? null
-          : await discoverRoleAssignment({
-              hello,
-              timeoutMs: LAN_ROLE_DISCOVERY_TIMEOUT_MS,
-            });
+          : setInterval(() => {
+              console.log("Still searching for the LAN test server...");
+            }, 10000);
+        let discovered: Awaited<ReturnType<typeof discoverRoleAssignment>> | null = null;
+        try {
+          discovered = manualPeer
+            ? null
+            : await discoverRoleAssignment({
+                hello,
+                timeoutMs: LAN_ROLE_DISCOVERY_TIMEOUT_MS,
+              });
+        } finally {
+          if (progress) clearInterval(progress);
+        }
+        const serverHost = manualPeer ?? discovered?.assignment.server.address;
+        if (!serverHost) {
+          throw new Error("Could not discover the LAN test server.");
+        }
+        return await runClient({
+          coordinatorUrl: coordinatorUrlFor(serverHost),
+          token,
+          assignment: discovered?.assignment ?? ({} as RoleAssignment),
+          hello,
+          explicitIds: true,
+          openFirewall,
+          firewall: discoveryFirewall,
+        });
       } finally {
-        if (progress) clearInterval(progress);
+        await closeDiscoveryFirewall?.().catch((error) => {
+          console.error("Firewall cleanup failed: " + String(error));
+        });
       }
-      const serverHost = manualPeer ?? discovered?.assignment.server.address;
-      if (!serverHost) {
-        throw new Error("Could not discover the LAN test server.");
-      }
-      return runClient({
-        coordinatorUrl: coordinatorUrlFor(serverHost),
-        token,
-        assignment: discovered?.assignment ?? ({} as RoleAssignment),
-        hello,
-        explicitIds: true,
-      });
     }
     const serverHost = process.env.SYNCPEER_LAN_HOST?.trim() || resolveAdvertisedAddress();
     return runServer({
@@ -328,6 +417,7 @@ const main = async (): Promise<number> => {
       hello,
       self: false,
       explicitIds: true,
+      openFirewall,
     });
   }
 
@@ -357,6 +447,7 @@ const main = async (): Promise<number> => {
       token,
       assignment: discovered.assignment,
       hello,
+      openFirewall,
     });
   }
 
@@ -367,6 +458,7 @@ const main = async (): Promise<number> => {
     assignment: discovered.assignment,
     hello,
     self: selfMode,
+    openFirewall,
   });
 };
 

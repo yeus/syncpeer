@@ -22,7 +22,7 @@ async function main(): Promise<void> {
     capabilities: { client: true, server: true },
   });
   const remote = createPeerHello({
-    commit: local.commit,
+    commit: "different-client-commit",
     capabilities: { client: true, server: true },
   });
   const socket = new FakeDiscoverySocket();

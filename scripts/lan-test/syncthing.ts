@@ -6,6 +6,7 @@ import net from "node:net";
 import type { LanFixture } from "./protocol.ts";
 
 export const SYNCTHING_GLOBAL_DISCOVERY_SERVER = "https://discovery.syncthing.net/v2/";
+export const SYNCTHING_LOCAL_DISCOVERY_PORT = 21027;
 const SYNCTHING_RELAY_POOL = "dynamic+https://relays.syncthing.net/endpoint";
 
 const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
@@ -214,6 +215,7 @@ const configureHome = (home: string, args: {
   xml = replaceRepeatedTag(xml, "globalAnnounceServer", [args.discoveryServer]);
   xml = replaceTag(xml, "globalAnnounceEnabled", "true");
   xml = replaceTag(xml, "localAnnounceEnabled", String(args.localAnnounce));
+  xml = replaceTag(xml, "localAnnouncePort", String(SYNCTHING_LOCAL_DISCOVERY_PORT));
   xml = replaceTag(xml, "relaysEnabled", "true");
   xml = replaceTag(xml, "natEnabled", "true");
   xml = addDevice(xml, args.trustedDeviceId, "syncpeer-lan-client");

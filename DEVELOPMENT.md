@@ -201,8 +201,10 @@ fixture on another computer. Enter the flake development shell on both
 computers first; it provides the GTK/WebKit runtime and `xvfb-run` for
 headless Tauri tests.
 
-Both checkouts must be on the same clean commit. Then run this command on both
-computers:
+Keep both checkouts clean and on compatible LAN protocol versions. They do not
+need to use the same Git commit: the server checkout defines the Syncthing
+fixture and test configuration, while the client checkout contains the
+Syncpeer implementation under test. Then run this command on both computers:
 
 ```bash
 npm run test:lan
@@ -242,6 +244,29 @@ On the client:
 ```bash
 npm run test:lan:client
 ```
+
+On NixOS, the firewall-enabled variants temporarily open the ports needed by
+the test and restore the declarative firewall configuration when the process
+exits:
+
+On the server:
+
+```bash
+npm run test:lan:server:firewall
+```
+
+On the client:
+
+```bash
+npm run test:lan:client:firewall
+```
+
+The server opens TCP `38378` for the coordinator, UDP `38377` for Syncpeer
+role discovery, UDP `21027` for Syncthing LAN discovery, and the dynamically
+allocated Syncthing data port. The client opens the two UDP discovery ports.
+This uses `nixos-firewall-tool`; it requires suitable `sudo` access. Cleanup
+uses its `reset` operation, so do not use this mode while you have other
+manually added runtime firewall rules that must be preserved.
 
 On the same LAN, multicast discovery finds the server automatically. For a
 remote run, set `SYNCPEER_LAN_HOST` on the server and

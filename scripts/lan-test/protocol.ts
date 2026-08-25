@@ -69,7 +69,6 @@ export const createPeerHello = (args: {
 export const isCompatiblePeer = (local: PeerHello, remote: PeerHello): boolean =>
   local.peerId !== remote.peerId &&
   local.protocolVersion === remote.protocolVersion &&
-  local.commit === remote.commit &&
   local.pairCode === remote.pairCode;
 
 export const assignRoles = (candidates: PeerCandidate[]): RoleAssignment => {
@@ -100,8 +99,15 @@ export const roleForPeer = (assignment: RoleAssignment, peerId: string): LanRole
 
 export const derivePairToken = (left: PeerHello, right: PeerHello): string => {
   const ids = [left.peerId, right.peerId].sort().join(":");
-  return Buffer.from(ids + ":" + left.commit + ":" + left.pairCode).toString("base64url");
+  return Buffer.from(ids + ":" + left.pairCode).toString("base64url");
 };
 
 export const deriveManualPairToken = (hello: PeerHello): string =>
-  Buffer.from("manual:" + hello.commit + ":" + hello.pairCode).toString("base64url");
+  Buffer.from("manual:" + hello.pairCode).toString("base64url");
+
+export const deriveServerCoordinatorToken = (
+  serverDeviceId: string,
+  pairCode = "",
+): string => Buffer.from(
+  "server:" + serverDeviceId.replaceAll("-", "").toUpperCase() + ":" + pairCode.trim(),
+).toString("base64url");

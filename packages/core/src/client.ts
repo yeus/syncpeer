@@ -397,13 +397,13 @@ function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
 function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
   if (typeof address !== "string" || address.trim() === "") return null;
   const value = address.trim();
-  if (value.startsWith("tcp://")) {
+  if (/^tcp(?:4|6)?:\/\//.test(value)) {
     const parsed = new URL(value);
     if (!parsed.hostname || !parsed.port) return null;
     return {
       address: value,
       protocol: "tcp",
-      host: parsed.hostname,
+      host: parsed.hostname.replace(/^\[|\]$/g, ""),
       port: Number(parsed.port),
     };
   }

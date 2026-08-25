@@ -27,7 +27,6 @@
 
         androidComposition = pkgs.androidenv.composeAndroidPackages {
           cmdLineToolsVersion = android.cmdLineToolsVersion;
-          platformToolsVersion = "35.0.2";
           buildToolsVersions = [ android.buildToolsVersion ];
           platformVersions = [ android.platformVersion ];
           includeNDK = true;
@@ -123,6 +122,7 @@ EOF
             librsvg
             atk
             libdecor
+            mesa
             xdg-utils
             xvfb-run
 
@@ -137,6 +137,19 @@ EOF
           NDK_HOME = "${androidSdkRoot}/ndk/${android.ndkVersion}";
           JAVA_HOME = "${jdk}";
           RUST_BACKTRACE = "1";
+          __EGL_VENDOR_LIBRARY_FILENAMES = "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json";
+          LIBGL_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
+            gtk3
+            webkitgtk_4_1
+            libsoup_3
+            glib
+            cairo
+            pango
+            gdk-pixbuf
+            atk
+            mesa
+          ]);
 
           shellHook = ''
             export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"

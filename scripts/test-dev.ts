@@ -51,7 +51,8 @@ const runServer = async (serverRoot: string): Promise<number> => {
   console.log("\nSyncpeer development server is running.");
   console.log("Server device ID: " + fixture.fixture.remoteDeviceId);
   console.log("Syncthing Web UI: " + fixture.syncGuiUrl);
-  console.log("Transport: global discovery with relay-only device traffic");
+  console.log("Transport: global discovery with relay fallback");
+  console.log("No inbound firewall port is required for relay traffic.");
   console.log("Waiting for pending clients. Press Ctrl-C to stop.\n");
 
   try {

@@ -204,7 +204,6 @@ const addFolder = (xml: string, args: {
 const configureHome = (home: string, args: {
   guiPort: number;
   syncPort: number;
-  discoveryServer: string;
   direct: boolean;
   localAnnounce: boolean;
   trustedDeviceId?: string;
@@ -223,9 +222,9 @@ const configureHome = (home: string, args: {
   );
   const addresses = args.direct
     ? ["tcp4://0.0.0.0:" + args.syncPort]
-    : [SYNCTHING_RELAY_POOL];
+    : ["tcp4://0.0.0.0:" + args.syncPort, SYNCTHING_RELAY_POOL];
   xml = replaceRepeatedTag(xml, "listenAddress", addresses);
-  xml = replaceRepeatedTag(xml, "globalAnnounceServer", [args.discoveryServer]);
+  xml = replaceRepeatedTag(xml, "globalAnnounceServer", ["default"]);
   xml = replaceTag(xml, "globalAnnounceEnabled", "true");
   xml = replaceTag(xml, "localAnnounceEnabled", String(args.localAnnounce));
   xml = replaceTag(xml, "localAnnouncePort", String(SYNCTHING_LOCAL_DISCOVERY_PORT));
@@ -387,7 +386,6 @@ export const createLanFixture = async (args: {
   const configure = (direct: boolean, localAnnounce: boolean, untrustedDeviceId?: string) => configureHome(home, {
     guiPort,
     syncPort,
-    discoveryServer,
     direct,
     localAnnounce,
     trustedDeviceId: args.trustedDeviceId,

@@ -18,9 +18,25 @@ const main = async (): Promise<void> => {
       serverHost: "relay-only",
       mode: "relay",
     });
-    await fixture.approveDevice({ deviceId: client.deviceId });
 
     const headers = { "X-API-Key": fixture.apiKey };
+    const optionsResponse = await fetch(
+      fixture.syncGuiUrl + "/rest/config/options",
+      { headers },
+    );
+    assert.equal(optionsResponse.status, 200);
+    const options = await optionsResponse.json() as {
+      globalAnnounceServers?: string[];
+      listenAddresses?: string[];
+    };
+    assert.deepEqual(options.globalAnnounceServers, ["default"]);
+    assert.ok(options.listenAddresses?.some((address) => address.startsWith("tcp")));
+    assert.ok(options.listenAddresses?.includes(
+      "dynamic+https://relays.syncthing.net/endpoint",
+    ));
+
+    await fixture.approveDevice({ deviceId: client.deviceId });
+
     const deviceResponse = await fetch(
       fixture.syncGuiUrl + "/rest/config/devices/" + encodeURIComponent(client.deviceId),
       { headers },

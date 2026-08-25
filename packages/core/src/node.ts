@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import dgram from "node:dgram";
+import net from "node:net";
 import os from "node:os";
 import { readFile } from "node:fs/promises";
 import https from "node:https";
@@ -8,6 +9,8 @@ import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
   type DiscoveredCandidate,
+  type SyncpeerRelayConnectOptions,
+  type SyncpeerRelayConnectResult,
   resolveGlobalDiscovery,
   type SyncpeerDiscoveryFetchInit,
   type SyncpeerDiscoveryResponse,
@@ -23,6 +26,11 @@ export { downloadRemoteFile } from "./transfer/download.js";
 type ByteBuffer = Buffer<ArrayBufferLike>;
 const LOCAL_DISCOVERY_MAGIC = 0x2ea7d90b;
 const LOCAL_DISCOVERY_PORT = 21027;
+const RELAY_MAGIC = 0x9e79bc40;
+const RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST = 3;
+const RELAY_MESSAGE_TYPE_RESPONSE = 4;
+const RELAY_MESSAGE_TYPE_CONNECT_REQUEST = 5;
+const RELAY_MESSAGE_TYPE_SESSION_INVITATION = 6;
 
 const LocalDiscoveryAnnounce = new protobuf.Type("Announce")
   .add(new protobuf.Field("id", 1, "bytes"))
@@ -132,6 +140,216 @@ async function connectNodeTls(options: SyncpeerTlsConnectOptions): Promise<Syncp
   return new NodeTlsSocket(socket);
 }
 
+type NodeSocket = net.Socket | tls.TLSSocket;
+
+class NodeSocketReader {
+  private chunks: Buffer[] = [];
+  private waiters: Array<{ resolve: (value: Buffer) => void; reject: (error: Error) => void }> = [];
+  private error: Error | null = null;
+
+  private readonly onData = (chunk: Buffer): void => {
+    const waiter = this.waiters.shift();
+    if (waiter) waiter.resolve(chunk);
+    else this.chunks.push(chunk);
+  };
+
+  private readonly onError = (error: Error): void => {
+    this.error = error;
+    while (this.waiters.length > 0) this.waiters.shift()?.reject(error);
+  };
+
+  private readonly onClose = (): void => {
+    this.onError(new Error("Relay socket closed"));
+  };
+
+  constructor(private readonly socket: NodeSocket) {
+    socket.on("data", this.onData);
+    socket.once("error", this.onError);
+    socket.once("close", this.onClose);
+  }
+
+  async readExact(length: number): Promise<Buffer> {
+    let output = Buffer.alloc(0);
+    while (output.length < length) {
+      const chunk = this.chunks.shift() ?? await this.readChunk();
+      output = Buffer.concat([output, chunk]);
+    }
+    const result = output.subarray(0, length);
+    const leftover = output.subarray(length);
+    if (leftover.length > 0) this.chunks.unshift(leftover);
+    return result;
+  }
+
+  dispose(): void {
+    this.socket.off("data", this.onData);
+    this.socket.off("error", this.onError);
+    this.socket.off("close", this.onClose);
+  }
+
+  private readChunk(): Promise<Buffer> {
+    if (this.error) return Promise.reject(this.error);
+    return new Promise<Buffer>((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+}
+
+function base32DecodeNoPadding(value: string): Buffer {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let current = 0;
+  const output: number[] = [];
+  for (const char of value) {
+    const digit = alphabet.indexOf(char);
+    if (digit < 0) throw new Error(`Invalid base32 character '${char}'`);
+    current = (current << 5) | digit;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      output.push((current >>> bits) & 0xff);
+    }
+  }
+  return Buffer.from(output);
+}
+
+function xdrOpaque(value: Uint8Array): Buffer {
+  const padding = (4 - (value.length % 4)) % 4;
+  const output = Buffer.alloc(4 + value.length + padding);
+  output.writeUInt32BE(value.length, 0);
+  Buffer.from(value).copy(output, 4);
+  return output;
+}
+
+function relayMessage(type: number, payload: Uint8Array): Buffer {
+  const output = Buffer.alloc(12 + payload.length);
+  output.writeUInt32BE(RELAY_MAGIC, 0);
+  output.writeUInt32BE(type, 4);
+  output.writeUInt32BE(payload.length, 8);
+  Buffer.from(payload).copy(output, 12);
+  return output;
+}
+
+async function readRelayMessage(reader: NodeSocketReader): Promise<{ type: number; payload: Buffer }> {
+  const header = await reader.readExact(12);
+  if (header.readUInt32BE(0) !== RELAY_MAGIC) throw new Error("Unexpected relay magic");
+  const type = header.readUInt32BE(4);
+  const length = header.readUInt32BE(8);
+  return { type, payload: await reader.readExact(length) };
+}
+
+function readXdrOpaque(payload: Buffer, offset: number): { value: Buffer; next: number } {
+  if (offset + 4 > payload.length) throw new Error("Relay payload ended unexpectedly");
+  const length = payload.readUInt32BE(offset);
+  const end = offset + 4 + length;
+  const paddedEnd = end + ((4 - (length % 4)) % 4);
+  if (paddedEnd > payload.length) throw new Error("Relay opaque field exceeded payload size");
+  return { value: payload.subarray(offset + 4, end), next: paddedEnd };
+}
+
+function relayResponse(payload: Buffer): { code: number; message: string } {
+  const message = readXdrOpaque(payload, 4);
+  return { code: payload.readUInt32BE(0), message: message.value.toString("utf8") };
+}
+
+function relayAddressHost(value: Buffer, fallback: string): string {
+  if (value.length === 4) return [...value].join(".");
+  if (value.length === 16) {
+    return value.toString("hex").match(/.{1,4}/g)?.join(":") ?? fallback;
+  }
+  const text = value.toString("utf8").trim();
+  return text || fallback;
+}
+
+function connectNodeTcp(host: string, port: number): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host, port });
+    socket.once("connect", () => resolve(socket));
+    socket.once("error", reject);
+  });
+}
+
+function connectNodeRelayTls(
+  socket: net.Socket | undefined,
+  options: { host: string; port: number; certPem: string; keyPem: string; alpn: string },
+): Promise<tls.TLSSocket> {
+  return new Promise((resolve, reject) => {
+    const secureSocket = tls.connect({
+      ...(socket ? { socket } : { host: options.host, port: options.port }),
+      servername: options.host,
+      ALPNProtocols: [options.alpn],
+      cert: options.certPem,
+      key: options.keyPem,
+      rejectUnauthorized: false,
+    });
+    secureSocket.once("secureConnect", () => resolve(secureSocket));
+    secureSocket.once("error", reject);
+  });
+}
+
+async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<SyncpeerRelayConnectResult> {
+  const relayUrl = new URL(options.relayAddress);
+  if (relayUrl.protocol !== "relay:") throw new Error("Relay address must use relay:// scheme");
+  const relayHost = relayUrl.hostname.replace(/^\[|\]$/g, "");
+  const relayPort = Number(relayUrl.port || 22067);
+  const relaySocket = await connectNodeRelayTls(undefined, {
+    host: relayHost,
+    port: relayPort,
+    certPem: options.certPem,
+    keyPem: options.keyPem,
+    alpn: "bep-relay",
+  });
+  const relayPeer = relaySocket.getPeerCertificate(true);
+  const expectedRelayId = relayUrl.searchParams.get("id");
+  if (expectedRelayId && canonicalDeviceId(computeDeviceIdFromDer(relayPeer.raw)) !== canonicalDeviceId(expectedRelayId)) {
+    relaySocket.destroy();
+    throw new Error("Relay certificate ID mismatch");
+  }
+  const relayReader = new NodeSocketReader(relaySocket);
+  await new Promise<void>((resolve, reject) => relaySocket.write(
+    relayMessage(RELAY_MESSAGE_TYPE_CONNECT_REQUEST, xdrOpaque(base32DecodeNoPadding(canonicalDeviceId(options.expectedDeviceId)))),
+    (error) => error ? reject(error) : resolve(),
+  ));
+  const invitation = await readRelayMessage(relayReader);
+  if (invitation.type === RELAY_MESSAGE_TYPE_RESPONSE) {
+    const response = relayResponse(invitation.payload);
+    throw new Error(`Relay connect request failed (${response.code}): ${response.message || "no message"}`);
+  }
+  if (invitation.type !== RELAY_MESSAGE_TYPE_SESSION_INVITATION) {
+    throw new Error("Unexpected relay response type");
+  }
+  let offset = 0;
+  const from = readXdrOpaque(invitation.payload, offset); offset = from.next;
+  const key = readXdrOpaque(invitation.payload, offset); offset = key.next;
+  const address = readXdrOpaque(invitation.payload, offset); offset = address.next;
+  const sessionPort = invitation.payload.readUInt32BE(offset); offset += 4;
+  const serverSocket = invitation.payload.readUInt32BE(offset);
+  if (serverSocket !== 0) throw new Error("Relay server-socket mode is not supported");
+  relayReader.dispose();
+  relaySocket.destroy();
+
+  const sessionHost = relayAddressHost(address.value, relayHost);
+  const sessionTcp = await connectNodeTcp(sessionHost, sessionPort || relayPort);
+  const sessionReader = new NodeSocketReader(sessionTcp);
+  await new Promise<void>((resolve, reject) => sessionTcp.write(
+    relayMessage(RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST, xdrOpaque(key.value)),
+    (error) => error ? reject(error) : resolve(),
+  ));
+  const joined = await readRelayMessage(sessionReader);
+  if (joined.type !== RELAY_MESSAGE_TYPE_RESPONSE) throw new Error("Unexpected relay join response type");
+  const response = relayResponse(joined.payload);
+  if (response.code !== 0) throw new Error(`Relay join failed (${response.code}): ${response.message || "no message"}`);
+  sessionReader.dispose();
+  const bepSocket = await connectNodeRelayTls(sessionTcp, {
+    host: sessionHost,
+    port: sessionPort || relayPort,
+    certPem: options.certPem,
+    keyPem: options.keyPem,
+    alpn: "bep/1.0",
+  });
+  return {
+    socket: new NodeTlsSocket(bepSocket),
+    connectedVia: `relay://${relayHost}:${relayPort} -> ${sessionHost}:${sessionPort || relayPort}`,
+  };
+}
+
 function normalizeDeviceId(id: string): string {
   return id.replace(/[^A-Z2-7]/gi, "").toUpperCase();
 }
@@ -183,7 +401,7 @@ function normalizeAnnounceAddress(
   if (!trimmed.includes("://")) {
     return `tcp://${fallbackHost}:${trimmed}`;
   }
-  if (!trimmed.startsWith("tcp://")) return trimmed;
+  if (!/^tcp(?:4|6)?:\/\//.test(trimmed)) return trimmed;
   try {
     const parsed = new URL(trimmed);
     if (!parsed.port) return null;
@@ -609,6 +827,7 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
   const enableLogs = process.env.SYNCPEER_DEBUG === "1";
   return {
     connectTls: connectNodeTls,
+    connectRelay: connectNodeRelay,
     async sha256(data: Uint8Array): Promise<Uint8Array> {
       const digest = crypto.createHash("sha256").update(Buffer.from(data)).digest();
       return new Uint8Array(digest);

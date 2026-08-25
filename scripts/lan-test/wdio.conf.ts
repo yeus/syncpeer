@@ -2,6 +2,7 @@ import path from "node:path";
 import type { Options } from "@wdio/types";
 
 const driverProvider = process.env.SYNCPEER_LAN_DRIVER ?? "embedded";
+const captureLogs = process.env.SYNCPEER_LAN_CAPTURE_LOGS === "1";
 
 if (driverProvider !== "embedded" && driverProvider !== "external") {
   throw new Error(
@@ -22,6 +23,8 @@ export const config = {
     ["tauri", {
       appBinaryPath: process.env.SYNCPEER_LAN_APP_BINARY,
       driverProvider,
+      captureBackendLogs: captureLogs,
+      captureFrontendLogs: captureLogs,
       ...(driverProvider === "external"
         ? { autoInstallTauriDriver: true }
         : {}),

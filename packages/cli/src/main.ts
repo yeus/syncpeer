@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -15,6 +15,7 @@ const DEFAULT_DISCOVERY_SERVER =
 interface CliOptions {
   host: string;
   port: number;
+  discoveryMode: "global" | "lan" | "direct";
   cert?: string;
   key?: string;
   remoteId?: string;
@@ -118,7 +119,9 @@ async function openRemoteFs(opts: CliOptions) {
     expectedDeviceId: opts.remoteId,
     deviceName: opts.deviceName,
     timeoutMs: opts.timeoutMs,
-    discoveryMode: "direct",
+    discoveryMode: opts.discoveryMode,
+    discoveryServer: opts.discoveryServer,
+    enableRelayFallback: true,
     folderPasswords: parseFolderPasswords(opts.folderPassword),
   });
 }
@@ -177,6 +180,11 @@ async function main() {
       "--discovery-server <url>",
       "Global discovery server",
       DEFAULT_DISCOVERY_SERVER,
+    )
+    .addOption(
+      new Option("--discovery-mode <mode>", "Connection discovery mode")
+        .choices(["global", "lan", "direct"])
+        .default("global"),
     )
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option(

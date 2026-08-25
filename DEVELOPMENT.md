@@ -205,9 +205,10 @@ npm run test:server
 
 The server immediately starts Syncthing, prints its stable device ID and local
 Web UI address, and then waits for pending clients. It uses official global
-discovery and relay-only device traffic, so it does not require an inbound
-firewall rule or the test coordinator. Its identity, approved clients, fixture
-folders, and logs persist under `.tmp/syncpeer-dev-server/` across restarts.
+discovery with the standard Syncthing relay fallback, so relay traffic does not
+require an inbound firewall rule or the test coordinator. Its identity,
+approved clients, fixture folders, and logs persist under
+`.tmp/syncpeer-dev-server/` across restarts.
 
 On the development computer, run:
 
@@ -329,10 +330,10 @@ WebKitWebDriver supplied by the flake.
 ## CLI Quick Examples
 
 ```bash
-npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/key.pem list
-npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/key.pem tree <folder-id>
-npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/key.pem files <folder-id> [dir]
-npx tsx src/cli/main.ts --host 127.0.0.1 --port 22000 --cert path/to/cert.pem --key path/to/key.pem download <folder-id> some/file.txt ./out.txt
+npx tsx src/cli/main.ts --remote-id <device-id> list
+npx tsx src/cli/main.ts --remote-id <device-id> tree <folder-id>
+npx tsx src/cli/main.ts --remote-id <device-id> files <folder-id> [dir]
+npx tsx src/cli/main.ts --remote-id <device-id> download <folder-id> some/file.txt ./out.txt
 ```
 
 If `--cert`/`--key` are omitted, syncpeer uses persisted identity at:

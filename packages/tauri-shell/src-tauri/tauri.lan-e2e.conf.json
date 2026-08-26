@@ -7,7 +7,17 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "capabilities": ["lan-e2e"]
+      "capabilities": [
+        {
+          "identifier": "lan-e2e",
+          "description": "Opt-in permissions for real Tauri LAN integration tests.",
+          "windows": ["*"],
+          "permissions": [
+            "core:default",
+            "wdio:default"
+          ]
+        }
+      ]
     }
   }
 }

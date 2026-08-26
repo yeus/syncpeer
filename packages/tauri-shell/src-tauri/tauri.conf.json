@@ -10,6 +10,9 @@
     "frontendDist": "../../app/dist"
   },
   "app": {
+    "security": {
+      "capabilities": ["default"]
+    },
     "windows": [
       {
         "title": "Syncpeer",

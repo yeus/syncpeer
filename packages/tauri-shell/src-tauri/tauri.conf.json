@@ -6,7 +6,7 @@
   "build": {
     "beforeBuildCommand": "npm install && npm run build -w @syncpeer/app",
     "beforeDevCommand": "npm run dev -w @syncpeer/app",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../../app/dist"
   },
   "app": {

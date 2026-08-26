@@ -41,7 +41,6 @@
           name = "syncpeer-appimage-fhs";
           targetPkgs = pkgs: with pkgs; [
             nodejs
-            yarn
             rustup
             pkg-config
             openssl
@@ -98,7 +97,6 @@ EOF
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             nodejs
-            yarn
 
             rustup
             gh

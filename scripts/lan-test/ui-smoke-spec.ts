@@ -11,6 +11,7 @@ import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoverySe
 import {
   connectUntilApproved,
   readCachedHash,
+  selectDiscoveryMode,
   setUploadFile,
   setValue,
   waitForDisconnected,
@@ -80,14 +81,10 @@ const openConnectionSettings = async (): Promise<void> => {
   );
 };
 
-const selectDiscoveryMode = async (mode: "direct" | "lan" | "global"): Promise<void> => {
-  await $("[data-testid='connection-discovery-mode']").selectByAttribute("value", mode);
-};
-
 const configureGlobalConnection = async (): Promise<void> => {
   await clickTestId("tab-devices");
   await openConnectionSettings();
-  await selectDiscoveryMode("global");
+  await selectDiscoveryMode(tauriBrowser, "global");
   await setValue("connection-discovery-server", discoveryServer());
   await setValue("connection-remote-id", serverDeviceId);
   await setValue("connection-timeout", connectionTimeout());
@@ -178,11 +175,11 @@ describe("Syncpeer Tauri UI smoke", () => {
 
     await clickTestId("tab-devices");
     await openConnectionSettings();
-    await selectDiscoveryMode("lan");
+    await selectDiscoveryMode(tauriBrowser, "lan");
     await waitForText(tauriBrowser, "LAN discovery uses Syncthing's local UDP discovery.");
-    await selectDiscoveryMode("direct");
+    await selectDiscoveryMode(tauriBrowser, "direct");
     await waitForText(tauriBrowser, "Host");
-    await selectDiscoveryMode("global");
+    await selectDiscoveryMode(tauriBrowser, "global");
     await waitForText(tauriBrowser, "Global discovery ignores manual host/port.");
   });
 

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { $ } from "@wdio/globals";
 import type { Browser as WdioBrowser } from "webdriverio";
 import type { BrowserExtension } from "@wdio/native-types";
@@ -22,16 +24,50 @@ export const setValue = async (testId: string, value: string): Promise<void> => 
   await element.setValue(value);
 };
 
+export const selectDiscoveryMode = async (
+  browser: TauriBrowser,
+  mode: "direct" | "lan" | "global",
+): Promise<void> => {
+  const selector = "[data-testid='connection-discovery-mode']";
+  await browser.waitUntil(
+    async () => (await browser.$(selector).isExisting()),
+    { timeout: 5_000, timeoutMsg: "Connection mode selector is not mounted." },
+  );
+  await browser.execute((nextMode: string) => {
+    const select = document.querySelector(
+      "[data-testid='connection-discovery-mode']",
+    ) as HTMLSelectElement | null;
+    if (!select) throw new Error("Connection mode selector is not mounted.");
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLSelectElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(select, nextMode);
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  }, mode);
+  await browser.waitUntil(
+    async () => (await browser.$(selector).getValue()) === mode,
+    { timeout: 5_000, timeoutMsg: "Connection mode did not update to " + mode + "." },
+  );
+};
+
 export const setUploadFile = async (
   browser: TauriBrowser,
   filePath: string,
 ): Promise<void> => {
-  await browser.execute(() => {
-    const input = document.getElementById("folder-upload-input") as HTMLElement | null;
+  const file = {
+    name: path.basename(filePath),
+    bytes: Array.from(fs.readFileSync(filePath)),
+  };
+  await browser.execute((payload: { name: string; bytes: number[] }) => {
+    const input = document.getElementById("folder-upload-input") as HTMLInputElement | null;
     if (!input) throw new Error("The folder upload input is not mounted.");
-    input.style.display = "block";
-  });
-  await $("#folder-upload-input").setValue(filePath);
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(payload.bytes)], payload.name));
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }, file);
 };
 
 export const connectUntilApproved = async (

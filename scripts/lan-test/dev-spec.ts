@@ -11,6 +11,7 @@ import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoverySe
 import {
   connectUntilApproved,
   readCachedHash,
+  selectDiscoveryMode,
   setUploadFile,
   setValue,
   type TauriBrowser,
@@ -37,8 +38,7 @@ describe("Syncpeer long-running development server", () => {
     await $("[data-testid='tab-devices']").click();
     const settings = $("[data-testid='connection-settings-toggle']");
     if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
-    await $("[data-testid='connection-discovery-mode']")
-      .selectByAttribute("value", "global");
+    await selectDiscoveryMode(lanBrowser, "global");
     await setValue("connection-discovery-server", discoveryServer());
     await setValue("connection-remote-id", serverDeviceId);
     await setValue("connection-timeout", "60000");

@@ -3304,8 +3304,36 @@ async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn linux_webview_needs_dmabuf_fallback(
+    driver_path: &Path,
+    env_configured: bool,
+    wayland_session: bool,
+) -> bool {
+    !env_configured && (wayland_session || !driver_path.exists())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_webview_environment() {
+    let driver_path = Path::new("/run/opengl-driver/lib/gbm/dri_gbm.so");
+    let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|session| session.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false);
+    if linux_webview_needs_dmabuf_fallback(
+        driver_path,
+        std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some(),
+        wayland_session,
+    ) {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    prepare_linux_webview_environment();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_syncpeer_android::init())
         .plugin(tauri_plugin_opener::init())
@@ -3400,6 +3428,16 @@ mod tests {
     fn syncpeer_packet_rejects_invalid_magic() {
         let invalid = vec![0_u8, 1, 2, 3, SYNCPEER_DISCOVERY_KIND_REPLY, 1, 2, 3];
         assert!(parse_syncpeer_packet(&invalid).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_webview_fallback_requires_a_missing_driver_and_no_override() {
+        let missing_driver = Path::new("/definitely-missing-syncpeer-gbm-driver");
+        assert!(linux_webview_needs_dmabuf_fallback(missing_driver, false, false));
+        assert!(!linux_webview_needs_dmabuf_fallback(missing_driver, true, false));
+        assert!(!linux_webview_needs_dmabuf_fallback(Path::new("/"), false, false));
+        assert!(linux_webview_needs_dmabuf_fallback(Path::new("/"), false, true));
     }
 
     #[test]

@@ -148,12 +148,17 @@ EOF
             atk
             mesa
           ]);
+          WEBKIT_DISABLE_DMABUF_RENDERER = "1";
 
           shellHook = ''
             export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.glib}/share:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
             export WINIT_WAYLAND_CSD_THEME=light
             export LIBDECOR_PLUGIN_DIR="${pkgs.libdecor}/lib/libdecor/plugins-1"
+            if [ ! -d /dev/dri ]; then
+              export LIBGL_ALWAYS_SOFTWARE=1
+              export GALLIUM_DRIVER=llvmpipe
+            fi
             gdk_cache="/tmp/syncpeer-gdk-pixbuf-loaders.cache"
             ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders \
               ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \

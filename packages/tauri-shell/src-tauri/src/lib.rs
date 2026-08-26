@@ -3359,6 +3359,18 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
 
+    #[cfg(debug_assertions)]
+    let builder = if std::env::var_os("SYNCPEER_OPEN_DEVTOOLS").is_some() {
+        builder.setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.open_devtools();
+            }
+            Ok(())
+        })
+    } else {
+        builder
+    };
+
     builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

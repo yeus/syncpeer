@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Syncpeer
+Comment=Sync files with Syncthing
+Exec=tauri-shell
+Icon=dev.syncpeer.app
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+StartupWMClass=Syncpeer

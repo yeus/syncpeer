@@ -4,6 +4,7 @@ dist/
 .direnv/
 .envrc
 .tools/
+.flatpak-builder/
 .tmp/
 android.logs
 output.log

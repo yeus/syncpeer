@@ -350,6 +350,12 @@ EOF
           cp "$artifact" "$output_dir/"
           cp "$artifact" "$dist_dir/"
         '';
+        buildFlatpakScript = pkgs.writeShellScriptBin "syncpeer-build-flatpak" ''
+          set -euo pipefail
+          repo_root="$PWD"
+          export PATH="${pkgs.appstream}/bin:${pkgs.flatpak}/bin:${pkgs.flatpak-builder}/bin:${pkgs.nodejs}/bin:$PATH"
+          exec "$repo_root/scripts/build-flatpak.sh"
+        '';
       in
       {
         devShells.default = pkgs.mkShell {
@@ -386,6 +392,9 @@ EOF
             androidSdk
 
             gradle
+            appstream
+            flatpak
+            flatpak-builder
           ];
 
           ANDROID_HOME = androidSdkRoot;
@@ -451,6 +460,9 @@ EOF
         packages.appimage-fhs = appimageFhs;
         apps.build-appimage = flake-utils.lib.mkApp {
           drv = buildAppImageScript;
+        };
+        apps.build-flatpak = flake-utils.lib.mkApp {
+          drv = buildFlatpakScript;
         };
       });
 }

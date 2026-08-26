@@ -149,7 +149,16 @@ Build desktop Linux bundles explicitly:
 ```bash
 npm run build:tauri:bundle:appimage
 npm run build:tauri:bundle:deb
+npm run build:tauri:bundle:flatpak
 ```
+
+The Flatpak build uses the GNOME 50 runtime and SDK. In the Nix development
+shell, the `flatpak` and `flatpak-builder` tools are available. The build
+command automatically adds a user-level Flathub remote when needed and asks
+`flatpak-builder` to install the runtime, SDK, and SDK extensions without
+requiring `sudo`.
+
+The resulting bundle is copied to `dist/Syncpeer_<version>_<arch>.flatpak`.
 
 ## Development Run Targets
 

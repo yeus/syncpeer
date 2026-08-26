@@ -7,7 +7,7 @@ import {
   LAN_FIXTURE_FOLDER_ID,
   LAN_FIXTURE_HELLO_CONTENT,
 } from "./fixture-data.ts";
-import { SYNCTHING_GLOBAL_DISCOVERY_SERVER } from "./fixture-data.ts";
+import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
 import {
   connectUntilApproved,
   readCachedHash,
@@ -21,7 +21,7 @@ const lanBrowser = browser as unknown as TauriBrowser;
 const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim() ?? "";
 const clientRoot = process.env.SYNCPEER_LAN_CLIENT_ROOT ?? path.resolve(".tmp/syncpeer-dev-client");
 const discoveryServer = (): string =>
-  process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || SYNCTHING_GLOBAL_DISCOVERY_SERVER;
+  normalizeDiscoveryServer(process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim());
 
 if (!serverDeviceId) throw new Error("SYNCPEER_DEV_SERVER_DEVICE_ID is missing.");
 

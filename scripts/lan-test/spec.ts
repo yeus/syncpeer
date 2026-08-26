@@ -258,8 +258,10 @@ describe("Syncpeer LAN integration", () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
     try {
+      const discoveryUrl = new URL(currentFixture.discoveryServer);
+      discoveryUrl.searchParams.set("device", currentFixture.remoteDeviceId);
       const response = await fetch(
-        "https://discovery.syncthing.net/v2/?device=" + encodeURIComponent(currentFixture.remoteDeviceId),
+        discoveryUrl,
         { signal: controller.signal },
       );
       await reportPhase("public-smoke", "passed", { status: response.status });

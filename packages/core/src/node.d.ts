@@ -7,6 +7,9 @@ export interface SyncpeerTlsConnectOptions {
   timeoutMs?: number;
 }
 
+export function getDefaultDiscoveryServer(): string;
+export function normalizeDiscoveryServer(value: string | undefined): string;
+
 export interface SyncpeerTlsSocket {
   read: (maxBytes?: number) => Promise<Uint8Array>;
   write: (data: Uint8Array) => Promise<void>;

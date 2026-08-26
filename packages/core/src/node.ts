@@ -23,6 +23,10 @@ import {
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.js";
 import type { SessionTransport } from "./ui/sessionTypes.js";
 export { downloadRemoteFile } from "./transfer/download.js";
+export {
+  getDefaultDiscoveryServer,
+  normalizeDiscoveryServer,
+} from "./ui/discoveryServer.js";
 
 type ByteBuffer = Buffer<ArrayBufferLike>;
 const LOCAL_DISCOVERY_MAGIC = 0x2ea7d90b;

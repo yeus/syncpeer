@@ -25,6 +25,17 @@ import {
   classifyRuntimeEnvironment,
   detectRuntimeEnvironment,
 } from "../packages/app/src/lib/runtimeInfo.ts";
+import {
+  getDefaultDiscoveryServer,
+  normalizeDiscoveryServer,
+} from "../packages/core/src/ui/discoveryServer.ts";
+
+const defaultDiscoveryServer = getDefaultDiscoveryServer();
+assert.ok(new URL(defaultDiscoveryServer).searchParams.get("id"));
+assert.equal(
+  normalizeDiscoveryServer("https://discovery.syncthing.net/v2/"),
+  defaultDiscoveryServer,
+);
 
 const update = (
   files: Array<{ name: string; deleted?: boolean }>,

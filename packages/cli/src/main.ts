@@ -5,12 +5,10 @@ import path from "node:path";
 import {
   createNodeSyncpeerClient,
   downloadRemoteFile,
+  getDefaultDiscoveryServer,
   resolveNodeGlobalDiscovery,
 } from "@syncpeer/core/node";
 import { ensureCliNodeIdentity } from "./identity.js";
-
-const DEFAULT_DISCOVERY_SERVER =
-  "https://discovery.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW";
 
 interface CliOptions {
   host: string;
@@ -181,7 +179,7 @@ async function main() {
     .option(
       "--discovery-server <url>",
       "Global discovery server",
-      DEFAULT_DISCOVERY_SERVER,
+      getDefaultDiscoveryServer(),
     )
     .addOption(
       new Option("--discovery-mode <mode>", "Connection discovery mode")
@@ -318,7 +316,7 @@ async function main() {
 
       const result = await resolveNodeGlobalDiscovery({
         expectedDeviceId: opts.remoteId,
-        discoveryServer: opts.discoveryServer ?? DEFAULT_DISCOVERY_SERVER,
+        discoveryServer: opts.discoveryServer ?? getDefaultDiscoveryServer(),
       });
 
       console.log(`deviceId\t${opts.remoteId}`);

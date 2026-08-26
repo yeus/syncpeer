@@ -6,8 +6,8 @@ import { browser, $ } from "@wdio/globals";
 import {
   LAN_FIXTURE_FOLDER_ID,
   LAN_FIXTURE_HELLO_CONTENT,
-  SYNCTHING_GLOBAL_DISCOVERY_SERVER,
 } from "./fixture-data.ts";
+import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
 import {
   connectUntilApproved,
   readCachedHash,
@@ -21,22 +21,24 @@ import {
 const tauriBrowser = browser as unknown as TauriBrowser;
 const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim() ?? "";
 const discoveryServer = (): string =>
-  process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || SYNCTHING_GLOBAL_DISCOVERY_SERVER;
+  normalizeDiscoveryServer(process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim());
 const connectionTimeout = (): string =>
   process.env.SYNCPEER_LAN_TIMEOUT_MS?.trim() || "120000";
 const folderWaitTimeout = (): number =>
   Number(process.env.SYNCPEER_LAN_FOLDER_WAIT_MS?.trim() || 90_000);
 
-const nativeDiscoveryRequest = (): { url: string; method: string; headers: Record<string, string>; pinServerDeviceId: null; allowInsecureTls: boolean } => {
+const nativeDiscoveryRequest = (): { url: string; method: string; headers: Record<string, string>; pinServerDeviceId: string | null; allowInsecureTls: boolean } => {
   const url = new URL(discoveryServer());
+  const pinServerDeviceId = url.searchParams.get("id");
   const allowInsecureTls = url.searchParams.has("insecure");
+  url.searchParams.delete("id");
   url.searchParams.delete("insecure");
   url.searchParams.set("device", serverDeviceId);
   return {
     url: url.toString(),
     method: "GET",
     headers: { Accept: "application/json" },
-    pinServerDeviceId: null,
+    pinServerDeviceId,
     allowInsecureTls,
   };
 };
@@ -122,12 +124,38 @@ const connectToServer = async (): Promise<void> => {
 };
 
 const clickItemTitle = async (name: string): Promise<void> => {
-  await tauriBrowser.execute((title: string) => {
+  const clicked = await tauriBrowser.execute((title: string) => {
     const item = [...document.querySelectorAll(".item-title")].find(
       (element) => element.textContent?.trim() === title,
     );
-    (item?.closest(".item-main-hit-clickable") as HTMLElement | null)?.click();
+    const target = item?.closest(".item-main-hit-clickable") as HTMLElement | null;
+    if (!target) return false;
+    target.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    return true;
   }, name);
+  assert.equal(clicked, true, `Could not click folder item ${name}.`);
+};
+
+const clickDownloadButton = async (name: string): Promise<void> => {
+  const clicked = await tauriBrowser.execute((title: string) => {
+    const item = [...document.querySelectorAll(".item-title")].find(
+      (element) => element.textContent?.trim() === title,
+    );
+    const row = item?.closest("li");
+    const button = row?.querySelector("button[aria-label^='Download']") as HTMLElement | null;
+    if (!button) return false;
+    button.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    return true;
+  }, name);
+  assert.equal(clicked, true, `Could not click Download for ${name}.`);
 };
 
 const returnToFolderRoot = async (): Promise<void> => {
@@ -180,6 +208,9 @@ describe("Syncpeer Tauri UI smoke", () => {
   });
 
   it("browses a remote folder and downloads through the Tauri cache", async () => {
+    await tauriBrowser.tauri.execute((tauri) =>
+      tauri.core.invoke("syncpeer_clear_cache"),
+    );
     await connectToServer();
     try {
       await clickTestId("tab-folders");
@@ -206,14 +237,27 @@ describe("Syncpeer Tauri UI smoke", () => {
         console.log("UI handshake identity logs:\n" + handshakeLogs.join("\n---\n"));
         throw error;
       }
-      await clickItemTitle("hello.txt");
-      await waitForText(tauriBrowser, "Downloaded hello.txt", 90_000);
+      await clickDownloadButton("hello.txt");
+      try {
+        await waitForText(tauriBrowser, "Downloaded hello.txt", 90_000);
+      } catch (error) {
+        await clickTestId("tab-devices");
+        await tauriBrowser.pause(500);
+        const logs = await tauriBrowser.execute(() =>
+          [...document.querySelectorAll(".item-meta")]
+            .map((element) => element.textContent?.trim() ?? "")
+            .filter(Boolean)
+            .slice(-120),
+        );
+        console.log("UI session logs after hello.txt download timeout:\n" + logs.join("\n---\n"));
+        throw error;
+      }
       assert.equal(
         await readCachedHash(tauriBrowser, "hello.txt"),
         createHash("sha256").update(LAN_FIXTURE_HELLO_CONTENT).digest("hex"),
       );
 
-      await clickItemTitle("blob.bin");
+      await clickDownloadButton("blob.bin");
       await waitForText(tauriBrowser, "Downloaded blob.bin", 180_000);
 
       const clientRoot = process.env.SYNCPEER_LAN_CLIENT_ROOT ?? path.resolve(".tmp/syncpeer-dev-client");

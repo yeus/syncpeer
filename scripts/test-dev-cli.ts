@@ -7,6 +7,10 @@ import {
   normalizeDeviceId,
 } from "../packages/core/src/ui/helpers.ts";
 import {
+  getDefaultDiscoveryServer,
+  normalizeDiscoveryServer,
+} from "../packages/core/src/ui/discoveryServer.ts";
+import {
   buildDiagnosticsRegistry,
   runDiagnosticsTests,
   type DiagnosticsBuiltinTest,
@@ -24,8 +28,9 @@ const clientRoot = (): string => path.resolve(
 
 const reportRoot = (): string => path.join(clientRoot(), "diagnostics");
 
-const discoveryServer = (): string => process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim()
-  || "https://discovery.syncthing.net/v2/";
+const discoveryServer = (): string => normalizeDiscoveryServer(
+  process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || getDefaultDiscoveryServer(),
+);
 
 const clientEnvironment = (): NodeJS.ProcessEnv => {
   const configuredHome = process.env.SYNCPEER_DEV_CLIENT_CONFIG_HOME?.trim();

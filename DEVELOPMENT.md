@@ -183,6 +183,43 @@ npm run android:dev
 - `npm run icons:generate`
 - `npm run icons:ensure:android`
 
+## Diagnostics and E2E Test Suites
+
+The repository has two test umbrellas:
+
+```bash
+npm run test:diagnostics
+npm run test:e2e
+```
+
+`test:diagnostics` runs the headless core/protocol checks, local Syncthing
+integration, CLI checks, PIM checks, approval checks, discovery checks, the
+NixOS firewall helper checks, and the native Tauri packet checks. It also runs
+the remote CLI and Syncthing REST checks when the corresponding external
+server/API is configured. Optional external checks are reported as skipped,
+never silently omitted. Its report is written to
+`.tmp/syncpeer-test-reports/diagnostics-report.json`.
+
+`test:e2e` runs the local Tauri workflows and, when a saved or configured
+development server ID is available, the remote Tauri UI workflows. The remote
+UI workflow includes a test that opens the app's Diagnostics page and runs all
+diagnostics through the real UI. Set
+`SYNCPEER_RUN_TWO_COMPUTER_E2E=1` to add the two-host LAN/internet harness.
+Its report is written to `.tmp/syncpeer-test-reports/e2e-report.json`.
+
+The local diagnostics harness creates isolated Syncthing homes, so it does
+not use or modify a running development server. Preserve those temporary
+homes for debugging with:
+
+```bash
+SYNCPEER_DIAGNOSTICS_KEEP=1 \
+  npm run test:diagnostics
+```
+
+The two suites are the supported test entry points. The long-running server
+and client commands below are operational harness controls, not additional
+test suites.
+
 ## Local Syncthing Integration Harness
 
 Download pinned Syncthing binary:
@@ -191,16 +228,11 @@ Download pinned Syncthing binary:
 npm run download:syncthing
 ```
 
-Run local automated integration harness:
+Run all headless diagnostics, including the local automated integration
+harness:
 
 ```bash
-npm run test:local
-```
-
-Keep temporary test state for debugging:
-
-```bash
-npm run test:local:keep
+npm run test:diagnostics
 ```
 
 ## Long-Running Development Test Server
@@ -237,41 +269,29 @@ verifies `hello.txt`, and uploads a test file. The server remains running for
 later client builds until Ctrl-C. The Syncthing Web UI is optional and remains
 bound to localhost.
 
-For a shorter UI-focused run against the same long-running server, use:
-
-```bash
-npm run test:ui
-```
-
-This launches the real Tauri application and checks the native identity and
-connection controls, a live global-discovery connection and disconnect, and a
-folder download verified through Tauri's local cache API. It uses the saved
-server device ID and client identity, so the server must already have approved
-this client.
-
-To run the complete development verification sequence, keep the server
-running and use one command on the client computer:
+To run the Tauri workflows against the same long-running server, keep the
+server running and use one command on the client computer:
 
 ```bash
 export SYNCPEER_DEV_SERVER_DEVICE_ID=...
 export SYNCPEER_DEV_CLIENT_CONFIG_HOME=.tmp/syncpeer-e2e-new
-npm run test:dev:all
+npm run test:e2e
 ```
 
-The command runs the local CLI/Syncthing regression suite first, then remote
-CLI diagnostics through global discovery and the relay, and finally the full
-Tauri UI smoke suite. The remote CLI checks identity, discovery, folder listing,
-folder browsing, small and large downloads, upload/download round trips, and
-repeated reconnects. The UI checks native discovery and relay commands,
-connection controls, reconnects, folder browsing, cache downloads, a large
-download, and an upload workflow.
+The local Tauri workflow is self-contained. The remote Tauri workflow checks
+native discovery and relay commands, connection controls, reconnects, folder
+browsing, cache downloads, a large download, an upload workflow, and the
+complete in-app diagnostics catalog.
+
+The self-contained workflow skips the LAN-discovery case because its fixture
+server and client share one network namespace and therefore cannot both bind
+Syncthing's fixed UDP discovery port. The two-host E2E workflow runs that case.
 
 The approved client identity must be selected with
 `SYNCPEER_DEV_CLIENT_CONFIG_HOME` when it is not the default CLI identity. The
-command writes structured reports to
-`.tmp/syncpeer-dev-client/diagnostics/`. Use `--skip-local`, `--skip-cli`, or
-`--skip-ui` when isolating one phase. The long-running server remains a
-separate process and is never started or stopped by this command.
+remote CLI diagnostics, when enabled, write their detailed report to
+`.tmp/syncpeer-dev-client/diagnostics/`. The long-running server remains a
+separate process and is never started or stopped by either umbrella.
 
 The shared diagnostics runner follows Taskyon's registry, metadata, progress,
 timeout, structured-result, and abort conventions so the same diagnostics can
@@ -281,16 +301,18 @@ later be reused by a Taskyon Syncthing storage backend.
 
 This harness runs a real Tauri Syncpeer client against an isolated Syncthing
 fixture on another computer. Enter the flake development shell on both
-computers first; it provides the GTK/WebKit runtime and `xvfb-run` for
-headless Tauri tests.
+computers first; it provides the GTK/WebKit runtime and `xvfb-run`. The local
+E2E umbrella uses `xvfb-run` for a deterministic Tauri display.
 
-Keep both checkouts clean and on compatible LAN protocol versions. They do not
+Keep both checkouts on compatible LAN protocol versions. They do not
 need to use the same Git commit: the server checkout defines the Syncthing
 fixture and test configuration, while the client checkout contains the
-Syncpeer implementation under test. Then run this command on both computers:
+Syncpeer implementation under test. For automatic two-host mode, run the
+E2E umbrella on both computers:
 
 ```bash
-npm run test:lan
+SYNCPEER_RUN_TWO_COMPUTER_E2E=1 \
+  npm run test:e2e
 ```
 
 Multicast discovery pairs the two processes and chooses one computer as the
@@ -305,10 +327,9 @@ other process has not started yet, then settles for 2 seconds after finding a
 compatible peer.
 
 Use `SYNCPEER_LAN_PAIR=my-pair` when more than one pair is being tested on
-the same network. `npm run test:lan:self` runs the same coordinator and Tauri
-client locally for development, but does not prove that the LAN path works.
-Add `--keep` to preserve the isolated Syncthing homes and logs under
-`.tmp/syncpeer-lan/` after a run.
+the same network. The local equivalent is included in `npm run test:e2e`.
+Set `SYNCPEER_E2E_KEEP=1` when preserving isolated Syncthing homes and logs
+under `.tmp/syncpeer-lan/` is needed.
 
 For a deliberate server-first run, use explicit roles. The server prints its
 random Syncthing device ID; enter it at the client prompt. The client prints
@@ -370,7 +391,8 @@ client with the external driver:
 
 ```bash
 SYNCPEER_LAN_DRIVER=external \
-  npm run test:lan
+  SYNCPEER_RUN_TWO_COMPUTER_E2E=1 \
+  npm run test:e2e
 ```
 
 That fallback installs `tauri-driver` through Cargo when needed and uses the

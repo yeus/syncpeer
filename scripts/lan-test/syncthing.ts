@@ -174,12 +174,25 @@ const addFolder = (xml: string, args: {
   encryptionPasswords?: Record<string, string>;
   type?: "sendreceive" | "sendonly";
 }): string => {
-  if (xml.includes('<folder id="' + args.id + '"')) return xml;
-  const devices = [...new Set(args.deviceIds)].map((deviceId) => [
+  const deviceBlock = (deviceId: string): string => [
     '        <device id="' + escapeXml(deviceId) + '" introducedBy="">',
-    "            <encryptionPassword>" + escapeXml(args.encryptionPasswords?.[deviceId] ?? "") + "</encryptionPassword>",
+    '            <encryptionPassword>' + escapeXml(args.encryptionPasswords?.[deviceId] ?? "") + '</encryptionPassword>',
     "        </device>",
-  ].join("\n")).join("\n");
+  ].join("\n");
+  const uniqueDeviceIds = [...new Set(args.deviceIds)];
+  const folderStart = xml.indexOf('<folder id="' + escapeXml(args.id) + '"');
+  if (folderStart >= 0) {
+    const folderEnd = xml.indexOf("</folder>", folderStart);
+    if (folderEnd < 0) throw new Error("Malformed Syncthing folder configuration.");
+    const existingFolder = xml.slice(folderStart, folderEnd);
+    const missingDevices = uniqueDeviceIds.filter((deviceId) =>
+      !existingFolder.includes('<device id="' + escapeXml(deviceId) + '"'),
+    );
+    if (missingDevices.length === 0) return xml;
+    const additions = missingDevices.map(deviceBlock).join("\n") + "\n    ";
+    return xml.slice(0, folderEnd) + additions + xml.slice(folderEnd);
+  }
+  const devices = uniqueDeviceIds.map(deviceBlock).join("\n");
   const block = [
     '    <folder id="' + escapeXml(args.id) + '" label="' + escapeXml(args.id) + '" path="' + escapeXml(args.folderPath) + '" type="' + (args.type ?? "sendreceive") + '" rescanIntervalS="1" fsWatcherEnabled="true" fsWatcherDelayS="1" fsWatcherTimeoutS="0" ignorePerms="false" autoNormalize="true">',
     "        <filesystemType>basic</filesystemType>",

@@ -25,6 +25,7 @@ const folderId = "syncpeer-test";
 const noiseFolderAId = "syncpeer-noise-a";
 const noiseFolderBId = "syncpeer-noise-b";
 const encryptedFolderId = "syncpeer-encrypted";
+const lockedEncryptedFolderId = "syncpeer-encrypted-locked";
 const bShareDir = path.join(root, "share-b");
 const aRecvDir = path.join(root, "share-a");
 const bNoiseShareADir = path.join(root, "share-b-noise-a");
@@ -32,11 +33,13 @@ const aNoiseRecvADir = path.join(root, "share-a-noise-a");
 const bNoiseShareBDir = path.join(root, "share-b-noise-b");
 const aNoiseRecvBDir = path.join(root, "share-a-noise-b");
 const bEncryptedShareDir = path.join(root, "share-b-encrypted");
+const bLockedEncryptedShareDir = path.join(root, "share-b-encrypted-locked");
 const cliConfigHome = path.join(root, "xdg-config");
 const cliNodeHome = path.join(cliConfigHome, "syncpeer", "cli-node");
 const cliUntrustedHome = path.join(root, "cli-untrusted-node");
 const cliObserverHome = path.join(root, "cli-observer-node");
 const encryptedFolderPassword = "correct horse battery staple";
+const lockedEncryptedFolderPassword = "a different folder password";
 const toolsDir = path.resolve(".tools");
 const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
 const A_SYNC_ADDR = "tcp://127.0.0.1:58300";
@@ -458,6 +461,7 @@ async function main() {
   ensureDir(aNoiseRecvBDir);
   ensureDir(bNoiseShareBDir);
   ensureDir(bEncryptedShareDir);
+  ensureDir(bLockedEncryptedShareDir);
   ensureDir(cliUntrustedHome);
   ensureDir(cliObserverHome);
 
@@ -469,6 +473,7 @@ async function main() {
   writeFile(path.join(bNoiseShareADir, "seed.txt"), "seed noise a\n");
   writeFile(path.join(bNoiseShareBDir, "seed.txt"), "seed noise b\n");
   writeFile(path.join(bEncryptedShareDir, "secret.txt"), expectedEncrypted);
+  writeFile(path.join(bLockedEncryptedShareDir, "hidden.txt"), "locked folder secret\n");
 
   console.log("Building CLI packages...");
   execFileSync(npmCmd, ["run", "build:cli"], { stdio: "inherit" });
@@ -560,6 +565,17 @@ async function main() {
         encryptionPasswords: {
           [cliUntrustedId]: encryptedFolderPassword,
           [cliObserverId]: encryptedFolderPassword,
+        },
+      },
+      {
+        id: lockedEncryptedFolderId,
+        label: lockedEncryptedFolderId,
+        path: bLockedEncryptedShareDir,
+        type: "sendonly",
+        deviceIds: [bId, cliUntrustedId, cliObserverId],
+        encryptionPasswords: {
+          [cliUntrustedId]: lockedEncryptedFolderPassword,
+          [cliObserverId]: lockedEncryptedFolderPassword,
         },
       },
     ],

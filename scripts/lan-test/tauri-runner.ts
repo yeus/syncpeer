@@ -23,7 +23,9 @@ export const runLanWdio = async (env: NodeJS.ProcessEnv): Promise<number> => {
   const wdioBin = path.resolve("node_modules", "@wdio", "cli", "bin", "wdio.js");
   const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
   const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
-  const useXvfb = process.platform === "linux" && !process.env.DISPLAY;
+  const runEnv = { ...process.env, ...env, SYNCPEER_LAN_APP_BINARY: lanAppBinary() };
+  const useXvfb = process.platform === "linux" &&
+    (runEnv.SYNCPEER_LAN_XVFB === "1" || !runEnv.DISPLAY);
   if (useXvfb) {
     try {
       execFileSync("which", ["xvfb-run"], { stdio: "ignore" });
@@ -34,6 +36,6 @@ export const runLanWdio = async (env: NodeJS.ProcessEnv): Promise<number> => {
   return runChild(
     useXvfb ? "xvfb-run" : process.execPath,
     useXvfb ? ["-a", process.execPath, ...wdioArgs] : wdioArgs,
-    { ...process.env, ...env, SYNCPEER_LAN_APP_BINARY: lanAppBinary() },
+    runEnv,
   );
 };

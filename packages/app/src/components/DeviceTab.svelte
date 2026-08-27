@@ -183,7 +183,11 @@
     >
       Settings
     </button>
-    <button class="ghost small" onclick={onOpenDiagnosticsPage}>Diagnostics</button>
+    <button
+      class="ghost small"
+      data-testid="open-diagnostics"
+      onclick={onOpenDiagnosticsPage}
+    >Diagnostics</button>
   </div>
 
   <div class="this-device-summary">

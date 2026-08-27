@@ -149,7 +149,7 @@
 
 <main class="diagnostics-page">
   <header class="diagnostics-header">
-    <button class="ghost" onclick={onBack}>Back To Main App</button>
+    <button class="ghost" data-testid="diagnostics-back" onclick={onBack}>Back To Main App</button>
     <h1 class="diagnostics-title">Diagnostics</h1>
   </header>
 
@@ -186,7 +186,12 @@
       <button class="primary" onclick={runSelectedCategory} disabled={isRunning || !selectedCategoryId}>
         {isRunning ? "Running..." : "Run Selected Category"}
       </button>
-      <button class="primary" onclick={runAllDiagnostics} disabled={isRunning || catalog.tests.length === 0}>
+      <button
+        class="primary"
+        data-testid="diagnostics-run-all"
+        onclick={runAllDiagnostics}
+        disabled={isRunning || catalog.tests.length === 0}
+      >
         {isRunning ? "Running..." : "Run All Diagnostics"}
       </button>
       <button class="ghost" onclick={loadCatalog} disabled={isCatalogLoading || isRunning}>
@@ -224,6 +229,7 @@
     {/if}
     <textarea
       class="result-box"
+      data-testid="diagnostics-result"
       readonly
       value={resultJson}
       placeholder="Run the test to see diagnostics output here."

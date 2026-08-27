@@ -3,6 +3,7 @@ import type { FileEntry, FolderSyncState } from "../core/model/remoteFs.js";
 
 export interface FlowDeps {
   sleep: (ms: number) => Promise<void>;
+  now?: () => number;
   log?: (entry: {
     level: "info" | "warning" | "error";
     event: string;
@@ -42,9 +43,10 @@ export const makeWaitForFoldersToPopulateFlow =
     const timeoutMs = Math.max(100, args.timeoutMs ?? 4000);
     const pollIntervalMs = Math.max(50, args.pollIntervalMs ?? 200);
     const connected = args.isConnected ?? (() => true);
-    const deadline = Date.now() + timeoutMs;
+    const now = deps.now ?? (() => Date.now());
+    const deadline = now() + timeoutMs;
     let attempts = 0;
-    while (Date.now() < deadline && connected()) {
+    while (now() < deadline && connected()) {
       const count = args.getCurrentFolderCount();
       if (count > 0) return { populated: true, attempts, finalFolderCount: count };
       attempts += 1;
@@ -90,13 +92,14 @@ export const makeWaitForFolderIndexToArriveFlow =
     const requestTimeoutMs = Math.max(100, args.requestTimeoutMs ?? 1200);
     const pollIntervalMs = Math.max(50, args.pollIntervalMs ?? 150);
     const connected = args.isConnected ?? (() => true);
-    const deadline = Date.now() + timeoutMs;
+    const now = deps.now ?? (() => Date.now());
+    const deadline = now() + timeoutMs;
     let folderSyncStates = [...(args.initialFolderSyncStates ?? [])];
     const attempts: FolderIndexPollAttempt[] = [];
     const getState = (): FolderSyncState | undefined =>
       folderSyncStates.find((entry) => entry.folderId === args.folderId);
     let attempt = 0;
-    while (Date.now() < deadline && connected()) {
+    while (now() < deadline && connected()) {
       const existing = getState();
       if (existing?.indexReceived) {
         return { received: true, folderSyncStates, attempts };
@@ -162,6 +165,7 @@ export const makeReadDirWithRetryFlow =
   }): Promise<{ entries: FileEntry[]; attempts: ReadDirAttempt[] }> => {
     const retryTimeoutMs = Math.max(100, args.retryTimeoutMs ?? 4000);
     const retryIntervalMs = Math.max(50, args.retryIntervalMs ?? 200);
+    const now = deps.now ?? (() => Date.now());
     const attempts: ReadDirAttempt[] = [];
     let entries = await args.fs.readDir(args.folderId, args.path);
     attempts.push({
@@ -172,9 +176,9 @@ export const makeReadDirWithRetryFlow =
     if (entries.length > 0 || !args.retryEmpty || args.locked) {
       return { entries, attempts };
     }
-    const deadline = Date.now() + retryTimeoutMs;
+    const deadline = now() + retryTimeoutMs;
     let attempt = 1;
-    while (Date.now() < deadline && entries.length === 0) {
+    while (now() < deadline && entries.length === 0) {
       await deps.sleep(retryIntervalMs);
       attempt += 1;
       entries = await args.fs.readDir(args.folderId, args.path);

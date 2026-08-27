@@ -1030,6 +1030,14 @@ class BepSession {
             }
             return next;
           });
+        const incomingLocalDevice = baseDevices.find((device: any) =>
+          bytesEqual(device.id, this.localDeviceId),
+        );
+        const incomingLocalToken =
+          incomingLocalDevice?.encryption_password_token instanceof Uint8Array &&
+          incomingLocalDevice.encryption_password_token.length > 0
+            ? incomingLocalDevice.encryption_password_token
+            : undefined;
         devices.push({
           id: this.localDeviceId,
           name: this.localDeviceName,
@@ -1037,12 +1045,10 @@ class BepSession {
           compression: 0,
           max_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
           index_id: localFolderIndexId,
-          // A Syncthing untrusted peer expects its side of the folder to be
-          // receive-encrypted. Echo the password token after validating it so
-          // the peer keeps the connection in encrypted mode.
-          encryption_password_token: state?.encrypted
-            ? state.folderCrypto?.passwordToken
-            : undefined,
+          // Syncthing puts the token on exactly one device entry. Preserve a
+          // token it announced for this device, but do not duplicate a token
+          // announced for the remote device after validating the password.
+          encryption_password_token: incomingLocalToken,
         });
         const sourceType = Number(folder.type ?? 0);
         const echoedType = state?.encrypted ? 3 : sourceType;
@@ -1058,8 +1064,8 @@ class BepSession {
             folderId: folder.id,
             sourceType,
             echoedType,
-            localTokenLength: state.folderCrypto?.passwordToken.length ?? 0,
-            localTokenIncluded: !!state.folderCrypto,
+            localTokenLength: incomingLocalToken?.length ?? 0,
+            localTokenIncluded: !!incomingLocalToken,
           });
         }
         return {

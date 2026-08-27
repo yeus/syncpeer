@@ -103,13 +103,15 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
 
   const waitForFoldersToPopulate = makeWaitForFoldersToPopulateFlow({
     sleep,
+    now,
     log: (entry) => emitTrace(entry.level, entry.event, entry.message, entry.details),
   });
   const waitForFolderIndexToArrive = makeWaitForFolderIndexToArriveFlow({
     sleep,
+    now,
     log: (entry) => emitTrace(entry.level, entry.event, entry.message, entry.details),
   });
-  const readDirWithRetry = makeReadDirWithRetryFlow({ sleep });
+  const readDirWithRetry = makeReadDirWithRetryFlow({ sleep, now });
 
   const actions = {
     connect: async (options: ConnectOptions): Promise<void> => {
@@ -364,6 +366,9 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
             "session.flow.folder_index.not_received",
             `Folder index not received yet for ${folderId}.`,
             { folderId },
+          );
+          throw new Error(
+            `Folder index was not received for ${folderId}; directory contents are not available yet.`,
           );
         }
 

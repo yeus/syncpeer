@@ -9,6 +9,8 @@ import {
 } from "./fixture-data.ts";
 import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
 import {
+  clickDownloadButton,
+  clickItemTitle,
   connectUntilApproved,
   readCachedHash,
   selectDiscoveryMode,
@@ -120,41 +122,6 @@ const connectToServer = async (): Promise<void> => {
   );
 };
 
-const clickItemTitle = async (name: string): Promise<void> => {
-  const clicked = await tauriBrowser.execute((title: string) => {
-    const item = [...document.querySelectorAll(".item-title")].find(
-      (element) => element.textContent?.trim() === title,
-    );
-    const target = item?.closest(".item-main-hit-clickable") as HTMLElement | null;
-    if (!target) return false;
-    target.dispatchEvent(new MouseEvent("click", {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-    }));
-    return true;
-  }, name);
-  assert.equal(clicked, true, `Could not click folder item ${name}.`);
-};
-
-const clickDownloadButton = async (name: string): Promise<void> => {
-  const clicked = await tauriBrowser.execute((title: string) => {
-    const item = [...document.querySelectorAll(".item-title")].find(
-      (element) => element.textContent?.trim() === title,
-    );
-    const row = item?.closest("li");
-    const button = row?.querySelector("button[aria-label^='Download']") as HTMLElement | null;
-    if (!button) return false;
-    button.dispatchEvent(new MouseEvent("click", {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-    }));
-    return true;
-  }, name);
-  assert.equal(clicked, true, `Could not click Download for ${name}.`);
-};
-
 const returnToFolderRoot = async (): Promise<void> => {
   const rootButton = $("button.crumb-button");
   if (!(await rootButton.isExisting())) return;
@@ -204,6 +171,27 @@ describe("Syncpeer Tauri UI smoke", () => {
     await disconnectIfConnected();
   });
 
+  it("runs all registered diagnostics through the Tauri UI", async () => {
+    await clickTestId("tab-devices");
+    const diagnosticsButton = $("[data-testid='open-diagnostics']");
+    await diagnosticsButton.waitForExist({ timeout: 10_000 });
+    await diagnosticsButton.click();
+    const runAll = $("[data-testid='diagnostics-run-all']");
+    const result = $("[data-testid='diagnostics-result']");
+    await runAll.waitForExist({ timeout: 10_000 });
+    await runAll.click();
+    await tauriBrowser.waitUntil(
+      async () => (await result.getValue()).includes('"allPassed": true'),
+      {
+        timeout: 180_000,
+        timeoutMsg: "The in-app diagnostics suite did not pass.",
+      },
+    );
+    assert.match(String(await result.getValue()), /"allPassed": true/);
+    await $("[data-testid='diagnostics-back']").click();
+    await $("[data-testid='global-connect-button']").waitForExist({ timeout: 10_000 });
+  });
+
   it("browses a remote folder and downloads through the Tauri cache", async () => {
     await tauriBrowser.tauri.execute((tauri) =>
       tauri.core.invoke("syncpeer_clear_cache"),
@@ -213,7 +201,7 @@ describe("Syncpeer Tauri UI smoke", () => {
       await clickTestId("tab-folders");
       await returnToFolderRoot();
       await waitForText(tauriBrowser, LAN_FIXTURE_FOLDER_ID, 90_000);
-      await clickItemTitle(LAN_FIXTURE_FOLDER_ID);
+      await clickItemTitle(tauriBrowser, LAN_FIXTURE_FOLDER_ID);
       try {
         await waitForText(tauriBrowser, "hello.txt", folderWaitTimeout());
       } catch (error) {
@@ -234,7 +222,7 @@ describe("Syncpeer Tauri UI smoke", () => {
         console.log("UI handshake identity logs:\n" + handshakeLogs.join("\n---\n"));
         throw error;
       }
-      await clickDownloadButton("hello.txt");
+      await clickDownloadButton(tauriBrowser, "hello.txt");
       try {
         await waitForText(tauriBrowser, "Downloaded hello.txt", 90_000);
       } catch (error) {
@@ -254,7 +242,7 @@ describe("Syncpeer Tauri UI smoke", () => {
         createHash("sha256").update(LAN_FIXTURE_HELLO_CONTENT).digest("hex"),
       );
 
-      await clickDownloadButton("blob.bin");
+      await clickDownloadButton(tauriBrowser, "blob.bin");
       await waitForText(tauriBrowser, "Downloaded blob.bin", 180_000);
 
       const clientRoot = process.env.SYNCPEER_LAN_CLIENT_ROOT ?? path.resolve(".tmp/syncpeer-dev-client");

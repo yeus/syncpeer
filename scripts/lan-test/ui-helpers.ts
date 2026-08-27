@@ -24,6 +24,47 @@ export const setValue = async (testId: string, value: string): Promise<void> => 
   await element.setValue(value);
 };
 
+export const clickItemTitle = async (
+  browser: TauriBrowser,
+  name: string,
+): Promise<void> => {
+  const clicked = await browser.execute((title: string) => {
+    const item = [...document.querySelectorAll(".item-title")].find(
+      (element) => element.textContent?.trim() === title,
+    );
+    const target = item?.closest(".item-main-hit-clickable") as HTMLElement | null;
+    if (!target) return false;
+    target.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    return true;
+  }, name);
+  if (!clicked) throw new Error("Could not click folder item " + name + ".");
+};
+
+export const clickDownloadButton = async (
+  browser: TauriBrowser,
+  name: string,
+): Promise<void> => {
+  const clicked = await browser.execute((title: string) => {
+    const item = [...document.querySelectorAll(".item-title")].find(
+      (element) => element.textContent?.trim() === title,
+    );
+    const row = item?.closest("li");
+    const button = row?.querySelector("button[aria-label^='Download']") as HTMLElement | null;
+    if (!button) return false;
+    button.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    return true;
+  }, name);
+  if (!clicked) throw new Error("Could not click Download for " + name + ".");
+};
+
 export const selectDiscoveryMode = async (
   browser: TauriBrowser,
   mode: "direct" | "lan" | "global",

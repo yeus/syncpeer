@@ -108,6 +108,8 @@ const runClient = async (args: {
     buildLanApp();
     const clientRoot = path.join(root, "client");
     fs.mkdirSync(clientRoot, { recursive: true });
+    const appStateRoot = path.join(clientRoot, "app-state");
+    fs.mkdirSync(appStateRoot, { recursive: true });
     const untrustedIdentity = generateSyncthingIdentity(
       path.join(clientRoot, "untrusted-identity"),
     );
@@ -124,6 +126,10 @@ const runClient = async (args: {
         SYNCPEER_LAN_UNTRUSTED_KEY: untrustedIdentity.keyPath,
         SYNCPEER_LAN_REMOTE_DEVICE_ID: remoteDeviceId,
         SYNCPEER_LAN_MANUAL_IDS: args.explicitIds ? "1" : "",
+        XDG_CONFIG_HOME: path.join(appStateRoot, "config"),
+        XDG_DATA_HOME: path.join(appStateRoot, "data"),
+        XDG_CACHE_HOME: path.join(appStateRoot, "cache"),
+        SYNCPEER_DEFAULT_IDENTITY_DIR: path.join(appStateRoot, "identity"),
     });
     await coordinatorRequest({
       baseUrl: args.coordinatorUrl,
@@ -204,6 +210,7 @@ const runServer = async (args: {
         ...process.env,
         SYNCPEER_LAN_COORDINATOR_URL: args.coordinatorUrl,
         SYNCPEER_LAN_COORDINATOR_TOKEN: coordinatorToken,
+        ...(args.self ? { SYNCPEER_LAN_SELF: "1" } : {}),
       },
     })
     : undefined;

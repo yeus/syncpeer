@@ -7,6 +7,16 @@ import type { Browser as WdioBrowser } from "webdriverio";
 import type { BrowserExtension } from "@wdio/native-types";
 import { coordinatorRequest } from "./coordinator.ts";
 import type { LanFixture } from "./protocol.ts";
+import {
+  clickDownloadButton,
+  clickItemTitle,
+  readCachedHash,
+  selectDiscoveryMode,
+  setUploadFile,
+  setValue,
+  waitForDisconnected,
+  waitForText,
+} from "./ui-helpers.ts";
 
 type LanBrowser = WdioBrowser & BrowserExtension;
 const lanBrowser = browser as unknown as LanBrowser;
@@ -61,33 +71,9 @@ const fixture = async (): Promise<LanFixture> => {
   throw new Error("Timed out waiting for LAN fixture: " + String(lastError));
 };
 
-const waitForText = async (text: string, timeout = 60_000): Promise<void> => {
-  await lanBrowser.waitUntil(
-    async () => (await lanBrowser.getPageSource()).includes(text),
-    { timeout, timeoutMsg: "Timed out waiting for text: " + text },
-  );
-};
-
 const clickTestId = async (testId: string): Promise<void> => {
   await $("[data-testid='" + testId + "']").click();
 };
-
-const setValue = async (testId: string, value: string): Promise<void> => {
-  const element = $("[data-testid='" + testId + "']");
-  await element.click();
-  await element.setValue(value);
-};
-
-const chooseDiscoveryMode = async (mode: "direct" | "lan" | "global"): Promise<void> => {
-  const select = $("[data-testid='connection-discovery-mode']");
-  await select.selectByAttribute("value", mode);
-};
-
-const clickItemTitle = async (name: string): Promise<void> => {
-  const item = $("//*[contains(@class, 'item-title') and normalize-space()='" + name + "']");
-  await item.click();
-};
-
 const connect = async (
   currentFixture: LanFixture,
   mode: "direct" | "lan" | "global",
@@ -96,7 +82,7 @@ const connect = async (
   await clickTestId("tab-devices");
   const settings = $("[data-testid='connection-settings-toggle']");
   if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
-  await chooseDiscoveryMode(mode);
+  await selectDiscoveryMode(lanBrowser, mode);
   const remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim()
     || currentFixture.remoteDeviceId;
   await setValue("connection-remote-id", remoteDeviceId);
@@ -110,12 +96,14 @@ const connect = async (
   await setValue("connection-cert", identity?.cert ?? "");
   await setValue("connection-key", identity?.key ?? "");
   await clickTestId("global-connect-button");
-  await waitForText("Connected");
+  await waitForText(lanBrowser, "Connected");
 };
 
 const disconnect = async (): Promise<void> => {
-  await clickTestId("global-connect-button");
-  await waitForText("Disconnected", 30_000);
+  const button = $("[data-testid='global-connect-button']");
+  if ((await button.getText()).trim() === "Connect") return;
+  await button.click();
+  await waitForDisconnected(lanBrowser, 30_000);
 };
 
 const openFolders = async (): Promise<void> => {
@@ -123,37 +111,24 @@ const openFolders = async (): Promise<void> => {
 };
 
 const downloadByName = async (name: string): Promise<void> => {
-  await waitForText(name);
-  await clickItemTitle(name);
-  await waitForText("Cached", 90_000);
+  await waitForText(lanBrowser, name);
+  await clickDownloadButton(lanBrowser, name);
+  await waitForText(lanBrowser, "Downloaded " + name, 90_000);
 };
 
 const uploadTextFile = async (name: string, content: string): Promise<void> => {
   const uploadPath = path.join(clientRoot, name);
   fs.mkdirSync(clientRoot, { recursive: true });
   fs.writeFileSync(uploadPath, content);
-  const input = $("#folder-upload-input");
-  await input.setValue(uploadPath);
-};
-
-const readCachedHash = async (relativePath: string): Promise<string | null> => {
-  const records = await lanBrowser.tauri.execute((tauri) =>
-    tauri.core.invoke("syncpeer_list_cached_files"),
-  ) as Array<{ path: string; localPath?: string }>;
-  const record = records.find((candidate) => candidate.path === relativePath);
-  if (!record?.localPath) return null;
-  const bytes = await lanBrowser.tauri.execute((tauri, filePath: string) =>
-    tauri.core.invoke("syncpeer_read_binary_file", { request: { path: filePath } }),
-    record.localPath,
-  ) as number[];
-  return createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+  await setUploadFile(lanBrowser, uploadPath);
 };
 
 describe("Syncpeer LAN integration", () => {
   let currentFixture: LanFixture;
 
   it("registers the real Tauri identity", async () => {
-    await waitForText("This Device", 60_000);
+    await clickTestId("tab-devices");
+    await waitForText(lanBrowser, "This Device", 60_000);
     const deviceId = await $("[data-testid='current-device-id']").getText();
     assert.match(deviceId, /^[A-Z2-7-]{40,}$/);
     if (process.env.SYNCPEER_LAN_MANUAL_IDS !== "1") {
@@ -164,17 +139,20 @@ describe("Syncpeer LAN integration", () => {
 
   it("downloads, uploads, and preserves cache integrity over direct TCP", async () => {
     await runPhase("direct", async () => {
+      await lanBrowser.tauri.execute((tauri) =>
+        tauri.core.invoke("syncpeer_clear_cache"),
+      );
       await connect(currentFixture, "direct");
       await openFolders();
-      await waitForText(currentFixture.folderId);
-      await clickItemTitle(currentFixture.folderId);
+      await waitForText(lanBrowser, currentFixture.folderId);
+      await clickItemTitle(lanBrowser, currentFixture.folderId);
       await downloadByName("hello.txt");
       const expectedHello = currentFixture.expectedFiles.find((file) => file.path === "hello.txt");
       assert.ok(expectedHello);
-      assert.equal(await readCachedHash("hello.txt"), expectedHello.sha256);
+      assert.equal(await readCachedHash(lanBrowser, "hello.txt"), expectedHello.sha256);
 
       await uploadTextFile("upload.txt", "uploaded from Syncpeer LAN test\n");
-      await waitForText("Uploaded upload.txt.", 90_000);
+      await waitForText(lanBrowser, "Uploaded upload.txt.", 90_000);
       const uploaded = await request<{ sha256: string; size: number }>("POST", "/v1/action", {
         action: "verify-upload",
       });
@@ -191,33 +169,51 @@ describe("Syncpeer LAN integration", () => {
         details: { durationMs: 12_000 },
       });
       await openFolders();
-      await clickItemTitle("blob.bin");
-      await waitForText("Cached", 120_000);
+      await clickDownloadButton(lanBrowser, "blob.bin");
+      await waitForText(lanBrowser, "Downloaded blob.bin", 120_000);
       const result = await churn;
       assert.ok(result.ticks >= 4);
     });
   });
 
-  it("connects through LAN discovery", async () => {
+  it("connects through LAN discovery", async function () {
+    if (process.env.SYNCPEER_LAN_SELF === "1") {
+      this.skip();
+      return;
+    }
     await runPhase("lan-discovery", async () => {
       await disconnect();
       await connect(currentFixture, "lan");
     });
   });
 
-  it("connects through official global discovery", async () => {
+  it("connects through official global discovery", async function () {
+    if (process.env.SYNCPEER_LAN_SELF === "1") {
+      await reportPhase("global", "skipped", {
+        reason: "self mode has one network namespace; run two-host E2E for public discovery",
+      });
+      this.skip();
+      return;
+    }
     await runPhase("global", async () => {
       await disconnect();
       await connect(currentFixture, "global");
     });
   });
 
-  it("falls back through the standard relay pool", async () => {
+  it("falls back through the standard relay pool", async function () {
+    if (process.env.SYNCPEER_LAN_SELF === "1") {
+      await reportPhase("relay", "skipped", {
+        reason: "self mode has one network namespace; run two-host E2E for relay transport",
+      });
+      this.skip();
+      return;
+    }
     await runPhase("relay", async () => {
       await request("POST", "/v1/action", { action: "switch-to-relay" });
       await disconnect();
       await connect(currentFixture, "global");
-      await waitForText("Path: relay", 60_000);
+      await waitForText(lanBrowser, "Path: relay", 60_000);
     });
   });
 
@@ -237,17 +233,19 @@ describe("Syncpeer LAN integration", () => {
       await disconnect();
       await connect(currentFixture, "direct", untrustedIdentity);
       await openFolders();
-      await waitForText(currentFixture.encryptedFolderId, 90_000);
+      await waitForText(lanBrowser, currentFixture.encryptedFolderId, 90_000);
       const passwordInput = $("[data-testid='folder-password-" + currentFixture.encryptedFolderId + "']");
       if (!(await passwordInput.isExisting())) {
         await clickTestId("edit-folder-password-" + currentFixture.encryptedFolderId);
       }
       await setValue(`folder-password-${currentFixture.encryptedFolderId}`, currentFixture.encryptedPassword);
       await clickTestId(`unlock-folder-${currentFixture.encryptedFolderId}`);
-      await waitForText("secret.txt", 90_000);
+      await waitForText(lanBrowser, "unlocked", 90_000);
+      await clickItemTitle(lanBrowser, currentFixture.encryptedFolderId);
+      await waitForText(lanBrowser, "secret.txt", 90_000);
       await downloadByName("secret.txt");
       assert.equal(
-        await readCachedHash("secret.txt"),
+        await readCachedHash(lanBrowser, "secret.txt"),
         currentFixture.encryptedExpected.sha256,
       );
     });

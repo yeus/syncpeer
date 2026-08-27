@@ -14,12 +14,16 @@ import {
   createSyncpeerCoreClient,
   withRecoveringSession,
 } from "../packages/core/dist/client.js";
-import { makeReadDirWithRetryFlow } from "../packages/core/dist/browser.js";
+import {
+  createSyncpeerSessionStore,
+  makeReadDirWithRetryFlow,
+} from "../packages/core/dist/browser.js";
 import type { RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
 import {
   coalescePendingIndexFrame,
   type PendingIndexFrame,
 } from "../packages/core/src/core/protocol/indexQueue.ts";
+import { deriveUntrustedFolderCrypto } from "../packages/core/src/core/model/untrusted.ts";
 import { resolvePackagedAppVersion } from "../packages/app/buildInfo.ts";
 import {
   classifyRuntimeEnvironment,
@@ -148,8 +152,8 @@ const remoteHandshake = new Uint8Array([
   ),
 ]);
 
-const createFakeTlsSocket = () => {
-  let handshake = remoteHandshake;
+const createFakeTlsSocket = (initialHandshake = remoteHandshake) => {
+  let handshake = initialHandshake;
   let closed = false;
   let rejectRead: ((error: Error) => void) | null = null;
   const writes: Uint8Array[] = [];
@@ -209,6 +213,96 @@ const closeParser = new FrameParser((type, message) => {
 });
 for (const write of fakeSocket.writes.slice(1)) closeParser.feed(write);
 assert.equal(closeReason, "Client closed");
+
+const encryptedFolderPassword = "correct horse battery staple";
+const encryptedFolderId = "encrypted-documents";
+const lockedFolderId = "encrypted-photos";
+const encryptedFolderCrypto = await deriveUntrustedFolderCrypto(
+  encryptedFolderId,
+  encryptedFolderPassword,
+);
+const lockedFolderCrypto = await deriveUntrustedFolderCrypto(
+  lockedFolderId,
+  "a different password",
+);
+const remoteDeviceIdBytes = new Uint8Array(
+  createHash("sha256").update(Buffer.from([4, 5, 6])).digest(),
+);
+const encryptedRemoteHandshake = new Uint8Array([
+  ...encodeHelloFrame({
+    device_name: "fake-syncthing",
+    client_name: "syncthing",
+    client_version: "v1.27.8",
+  }),
+  ...encodeMessageFrame(
+    MessageTypeValues.CLUSTER_CONFIG,
+    ClusterConfig,
+    {
+      folders: [
+        {
+          id: encryptedFolderId,
+          label: "Encrypted documents",
+          type: 0,
+          devices: [{
+            id: remoteDeviceIdBytes,
+            name: "fake-syncthing",
+            encryption_password_token: encryptedFolderCrypto.passwordToken,
+          }],
+        },
+        {
+          id: lockedFolderId,
+          label: "Encrypted photos",
+          type: 0,
+          devices: [{
+            id: remoteDeviceIdBytes,
+            name: "fake-syncthing",
+            encryption_password_token: lockedFolderCrypto.passwordToken,
+          }],
+        },
+      ],
+    },
+  ),
+]);
+const encryptedSocket = createFakeTlsSocket(encryptedRemoteHandshake);
+const encryptedClient = createSyncpeerCoreClient({
+  connectTls: async () => encryptedSocket.socket,
+  sha256: (data) => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: (length) => new Uint8Array(length),
+  discoveryFetch: async () => {
+    throw new Error("Discovery is not used by this encrypted-folder test.");
+  },
+});
+const encryptedSession = await encryptedClient.openSession({
+  host: "127.0.0.1",
+  port: 22000,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  deviceName: "syncpeer-encrypted-regression",
+  discoveryMode: "direct",
+  folderPasswords: { [encryptedFolderId]: encryptedFolderPassword },
+});
+const echoedEncryptedConfigs: any[] = [];
+const encryptedWriteParser = new FrameParser((type, message) => {
+  if (type === MessageTypeValues.CLUSTER_CONFIG) {
+    echoedEncryptedConfigs.push(message);
+  }
+});
+for (const write of encryptedSocket.writes.slice(1)) {
+  encryptedWriteParser.feed(write);
+}
+assert.equal(echoedEncryptedConfigs.length, 1);
+for (const folder of echoedEncryptedConfigs[0].folders) {
+  const tokenCount = folder.devices.filter(
+    (device: { encryption_password_token?: Uint8Array }) =>
+      device.encryption_password_token?.length > 0,
+  ).length;
+  assert.equal(
+    tokenCount,
+    1,
+    `Encrypted folder ${folder.id} must echo exactly one password token.`,
+  );
+}
+await encryptedSession.close();
 
 const retrySocket = createFakeTlsSocket();
 let discoveryCalls = 0;
@@ -343,4 +437,59 @@ assert.deepEqual(
 );
 assert.equal(delayedFolderIndex.attempts.length, 2);
 
-console.log("Review regression checks passed.");
+let fakeNow = 0;
+let noIndexReadDirCalls = 0;
+const noIndexFolder = {
+  id: "encrypted-documents",
+  label: "Encrypted documents",
+  readOnly: true,
+  encrypted: true,
+  needsPassword: false,
+};
+const noIndexFs = {
+  listFolders: async () => [noIndexFolder],
+  requestFolderIndex: async () => undefined,
+  setFocusedFolder: () => undefined,
+  readDir: async () => {
+    noIndexReadDirCalls += 1;
+    return [];
+  },
+} as any;
+const noIndexOverview = {
+  folders: [noIndexFolder],
+  device: null,
+  folderSyncStates: [{
+    folderId: noIndexFolder.id,
+    remoteIndexId: "1",
+    remoteMaxSequence: "1",
+    indexReceived: false,
+  }],
+  connectedVia: "tcp://127.0.0.1:22000",
+  transportKind: "direct-tcp" as const,
+};
+const noIndexStore = createSyncpeerSessionStore({
+  now: () => fakeNow,
+  sleep: async (ms) => {
+    fakeNow += ms;
+  },
+  transport: {
+    connectAndSync: async () => noIndexFs,
+    connectAndGetOverview: async () => noIndexOverview,
+    connectAndGetFolderVersions: async () => noIndexOverview.folderSyncStates,
+  },
+});
+const noIndexOptions = {
+  host: "127.0.0.1",
+  port: 22000,
+  deviceName: "syncpeer-no-index-regression",
+  discoveryMode: "direct" as const,
+};
+await noIndexStore.actions.connect(noIndexOptions);
+await assert.rejects(
+  noIndexStore.actions.openFolder(noIndexFolder.id, noIndexOptions),
+  /Folder index was not received/,
+);
+assert.equal(noIndexStore.getState().directory.status, "error");
+assert.equal(noIndexReadDirCalls, 0);
+
+console.log("Core diagnostics passed.");

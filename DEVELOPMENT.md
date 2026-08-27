@@ -152,6 +152,11 @@ npm run build:tauri:bundle:deb
 npm run build:tauri:bundle:flatpak
 ```
 
+AppImage builds use a fresh temporary Cargo/AppDir staging tree and remove it
+after the build. Only the final AppImage is copied into the Tauri bundle
+directory and `dist/`, so read-only Nix store files are not left in Cargo's
+normal target directory.
+
 The Flatpak build uses the GNOME 50 runtime and SDK. In the Nix development
 shell, the `flatpak` and `flatpak-builder` tools are available. The build
 command automatically adds a user-level Flathub remote when needed and asks

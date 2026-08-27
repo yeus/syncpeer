@@ -97,10 +97,10 @@
           repo_root="$PWD"
           shim_dir="$repo_root/.tmp/appimage-shim"
           run_id="$(date +%s)"
-          tmp_dir="/tmp/syncpeer-appimage-tmp-$run_id"
+          tmp_dir="$(mktemp -d /tmp/syncpeer-appimage-tmp.XXXXXX)"
           cache_dir="$repo_root/.tmp/appimage-cache"
           home_dir="/tmp/syncpeer-appimage-home"
-          cargo_target_dir="$cache_dir/cargo-target"
+          cargo_target_dir="$tmp_dir/cargo-target"
           schemas_dir="$tmp_dir/glib-2.0/schemas"
           tools_dir="$cache_dir/tauri"
           appimage_plugin="$tools_dir/linuxdeploy-plugin-appimage.AppImage"
@@ -110,6 +110,13 @@
           rustup_home="''${RUSTUP_HOME:-$HOME/.rustup}"
           cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
           mkdir -p "$tmp_dir" "$tools_dir" "$home_dir"
+          cleanup() {
+            status="$?"
+            chmod -R u+rwX "$tmp_dir" 2>/dev/null || true
+            rm -rf -- "$tmp_dir"
+            exit "$status"
+          }
+          trap cleanup EXIT
           # Older runs used a shell wrapper at this path. Restore the real
           # linuxdeploy binary so the cache remains usable after upgrading.
           if [ -x "$tools_dir/linuxdeploy-real.AppImage" ]; then
@@ -340,13 +347,16 @@ exec ${pkgs.pkgconf}/bin/pkgconf "''$@"
 EOF
           chmod +x "$shim_dir/pkgconf"
           ln -sf "$shim_dir/pkgconf" "$shim_dir/pkg-config"
-          ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$cargo_target_dir\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" SYNCPEER_APPIMAGE_SCHEMAS_DIR=\"$schemas_dir\" SYNCPEER_APPIMAGE_GTK_STAGE_DIR=\"$gtk_stage_dir\" SYNCPEER_APPIMAGE_GDK_STAGE_DIR=\"$gdk_stage_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.adwaita-icon-theme}/share\" WINIT_WAYLAND_CSD_THEME=light LIBDECOR_PLUGIN_DIR=\"${pkgs.libdecor}/lib/libdecor/plugins-1\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -lc 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] WINIT_WAYLAND_CSD_THEME=\$WINIT_WAYLAND_CSD_THEME\"; echo \"[appimage-debug] LIBDECOR_PLUGIN_DIR=\$LIBDECOR_PLUGIN_DIR\"; gdk_cache=\"/tmp/syncpeer-appimage-gdk-pixbuf-loaders.cache\"; ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so > \"\$gdk_cache\" 2>/dev/null || true; if [ -s \"\$gdk_cache\" ]; then export GDK_PIXBUF_MODULE_FILE=\"\$gdk_cache\"; fi; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build:bundle:appimage -w @syncpeer/tauri-shell -- --verbose'"
+          ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$cargo_target_dir\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" SYNCPEER_APPIMAGE_SCHEMAS_DIR=\"$schemas_dir\" SYNCPEER_APPIMAGE_GTK_STAGE_DIR=\"$gtk_stage_dir\" SYNCPEER_APPIMAGE_GDK_STAGE_DIR=\"$gdk_stage_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.adwaita-icon-theme}/share\" WINIT_WAYLAND_CSD_THEME=light LIBDECOR_PLUGIN_DIR=\"${pkgs.libdecor}/lib/libdecor/plugins-1\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -lc 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] WINIT_WAYLAND_CSD_THEME=\$WINIT_WAYLAND_CSD_THEME\"; echo \"[appimage-debug] LIBDECOR_PLUGIN_DIR=\$LIBDECOR_PLUGIN_DIR\"; gdk_cache=\"/tmp/syncpeer-appimage-gdk-pixbuf-loaders.cache\"; ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so > \"\$gdk_cache\" 2>/dev/null || true; if [ -s \"\$gdk_cache\" ]; then export GDK_PIXBUF_MODULE_FILE=\"\$gdk_cache\"; fi; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build:bundle:appimage:internal -w @syncpeer/tauri-shell -- --verbose'"
           artifact="$(find "$cargo_target_dir/release/bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
           test -n "$artifact"
           output_dir="$repo_root/packages/tauri-shell/src-tauri/target/release/bundle/appimage"
           dist_dir="$repo_root/dist"
-          mkdir -p "$output_dir"
-          mkdir -p "$dist_dir"
+          if [ -d "$output_dir" ]; then
+            chmod -R u+rwX "$output_dir" 2>/dev/null || true
+            rm -rf -- "$output_dir"
+          fi
+          mkdir -p "$output_dir" "$dist_dir"
           cp "$artifact" "$output_dir/"
           cp "$artifact" "$dist_dir/"
         '';

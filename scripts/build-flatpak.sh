@@ -10,6 +10,7 @@ state_dir="$build_root/state"
 build_dir="$build_root/build"
 repo_dir="$build_root/repo"
 version="$(node -p "require('./packages/tauri-shell/src-tauri/tauri.conf.json').version")"
+branch="stable"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -31,6 +32,7 @@ mkdir -p "$build_root" "$state_dir" "$repo_dir"
 flatpak-builder \
   --force-clean \
   --disable-rofiles-fuse \
+  --default-branch="$branch" \
   --user \
   --install-deps-from=flathub \
   --repo="$repo_dir" \
@@ -45,6 +47,7 @@ flatpak build-bundle \
   "$repo_dir" \
   "$artifact" \
   dev.syncpeer.app \
+  "$branch" \
   --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
 
 echo "Flatpak bundle created: $artifact"

@@ -165,6 +165,28 @@ requiring `sudo`.
 
 The resulting bundle is copied to `dist/Syncpeer_<version>_<arch>.flatpak`.
 
+## CI Releases
+
+GitHub Actions builds and publishes AppImage, Flatpak, and the signed Android
+APK only when a version tag is pushed. The tag must exactly match the Tauri
+version, for example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Tags with a pre-release suffix, such as `v0.4.0-rc.1`, are published as GitHub
+pre-releases. Android release signing uses the configured GitHub Actions
+secrets; the keystore must remain the same across releases.
+
+To synchronize Android signing secrets from the host's Linux Secret Service to
+GitHub Actions:
+
+```bash
+npm run sync:android:secrets -- yeus/syncpeer
+```
+
 ## Development Run Targets
 
 Run desktop app in dev mode:

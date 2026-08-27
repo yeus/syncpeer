@@ -28,6 +28,7 @@
     "build:android:init": "npm run android:init -w @syncpeer/tauri-shell",
     "build:android": "npm run build:android:prod",
     "build:android:prod": "scripts/build-android-prod-with-secrets.sh",
+    "sync:android:secrets": "scripts/sync-android-signing-secrets.sh",
     "build:android:dev": "npm run build:android:dev -w @syncpeer/tauri-shell && node scripts/copy-android-apk.mjs debug",
     "android:install:diagnose": "scripts/diagnose-android-install.sh dist/syncpeer-android-release-arm64-v8a.apk dev.syncpeer.app",
     "android:dev": "npm run android:dev -w @syncpeer/tauri-shell",

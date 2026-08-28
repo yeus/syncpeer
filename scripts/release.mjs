@@ -24,6 +24,14 @@ const packageLockWorkspacePaths = [
   "packages/app",
   "packages/tauri-shell",
 ];
+const releaseMetadataPaths = [
+  "package-lock.json",
+  ...packagePaths,
+  tauriConfigPath,
+  ...cargoManifestPaths,
+  cargoLockPath,
+  "packages/tauri-shell/src-tauri/gen/android/app/tauri.properties",
+];
 
 const absolutePath = (relativePath) => path.join(repositoryRoot, relativePath);
 
@@ -148,6 +156,10 @@ const assertTagAvailable = (version) => {
   }
 };
 
+const stageReleaseMetadata = () => {
+  gitOutput(["add", "--", ...releaseMetadataPaths]);
+};
+
 const updatePackageMetadata = (version) => {
   for (const relativePath of packagePaths) {
     const packageJson = readJson(relativePath);
@@ -255,7 +267,8 @@ const main = async () => {
   }
   updateReleaseMetadata(version);
   assertConsistency();
-  console.log("Release metadata updated. Review and commit the changes, then push the commit and tag:");
+  stageReleaseMetadata();
+  console.log("Release metadata updated and staged. Review and commit the changes, then push the commit and tag:");
   console.log(`  git tag -a v${version} -m "Release v${version}"`);
   console.log(`  git push origin v${version}`);
 };

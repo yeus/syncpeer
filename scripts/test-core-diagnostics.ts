@@ -125,7 +125,10 @@ const tauriConfig = JSON.parse(
     "utf8",
   ),
 ) as unknown;
-assert.equal(resolvePackagedAppVersion(tauriConfig), "0.1.0");
+const rootPackage = JSON.parse(
+  await readFile(new URL("../package.json", import.meta.url), "utf8"),
+) as { version?: unknown };
+assert.equal(resolvePackagedAppVersion(tauriConfig), rootPackage.version);
 
 const fakeCertificate =
   "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";

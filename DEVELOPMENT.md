@@ -169,12 +169,19 @@ The resulting bundle is copied to `dist/Syncpeer_<version>_<arch>.flatpak`.
 
 GitHub Actions builds and publishes AppImage, Flatpak, and the signed Android
 APK only when a version tag is pushed. The tag must exactly match the Tauri
-version, for example:
+version. Prepare a release from a clean working tree with:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+npm run release
 ```
+
+The command displays the current version and latest local version-like tag, asks
+for the new semantic version, updates the project metadata and lockfiles, and
+prints the exact tag commands. Review and commit those changes before creating
+and pushing the tag. It does not commit or push automatically.
+
+Older bare tags such as `0.3` are historical development tags; they do not
+trigger the release workflow, which listens for tags beginning with `v`.
 
 Tags with a pre-release suffix, such as `v0.4.0-rc.1`, are published as GitHub
 pre-releases. Android release signing uses the configured GitHub Actions

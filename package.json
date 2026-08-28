@@ -1,5 +1,6 @@
 {
   "name": "syncpeer",
+  "version": "0.1.0",
   "private": true,
   "workspaces": [
     "packages/*"
@@ -8,6 +9,7 @@
     "test": "npm run test:diagnostics",
     "test:diagnostics": "node --experimental-strip-types scripts/test-diagnostics.ts",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
+    "release": "node scripts/release.mjs",
     "lint": "eslint eslint.config.mjs \"packages/**/*.{js,mjs,cjs,ts,svelte}\" \"scripts/**/*.{js,mjs,cjs,ts,svelte}\"",
     "download:syncthing": "node scripts/download-syncthing.mjs",
     "test:server": "node --experimental-strip-types scripts/test-dev.ts --server",

@@ -43,6 +43,10 @@ const main = async (): Promise<void> => {
       name: "Core protocol, session, and runtime diagnostics",
     },
     {
+      ...nodeScript("scripts/release.mjs", ["--check"]),
+      name: "Release metadata diagnostics",
+    },
+    {
       ...nodeScript("scripts/test-local.ts", localArgs),
       name: "Local Syncthing integration diagnostics",
     },

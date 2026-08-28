@@ -1,4 +1,11 @@
 <script lang="ts">
+  import type {
+    BreadcrumbSegment,
+    CachedFileRecord,
+    FileEntry,
+    FolderInfo,
+  } from "@syncpeer/core/browser";
+  import type { AppState } from "../app/state.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -9,12 +16,12 @@
   import StatusChip from "./StatusChip.svelte";
 
   interface Props {
-    app: any;
-    breadcrumbs: any[];
-    rootFolders: any[];
+    app: AppState;
+    breadcrumbs: BreadcrumbSegment[];
+    rootFolders: Array<{ id: string; name: string; readOnly: boolean }>;
     favoriteKeys: Set<string>;
     onGoToRootView: () => void;
-    onGoToBreadcrumb: (segment: any) => void;
+    onGoToBreadcrumb: (segment: BreadcrumbSegment) => void;
     onOpenFolderRoot: (folderId: string) => void;
     onOpenDirectory: (path: string) => void;
     onSetDirectoryPage: (page: number) => void;
@@ -32,11 +39,11 @@
     onClearFolderPassword: (folderId: string) => void;
     isFolderLocked: (folderId: string) => boolean;
     folderLockLabel: (folderId: string) => string;
-    folderState: (folderId: string) => any;
+    folderState: (folderId: string) => FolderInfo | undefined;
     isPasswordInputVisible: (folderId: string) => boolean;
     activeFolderPasswords: Record<string, string>;
     downloadButtonLabel: (folderId: string, path: string) => string;
-    entries: any[];
+    entries: FileEntry[];
     directoryPage: number;
     directoryTotalPages: number;
     directoryPageSize: number;
@@ -108,7 +115,7 @@
     return false;
   };
 
-  const cachedLocalPathByKey = (files: any[]) =>
+  const cachedLocalPathByKey = (files: CachedFileRecord[]) =>
     new Map(
       files
         .filter((file) => typeof file.localPath === "string" && file.localPath.trim() !== "")
@@ -120,7 +127,7 @@
 
   let rootRows = $derived.by(() =>
     rootFolders.map(
-      (folder: any): RootFolderItem => ({
+      (folder): RootFolderItem => ({
         kind: "root-folder",
         folderId: folder.id,
         name: folder.name,
@@ -140,7 +147,7 @@
 
   let entryRows = $derived.by(() =>
     entries.map(
-      (entry: any): FolderEntryItem => ({
+      (entry): FolderEntryItem => ({
         kind: "folder-entry",
         folderId: app.session.currentFolderId,
         name: entry.name,

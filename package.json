@@ -8,7 +8,7 @@
     "test": "npm run test:diagnostics",
     "test:diagnostics": "node --experimental-strip-types scripts/test-diagnostics.ts",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
-    "lint": "eslint eslint.config.js \"packages/**/*.{js,mjs,cjs,ts,svelte}\" \"scripts/**/*.{js,mjs,cjs,ts,svelte}\"",
+    "lint": "eslint eslint.config.mjs \"packages/**/*.{js,mjs,cjs,ts,svelte}\" \"scripts/**/*.{js,mjs,cjs,ts,svelte}\"",
     "download:syncthing": "node scripts/download-syncthing.mjs",
     "test:server": "node --experimental-strip-types scripts/test-dev.ts --server",
     "test:client": "node --experimental-strip-types scripts/test-dev.ts --client",

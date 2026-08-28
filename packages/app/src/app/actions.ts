@@ -14,6 +14,7 @@ import {
   resolveDirectoryPath,
   sameDeviceId,
   type BreadcrumbSegment,
+  type FileEntry,
 } from "@syncpeer/core/browser";
 import {
   canonicalRecordPath,
@@ -22,9 +23,6 @@ import {
 } from "../../../core/src/pim/index.ts";
 import {
   FOLDER_PASSWORD_SCOPE_SEPARATOR,
-  type CachedFileRecord,
-  type FolderInfo,
-  type RemoteDeviceInfo,
   type SyncpeerBrowserClient,
   type SyncpeerSessionStore,
 } from "@syncpeer/core/browser";
@@ -45,8 +43,7 @@ import {
 import {
   activeFolderPasswordScopeDeviceId,
   activeFolderPasswords,
-  activeSourceDeviceId,
-  advertisedDevices,
+  type advertisedDevices,
   advertisedFolders,
   applySessionState,
   cacheFileKeyExists,
@@ -55,12 +52,10 @@ import {
   downloadProgressText,
   favoriteEntryKey,
   folderIsLocked,
-  folderState,
   folderVersionKeyFromState,
   formatBytes,
   formatModified,
   hasSuccessfulConnectionHistory,
-  isIntroducerDevice,
   isSavedDeviceConnected,
   directoryTotalPages,
   persistState,
@@ -69,7 +64,6 @@ import {
   setError,
   shouldHintRemoteApprovalPending,
   type AppState,
-  type OfflineFolderSnapshot,
 } from "./state.ts";
 import {
   suggestedClientName,
@@ -101,9 +95,9 @@ const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
 const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
 const DOWNLOAD_NOTIFICATION_ID = 11001;
 const UPLOAD_NOTIFICATION_ID = 11002;
-const appVersion = __SYNCPEER_APP_VERSION__ || "0.0.0";
-const buildCommit = __SYNCPEER_BUILD_COMMIT__ || "unknown";
-const buildTimeUtc = __SYNCPEER_BUILD_TIME_UTC__ || "unknown";
+const appVersion = String(import.meta.env.SYNCPEER_APP_VERSION || "0.0.0");
+const buildCommit = String(import.meta.env.SYNCPEER_BUILD_COMMIT || "unknown");
+const buildTimeUtc = String(import.meta.env.SYNCPEER_BUILD_TIME_UTC || "unknown");
 const runtimeEnvironment = detectRuntimeEnvironment();
 const runtimeSurface = detectRuntimeSurface();
 const appBuildMode = import.meta.env.DEV ? "development" : "production";
@@ -210,7 +204,7 @@ const copyText = async (text: string) => {
 
 const ensureClientName = (state: AppState) => {
   const currentName = state.connection.deviceName.trim();
-  if (__SYNCPEER_LAN_E2E__ && currentName === "syncpeer-ui") {
+  if (import.meta.env.SYNCPEER_LAN_E2E === true && currentName === "syncpeer-ui") {
     state.connection.deviceName = "syncpeer-ui-e2e";
     return true;
   }
@@ -333,7 +327,7 @@ const readDirectoryEntriesRecursively = async (
   folderId: string,
   dirPath: string,
   depthLeft: number,
-): Promise<import("@syncpeer/core/browser").FileEntry[]> => {
+): Promise<FileEntry[]> => {
   if (depthLeft < 0) return [];
   const entries = await remoteFs.readDir(folderId, dirPath);
   const nested = await Promise.all(
@@ -862,7 +856,7 @@ export const createAppActions = (args: {
       const remoteFs = state.session.remoteFs;
       const cachedFiles = await client.listCachedFiles();
       const cachedByKey = new Map(cachedFiles.map((item) => [item.key, item]));
-      const dirCache = new Map<string, import("@syncpeer/core/browser").FileEntry[]>();
+      const dirCache = new Map<string, FileEntry[]>();
 
       for (const favorite of starredFiles) {
         const targetPath = normalizePath(favorite.path);

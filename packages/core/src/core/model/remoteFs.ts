@@ -1,4 +1,5 @@
 import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
+import type { BepFileInfo } from "../protocol/bep.js";
 
 export interface FolderInfo {
   id: string;
@@ -80,7 +81,7 @@ interface FolderState {
 }
 
 interface StoredFileRecord {
-  indexFile: any;
+  indexFile: BepFileInfo;
   request?: EncryptedRequestRecord;
 }
 
@@ -126,7 +127,8 @@ function isRetryableCompatibilityError(error: unknown): boolean {
   );
 }
 
-function toEntry(path: string, file: any): FileEntry {
+function toEntry(path: string, file: BepFileInfo): FileEntry {
+  const rawBlocks = file.blocks ?? file.Blocks;
   const typeValue = Number(file.type ?? 0);
   const type =
     typeValue === 1 ? "directory" :
@@ -141,11 +143,11 @@ function toEntry(path: string, file: any): FileEntry {
     modifiedMs: Number(file.modified_s ?? 0) * 1000 + Math.floor(Number(file.modified_ns ?? 0) / 1e6),
     invalid: Boolean(file.invalid),
     deleted: Boolean(file.deleted),
-    blocks: Array.isArray(file.blocks ?? file.Blocks)
-      ? (file.blocks ?? file.Blocks).map((b: any) => ({
-          offset: Number(b.offset ?? 0),
-          size: Number(b.size ?? 0),
-          hash: b.hash instanceof Uint8Array ? b.hash : new Uint8Array(b.hash ?? []),
+    blocks: rawBlocks
+      ? rawBlocks.map((b) => ({
+          offset: b.offset,
+          size: b.size,
+          hash: b.hash,
         }))
       : undefined,
   };

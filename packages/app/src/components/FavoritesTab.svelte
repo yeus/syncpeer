@@ -1,19 +1,21 @@
 <script lang="ts">
+  import type { CachedFileRecord, FavoriteRecord } from "@syncpeer/core/browser";
+  import type { AppState } from "../app/state.ts";
   import type { CachedFileItem, FavoriteItem } from "./FileSystemListItem.svelte";
   import FileSystemListItem from "./FileSystemListItem.svelte";
   import Panel from "./Panel.svelte";
 
   interface Props {
-    app: any;
+    app: AppState;
     onOpenDownloadedFilesPanel: () => void;
-    onOpenFavorite: (favorite: any) => void;
+    onOpenFavorite: (favorite: FavoriteRecord) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
     onOpenCachedDirectory: (folderId: string, path: string) => void;
     onRemoveCachedFile: (folderId: string, path: string) => void;
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
-    onRemoveFavorite: (favorite: any) => void;
+    onRemoveFavorite: (favorite: FavoriteRecord) => void;
     onClearAllCache: () => void;
     formatBytes: (value: number) => string;
     formatModified: (value: number) => string;
@@ -42,7 +44,7 @@
       : "Download";
   };
 
-  const cachedLocalPathByKey = (files: any[]) =>
+  const cachedLocalPathByKey = (files: CachedFileRecord[]) =>
     new Map(
       files
         .filter((file) => typeof file.localPath === "string" && file.localPath.trim() !== "")
@@ -54,7 +56,7 @@
 
   let favoriteRows = $derived.by(() =>
     app.favorites.items.map(
-      (favorite: any): FavoriteItem => ({
+      (favorite): FavoriteItem => ({
         kind: "favorite",
         key: favorite.key,
         folderId: favorite.folderId,
@@ -77,7 +79,7 @@
 
   let downloadedRows = $derived.by(() =>
     app.favorites.downloadedFiles.map(
-      (file: any): CachedFileItem => ({
+      (file): CachedFileItem => ({
         kind: "cached-file",
         key: file.key,
         folderId: file.folderId,

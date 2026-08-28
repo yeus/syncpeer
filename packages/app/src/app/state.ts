@@ -292,9 +292,9 @@ export type AppState = ReturnType<typeof createInitialState>;
 
 export interface OfflineFolderSnapshot {
   deviceId: string;
-  remoteDevice: import("@syncpeer/core/browser").RemoteDeviceInfo | null;
-  folders: import("@syncpeer/core/browser").FolderInfo[];
-  folderSyncStates: import("@syncpeer/core/browser").FolderSyncState[];
+  remoteDevice: RemoteDeviceInfo | null;
+  folders: FolderInfo[];
+  folderSyncStates: FolderSyncState[];
   connectedVia: string;
   transportKind: "direct-tcp" | "relay" | "";
   lastSeenAtMs: number;
@@ -518,7 +518,7 @@ export const isSavedDeviceAwaitingRemoteApproval = (
 
 export const connectionDetails = (state: AppState) => ({
   ...buildConnectionDetails(state.connection, activeFolderPasswords(state)),
-  relayOnly: __SYNCPEER_LAN_E2E__,
+  relayOnly: import.meta.env.SYNCPEER_LAN_E2E === true,
 });
 
 export const downloadButtonLabel = (

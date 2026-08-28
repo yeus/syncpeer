@@ -12,11 +12,20 @@ import {
   Request,
   Response,
   Ping,
+  type BepBlockInfo,
+  type BepClose,
+  type BepClusterConfig,
+  type BepFileInfo,
+  type BepHello,
+  type BepIndex,
+  type BepRequest,
+  type BepResponse,
 } from "./core/protocol/bep.js";
 import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.js";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
 import {
   coalescePendingIndexFrame,
+  type FolderIndexMessage,
   type PendingIndexFrame,
 } from "./core/protocol/indexQueue.js";
 import {
@@ -178,7 +187,7 @@ interface FolderState {
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
-  files: Map<string, { indexFile: any; request?: { encryptedName: string; fileKey: Uint8Array; encryptedBlocks: any[] } }>;
+  files: Map<string, { indexFile: BepFileInfo; request?: { encryptedName: string; fileKey: Uint8Array; encryptedBlocks: BepBlockInfo[] } }>;
 }
 
 interface UploadedBlock {
@@ -540,9 +549,11 @@ async function resolveGlobalDiscoveryInternal(
     );
   }
   const payload = await response.json();
-  const rawAddresses: unknown[] = Array.isArray((payload as any)?.addresses)
-    ? (payload as any).addresses
-    : [];
+  const rawAddresses: unknown[] =
+    typeof payload === "object" && payload !== null &&
+    "addresses" in payload && Array.isArray(payload.addresses)
+      ? payload.addresses
+      : [];
   const candidates = dedupeCandidates(
     rawAddresses
       .map(parseDiscoveryCandidate)
@@ -771,7 +782,7 @@ class BepSession {
     this.keepaliveTimer = null;
   }
 
-  private onFrame(type: number, msg: any): void {
+  private onFrame(type: number, msg: unknown): void {
     if (
       type !== MessageTypeValues.PING &&
       type !== MessageTypeValues.INDEX &&
@@ -788,22 +799,23 @@ class BepSession {
     }
     switch (type) {
       case MessageTypeValues.CLUSTER_CONFIG:
-        void this.handleClusterConfig(msg);
+        void this.handleClusterConfig(msg as BepClusterConfig);
         break;
       case MessageTypeValues.INDEX:
       case MessageTypeValues.INDEX_UPDATE:
-        this.enqueueIndex(type, msg);
+        this.enqueueIndex(type, msg as BepIndex);
         break;
       case MessageTypeValues.RESPONSE:
-        this.handleResponse(msg);
+        this.handleResponse(msg as BepResponse);
         break;
       case MessageTypeValues.REQUEST:
-        void this.handleRequest(msg);
+        void this.handleRequest(msg as BepRequest);
         break;
       case MessageTypeValues.CLOSE: {
+        const close = msg as BepClose;
         const reason =
-          typeof msg?.reason === "string" && msg.reason.trim() !== ""
-            ? msg.reason.trim()
+          typeof close.reason === "string" && close.reason.trim() !== ""
+            ? close.reason.trim()
             : "Remote sent CLOSE";
         this.log("frame.close", { reason });
         this.onSocketClosed(new Error(`BEP close from remote: ${reason}`));
@@ -814,15 +826,15 @@ class BepSession {
     }
   }
 
-  private enqueueIndex(type: number, index: any): void {
+  private enqueueIndex(type: number, index: BepIndex): void {
     const folderId = String(index?.folder ?? "").trim();
     if (!folderId) {
       void this.handleIndex(index);
       return;
     }
-    const incoming: PendingIndexFrame = {
-      kind: type === MessageTypeValues.INDEX ? "index" : "update",
-      index,
+      const incoming: PendingIndexFrame = {
+        kind: type === MessageTypeValues.INDEX ? "index" : "update",
+        index: index as FolderIndexMessage,
     };
     const pending = this.pendingIndexByFolder.get(folderId);
     this.pendingIndexByFolder.set(
@@ -840,7 +852,7 @@ class BepSession {
         const next = this.pendingIndexByFolder.get(folderId);
         if (!next) break;
         this.pendingIndexByFolder.delete(folderId);
-        await this.handleIndex(next.index);
+        await this.handleIndex(next.index as BepIndex);
       }
     } finally {
       this.indexApplyInFlight.delete(folderId);
@@ -876,12 +888,12 @@ class BepSession {
     });
   }
 
-  private async handleClusterConfig(cfg: any): Promise<void> {
-    for (const folder of cfg.folders || []) {
-      const folderDevices = Array.isArray(folder.devices) ? folder.devices : [];
+  private async handleClusterConfig(cfg: BepClusterConfig): Promise<void> {
+    for (const folder of cfg.folders ?? []) {
+      const folderDevices = folder.devices ?? [];
       const advertisedDevices: AdvertisedDeviceInfo[] = folderDevices
-        .filter((device: any) => device?.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
-        .map((device: any) => ({
+        .filter((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
+        .map((device) => ({
           id: encodeDeviceId(device.id),
           name:
             typeof device.name === "string" && device.name.trim() !== ""
@@ -889,13 +901,13 @@ class BepSession {
               : undefined,
         }));
       const remoteDevice = this.remoteDeviceId
-        ? folderDevices.find((device: any) =>
+        ? folderDevices.find((device) =>
             bytesEqual(device.id, this.remoteDeviceId!),
           )
         : folderDevices.find(
-            (device: any) => !bytesEqual(device.id, this.localDeviceId),
+            (device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId),
           );
-      const localDeviceEntry = folderDevices.find((device: any) =>
+      const localDeviceEntry = folderDevices.find((device) =>
         device?.id instanceof Uint8Array && bytesEqual(device.id, this.localDeviceId),
       );
       const remoteIndexId =
@@ -904,8 +916,8 @@ class BepSession {
       const folderId = String(folder.id ?? "").trim();
       const stopReason = Number(folder.stop_reason ?? 0);
       const normalizedDeviceIds = folderDevices
-        .filter((device: any) => device?.id instanceof Uint8Array)
-        .map((device: any) => encodeDeviceId(device.id));
+        .filter((device) => device.id instanceof Uint8Array)
+        .map((device) => encodeDeviceId(device.id));
       const localToken =
         localDeviceEntry?.encryption_password_token instanceof Uint8Array
           ? localDeviceEntry.encryption_password_token
@@ -1010,16 +1022,14 @@ class BepSession {
     }
     if (!this.echoedClusterConfig) {
       this.echoedClusterConfig = true;
-      const folders = (cfg.folders || []).map((folder: any) => {
+      const folders = (cfg.folders ?? []).map((folder) => {
         const folderId = String(folder.id ?? "");
         const state = this.folders.get(folderId);
         const localFolderIndexId = this.localIndexIdForFolder(folderId);
-        const baseDevices = Array.isArray(folder.devices)
-          ? [...folder.devices]
-          : [];
+        const baseDevices = folder.devices ? [...folder.devices] : [];
         const devices = baseDevices
-          .filter((device: any) => !bytesEqual(device.id, this.localDeviceId))
-          .map((device: any) => {
+          .filter((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
+          .map((device) => {
             const next = { ...device };
             if (
               this.remoteDeviceId &&
@@ -1030,7 +1040,7 @@ class BepSession {
             }
             return next;
           });
-        const incomingLocalDevice = baseDevices.find((device: any) =>
+        const incomingLocalDevice = baseDevices.find((device) =>
           bytesEqual(device.id, this.localDeviceId),
         );
         const incomingLocalToken =
@@ -1055,7 +1065,7 @@ class BepSession {
         this.log("cluster.echo.folder.prepared", {
           folderId: String(folder.id ?? ""),
           stopReason: Number(folder.stop_reason ?? 0),
-          deviceCountIn: Array.isArray(folder.devices) ? folder.devices.length : 0,
+          deviceCountIn: folder.devices?.length ?? 0,
           deviceCountOut: devices.length,
           localDeviceInserted: true,
         });
@@ -1105,14 +1115,14 @@ class BepSession {
     }
   }
 
-  private async handleIndex(index: any): Promise<void> {
-    const folderId = index.folder;
+  private async handleIndex(index: BepIndex): Promise<void> {
+    const folderId = String(index.folder ?? "");
     const state = this.folders.get(folderId);
     if (!state) return;
     // Syncthing may send the initial index before the UI opens this folder.
     // Keep that authoritative snapshot; an empty INDEX frame from the client
     // does not make Syncthing resend an unchanged index.
-    const files = Array.isArray(index.files) ? index.files : [];
+    const files = index.files ?? [];
     this.log("index.received", {
       folderId,
       fileCount: files.length,
@@ -1148,15 +1158,13 @@ class BepSession {
             : new Uint8Array(file.encrypted ?? []);
         const originalFile =
           encryptedMetadata.length > 0
-            ? FileInfo.decode(decryptUntrustedBytes(fileKey, encryptedMetadata))
+          ? FileInfo.decode(decryptUntrustedBytes(fileKey, encryptedMetadata)) as unknown as BepFileInfo
             : file;
-        const encryptedBlocks = Array.isArray(file.blocks ?? file.Blocks)
-          ? (file.blocks ?? file.Blocks).map((block: any) => ({
-              offset: Number(block.offset ?? 0),
-              size: Number(block.size ?? 0),
-              hash: block.hash instanceof Uint8Array ? block.hash : new Uint8Array(block.hash ?? []),
-            }))
-          : [];
+        const encryptedBlocks = (file.blocks ?? file.Blocks ?? []).map((block) => ({
+          offset: Number(block.offset),
+          size: Number(block.size),
+          hash: block.hash,
+        }));
         state.files.set(plaintextName, {
           indexFile: originalFile,
           request: {
@@ -1190,8 +1198,8 @@ class BepSession {
     });
   }
 
-  private handleResponse(resp: any): void {
-    const id = resp.id;
+  private handleResponse(resp: BepResponse): void {
+    const id = Number(resp.id ?? 0);
     const entry = this.pending.get(id);
     if (!entry) return;
     this.pending.delete(id);
@@ -1265,7 +1273,7 @@ class BepSession {
     return next;
   }
 
-  private async handleRequest(req: any): Promise<void> {
+  private async handleRequest(req: BepRequest): Promise<void> {
     const id = Number(req?.id ?? 0);
     const folderId = String(req?.folder ?? "").trim();
     const path = String(req?.name ?? "");
@@ -1785,7 +1793,7 @@ class BepSession {
 
 async function readRemoteHello(
   socket: SyncpeerTlsSocket,
-): Promise<{ hello: any; leftover: Uint8Array }> {
+): Promise<{ hello: BepHello; leftover: Uint8Array }> {
   let buf = new Uint8Array(0);
   const magic = 0x2ea7d90b;
   while (true) {
@@ -1805,7 +1813,7 @@ async function readRemoteHello(
     if (buf.length < 6 + len) continue;
     const helloBuf = buf.slice(6, 6 + len);
     const leftover = buf.slice(6 + len);
-    const hello = Hello.decode(helloBuf);
+    const hello = Hello.decode(helloBuf) as unknown as BepHello;
     return { hello, leftover };
   }
 }
@@ -2270,6 +2278,7 @@ export function createSyncpeerCoreClient(
             "Connection timed out. This does not automatically mean approval is missing. " +
               "Approval is mainly a first-pairing possibility; previously connected devices usually time out for network/path reasons. " +
               `Technical details: ${message}`,
+            { cause: error },
           );
         }
         throw error;

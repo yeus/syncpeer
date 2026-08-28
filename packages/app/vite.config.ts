@@ -20,10 +20,10 @@ const APP_VERSION = resolvePackagedAppVersion(tauriConfig);
 export default defineConfig(({ mode }) => ({
   plugins: [svelte()],
   define: {
-    __SYNCPEER_APP_VERSION__: JSON.stringify(APP_VERSION),
-    __SYNCPEER_BUILD_COMMIT__: JSON.stringify(BUILD_COMMIT),
-    __SYNCPEER_BUILD_TIME_UTC__: JSON.stringify(BUILD_TIME_UTC),
-    __SYNCPEER_LAN_E2E__: JSON.stringify(mode === "lan-e2e"),
+    "import.meta.env.SYNCPEER_APP_VERSION": JSON.stringify(APP_VERSION),
+    "import.meta.env.SYNCPEER_BUILD_COMMIT": JSON.stringify(BUILD_COMMIT),
+    "import.meta.env.SYNCPEER_BUILD_TIME_UTC": JSON.stringify(BUILD_TIME_UTC),
+    "import.meta.env.SYNCPEER_LAN_E2E": JSON.stringify(mode === "lan-e2e"),
   },
   resolve: {
     alias: [

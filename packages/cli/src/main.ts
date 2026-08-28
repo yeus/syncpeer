@@ -205,7 +205,11 @@ async function main() {
       15000,
     );
 
-  const withSession = async (run: (remoteFs: any) => Promise<void>) => {
+  const withSession = async (
+    run: (
+      remoteFs: Awaited<ReturnType<typeof openRemoteFs>>["remoteFs"],
+    ) => Promise<void>,
+  ) => {
     const opts = program.opts<CliOptions>();
     const session = await openRemoteFs(opts);
     try {
@@ -320,9 +324,12 @@ async function main() {
       });
 
       console.log(`deviceId\t${opts.remoteId}`);
-      const addresses = Array.isArray((result.payload as any)?.addresses)
-        ? (result.payload as any).addresses
-        : [];
+      const payload = result.payload;
+      const addresses =
+        typeof payload === "object" && payload !== null && "addresses" in payload &&
+        Array.isArray(payload.addresses)
+          ? payload.addresses
+          : [];
       console.log(`rawAddresses\t${JSON.stringify(addresses)}`);
       for (const candidate of result.candidates) {
         console.log(

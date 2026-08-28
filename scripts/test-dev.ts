@@ -9,7 +9,9 @@ import {
   normalizeDeviceId,
 } from "../packages/core/src/ui/helpers.ts";
 
+// The test server prints peer-provided text; replace terminal controls before logging it.
 const terminalText = (value: string): string =>
+  // eslint-disable-next-line no-control-regex -- intentionally removes terminal controls
   value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
 
 const promptForApproval = async (

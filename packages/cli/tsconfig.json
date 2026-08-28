@@ -5,11 +5,7 @@
     "outDir": "dist",
     "declaration": true,
     "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "baseUrl": ".",
-    "paths": {
-      "@syncpeer/core/node": ["../core/src/node.d.ts"]
-    }
+    "moduleResolution": "NodeNext"
   },
   "include": ["src/**/*"]
 }

@@ -4,10 +4,7 @@ import {
   type SyncpeerSessionHandle,
   withRecoveringSession,
 } from "../client.js";
-import {
-  getDefaultDiscoveryServer,
-  normalizeDiscoveryServer,
-} from "./discoveryServer.js";
+import { normalizeDiscoveryServer } from "./discoveryServer.js";
 export { getDefaultDiscoveryServer, normalizeDiscoveryServer } from "./discoveryServer.js";
 import type {
   FileDownloadProgress,

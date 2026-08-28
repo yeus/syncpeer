@@ -37,7 +37,9 @@ function resolveSyncthingBin(): string | null {
     try {
       execFileSync(candidate, ["--help"], { stdio: "ignore" });
       return candidate;
-    } catch {}
+    } catch {
+      // Try the next candidate executable.
+    }
   }
   return null;
 }

@@ -18,7 +18,9 @@ const loadResolveNodeLocalDiscovery = async (): Promise<ResolveNodeLocalDiscover
     if (typeof mod.resolveNodeLocalDiscovery === "function") {
       return mod.resolveNodeLocalDiscovery;
     }
-  } catch {}
+  } catch {
+    // Fall back to the TypeScript source when the build is unavailable.
+  }
   const mod = (await import("../packages/core/src/node.ts")) as {
     resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
   };

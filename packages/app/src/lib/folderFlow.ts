@@ -1,4 +1,10 @@
-import type { ConnectOptions, RemoteFsLike, SyncpeerBrowserClient } from "@syncpeer/core/browser";
+import type {
+  ConnectOptions,
+  FileEntry,
+  FolderInfo,
+  RemoteFsLike,
+  SyncpeerBrowserClient,
+} from "@syncpeer/core/browser";
 import {
   makeReadDirWithRetryFlow,
   makeWaitForFolderIndexToArriveFlow,
@@ -30,7 +36,7 @@ export async function waitForFoldersToPopulateFlow(args: {
   isConnected?: () => boolean;
   getCurrentFolderCount: () => number;
   applyOverview: (overview: {
-    folders: any[];
+    folders: FolderInfo[];
     connectedVia: string;
     transportKind: "direct-tcp" | "relay";
   }) => void;
@@ -95,11 +101,10 @@ export async function readDirWithFrontendRetryFlow(args: {
   retryTimeoutMs?: number;
   retryIntervalMs?: number;
   logger?: FlowLogger;
-}): Promise<{ entries: any[]; attempts: ReadDirAttempt[] }> {
+}): Promise<{ entries: FileEntry[]; attempts: ReadDirAttempt[] }> {
   const flow = makeReadDirWithRetryFlow({
     sleep,
     log: args.logger,
   });
   return flow(args);
 }
-

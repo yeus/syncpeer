@@ -123,7 +123,6 @@
     onRemoveFavorite = () => {},
     onOpenCachedDirectory = () => {},
     onOpenCachedFile = () => {},
-    onOpenCachedFileDirectory = () => {},
     onRemoveCachedFile = () => {},
     onDownloadFile = () => {},
     onOpenOrDownloadFile = () => {},

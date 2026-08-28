@@ -23,13 +23,13 @@ const root = protobuf.parse(schemaText, { keepCase: true }).root;
 
 function lookupTypeAny(...names: string[]) {
   for (const name of names) {
-    try { return root.lookupType(name); } catch {}
+    try { return root.lookupType(name); } catch { continue; }
   }
   throw new Error(`Type not found in BEP schema: ${names.join(", ")}`);
 }
 function lookupEnumAny(...names: string[]) {
   for (const name of names) {
-    try { return root.lookupEnum(name); } catch {}
+    try { return root.lookupEnum(name); } catch { continue; }
   }
   throw new Error(`Enum not found in BEP schema: ${names.join(", ")}`);
 }
@@ -73,6 +73,80 @@ export interface DecodedHeader {
   compression?: MessageCompression;
 }
 
+export interface BepBlockInfo {
+  offset: number;
+  size: number;
+  hash: Uint8Array;
+}
+
+export interface BepFileInfo {
+  name: string;
+  type?: number;
+  size?: number;
+  modified_s?: number;
+  modified_ns?: number;
+  invalid?: boolean;
+  deleted?: boolean;
+  encrypted?: Uint8Array;
+  blocks?: BepBlockInfo[];
+  Blocks?: BepBlockInfo[];
+}
+
+export interface BepDeviceInfo {
+  id: Uint8Array;
+  name?: string;
+  addresses?: string[];
+  compression?: number;
+  cert_name?: string;
+  index_id?: number | string;
+  max_sequence?: number | string;
+  introducer?: boolean;
+  skip_introduction_removals?: boolean;
+  encryption_password_token?: Uint8Array;
+}
+
+export interface BepFolderInfo {
+  id?: string;
+  label?: string;
+  type?: number;
+  read_only?: boolean;
+  stop_reason?: number;
+  devices?: BepDeviceInfo[];
+}
+
+export interface BepClusterConfig {
+  folders?: BepFolderInfo[];
+}
+
+export interface BepIndex {
+  folder?: string;
+  files?: BepFileInfo[];
+}
+
+export interface BepResponse {
+  id?: number;
+  code?: number;
+  data?: Uint8Array;
+}
+
+export interface BepRequest {
+  id?: number;
+  folder?: string;
+  name?: string;
+  offset?: number;
+  size?: number;
+}
+
+export interface BepClose {
+  reason?: string;
+}
+
+export interface BepHello {
+  device_name?: string;
+  client_name?: string;
+  client_version?: string;
+}
+
 export function encodeHelloFrame(message: Record<string, unknown>): Uint8Array {
   const encoded = Hello.encode(Hello.create(message)).finish();
   if (encoded.length > 0xffff) throw new Error("Hello frame too long");
@@ -109,7 +183,7 @@ export class FrameParser {
       const headerBuf = this.buffer.subarray(2, 2 + headerLen);
       const header = Header.decode(headerBuf) as unknown as DecodedHeader;
       let messageBuf = this.buffer.subarray(msgLenOffset + 4, totalLen);
-      const compression = Number((header as any).compression ?? MessageCompressionValues.NONE);
+      const compression = Number(header.compression ?? MessageCompressionValues.NONE);
       if (compression === MessageCompressionValues.LZ4) {
         if (messageBuf.length < 4) throw new Error(`LZ4 message too short (${messageBuf.length})`);
         const view = new DataView(messageBuf.buffer, messageBuf.byteOffset, messageBuf.byteLength);

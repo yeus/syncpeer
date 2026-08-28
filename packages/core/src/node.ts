@@ -426,17 +426,16 @@ function tryParseLocalDiscoveryPacket(
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
   const magic = view.getUint32(0, false);
   if (magic !== LOCAL_DISCOVERY_MAGIC) return null;
-  let decoded: any;
+  let decoded: { id?: unknown; addresses?: unknown };
   try {
-    decoded = LocalDiscoveryAnnounce.decode(packet.slice(4));
+    decoded = LocalDiscoveryAnnounce.decode(packet.slice(4)) as unknown as {
+      id?: unknown;
+      addresses?: unknown;
+    };
   } catch {
     return null;
   }
-  const id = decoded?.id instanceof Uint8Array
-    ? decoded.id
-    : decoded?.id?.buffer
-      ? new Uint8Array(decoded.id)
-      : null;
+  const id = decoded.id instanceof Uint8Array ? decoded.id : null;
   if (!id || id.length === 0) return null;
   const addresses = Array.isArray(decoded?.addresses)
     ? decoded.addresses

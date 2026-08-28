@@ -3,7 +3,7 @@ import App from "./App.svelte";
 import "./lib/styles/tokens.css";
 import "./lib/styles/base.css";
 
-if (__SYNCPEER_LAN_E2E__) {
+if (import.meta.env.SYNCPEER_LAN_E2E === true) {
   await import("@wdio/tauri-plugin");
 }
 

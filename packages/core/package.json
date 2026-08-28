@@ -7,20 +7,20 @@
   },
   "exports": {
     ".": {
-      "import": "./src/index.ts",
-      "types": "./src/index.d.ts"
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
     },
     "./pim": {
-      "import": "./src/pim/index.ts",
-      "types": "./src/pim/index.ts"
+      "import": "./dist/pim/index.js",
+      "types": "./dist/pim/index.d.ts"
     },
     "./node": {
       "import": "./dist/node.js",
       "types": "./dist/node.d.ts"
     },
     "./browser": {
-      "import": "./src/browser.ts",
-      "types": "./src/browser.d.ts"
+      "import": "./dist/browser.js",
+      "types": "./dist/browser.d.ts"
     }
   },
   "dependencies": {
@@ -28,5 +28,9 @@
     "@noble/hashes": "^2.0.1",
     "lz4js": "^0.2.0",
     "protobufjs": "^8.0.1"
+  },
+  "devDependencies": {
+    "@types/lz4js": "^0.2.2",
+    "vite": "^6.4.2"
   }
 }

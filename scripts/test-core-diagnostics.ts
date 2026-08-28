@@ -3,12 +3,12 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   ClusterConfig,
-  Close,
   encodeHelloFrame,
   encodeMessageFrame,
   FrameParser,
   Index,
   MessageTypeValues,
+  type BepClusterConfig,
 } from "../packages/core/dist/core/protocol/bep.js";
 import {
   createSyncpeerCoreClient,
@@ -17,6 +17,7 @@ import {
 import {
   createSyncpeerSessionStore,
   makeReadDirWithRetryFlow,
+  type RemoteFsLike,
 } from "../packages/core/dist/browser.js";
 import type { RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
 import {
@@ -281,7 +282,7 @@ const encryptedSession = await encryptedClient.openSession({
   discoveryMode: "direct",
   folderPasswords: { [encryptedFolderId]: encryptedFolderPassword },
 });
-const echoedEncryptedConfigs: any[] = [];
+const echoedEncryptedConfigs: BepClusterConfig[] = [];
 const encryptedWriteParser = new FrameParser((type, message) => {
   if (type === MessageTypeValues.CLUSTER_CONFIG) {
     echoedEncryptedConfigs.push(message);
@@ -446,7 +447,7 @@ const noIndexFolder = {
   encrypted: true,
   needsPassword: false,
 };
-const noIndexFs = {
+const noIndexFs: RemoteFsLike = {
   listFolders: async () => [noIndexFolder],
   requestFolderIndex: async () => undefined,
   setFocusedFolder: () => undefined,
@@ -454,7 +455,13 @@ const noIndexFs = {
     noIndexReadDirCalls += 1;
     return [];
   },
-} as any;
+  readFileFully: async () => {
+    throw new Error("readFileFully is not used by the no-index test");
+  },
+  writeFileFully: async () => {
+    throw new Error("writeFileFully is not used by the no-index test");
+  },
+};
 const noIndexOverview = {
   folders: [noIndexFolder],
   device: null,

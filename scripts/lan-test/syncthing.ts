@@ -284,18 +284,19 @@ const startProcess = (
 const stopProcess = async (child: ChildProcess | null): Promise<void> => {
   if (!child || child.exitCode !== null) return;
   await new Promise<void>((resolve) => {
-    let timer: NodeJS.Timeout;
-    const finish = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    timer = setTimeout(() => {
+    const timer = setTimeout(() => {
       child.kill("SIGKILL");
       resolve();
     }, 5000);
-    child.once("exit", finish);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
     child.kill("SIGTERM");
-    if (child.exitCode !== null) finish();
+    if (child.exitCode !== null) {
+      clearTimeout(timer);
+      resolve();
+    }
   });
 };
 

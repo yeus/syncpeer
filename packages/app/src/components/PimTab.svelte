@@ -1,8 +1,9 @@
 <script lang="ts">
+  import type { AppState } from "../app/state.ts";
   import Panel from "./Panel.svelte";
 
   interface Props {
-    app: any;
+    app: AppState;
     onPickAndroidPimDirectory: () => void;
     onInitializePimFolder: () => void;
     onSyncAndroidPimNow: () => void;
@@ -147,7 +148,7 @@
 
 <Panel title="PIM Status">
   <div class="status-list">
-    {#each statusRows as row}
+    {#each statusRows as row (row.label)}
       <p class="status-line"><strong>{row.label}:</strong> {row.value}</p>
     {/each}
     <p class="hint">

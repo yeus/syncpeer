@@ -1,13 +1,15 @@
 <script lang="ts">
+  import type { AdvertisedDeviceItem } from "@syncpeer/core/browser";
   import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
   import { detectRuntimeEnvironment, detectRuntimeSurface } from "../lib/runtimeInfo.ts";
+  import type { AppState } from "../app/state.ts";
 
   interface Props {
-    app: any;
-    advertisedDevices: any[];
+    app: AppState;
+    advertisedDevices: AdvertisedDeviceItem[];
     isSavedDeviceConnected: (deviceId: string) => boolean;
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
     isLanDiscoveredDevice: (deviceId: string) => boolean;
@@ -24,7 +26,7 @@
     onCopyIdentityBackupSecret: () => void;
     onRestoreIdentityRecovery: () => void;
     onAddSavedDevice: () => void;
-    onApproveAdvertisedDevice: (device: any) => void;
+    onApproveAdvertisedDevice: (device: AdvertisedDeviceItem) => void;
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
@@ -57,9 +59,9 @@
     onConnectLocalCandidate,
   }: Props = $props();
 
-  const appVersion = __SYNCPEER_APP_VERSION__ || "0.0.0";
-  const buildCommit = __SYNCPEER_BUILD_COMMIT__ || "unknown";
-  const buildTimeUtc = __SYNCPEER_BUILD_TIME_UTC__ || "";
+  const appVersion = String(import.meta.env.SYNCPEER_APP_VERSION || "0.0.0");
+  const buildCommit = String(import.meta.env.SYNCPEER_BUILD_COMMIT || "unknown");
+  const buildTimeUtc = String(import.meta.env.SYNCPEER_BUILD_TIME_UTC || "");
   const runtimeEnvironment = detectRuntimeEnvironment();
   const runtimeSurface = detectRuntimeSurface();
   const buildMode = import.meta.env.DEV ? "development" : "production";
@@ -76,7 +78,7 @@
   ));
 
   let deviceRows = $derived.by(() => {
-    const savedRows = app.devices.savedDevices.map((device: any) => {
+    const savedRows = app.devices.savedDevices.map((device) => {
       const isConnected = isSavedDeviceConnected(device.id);
       const isLanDetected = isLanDiscoveredDevice(device.id);
       const lanMeta =
@@ -109,16 +111,16 @@
     });
 
     const connected = savedRows
-      .filter((row: any) => row.isConnected)
-      .sort((left: any, right: any) => left.name.localeCompare(right.name));
+      .filter((row) => row.isConnected)
+      .sort((left, right) => left.name.localeCompare(right.name));
     const savedNotConnected = savedRows
-      .filter((row: any) => !row.isConnected)
-      .sort((left: any, right: any) => left.name.localeCompare(right.name));
+      .filter((row) => !row.isConnected)
+      .sort((left, right) => left.name.localeCompare(right.name));
 
     const notApproved = advertisedDevices
-      .filter((device: any) => !device.accepted)
-      .sort((left: any, right: any) => left.name.localeCompare(right.name))
-      .map((device: any) => ({
+      .filter((device) => !device.accepted)
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((device) => ({
         kind: "advertised" as const,
         id: `advertised:${device.id}`,
         name: device.name,
@@ -127,7 +129,7 @@
         metaLines: [`Seen in folders: ${device.sourceFolderIds.join(", ")}`],
       }));
 
-    const localCandidates = app.devices.lanAnonymousCandidates.map((candidate: any) => {
+    const localCandidates = app.devices.lanAnonymousCandidates.map((candidate) => {
       const firstAddress = String(candidate.addresses?.[0] ?? "");
       const isLocalHost =
         firstAddress.includes("127.0.0.1") || firstAddress.includes("localhost");

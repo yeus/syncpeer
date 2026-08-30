@@ -36,7 +36,11 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { reportUiError } from "../lib/tauriAdapters.js";
 import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
-import { detectRuntimeEnvironment, detectRuntimeSurface } from "../lib/runtimeInfo.ts";
+import {
+  detectRuntimeEnvironment,
+  detectRuntimeSurface,
+  supportsOngoingTransferNotifications,
+} from "../lib/runtimeInfo.ts";
 import {
   buildDiagnosticsRegistry,
   runDiagnosticsTests,
@@ -535,8 +539,9 @@ export const createAppActions = (args: {
     id: number,
     title: string,
     body: string,
-    options?: { ongoing?: boolean; force?: boolean },
+    options?: { ongoing?: boolean; force?: boolean; progress?: boolean },
   ) => {
+    if (options?.progress && !supportsOngoingTransferNotifications(runtimeSurface)) return;
     const now = Date.now();
     if (!options?.force && now - lastTransferNotificationAtMs < 2000) return;
     const granted = await ensureNativeNotificationPermission();
@@ -557,6 +562,7 @@ export const createAppActions = (args: {
   };
 
   const clearTransferNotification = async (id: number) => {
+    if (!supportsOngoingTransferNotifications(runtimeSurface)) return;
     try {
       await removeActiveNativeNotifications([{ id }]);
     } catch {
@@ -1451,7 +1457,7 @@ export const createAppActions = (args: {
           DOWNLOAD_NOTIFICATION_ID,
           "Syncpeer download",
           `${name}: ${state.favorites.activeDownloadText}`,
-          { ongoing: true },
+          { ongoing: true, progress: true },
         );
         const now = Date.now();
         if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
@@ -1912,7 +1918,7 @@ export const createAppActions = (args: {
         UPLOAD_NOTIFICATION_ID,
         "Syncpeer upload",
         `${fileName}: ${uploadNotice}`,
-        { ongoing: pct < 100 },
+        { ongoing: pct < 100, progress: true },
       );
     };
     try {

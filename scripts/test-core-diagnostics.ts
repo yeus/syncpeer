@@ -34,6 +34,7 @@ import { resolvePackagedAppVersion } from "../packages/app/buildInfo.ts";
 import {
   classifyRuntimeEnvironment,
   detectRuntimeEnvironment,
+  supportsOngoingTransferNotifications,
 } from "../packages/app/src/lib/runtimeInfo.ts";
 import {
   getDefaultDiscoveryServer,
@@ -178,6 +179,9 @@ assert.equal(
   classifyRuntimeEnvironment({ hasNodeRuntime: false, hasTauriRuntime: false }),
   "browser",
 );
+assert.equal(supportsOngoingTransferNotifications("android-ui"), true);
+assert.equal(supportsOngoingTransferNotifications("desktop-ui"), false);
+assert.equal(supportsOngoingTransferNotifications("web-ui"), false);
 
 const runtimeGlobal = globalThis as { __TAURI_INTERNALS__?: unknown };
 const previousTauriInternals = runtimeGlobal.__TAURI_INTERNALS__;

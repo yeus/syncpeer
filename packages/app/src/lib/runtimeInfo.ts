@@ -1,6 +1,9 @@
 export type RuntimeSurface = "cli" | "desktop-ui" | "android-ui" | "web-ui";
 export type RuntimeEnvironment = "tauri" | "browser" | "node";
 
+export const supportsOngoingTransferNotifications = (surface: RuntimeSurface) =>
+  surface === "android-ui";
+
 export const classifyRuntimeEnvironment = (signals: {
   hasNodeRuntime: boolean;
   hasTauriRuntime: boolean;

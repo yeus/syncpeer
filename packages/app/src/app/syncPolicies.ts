@@ -1,5 +1,6 @@
 import { normalizeDeviceId } from "@syncpeer/core/browser";
 import type {
+  ConnectionScope,
   FolderInfo,
   FolderSyncState,
   RemoteDeviceInfo,
@@ -35,6 +36,7 @@ export const saveOfflineSnapshot = (
     folderSyncStates: FolderSyncState[];
     connectedVia: string;
     transportKind: "direct-tcp" | "relay" | "";
+    connectionScope?: ConnectionScope | "";
   },
 ) => {
   const deviceId = normalizeDeviceId(sourceDeviceId);
@@ -49,6 +51,7 @@ export const saveOfflineSnapshot = (
       folderSyncStates: snapshot.folderSyncStates,
       connectedVia: snapshot.connectedVia,
       transportKind: snapshot.transportKind,
+      connectionScope: snapshot.connectionScope ?? "",
       lastSeenAtMs: Date.now(),
     },
   };
@@ -91,6 +94,7 @@ export const restoreOfflineSnapshot = (
   state.session.remoteDevice = snapshot.remoteDevice;
   state.session.connectionPath = snapshot.connectedVia;
   state.session.connectionTransport = snapshot.transportKind;
+  state.session.connectionScope = snapshot.connectionScope ?? "";
   if (
     state.session.currentFolderId &&
     !snapshot.folders.some((folder) => folder.id === state.session.currentFolderId)

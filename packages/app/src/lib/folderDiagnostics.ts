@@ -1,5 +1,6 @@
 import type {
   ConnectOptions,
+  ConnectionScope,
   FolderSyncState,
   SessionTraceEvent,
   SyncpeerBrowserClient,
@@ -47,6 +48,7 @@ export interface FolderDiagnosticsReport {
   overview: {
     connectedVia: string;
     transportKind: "direct-tcp" | "relay";
+    connectionScope?: ConnectionScope;
     folderCount: number;
     folderIds: string[];
     folderSyncStates: FolderSyncState[];
@@ -129,6 +131,7 @@ export async function runFolderContentDiagnostics(args: {
     folderCount: connectedState.folders.length,
     connectedVia: connectedState.connectionPath,
     transportKind: connectedState.connectionTransport || "direct-tcp",
+    connectionScope: connectedState.connectionScope || undefined,
   });
 
   const polling: FolderDiagnosticsReport["polling"] = [];
@@ -326,6 +329,7 @@ export async function runFolderContentDiagnostics(args: {
     overview: {
       connectedVia: session.getState().connectionPath,
       transportKind: session.getState().connectionTransport || "direct-tcp",
+      connectionScope: session.getState().connectionScope || undefined,
       folderCount: foldersToCheck.length,
       folderIds: foldersToCheck.map((folder) => folder.id),
       folderSyncStates: latestSyncStates,

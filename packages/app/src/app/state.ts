@@ -18,6 +18,7 @@ import {
   sameDeviceId,
   toConnectionSettings,
   type CachedFileRecord,
+  type ConnectionScope,
   type FileEntry,
   type FolderInfo,
   type FolderSyncState,
@@ -144,6 +145,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       remoteDevice: null as RemoteDeviceInfo | null,
       connectionPath: "",
       connectionTransport: "" as "direct-tcp" | "relay" | "",
+      connectionScope: "" as ConnectionScope | "",
       folders: [] as FolderInfo[],
       folderSyncStates: [] as FolderSyncState[],
       directory: {
@@ -297,6 +299,7 @@ export interface OfflineFolderSnapshot {
   folderSyncStates: FolderSyncState[];
   connectedVia: string;
   transportKind: "direct-tcp" | "relay" | "";
+  connectionScope?: ConnectionScope | "";
   lastSeenAtMs: number;
 }
 
@@ -407,6 +410,7 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.remoteDevice = next.remoteDevice;
   state.session.connectionPath = next.connectionPath;
   state.session.connectionTransport = next.connectionTransport;
+  state.session.connectionScope = next.connectionScope;
   if (next.lastError) {
     state.ui.recentError = next.lastError;
   }
@@ -644,4 +648,9 @@ export const downloadProgressText = (
 
 export const downloadTransportText = (
   transportKind: "direct-tcp" | "relay" | "" | undefined,
-) => transportKind === "relay" ? "relay" : "direct";
+  connectionScope?: ConnectionScope | "",
+) => {
+  const transport = transportKind === "relay" ? "relay" : "direct";
+  const scope = connectionScope === "lan" ? "LAN" : connectionScope === "wan" ? "WAN" : "unknown";
+  return `${transport} · ${scope}`;
+};

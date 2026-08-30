@@ -15,6 +15,8 @@ import {
   sameDeviceId,
   type BreadcrumbSegment,
   type FileEntry,
+  type FileDownloadResult,
+  type FileDownloadSink,
 } from "@syncpeer/core/browser";
 import {
   canonicalRecordPath,
@@ -689,6 +691,7 @@ export const createAppActions = (args: {
         folderSyncStates: session.folderSyncStates,
         connectedVia: session.connectionPath,
         transportKind: session.connectionTransport,
+        connectionScope: session.connectionScope,
       });
       applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       state.session.lastUpdatedAt = nowTime();
@@ -783,6 +786,7 @@ export const createAppActions = (args: {
         folderSyncStates: session.folderSyncStates,
         connectedVia: session.connectionPath,
         transportKind: session.connectionTransport,
+        connectionScope: session.connectionScope,
       });
       applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       if (
@@ -1389,12 +1393,18 @@ export const createAppActions = (args: {
     let lastTransferLogAtMs = 0;
     let activeTransportKind = state.session.connectionTransport;
     let activeConnectedVia = state.session.connectionPath;
+    let activeConnectionScope = state.session.connectionScope;
     let downloadCompleted = false;
+    let activeSink: FileDownloadSink | null = null;
+    let transferServiceStarted = false;
     const downloadKey = cachedFileKey(folderId, path);
     const remoteFs = state.session.remoteFs;
     state.favorites.activeDownloadKey = downloadKey;
     state.favorites.activeDownloadText =
-      `0% • 0 B/s • ETA -- • ${downloadTransportText(state.session.connectionTransport)}`;
+      `0% • 0 B/s • ETA -- • ${downloadTransportText(
+        state.session.connectionTransport,
+        state.session.connectionScope,
+      )}`;
     setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
     void maybeTransferNotification(
       DOWNLOAD_NOTIFICATION_ID,
@@ -1408,63 +1418,77 @@ export const createAppActions = (args: {
       fileName: name,
     });
     try {
-      const bytes = await downloadRemoteFile(remoteFs, {
-        folderId,
-        path,
-        onProgress: ({
+      await client.startTransfer?.(name);
+      transferServiceStarted = true;
+      const onProgress = ({
+        downloadedBytes,
+        totalBytes,
+        transportKind,
+        connectedVia,
+        connectionScope,
+      }: {
+        downloadedBytes: number;
+        totalBytes: number;
+        transportKind?: "direct-tcp" | "relay";
+        connectedVia?: string;
+        connectionScope?: "lan" | "wan" | "unknown";
+      }) => {
+        activeTransportKind = transportKind ?? activeTransportKind;
+        activeConnectedVia = connectedVia ?? activeConnectedVia;
+        activeConnectionScope = connectionScope ?? activeConnectionScope;
+        const elapsedMs = elapsedMsSince(startedAt);
+        const rateBps = averageRateBps(downloadedBytes, elapsedMs);
+        state.favorites.activeDownloadText = downloadProgressText(
           downloadedBytes,
           totalBytes,
-          transportKind,
-          connectedVia,
-        }: {
-          downloadedBytes: number;
-          totalBytes: number;
-          transportKind?: "direct-tcp" | "relay";
-          connectedVia?: string;
-        }) => {
-          activeTransportKind = transportKind ?? activeTransportKind;
-          activeConnectedVia = connectedVia ?? activeConnectedVia;
-          const elapsedMs = elapsedMsSince(startedAt);
-          const rateBps = averageRateBps(downloadedBytes, elapsedMs);
-          state.favorites.activeDownloadText = downloadProgressText(
+          elapsedMs / 1000,
+        ) + ` • ${downloadTransportText(
+          transportKind ?? state.session.connectionTransport,
+          connectionScope ?? state.session.connectionScope,
+        )}`;
+        setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
+        void maybeTransferNotification(
+          DOWNLOAD_NOTIFICATION_ID,
+          "Syncpeer download",
+          `${name}: ${state.favorites.activeDownloadText}`,
+          { ongoing: true },
+        );
+        const now = Date.now();
+        if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
+          lastTransferLogAtMs = now;
+          pushSessionLog(state, "info", "download.progress", `Downloading ${name}`, {
+            folderId,
+            path,
             downloadedBytes,
             totalBytes,
-            elapsedMs / 1000,
-          ) + ` • ${downloadTransportText(transportKind ?? state.session.connectionTransport)}`;
-          setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
-          void maybeTransferNotification(
-            DOWNLOAD_NOTIFICATION_ID,
-            "Syncpeer download",
-            `${name}: ${state.favorites.activeDownloadText}`,
-            { ongoing: true },
-          );
-          const now = Date.now();
-          if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
-            lastTransferLogAtMs = now;
-            pushSessionLog(state, "info", "download.progress", `Downloading ${name}`, {
-              folderId,
-              path,
-              downloadedBytes,
-              totalBytes,
-              elapsedMs,
-              rateBps: Math.round(rateBps),
-              rate: formatRateSafe(rateBps),
-              transportKind: transportKind ?? state.session.connectionTransport,
-              connectedVia,
-            });
-          }
-        },
-      });
+            elapsedMs,
+            rateBps: Math.round(rateBps),
+            rate: formatRateSafe(rateBps),
+            transportKind: transportKind ?? state.session.connectionTransport,
+            connectedVia,
+            connectionScope: connectionScope ?? state.session.connectionScope,
+          });
+        }
+      };
+      let downloadResult: FileDownloadResult;
+      if (remoteFs.readFileToSink && client.createFileDownloadSink) {
+        const sink = await client.createFileDownloadSink({ folderId, path, name });
+        activeSink = sink;
+        downloadResult = await remoteFs.readFileToSink(folderId, path, sink, onProgress);
+      } else {
+        const bytes = await downloadRemoteFile(remoteFs, { folderId, path, onProgress });
+        await client.cacheFile(folderId, path, name, bytes);
+        downloadResult = { bytesWritten: bytes.length, totalBytes: bytes.length };
+      }
       const elapsedMs = elapsedMsSince(startedAt);
-      const rateBps = averageRateBps(bytes.length, elapsedMs);
-      await client.cacheFile(folderId, path, name, bytes);
+      const rateBps = averageRateBps(downloadResult.bytesWritten, elapsedMs);
       updateCachedKey(state, folderId, path, true);
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
       state.favorites.activeDownloadText =
-        `100% • Done • ${downloadTransportText(activeTransportKind)}`;
+        `100% • Done • ${downloadTransportText(activeTransportKind, activeConnectionScope)}`;
       downloadCompleted = true;
       setDownloadNotice(
-        `Downloaded ${name} via ${downloadTransportText(activeTransportKind)}`,
+        `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}`,
         4000,
       );
       void maybeTransferNotification(
@@ -1476,17 +1500,25 @@ export const createAppActions = (args: {
       pushSessionLog(state, "info", "download.complete", `Downloaded ${name}`, {
         folderId,
         path,
-        sizeBytes: bytes.length,
+        sizeBytes: downloadResult.bytesWritten,
         elapsedMs,
         rateBps: Math.round(rateBps),
         rate: formatRateSafe(rateBps),
         transportKind: activeTransportKind,
         connectedVia: activeConnectedVia,
+        connectionScope: activeConnectionScope,
       });
       if (options?.openAfterDownload) {
         await openCachedFile(folderId, path);
       }
     } catch (error) {
+      if (activeSink) {
+        try {
+          await activeSink.abort(error);
+        } catch (abortError) {
+          reportActionError(state, "download_file.abort_failed", abortError, { folderId, path });
+        }
+      }
       reportActionError(state, "download_file.failed", error, { folderId, path });
       setDownloadNotice(`Download failed: ${name}`, 6000);
       void maybeTransferNotification(
@@ -1496,6 +1528,13 @@ export const createAppActions = (args: {
         { ongoing: false, force: true },
       );
     } finally {
+      if (transferServiceStarted) {
+        try {
+          await client.stopTransfer?.();
+        } catch (error) {
+          reportActionError(state, "download_file.stop_service_failed", error, { folderId, path });
+        }
+      }
       state.favorites.isDownloading = false;
       if (state.favorites.activeDownloadKey === downloadKey) {
         state.favorites.activeDownloadKey = "";
@@ -2624,6 +2663,28 @@ export const createAppActions = (args: {
             skipped: true,
             reason: error instanceof Error ? error.message : String(error),
           };
+        }
+      },
+    },
+    {
+      test: {
+        id: "android.transfer_runtime_command",
+        name: "Android Transfer Runtime Command",
+        description: "Starts and stops the Android UIDT or legacy transfer runtime.",
+        categoryId: "android",
+      },
+      fn: async () => {
+        if (detectRuntimeSurface() !== "android-ui") {
+          return { skipped: true, reason: "Android UI runtime required." };
+        }
+        if (!client.startTransfer || !client.stopTransfer) {
+          return { skipped: true, reason: "Transfer service bridge is unavailable." };
+        }
+        await client.startTransfer("Diagnostics transfer");
+        try {
+          return { supported: true, started: true };
+        } finally {
+          await client.stopTransfer();
         }
       },
     },

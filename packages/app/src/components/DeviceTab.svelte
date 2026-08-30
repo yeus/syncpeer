@@ -5,7 +5,7 @@
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
   import { detectRuntimeEnvironment, detectRuntimeSurface } from "../lib/runtimeInfo.ts";
-  import type { AppState } from "../app/state.ts";
+  import { downloadTransportText, type AppState } from "../app/state.ts";
 
   interface Props {
     app: AppState;
@@ -92,7 +92,7 @@
         ? [
             clientLabel ? `Client: ${clientLabel}` : "",
             app.session.connectionPath
-              ? `Connected via ${app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}: ${app.session.connectionPath}`
+              ? `Connected via ${downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}: ${app.session.connectionPath}`
               : "",
             lanMeta,
           ].filter((line: string) => line !== "")
@@ -158,7 +158,7 @@
 </script>
 
 <Panel title="Devices">
-  <div class="status-row">
+  <div class="status-row" data-testid="connection-status">
     <StatusChip tone={app.session.isConnected ? "online" : "offline"}>
       {app.session.isConnected ? "Connected" : "Disconnected"}
     </StatusChip>
@@ -168,7 +168,7 @@
     {#if app.session.isConnected && app.session.connectionPath}
       <span>
         Path:
-        {app.session.connectionTransport === "relay" ? "relay" : "direct tcp"}
+        {downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}
         ({app.session.connectionPath})
       </span>
     {/if}
@@ -347,7 +347,7 @@
 
         <label>
           Saved Devices
-          <select bind:value={app.devices.selectedSavedDeviceId}>
+          <select data-testid="connection-saved-device" bind:value={app.devices.selectedSavedDeviceId}>
             <option value="">Manual entry</option>
             {#each app.devices.savedDevices as device (device.id)}
               <option value={device.id}>{device.name}</option>

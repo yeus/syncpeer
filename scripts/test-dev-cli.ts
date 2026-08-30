@@ -171,13 +171,22 @@ const diagnosticsTests = (serverDeviceId: string): DiagnosticsBuiltinTest[] => {
     test("downloadLargeFile", () => {
       fs.mkdirSync(root, { recursive: true });
       const outputPath = path.join(root, "cli-blob.bin");
+      const startedAt = Date.now();
       base("download", [fixtureFolderId, "blob.bin", outputPath]);
+      const elapsedMs = Math.max(1, Date.now() - startedAt);
       const actualHash = sha256File(outputPath);
       const expectedHash = fixtureBlobHash();
       if (actualHash !== expectedHash) {
         throw new Error(`blob.bin hash mismatch: expected ${expectedHash}, got ${actualHash}`);
       }
-      return { outputPath, bytes: fs.statSync(outputPath).size, sha256: actualHash };
+      const bytes = fs.statSync(outputPath).size;
+      return {
+        outputPath,
+        bytes,
+        sha256: actualHash,
+        elapsedMs,
+        mibPerSecond: bytes / 1024 / 1024 * 1000 / elapsedMs,
+      };
     }, 240_000),
     test("uploadAndDownloadRoundTrip", async () => {
       fs.mkdirSync(root, { recursive: true });

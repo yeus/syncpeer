@@ -8,6 +8,7 @@ import type {
   SyncpeerHostAdapter,
   SyncpeerPlatformAdapter,
   SyncpeerTlsSocket,
+  FileDownloadSink,
 } from "@syncpeer/core/browser";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -372,6 +373,52 @@ export const createTauriAdapters = (
       await invokeWithLogging("syncpeer_cache_file", {
         request: { folderId, path, name, bytes: Array.from(bytes), modifiedMs: modifiedMs ?? null },
       });
+    },
+    createFileDownloadSink: async ({ folderId, path, name, modifiedMs }): Promise<FileDownloadSink> => {
+      let transferId: string | null = null;
+      let committed = false;
+      return {
+        begin: async (metadata) => {
+          if (transferId) return;
+          const response = await invokeWithLogging<{ transferId: string }>(
+            "syncpeer_cache_begin_file",
+            {
+              request: {
+                folderId,
+                path,
+                name,
+                sizeBytes: metadata.sizeBytes,
+                modifiedMs: modifiedMs ?? null,
+              },
+            },
+          );
+          transferId = response.transferId;
+        },
+        write: async (offset, bytes) => {
+          if (!transferId || committed) throw new Error("Download sink is not writable.");
+          await invokeWithLogging("syncpeer_cache_write_chunk", {
+            request: { transferId, offset, bytes: Array.from(bytes) },
+          });
+        },
+        commit: async () => {
+          if (!transferId || committed) return;
+          await invokeWithLogging("syncpeer_cache_commit", { request: { transferId } });
+          committed = true;
+        },
+        abort: async () => {
+          if (!transferId || committed) return;
+          await invokeWithLogging("syncpeer_cache_abort", { request: { transferId } });
+          transferId = null;
+        },
+      };
+    },
+    startTransfer: async (label: string) => {
+      await invokeWithLogging("syncpeer_android_start_transfer_service", {
+        request: { label },
+      });
+    },
+    stopTransfer: async () => {
+      await invokeWithLogging("syncpeer_android_stop_transfer_service");
     },
     getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
       invokeWithLogging<CachedFileStatus[]>("syncpeer_get_cached_statuses", { request: { folderId, paths } }),

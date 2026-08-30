@@ -3,10 +3,15 @@ package dev.syncpeer.plugin.android
 import android.Manifest
 import android.content.ContentUris
 import android.content.ContentValues
+import android.app.job.JobInfo
+import android.app.job.JobScheduler
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.PersistableBundle
 import android.webkit.MimeTypeMap
 import android.app.Activity
 import android.content.Context
@@ -24,6 +29,7 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
 import java.io.File
+import java.io.FileInputStream
 
 @InvokeArg
 class OpenWithChooserArgs {
@@ -38,6 +44,19 @@ class SafWriteFileArgs {
   var relativePath: String = ""
   var bytes: List<Int> = emptyList()
   var mimeType: String? = null
+}
+
+@InvokeArg
+class SafCopyFileArgs {
+  var treeUri: String = ""
+  var relativePath: String = ""
+  var sourcePath: String = ""
+  var mimeType: String? = null
+}
+
+@InvokeArg
+class TransferServiceArgs {
+  var label: String = "File transfer"
 }
 
 @InvokeArg
@@ -87,6 +106,71 @@ class AndroidCalendarDeleteArgs {
 @TauriPlugin
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private var multicastLock: WifiManager.MulticastLock? = null
+
+  @Command
+  fun startTransferService(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(TransferServiceArgs::class.java)
+      val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        scheduleUserInitiatedTransfer(args.label)
+      } else {
+        startForegroundTransfer(args.label)
+      }
+      invoke.resolveObject(result)
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not start transfer runtime.")
+    }
+  }
+
+  @Command
+  fun stopTransferService(invoke: Invoke) {
+    try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        val scheduler = activity.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler
+        scheduler?.cancel(SyncpeerTransferConstants.JOB_ID)
+      }
+      activity.stopService(Intent(activity, SyncpeerTransferService::class.java))
+      invoke.resolveObject(mapOf("stopped" to true))
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not stop transfer runtime.")
+    }
+  }
+
+  private fun startForegroundTransfer(label: String): Map<String, Any> {
+    val intent = Intent(activity, SyncpeerTransferService::class.java)
+      .putExtra(SyncpeerTransferService.EXTRA_LABEL, label)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      ContextCompat.startForegroundService(activity, intent)
+    } else {
+      activity.startService(intent)
+    }
+    return mapOf("started" to true, "mode" to "foreground-service")
+  }
+
+  private fun scheduleUserInitiatedTransfer(label: String): Map<String, Any> {
+    val scheduler = activity.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler
+      ?: throw IllegalStateException("JobScheduler is unavailable.")
+    scheduler.cancel(SyncpeerTransferConstants.JOB_ID)
+    val extras = PersistableBundle().apply {
+      putString(SyncpeerTransferConstants.EXTRA_LABEL, label)
+    }
+    val job = JobInfo.Builder(
+      SyncpeerTransferConstants.JOB_ID,
+      ComponentName(activity, SyncpeerTransferJobService::class.java),
+    )
+      .setUserInitiated(true)
+      .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+      .setExtras(extras)
+      .build()
+    if (scheduler.schedule(job) != JobScheduler.RESULT_SUCCESS) {
+      throw IllegalStateException("Android rejected the user-initiated transfer job.")
+    }
+    return mapOf(
+      "started" to true,
+      "mode" to "user-initiated",
+      "jobId" to SyncpeerTransferConstants.JOB_ID,
+    )
+  }
 
   @Command
   fun enableMulticastLock(invoke: Invoke) {
@@ -153,47 +237,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun writeFileToSafTree(invoke: Invoke) {
     try {
       val args = invoke.parseArgs(SafWriteFileArgs::class.java)
-      if (args.treeUri.isBlank()) {
-        invoke.reject("treeUri is required.")
-        return
-      }
-      if (args.relativePath.isBlank()) {
-        invoke.reject("relativePath is required.")
-        return
-      }
-      val tree = DocumentFile.fromTreeUri(activity, Uri.parse(args.treeUri))
-      if (tree == null) {
-        invoke.reject("Invalid tree URI.")
-        return
-      }
-      val pathParts = args.relativePath.split('/').filter { it.isNotBlank() }
-      if (pathParts.isEmpty()) {
-        invoke.reject("relativePath is empty.")
-        return
-      }
-
-      var currentDir: DocumentFile = tree
-      for (segment in pathParts.dropLast(1)) {
-        val existing = currentDir.findFile(segment)
-        currentDir =
-          if (existing != null && existing.isDirectory) {
-            existing
-          } else {
-            currentDir.createDirectory(segment)
-              ?: throw IllegalStateException("Could not create SAF directory: $segment")
-          }
-      }
-
-      val fileName = pathParts.last()
-      val mimeType = args.mimeType ?: guessMimeType(fileName)
-      val existingFile = currentDir.findFile(fileName)
-      val target =
-        if (existingFile != null && existingFile.isFile) {
-          existingFile
-        } else {
-          currentDir.createFile(mimeType, fileName)
-            ?: throw IllegalStateException("Could not create SAF file: $fileName")
-        }
+      val target = resolveOrCreateSafFile(args.treeUri, args.relativePath, args.mimeType)
 
       val content = args.bytes.map { it.toByte() }.toByteArray()
       activity.contentResolver.openOutputStream(target.uri, "w").use { stream ->
@@ -206,6 +250,36 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve()
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not write SAF file.")
+    }
+  }
+
+  @Command
+  fun writeFileToSafTreeFromPath(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(SafCopyFileArgs::class.java)
+      val source = File(args.sourcePath)
+      if (!source.isFile) {
+        invoke.reject("Source file does not exist: ${args.sourcePath}")
+        return
+      }
+      val target = resolveOrCreateSafFile(args.treeUri, args.relativePath, args.mimeType)
+      FileInputStream(source).use { input ->
+        activity.contentResolver.openOutputStream(target.uri, "w").use { output ->
+          if (output == null) {
+            throw IllegalStateException("Could not open SAF output stream.")
+          }
+          val buffer = ByteArray(64 * 1024)
+          while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            output.write(buffer, 0, count)
+          }
+          output.flush()
+        }
+      }
+      invoke.resolve()
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not copy file to SAF tree.")
     }
   }
 
@@ -598,6 +672,43 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
     return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
       ?: "application/octet-stream"
+  }
+
+  private fun resolveOrCreateSafFile(
+    treeUri: String,
+    relativePath: String,
+    requestedMimeType: String?,
+  ): DocumentFile {
+    if (treeUri.isBlank()) throw IllegalArgumentException("treeUri is required.")
+    if (relativePath.isBlank()) throw IllegalArgumentException("relativePath is required.")
+    val tree = DocumentFile.fromTreeUri(activity, Uri.parse(treeUri))
+      ?: throw IllegalArgumentException("Invalid tree URI.")
+    val pathParts = relativePath.split('/').filter { it.isNotBlank() }
+    if (pathParts.isEmpty() || pathParts.any { it == "." || it == ".." }) {
+      throw IllegalArgumentException("relativePath is invalid.")
+    }
+
+    var currentDir: DocumentFile = tree
+    for (segment in pathParts.dropLast(1)) {
+      val existing = currentDir.findFile(segment)
+      currentDir =
+        if (existing != null && existing.isDirectory) {
+          existing
+        } else {
+          currentDir.createDirectory(segment)
+            ?: throw IllegalStateException("Could not create SAF directory: $segment")
+        }
+    }
+
+    val fileName = pathParts.last()
+    val mimeType = requestedMimeType ?: guessMimeType(fileName)
+    val existingFile = currentDir.findFile(fileName)
+    return if (existingFile != null && existingFile.isFile) {
+      existingFile
+    } else {
+      currentDir.createFile(mimeType, fileName)
+        ?: throw IllegalStateException("Could not create SAF file: $fileName")
+    }
   }
 
   private fun ensurePermission(permission: String) {

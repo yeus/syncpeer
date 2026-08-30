@@ -111,15 +111,17 @@ const connectToServer = async (): Promise<void> => {
   await disconnectIfConnected();
   await configureGlobalConnection();
   await connectUntilApproved(tauriBrowser);
-  const source = await tauriBrowser.getPageSource();
+  const statusText = (await $("[data-testid='connection-status']").getText())
+    .replace(/\s+/g, " ")
+    .trim();
   console.log(
     "UI connection state: " +
     JSON.stringify({
       connected: (await $("[data-testid='global-connect-button']").getText()).trim() === "Disconnect",
-      relayPathRendered: source.includes("Path: relay"),
-      directPathRendered: source.includes("Path: direct tcp"),
+      statusText,
     }),
   );
+  assert.match(statusText, /Path: (direct|relay) · (LAN|WAN|unknown)/);
 };
 
 const returnToFolderRoot = async (): Promise<void> => {
@@ -238,8 +240,8 @@ describe("Syncpeer Tauri UI smoke", () => {
         throw error;
       }
       assert.match(
-        await tauriBrowser.getPageSource(),
-        /Downloaded hello\.txt via (direct|relay)/,
+        (await tauriBrowser.getPageSource()).replace(/\s+/g, " "),
+        /Downloaded hello\.txt via (direct|relay) · (LAN|WAN|unknown)/,
       );
       assert.equal(
         await readCachedHash(tauriBrowser, "hello.txt"),
@@ -249,8 +251,8 @@ describe("Syncpeer Tauri UI smoke", () => {
       await clickDownloadButton(tauriBrowser, "blob.bin");
       await waitForText(tauriBrowser, "Downloaded blob.bin", 180_000);
       assert.match(
-        await tauriBrowser.getPageSource(),
-        /Downloaded blob\.bin via (direct|relay)/,
+        (await tauriBrowser.getPageSource()).replace(/\s+/g, " "),
+        /Downloaded blob\.bin via (direct|relay) · (LAN|WAN|unknown)/,
       );
 
       const clientRoot = process.env.SYNCPEER_LAN_CLIENT_ROOT ?? path.resolve(".tmp/syncpeer-dev-client");

@@ -24,6 +24,25 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct SyncpeerAndroid<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> SyncpeerAndroid<R> {
+  pub fn start_transfer_service(&self, label: &str) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>(
+        "startTransferService",
+        json!({"label": label}),
+      )
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
+  pub fn stop_transfer_service(&self) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>("stopTransferService", json!({}))
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
   pub fn enable_multicast_lock(&self) -> crate::Result<()> {
     self
       .0
@@ -66,6 +85,27 @@ impl<R: Runtime> SyncpeerAndroid<R> {
           "treeUri": tree_uri,
           "relativePath": relative_path,
           "bytes": bytes,
+          "mimeType": mime_type
+        }),
+      )
+      .map_err(Into::into)
+  }
+
+  pub fn write_file_to_saf_tree_from_path(
+    &self,
+    tree_uri: &str,
+    relative_path: &str,
+    source_path: &str,
+    mime_type: Option<&str>,
+  ) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin(
+        "writeFileToSafTreeFromPath",
+        json!({
+          "treeUri": tree_uri,
+          "relativePath": relative_path,
+          "sourcePath": source_path,
           "mimeType": mime_type
         }),
       )

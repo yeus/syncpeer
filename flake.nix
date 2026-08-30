@@ -29,6 +29,10 @@
           cmdLineToolsVersion = android.cmdLineToolsVersion;
           buildToolsVersions = [ android.buildToolsVersion ];
           platformVersions = [ android.platformVersion ];
+          includeSystemImages = true;
+          systemImageTypes = [ "google_apis" ];
+          abiVersions = [ "x86_64" ];
+          includeEmulator = "if-supported";
           includeNDK = true;
           ndkVersions = [ android.ndkVersion ];
           cmakeVersions = [ android.cmakeVersion ];
@@ -399,13 +403,16 @@ EOF
             xvfb-run
 
             jdk
-            androidSdk
+            androidComposition.androidsdk
+            androidComposition.platform-tools
 
             gradle
             appstream
             flatpak
             flatpak-builder
-          ];
+          ] ++ lib.optional
+            (stdenv.hostPlatform.isx86_64 || stdenv.hostPlatform.isDarwin)
+            androidComposition.emulator;
 
           ANDROID_HOME = androidSdkRoot;
           ANDROID_SDK_ROOT = androidSdkRoot;
@@ -427,6 +434,9 @@ EOF
           ]);
           shellHook = ''
             export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+            export ANDROID_USER_HOME="''${ANDROID_USER_HOME:-''${XDG_STATE_HOME:-$HOME/.local/state}/syncpeer/android}"
+            export ANDROID_AVD_HOME="''${ANDROID_AVD_HOME:-$ANDROID_USER_HOME/avd}"
+            export ANDROID_EMULATOR_HOME="''${ANDROID_EMULATOR_HOME:-$ANDROID_USER_HOME/emulator}"
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.glib}/share:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share:''${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
             export WINIT_WAYLAND_CSD_THEME=light
             export LIBDECOR_PLUGIN_DIR="${pkgs.libdecor}/lib/libdecor/plugins-1"

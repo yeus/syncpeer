@@ -1,5 +1,6 @@
 import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.js";
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./browserClient.js";
+import type { ConnectionScope } from "../client.js";
 
 export type SessionPhase = "idle" | "connecting" | "connected" | "refreshing" | "error";
 export type DirectoryStatus = "idle" | "loading" | "ready" | "stale" | "locked" | "error";
@@ -35,6 +36,7 @@ export interface SessionState {
   remoteDevice: RemoteDeviceInfo | null;
   connectionPath: string;
   connectionTransport: "direct-tcp" | "relay" | "";
+  connectionScope: ConnectionScope | "";
   folders: FolderInfo[];
   folderSyncStates: FolderSyncState[];
   directory: SessionDirectoryState;

@@ -24,6 +24,7 @@ import {
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.js";
 import type { SessionTransport } from "./ui/sessionTypes.js";
 export { downloadRemoteFile } from "./transfer/download.js";
+export type { FileDownloadSink } from "./transfer/stream.js";
 export {
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
@@ -956,6 +957,18 @@ export const createNodeSessionTransport = (): SessionTransport => {
           withSessionTransportProgress(session, onProgress),
         ),
       ),
+    readFileToSink: (folderId, path, sink, onProgress) =>
+      withRecoveringSession(
+        activeOptions,
+        ensureSession,
+        focusedFolderId,
+        (session) => session.remoteFs.readFileToSink(
+          folderId,
+          path,
+          sink,
+          withSessionTransportProgress(session, onProgress),
+        ),
+      ),
     writeFileFully: (folderId, path, bytes, options) =>
       withRecoveringSession(
         activeOptions,
@@ -1026,6 +1039,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
             folderSyncStates,
             connectedVia: session.connectedVia,
             transportKind: session.transportKind,
+            connectionScope: session.connectionScope,
           };
         },
       );

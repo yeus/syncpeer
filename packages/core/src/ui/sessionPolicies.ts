@@ -9,6 +9,7 @@ export const createInitialSessionState = (): SessionState => ({
   remoteDevice: null,
   connectionPath: "",
   connectionTransport: "",
+  connectionScope: "",
   folders: [],
   folderSyncStates: [],
   directory: {
@@ -79,6 +80,7 @@ export const applyOverviewToState = (
         ...state,
         connectionPath: overview.connectedVia,
         connectionTransport: overview.transportKind,
+        connectionScope: overview.connectionScope ?? "unknown",
       },
       preservedEmpty: true,
     };
@@ -96,6 +98,7 @@ export const applyOverviewToState = (
       folderSyncStates: nextFolderSyncStates,
       connectionPath: overview.connectedVia,
       connectionTransport: overview.transportKind,
+      connectionScope: overview.connectionScope ?? "unknown",
       snapshot: {
         active: hasLiveFolders || nextFolderSyncStates.length > 0,
         sourceDeviceId,

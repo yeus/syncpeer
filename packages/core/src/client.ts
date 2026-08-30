@@ -136,12 +136,18 @@ export interface SyncpeerGlobalDiscoveryOptions {
   discoveryServer?: string;
 }
 
+export type ConnectionScope = "lan" | "wan" | "unknown";
+
+type DiscoverySource = "local" | "global" | "manual";
+
 export interface DiscoveredCandidate {
   address: string;
   protocol: "tcp" | "relay" | "unknown";
   host?: string;
   port?: number;
   deviceId?: string;
+  scope?: ConnectionScope;
+  source?: DiscoverySource;
 }
 
 export interface SyncpeerGlobalDiscoveryResult {
@@ -153,6 +159,7 @@ export interface SyncpeerSessionHandle {
   remoteFs: RemoteFs;
   connectedVia: string;
   transportKind: "direct-tcp" | "relay";
+  connectionScope?: ConnectionScope;
   isClosed: () => boolean;
   close: () => Promise<void>;
 }
@@ -165,6 +172,7 @@ export const withSessionTransportProgress = (
     ? (progress) => onProgress({
         ...progress,
         transportKind: session.transportKind,
+        ...(session.connectionScope ? { connectionScope: session.connectionScope } : {}),
         connectedVia: session.connectedVia,
       })
     : undefined;
@@ -174,6 +182,7 @@ export async function withRecoveringSession<TOptions, TResult>(
   ensureSession: (options: TOptions) => Promise<SyncpeerSessionHandle>,
   focusedFolderId: string | null,
   operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
+  canRecover: () => boolean = () => true,
 ): Promise<TResult> {
   if (options === null) {
     throw new Error("No active connection. Connect first.");
@@ -184,7 +193,7 @@ export async function withRecoveringSession<TOptions, TResult>(
     try {
       return await operation(session);
     } catch (error) {
-      if (!session.isClosed() || attempt === 3) throw error;
+      if (!canRecover() || !session.isClosed() || attempt === 3) throw error;
       session = await ensureSession(options);
     }
   }
@@ -358,6 +367,24 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs?: number): Promise<T> {
   });
 }
 
+async function withSessionTimeout(
+  opening: Promise<SyncpeerSessionHandle>,
+  timeoutMs: number,
+): Promise<SyncpeerSessionHandle> {
+  let timedOut = false;
+  const guarded = opening.then(async (session) => {
+    if (!timedOut) return session;
+    await session.close().catch(() => undefined);
+    throw new Error("Connection attempt completed after its timeout");
+  });
+  try {
+    return await withTimeout(guarded, timeoutMs);
+  } catch (error) {
+    timedOut = true;
+    throw error;
+  }
+}
+
 function isTimeoutLikeError(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -474,6 +501,8 @@ function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
       protocol: "tcp",
       host: parsed.hostname.replace(/^\[|\]$/g, ""),
       port: Number(parsed.port),
+      scope: connectionScopeForHost(parsed.hostname),
+      source: "global",
     };
   }
   if (value.startsWith("relay://")) {
@@ -483,9 +512,11 @@ function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
       protocol: "relay",
       host: parsed.hostname || undefined,
       port: parsed.port ? Number(parsed.port) : undefined,
+      scope: "wan",
+      source: "global",
     };
   }
-  return { address: value, protocol: "unknown" };
+  return { address: value, protocol: "unknown", scope: "unknown", source: "global" };
 }
 
 function isPrivateIpv4(host: string): boolean {
@@ -499,6 +530,17 @@ function isPrivateIpv4(host: string): boolean {
     return n >= 16 && n <= 31;
   }
   return false;
+}
+
+function connectionScopeForHost(host: string): ConnectionScope {
+  const normalized = host.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if (normalized === "localhost" || isPrivateIpv4(normalized)) return "lan";
+  const parsed = normalized.includes(":") ? normalized : "";
+  if (parsed === "::1" || parsed.startsWith("fe80:") || parsed.startsWith("fc") || parsed.startsWith("fd")) {
+    return "lan";
+  }
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(normalized) || parsed !== "") return "wan";
+  return "unknown";
 }
 
 function scoreCandidate(candidate: DiscoveredCandidate): number {
@@ -1744,7 +1786,6 @@ class BepSession {
           timeoutMs,
           durationMs: Date.now() - meta.startedAtMs,
         });
-        this.onSocketClosed(error);
         reject(error);
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, meta });
@@ -1849,6 +1890,7 @@ async function openBepSessionOnSocket(
   connectedPort: number,
   connectedVia: string,
   transportKind: "direct-tcp" | "relay",
+  connectionScope: ConnectionScope,
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.bep.handshake.start", {
     connectedHost,
@@ -1931,6 +1973,7 @@ async function openBepSessionOnSocket(
     remoteFs: session.buildRemoteFs(remoteDeviceInfo),
     connectedVia,
     transportKind,
+    connectionScope,
     isClosed: () => session.isClosed(),
     close: () => session.close(),
   };
@@ -1942,6 +1985,7 @@ async function openDirectSession(
   host: string,
   port: number,
   timeoutMs?: number,
+  connectionScope = connectionScopeForHost(host),
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.direct.connect.start", {
     host,
@@ -1969,6 +2013,7 @@ async function openDirectSession(
     port,
     `tcp://${host}:${port}`,
     "direct-tcp",
+    connectionScope,
   );
   adapter.log?.("core.direct.connect.ready", {
     host,
@@ -1981,6 +2026,7 @@ async function openRelaySession(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
   relayAddress: string,
+  timeoutMs = opts.timeoutMs,
 ): Promise<SyncpeerSessionHandle> {
   if (!adapter.connectRelay) {
     throw new Error("Relay transport is not available in this host adapter");
@@ -1998,7 +2044,7 @@ async function openRelaySession(
     certPem: opts.certPem,
     keyPem: opts.keyPem,
     caPem: opts.caPem,
-    timeoutMs: opts.timeoutMs,
+    timeoutMs,
   });
   adapter.log?.("core.relay.connect.tunnel_ready", {
     relayAddress,
@@ -2012,6 +2058,7 @@ async function openRelaySession(
     0,
     relay.connectedVia,
     "relay",
+    "wan",
   );
   adapter.log?.("core.relay.connect.ready", {
     relayAddress,
@@ -2051,7 +2098,11 @@ async function openSessionAttempt(
     ? globalDiscoveryResult.value.candidates
     : [];
   const localCandidates = localDiscoveryResult.status === "fulfilled"
-    ? localDiscoveryResult.value
+    ? localDiscoveryResult.value.map((candidate) => ({
+        ...candidate,
+        source: "local" as const,
+        scope: candidate.scope ?? "lan",
+      }))
     : [];
 
   if (localCandidates.length > 0) {
@@ -2118,12 +2169,9 @@ async function openSessionAttempt(
 
   const connectDeadline = Date.now() + totalTimeout;
   const relayEnabled = opts.enableRelayFallback !== false;
-  const relayBudgetMs = relayEnabled && relayCandidates.length > 0
-    ? opts.relayOnly
-      ? totalTimeout
-      : Math.max(1500, Math.min(5000, Math.floor(totalTimeout * 0.4)))
+  const relayStartDelayMs = relayEnabled && relayCandidates.length > 0 && !opts.relayOnly
+    ? Math.min(2500, Math.max(0, Math.floor(totalTimeout * 0.25)))
     : 0;
-  const directDeadline = connectDeadline - relayBudgetMs;
   const perCandidateTimeout = Math.max(
     8000,
     Math.min(30000, Math.floor(totalTimeout / Math.max(directCandidates.length || 1, 1))),
@@ -2131,7 +2179,7 @@ async function openSessionAttempt(
   adapter.log?.("core.discovery.connect_strategy", {
     totalTimeout,
     perCandidateTimeout,
-    relayBudgetMs,
+    relayStartDelayMs,
     directCandidateCount: directCandidates.length,
     relayCandidateCount: relayCandidates.length,
     orderedCandidates: ordered.map((candidate) => describeCandidate(candidate)),
@@ -2141,95 +2189,126 @@ async function openSessionAttempt(
   if (opts.relayOnly && relayCandidates.length === 0) {
     throw new Error("Relay-only mode requires a relay address from global discovery.");
   }
-  if (directCandidates.length > 0) {
-    for (const candidate of directCandidates) {
-      const remainingMs = Math.max(0, directDeadline - Date.now());
-      if (remainingMs <= 0) {
-        errors.push("Direct candidate phase exhausted its timeout budget");
-        break;
-      }
-      const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
-      try {
-        adapter.log?.("core.discovery.candidate.try", {
-          address: candidate.address,
-          host: candidate.host,
-          port: candidate.port,
-          perCandidateTimeout: candidateTimeoutMs,
-          strategy: "sequential",
-        });
-        return await withTimeout(
-          openDirectSession(
-            adapter,
-            opts,
-            candidate.host!,
-            candidate.port!,
-            candidateTimeoutMs,
-          ),
-          candidateTimeoutMs,
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        adapter.log?.("core.discovery.candidate.failed", {
-          address: candidate.address,
-          host: candidate.host,
-          port: candidate.port,
-          message,
-        });
-        errors.push(`${candidate.address}: ${message}`);
-      }
+  let winningSession: SyncpeerSessionHandle | null = null;
+  const claimSession = async (session: SyncpeerSessionHandle) => {
+    if (winningSession) {
+      await session.close().catch(() => undefined);
+      throw new Error("Connection attempt lost the connection race");
     }
-  }
+    winningSession = session;
+    return session;
+  };
 
-  if (relayEnabled) {
-    const relayMaxAttempts = 2;
-    for (const candidate of relayCandidates) {
-      for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
-        const remainingMs = Math.max(0, connectDeadline - Date.now());
-        if (remainingMs <= 0) {
-          break;
-        }
-        const attemptTimeoutMs = Math.min(
-          remainingMs,
-          Math.max(
-            1000,
-            Math.min(10000, Math.floor(remainingMs / (relayMaxAttempts - attempt + 1))),
-          ),
-        );
-        try {
-          adapter.log?.("core.discovery.relay.try", {
-            address: candidate.address,
-            attempt,
-            attemptsTotal: relayMaxAttempts,
-            timeoutMs: attemptTimeoutMs,
-          });
-          return await withTimeout(
-            openRelaySession(adapter, opts, candidate.address),
-            attemptTimeoutMs,
-          );
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          adapter.log?.("core.discovery.relay.failed", {
-            address: candidate.address,
-            attempt,
-            attemptsTotal: relayMaxAttempts,
-            message,
-          });
-          errors.push(
-            `${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`,
-          );
-          const isLastAttempt = attempt >= relayMaxAttempts;
-          const shouldRetry =
-            !isLastAttempt &&
-            (isTimeoutLikeError(message) || isTransientRelayError(message));
-          if (!shouldRetry) {
-            break;
-          }
-          await waitMs(250);
-        }
-      }
+  const openDirectCandidate = async (
+    candidate: DiscoveredCandidate,
+  ): Promise<SyncpeerSessionHandle> => {
+    if (winningSession) throw new Error("Direct connection race cancelled");
+    const remainingMs = Math.max(0, connectDeadline - Date.now());
+    if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
+    const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
+    try {
+      adapter.log?.("core.discovery.candidate.try", {
+        address: candidate.address,
+        host: candidate.host,
+        port: candidate.port,
+        perCandidateTimeout: candidateTimeoutMs,
+        strategy: "parallel-with-relay-fallback",
+      });
+      const session = await withSessionTimeout(
+        openDirectSession(
+          adapter,
+          opts,
+          candidate.host!,
+          candidate.port!,
+          candidateTimeoutMs,
+          candidate.scope ?? (candidate.source === "local" ? "lan" : connectionScopeForHost(candidate.host!)),
+        ),
+        candidateTimeoutMs,
+      );
+      return await claimSession(session);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      adapter.log?.("core.discovery.candidate.failed", {
+        address: candidate.address,
+        host: candidate.host,
+        port: candidate.port,
+        message,
+      });
+      errors.push(`${candidate.address}: ${message}`);
+      throw error;
     }
-  } else if (relayCandidates.length > 0) {
+  };
+
+  const directTask = directCandidates.length === 0
+    ? null
+    : Promise.any(directCandidates.map(openDirectCandidate));
+
+  const relayTask = !relayEnabled || relayCandidates.length === 0
+    ? null
+    : (async (): Promise<SyncpeerSessionHandle> => {
+        if (relayStartDelayMs > 0) await waitMs(relayStartDelayMs);
+        if (winningSession) throw new Error("Relay connection race cancelled");
+        const relayMaxAttempts = 2;
+        for (const candidate of relayCandidates) {
+          for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
+            if (winningSession) throw new Error("Relay connection race cancelled");
+            const remainingMs = Math.max(0, connectDeadline - Date.now());
+            if (remainingMs <= 0) break;
+            const attemptTimeoutMs = Math.min(
+              remainingMs,
+              Math.max(
+                1000,
+                Math.min(10000, Math.floor(remainingMs / (relayMaxAttempts - attempt + 1))),
+              ),
+            );
+            try {
+              adapter.log?.("core.discovery.relay.try", {
+                address: candidate.address,
+                attempt,
+                attemptsTotal: relayMaxAttempts,
+                timeoutMs: attemptTimeoutMs,
+                strategy: relayStartDelayMs > 0 ? "parallel-fallback" : "preferred",
+              });
+              const session = await withSessionTimeout(
+                openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs),
+                attemptTimeoutMs,
+              );
+              return await claimSession(session);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              adapter.log?.("core.discovery.relay.failed", {
+                address: candidate.address,
+                attempt,
+                attemptsTotal: relayMaxAttempts,
+                message,
+              });
+              errors.push(
+                `${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`,
+              );
+              const isLastAttempt = attempt >= relayMaxAttempts;
+              const shouldRetry =
+                !isLastAttempt &&
+                (isTimeoutLikeError(message) || isTransientRelayError(message));
+              if (!shouldRetry) break;
+              await waitMs(250);
+            }
+          }
+        }
+        throw new Error("All relay discovery candidates failed.");
+      })();
+
+  if (relayCandidates.length > 0 && !relayEnabled) {
     errors.push("Relay fallback is disabled by settings");
+  }
+  const attempts = [directTask, relayTask].filter(
+    (attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null,
+  );
+  if (attempts.length > 0) {
+    try {
+      return await Promise.any(attempts);
+    } catch {
+      // The detailed candidate errors below are more useful than AggregateError.
+    }
   }
 
   const hint = maybeConnectionHint(opts, errors);

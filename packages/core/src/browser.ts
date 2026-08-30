@@ -2,6 +2,7 @@ export { createSyncpeerCoreClient } from "./client.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
+  ConnectionScope,
   SyncpeerDiscoveryFetchInit,
   SyncpeerDiscoveryResponse,
   SyncpeerHostAdapter,
@@ -74,6 +75,22 @@ export {
 } from "./ui/sessionFlows.js";
 export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.js";
 export { downloadRemoteFile } from "./transfer/download.js";
+export {
+  createDuplexChannel,
+  createStream,
+} from "./transfer/frpBus.js";
+export { createPortFromTransport } from "./transfer/frpTransport.js";
+export type { DuplexChannel, Port, Stream } from "./transfer/frpBus.js";
+export type { DuplexTransport } from "./transfer/frpTransport.js";
+export {
+  createPortDownloadSink,
+} from "./transfer/stream.js";
+export type {
+  FileDownloadMetadata,
+  FileDownloadResult,
+  FileDownloadSink,
+  FileTransferMessage,
+} from "./transfer/stream.js";
 export type {
   CachedFileRecord,
   CachedFileStatus,

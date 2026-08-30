@@ -15,9 +15,13 @@ import {
   withSessionTransportProgress,
   withRecoveringSession,
 } from "../packages/core/dist/client.js";
+import { RemoteFs as BuiltRemoteFs } from "../packages/core/dist/core/model/remoteFs.js";
 import {
+  createDuplexChannel,
+  createPortDownloadSink,
   createSyncpeerSessionStore,
   makeReadDirWithRetryFlow,
+  type FileTransferMessage,
   type RemoteFsLike,
 } from "../packages/core/dist/browser.js";
 import type { RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
@@ -62,6 +66,51 @@ assert.deepEqual(decoratedProgress, {
   transportKind: "relay",
   connectedVia: "relay://relay.example:22067",
 });
+
+const transferChannel = createDuplexChannel<FileTransferMessage>();
+const transferMessages: FileTransferMessage[] = [];
+const stopTransferObserver = transferChannel.y.receive((message) => {
+  transferMessages.push(message);
+  if (message.type === "transfer.begin") {
+    transferChannel.y.send({
+      type: "transfer.ack",
+      transferId: message.transferId,
+      operation: "begin",
+    });
+  } else if (message.type === "transfer.chunk") {
+    transferChannel.y.send({
+      type: "transfer.ack",
+      transferId: message.transferId,
+      operation: "chunk",
+      chunkId: message.chunkId,
+    });
+  } else if (message.type === "transfer.commit") {
+    transferChannel.y.send({
+      type: "transfer.ack",
+      transferId: message.transferId,
+      operation: "commit",
+    });
+  }
+});
+const transferSink = createPortDownloadSink(transferChannel.x, "diagnostic-transfer");
+await transferSink.begin({
+  folderId: "documents",
+  path: "large.bin",
+  sizeBytes: 3,
+  encrypted: false,
+});
+await transferSink.write(0, new Uint8Array([1, 2, 3]));
+await transferSink.commit();
+stopTransferObserver();
+assert.deepEqual(transferMessages.map((message) => message.type), [
+  "transfer.begin",
+  "transfer.chunk",
+  "transfer.commit",
+]);
+assert.deepEqual(
+  Array.from(transferMessages[1].type === "transfer.chunk" ? transferMessages[1].bytes : []),
+  [1, 2, 3],
+);
 
 const update = (
   files: Array<{ name: string; deleted?: boolean }>,
@@ -226,6 +275,7 @@ const fakeSession = await coreClient.openSession({
   deviceName: "syncpeer-regression",
   discoveryMode: "direct",
 });
+assert.equal(fakeSession.connectionScope, "lan");
 const initialFolderState = await fakeSession.remoteFs.getFolderSyncState("documents");
 assert.equal(initialFolderState?.indexReceived, true);
 await fakeSession.close();
@@ -261,8 +311,88 @@ await assert.rejects(
   timeoutSession.remoteFs.readFileFully("documents", "hello.txt"),
   /Request timeout|Connection closed/,
 );
-assert.equal(timeoutSession.isClosed(), true);
+assert.equal(timeoutSession.isClosed(), false);
 await timeoutSession.close();
+
+const streamPayload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+let streamRequests = 0;
+const streamFolder = {
+  id: "stream-documents",
+  label: "Stream documents",
+  readOnly: false,
+  advertisedDevices: [],
+  encrypted: false,
+  needsPassword: false,
+  indexReceived: true,
+  files: new Map([
+    ["large.bin", {
+      indexFile: {
+        name: "large.bin",
+        type: 0,
+        size: streamPayload.length,
+        blocks: [
+          { offset: 0, size: 3, hash: new Uint8Array() },
+          { offset: 3, size: 3, hash: new Uint8Array() },
+          { offset: 6, size: 3, hash: new Uint8Array() },
+        ],
+      },
+    }],
+  ]),
+};
+const streamFs = new BuiltRemoteFs(
+  new Map([[streamFolder.id, streamFolder]]),
+  async (_folderId, _path, offset, size) => {
+    streamRequests += 1;
+    return streamPayload.slice(offset, offset + size);
+  },
+  async () => undefined,
+  () => undefined,
+);
+const streamWrites: Array<{ offset: number; bytes: number[] }> = [];
+let streamBegan = false;
+let streamCommitted = false;
+const streamed = await streamFs.readFileToSink("stream-documents", "large.bin", {
+  begin: (metadata) => {
+    streamBegan = metadata.sizeBytes === streamPayload.length;
+  },
+  write: (offset, bytes) => {
+    streamWrites.push({ offset, bytes: Array.from(bytes) });
+  },
+  commit: () => {
+    streamCommitted = true;
+  },
+  abort: () => undefined,
+});
+assert.equal(streamRequests, 3);
+assert.equal(streamBegan, true);
+assert.equal(streamCommitted, true);
+assert.deepEqual(streamed, { bytesWritten: 9, totalBytes: 9 });
+assert.deepEqual(streamWrites, [
+  { offset: 0, bytes: [1, 2, 3] },
+  { offset: 3, bytes: [4, 5, 6] },
+  { offset: 6, bytes: [7, 8, 9] },
+]);
+
+let incompleteCommitted = false;
+const incompleteFs = new BuiltRemoteFs(
+  new Map([[streamFolder.id, streamFolder]]),
+  async (_folderId, _path, offset, size) =>
+    streamPayload.slice(offset, offset + (offset === 6 ? size - 1 : size)),
+  async () => undefined,
+  () => undefined,
+);
+await assert.rejects(
+  incompleteFs.readFileToSink("stream-documents", "large.bin", {
+    begin: () => undefined,
+    write: () => undefined,
+    commit: () => {
+      incompleteCommitted = true;
+    },
+    abort: () => undefined,
+  }),
+  /expected 3 bytes, received 2/,
+);
+assert.equal(incompleteCommitted, false);
 
 const encryptedFolderPassword = "correct horse battery staple";
 const encryptedFolderId = "encrypted-documents";
@@ -393,9 +523,64 @@ const retrySession = await retryClient.openSession({
   relayOnly: true,
   timeoutMs: 5_000,
 });
+assert.equal(retrySession.connectionScope, "wan");
 assert.ok(discoveryCalls >= 2);
 assert.ok(relayCalls >= 3);
 await retrySession.close();
+
+const relayRaceSocket = createFakeTlsSocket();
+const relayRaceEvents: string[] = [];
+let relayRaceTimeoutMs = 0;
+let relayRaceDirectSettled = 0;
+const relayRaceClient = createSyncpeerCoreClient({
+  connectTls: async ({ host }) => {
+    relayRaceEvents.push(`direct:${host}`);
+    return new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error("direct connection timed out")), 7_000);
+    }).finally(() => {
+      relayRaceDirectSettled += 1;
+    });
+  },
+  connectRelay: async ({ relayAddress, timeoutMs }) => {
+    assert.equal(relayRaceDirectSettled, 0);
+    relayRaceTimeoutMs = timeoutMs ?? 0;
+    relayRaceEvents.push(`relay:${relayAddress}`);
+    return { socket: relayRaceSocket.socket, connectedVia: relayAddress };
+  },
+  sha256: () => new Uint8Array(32),
+  randomBytes: (length) => new Uint8Array(length),
+  discoveryFetch: async () => {
+    const body = JSON.stringify({
+      addresses: [
+        "tcp4://10.0.0.1:22000",
+        "tcp4://203.0.113.1:22000",
+        "relay://relay.example:22067/?id=relay",
+      ],
+    });
+    return {
+      ok: true,
+      status: 200,
+      text: async () => body,
+      json: async () => JSON.parse(body),
+    };
+  },
+});
+const relayRaceStartedAt = Date.now();
+const relayRaceSession = await relayRaceClient.openSession({
+  host: "",
+  port: 0,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  expectedDeviceId: "A".repeat(52),
+  deviceName: "syncpeer-relay-race-regression",
+  discoveryMode: "global",
+  timeoutMs: 15_000,
+});
+assert.equal(relayRaceSession.connectionScope, "wan");
+assert.ok(Date.now() - relayRaceStartedAt < 6_000);
+assert.ok(relayRaceTimeoutMs > 0 && relayRaceTimeoutMs < 10_000);
+assert.ok(relayRaceEvents.includes("relay:relay://relay.example:22067/?id=relay"));
+await relayRaceSession.close();
 
 const keepaliveSocket = createFakeTlsSocket();
 const keepaliveClient = createSyncpeerCoreClient({
@@ -481,6 +666,32 @@ const repeatedlyRecoveredFolders = await withRecoveringSession(
 );
 assert.deepEqual(repeatedlyRecoveredFolders, [{ id: "documents" }]);
 assert.equal(repeatedRecoveryCalls, 3);
+
+let cancelledRecoveryCalls = 0;
+let recoveryAllowed = true;
+await assert.rejects(
+  withRecoveringSession(
+    "test-options",
+    async () => {
+      cancelledRecoveryCalls += 1;
+      return {
+        remoteFs: {
+          listFolders: async () => {
+            recoveryAllowed = false;
+            throw new Error("Connection closed");
+          },
+          setFocusedFolder: () => undefined,
+        } as unknown as RemoteFs,
+        isClosed: () => true,
+      };
+    },
+    null,
+    (session) => session.remoteFs.listFolders(),
+    () => recoveryAllowed,
+  ),
+  /Connection closed/,
+);
+assert.equal(cancelledRecoveryCalls, 1);
 
 let readDirCalls = 0;
 const readDirWithRetry = makeReadDirWithRetryFlow({
@@ -670,6 +881,45 @@ await stableStore.actions.connect({
 await stableStore.actions.refreshOverview();
 assert.deepEqual(
   stableStore.getState().folders.map((folder) => folder.id),
+  ["flickr"],
+);
+
+let refreshCancellationCalls = 0;
+let resolvePendingOverview: ((overview: typeof stableOverview) => void) | null = null;
+let markRefreshStarted: (() => void) | null = null;
+const refreshStarted = new Promise<void>((resolve) => {
+  markRefreshStarted = resolve;
+});
+const refreshCancellationStore = createSyncpeerSessionStore({
+  transport: {
+    connectAndSync: async () => stableFs,
+    connectAndGetOverview: async () => {
+      refreshCancellationCalls += 1;
+      if (refreshCancellationCalls === 1) return stableOverview;
+      markRefreshStarted?.();
+      return new Promise((resolve) => {
+        resolvePendingOverview = resolve;
+      });
+    },
+    connectAndGetFolderVersions: async () => [],
+  },
+});
+const refreshCancellationOptions = {
+  host: "127.0.0.1",
+  port: 22000,
+  deviceName: "syncpeer-refresh-cancellation-regression",
+  discoveryMode: "direct" as const,
+};
+await refreshCancellationStore.actions.connect(refreshCancellationOptions);
+const pendingRefresh = refreshCancellationStore.actions.refreshOverview();
+await refreshStarted;
+const pendingDisconnect = refreshCancellationStore.actions.disconnect();
+await Promise.resolve();
+resolvePendingOverview?.({ ...stableOverview, folders: [] });
+await Promise.all([pendingRefresh, pendingDisconnect]);
+assert.equal(refreshCancellationStore.getState().phase, "idle");
+assert.deepEqual(
+  refreshCancellationStore.getState().folders.map((folder) => folder.id),
   ["flickr"],
 );
 

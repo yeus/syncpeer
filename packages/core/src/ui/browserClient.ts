@@ -5,6 +5,7 @@ import {
   type SyncpeerSessionHandle,
   withRecoveringSession,
 } from "../client.js";
+import type { ConnectionScope } from "../client.js";
 import { normalizeDiscoveryServer } from "./discoveryServer.js";
 export { getDefaultDiscoveryServer, normalizeDiscoveryServer } from "./discoveryServer.js";
 import type {
@@ -15,6 +16,7 @@ import type {
   FolderSyncState,
   RemoteDeviceInfo,
 } from "../core/model/remoteFs.js";
+import type { FileDownloadResult, FileDownloadSink } from "../transfer/stream.js";
 
 export interface ConnectOptions {
   host: string;
@@ -48,6 +50,12 @@ export interface RemoteFsLike {
     path: string,
     onProgress?: (progress: FileDownloadProgress) => void,
   ) => Promise<Uint8Array>;
+  readFileToSink?: (
+    folderId: string,
+    path: string,
+    sink: FileDownloadSink,
+    onProgress?: (progress: FileDownloadProgress) => void,
+  ) => Promise<FileDownloadResult>;
   writeFileFully: (
     folderId: string,
     path: string,
@@ -62,6 +70,7 @@ export interface ConnectionOverview {
   folderSyncStates: FolderSyncState[];
   connectedVia: string;
   transportKind: "direct-tcp" | "relay";
+  connectionScope?: ConnectionScope;
 }
 
 export interface UiLogEntry {
@@ -144,6 +153,14 @@ export interface SyncpeerPlatformAdapter {
     bytes: Uint8Array,
     modifiedMs?: number,
   ) => Promise<void>;
+  createFileDownloadSink?: (args: {
+    folderId: string;
+    path: string;
+    name: string;
+    modifiedMs?: number;
+  }) => Promise<FileDownloadSink>;
+  startTransfer?: (label: string) => Promise<void>;
+  stopTransfer?: () => Promise<void>;
   getCachedStatuses?: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   listCachedFiles?: () => Promise<CachedFileRecord[]>;
   openCachedFile?: (folderId: string, path: string) => Promise<void>;
@@ -208,6 +225,9 @@ export interface SyncpeerBrowserClient {
     bytes: Uint8Array,
     modifiedMs?: number,
   ) => Promise<void>;
+  createFileDownloadSink?: SyncpeerPlatformAdapter["createFileDownloadSink"];
+  startTransfer?: (label: string) => Promise<void>;
+  stopTransfer?: () => Promise<void>;
   getCachedStatuses: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   listCachedFiles: () => Promise<CachedFileRecord[]>;
   openCachedFile: (folderId: string, path: string) => Promise<void>;
@@ -358,6 +378,7 @@ const toConnectionOverview = async (
     folderSyncStates,
     connectedVia: session.connectedVia,
     transportKind: session.transportKind,
+    connectionScope: session.connectionScope,
   };
 };
 
@@ -406,6 +427,7 @@ export const createSyncpeerBrowserClient = (
   let openingConnectionKey: string | null = null;
   let activeConnectOptions: ConnectOptions | null = null;
   let focusedFolderId: string | null = null;
+  let sessionGeneration = 0;
 
   const closeActiveSession = async (): Promise<void> => {
     const previous = activeSession;
@@ -498,6 +520,7 @@ export const createSyncpeerBrowserClient = (
       }
     }
 
+    const openingGeneration = sessionGeneration;
     openingConnectionKey = key;
     openingSession = (async () => {
       await closeActiveSession();
@@ -521,6 +544,10 @@ export const createSyncpeerBrowserClient = (
         relayOnly: normalized.relayOnly,
         folderPasswords: normalized.folderPasswords,
       });
+      if (sessionGeneration !== openingGeneration) {
+        await session.close().catch(() => undefined);
+        throw new Error("Connection attempt was cancelled by disconnect");
+      }
       activeSession = session;
       activeConnectionKey = key;
       logClient(options.onLog, "client.session.open.ready", {
@@ -540,19 +567,33 @@ export const createSyncpeerBrowserClient = (
     }
   };
 
+  const withSessionOperation = async <TResult>(
+    connectOptions: ConnectOptions | null,
+    operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
+  ): Promise<TResult> => {
+    const operationGeneration = sessionGeneration;
+    const result = await withRecoveringSession(
+      connectOptions,
+      ensureSession,
+      focusedFolderId,
+      operation,
+      () => sessionGeneration === operationGeneration,
+    );
+    if (sessionGeneration !== operationGeneration) {
+      throw new Error("Session operation was cancelled by disconnect");
+    }
+    return result;
+  };
+
   const remoteFsLike: RemoteFsLike = {
     listFolders: () =>
-      withRecoveringSession(
+      withSessionOperation(
         activeConnectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => session.remoteFs.listFolders(),
       ),
     requestFolderIndex: (folderId: string) =>
-      withRecoveringSession(
+      withSessionOperation(
         activeConnectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => session.remoteFs.requestFolderIndex(folderId),
       ),
     setFocusedFolder: (folderId: string | null) => {
@@ -562,17 +603,13 @@ export const createSyncpeerBrowserClient = (
       }
     },
     waitForFolderIndex: (folderId: string, timeoutMs?: number, pollMs?: number) =>
-      withRecoveringSession(
+      withSessionOperation(
         activeConnectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => session.remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
       ),
     readDir: (folderId: string, path: string) =>
-      withRecoveringSession(
+      withSessionOperation(
         activeConnectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => session.remoteFs.readDir(folderId, path),
       ),
     readFileFully: (
@@ -580,13 +617,26 @@ export const createSyncpeerBrowserClient = (
       path: string,
       onProgress?: (progress: FileDownloadProgress) => void,
     ) =>
-      withRecoveringSession(
+      withSessionOperation(
         activeConnectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => session.remoteFs.readFileFully(
           folderId,
           path,
+          withSessionTransportProgress(session, onProgress),
+        ),
+      ),
+    readFileToSink: (
+      folderId: string,
+      path: string,
+      sink: FileDownloadSink,
+      onProgress?: (progress: FileDownloadProgress) => void,
+    ) =>
+      withSessionOperation(
+        activeConnectOptions,
+        (session) => session.remoteFs.readFileToSink(
+          folderId,
+          path,
+          sink,
           withSessionTransportProgress(session, onProgress),
         ),
       ),
@@ -596,10 +646,8 @@ export const createSyncpeerBrowserClient = (
       bytes: Uint8Array,
       options?: { modifiedMs?: number },
     ) =>
-      withRecoveringSession(
+      withSessionOperation(
         activeConnectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => session.remoteFs.writeFileFully(folderId, path, bytes, options),
       ),
   };
@@ -613,10 +661,8 @@ export const createSyncpeerBrowserClient = (
     connectAndGetOverview: async (
       connectOptions: ConnectOptions,
     ): Promise<ConnectionOverview> => {
-      const overview = await withRecoveringSession(
+      const overview = await withSessionOperation(
         connectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => toConnectionOverview(session),
       );
       activeConnectOptions = connectOptions;
@@ -625,10 +671,8 @@ export const createSyncpeerBrowserClient = (
     connectAndGetFolderVersions: async (
       connectOptions: ConnectOptions,
     ): Promise<FolderSyncState[]> => {
-      const states = await withRecoveringSession(
+      const states = await withSessionOperation(
         connectOptions,
-        ensureSession,
-        focusedFolderId,
         (session) => Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
       );
       activeConnectOptions = connectOptions;
@@ -675,6 +719,7 @@ export const createSyncpeerBrowserClient = (
       return [...known, ...anonymous];
     },
     disconnect: async (): Promise<void> => {
+      sessionGeneration += 1;
       activeConnectOptions = null;
       focusedFolderId = null;
       await closeActiveSession();
@@ -701,6 +746,15 @@ export const createSyncpeerBrowserClient = (
       if (!platformAdapter.cacheFile) return throwMissingAdapter("cacheFile");
       return platformAdapter.cacheFile(folderId, path, name, bytes, modifiedMs);
     },
+    createFileDownloadSink: platformAdapter.createFileDownloadSink
+      ? (args) => platformAdapter.createFileDownloadSink!(args)
+      : undefined,
+    startTransfer: platformAdapter.startTransfer
+      ? (label) => platformAdapter.startTransfer!(label)
+      : undefined,
+    stopTransfer: platformAdapter.stopTransfer
+      ? () => platformAdapter.stopTransfer!()
+      : undefined,
     getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
       platformAdapter.getCachedStatuses
         ? platformAdapter.getCachedStatuses(folderId, paths)

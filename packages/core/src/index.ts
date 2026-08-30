@@ -2,6 +2,7 @@ export { createSyncpeerCoreClient } from "./client.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
+  ConnectionScope,
   DiscoveredCandidate,
   SyncpeerHostAdapter,
   SyncpeerSessionHandle,
@@ -18,6 +19,16 @@ export { RemoteFs } from "./core/model/remoteFs.js";
 export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export { downloadRemoteFile } from "./transfer/download.js";
+export { createDuplexChannel, createStream } from "./transfer/frpBus.js";
+export { createPortFromTransport } from "./transfer/frpTransport.js";
+export type { DuplexChannel, Port, Stream } from "./transfer/frpBus.js";
+export type { DuplexTransport } from "./transfer/frpTransport.js";
+export type {
+  FileDownloadMetadata,
+  FileDownloadResult,
+  FileDownloadSink,
+  FileTransferMessage,
+} from "./transfer/stream.js";
 export {
   canonicalRecordPath,
   collectionRootPath,

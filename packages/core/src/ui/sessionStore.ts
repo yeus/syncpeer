@@ -145,6 +145,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         const fs = await depsInput.transport.connectAndSync(options);
         const overview = await depsInput.transport.connectAndGetOverview(options);
         setState((current) => {
+          if (current.requestEpoch !== nextEpoch) return current;
           const applied = applyOverviewToState(current, overview, options);
           return ensureCurrentFolderStillExists({
             ...applied.nextState,
@@ -157,6 +158,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
             requestEpoch: nextEpoch,
           });
         });
+        if (state.requestEpoch !== nextEpoch) return;
 
         await waitForFoldersToPopulate({
           timeoutMs: 4000,
@@ -186,48 +188,73 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         }
       } catch (error) {
         const message = resolveErrorMessage(error);
-        setState((current) => ({
-          ...current,
-          phase: "error",
-          pending: {
-            ...current.pending,
-            connecting: false,
-            refreshingOverview: false,
-            loadingDirectory: false,
-          },
-          remoteFs: null,
-          lastError: message,
-        }));
+        setState((current) =>
+          current.requestEpoch !== nextEpoch
+            ? current
+            : {
+                ...current,
+                phase: "error",
+                pending: {
+                  ...current.pending,
+                  connecting: false,
+                  refreshingOverview: false,
+                  loadingDirectory: false,
+                },
+                remoteFs: null,
+                lastError: message,
+              },
+        );
         throw error;
       }
     },
 
     disconnect: async (): Promise<void> => {
-      try {
-        await depsInput.transport.disconnect?.();
-      } finally {
-        setState((current) => ({
-          ...current,
-          phase: "idle",
-          remoteFs: null,
+      const disconnectEpoch = state.requestEpoch + 1;
+      setState((current) => ({
+        ...current,
+        phase: "idle",
+        remoteFs: null,
         directory: {
           ...directoryToIdle(current).directory,
           versionKey: "",
         },
-          currentFolderVersionKey: "",
-          pending: {
-            connecting: false,
-            loadingDirectory: false,
-            refreshingOverview: false,
-          },
-          requestEpoch: current.requestEpoch + 1,
-        }));
+        currentFolderVersionKey: "",
+        pending: {
+          connecting: false,
+          loadingDirectory: false,
+          refreshingOverview: false,
+        },
+        requestEpoch: disconnectEpoch,
+      }));
+      try {
+        await depsInput.transport.disconnect?.();
+      } finally {
+        setState((current) =>
+          current.requestEpoch !== disconnectEpoch
+            ? current
+            : {
+                ...current,
+                phase: "idle",
+                remoteFs: null,
+                directory: {
+                  ...directoryToIdle(current).directory,
+                  versionKey: "",
+                },
+                currentFolderVersionKey: "",
+                pending: {
+                  connecting: false,
+                  loadingDirectory: false,
+                  refreshingOverview: false,
+                },
+              },
+        );
       }
     },
 
     refreshOverview: async (options?: ConnectOptions): Promise<void> => {
       const resolved = resolveOptions(options);
       if (!state.remoteFs) return;
+      const targetEpoch = state.requestEpoch;
       setState((current) => ({
         ...current,
         phase: "refreshing",
@@ -242,6 +269,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         const overview = await depsInput.transport.connectAndGetOverview(resolved);
         let shouldReloadDirectory = false;
         setState((current) => {
+          if (current.requestEpoch !== targetEpoch || current.remoteFs === null) return current;
           const applied = applyOverviewToState(current, overview, resolved);
           const nextState = ensureCurrentFolderStillExists({
             ...applied.nextState,
@@ -266,17 +294,22 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           if (!versionChanged) return nextState;
           return directoryToStaleKeepingVersion(nextState, nextState.directory.versionKey);
         });
+        if (state.requestEpoch !== targetEpoch || !state.remoteFs) return;
         if (shouldReloadDirectory && state.directory.folderId && !directoryIsLocked(state)) {
           await actions.reloadCurrentDirectory(resolved);
         }
       } catch (error) {
         const message = resolveErrorMessage(error);
-        setState((current) => ({
-          ...current,
-          phase: "error",
-          pending: { ...current.pending, refreshingOverview: false },
-          lastError: message,
-        }));
+        setState((current) =>
+          current.requestEpoch !== targetEpoch
+            ? current
+            : {
+                ...current,
+                phase: "error",
+                pending: { ...current.pending, refreshingOverview: false },
+                lastError: message,
+              },
+        );
         throw error;
       }
     },
@@ -357,7 +390,9 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
           fetchFolderVersions: depsInput.transport.connectAndGetFolderVersions,
           isConnected,
           onFolderSyncStates: (states) => {
-            setState((next) => ({ ...next, folderSyncStates: states }));
+            setState((next) =>
+              next.requestEpoch === targetEpoch ? { ...next, folderSyncStates: states } : next,
+            );
           },
         });
         if (!indexResult.received) {
@@ -398,7 +433,9 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         });
       } catch (error) {
         const message = resolveErrorMessage(error);
-        setState((next) => directoryToError(next, message));
+        setState((next) =>
+          next.requestEpoch === targetEpoch ? directoryToError(next, message) : next,
+        );
         throw error;
       }
     },

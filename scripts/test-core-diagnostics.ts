@@ -12,6 +12,7 @@ import {
 } from "../packages/core/dist/core/protocol/bep.js";
 import {
   createSyncpeerCoreClient,
+  withSessionTransportProgress,
   withRecoveringSession,
 } from "../packages/core/dist/client.js";
 import {
@@ -41,6 +42,26 @@ assert.equal(
   normalizeDiscoveryServer("https://discovery.syncthing.net/v2/"),
   defaultDiscoveryServer,
 );
+
+let decoratedProgress: unknown = null;
+withSessionTransportProgress(
+  {
+    remoteFs: {} as RemoteFs,
+    connectedVia: "relay://relay.example:22067",
+    transportKind: "relay",
+    isClosed: () => false,
+    close: async () => undefined,
+  },
+  (progress) => {
+    decoratedProgress = progress;
+  },
+)?.({ downloadedBytes: 1, totalBytes: 2 });
+assert.deepEqual(decoratedProgress, {
+  downloadedBytes: 1,
+  totalBytes: 2,
+  transportKind: "relay",
+  connectedVia: "relay://relay.example:22067",
+});
 
 const update = (
   files: Array<{ name: string; deleted?: boolean }>,
@@ -217,6 +238,31 @@ const closeParser = new FrameParser((type, message) => {
 });
 for (const write of fakeSocket.writes.slice(1)) closeParser.feed(write);
 assert.equal(closeReason, "Client closed");
+
+const timeoutSocket = createFakeTlsSocket();
+const timeoutClient = createSyncpeerCoreClient({
+  connectTls: async () => timeoutSocket.socket,
+  sha256: (data) => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: (length) => new Uint8Array(length),
+  discoveryFetch: async () => {
+    throw new Error("Discovery is not used by this timeout test.");
+  },
+});
+const timeoutSession = await timeoutClient.openSession({
+  host: "127.0.0.1",
+  port: 22000,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  deviceName: "syncpeer-timeout-regression",
+  discoveryMode: "direct",
+  requestTimeoutMs: 1_000,
+});
+await assert.rejects(
+  timeoutSession.remoteFs.readFileFully("documents", "hello.txt"),
+  /Request timeout|Connection closed/,
+);
+assert.equal(timeoutSession.isClosed(), true);
+await timeoutSession.close();
 
 const encryptedFolderPassword = "correct horse battery staple";
 const encryptedFolderId = "encrypted-documents";
@@ -414,6 +460,28 @@ const recoveredFolders = await withRecoveringSession(
 assert.deepEqual(recoveredFolders, [{ id: "documents" }]);
 assert.equal(recoveryCalls, 2);
 
+let repeatedRecoveryCalls = 0;
+const repeatedlyRecoveredFolders = await withRecoveringSession(
+  "test-options",
+  async () => {
+    repeatedRecoveryCalls += 1;
+    return {
+      remoteFs: {
+        listFolders: async () => {
+          if (repeatedRecoveryCalls < 3) throw new Error("Connection closed");
+          return [{ id: "documents" }];
+        },
+        setFocusedFolder: () => undefined,
+      } as unknown as RemoteFs,
+      isClosed: () => repeatedRecoveryCalls < 3,
+    };
+  },
+  "documents",
+  (session) => session.remoteFs.listFolders(),
+);
+assert.deepEqual(repeatedlyRecoveredFolders, [{ id: "documents" }]);
+assert.equal(repeatedRecoveryCalls, 3);
+
 let readDirCalls = 0;
 const readDirWithRetry = makeReadDirWithRetryFlow({
   sleep: async () => undefined,
@@ -501,5 +569,108 @@ await assert.rejects(
 );
 assert.equal(noIndexStore.getState().directory.status, "error");
 assert.equal(noIndexReadDirCalls, 0);
+
+let delayedDirectoryReadCalls = 0;
+const delayedDirectoryFolder = {
+  id: "documents",
+  label: "Documents",
+  readOnly: false,
+  encrypted: false,
+  needsPassword: false,
+};
+const delayedDirectoryFs: RemoteFsLike = {
+  listFolders: async () => [delayedDirectoryFolder],
+  requestFolderIndex: async () => undefined,
+  setFocusedFolder: () => undefined,
+  waitForFolderIndex: async () => true,
+  readDir: async () => {
+    delayedDirectoryReadCalls += 1;
+    return delayedDirectoryReadCalls === 1
+      ? []
+      : [{ name: "flickr", path: "flickr", type: "directory", size: 0, modifiedMs: 0 }];
+  },
+  readFileFully: async () => new Uint8Array(),
+  writeFileFully: async () => undefined,
+};
+const delayedDirectoryOverview = {
+  folders: [delayedDirectoryFolder],
+  device: null,
+  folderSyncStates: [{
+    folderId: delayedDirectoryFolder.id,
+    remoteIndexId: "1",
+    remoteMaxSequence: "1",
+    indexReceived: true,
+  }],
+  connectedVia: "tcp://127.0.0.1:22000",
+  transportKind: "direct-tcp" as const,
+};
+const delayedDirectoryStore = createSyncpeerSessionStore({
+  transport: {
+    connectAndSync: async () => delayedDirectoryFs,
+    connectAndGetOverview: async () => delayedDirectoryOverview,
+    connectAndGetFolderVersions: async () => delayedDirectoryOverview.folderSyncStates,
+  },
+  sleep: async () => undefined,
+});
+await delayedDirectoryStore.actions.connect({
+  host: "127.0.0.1",
+  port: 22000,
+  deviceName: "syncpeer-folder-regression",
+  discoveryMode: "direct",
+});
+await delayedDirectoryStore.actions.openFolder(delayedDirectoryFolder.id);
+assert.deepEqual(
+  delayedDirectoryStore.getState().entries.map((entry) => entry.name),
+  ["flickr"],
+);
+assert.equal(delayedDirectoryReadCalls, 2);
+
+let overviewRefreshCalls = 0;
+const stableFolder = {
+  id: "flickr",
+  label: "Flickr",
+  readOnly: false,
+};
+const stableOverview = {
+  folders: [stableFolder],
+  device: {
+    id: "A".repeat(52),
+    deviceName: "stable-peer",
+    clientName: "syncthing",
+    clientVersion: "v1.27.8",
+  },
+  folderSyncStates: [],
+  connectedVia: "tcp://127.0.0.1:22000",
+  transportKind: "direct-tcp" as const,
+};
+const stableFs = {
+  ...delayedDirectoryFs,
+  listFolders: async () => [stableFolder],
+} as RemoteFsLike;
+const stableStore = createSyncpeerSessionStore({
+  transport: {
+    connectAndSync: async () => stableFs,
+    connectAndGetOverview: async () => {
+      overviewRefreshCalls += 1;
+      return overviewRefreshCalls === 1
+        ? stableOverview
+        : { ...stableOverview, folders: [] };
+    },
+    connectAndGetFolderVersions: async () => [],
+  },
+  sleep: async () => undefined,
+});
+await stableStore.actions.connect({
+  host: "127.0.0.1",
+  port: 22000,
+  remoteId: "A".repeat(52),
+  deviceName: "syncpeer-overview-regression",
+  discoveryMode: "direct",
+});
+await stableStore.actions.refreshOverview();
+assert.deepEqual(
+  stableStore.getState().folders.map((folder) => folder.id),
+  ["flickr"],
+);
 
 console.log("Core diagnostics passed.");

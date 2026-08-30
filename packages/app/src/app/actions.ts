@@ -50,6 +50,7 @@ import {
   connectionDetails,
   currentSourceDeviceId,
   downloadProgressText,
+  downloadTransportText,
   favoriteEntryKey,
   folderIsLocked,
   folderVersionKeyFromState,
@@ -1386,10 +1387,14 @@ export const createAppActions = (args: {
     state.favorites.isDownloading = true;
     const startedAt = Date.now();
     let lastTransferLogAtMs = 0;
+    let activeTransportKind = state.session.connectionTransport;
+    let activeConnectedVia = state.session.connectionPath;
+    let downloadCompleted = false;
     const downloadKey = cachedFileKey(folderId, path);
     const remoteFs = state.session.remoteFs;
     state.favorites.activeDownloadKey = downloadKey;
-    state.favorites.activeDownloadText = "0% • 0 B/s • ETA --";
+    state.favorites.activeDownloadText =
+      `0% • 0 B/s • ETA -- • ${downloadTransportText(state.session.connectionTransport)}`;
     setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
     void maybeTransferNotification(
       DOWNLOAD_NOTIFICATION_ID,
@@ -1409,17 +1414,23 @@ export const createAppActions = (args: {
         onProgress: ({
           downloadedBytes,
           totalBytes,
+          transportKind,
+          connectedVia,
         }: {
           downloadedBytes: number;
           totalBytes: number;
+          transportKind?: "direct-tcp" | "relay";
+          connectedVia?: string;
         }) => {
+          activeTransportKind = transportKind ?? activeTransportKind;
+          activeConnectedVia = connectedVia ?? activeConnectedVia;
           const elapsedMs = elapsedMsSince(startedAt);
           const rateBps = averageRateBps(downloadedBytes, elapsedMs);
           state.favorites.activeDownloadText = downloadProgressText(
             downloadedBytes,
             totalBytes,
             elapsedMs / 1000,
-          );
+          ) + ` • ${downloadTransportText(transportKind ?? state.session.connectionTransport)}`;
           setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
           void maybeTransferNotification(
             DOWNLOAD_NOTIFICATION_ID,
@@ -1438,6 +1449,8 @@ export const createAppActions = (args: {
               elapsedMs,
               rateBps: Math.round(rateBps),
               rate: formatRateSafe(rateBps),
+              transportKind: transportKind ?? state.session.connectionTransport,
+              connectedVia,
             });
           }
         },
@@ -1447,8 +1460,13 @@ export const createAppActions = (args: {
       await client.cacheFile(folderId, path, name, bytes);
       updateCachedKey(state, folderId, path, true);
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
-      state.favorites.activeDownloadText = "100% • Done";
-      setDownloadNotice(`Downloaded ${name}`, 4000);
+      state.favorites.activeDownloadText =
+        `100% • Done • ${downloadTransportText(activeTransportKind)}`;
+      downloadCompleted = true;
+      setDownloadNotice(
+        `Downloaded ${name} via ${downloadTransportText(activeTransportKind)}`,
+        4000,
+      );
       void maybeTransferNotification(
         DOWNLOAD_NOTIFICATION_ID,
         "Syncpeer download complete",
@@ -1462,6 +1480,8 @@ export const createAppActions = (args: {
         elapsedMs,
         rateBps: Math.round(rateBps),
         rate: formatRateSafe(rateBps),
+        transportKind: activeTransportKind,
+        connectedVia: activeConnectedVia,
       });
       if (options?.openAfterDownload) {
         await openCachedFile(folderId, path);
@@ -1481,7 +1501,7 @@ export const createAppActions = (args: {
         state.favorites.activeDownloadKey = "";
         state.favorites.activeDownloadText = "";
       }
-      if (state.favorites.activeDownloadText === "100% • Done") {
+      if (downloadCompleted) {
         window.setTimeout(() => {
           void clearTransferNotification(DOWNLOAD_NOTIFICATION_ID);
         }, 2500);

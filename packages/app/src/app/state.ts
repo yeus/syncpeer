@@ -641,3 +641,7 @@ export const downloadProgressText = (
     speed > 0 ? remainingBytes / speed : Number.POSITIVE_INFINITY;
   return `${percent}% • ${formatRate(speed)} • ETA ${formatEta(etaSeconds)}`;
 };
+
+export const downloadTransportText = (
+  transportKind: "direct-tcp" | "relay" | "" | undefined,
+) => transportKind === "relay" ? "relay" : "direct";

@@ -7,6 +7,7 @@ import type { LanFixture } from "./protocol.ts";
 import {
   LAN_FIXTURE_ENCRYPTED_FOLDER_ID,
   LAN_FIXTURE_ENCRYPTED_PASSWORD,
+  LAN_FIXTURE_BLOB_SIZE,
   LAN_FIXTURE_FOLDER_ID,
   LAN_FIXTURE_HELLO_CONTENT,
   SYNCTHING_GLOBAL_DISCOVERY_SERVER,
@@ -389,7 +390,7 @@ export const createLanFixture = async (args: {
   fs.writeFileSync(path.join(sharePath, "hello.txt"), LAN_FIXTURE_HELLO_CONTENT);
   fs.mkdirSync(path.join(sharePath, "nested"), { recursive: true });
   fs.writeFileSync(path.join(sharePath, "nested", "file.txt"), "nested LAN file\n");
-  const blob = Buffer.alloc(12 * 1024 * 1024);
+  const blob = Buffer.alloc(LAN_FIXTURE_BLOB_SIZE);
   for (let index = 0; index < blob.length; index += 1) blob[index] = index % 251;
   fs.writeFileSync(path.join(sharePath, "blob.bin"), blob);
   fs.writeFileSync(path.join(encryptedSharePath, "secret.txt"), "encrypted LAN secret\n");

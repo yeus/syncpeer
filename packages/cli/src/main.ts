@@ -3,7 +3,7 @@ import { Command, Option } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  createNodeSyncpeerClient,
+  createNodeSessionTransport,
   downloadRemoteFile,
   getDefaultDiscoveryServer,
   resolveNodeGlobalDiscovery,
@@ -107,15 +107,13 @@ async function openRemoteFs(opts: CliOptions) {
     key = identity.key;
   }
 
-  const client = createNodeSyncpeerClient();
-  const certPem = fs.readFileSync(cert, "utf8");
-  const keyPem = fs.readFileSync(key, "utf8");
-  return client.openSession({
+  const transport = createNodeSessionTransport();
+  const remoteFs = await transport.connectAndSync({
     host: opts.host,
     port: opts.port,
-    certPem,
-    keyPem,
-    expectedDeviceId: opts.remoteId,
+    cert,
+    key,
+    remoteId: opts.remoteId,
     deviceName: opts.deviceName,
     timeoutMs: opts.timeoutMs,
     discoveryMode: opts.discoveryMode,
@@ -124,6 +122,10 @@ async function openRemoteFs(opts: CliOptions) {
     relayOnly: opts.relayOnly,
     folderPasswords: parseFolderPasswords(opts.folderPassword),
   });
+  return {
+    remoteFs,
+    close: () => transport.disconnect?.(),
+  };
 }
 
 async function renderTree(
@@ -268,12 +270,19 @@ async function main() {
     .description("Download a file from the remote peer")
     .action(async (folderId: string, remotePath: string, localPath: string) =>
       withSession(async (remoteFs) => {
+        let transportKind = "direct";
         const bytes = await downloadRemoteFile(remoteFs, {
           folderId,
           path: remotePath,
+          onProgress: (progress) => {
+            const nextTransportKind = progress.transportKind === "relay" ? "relay" : "direct";
+            if (nextTransportKind === transportKind) return;
+            transportKind = nextTransportKind;
+            console.log(`Transfer transport: ${transportKind}`);
+          },
         });
         fs.writeFileSync(localPath, Buffer.from(bytes));
-        console.log(`Wrote ${bytes.length} bytes to ${localPath}`);
+        console.log(`Wrote ${bytes.length} bytes to ${localPath} via ${transportKind}`);
       }),
     );
 

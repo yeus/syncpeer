@@ -52,6 +52,8 @@ export interface FolderSyncState {
 export interface FileDownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
+  transportKind?: "direct-tcp" | "relay";
+  connectedVia?: string;
 }
 
 export interface FileUploadOptions {

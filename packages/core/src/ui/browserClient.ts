@@ -1,5 +1,6 @@
 import {
   createSyncpeerCoreClient,
+  withSessionTransportProgress,
   type SyncpeerHostAdapter,
   type SyncpeerSessionHandle,
   withRecoveringSession,
@@ -583,7 +584,11 @@ export const createSyncpeerBrowserClient = (
         activeConnectOptions,
         ensureSession,
         focusedFolderId,
-        (session) => session.remoteFs.readFileFully(folderId, path, onProgress),
+        (session) => session.remoteFs.readFileFully(
+          folderId,
+          path,
+          withSessionTransportProgress(session, onProgress),
+        ),
       ),
     writeFileFully: (
       folderId: string,

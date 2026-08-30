@@ -7,6 +7,11 @@ import {
   normalizeDeviceId,
 } from "../packages/core/src/ui/helpers.ts";
 import {
+  LAN_FIXTURE_BLOB_SIZE,
+  LAN_FIXTURE_FOLDER_ID,
+  LAN_FIXTURE_HELLO_CONTENT,
+} from "./lan-test/fixture-data.ts";
+import {
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
 } from "../packages/core/src/ui/discoveryServer.ts";
@@ -16,9 +21,9 @@ import {
   type DiagnosticsBuiltinTest,
 } from "../packages/shared/modules/diagnosticsRunner.ts";
 
-const fixtureFolderId = "syncpeer-lan";
-const fixtureHello = "hello from the LAN fixture\n";
-const fixtureBlobSize = 12 * 1024 * 1024;
+const fixtureFolderId = LAN_FIXTURE_FOLDER_ID;
+const fixtureHello = LAN_FIXTURE_HELLO_CONTENT;
+const fixtureBlobSize = LAN_FIXTURE_BLOB_SIZE;
 
 const npmCommand = (): string => process.platform === "win32" ? "npm.cmd" : "npm";
 

@@ -237,6 +237,10 @@ describe("Syncpeer Tauri UI smoke", () => {
         console.log("UI session logs after hello.txt download timeout:\n" + logs.join("\n---\n"));
         throw error;
       }
+      assert.match(
+        await tauriBrowser.getPageSource(),
+        /Downloaded hello\.txt via (direct|relay)/,
+      );
       assert.equal(
         await readCachedHash(tauriBrowser, "hello.txt"),
         createHash("sha256").update(LAN_FIXTURE_HELLO_CONTENT).digest("hex"),
@@ -244,6 +248,10 @@ describe("Syncpeer Tauri UI smoke", () => {
 
       await clickDownloadButton(tauriBrowser, "blob.bin");
       await waitForText(tauriBrowser, "Downloaded blob.bin", 180_000);
+      assert.match(
+        await tauriBrowser.getPageSource(),
+        /Downloaded blob\.bin via (direct|relay)/,
+      );
 
       const clientRoot = process.env.SYNCPEER_LAN_CLIENT_ROOT ?? path.resolve(".tmp/syncpeer-dev-client");
       const uploadName = `ui-upload-${Date.now()}.txt`;
@@ -252,6 +260,35 @@ describe("Syncpeer Tauri UI smoke", () => {
       fs.writeFileSync(uploadPath, "uploaded from the Syncpeer Tauri UI\n", "utf8");
       await setUploadFile(tauriBrowser, uploadPath);
       await waitForText(tauriBrowser, `Uploaded ${uploadName}.`, 90_000);
+    } finally {
+      await disconnectIfConnected();
+    }
+  });
+
+  it("keeps folders and directory entries after foreground refreshes", async () => {
+    await connectToServer();
+    try {
+      await clickTestId("tab-folders");
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        await returnToFolderRoot();
+        await waitForText(tauriBrowser, LAN_FIXTURE_FOLDER_ID, folderWaitTimeout());
+        await clickItemTitle(tauriBrowser, LAN_FIXTURE_FOLDER_ID);
+        await waitForText(tauriBrowser, "hello.txt", folderWaitTimeout());
+
+        await tauriBrowser.execute(() => {
+          window.dispatchEvent(new Event("focus"));
+          window.dispatchEvent(new Event("pageshow"));
+          document.dispatchEvent(new Event("visibilitychange"));
+        });
+        await clickTestId("tab-devices");
+        await waitForText(tauriBrowser, "This Device");
+        await clickTestId("tab-folders");
+        await returnToFolderRoot();
+        await waitForText(tauriBrowser, LAN_FIXTURE_FOLDER_ID, folderWaitTimeout());
+        await clickItemTitle(tauriBrowser, LAN_FIXTURE_FOLDER_ID);
+        await waitForText(tauriBrowser, "hello.txt", folderWaitTimeout());
+        console.log(`Foreground folder refresh ${attempt} passed.`);
+      }
     } finally {
       await disconnectIfConnected();
     }

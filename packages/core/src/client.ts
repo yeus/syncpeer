@@ -21,7 +21,11 @@ import {
   type BepRequest,
   type BepResponse,
 } from "./core/protocol/bep.js";
-import { RemoteFs, type FileUploadOptions } from "./core/model/remoteFs.js";
+import {
+  RemoteFs,
+  type FileDownloadProgress,
+  type FileUploadOptions,
+} from "./core/model/remoteFs.js";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
 import {
   coalescePendingIndexFrame,
@@ -120,6 +124,7 @@ export interface SyncpeerConnectOptions {
   enableRelayFallback?: boolean;
   relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
+  requestTimeoutMs?: number;
   keepalive?: {
     pingIntervalMs?: number;
     receiveTimeoutMs?: number;
@@ -152,6 +157,18 @@ export interface SyncpeerSessionHandle {
   close: () => Promise<void>;
 }
 
+export const withSessionTransportProgress = (
+  session: SyncpeerSessionHandle,
+  onProgress?: (progress: FileDownloadProgress) => void,
+): ((progress: FileDownloadProgress) => void) | undefined =>
+  onProgress
+    ? (progress) => onProgress({
+        ...progress,
+        transportKind: session.transportKind,
+        connectedVia: session.connectedVia,
+      })
+    : undefined;
+
 export async function withRecoveringSession<TOptions, TResult>(
   options: TOptions | null,
   ensureSession: (options: TOptions) => Promise<SyncpeerSessionHandle>,
@@ -161,16 +178,17 @@ export async function withRecoveringSession<TOptions, TResult>(
   if (options === null) {
     throw new Error("No active connection. Connect first.");
   }
-  const session = await ensureSession(options);
-  if (focusedFolderId) session.remoteFs.setFocusedFolder(focusedFolderId);
-  try {
-    return await operation(session);
-  } catch (error) {
-    if (!session.isClosed()) throw error;
-    const recovered = await ensureSession(options);
-    if (focusedFolderId) recovered.remoteFs.setFocusedFolder(focusedFolderId);
-    return operation(recovered);
+  let session = await ensureSession(options);
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (focusedFolderId) session.remoteFs.setFocusedFolder(focusedFolderId);
+    try {
+      return await operation(session);
+    } catch (error) {
+      if (!session.isClosed() || attempt === 3) throw error;
+      session = await ensureSession(options);
+    }
   }
+  throw new Error("Session recovery exhausted unexpectedly.");
 }
 
 interface FolderState {
@@ -611,6 +629,7 @@ class BepSession {
   private remoteDeviceId?: Uint8Array;
   private readonly pingIntervalMs: number;
   private readonly receiveTimeoutMs: number;
+  private readonly requestTimeoutMs: number;
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private keepaliveInFlight = false;
   private lastReadAt = Date.now();
@@ -625,6 +644,7 @@ class BepSession {
     folderPasswords?: Record<string, string>,
     remoteDeviceId?: Uint8Array,
     keepalive?: SyncpeerConnectOptions["keepalive"],
+    requestTimeoutMs?: number,
   ) {
     this.socket = socket;
     this.adapter = adapter;
@@ -636,6 +656,7 @@ class BepSession {
       this.pingIntervalMs,
       keepalive?.receiveTimeoutMs ?? 300_000,
     );
+    this.requestTimeoutMs = Math.max(1_000, requestTimeoutMs ?? 20_000);
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
@@ -1714,15 +1735,17 @@ class BepSession {
       0,
     );
     return new Promise<Uint8Array>((resolve, reject) => {
-      const timeoutMs = 20_000;
+      const timeoutMs = this.requestTimeoutMs;
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        const error = new Error(`Request timeout for ${name} at offset ${offset}`);
         this.log("request.timeout", {
           ...meta,
           timeoutMs,
           durationMs: Date.now() - meta.startedAtMs,
         });
-        reject(new Error(`Request timeout for ${name} at offset ${offset}`));
+        this.onSocketClosed(error);
+        reject(error);
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, meta });
       this.writeFrame(frame).catch((error) => {
@@ -1891,6 +1914,7 @@ async function openBepSessionOnSocket(
     opts.folderPasswords,
     remoteDeviceIdBytes,
     opts.keepalive,
+    opts.requestTimeoutMs,
   );
   await session.initialize(leftover);
   adapter.log?.("core.bep.cluster_config.wait", {

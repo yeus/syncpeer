@@ -8,6 +8,7 @@ import tls from "node:tls";
 import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
+  withSessionTransportProgress,
   withRecoveringSession,
   type DiscoveredCandidate,
   type SyncpeerRelayConnectOptions,
@@ -949,7 +950,11 @@ export const createNodeSessionTransport = (): SessionTransport => {
         activeOptions,
         ensureSession,
         focusedFolderId,
-        (session) => session.remoteFs.readFileFully(folderId, path, onProgress),
+        (session) => session.remoteFs.readFileFully(
+          folderId,
+          path,
+          withSessionTransportProgress(session, onProgress),
+        ),
       ),
     writeFileFully: (folderId, path, bytes, options) =>
       withRecoveringSession(

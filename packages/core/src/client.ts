@@ -177,6 +177,9 @@ export const withSessionTransportProgress = (
       })
     : undefined;
 
+const isAbortError = (error: unknown): boolean =>
+  error instanceof Error && error.name === "AbortError";
+
 export async function withRecoveringSession<TOptions, TResult>(
   options: TOptions | null,
   ensureSession: (options: TOptions) => Promise<SyncpeerSessionHandle>,
@@ -193,6 +196,7 @@ export async function withRecoveringSession<TOptions, TResult>(
     try {
       return await operation(session);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       if (!canRecover() || !session.isClosed() || attempt === 3) throw error;
       session = await ensureSession(options);
     }
@@ -644,6 +648,8 @@ class BepSession {
       resolve: (data: Uint8Array) => void;
       reject: (err: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      onAbort?: () => void;
+      cleanup?: () => void;
       meta: PendingRequestMeta;
     }
   >();
@@ -789,8 +795,8 @@ class BepSession {
     this.closeReason = error;
     this.stopKeepalive();
     this.log("socket.closed", { message: error.message });
-    for (const { reject, timer } of this.pending.values()) {
-      clearTimeout(timer);
+    for (const { reject, cleanup } of this.pending.values()) {
+      cleanup?.();
       reject(error);
     }
     this.pending.clear();
@@ -1266,7 +1272,7 @@ class BepSession {
     const entry = this.pending.get(id);
     if (!entry) return;
     this.pending.delete(id);
-    clearTimeout(entry.timer);
+    entry.cleanup?.();
     this.log("request.response", {
       id,
       folder: entry.meta.folder,
@@ -1740,9 +1746,19 @@ class BepSession {
     name: string,
     offset: number,
     size: number,
-    options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
+    options?: {
+      hash?: Uint8Array;
+      blockNo?: number;
+      fromTemporary?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<Uint8Array> {
     if (this.closed) return Promise.reject(new Error("Connection closed"));
+    if (options?.signal?.aborted) {
+      const error = new Error("Download cancelled.");
+      error.name = "AbortError";
+      return Promise.reject(error);
+    }
     const id = this.nextId++;
     const blockHash = options?.hash ?? new Uint8Array(0);
     const blockNo = Number.isFinite(options?.blockNo)
@@ -1778,8 +1794,13 @@ class BepSession {
     );
     return new Promise<Uint8Array>((resolve, reject) => {
       const timeoutMs = this.requestTimeoutMs;
-      const timer = setTimeout(() => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        options?.signal?.removeEventListener("abort", onAbort);
+      };
+      const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
         this.pending.delete(id);
+        cleanup();
         const error = new Error(`Request timeout for ${name} at offset ${offset}`);
         this.log("request.timeout", {
           ...meta,
@@ -1788,9 +1809,24 @@ class BepSession {
         });
         reject(error);
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer, meta });
+      const onAbort = () => {
+        if (!this.pending.has(id)) {
+          cleanup();
+          return;
+        }
+        this.pending.delete(id);
+        cleanup();
+        const error = new Error("Download cancelled.");
+        error.name = "AbortError";
+        reject(error);
+      };
+      this.pending.set(id, { resolve, reject, timer, onAbort, cleanup, meta });
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options?.signal?.aborted) onAbort();
       this.writeFrame(frame).catch((error) => {
-        clearTimeout(timer);
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        entry.cleanup?.();
         this.pending.delete(id);
         this.log("request.write_failed", {
           ...meta,
@@ -1827,8 +1863,8 @@ class BepSession {
     this.closed = true;
     this.stopKeepalive();
     const closeError = this.closeReason ?? new Error("Connection closed");
-    for (const { timer, reject } of this.pending.values()) {
-      clearTimeout(timer);
+    for (const { reject, cleanup } of this.pending.values()) {
+      cleanup?.();
       reject(closeError);
     }
     this.pending.clear();

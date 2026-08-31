@@ -946,7 +946,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
         focusedFolderId,
         (session) => session.remoteFs.readDir(folderId, path),
       ),
-    readFileFully: (folderId, path, onProgress) =>
+    readFileFully: (folderId, path, onProgress, signal) =>
       withRecoveringSession(
         activeOptions,
         ensureSession,
@@ -955,9 +955,10 @@ export const createNodeSessionTransport = (): SessionTransport => {
           folderId,
           path,
           withSessionTransportProgress(session, onProgress),
+          signal,
         ),
       ),
-    readFileToSink: (folderId, path, sink, onProgress) =>
+    readFileToSink: (folderId, path, sink, onProgress, signal) =>
       withRecoveringSession(
         activeOptions,
         ensureSession,
@@ -967,6 +968,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
           path,
           sink,
           withSessionTransportProgress(session, onProgress),
+          signal,
         ),
       ),
     writeFileFully: (folderId, path, bytes, options) =>

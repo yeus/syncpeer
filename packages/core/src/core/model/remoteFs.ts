@@ -107,6 +107,16 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const createAbortError = (): Error => {
+  const error = new Error("Download cancelled.");
+  error.name = "AbortError";
+  return error;
+};
+
+const throwIfAborted = (signal?: AbortSignal): void => {
+  if (signal?.aborted) throw createAbortError();
+};
+
 function resolveRequestName(folder: FolderState, requestedPath: string): string {
   const normalized = normalizePath(requestedPath);
   for (const [key, value] of folder.files) {
@@ -180,7 +190,12 @@ export class RemoteFs {
     filePath: string,
     offset: number,
     length: number,
-    options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
+    options?: {
+      hash?: Uint8Array;
+      blockNo?: number;
+      fromTemporary?: boolean;
+      signal?: AbortSignal;
+    },
   ) => Promise<Uint8Array>;
   private log?: (event: string, details?: Record<string, unknown>) => void;
   private remoteDevice?: RemoteDeviceInfo;
@@ -201,7 +216,12 @@ export class RemoteFs {
       filePath: string,
       offset: number,
       length: number,
-      options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
+      options?: {
+        hash?: Uint8Array;
+        blockNo?: number;
+        fromTemporary?: boolean;
+        signal?: AbortSignal;
+      },
     ) => Promise<Uint8Array>,
     requestFolderIndexUpdate: (folderId: string) => Promise<void>,
     setFocusedFolderId: (folderId: string | null) => void,
@@ -359,11 +379,17 @@ export class RemoteFs {
     });
   }
 
-  async readFileRange(folderId: string, path: string, offset: number, length: number): Promise<Uint8Array> {
+  async readFileRange(
+    folderId: string,
+    path: string,
+    offset: number,
+    length: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
     const requestName = resolveRequestName(folder, path);
-    return this.requestBlockWithRetry(folderId, requestName, offset, length);
+    return this.requestBlockWithRetry(folderId, requestName, offset, length, { signal });
   }
 
   private async requestBlockWithRetry(
@@ -371,13 +397,20 @@ export class RemoteFs {
     filePath: string,
     offset: number,
     length: number,
-    options?: { hash?: Uint8Array; blockNo?: number; fromTemporary?: boolean },
+    options?: {
+      hash?: Uint8Array;
+      blockNo?: number;
+      fromTemporary?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<Uint8Array> {
+    throwIfAborted(options?.signal);
     let lastError: unknown = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {
         return await this.requestBlock(folderId, filePath, offset, length, options);
       } catch (error) {
+        throwIfAborted(options?.signal);
         lastError = error;
         if (!isRetryableTransferError(error) || attempt === 3) throw error;
         this.log?.("core.request.retry", {
@@ -414,6 +447,7 @@ export class RemoteFs {
     folderId: string,
     path: string,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ): Promise<Uint8Array> {
     const chunks: Uint8Array[] = [];
     await this.readFileToSink(folderId, path, {
@@ -423,7 +457,7 @@ export class RemoteFs {
       },
       commit: () => undefined,
       abort: () => undefined,
-    }, onProgress);
+    }, onProgress, signal);
     const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     const output = new Uint8Array(total);
     let offset = 0;
@@ -439,20 +473,22 @@ export class RemoteFs {
     path: string,
     sink: FileDownloadSink,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
+    throwIfAborted(signal);
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
     if (!folder.indexReceived) await this.waitForFolderIndex(folderId, 6000, 120);
     const storedFile = resolveStoredFile(folder, path);
     if (folder.encrypted) {
-      return this.readEncryptedFileToSink(folder, path, storedFile, sink, onProgress);
+      return this.readEncryptedFileToSink(folder, path, storedFile, sink, onProgress, signal);
     }
     const requestName = resolveRequestName(folder, path);
 
     const requestWithCompatibilityFallback = async (
       offset: number,
       size: number,
-      options?: { hash?: Uint8Array; blockNo?: number },
+      options?: { hash?: Uint8Array; blockNo?: number; signal?: AbortSignal },
     ): Promise<Uint8Array> => {
       const requestModes: Array<{ fromTemporary: boolean; includeBlockMetadata: boolean }> = [
         // Prefer non-temporary requests first; some peers reject temporary pulls for normal files.
@@ -468,6 +504,7 @@ export class RemoteFs {
             fromTemporary: mode.fromTemporary,
             hash: mode.includeBlockMetadata ? options?.hash : undefined,
             blockNo: mode.includeBlockMetadata ? options?.blockNo : undefined,
+            signal: options?.signal,
           });
         } catch (error) {
           lastError = error;
@@ -498,10 +535,12 @@ export class RemoteFs {
         const chunks: Uint8Array[] = [];
         let downloaded = 0;
         while (downloaded < size) {
+          throwIfAborted(options?.signal);
           const remaining = size - downloaded;
           const nextSize = Math.min(compatibilityChunkSize, remaining);
           const chunk = await this.requestBlockWithRetry(folderId, requestName, offset + downloaded, nextSize, {
             fromTemporary: true,
+            signal: options?.signal,
           });
           if (chunk.length === 0) {
             throw new Error(`Unexpected empty compatibility chunk for ${requestName} at offset ${offset + downloaded}`);
@@ -526,7 +565,7 @@ export class RemoteFs {
     const requestWithTemporaryFallback = async (
       offset: number,
       size: number,
-      options?: { hash?: Uint8Array; blockNo?: number },
+      options?: { hash?: Uint8Array; blockNo?: number; signal?: AbortSignal },
     ): Promise<Uint8Array> => {
       try {
         return await requestWithCompatibilityFallback(offset, size, options);
@@ -543,7 +582,7 @@ export class RemoteFs {
       await new Promise((resolve) => setTimeout(resolve, 200));
       entry = await this.stat(folderId, path);
     }
-    if (!entry) return this.readFileByProbing(folderId, path, sink, onProgress);
+    if (!entry) return this.readFileByProbing(folderId, path, sink, onProgress, signal);
     if (entry.type === "directory") throw new Error(`Not a file: ${path}`);
     if (entry.invalid) {
       throw new Error(`Remote reports this file as invalid/unavailable: ${path}`);
@@ -553,7 +592,7 @@ export class RemoteFs {
     }
     if (!entry.blocks || entry.blocks.length == 0) {
       if (!Number.isFinite(entry.size) || entry.size <= 0) {
-        return this.readFileByProbing(folderId, path, sink, onProgress);
+        return this.readFileByProbing(folderId, path, sink, onProgress, signal);
       }
       const chunkSize = 128 * 1024;
       const plan: Array<{ offset: number; size: number }> = [];
@@ -570,9 +609,10 @@ export class RemoteFs {
         false,
         plan,
         6,
-        (next) => requestWithTemporaryFallback(next.offset, next.size),
+        (next) => requestWithTemporaryFallback(next.offset, next.size, { signal }),
         sink,
         onProgress,
+        signal,
       );
     }
     const totalBytes = entry.size > 0 ? entry.size : entry.blocks.reduce((sum, block) => sum + block.size, 0);
@@ -592,9 +632,11 @@ export class RemoteFs {
       (next) => requestWithTemporaryFallback(next.offset, next.size, {
         hash: next.block.hash,
         blockNo: next.blockNo,
+        signal,
       }),
       sink,
       onProgress,
+      signal,
     );
   }
 
@@ -620,6 +662,7 @@ export class RemoteFs {
     storedFile: StoredFileRecord | null,
     sink: FileDownloadSink,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
     let resolvedFile = storedFile;
     if (!resolvedFile || !resolvedFile.request) {
@@ -630,6 +673,7 @@ export class RemoteFs {
         !folder.passwordError &&
         Date.now() < deadline
       ) {
+        throwIfAborted(signal);
         await sleep(120);
         resolvedFile = resolveStoredFile(folder, path);
       }
@@ -653,6 +697,7 @@ export class RemoteFs {
         encrypted: true,
       };
       await sink.begin(metadata);
+      throwIfAborted(signal);
       await sink.commit();
       return { bytesWritten: 0, totalBytes: 0 };
     }
@@ -684,6 +729,7 @@ export class RemoteFs {
             hash: next.encryptedBlock.hash,
             blockNo: next.blockNo,
             fromTemporary: false,
+            signal,
           },
         );
         if (payload.length === 0) {
@@ -697,6 +743,7 @@ export class RemoteFs {
       },
       sink,
       onProgress,
+      signal,
     );
   }
 
@@ -705,6 +752,7 @@ export class RemoteFs {
     path: string,
     sink: FileDownloadSink,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
@@ -712,16 +760,23 @@ export class RemoteFs {
     const maxProbeSize = 16 * 1024 * 1024;
     let chunk: Uint8Array;
     try {
-      chunk = await this.requestBlockWithRetry(folderId, requestName, 0, maxProbeSize, { fromTemporary: false });
+      chunk = await this.requestBlockWithRetry(folderId, requestName, 0, maxProbeSize, {
+        fromTemporary: false,
+        signal,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
       if (!message.includes("timeout")) throw error;
-      chunk = await this.requestBlockWithRetry(folderId, requestName, 0, maxProbeSize, { fromTemporary: true });
+      chunk = await this.requestBlockWithRetry(folderId, requestName, 0, maxProbeSize, {
+        fromTemporary: true,
+        signal,
+      });
     }
     if (chunk.length === 0) throw new Error(`Not a file: ${requestName}`);
     let end = chunk.length;
     while (end > 0 && chunk[end - 1] === 0) end--;
     const trimmed = chunk.slice(0, end);
+    throwIfAborted(signal);
     await sink.begin({
       folderId,
       path: normalizePath(path),
@@ -747,40 +802,94 @@ export class RemoteFs {
     request: (item: T) => Promise<Uint8Array>,
     sink: FileDownloadSink,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
+    throwIfAborted(signal);
     await sink.begin({ folderId, path, sizeBytes: totalBytes, encrypted });
     let downloaded = 0;
-    for (let start = 0; start < plan.length; start += Math.max(1, concurrency)) {
-      const batch = plan.slice(start, start + Math.max(1, concurrency));
-      const chunks = await Promise.all(batch.map(async (item) => {
-        const chunk = await request(item);
-        if (chunk.length === 0) {
-          throw new Error(`Unexpected empty block while reading ${path} at offset ${item.offset}`);
+    let pending: Array<{ offset: number; bytes: Uint8Array }> = [];
+    let pendingBytes = 0;
+    const flushPending = async (): Promise<void> => {
+      if (pending.length === 0) return;
+      const first = pending[0];
+      const combined = new Uint8Array(pendingBytes);
+      let targetOffset = 0;
+      for (const item of pending) {
+        combined.set(item.bytes, targetOffset);
+        targetOffset += item.bytes.length;
+      }
+      pending = [];
+      pendingBytes = 0;
+      await sink.write(first.offset, combined);
+    };
+    const inFlight = new Map<number, Promise<
+      { index: number; bytes: Uint8Array; error?: never } |
+      { index: number; bytes?: never; error: unknown }
+    >>();
+    const completed = new Map<number, Uint8Array>();
+    let nextRequestIndex = 0;
+    let nextWriteIndex = 0;
+    const startRequest = (index: number) => {
+      const pendingRequest = request(plan[index]).then(
+        (bytes) => ({ index, bytes }),
+        (error: unknown) => ({ index, error }),
+      );
+      inFlight.set(index, pendingRequest);
+    };
+    while (nextRequestIndex < Math.min(plan.length, Math.max(1, concurrency))) {
+      startRequest(nextRequestIndex);
+      nextRequestIndex += 1;
+    }
+    while (inFlight.size > 0) {
+      throwIfAborted(signal);
+      const result = await Promise.race(inFlight.values());
+      inFlight.delete(result.index);
+      if ("error" in result) throw result.error;
+      const item = plan[result.index];
+      if (result.bytes.length === 0) {
+        throw new Error(`Unexpected empty block while reading ${path} at offset ${item.offset}`);
+      }
+      if (result.bytes.length !== item.size) {
+        throw new Error(
+          `Downloaded block for ${path} at offset ${item.offset}: ` +
+          `expected ${item.size} bytes, received ${result.bytes.length}`,
+        );
+      }
+      completed.set(result.index, result.bytes);
+      if (nextRequestIndex < plan.length) {
+        startRequest(nextRequestIndex);
+        nextRequestIndex += 1;
+      }
+      while (completed.has(nextWriteIndex)) {
+        throwIfAborted(signal);
+        const chunk = completed.get(nextWriteIndex)!;
+        completed.delete(nextWriteIndex);
+        const next = plan[nextWriteIndex];
+        const previous = pending[pending.length - 1];
+        const contiguous = previous
+          ? previous.offset + previous.bytes.length === next.offset
+          : true;
+        if (!contiguous || pendingBytes + chunk.length > 1024 * 1024) {
+          await flushPending();
         }
-        if (chunk.length !== item.size) {
-          throw new Error(
-            `Downloaded block for ${path} at offset ${item.offset}: ` +
-            `expected ${item.size} bytes, received ${chunk.length}`,
-          );
-        }
-        return chunk;
-      }));
-      for (let index = 0; index < chunks.length; index += 1) {
-        const chunk = chunks[index];
-        const item = batch[index];
-        await sink.write(item.offset, chunk);
+        pending.push({ offset: next.offset, bytes: chunk });
+        pendingBytes += chunk.length;
         downloaded += chunk.length;
         onProgress?.({
           downloadedBytes: downloaded,
           totalBytes: Math.max(totalBytes, downloaded),
         });
+        nextWriteIndex += 1;
       }
     }
+    throwIfAborted(signal);
+    await flushPending();
     if (downloaded !== totalBytes) {
       throw new Error(
         `Incomplete download for ${path}: expected ${totalBytes} bytes, received ${downloaded}`,
       );
     }
+    throwIfAborted(signal);
     await sink.commit();
     return {
       bytesWritten: downloaded,

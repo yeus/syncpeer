@@ -372,10 +372,59 @@ assert.equal(streamBegan, true);
 assert.equal(streamCommitted, true);
 assert.deepEqual(streamed, { bytesWritten: 9, totalBytes: 9 });
 assert.deepEqual(streamWrites, [
-  { offset: 0, bytes: [1, 2, 3] },
-  { offset: 3, bytes: [4, 5, 6] },
-  { offset: 6, bytes: [7, 8, 9] },
+  { offset: 0, bytes: [1, 2, 3, 4, 5, 6, 7, 8, 9] },
 ]);
+
+const pipelinedPayload = new Uint8Array([1, 2, 3, 4, 5, 6, 7]);
+const pipelinedRequests: number[] = [];
+const pipelinedResolvers = new Map<number, (bytes: Uint8Array) => void>();
+const pipelinedFolder = {
+  ...streamFolder,
+  files: new Map([
+    ["pipelined.bin", {
+      indexFile: {
+        name: "pipelined.bin",
+        type: 0,
+        size: pipelinedPayload.length,
+        blocks: [...pipelinedPayload].map((_value, offset) => ({
+          offset,
+          size: 1,
+          hash: new Uint8Array(),
+        })),
+      },
+    }],
+  ]),
+};
+const pipelinedFs = new BuiltRemoteFs(
+  new Map([[pipelinedFolder.id, pipelinedFolder]]),
+  async (_folderId, _path, offset) => {
+    pipelinedRequests.push(offset);
+    return new Promise<Uint8Array>((resolve) => {
+      pipelinedResolvers.set(offset, resolve);
+    });
+  },
+  async () => undefined,
+  () => undefined,
+);
+const pipelinedDownload = pipelinedFs.readFileToSink(
+  pipelinedFolder.id,
+  "pipelined.bin",
+  {
+    begin: () => undefined,
+    write: () => undefined,
+    commit: () => undefined,
+    abort: () => undefined,
+  },
+);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.deepEqual(pipelinedRequests, [0, 1, 2, 3, 4, 5]);
+pipelinedResolvers.get(1)?.(pipelinedPayload.slice(1, 2));
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.deepEqual(pipelinedRequests, [0, 1, 2, 3, 4, 5, 6]);
+for (const offset of [0, 2, 3, 4, 5, 6]) {
+  pipelinedResolvers.get(offset)?.(pipelinedPayload.slice(offset, offset + 1));
+}
+await pipelinedDownload;
 
 let incompleteCommitted = false;
 const incompleteFs = new BuiltRemoteFs(

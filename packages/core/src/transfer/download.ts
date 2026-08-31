@@ -5,6 +5,7 @@ export interface DownloadRemoteFileFs {
     folderId: string,
     path: string,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ) => Promise<Uint8Array>;
 }
 
@@ -14,5 +15,11 @@ export const downloadRemoteFile = async (
     folderId: string;
     path: string;
     onProgress?: (progress: FileDownloadProgress) => void;
+    signal?: AbortSignal;
   },
-): Promise<Uint8Array> => remoteFs.readFileFully(args.folderId, args.path, args.onProgress);
+): Promise<Uint8Array> => remoteFs.readFileFully(
+  args.folderId,
+  args.path,
+  args.onProgress,
+  args.signal,
+);

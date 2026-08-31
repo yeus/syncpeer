@@ -49,12 +49,14 @@ export interface RemoteFsLike {
     folderId: string,
     path: string,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ) => Promise<Uint8Array>;
   readFileToSink?: (
     folderId: string,
     path: string,
     sink: FileDownloadSink,
     onProgress?: (progress: FileDownloadProgress) => void,
+    signal?: AbortSignal,
   ) => Promise<FileDownloadResult>;
   writeFileFully: (
     folderId: string,
@@ -161,6 +163,13 @@ export interface SyncpeerPlatformAdapter {
   }) => Promise<FileDownloadSink>;
   startTransfer?: (label: string) => Promise<void>;
   stopTransfer?: () => Promise<void>;
+  updateTransferNotification?: (args: {
+    title: string;
+    body: string;
+    progress?: number;
+    ongoing: boolean;
+    cancellable: boolean;
+  }) => Promise<void>;
   getCachedStatuses?: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   listCachedFiles?: () => Promise<CachedFileRecord[]>;
   openCachedFile?: (folderId: string, path: string) => Promise<void>;
@@ -228,6 +237,7 @@ export interface SyncpeerBrowserClient {
   createFileDownloadSink?: SyncpeerPlatformAdapter["createFileDownloadSink"];
   startTransfer?: (label: string) => Promise<void>;
   stopTransfer?: () => Promise<void>;
+  updateTransferNotification?: SyncpeerPlatformAdapter["updateTransferNotification"];
   getCachedStatuses: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   listCachedFiles: () => Promise<CachedFileRecord[]>;
   openCachedFile: (folderId: string, path: string) => Promise<void>;
@@ -616,6 +626,7 @@ export const createSyncpeerBrowserClient = (
       folderId: string,
       path: string,
       onProgress?: (progress: FileDownloadProgress) => void,
+      signal?: AbortSignal,
     ) =>
       withSessionOperation(
         activeConnectOptions,
@@ -623,6 +634,7 @@ export const createSyncpeerBrowserClient = (
           folderId,
           path,
           withSessionTransportProgress(session, onProgress),
+          signal,
         ),
       ),
     readFileToSink: (
@@ -630,6 +642,7 @@ export const createSyncpeerBrowserClient = (
       path: string,
       sink: FileDownloadSink,
       onProgress?: (progress: FileDownloadProgress) => void,
+      signal?: AbortSignal,
     ) =>
       withSessionOperation(
         activeConnectOptions,
@@ -638,6 +651,7 @@ export const createSyncpeerBrowserClient = (
           path,
           sink,
           withSessionTransportProgress(session, onProgress),
+          signal,
         ),
       ),
     writeFileFully: (
@@ -754,6 +768,9 @@ export const createSyncpeerBrowserClient = (
       : undefined,
     stopTransfer: platformAdapter.stopTransfer
       ? () => platformAdapter.stopTransfer!()
+      : undefined,
+    updateTransferNotification: platformAdapter.updateTransferNotification
+      ? (args) => platformAdapter.updateTransferNotification!(args)
       : undefined,
     getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
       platformAdapter.getCachedStatuses

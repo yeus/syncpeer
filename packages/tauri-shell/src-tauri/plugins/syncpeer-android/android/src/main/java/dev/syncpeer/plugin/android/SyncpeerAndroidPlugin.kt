@@ -13,6 +13,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PersistableBundle
 import android.webkit.MimeTypeMap
+import android.webkit.WebView
 import android.app.Activity
 import android.content.Context
 import android.provider.CalendarContract
@@ -57,6 +58,15 @@ class SafCopyFileArgs {
 @InvokeArg
 class TransferServiceArgs {
   var label: String = "File transfer"
+}
+
+@InvokeArg
+class TransferNotificationArgs {
+  var title: String = "Syncpeer transfer"
+  var body: String = "File transfer"
+  var progress: Int? = null
+  var ongoing: Boolean = true
+  var cancellable: Boolean = false
 }
 
 @InvokeArg
@@ -107,6 +117,20 @@ class AndroidCalendarDeleteArgs {
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private var multicastLock: WifiManager.MulticastLock? = null
 
+  override fun load(webView: WebView) {
+    super.load(webView)
+    if (activity.intent?.action == SyncpeerTransferConstants.ACTION_CANCEL) {
+      handleTransferCancellation()
+    }
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    if (intent.action == SyncpeerTransferConstants.ACTION_CANCEL) {
+      handleTransferCancellation()
+    }
+  }
+
   @Command
   fun startTransferService(invoke: Invoke) {
     try {
@@ -125,15 +149,48 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun stopTransferService(invoke: Invoke) {
     try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        val scheduler = activity.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler
-        scheduler?.cancel(SyncpeerTransferConstants.JOB_ID)
-      }
-      activity.stopService(Intent(activity, SyncpeerTransferService::class.java))
+      stopTransferRuntime()
       invoke.resolveObject(mapOf("stopped" to true))
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not stop transfer runtime.")
     }
+  }
+
+  @Command
+  fun updateTransferNotification(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(TransferNotificationArgs::class.java)
+      SyncpeerTransferNotifications.update(
+        activity,
+        args.title,
+        args.body,
+        args.progress,
+        args.ongoing,
+        args.cancellable,
+      )
+      invoke.resolveObject(mapOf("updated" to true))
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not update transfer notification.")
+    }
+  }
+
+  private fun stopTransferRuntime() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      val scheduler = activity.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler
+      scheduler?.cancel(SyncpeerTransferConstants.JOB_ID)
+    }
+    activity.stopService(Intent(activity, SyncpeerTransferService::class.java))
+  }
+
+  private fun handleTransferCancellation() {
+    stopTransferRuntime()
+    triggerObject(
+      SyncpeerTransferConstants.EVENT_TRANSFER_ACTION,
+      mapOf(
+        "actionId" to "cancel",
+        "notification" to mapOf("id" to SyncpeerTransferConstants.NOTIFICATION_ID),
+      ),
+    )
   }
 
   private fun startForegroundTransfer(label: String): Map<String, Any> {

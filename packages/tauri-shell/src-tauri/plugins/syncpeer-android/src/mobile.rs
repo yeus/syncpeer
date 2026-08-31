@@ -43,6 +43,30 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .map_err(Into::into)
   }
 
+  pub fn update_transfer_notification(
+    &self,
+    title: &str,
+    body: &str,
+    progress: Option<u8>,
+    ongoing: bool,
+    cancellable: bool,
+  ) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>(
+        "updateTransferNotification",
+        json!({
+          "title": title,
+          "body": body,
+          "progress": progress,
+          "ongoing": ongoing,
+          "cancellable": cancellable,
+        }),
+      )
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
   pub fn enable_multicast_lock(&self) -> crate::Result<()> {
     self
       .0

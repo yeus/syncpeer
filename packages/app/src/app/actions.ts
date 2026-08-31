@@ -29,11 +29,16 @@ import {
   type SyncpeerSessionStore,
 } from "@syncpeer/core/browser";
 import {
+  createChannel as createNativeNotificationChannel,
+  Importance as NativeNotificationImportance,
   isPermissionGranted as isNativeNotificationPermissionGranted,
+  onAction as onNativeNotificationAction,
+  registerActionTypes as registerNativeNotificationActionTypes,
   requestPermission as requestNativeNotificationPermission,
   sendNotification as sendNativeNotification,
   removeActive as removeActiveNativeNotifications,
 } from "@tauri-apps/plugin-notification";
+import { addPluginListener } from "@tauri-apps/api/core";
 import { reportUiError } from "../lib/tauriAdapters.js";
 import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
 import {
@@ -100,8 +105,11 @@ import {
 const nowTime = () => new Date().toLocaleTimeString();
 const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
 const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
-const DOWNLOAD_NOTIFICATION_ID = 11001;
-const UPLOAD_NOTIFICATION_ID = 11002;
+const TRANSFER_NOTIFICATION_ID = 22067;
+const TRANSFER_NOTIFICATION_CHANNEL_ID = "syncpeer-transfers-v2";
+const TRANSFER_NOTIFICATION_ACTION_TYPE = "syncpeer-transfer";
+const TRANSFER_NOTIFICATION_CANCEL_ACTION = "cancel";
+const TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS = 1000;
 const appVersion = String(import.meta.env.SYNCPEER_APP_VERSION || "0.0.0");
 const buildCommit = String(import.meta.env.SYNCPEER_BUILD_COMMIT || "unknown");
 const buildTimeUtc = String(import.meta.env.SYNCPEER_BUILD_TIME_UTC || "unknown");
@@ -506,6 +514,19 @@ export const createAppActions = (args: {
   let downloadNoticeTimer: number | null = null;
   let lastTransferNotificationAtMs = 0;
   let notificationPermissionRequested = false;
+  let transferNotificationSetup: Promise<void> | null = null;
+  let transferNotificationTimer: ReturnType<typeof setTimeout> | null = null;
+  let transferNotificationInFlight: Promise<void> | null = null;
+  let pendingTransferNotification: {
+    id: number;
+    title: string;
+    body: string;
+    ongoing: boolean;
+    force: boolean;
+    progressPercent?: number;
+    cancellable: boolean;
+  } | null = null;
+  let activeTransferCancellation: (() => void) | null = null;
   let connectInFlight: Promise<void> | null = null;
 
   const setDownloadNotice = (message: string, clearAfterMs = 0) => {
@@ -535,29 +556,141 @@ export const createAppActions = (args: {
     }
   };
 
+  const ensureTransferNotificationSetup = () => {
+    if (!supportsOngoingTransferNotifications(runtimeSurface)) return Promise.resolve();
+    if (!transferNotificationSetup) {
+      transferNotificationSetup = (async () => {
+        if (client.updateTransferNotification) {
+          await addPluginListener<{ actionId?: string; notification?: { id?: number } }>(
+            "syncpeer-android",
+            "transferAction",
+            (event) => {
+              if (
+                event.actionId === TRANSFER_NOTIFICATION_CANCEL_ACTION &&
+                Number(event.notification?.id) === TRANSFER_NOTIFICATION_ID
+              ) {
+                activeTransferCancellation?.();
+              }
+            },
+          );
+          return;
+        }
+        await createNativeNotificationChannel({
+          id: TRANSFER_NOTIFICATION_CHANNEL_ID,
+          name: "Syncpeer transfers",
+          description: "File transfer progress",
+          importance: NativeNotificationImportance.Low,
+          vibration: false,
+          lights: false,
+        });
+        await registerNativeNotificationActionTypes([{
+          id: TRANSFER_NOTIFICATION_ACTION_TYPE,
+          actions: [{ id: TRANSFER_NOTIFICATION_CANCEL_ACTION, title: "Cancel" }],
+        }]);
+        await onNativeNotificationAction((event) => {
+          const data = event as unknown as {
+            actionId?: string;
+            notification?: { id?: number };
+          };
+          if (
+            data.actionId === TRANSFER_NOTIFICATION_CANCEL_ACTION &&
+            Number(data.notification?.id) === TRANSFER_NOTIFICATION_ID
+          ) {
+            activeTransferCancellation?.();
+          }
+        });
+      })().catch(() => undefined);
+    }
+    return transferNotificationSetup;
+  };
+
+  const flushTransferNotification = async () => {
+    if (transferNotificationInFlight || !pendingTransferNotification) return;
+    const next = pendingTransferNotification;
+    pendingTransferNotification = null;
+    transferNotificationInFlight = (async () => {
+      await ensureTransferNotificationSetup();
+      const granted = await ensureNativeNotificationPermission();
+      if (!granted) return;
+      const androidNotification = supportsOngoingTransferNotifications(runtimeSurface);
+      try {
+        if (androidNotification && client.updateTransferNotification) {
+          await client.updateTransferNotification({
+            title: next.title,
+            body: next.body,
+            progress: next.progressPercent,
+            ongoing: next.ongoing,
+            cancellable: next.cancellable,
+          });
+        } else {
+          sendNativeNotification({
+            id: next.id,
+            title: next.title,
+            body: next.body,
+            ...(androidNotification ? {
+              channelId: TRANSFER_NOTIFICATION_CHANNEL_ID,
+              ...(next.ongoing && next.cancellable
+                ? { actionTypeId: TRANSFER_NOTIFICATION_ACTION_TYPE }
+                : {}),
+            } : {}),
+            ongoing: next.ongoing,
+            autoCancel: !next.ongoing,
+            silent: true,
+          });
+        }
+        lastTransferNotificationAtMs = Date.now();
+      } catch {
+        // Best-effort only.
+      }
+    })().finally(() => {
+      transferNotificationInFlight = null;
+      if (pendingTransferNotification) {
+        const elapsed = Date.now() - lastTransferNotificationAtMs;
+        if (pendingTransferNotification.force || elapsed >= TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS) {
+          void flushTransferNotification();
+        } else if (!transferNotificationTimer) {
+          transferNotificationTimer = setTimeout(() => {
+            transferNotificationTimer = null;
+            void flushTransferNotification();
+          }, TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS - elapsed);
+        }
+      }
+    });
+    await transferNotificationInFlight;
+  };
+
   const maybeTransferNotification = async (
     id: number,
     title: string,
     body: string,
-    options?: { ongoing?: boolean; force?: boolean; progress?: boolean },
-  ) => {
+    options?: {
+      ongoing?: boolean;
+      force?: boolean;
+      progress?: boolean;
+      progressPercent?: number;
+      cancellable?: boolean;
+    },
+  ): Promise<void> => {
     if (options?.progress && !supportsOngoingTransferNotifications(runtimeSurface)) return;
-    const now = Date.now();
-    if (!options?.force && now - lastTransferNotificationAtMs < 2000) return;
-    const granted = await ensureNativeNotificationPermission();
-    if (!granted) return;
-    lastTransferNotificationAtMs = now;
-    try {
-      sendNativeNotification({
-        id,
-        title,
-        body,
-        ongoing: options?.ongoing ?? true,
-        autoCancel: !(options?.ongoing ?? true),
-        silent: true,
-      });
-    } catch {
-      // Best-effort only.
+    pendingTransferNotification = {
+      id,
+      title,
+      body,
+      ongoing: options?.ongoing ?? true,
+      force: options?.force ?? false,
+      progressPercent: options?.progressPercent,
+      cancellable: options?.cancellable ?? false,
+    };
+    const elapsed = Date.now() - lastTransferNotificationAtMs;
+    if (options?.force || (!transferNotificationInFlight && elapsed >= TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS)) {
+      await flushTransferNotification();
+      return;
+    }
+    if (!transferNotificationTimer) {
+        transferNotificationTimer = setTimeout(() => {
+          transferNotificationTimer = null;
+          void flushTransferNotification();
+        }, Math.max(0, TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS - elapsed));
     }
   };
 
@@ -1403,6 +1536,11 @@ export const createAppActions = (args: {
     let downloadCompleted = false;
     let activeSink: FileDownloadSink | null = null;
     let transferServiceStarted = false;
+    const abortController = new AbortController();
+    activeTransferCancellation = () => {
+      abortController.abort();
+      setDownloadNotice(`Cancelling download ${name}…`);
+    };
     const downloadKey = cachedFileKey(folderId, path);
     const remoteFs = state.session.remoteFs;
     state.favorites.activeDownloadKey = downloadKey;
@@ -1412,12 +1550,6 @@ export const createAppActions = (args: {
         state.session.connectionScope,
       )}`;
     setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
-    void maybeTransferNotification(
-      DOWNLOAD_NOTIFICATION_ID,
-      "Syncpeer download",
-      `Downloading ${name}: 0%`,
-      { ongoing: true, force: true },
-    );
     pushSessionLog(state, "info", "download.start", `Downloading ${name}`, {
       folderId,
       path,
@@ -1426,6 +1558,12 @@ export const createAppActions = (args: {
     try {
       await client.startTransfer?.(name);
       transferServiceStarted = true;
+      await maybeTransferNotification(
+        TRANSFER_NOTIFICATION_ID,
+        "Syncpeer download",
+        `Downloading ${name}: 0%`,
+        { ongoing: true, force: true, progressPercent: 0, cancellable: true },
+      );
       const onProgress = ({
         downloadedBytes,
         totalBytes,
@@ -1453,11 +1591,18 @@ export const createAppActions = (args: {
           connectionScope ?? state.session.connectionScope,
         )}`;
         setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
-        void maybeTransferNotification(
-          DOWNLOAD_NOTIFICATION_ID,
+        maybeTransferNotification(
+          TRANSFER_NOTIFICATION_ID,
           "Syncpeer download",
           `${name}: ${state.favorites.activeDownloadText}`,
-          { ongoing: true, progress: true },
+          {
+            ongoing: true,
+            progress: true,
+            progressPercent: totalBytes > 0
+              ? Math.floor((downloadedBytes / totalBytes) * 100)
+              : undefined,
+            cancellable: true,
+          },
         );
         const now = Date.now();
         if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
@@ -1480,9 +1625,20 @@ export const createAppActions = (args: {
       if (remoteFs.readFileToSink && client.createFileDownloadSink) {
         const sink = await client.createFileDownloadSink({ folderId, path, name });
         activeSink = sink;
-        downloadResult = await remoteFs.readFileToSink(folderId, path, sink, onProgress);
+        downloadResult = await remoteFs.readFileToSink(
+          folderId,
+          path,
+          sink,
+          onProgress,
+          abortController.signal,
+        );
       } else {
-        const bytes = await downloadRemoteFile(remoteFs, { folderId, path, onProgress });
+        const bytes = await downloadRemoteFile(remoteFs, {
+          folderId,
+          path,
+          onProgress,
+          signal: abortController.signal,
+        });
         await client.cacheFile(folderId, path, name, bytes);
         downloadResult = { bytesWritten: bytes.length, totalBytes: bytes.length };
       }
@@ -1497,8 +1653,8 @@ export const createAppActions = (args: {
         `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}`,
         4000,
       );
-      void maybeTransferNotification(
-        DOWNLOAD_NOTIFICATION_ID,
+      maybeTransferNotification(
+        TRANSFER_NOTIFICATION_ID,
         "Syncpeer download complete",
         name,
         { ongoing: false, force: true },
@@ -1525,14 +1681,24 @@ export const createAppActions = (args: {
           reportActionError(state, "download_file.abort_failed", abortError, { folderId, path });
         }
       }
-      reportActionError(state, "download_file.failed", error, { folderId, path });
-      setDownloadNotice(`Download failed: ${name}`, 6000);
-      void maybeTransferNotification(
-        DOWNLOAD_NOTIFICATION_ID,
-        "Syncpeer download failed",
-        name,
-        { ongoing: false, force: true },
-      );
+      if (error instanceof Error && error.name === "AbortError") {
+        setDownloadNotice(`Download cancelled: ${name}`, 4000);
+        maybeTransferNotification(
+          TRANSFER_NOTIFICATION_ID,
+          "Syncpeer download cancelled",
+          name,
+          { ongoing: false, force: true },
+        );
+      } else {
+        reportActionError(state, "download_file.failed", error, { folderId, path });
+        setDownloadNotice(`Download failed: ${name}`, 6000);
+        maybeTransferNotification(
+          TRANSFER_NOTIFICATION_ID,
+          "Syncpeer download failed",
+          name,
+          { ongoing: false, force: true },
+        );
+      }
     } finally {
       if (transferServiceStarted) {
         try {
@@ -1546,12 +1712,18 @@ export const createAppActions = (args: {
         state.favorites.activeDownloadKey = "";
         state.favorites.activeDownloadText = "";
       }
+      activeTransferCancellation = null;
       if (downloadCompleted) {
         window.setTimeout(() => {
-          void clearTransferNotification(DOWNLOAD_NOTIFICATION_ID);
+          void clearTransferNotification(TRANSFER_NOTIFICATION_ID);
         }, 2500);
       }
     }
+  };
+
+  const cancelDownload = () => {
+    if (!state.favorites.isDownloading) return;
+    activeTransferCancellation?.();
   };
 
   const openOrDownloadFile = async (folderId: string, path: string, name: string) => {
@@ -1875,11 +2047,11 @@ export const createAppActions = (args: {
     state.ui.uploadMessage = `Uploading ${fileName}...`;
     const startedAtMs = Date.now();
     let lastTransferLogAtMs = 0;
-    void maybeTransferNotification(
-      UPLOAD_NOTIFICATION_ID,
+    maybeTransferNotification(
+      TRANSFER_NOTIFICATION_ID,
       "Syncpeer upload",
       `Uploading ${fileName}: 0%`,
-      { ongoing: true, force: true },
+      { ongoing: true, force: true, progressPercent: 0 },
     );
     pushSessionLog(state, "info", "upload.start", `Uploading ${fileName}`, {
       folderId: state.session.currentFolderId,
@@ -1914,11 +2086,11 @@ export const createAppActions = (args: {
       }
       const uploadNotice = `Upload ${pct}%${state.ui.uploadProgressEta ? ` · ETA ${state.ui.uploadProgressEta}` : ""}`;
       setDownloadNotice(uploadNotice);
-      void maybeTransferNotification(
-        UPLOAD_NOTIFICATION_ID,
+      maybeTransferNotification(
+        TRANSFER_NOTIFICATION_ID,
         "Syncpeer upload",
         `${fileName}: ${uploadNotice}`,
-        { ongoing: pct < 100, progress: true },
+        { ongoing: pct < 100, progress: true, progressPercent: pct },
       );
     };
     try {
@@ -1939,8 +2111,8 @@ export const createAppActions = (args: {
       await loadDirectorySideEffects(state, client);
       state.ui.uploadMessage = `Uploaded ${fileName}.`;
       setDownloadNotice(`Uploaded ${fileName}`, 4000);
-      void maybeTransferNotification(
-        UPLOAD_NOTIFICATION_ID,
+      maybeTransferNotification(
+        TRANSFER_NOTIFICATION_ID,
         "Syncpeer upload complete",
         fileName,
         { ongoing: false, force: true },
@@ -1963,8 +2135,8 @@ export const createAppActions = (args: {
         sizeBytes: bytes.length,
       });
       setDownloadNotice(`Upload failed: ${fileName}`, 6000);
-      void maybeTransferNotification(
-        UPLOAD_NOTIFICATION_ID,
+      maybeTransferNotification(
+        TRANSFER_NOTIFICATION_ID,
         "Syncpeer upload failed",
         fileName,
         { ongoing: false, force: true },
@@ -1985,7 +2157,7 @@ export const createAppActions = (args: {
       }
       if (state.ui.uploadProgressPercent >= 100) {
         window.setTimeout(() => {
-          void clearTransferNotification(UPLOAD_NOTIFICATION_ID);
+          void clearTransferNotification(TRANSFER_NOTIFICATION_ID);
         }, 2500);
       }
     }
@@ -2801,6 +2973,7 @@ export const createAppActions = (args: {
     openCachedDirectory,
     openOrDownloadFile,
     downloadFile,
+    cancelDownload,
     updateFolderPasswordDraft,
     setFolderPasswordInputVisible,
     saveFolderPassword,

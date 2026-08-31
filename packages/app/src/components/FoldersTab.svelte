@@ -32,6 +32,7 @@
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
+    onCancelDownload: () => void;
     onToggleFavorite: (folderId: string, path: string, name: string, kind: "folder" | "file") => void;
     onSetPasswordVisible: (folderId: string, visible: boolean) => void;
     onUpdateFolderPasswordDraft: (folderId: string, password: string) => void;
@@ -71,6 +72,7 @@
     onOpenCachedFileDirectory,
     onOpenOrDownloadFile,
     onDownloadFile,
+    onCancelDownload,
     onToggleFavorite,
     onSetPasswordVisible,
     onUpdateFolderPasswordDraft,
@@ -338,6 +340,7 @@
               onOpenCachedFileDirectory={onOpenCachedFileDirectory}
               onOpenOrDownloadFile={onOpenOrDownloadFile}
               onDownloadFile={onDownloadFile}
+              onCancelDownload={onCancelDownload}
               onToggleFavorite={onToggleFavorite}
               viewMode={directoryViewMode}
             />

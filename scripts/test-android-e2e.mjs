@@ -254,6 +254,7 @@ const waitForUiText = (cdp, text, timeout = 60_000) => waitForUiCondition(
 
 const readUiDownloadState = async (cdp, name) => cdp.evaluate(`(() => {
   const text = document.body?.innerText || "";
+  if (text.includes(${JSON.stringify(`Download cancelled: ${name}`)})) return "cancelled";
   if (text.includes(${JSON.stringify(`Download failed: ${name}`)})) return "failed";
   if (text.includes(${JSON.stringify(`Downloading ${name}`)})) return "active";
   if (text.includes(${JSON.stringify(`Downloaded ${name}`)})) return "done";
@@ -323,6 +324,15 @@ const clickUiDownload = (cdp, title) => cdp.evaluate(`(() => {
   return true;
 })()`);
 
+const clickUiCancelDownload = (cdp, title) => cdp.evaluate(`(() => {
+  const item = [...document.querySelectorAll(".item-title")]
+    .find((element) => element.textContent?.trim() === ${JSON.stringify(title)});
+  const button = item?.closest("li")?.querySelector("button[aria-label='Cancel download']");
+  if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+  button.click();
+  return true;
+})()`);
+
 const waitForUiDownloadButton = async (cdp, title, timeout = 30_000) => {
   await waitForUiCondition(
     cdp,
@@ -376,12 +386,60 @@ const notificationBounds = (xml, text) => {
   return null;
 };
 
+const notificationRowBounds = (xml, titles) => {
+  const titleIndex = titles
+    .map((title) => xml.indexOf(`text="${title}"`))
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0];
+  if (titleIndex === undefined) return null;
+  const rowPattern = /<node\b[^>]*resource-id="com\.android\.systemui:id\/expandableNotificationRow"[^>]*>/g;
+  let row = null;
+  for (const match of xml.matchAll(rowPattern)) {
+    if ((match.index ?? 0) < titleIndex) row = match[0];
+  }
+  if (!row) return null;
+  const bounds = row.match(/\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+  if (!bounds) return null;
+  const rowBounds = {
+    left: Number(bounds[1]),
+    top: Number(bounds[2]),
+    right: Number(bounds[3]),
+    bottom: Number(bounds[4]),
+  };
+  const expandPattern = /<node\b[^>]*resource-id="android:id\/expand_button"[^>]*>/g;
+  for (const match of xml.matchAll(expandPattern)) {
+    const expandBounds = match[0].match(/\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+    if (!expandBounds) continue;
+    const x = Math.floor((Number(expandBounds[1]) + Number(expandBounds[3])) / 2);
+    const y = Math.floor((Number(expandBounds[2]) + Number(expandBounds[4])) / 2);
+    if (
+      x >= rowBounds.left && x <= rowBounds.right &&
+      y >= rowBounds.top && y <= rowBounds.bottom
+    ) {
+      return { x, y };
+    }
+  }
+  return {
+    x: Math.floor((rowBounds.left + rowBounds.right) / 2),
+    y: Math.floor((rowBounds.top + rowBounds.bottom) / 2),
+  };
+};
+
 const waitForNotificationBounds = async (text, timeout = 15_000) => {
   const deadline = Date.now() + timeout;
   runAdb(["shell", "cmd", "statusbar", "expand-notifications"]);
+  let expanded = false;
   while (Date.now() < deadline) {
-    const bounds = notificationBounds(notificationUiXml(), text);
+    const xml = notificationUiXml();
+    const bounds = notificationBounds(xml, text);
     if (bounds) return bounds;
+    if (!expanded) {
+      const notificationRow = notificationRowBounds(xml, ["Syncpeer download", "Syncpeer transfer"]);
+      if (notificationRow) {
+        runAdb(["shell", "input", "tap", String(notificationRow.x), String(notificationRow.y)]);
+        expanded = true;
+      }
+    }
     await wait(250);
   }
   throw new Error(`Android notification was not visible: ${text}`);
@@ -395,6 +453,118 @@ const tapNotification = async (text) => {
     await assertForeground();
   } finally {
     runAdb(["shell", "cmd", "statusbar", "collapse"]);
+  }
+};
+
+const appNotificationRecords = () => {
+  const dump = runAdb(["shell", "dumpsys", "notification", "--noredact"]);
+  const records = dump.split(/\n(?=\s{4}NotificationRecord\()/)
+    .filter((record) => record.includes(`pkg=${packageName}`));
+  return {
+    dump,
+    records,
+    transferRecords: records.filter((record) =>
+      /\bid=(11001|11002|22067)\b/.test(record) || record.includes("channel=syncpeer-transfers"),
+    ),
+  };
+};
+
+const clearTransferNotifications = async (cdp) => {
+  stopTransferService();
+  try {
+    await tauriInvoke(cdp, "plugin:notification|remove_active", {
+      notifications: [{ id: 11001 }, { id: 11002 }, { id: 22067 }],
+    });
+  } catch {
+    // Older builds may not expose the notification plugin command to CDP.
+  }
+  await wait(500);
+};
+
+const waitForActiveTransferNotification = async (timeout = 15_000) => {
+  const deadline = Date.now() + timeout;
+  let latest = { dump: "", records: [], transferRecords: [] };
+  while (Date.now() < deadline) {
+    latest = appNotificationRecords();
+    if (
+      latest.transferRecords.length === 1 &&
+      /\b\d{1,3}%/.test(latest.transferRecords[0])
+    ) {
+      return latest;
+    }
+    await wait(250);
+  }
+  const summary = latest.transferRecords
+    .map((record) => record.split("\n")[0])
+    .join(" | ");
+  throw new Error(
+    `Expected one active Android transfer notification with a percentage, found ` +
+    `${latest.transferRecords.length}: ${summary}`,
+  );
+};
+
+const runAndroidDownloadNotificationRegression = async () => {
+  let cdp = await launchAndroidApp(true);
+  try {
+    if (!await openAndroidConnection(cdp)) {
+      throw new Error("Download notification test could not connect to the remote test server.");
+    }
+    await clearTransferNotifications(cdp);
+    await startAndroidBlobDownload(cdp, false);
+    await waitForTransferJob(true, 15_000);
+    const notificationState = await waitForActiveTransferNotification(
+      Math.min(downloadTimeoutMs, 60_000),
+    );
+    const channelStart = notificationState.dump.indexOf("NotificationChannel{mId='syncpeer-transfers");
+    const channelEnd = notificationState.dump.indexOf("}", channelStart);
+    const channel = notificationState.dump.slice(channelStart, channelEnd + 1);
+    if (!channel.includes("mVibrationEnabled=false")) {
+      throw new Error("Android transfer notification channel still enables vibration.");
+    }
+
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await wait(500);
+    const cancelBounds = await waitForNotificationBounds("Cancel");
+    runAdb(["shell", "input", "tap", String(cancelBounds.x), String(cancelBounds.y)]);
+    await assertForeground();
+    await waitForTransferRuntime(false, downloadTimeoutMs);
+    const cancelledSummary = await cachedFileSummary(cdp, "blob.bin");
+    if (cancelledSummary.found) {
+      throw new Error(`Notification cancellation left a cached blob: ${JSON.stringify(cancelledSummary)}`);
+    }
+  } finally {
+    cdp.close();
+    stopTransferService();
+  }
+
+  cdp = await launchAndroidApp();
+  try {
+    if (!await openAndroidConnection(cdp)) {
+      throw new Error("In-app download cancellation test could not connect to the remote test server.");
+    }
+    await clearTransferNotifications(cdp);
+    await startAndroidBlobDownload(cdp, false);
+    if (!await clickUiCancelDownload(cdp, "blob.bin")) {
+      throw new Error("Android UI did not expose a cancel control for the active download.");
+    }
+    await waitForUiCondition(
+      cdp,
+      `(() => {
+        const text = document.body?.innerText || "";
+        return text.includes("Download cancelled: blob.bin");
+      })()`,
+      "cancelled Android UI download",
+      30_000,
+    );
+    await waitForTransferRuntime(false, downloadTimeoutMs);
+    const cancelledSummary = await cachedFileSummary(cdp, "blob.bin");
+    if (cancelledSummary.found) {
+      throw new Error(`In-app cancellation left a cached blob: ${JSON.stringify(cancelledSummary)}`);
+    }
+    console.log("Android download notification and cancellation regression passed.");
+  } finally {
+    cdp.close();
+    stopTransferService();
   }
 };
 
@@ -678,13 +848,18 @@ const runAndroidBackgroundDownload = async (cdp) => {
   if (blobState !== "active") {
     throw new Error(`Android background download was not active before backgrounding: ${blobState}`);
   }
+  const startedAtMs = Date.now();
   runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
   await wait(2_000);
   await waitForTransferRuntime(true, 15_000);
   await waitForTransferRuntime(false, downloadTimeoutMs);
   const summary = await readBlobAfterRelaunch(cdp, "Android background download");
+  const elapsedMs = Math.max(1, Date.now() - startedAtMs);
+  const mibPerSecond = summary.size / 1024 / 1024 / (elapsedMs / 1000);
   console.log(
-    `Android background download passed: ${summary.size} bytes${summary.sha256 ? `, sha256=${summary.sha256}` : ""}`,
+    `Android background download passed: ${summary.size} bytes in ${elapsedMs} ms ` +
+    `(${mibPerSecond.toFixed(2)} MiB/s)` +
+    `${summary.sha256 ? `, sha256=${summary.sha256}` : ""}`,
   );
 };
 
@@ -883,6 +1058,7 @@ const runOptionalAndroidNetworkWorkflow = async () => {
     cdp.close();
     stopTransferService();
   }
+  await runAndroidDownloadNotificationRegression();
   await runAndroidForceStopScenario();
   await runAndroidNetworkLossScenario();
   await runAndroidDozeScenario();
@@ -926,6 +1102,12 @@ const main = async () => {
   } finally {
     lifecycleCdp.close();
     stopTransferService();
+  }
+
+  if (process.env.SYNCPEER_ANDROID_NOTIFICATION_ONLY === "1") {
+    await runAndroidDownloadNotificationRegression();
+    console.log(`Android download notification regression passed for ${packageName}.`);
+    return;
   }
 
   runAdb(["shell", "monkey", "-p", packageName, "1"]);

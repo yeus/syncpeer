@@ -324,6 +324,7 @@
           onRemoveCachedFile={actions.removeCachedFile}
           onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
+          onCancelDownload={actions.cancelDownload}
           onRemoveFavorite={actions.removeFavorite}
           onClearAllCache={actions.clearAllCache}
           {formatBytes}
@@ -351,6 +352,7 @@
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
           onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
+          onCancelDownload={actions.cancelDownload}
           onToggleFavorite={actions.toggleFavorite}
           onSetPasswordVisible={actions.setFolderPasswordInputVisible}
           onUpdateFolderPasswordDraft={actions.updateFolderPasswordDraft}

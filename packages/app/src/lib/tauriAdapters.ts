@@ -420,6 +420,17 @@ export const createTauriAdapters = (
     stopTransfer: async () => {
       await invokeWithLogging("syncpeer_android_stop_transfer_service");
     },
+    updateTransferNotification: async ({
+      title,
+      body,
+      progress,
+      ongoing,
+      cancellable,
+    }) => {
+      await invokeWithLogging("syncpeer_android_update_transfer_notification", {
+        request: { title, body, progress: progress ?? null, ongoing, cancellable },
+      });
+    },
     getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
       invokeWithLogging<CachedFileStatus[]>("syncpeer_get_cached_statuses", { request: { folderId, paths } }),
     listCachedFiles: async (): Promise<CachedFileRecord[]> =>

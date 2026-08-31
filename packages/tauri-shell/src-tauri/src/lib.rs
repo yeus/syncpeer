@@ -155,6 +155,16 @@ struct AndroidTransferServiceRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AndroidTransferNotificationRequest {
+    title: String,
+    body: String,
+    progress: Option<u8>,
+    ongoing: bool,
+    cancellable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AndroidSafWriteFileRequest {
     tree_uri: String,
     relative_path: String,
@@ -473,6 +483,7 @@ struct CacheWriter {
     expected_size: u64,
     modified_ms: Option<f64>,
     temp_path: PathBuf,
+    file: Arc<Mutex<fs::File>>,
 }
 
 #[derive(Default)]
@@ -2775,7 +2786,12 @@ async fn syncpeer_cache_begin_file(
         )
     })?;
     let temp_path = partial_root.join(format!("{transfer_id}.part"));
-    fs::File::create(&temp_path).map_err(|error| {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| {
         format!(
             "Could not create partial cached file {}: {error}",
             temp_path.display()
@@ -2789,6 +2805,7 @@ async fn syncpeer_cache_begin_file(
         expected_size: request.size_bytes,
         modified_ms: request.modified_ms,
         temp_path,
+        file: Arc::new(Mutex::new(file)),
     };
     let mut guard = store
         .lock()
@@ -2806,14 +2823,14 @@ async fn syncpeer_cache_write_chunk(
     if request.bytes.len() > MAX_CHUNK_BYTES {
         return Err(format!("Transfer chunk exceeds {MAX_CHUNK_BYTES} bytes."));
     }
-    let (temp_path, expected_size) = {
+    let (file, expected_size) = {
         let guard = store
             .lock()
             .map_err(|_| "Cache writer store lock poisoned".to_string())?;
         guard
             .writers
             .get(&request.transfer_id)
-            .map(|writer| (writer.temp_path.clone(), writer.expected_size))
+            .map(|writer| (Arc::clone(&writer.file), writer.expected_size))
             .ok_or_else(|| "Unknown cache transfer.".to_string())?
     };
     let chunk_size = u64::try_from(request.bytes.len())
@@ -2821,17 +2838,13 @@ async fn syncpeer_cache_write_chunk(
     if request.offset > expected_size || chunk_size > expected_size - request.offset {
         return Err("Transfer chunk is outside the expected file size.".to_string());
     }
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&temp_path)
-        .map_err(|error| format!("Could not open partial cached file: {error}"))?;
+    let mut file = file
+        .lock()
+        .map_err(|_| "Cache writer file lock poisoned".to_string())?;
     file.seek(SeekFrom::Start(request.offset))
         .map_err(|error| format!("Could not seek partial cached file: {error}"))?;
     file.write_all(&request.bytes)
-        .map_err(|error| format!("Could not write partial cached file: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("Could not flush partial cached file: {error}"))
+        .map_err(|error| format!("Could not write partial cached file: {error}"))
 }
 
 #[tauri::command]
@@ -2850,6 +2863,12 @@ async fn syncpeer_cache_commit(
             .cloned()
             .ok_or_else(|| "Unknown cache transfer.".to_string())?
     };
+    writer
+        .file
+        .lock()
+        .map_err(|_| "Cache writer file lock poisoned".to_string())?
+        .flush()
+        .map_err(|error| format!("Could not flush partial cached file: {error}"))?;
     let actual_size = fs::metadata(&writer.temp_path)
         .map_err(|error| format!("Could not inspect partial cached file: {error}"))?
         .len();
@@ -3004,6 +3023,31 @@ async fn syncpeer_android_stop_transfer_service(app: tauri::AppHandle) -> Result
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_update_transfer_notification(
+    app: tauri::AppHandle,
+    request: AndroidTransferNotificationRequest,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .update_transfer_notification(
+                &request.title,
+                &request.body,
+                request.progress,
+                request.ongoing,
+                request.cancellable,
+            )
+            .map_err(|error| format!("Could not update transfer notification: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
         Ok(())
     }
 }
@@ -3676,6 +3720,7 @@ pub fn run() {
             syncpeer_android_open_with_chooser,
             syncpeer_android_start_transfer_service,
             syncpeer_android_stop_transfer_service,
+            syncpeer_android_update_transfer_notification,
             syncpeer_android_write_saf_file,
             syncpeer_android_pick_saf_directory,
             syncpeer_android_list_persisted_saf_uris,

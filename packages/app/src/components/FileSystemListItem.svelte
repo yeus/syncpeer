@@ -17,6 +17,7 @@
   import Star from "lucide-svelte/icons/star";
   import Trash2 from "lucide-svelte/icons/trash-2";
   import Unlock from "lucide-svelte/icons/unlock";
+  import X from "lucide-svelte/icons/x";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
 
@@ -102,6 +103,7 @@
     onOpenCachedFileDirectory?: (folderId: string, path: string) => void;
     onRemoveCachedFile?: (folderId: string, path: string) => void;
     onDownloadFile?: (folderId: string, path: string, name: string) => void;
+    onCancelDownload?: () => void;
     onOpenOrDownloadFile?: (folderId: string, path: string, name: string) => void;
     onSetPasswordVisible?: (folderId: string, visible: boolean) => void;
     onUpdateFolderPasswordDraft?: (folderId: string, password: string) => void;
@@ -125,6 +127,7 @@
     onOpenCachedFile = () => {},
     onRemoveCachedFile = () => {},
     onDownloadFile = () => {},
+    onCancelDownload = () => {},
     onOpenOrDownloadFile = () => {},
     onSetPasswordVisible = () => {},
     onUpdateFolderPasswordDraft = () => {},
@@ -523,7 +526,16 @@
         {/if}
       </button>
     {:else if item.kind === "folder-entry"}
-      {#if item.entryType === "directory"}
+      {#if item.isDownloadingActive}
+        <button
+          class="row-action"
+          onclick={onCancelDownload}
+          aria-label="Cancel download"
+          title="Cancel download"
+        >
+          <X size={16} />
+        </button>
+      {:else if item.entryType === "directory"}
         {#if item.isCached}
           <button
             class="row-action"
@@ -563,7 +575,16 @@
         {/if}
       </button>
     {:else if item.kind === "favorite"}
-      {#if item.favoriteKind === "file" && !item.isCached}
+      {#if item.isDownloadingActive}
+        <button
+          class="row-action"
+          onclick={onCancelDownload}
+          aria-label="Cancel download"
+          title="Cancel download"
+        >
+          <X size={16} />
+        </button>
+      {:else if item.favoriteKind === "file" && !item.isCached}
         <button
           class="row-action"
           onclick={() => onDownloadFile(item.folderId, item.path, item.name)}

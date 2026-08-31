@@ -15,6 +15,7 @@
     onRemoveCachedFile: (folderId: string, path: string) => void;
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
+    onCancelDownload: () => void;
     onRemoveFavorite: (favorite: FavoriteRecord) => void;
     onClearAllCache: () => void;
     formatBytes: (value: number) => string;
@@ -31,6 +32,7 @@
     onRemoveCachedFile,
     onOpenOrDownloadFile,
     onDownloadFile,
+    onCancelDownload,
     onRemoveFavorite,
     onClearAllCache,
     formatBytes,
@@ -125,6 +127,7 @@
           onRemoveCachedFile={onRemoveCachedFile}
           onOpenOrDownloadFile={onOpenOrDownloadFile}
           onDownloadFile={onDownloadFile}
+          onCancelDownload={onCancelDownload}
           onRemoveFavorite={onRemoveFavorite}
         />
       {/each}

@@ -1,6 +1,6 @@
 {
   "name": "@syncpeer/cli",
-  "version": "0.4.0-rc.3",
+  "version": "0.4.0-rc.4",
   "type": "module",
   "bin": {
     "syncpeer": "dist/main.js"
@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@syncpeer/core": "0.4.0-rc.3",
+    "@syncpeer/core": "0.4.0-rc.4",
     "commander": "^14.0.3"
   }
 }

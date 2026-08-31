@@ -30,7 +30,6 @@ const releaseMetadataPaths = [
   tauriConfigPath,
   ...cargoManifestPaths,
   cargoLockPath,
-  "packages/tauri-shell/src-tauri/gen/android/app/tauri.properties",
 ];
 
 const absolutePath = (relativePath) => path.join(repositoryRoot, relativePath);
@@ -126,10 +125,6 @@ const collectConsistencyErrors = () => {
     }
   }
 
-  const androidProperties = readText("packages/tauri-shell/src-tauri/gen/android/app/tauri.properties");
-  if (!new RegExp(`^tauri\\.android\\.versionName=${expected.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}$`, "m").test(androidProperties)) {
-    errors.push("Android tauri.properties has a stale versionName");
-  }
   return { expected, errors };
 };
 
@@ -158,6 +153,19 @@ const assertTagAvailable = (version) => {
 
 const stageReleaseMetadata = () => {
   gitOutput(["add", "--", ...releaseMetadataPaths]);
+};
+
+const commitRelease = (version) => {
+  const tag = `v${version}`;
+  gitOutput(["commit", "-m", `chore: prepare release ${tag}`]);
+  gitOutput(["tag", "-a", tag, "-m", `Release ${tag}`]);
+  return tag;
+};
+
+const releasePushCommand = (tag) => {
+  const branch = gitOutput(["branch", "--show-current"]);
+  if (!branch) return `git push origin ${tag}`;
+  return `git push origin ${branch} ${tag}`;
 };
 
 const updatePackageMetadata = (version) => {
@@ -207,12 +215,6 @@ const updateReleaseMetadata = (version) => {
   );
   writeText(cargoLockPath, cargoLock);
 
-  const androidPropertiesPath = "packages/tauri-shell/src-tauri/gen/android/app/tauri.properties";
-  const androidProperties = readText(androidPropertiesPath).replace(
-    /^tauri\.android\.versionName=.*$/m,
-    `tauri.android.versionName=${version}`,
-  );
-  writeText(androidPropertiesPath, androidProperties);
 };
 
 const latestTag = () => gitOutput(["tag", "--list", "--sort=-creatordate"])
@@ -268,9 +270,10 @@ const main = async () => {
   updateReleaseMetadata(version);
   assertConsistency();
   stageReleaseMetadata();
-  console.log("Release metadata updated and staged. Review and commit the changes, then push the commit and tag:");
-  console.log(`  git tag -a v${version} -m "Release v${version}"`);
-  console.log(`  git push origin v${version}`);
+  const tag = commitRelease(version);
+  console.log(`Release commit and tag created locally: ${tag}`);
+  console.log("Push the release commit and tag when ready:");
+  console.log(`  ${releasePushCommand(tag)}`);
 };
 
 main().catch((error) => {

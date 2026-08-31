@@ -177,9 +177,9 @@ npm run release
 
 The command displays the current version and latest local version-like tag, asks
 for the new semantic version, updates and stages the project metadata and
-lockfiles, and prints the exact tag commands. Review and commit those changes
-before creating and pushing the tag. It does not commit or push automatically;
-unrelated files are not staged automatically.
+lockfiles, creates the release commit, and creates the matching annotated tag
+locally. It does not push automatically and unrelated files are not staged.
+At the end it prints one command that pushes the release commit and tag.
 
 Older bare tags such as `0.3` are historical development tags; they do not
 trigger the release workflow, which listens for tags beginning with `v`.

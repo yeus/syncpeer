@@ -1,6 +1,6 @@
 {
   "name": "@syncpeer/app",
-  "version": "0.4.0-rc.4",
+  "version": "0.4.0-rc.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@syncpeer/core": "0.4.0-rc.4",
+    "@syncpeer/core": "0.4.0-rc.5",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "lucide-svelte": "^1.0.1",

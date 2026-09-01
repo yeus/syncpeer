@@ -124,11 +124,20 @@ export interface SyncpeerConnectOptions {
   enableRelayFallback?: boolean;
   relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
+  sharedFolders?: SharedFolder[];
   requestTimeoutMs?: number;
   keepalive?: {
     pingIntervalMs?: number;
     receiveTimeoutMs?: number;
   };
+}
+
+export interface SharedFolder {
+  id: string;
+  label?: string;
+  encryption:
+    | { mode: "encrypted"; password: string }
+    | { mode: "plaintext" };
 }
 
 export interface SyncpeerGlobalDiscoveryOptions {
@@ -431,11 +440,38 @@ function isTransientRelayError(message: string): boolean {
   );
 }
 
-function isTransientDiscoveryError(message: string): boolean {
+function errorSignals(error: unknown, seen = new Set<unknown>()): string[] {
+  if (error === null || error === undefined || seen.has(error)) return [];
+  if (typeof error === "string") return [error];
+  if (typeof error !== "object") return [String(error)];
+  seen.add(error);
+  const value = error as {
+    name?: unknown;
+    message?: unknown;
+    code?: unknown;
+    cause?: unknown;
+    errors?: unknown;
+  };
+  const ownSignals = [value.name, value.message, value.code]
+    .filter((entry): entry is string => typeof entry === "string");
+  const nestedErrors = Array.isArray(value.errors) ? value.errors : [];
+  return [
+    ...ownSignals,
+    ...errorSignals(value.cause, seen),
+    ...nestedErrors.flatMap((nested) => errorSignals(nested, seen)),
+  ];
+}
+
+function isTransientDiscoveryError(error: unknown): boolean {
+  const message = errorSignals(error).join(" ");
   const normalized = message.toLowerCase();
   return (
     isTimeoutLikeError(message) ||
     isTransientRelayError(message) ||
+    normalized.includes("etimedout") ||
+    normalized.includes("enetunreach") ||
+    normalized.includes("ehostunreach") ||
+    normalized.includes("eai_again") ||
     normalized.includes("no global discovery candidates") ||
     normalized.includes("global discovery did not find") ||
     normalized.includes("connection closed before bep hello")
@@ -668,6 +704,10 @@ class BepSession {
   private indexApplyInFlight = new Set<string>();
   private uploadedFilesByFolder = new Map<string, Map<string, UploadedFileRecord>>();
   private readonly folderPasswords: Map<string, string>;
+  private readonly sharedFolders = new Map<
+    string,
+    SharedFolder & { folderCrypto?: UntrustedFolderCrypto }
+  >();
   private readonly localVersionCounterId: string;
   private activeFolderIds = new Set<string>();
   private socket: SyncpeerTlsSocket;
@@ -690,6 +730,7 @@ class BepSession {
     localDeviceId: Uint8Array,
     localDeviceName: string,
     folderPasswords?: Record<string, string>,
+    sharedFolders?: SharedFolder[],
     remoteDeviceId?: Uint8Array,
     keepalive?: SyncpeerConnectOptions["keepalive"],
     requestTimeoutMs?: number,
@@ -716,6 +757,32 @@ class BepSession {
         .map(([folderId, password]) => [folderId.trim(), password.trim()] as const)
         .filter(([folderId, password]) => folderId !== "" && password !== ""),
     );
+    for (const folder of sharedFolders ?? []) {
+      const id = folder.id.trim();
+      if (!id) throw new Error("Shared folder ID must not be empty.");
+      if (this.sharedFolders.has(id)) {
+        throw new Error(`Shared folder ID must be unique: ${id}`);
+      }
+      const label = folder.label?.trim() || id;
+      if (folder.encryption.mode === "encrypted") {
+        const password = folder.encryption.password.trim();
+        if (!password) {
+          throw new Error(`Encrypted shared folder ${id} requires a password.`);
+        }
+        this.folderPasswords.set(id, password);
+        this.sharedFolders.set(id, {
+          id,
+          label,
+          encryption: { mode: "encrypted", password },
+        });
+      } else {
+        this.sharedFolders.set(id, {
+          id,
+          label,
+          encryption: { mode: "plaintext" },
+        });
+      }
+    }
   }
 
   private computeLocalVersionCounterId(): string {
@@ -730,6 +797,7 @@ class BepSession {
   }
 
   async initialize(leftover: Uint8Array): Promise<void> {
+    await this.initializeSharedFolders();
     const random = await this.adapter.randomBytes(8);
     const view = new DataView(
       random.buffer,
@@ -748,6 +816,33 @@ class BepSession {
       () => void this.checkKeepalive(),
       Math.max(1, Math.floor(this.pingIntervalMs / 2)),
     );
+  }
+
+  private async initializeSharedFolders(): Promise<void> {
+    for (const [folderId, sharedFolder] of this.sharedFolders) {
+      const folderCrypto = sharedFolder.encryption.mode === "encrypted"
+        ? await deriveUntrustedFolderCrypto(
+            folderId,
+            sharedFolder.encryption.password,
+          )
+        : undefined;
+      this.sharedFolders.set(folderId, { ...sharedFolder, folderCrypto });
+      this.folders.set(folderId, {
+        id: folderId,
+        label: sharedFolder.label ?? folderId,
+        readOnly: false,
+        advertisedDevices: [],
+        encrypted: !!folderCrypto,
+        needsPassword: false,
+        folderCrypto,
+        localDevicePresentInFolder: true,
+        stopReason: 0,
+        indexReceived: true,
+        remoteIndexId: "0",
+        remoteMaxSequence: "0",
+        files: new Map(),
+      });
+    }
   }
 
   private log(event: string, details?: Record<string, unknown>): void {
@@ -957,6 +1052,61 @@ class BepSession {
     });
   }
 
+  private sharedFolderConfig(folderId: string) {
+    const sharedFolder = this.sharedFolders.get(folderId);
+    if (!sharedFolder || !this.remoteDeviceId) {
+      throw new Error(`Cannot advertise shared folder ${folderId} without a remote device.`);
+    }
+    const localFolderIndexId = this.localIndexIdForFolder(folderId);
+    return {
+      id: folderId,
+      label: sharedFolder.label ?? folderId,
+      type: 0,
+      read_only: false,
+      devices: [
+        {
+          id: this.localDeviceId,
+          name: this.localDeviceName,
+          addresses: ["dynamic"],
+          compression: 0,
+          max_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
+          index_id: localFolderIndexId,
+        },
+        {
+          id: this.remoteDeviceId,
+          addresses: ["dynamic"],
+          compression: 0,
+          max_sequence: 0,
+          index_id: 0,
+          encryption_password_token: sharedFolder.folderCrypto?.passwordToken,
+        },
+      ],
+    };
+  }
+
+  private async sendSharedFolderIndexes(): Promise<void> {
+    for (const folderId of this.sharedFolders.keys()) {
+      const folder = this.folders.get(folderId);
+      if (!folder) continue;
+      const frame = encodeMessageFrame(
+        MessageTypeValues.INDEX,
+        Index,
+        {
+          folder: folderId,
+          files: [...folder.files.values()].map((file) => file.indexFile),
+          last_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
+        },
+        0,
+      );
+      await this.writeFrame(frame);
+      this.log("shared_folder.index.sent", {
+        folderId,
+        fileCount: folder.files.size,
+        bytes: frame.length,
+      });
+    }
+  }
+
   private async handleClusterConfig(cfg: BepClusterConfig): Promise<void> {
     for (const folder of cfg.folders ?? []) {
       const folderDevices = folder.devices ?? [];
@@ -996,6 +1146,23 @@ class BepSession {
           ? remoteDevice.encryption_password_token
           : null;
       const announcedToken = localToken ?? remoteToken;
+      const sharedFolder = this.sharedFolders.get(folderId);
+      if (sharedFolder) {
+        const state = this.folders.get(folderId);
+        if (state) {
+          state.advertisedDevices = advertisedDevices;
+          state.localDevicePresentInFolder = !!localDeviceEntry;
+          state.remoteIndexId = remoteIndexId;
+          state.remoteMaxSequence = remoteMaxSequence;
+        }
+        this.log("shared_folder.acceptance.received", {
+          folderId,
+          folderType: Number(folder.type ?? 0),
+          localDevicePresentInFolder: !!localDeviceEntry,
+          encrypted: sharedFolder.encryption.mode === "encrypted",
+        });
+        continue;
+      }
       this.log("cluster.folder.received", {
         folderId,
         folderType: Number(folder.type ?? 0),
@@ -1093,6 +1260,9 @@ class BepSession {
       this.echoedClusterConfig = true;
       const folders = (cfg.folders ?? []).map((folder) => {
         const folderId = String(folder.id ?? "");
+        if (this.sharedFolders.has(folderId)) {
+          return this.sharedFolderConfig(folderId);
+        }
         const state = this.folders.get(folderId);
         const localFolderIndexId = this.localIndexIdForFolder(folderId);
         const baseDevices = folder.devices ? [...folder.devices] : [];
@@ -1153,6 +1323,14 @@ class BepSession {
           devices,
         };
       });
+      const incomingFolderIds = new Set(
+        (cfg.folders ?? []).map((folder) => String(folder.id ?? "")),
+      );
+      for (const folderId of this.sharedFolders.keys()) {
+        if (!incomingFolderIds.has(folderId)) {
+          folders.push(this.sharedFolderConfig(folderId));
+        }
+      }
       const frame = encodeMessageFrame(
         MessageTypeValues.CLUSTER_CONFIG,
         ClusterConfig,
@@ -1178,6 +1356,7 @@ class BepSession {
         });
       }
     }
+    await this.sendSharedFolderIndexes();
     if (this.readyState === "pending") {
       this.readyState = "ready";
       this.readyResolve();
@@ -1990,6 +2169,7 @@ async function openBepSessionOnSocket(
     localDeviceId,
     opts.deviceName,
     opts.folderPasswords,
+    opts.sharedFolders,
     remoteDeviceIdBytes,
     opts.keepalive,
     opts.requestTimeoutMs,
@@ -2378,7 +2558,7 @@ async function openSession(
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
       lastError = normalized;
-      if (!isTransientDiscoveryError(normalized.message)) throw normalized;
+      if (!isTransientDiscoveryError(error)) throw normalized;
       const waitForMs = Math.min(1000, Math.max(0, deadline - Date.now()));
       if (waitForMs <= 0) break;
       adapter.log?.("core.discovery.retry", {

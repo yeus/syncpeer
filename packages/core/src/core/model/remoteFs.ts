@@ -139,13 +139,10 @@ function resolveStoredFile(folder: FolderState, requestedPath: string): StoredFi
 
 function isRetryableCompatibilityError(error: unknown): boolean {
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  return (
-    message.includes("timeout") ||
-    message.includes("no such file")
-  );
+  return message.includes("no such file");
 }
 
-function isRetryableTransferError(error: unknown): boolean {
+export function isTransportFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   return [
     "timeout",
@@ -412,7 +409,7 @@ export class RemoteFs {
       } catch (error) {
         throwIfAborted(options?.signal);
         lastError = error;
-        if (!isRetryableTransferError(error) || attempt === 3) throw error;
+        if (!isTransportFailure(error) || attempt === 3) throw error;
         this.log?.("core.request.retry", {
           folderId,
           path: filePath,

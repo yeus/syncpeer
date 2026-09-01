@@ -6,11 +6,12 @@ export type {
   SyncpeerDiscoveryFetchInit,
   SyncpeerDiscoveryResponse,
   SyncpeerHostAdapter,
+  SharedFolder,
   SyncpeerSessionHandle,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
 } from "./client.js";
-export { RemoteFs } from "./core/model/remoteFs.js";
+export { isTransportFailure, RemoteFs } from "./core/model/remoteFs.js";
 export type {
   AdvertisedDeviceInfo,
   FileBlock,

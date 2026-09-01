@@ -5,6 +5,7 @@ export type {
   ConnectionScope,
   DiscoveredCandidate,
   SyncpeerHostAdapter,
+  SharedFolder,
   SyncpeerSessionHandle,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
@@ -15,7 +16,7 @@ export {
   createNodeSyncpeerClient,
   resolveNodeLocalDiscovery,
 } from "./node.js";
-export { RemoteFs } from "./core/model/remoteFs.js";
+export { isTransportFailure, RemoteFs } from "./core/model/remoteFs.js";
 export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export { downloadRemoteFile } from "./transfer/download.js";

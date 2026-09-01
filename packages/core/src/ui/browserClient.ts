@@ -6,6 +6,7 @@ import {
   withRecoveringSession,
 } from "../client.js";
 import type { ConnectionScope } from "../client.js";
+import type { SharedFolder } from "../client.js";
 import { normalizeDiscoveryServer } from "./discoveryServer.js";
 export { getDefaultDiscoveryServer, normalizeDiscoveryServer } from "./discoveryServer.js";
 import type {
@@ -31,6 +32,7 @@ export interface ConnectOptions {
   enableRelayFallback?: boolean;
   relayOnly?: boolean;
   folderPasswords?: Record<string, string>;
+  sharedFolders?: SharedFolder[];
 }
 
 export interface LocalDiscoveredDevice {
@@ -325,6 +327,10 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
       .map(([folderId, password]) => [folderId.trim(), password.trim()])
       .filter(([folderId, password]) => folderId !== "" && password !== ""),
   ),
+  sharedFolders: options.sharedFolders?.map((folder) => ({
+    ...folder,
+    encryption: { ...folder.encryption },
+  })),
 });
 
 const maybeInlinePem = (value: string | undefined): string | null => {
@@ -371,6 +377,7 @@ const serializeConnectionKey = (
     keyPem,
     relayOnly: options.relayOnly === true,
     folderPasswords: options.folderPasswords ?? {},
+    sharedFolders: options.sharedFolders ?? [],
   });
 
 const toConnectionOverview = async (
@@ -553,6 +560,7 @@ export const createSyncpeerBrowserClient = (
         enableRelayFallback: normalized.enableRelayFallback,
         relayOnly: normalized.relayOnly,
         folderPasswords: normalized.folderPasswords,
+        sharedFolders: normalized.sharedFolders,
       });
       if (sessionGeneration !== openingGeneration) {
         await session.close().catch(() => undefined);

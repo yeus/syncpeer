@@ -20,10 +20,12 @@ import {
   createDuplexChannel,
   createPortDownloadSink,
   createSyncpeerSessionStore,
+  isTransportFailure,
   makeReadDirWithRetryFlow,
   type FileTransferMessage,
   type RemoteFsLike,
 } from "../packages/core/dist/browser.js";
+
 import type { RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
 import {
   coalescePendingIndexFrame,
@@ -40,6 +42,10 @@ import {
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
 } from "../packages/core/src/ui/discoveryServer.ts";
+
+assert.equal(isTransportFailure(new Error("TLS flush failed: Broken pipe")), true);
+assert.equal(isTransportFailure(new Error("Request timeout for file at offset 0")), true);
+assert.equal(isTransportFailure(new Error("No such file")), false);
 
 const defaultDiscoveryServer = getDefaultDiscoveryServer();
 assert.ok(new URL(defaultDiscoveryServer).searchParams.get("id"));
@@ -447,6 +453,48 @@ await assert.rejects(
 );
 assert.equal(incompleteCommitted, false);
 
+let stalledTransferRequests = 0;
+const stalledTransferFolder = {
+  ...streamFolder,
+  files: new Map([
+    ["large.bin", {
+      indexFile: {
+        name: "large.bin",
+        type: 0,
+        size: streamPayload.length,
+        blocks: [{
+          offset: 0,
+          size: streamPayload.length,
+          hash: new Uint8Array(),
+        }],
+      },
+    }],
+  ]),
+};
+const stalledTransferFs = new BuiltRemoteFs(
+  new Map([[stalledTransferFolder.id, stalledTransferFolder]]),
+  async () => {
+    stalledTransferRequests += 1;
+    throw new Error("Request timeout while transport is unavailable");
+  },
+  async () => undefined,
+  () => undefined,
+);
+await assert.rejects(
+  stalledTransferFs.readFileToSink("stream-documents", "large.bin", {
+    begin: () => undefined,
+    write: () => undefined,
+    commit: () => undefined,
+    abort: () => undefined,
+  }),
+  /Request timeout/,
+);
+assert.equal(
+  stalledTransferRequests,
+  3,
+  "A dead transport must not retry every compatibility mode on the same session",
+);
+
 const encryptedFolderPassword = "correct horse battery staple";
 const encryptedFolderId = "encrypted-documents";
 const lockedFolderId = "encrypted-photos";
@@ -537,6 +585,83 @@ for (const folder of echoedEncryptedConfigs[0].folders) {
 }
 await encryptedSession.close();
 
+const outboundShareHandshake = new Uint8Array([
+  ...encodeHelloFrame({
+    device_name: "untrusted-storage",
+    client_name: "syncthing",
+    client_version: "v1.27.8",
+  }),
+  ...encodeMessageFrame(
+    MessageTypeValues.CLUSTER_CONFIG,
+    ClusterConfig,
+    { folders: [] },
+  ),
+]);
+const outboundShareSocket = createFakeTlsSocket(outboundShareHandshake);
+const outboundShareClient = createSyncpeerCoreClient({
+  connectTls: async () => outboundShareSocket.socket,
+  sha256: (data) => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: (length) => new Uint8Array(length),
+  discoveryFetch: async () => {
+    throw new Error("Discovery is not used by this outbound-share test.");
+  },
+});
+const outboundShareSession = await outboundShareClient.openSession({
+  host: "127.0.0.1",
+  port: 22000,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  deviceName: "syncpeer-outbound-share",
+  discoveryMode: "direct",
+  sharedFolders: [
+    {
+      id: "encrypted-by-default",
+      label: "Encrypted by default",
+      encryption: { mode: "encrypted", password: "syncpeer-test-only" },
+    },
+    {
+      id: "explicitly-plaintext",
+      label: "Explicitly plaintext",
+      encryption: { mode: "plaintext" },
+    },
+  ],
+});
+const outboundShareConfigs: BepClusterConfig[] = [];
+const outboundShareParser = new FrameParser((type, message) => {
+  if (type === MessageTypeValues.CLUSTER_CONFIG) {
+    outboundShareConfigs.push(message);
+  }
+});
+for (const write of outboundShareSocket.writes.slice(1)) {
+  outboundShareParser.feed(write);
+}
+assert.equal(outboundShareConfigs.length, 1);
+const advertisedEncryptedFolder = outboundShareConfigs[0].folders.find(
+  (folder) => folder.id === "encrypted-by-default",
+);
+assert.ok(advertisedEncryptedFolder);
+assert.equal(advertisedEncryptedFolder.type, 0);
+assert.equal(advertisedEncryptedFolder.devices.length, 2);
+assert.equal(
+  advertisedEncryptedFolder.devices.filter(
+    (device) => device.encryption_password_token?.length > 0,
+  ).length,
+  1,
+  "An encrypted outbound share must put exactly one password token on the receiving peer.",
+);
+const advertisedPlaintextFolder = outboundShareConfigs[0].folders.find(
+  (folder) => folder.id === "explicitly-plaintext",
+);
+assert.ok(advertisedPlaintextFolder);
+assert.equal(
+  advertisedPlaintextFolder.devices.some(
+    (device) => device.encryption_password_token?.length > 0,
+  ),
+  false,
+  "Plaintext sharing must require an explicit mode and advertise no password token.",
+);
+await outboundShareSession.close();
+
 const retrySocket = createFakeTlsSocket();
 let discoveryCalls = 0;
 let relayCalls = 0;
@@ -553,7 +678,21 @@ const retryClient = createSyncpeerCoreClient({
   randomBytes: (length) => new Uint8Array(length),
   discoveryFetch: async () => {
     discoveryCalls += 1;
-    const relay = discoveryCalls === 1
+    if (discoveryCalls === 1) {
+      const timeout = Object.assign(
+        new AggregateError([
+          Object.assign(new Error("connect ETIMEDOUT"), {
+            code: "ETIMEDOUT",
+          }),
+          Object.assign(new Error("connect ENETUNREACH"), {
+            code: "ENETUNREACH",
+          }),
+        ]),
+        { code: "ETIMEDOUT" },
+      );
+      throw timeout;
+    }
+    const relay = discoveryCalls === 2
       ? "relay://stale.example:22067/?id=stale"
       : "relay://fresh.example:22067/?id=fresh";
     const body = JSON.stringify({ addresses: [relay] });
@@ -577,7 +716,7 @@ const retrySession = await retryClient.openSession({
   timeoutMs: 5_000,
 });
 assert.equal(retrySession.connectionScope, "wan");
-assert.ok(discoveryCalls >= 2);
+assert.ok(discoveryCalls >= 3);
 assert.ok(relayCalls >= 3);
 await retrySession.close();
 

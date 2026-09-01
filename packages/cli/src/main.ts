@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type { SharedFolder } from "@syncpeer/core";
 import {
   createNodeSessionTransport,
   downloadRemoteFile,
@@ -26,6 +28,13 @@ interface CliOptions {
 }
 
 interface UploadCommandOptions {
+  serveMs?: number;
+}
+
+interface ShareFolderCommandOptions {
+  label?: string;
+  password?: string;
+  plaintext?: boolean;
   serveMs?: number;
 }
 
@@ -96,7 +105,10 @@ function parseFolderPasswords(values: string[] | undefined): Record<string, stri
   return out;
 }
 
-async function openRemoteFs(opts: CliOptions) {
+async function openRemoteFs(
+  opts: CliOptions,
+  sharedFolders?: SharedFolder[],
+) {
   let cert: string;
   let key: string;
   if (opts.cert || opts.key) {
@@ -122,11 +134,53 @@ async function openRemoteFs(opts: CliOptions) {
     enableRelayFallback: true,
     relayOnly: opts.relayOnly,
     folderPasswords: parseFolderPasswords(opts.folderPassword),
+    sharedFolders,
   });
   return {
     remoteFs,
     close: () => transport.disconnect?.(),
   };
+}
+
+function collectLocalFiles(
+  rootPath: string,
+  relativePath = "",
+): Array<{ path: string; bytes: Uint8Array; modifiedMs: number }> {
+  const directoryPath = path.join(rootPath, relativePath);
+  const files: Array<{ path: string; bytes: Uint8Array; modifiedMs: number }> = [];
+  for (const entry of fs.readdirSync(directoryPath, { withFileTypes: true })) {
+    const filePath = relativePath
+      ? `${relativePath}/${entry.name}`
+      : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...collectLocalFiles(rootPath, filePath));
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const absolutePath = path.join(rootPath, filePath);
+    files.push({
+      path: filePath,
+      bytes: new Uint8Array(fs.readFileSync(absolutePath)),
+      modifiedMs: fs.statSync(absolutePath).mtimeMs,
+    });
+  }
+  return files;
+}
+
+function generatedFolderPassword(): string {
+  return randomBytes(24).toString("base64url");
+}
+
+function waitForSignal(): Promise<void> {
+  return new Promise((resolve) => {
+    const stop = () => {
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
+      resolve();
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+  });
 }
 
 async function renderTree(
@@ -265,6 +319,74 @@ async function main() {
       await session.close();
     }
   };
+
+  program
+    .command("share-folder <folderId> <localPath>")
+    .description(
+      "Advertise and serve a local folder; encryption is enabled by default",
+    )
+    .option("--label <label>", "Human-readable folder label")
+    .option(
+      "--password <password>",
+      "Encryption password (generated when omitted)",
+    )
+    .option(
+      "--plaintext",
+      "Explicitly share plaintext with a trusted peer",
+      false,
+    )
+    .option(
+      "--serve-ms <ms>",
+      "Stop after this many milliseconds; zero waits for Ctrl-C",
+      (value) => parseInt(value, 10),
+      0,
+    )
+    .action(async (
+      folderId: string,
+      localPath: string,
+      shareOpts: ShareFolderCommandOptions,
+    ) => {
+      const opts = program.opts<CliOptions>();
+      const normalizedFolderId = folderId.trim();
+      if (!normalizedFolderId) throw new Error("folderId must not be empty");
+      const rootPath = fs.realpathSync(localPath);
+      if (!fs.statSync(rootPath).isDirectory()) {
+        throw new Error(`Local share path is not a directory: ${rootPath}`);
+      }
+      const password = shareOpts.plaintext
+        ? null
+        : shareOpts.password?.trim() || generatedFolderPassword();
+      const sharedFolder: SharedFolder = {
+        id: normalizedFolderId,
+        label: shareOpts.label?.trim() || normalizedFolderId,
+        encryption: password
+          ? { mode: "encrypted", password }
+          : { mode: "plaintext" },
+      };
+      const session = await openRemoteFs(opts, [sharedFolder]);
+      try {
+        const files = collectLocalFiles(rootPath);
+        for (const file of files) {
+          await session.remoteFs.writeFileFully(
+            normalizedFolderId,
+            file.path,
+            file.bytes,
+            { modifiedMs: file.modifiedMs },
+          );
+        }
+        console.log(`Shared folder ID: ${normalizedFolderId}`);
+        console.log(`Shared folder path: ${rootPath}`);
+        console.log(`Files advertised: ${files.length}`);
+        console.log(`Encryption: ${password ? "enabled" : "disabled"}`);
+        if (password) console.log(`Folder password: ${password}`);
+        console.log("Waiting for the peer to accept and synchronize. Press Ctrl-C to stop.");
+        const serveMs = Math.max(0, Number(shareOpts.serveMs ?? 0));
+        if (serveMs > 0) await sleepMs(serveMs);
+        else await waitForSignal();
+      } finally {
+        await session.close();
+      }
+    });
 
   program
     .command("list")

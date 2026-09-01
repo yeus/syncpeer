@@ -907,6 +907,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
       enableRelayFallback: options.enableRelayFallback ?? true,
       relayOnly: options.relayOnly ?? false,
       folderPasswords: options.folderPasswords ?? {},
+      sharedFolders: options.sharedFolders ?? [],
       certPem,
       keyPem,
     });
@@ -1009,6 +1010,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
       timeoutMs: options.timeoutMs,
       enableRelayFallback: options.enableRelayFallback,
       folderPasswords: options.folderPasswords,
+      sharedFolders: options.sharedFolders,
       relayOnly: options.relayOnly,
     });
     const session = await opening;

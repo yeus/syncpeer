@@ -216,7 +216,7 @@ const remoteHandshake = new Uint8Array([
   ...encodeHelloFrame({
     device_name: "fake-syncthing",
     client_name: "syncthing",
-    client_version: "v1.27.8",
+    client_version: "v2.1.2",
   }),
   ...encodeMessageFrame(
     MessageTypeValues.CLUSTER_CONFIG,
@@ -513,7 +513,7 @@ const encryptedRemoteHandshake = new Uint8Array([
   ...encodeHelloFrame({
     device_name: "fake-syncthing",
     client_name: "syncthing",
-    client_version: "v1.27.8",
+    client_version: "v2.1.2",
   }),
   ...encodeMessageFrame(
     MessageTypeValues.CLUSTER_CONFIG,
@@ -589,7 +589,7 @@ const outboundShareHandshake = new Uint8Array([
   ...encodeHelloFrame({
     device_name: "untrusted-storage",
     client_name: "syncthing",
-    client_version: "v1.27.8",
+    client_version: "v2.1.2",
   }),
   ...encodeMessageFrame(
     MessageTypeValues.CLUSTER_CONFIG,
@@ -1040,7 +1040,7 @@ const stableOverview = {
     id: "A".repeat(52),
     deviceName: "stable-peer",
     clientName: "syncthing",
-    clientVersion: "v1.27.8",
+    clientVersion: "v2.1.2",
   },
   folderSyncStates: [],
   connectedVia: "tcp://127.0.0.1:22000",

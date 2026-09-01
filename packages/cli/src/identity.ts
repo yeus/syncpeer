@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_SYNCTHING_VERSION = process.env.SYNCTHING_VERSION ?? "v1.27.8";
+const DEFAULT_SYNCTHING_VERSION = process.env.SYNCTHING_VERSION ?? "v2.1.2";
 const DEVICE_ID_RE = /([A-Z2-7-]{52,56})/;
 
 export interface CliNodeIdentity {
@@ -101,7 +101,7 @@ export function ensureCliNodeIdentity(): CliNodeIdentity {
         "Or pass --cert and --key explicitly.",
       ].join("\n"));
     }
-    execFileSync(syncthingBin, ["generate", "--home", cliNodeDir], { stdio: "ignore" });
+    execFileSync(syncthingBin, ["generate", "--home", cliNodeDir, "--no-port-probing"], { stdio: "ignore" });
   }
 
   if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {

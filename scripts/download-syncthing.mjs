@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 
 // Download a pinned Syncthing release into the .tools directory.
 // Set SYNCTHING_VERSION to override the default.
-const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
+const version = process.env.SYNCTHING_VERSION ?? "v2.1.2";
 const relayVersion = process.env.SYNCTHING_RELAY_VERSION ?? "v2.1.3";
 
 const platformMap = {

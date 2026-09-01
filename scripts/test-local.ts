@@ -41,7 +41,7 @@ const cliObserverHome = path.join(root, "cli-observer-node");
 const encryptedFolderPassword = "correct horse battery staple";
 const lockedEncryptedFolderPassword = "a different folder password";
 const toolsDir = path.resolve(".tools");
-const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
+const version = process.env.SYNCTHING_VERSION ?? "v2.1.2";
 const A_SYNC_ADDR = "tcp://127.0.0.1:58300";
 const B_SYNC_ADDR = "tcp://127.0.0.1:58301";
 const A_GUI_ADDR = "127.0.0.1:58384";
@@ -296,7 +296,7 @@ function normalizeDeviceId(value) {
     .replace(/[^A-Z2-7]/g, "");
 }
 
-async function waitForIntroducedDeviceAdvertisement(options) {
+async function waitForFolderDeviceAdvertisement(options) {
   const {
     introducerHost,
     introducerPort,
@@ -305,10 +305,11 @@ async function waitForIntroducedDeviceAdvertisement(options) {
     localKeyPath,
     localDeviceName,
     expectedFolderId,
-    expectedIntroducedDeviceId,
+    expectedDeviceId,
+    expectedAdvertised,
     timeoutMs,
   } = options;
-  const expectedIntroduced = normalizeDeviceId(expectedIntroducedDeviceId);
+  const expectedDevice = normalizeDeviceId(expectedDeviceId);
   const deadline = Date.now() + timeoutMs;
   let lastErr = null;
   while (Date.now() < deadline) {
@@ -342,15 +343,16 @@ async function waitForIntroducedDeviceAdvertisement(options) {
           id: normalizeDeviceId(device.id),
           name: device.name ?? "",
         }));
-        const matched = advertised.find((device) => device.id === expectedIntroduced);
-        if (matched) {
+        const matched = advertised.find((device) => device.id === expectedDevice);
+        if (expectedAdvertised && matched) {
           return {
-            introducedDeviceId: matched.id,
-            introducedDeviceName: matched.name,
+            deviceId: matched.id,
+            deviceName: matched.name,
           };
         }
+        if (!expectedAdvertised && !matched) return null;
         lastErr = new Error(
-          `Introducer folder "${expectedFolderId}" did not advertise device ${expectedIntroduced} yet. Advertised: ${advertised.map((item) => item.id).join(", ")}`,
+          `Folder "${expectedFolderId}" ${expectedAdvertised ? "did not advertise" : "unexpectedly advertised"} device ${expectedDevice}. Advertised: ${advertised.map((item) => item.id).join(", ")}`,
         );
       }
     } catch (err) {
@@ -367,7 +369,7 @@ async function waitForIntroducedDeviceAdvertisement(options) {
     await sleep(1500);
   }
   throw new Error(
-    `Timed out waiting for introducer advertisement: ${String(lastErr)}`,
+    `Timed out waiting for folder device advertisement: ${String(lastErr)}`,
   );
 }
 
@@ -479,19 +481,19 @@ async function main() {
   execFileSync(npmCmd, ["run", "build:cli"], { stdio: "inherit" });
 
   console.log("Bootstrapping Syncthing homes...");
-  execFileSync(syncthingBin, ["generate", "--home", aHome], { stdio: "inherit" });
-  execFileSync(syncthingBin, ["generate", "--home", bHome], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", aHome, "--no-port-probing"], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", bHome, "--no-port-probing"], { stdio: "inherit" });
 
   const aId = readDeviceId(aHome);
   const bId = readDeviceId(bHome);
 
   console.log("Preparing persisted cli-node identity...");
   ensureDir(cliNodeHome);
-  execFileSync(syncthingBin, ["generate", "--home", cliNodeHome], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", cliNodeHome, "--no-port-probing"], { stdio: "inherit" });
   const cliNodeId = readDeviceId(cliNodeHome);
-  execFileSync(syncthingBin, ["generate", "--home", cliUntrustedHome], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", cliUntrustedHome, "--no-port-probing"], { stdio: "inherit" });
   const cliUntrustedId = readDeviceId(cliUntrustedHome);
-  execFileSync(syncthingBin, ["generate", "--home", cliObserverHome], { stdio: "inherit" });
+  execFileSync(syncthingBin, ["generate", "--home", cliObserverHome, "--no-port-probing"], { stdio: "inherit" });
   const cliObserverId = readDeviceId(cliObserverHome);
 
   configureHome(aHome, {
@@ -635,7 +637,7 @@ async function main() {
     }
     console.log("Remote upload smoke check passed.");
 
-    const introduced = await waitForIntroducedDeviceAdvertisement({
+    const introduced = await waitForFolderDeviceAdvertisement({
       introducerHost: "127.0.0.1",
       introducerPort: 58300,
       introducerDeviceId: aId,
@@ -643,17 +645,18 @@ async function main() {
       localKeyPath: path.join(cliNodeHome, "key.pem"),
       localDeviceName: "syncpeer-cli-introducer-check",
       expectedFolderId: folderId,
-      expectedIntroducedDeviceId: bId,
+      expectedDeviceId: bId,
+      expectedAdvertised: true,
       timeoutMs: 60_000,
     });
-    if (introduced.introducedDeviceId !== normalizeDeviceId(bId)) {
+    if (introduced?.deviceId !== normalizeDeviceId(bId)) {
       throw new Error(
-        `Introducer advertisement device ID mismatch: expected ${normalizeDeviceId(bId)}, got ${introduced.introducedDeviceId}`,
+        `Introducer advertisement device ID mismatch: expected ${normalizeDeviceId(bId)}, got ${introduced?.deviceId}`,
       );
     }
     console.log("Introducer advertisement check passed.");
 
-    const untrustedIntroduced = await waitForIntroducedDeviceAdvertisement({
+    await waitForFolderDeviceAdvertisement({
       introducerHost: "127.0.0.1",
       introducerPort: 58301,
       introducerDeviceId: bId,
@@ -661,15 +664,11 @@ async function main() {
       localKeyPath: path.join(cliObserverHome, "key.pem"),
       localDeviceName: "syncpeer-cli-untrusted-probe",
       expectedFolderId: encryptedFolderId,
-      expectedIntroducedDeviceId: cliUntrustedId,
+      expectedDeviceId: cliUntrustedId,
+      expectedAdvertised: false,
       timeoutMs: 60_000,
     });
-    if (untrustedIntroduced.introducedDeviceId !== normalizeDeviceId(cliUntrustedId)) {
-      throw new Error(
-        `Untrusted advertisement device ID mismatch: expected ${normalizeDeviceId(cliUntrustedId)}, got ${untrustedIntroduced.introducedDeviceId}`,
-      );
-    }
-    console.log("Untrusted introduced-device advertisement check passed.");
+    console.log("Untrusted device redaction check passed.");
 
     console.log("");
     console.log("=== Running core session-store parity checks ===");

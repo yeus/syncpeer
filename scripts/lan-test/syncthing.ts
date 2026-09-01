@@ -23,7 +23,7 @@ import {
 export const SYNCTHING_LOCAL_DISCOVERY_PORT = 21027;
 const SYNCTHING_RELAY_POOL = "dynamic+https://relays.syncthing.net/endpoint";
 
-const version = process.env.SYNCTHING_VERSION ?? "v1.27.8";
+const version = process.env.SYNCTHING_VERSION ?? "v2.1.2";
 const relayVersion = process.env.SYNCTHING_RELAY_VERSION ?? "v2.1.3";
 const platform = process.platform === "linux" ? "linux" : process.platform === "darwin" ? "macos" : "";
 const arch = process.arch === "x64" ? "amd64" : process.arch === "arm64" ? "arm64" : "";
@@ -62,7 +62,7 @@ export const generateSyncthingIdentity = (home: string): {
 } => {
   ensureSyncthingTools();
   ensureDir(home);
-  execFileSync(binaryPath("syncthing"), ["generate", "--home", home], { stdio: "ignore" });
+  execFileSync(binaryPath("syncthing"), ["generate", "--home", home, "--no-port-probing"], { stdio: "ignore" });
   return {
     deviceId: readDeviceId(home),
     certPath: path.join(home, "cert.pem"),
@@ -383,7 +383,11 @@ export const createLanFixture = async (args: {
   ensureDir(sharePath);
   ensureDir(encryptedSharePath);
   if (!fs.existsSync(path.join(home, "config.xml"))) {
-    execFileSync(binaryPath("syncthing"), ["generate", "--home", home], { stdio: "ignore" });
+    execFileSync(
+      binaryPath("syncthing"),
+      ["generate", "--home", home, "--no-port-probing"],
+      { stdio: "ignore" },
+    );
   }
   const serverDeviceId = readDeviceId(home);
   const syncPort = await freePort();

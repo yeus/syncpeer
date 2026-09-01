@@ -3,6 +3,7 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { fileURLToPath, URL } from "node:url";
 import { execSync } from "node:child_process";
 import tauriConfig from "../tauri-shell/src-tauri/tauri.conf.json" with { type: "json" };
+import { isUiE2eBuildMode } from "./buildMode.ts";
 import { resolvePackagedAppVersion } from "./buildInfo.ts";
 
 const resolveBuildCommit = (): string => {
@@ -23,7 +24,7 @@ export default defineConfig(({ mode }) => ({
     "import.meta.env.SYNCPEER_APP_VERSION": JSON.stringify(APP_VERSION),
     "import.meta.env.SYNCPEER_BUILD_COMMIT": JSON.stringify(BUILD_COMMIT),
     "import.meta.env.SYNCPEER_BUILD_TIME_UTC": JSON.stringify(BUILD_TIME_UTC),
-    "import.meta.env.SYNCPEER_LAN_E2E": JSON.stringify(mode === "lan-e2e"),
+    "import.meta.env.SYNCPEER_LAN_E2E": JSON.stringify(isUiE2eBuildMode(mode)),
   },
   resolve: {
     alias: [

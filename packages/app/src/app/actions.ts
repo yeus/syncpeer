@@ -8,6 +8,7 @@ import {
   formatEta,
   formatRate,
   isValidSyncthingDeviceId,
+  isTransportFailure,
   normalizeDeviceId,
   normalizeDiscoveryServer,
   normalizePath,
@@ -60,6 +61,7 @@ import {
   cacheFileKeyExists,
   connectionDetails,
   currentSourceDeviceId,
+  activeSourceDeviceId,
   downloadProgressText,
   downloadTransportText,
   favoriteEntryKey,
@@ -89,6 +91,8 @@ import {
   folderSignature,
   hasAutoConnectTarget,
   restoreOfflineSnapshot,
+  restoreOfflineDirectory,
+  saveOfflineDirectorySnapshot,
   saveOfflineSnapshot,
   setRemoteApprovalPending,
 } from "./syncPolicies.ts";
@@ -125,6 +129,18 @@ const clearDirectoryView = (state: AppState) => {
 
 const resetRuntimeState = (state: AppState) => {
   state.session = resetRuntimeSessionState(state.session);
+};
+
+const restoreAfterTransportFailure = (state: AppState, error: unknown) => {
+  if (!isTransportFailure(error)) return;
+  const sourceDeviceId = activeSourceDeviceId(state);
+  resetRuntimeState(state);
+  restoreOfflineSnapshot(
+    state,
+    clearDirectoryView,
+    sourceDeviceId,
+    "transport_failed",
+  );
 };
 
 const refreshCachedStatuses = async (
@@ -470,6 +486,7 @@ const loadDirectorySideEffects = async (
     state.session.currentFolderId,
   );
   state.session.lastUpdatedAt = nowTime();
+  saveOfflineDirectorySnapshot(state, activeSourceDeviceId(state));
 };
 
 const updateOverviewSyncTracking = (state: AppState) => {
@@ -939,6 +956,7 @@ export const createAppActions = (args: {
       updateOverviewSyncTracking(state);
     } catch (error) {
       reportActionError(state, "refresh_overview.failed", error, connectionDetails(state));
+      restoreAfterTransportFailure(state, error);
     }
   };
 
@@ -1313,12 +1331,19 @@ export const createAppActions = (args: {
     if (folderIsLocked(state, folderId)) return;
     state.ui.uploadMessage = "";
     state.activeTab = "folders";
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      if (!restoreOfflineDirectory(state, folderId, "")) {
+        state.ui.recentError = "This folder has not been browsed on this device yet.";
+      }
+      return;
+    }
     try {
       await sessionStore.actions.openFolder(folderId, connectionDetails(state));
       applySessionState(state, sessionStore.getState());
       await loadDirectorySideEffects(state, client);
     } catch (error) {
       reportActionError(state, "folder.open_root.failed", error, { folderId });
+      restoreAfterTransportFailure(state, error);
     }
   };
 
@@ -1326,18 +1351,31 @@ export const createAppActions = (args: {
     if (!state.session.currentFolderId) return;
     state.ui.uploadMessage = "";
     const nextPath = resolveDirectoryPath(state.session.currentPath, path);
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      if (!restoreOfflineDirectory(state, state.session.currentFolderId, nextPath)) {
+        state.ui.recentError = "This directory has not been browsed on this device yet.";
+      }
+      return;
+    }
     try {
       await sessionStore.actions.openPath(nextPath, connectionDetails(state));
       applySessionState(state, sessionStore.getState());
       await loadDirectorySideEffects(state, client);
     } catch (error) {
       reportActionError(state, "folder.open_path.failed", error, { path: nextPath });
+      restoreAfterTransportFailure(state, error);
     }
   };
 
   const goToBreadcrumb = async (segment: BreadcrumbSegment) => {
     if (segment.ellipsis) return;
     state.ui.uploadMessage = "";
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      if (!restoreOfflineDirectory(state, segment.targetFolderId, segment.targetPath)) {
+        state.ui.recentError = "This directory has not been browsed on this device yet.";
+      }
+      return;
+    }
     try {
       await sessionStore.actions.goToPath(
         segment.targetFolderId,
@@ -1348,11 +1386,16 @@ export const createAppActions = (args: {
       await loadDirectorySideEffects(state, client);
     } catch (error) {
       reportActionError(state, "folder.go_to_breadcrumb.failed", error, segment);
+      restoreAfterTransportFailure(state, error);
     }
   };
 
   const goToRootView = async () => {
     state.ui.uploadMessage = "";
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      clearDirectoryView(state);
+      return;
+    }
     await sessionStore.actions.goToRoot();
     applySessionState(state, sessionStore.getState());
     state.session.directoryPage = 1;
@@ -1691,6 +1734,7 @@ export const createAppActions = (args: {
         );
       } else {
         reportActionError(state, "download_file.failed", error, { folderId, path });
+        restoreAfterTransportFailure(state, error);
         setDownloadNotice(`Download failed: ${name}`, 6000);
         maybeTransferNotification(
           TRANSFER_NOTIFICATION_ID,

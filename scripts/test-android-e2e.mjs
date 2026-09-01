@@ -20,6 +20,15 @@ const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim()
 const discoveryServer = process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || "";
 const connectionTimeoutMs = Number(process.env.SYNCPEER_LAN_TIMEOUT_MS || 120_000);
 const downloadTimeoutMs = Number(process.env.SYNCPEER_ANDROID_DOWNLOAD_TIMEOUT_MS || 240_000);
+const targetFolderId = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-lan";
+const targetFolderTitle = process.env.SYNCPEER_E2E_FOLDER_TITLE?.trim() || targetFolderId;
+const targetFolderPassword = process.env.SYNCPEER_E2E_FOLDER_PASSWORD?.trim() || "";
+const targetFileName = process.env.SYNCPEER_E2E_FILE_NAME?.trim() || "hello.txt";
+const targetLargeFileName = process.env.SYNCPEER_E2E_LARGE_FILE_NAME?.trim() || "blob.bin";
+const targetLargeFileSize = Number(
+  process.env.SYNCPEER_E2E_LARGE_FILE_SIZE || 30 * 1024 * 1024,
+);
+const targetLargeFileSha256 = process.env.SYNCPEER_E2E_LARGE_FILE_SHA256?.trim() || "";
 
 const runAdb = (args, timeout = 30_000) => {
   try {
@@ -196,12 +205,21 @@ const connectCdp = async () => {
   });
   const client = {
     evaluate: async (expression, timeout = 30_000) => {
-      const result = await command("Runtime.evaluate", {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-        userGesture: true,
-      }, timeout);
+      let result;
+      try {
+        result = await command("Runtime.evaluate", {
+          expression,
+          awaitPromise: true,
+          returnByValue: true,
+          userGesture: true,
+        }, timeout);
+      } catch (error) {
+        const preview = expression.replaceAll(/\s+/g, " ").slice(0, 160);
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; expression=${preview}`,
+          { cause: error },
+        );
+      }
       if (result?.exceptionDetails) {
         const exception = result.exceptionDetails.exception;
         throw new Error(
@@ -311,7 +329,9 @@ const clickUiItem = (cdp, title) => cdp.evaluate(`(() => {
     .find((element) => element.textContent?.trim() === ${JSON.stringify(title)});
   const target = item?.closest(".item-main-hit-clickable");
   if (!(target instanceof HTMLElement)) return false;
-  target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+  target.dispatchEvent(
+    new MouseEvent("click", { bubbles: true, cancelable: true, view: window }),
+  );
   return true;
 })()`);
 
@@ -528,7 +548,7 @@ const runAndroidDownloadNotificationRegression = async () => {
     runAdb(["shell", "input", "tap", String(cancelBounds.x), String(cancelBounds.y)]);
     await assertForeground();
     await waitForTransferRuntime(false, downloadTimeoutMs);
-    const cancelledSummary = await cachedFileSummary(cdp, "blob.bin");
+    const cancelledSummary = await cachedFileSummary(cdp, targetLargeFileName);
     if (cancelledSummary.found) {
       throw new Error(`Notification cancellation left a cached blob: ${JSON.stringify(cancelledSummary)}`);
     }
@@ -544,20 +564,20 @@ const runAndroidDownloadNotificationRegression = async () => {
     }
     await clearTransferNotifications(cdp);
     await startAndroidBlobDownload(cdp, false);
-    if (!await clickUiCancelDownload(cdp, "blob.bin")) {
+    if (!await clickUiCancelDownload(cdp, targetLargeFileName)) {
       throw new Error("Android UI did not expose a cancel control for the active download.");
     }
     await waitForUiCondition(
       cdp,
       `(() => {
         const text = document.body?.innerText || "";
-        return text.includes("Download cancelled: blob.bin");
+        return text.includes(${JSON.stringify(`Download cancelled: ${targetLargeFileName}`)});
       })()`,
       "cancelled Android UI download",
       30_000,
     );
     await waitForTransferRuntime(false, downloadTimeoutMs);
-    const cancelledSummary = await cachedFileSummary(cdp, "blob.bin");
+    const cancelledSummary = await cachedFileSummary(cdp, targetLargeFileName);
     if (cancelledSummary.found) {
       throw new Error(`In-app cancellation left a cached blob: ${JSON.stringify(cancelledSummary)}`);
     }
@@ -668,8 +688,8 @@ const cachedFileSummary = async (cdp, relativePath) => {
 const fixtureBlobHash = () => {
   const hash = createHash("sha256");
   const chunkSize = 1024 * 1024;
-  for (let offset = 0; offset < 30 * 1024 * 1024; offset += chunkSize) {
-    const chunk = Buffer.alloc(Math.min(chunkSize, 30 * 1024 * 1024 - offset));
+  for (let offset = 0; offset < targetLargeFileSize; offset += chunkSize) {
+    const chunk = Buffer.alloc(Math.min(chunkSize, targetLargeFileSize - offset));
     for (let index = 0; index < chunk.length; index += 1) chunk[index] = (offset + index) % 251;
     hash.update(chunk);
   }
@@ -681,6 +701,8 @@ const openAndroidConnection = async (cdp) => {
     console.log("Android network UI workflow skipped: no server device ID configured.");
     return false;
   }
+  const localDeviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+  console.log(`Android E2E client device ID: ${localDeviceId}`);
   await waitForUiCondition(
     cdp,
     'document.querySelector("[data-testid=tab-devices]") !== null',
@@ -745,7 +767,7 @@ const openAndroidConnection = async (cdp) => {
     if (state?.label === "Disconnect") return true;
     if (state?.error) lastError = state.error;
     if (state?.label === "Connect" && !state.disabled) await clickUiTestId(cdp, "global-connect-button");
-    await wait(2_000);
+    await wait(10_000);
   }
   throw new Error(
     `Timed out waiting for Android UI connection approval.${lastError ? ` Last error: ${lastError}` : ""}`,
@@ -786,9 +808,32 @@ const openAndroidFolder = async (cdp, clearCache = false) => {
       30_000,
     );
   }
-  await waitForUiText(cdp, "syncpeer-lan", 90_000);
-  if (!await clickUiItem(cdp, "syncpeer-lan")) {
-    throw new Error("Android UI could not open the syncpeer-lan folder.");
+  await waitForUiText(cdp, targetFolderTitle, 90_000);
+  if (targetFolderPassword) {
+    const passwordInput = `folder-password-${targetFolderId}`;
+    const editButton = `edit-folder-password-${targetFolderId}`;
+    const inputVisible = await cdp.evaluate(
+      `document.querySelector(${JSON.stringify(`[data-testid="${passwordInput}"]`)}) !== null`,
+    );
+    const editVisible = await cdp.evaluate(
+      `document.querySelector(${JSON.stringify(`[data-testid="${editButton}"]`)}) !== null`,
+    );
+    if (!inputVisible && editVisible) {
+      await clickUiTestId(cdp, editButton);
+      await waitForUiCondition(
+        cdp,
+        `document.querySelector(${JSON.stringify(`[data-testid="${passwordInput}"]`)}) !== null`,
+        "encrypted folder password input",
+        5_000,
+      );
+    }
+    if (inputVisible || editVisible) {
+      await setUiValue(cdp, passwordInput, targetFolderPassword);
+      await clickUiTestId(cdp, `unlock-folder-${targetFolderId}`);
+    }
+  }
+  if (!await clickUiItem(cdp, targetFolderTitle)) {
+    throw new Error(`Android UI could not open the ${targetFolderTitle} folder.`);
   }
 };
 
@@ -798,8 +843,12 @@ const startAndroidFileDownload = async (cdp, name) => {
   if (!await clickUiDownload(cdp, name)) {
     throw new Error(`Android UI could not start the ${name} download.`);
   }
-  const state = await waitForUiDownloadState(cdp, name, name === "blob.bin" ? 30_000 : 90_000);
-  if (name !== "blob.bin") {
+  const state = await waitForUiDownloadState(
+    cdp,
+    name,
+    name === targetLargeFileName ? 30_000 : 90_000,
+  );
+  if (name !== targetLargeFileName) {
     await waitForUiDownloadDone(cdp, name);
     return "done";
   }
@@ -809,26 +858,40 @@ const startAndroidFileDownload = async (cdp, name) => {
 const startAndroidBlobDownload = async (cdp, verifyHello = true) => {
   await openAndroidFolder(cdp, true);
   if (verifyHello) {
-    const helloState = await startAndroidFileDownload(cdp, "hello.txt");
+    const helloState = await startAndroidFileDownload(cdp, targetFileName);
     if (helloState !== "done") {
-      throw new Error(`Android UI hello.txt download did not finish: ${helloState}`);
+      throw new Error(`Android UI ${targetFileName} download did not finish: ${helloState}`);
     }
   }
-  const blobState = await startAndroidFileDownload(cdp, "blob.bin");
-  console.log(`Android UI started blob.bin download (${blobState}).`);
+  const blobState = await startAndroidFileDownload(cdp, targetLargeFileName);
+  console.log(`Android UI started ${targetLargeFileName} download (${blobState}).`);
   return blobState;
 };
 
 const assertCompleteBlob = async (cdp, context) => {
-  const summary = await cachedFileSummary(cdp, "blob.bin");
-  if (!summary?.found || summary.size !== 30 * 1024 * 1024) {
+  const summary = await cachedFileSummary(cdp, targetLargeFileName);
+  if (!summary?.found || summary.size !== targetLargeFileSize) {
     throw new Error(`${context} did not produce the full blob: ${JSON.stringify(summary)}`);
   }
-  const expectedHash = fixtureBlobHash();
+  const expectedHash = targetLargeFileSha256 || fixtureBlobHash();
   if (summary.sha256 && summary.sha256 !== expectedHash) {
     throw new Error(`${context} blob hash mismatch: expected ${expectedHash}, got ${summary.sha256}`);
   }
   return summary;
+};
+
+const disconnectAndroidSession = async (cdp) => {
+  const connected = await cdp.evaluate(
+    'document.querySelector("[data-testid=global-connect-button]")?.textContent?.trim() === "Disconnect"',
+  );
+  if (!connected) return;
+  await clickUiTestId(cdp, "global-connect-button");
+  await waitForUiCondition(
+    cdp,
+    'document.querySelector("[data-testid=global-connect-button]")?.textContent?.trim() === "Connect"',
+    "graceful Android test disconnect",
+    30_000,
+  );
 };
 
 const readBlobAfterRelaunch = async (cdp, context) => {
@@ -839,6 +902,7 @@ const readBlobAfterRelaunch = async (cdp, context) => {
   try {
     return await assertCompleteBlob(foregroundCdp, context);
   } finally {
+    await disconnectAndroidSession(foregroundCdp);
     foregroundCdp.close();
   }
 };
@@ -918,7 +982,7 @@ const runAndroidForceStopScenario = async () => {
 
   cdp = await launchAndroidApp();
   try {
-    const summary = await cachedFileSummary(cdp, "blob.bin");
+    const summary = await cachedFileSummary(cdp, targetLargeFileName);
     if (summary.found) {
       throw new Error(`Force-stop left a committed partial blob: ${JSON.stringify(summary)}`);
     }
@@ -926,7 +990,7 @@ const runAndroidForceStopScenario = async () => {
       throw new Error("Force-stop recovery could not reconnect to the remote test server.");
     }
     await openAndroidFolder(cdp, true);
-    const retryState = await startAndroidFileDownload(cdp, "hello.txt");
+    const retryState = await startAndroidFileDownload(cdp, targetFileName);
     if (retryState !== "done") {
       throw new Error(`Force-stop recovery download did not finish: ${retryState}`);
     }
@@ -953,15 +1017,15 @@ const runAndroidNetworkLossScenario = async () => {
     setAirplaneMode(true);
     airplaneMode = true;
     await wait(5_000);
-    const interruptedSummary = await cachedFileSummary(cdp, "blob.bin");
-    if (interruptedSummary.found && interruptedSummary.size === 30 * 1024 * 1024) {
+    const interruptedSummary = await cachedFileSummary(cdp, targetLargeFileName);
+    if (interruptedSummary.found && interruptedSummary.size === targetLargeFileSize) {
       throw new Error("Network-loss test completed before the network was disabled.");
     }
     setAirplaneMode(false);
     airplaneMode = false;
     await waitForTransferRuntime(false, downloadTimeoutMs);
-    const summary = await cachedFileSummary(cdp, "blob.bin");
-    if (summary.found && summary.size === 30 * 1024 * 1024) {
+    const summary = await cachedFileSummary(cdp, targetLargeFileName);
+    if (summary.found && summary.size === targetLargeFileSize) {
       const verified = await assertCompleteBlob(cdp, "Android network-loss recovery");
       console.log(
         `Android network-loss recovery passed without retry: ${verified.size} bytes${verified.sha256 ? `, sha256=${verified.sha256}` : ""}`,
@@ -1012,13 +1076,14 @@ const runAndroidDozeScenario = async () => {
     cdp.close();
     await wait(1_000);
     cdp = await launchAndroidApp();
-    const summary = await cachedFileSummary(cdp, "blob.bin");
-    if (summary.found && summary.size !== 30 * 1024 * 1024) {
+    const summary = await cachedFileSummary(cdp, targetLargeFileName);
+    if (summary.found && summary.size !== targetLargeFileSize) {
       throw new Error(`Android doze produced an invalid committed blob: ${JSON.stringify(summary)}`);
     }
     await tauriInvoke(cdp, "syncpeer_android_stop_transfer_service");
     await waitForTransferRuntime(false, 10_000);
-    if (summary.found && summary.size === 30 * 1024 * 1024) {
+    await disconnectAndroidSession(cdp);
+    if (summary.found && summary.size === targetLargeFileSize) {
       const verified = await assertCompleteBlob(cdp, "Android doze transfer");
       console.log(
         `Android doze transfer passed with job state ${idleState}; ` +
@@ -1085,6 +1150,16 @@ const main = async () => {
   }
   grantNotificationPermission();
 
+  if (process.env.SYNCPEER_ANDROID_NETWORK_ONLY === "1") {
+    runAdb(["shell", "am", "force-stop", packageName]);
+    runAdb(["shell", "monkey", "-p", packageName, "1"]);
+    await wait(1_000);
+    await assertForeground();
+    await runOptionalAndroidNetworkWorkflow();
+    console.log(`Android network E2E passed for ${packageName}.`);
+    return;
+  }
+
   runAdb(["shell", "am", "force-stop", packageName]);
   runAdb(["shell", "monkey", "-p", packageName, "1"]);
   await wait(1_000);
@@ -1110,8 +1185,9 @@ const main = async () => {
     return;
   }
 
+  runAdb(["shell", "am", "force-stop", packageName]);
   runAdb(["shell", "monkey", "-p", packageName, "1"]);
-  await wait(500);
+  await wait(1_000);
   await assertForeground();
   await runOptionalAndroidNetworkWorkflow();
 

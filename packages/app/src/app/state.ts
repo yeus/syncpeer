@@ -139,6 +139,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
     session: {
       remoteFs: null as RemoteFsLike | null,
       isConnected: false,
+      isOfflineSnapshot: false,
+      offlineLastSeenAtMs: 0,
       isConnecting: false,
       isRefreshing: false,
       isLoadingDirectory: false,
@@ -300,7 +302,17 @@ export interface OfflineFolderSnapshot {
   connectedVia: string;
   transportKind: "direct-tcp" | "relay" | "";
   connectionScope?: ConnectionScope | "";
+  directories?: Record<string, OfflineDirectorySnapshot>;
+  activeDirectoryKey?: string;
   lastSeenAtMs: number;
+}
+
+export interface OfflineDirectorySnapshot {
+  folderId: string;
+  path: string;
+  entries: FileEntry[];
+  versionKey: string;
+  loadedAtMs: number;
 }
 
 export const pushSessionLog = (
@@ -381,6 +393,10 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.remoteFs = next.remoteFs;
   state.session.isConnected =
     next.phase === "connected" || next.phase === "refreshing";
+  if (state.session.isConnected) {
+    state.session.isOfflineSnapshot = false;
+    state.session.offlineLastSeenAtMs = 0;
+  }
   state.session.isConnecting = next.pending.connecting;
   state.session.isRefreshing = next.pending.refreshingOverview;
   state.session.isLoadingDirectory = next.pending.loadingDirectory;

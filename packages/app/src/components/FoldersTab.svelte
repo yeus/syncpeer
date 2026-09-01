@@ -206,14 +206,29 @@
     const status = app.session.directory?.status;
     return app.session.isRefreshing || app.session.isLoadingDirectory || status === "loading" || status === "stale";
   });
+
+  let folderViewStatus = $derived.by(() => {
+    if (app.session.isConnected && !app.session.isOfflineSnapshot) {
+      return { tone: "online" as const, label: "Live · in sync" };
+    }
+    const seen = app.session.offlineLastSeenAtMs;
+    return {
+      tone: "offline" as const,
+      label: seen
+        ? `Offline · last seen ${new Date(seen).toLocaleString()}`
+        : "Offline",
+    };
+  });
 </script>
 
 <Panel title="Folders">
-  {#if !app.session.isConnected}
+  {#if !app.session.isConnected && app.session.folders.length === 0}
     <p class="empty">Connect to browse folders.</p>
   {:else}
     <div class="status-row">
-      <StatusChip tone="online">Connected</StatusChip>
+      <span data-testid="folder-view-status">
+        <StatusChip tone={folderViewStatus.tone}>{folderViewStatus.label}</StatusChip>
+      </span>
       {#if app.session.remoteDevice}
         <span>{app.session.remoteDevice.deviceName}</span>
       {/if}

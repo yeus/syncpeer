@@ -29,6 +29,17 @@ const connectionTimeout = (): string =>
   process.env.SYNCPEER_LAN_TIMEOUT_MS?.trim() || "120000";
 const folderWaitTimeout = (): number =>
   Number(process.env.SYNCPEER_LAN_FOLDER_WAIT_MS?.trim() || 90_000);
+const targetFolderId = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() ||
+  LAN_FIXTURE_FOLDER_ID;
+const targetFolderTitle = process.env.SYNCPEER_E2E_FOLDER_TITLE?.trim() ||
+  targetFolderId;
+const targetFileName = process.env.SYNCPEER_E2E_FILE_NAME?.trim() || "hello.txt";
+const targetFolderPassword = process.env.SYNCPEER_E2E_FOLDER_PASSWORD?.trim() || "";
+const targetFileSha256 = process.env.SYNCPEER_E2E_FILE_SHA256?.trim() ||
+  createHash("sha256").update(LAN_FIXTURE_HELLO_CONTENT).digest("hex");
+const targetLargeFileName = process.env.SYNCPEER_E2E_LARGE_FILE_NAME === undefined
+  ? "blob.bin"
+  : process.env.SYNCPEER_E2E_LARGE_FILE_NAME.trim();
 
 const nativeDiscoveryRequest = (): { url: string; method: string; headers: Record<string, string>; pinServerDeviceId: string | null; allowInsecureTls: boolean } => {
   const url = new URL(discoveryServer());
@@ -132,6 +143,19 @@ const returnToFolderRoot = async (): Promise<void> => {
   });
 };
 
+const unlockTargetFolder = async (): Promise<void> => {
+  if (!targetFolderPassword) return;
+  const editButton = $(`[data-testid='edit-folder-password-${targetFolderId}']`);
+  const passwordInput = $(`[data-testid='folder-password-${targetFolderId}']`);
+  if (!(await passwordInput.isExisting()) && !(await editButton.isExisting())) return;
+  if (await editButton.isExisting()) {
+    await editButton.click();
+    await passwordInput.waitForExist({ timeout: 5_000 });
+  }
+  await setValue(`folder-password-${targetFolderId}`, targetFolderPassword);
+  await clickTestId(`unlock-folder-${targetFolderId}`);
+};
+
 describe("Syncpeer Tauri UI smoke", () => {
   it("renders the native identity and connection mode controls", async () => {
     await clickTestId("tab-devices");
@@ -202,10 +226,11 @@ describe("Syncpeer Tauri UI smoke", () => {
     try {
       await clickTestId("tab-folders");
       await returnToFolderRoot();
-      await waitForText(tauriBrowser, LAN_FIXTURE_FOLDER_ID, 90_000);
-      await clickItemTitle(tauriBrowser, LAN_FIXTURE_FOLDER_ID);
+      await waitForText(tauriBrowser, targetFolderTitle, 90_000);
+      await unlockTargetFolder();
+      await clickItemTitle(tauriBrowser, targetFolderTitle);
       try {
-        await waitForText(tauriBrowser, "hello.txt", folderWaitTimeout());
+        await waitForText(tauriBrowser, targetFileName, folderWaitTimeout());
       } catch (error) {
         await clickTestId("tab-devices");
         await tauriBrowser.pause(500);
@@ -224,9 +249,9 @@ describe("Syncpeer Tauri UI smoke", () => {
         console.log("UI handshake identity logs:\n" + handshakeLogs.join("\n---\n"));
         throw error;
       }
-      await clickDownloadButton(tauriBrowser, "hello.txt");
+      await clickDownloadButton(tauriBrowser, targetFileName);
       try {
-        await waitForText(tauriBrowser, "Downloaded hello.txt", 90_000);
+        await waitForText(tauriBrowser, `Downloaded ${targetFileName}`, 90_000);
       } catch (error) {
         await clickTestId("tab-devices");
         await tauriBrowser.pause(500);
@@ -239,21 +264,24 @@ describe("Syncpeer Tauri UI smoke", () => {
         console.log("UI session logs after hello.txt download timeout:\n" + logs.join("\n---\n"));
         throw error;
       }
-      assert.match(
-        (await tauriBrowser.getPageSource()).replace(/\s+/g, " "),
-        /Downloaded hello\.txt via (direct|relay) · (LAN|WAN|unknown)/,
+      assert.ok(
+        (await tauriBrowser.getPageSource())
+          .replace(/\s+/g, " ")
+          .includes(`Downloaded ${targetFileName} via relay · WAN`),
       );
       assert.equal(
-        await readCachedHash(tauriBrowser, "hello.txt"),
-        createHash("sha256").update(LAN_FIXTURE_HELLO_CONTENT).digest("hex"),
+        await readCachedHash(tauriBrowser, targetFileName),
+        targetFileSha256,
       );
 
-      await clickDownloadButton(tauriBrowser, "blob.bin");
-      await waitForText(tauriBrowser, "Downloaded blob.bin", 180_000);
-      assert.match(
-        (await tauriBrowser.getPageSource()).replace(/\s+/g, " "),
-        /Downloaded blob\.bin via (direct|relay) · (LAN|WAN|unknown)/,
-      );
+      if (targetLargeFileName) {
+        await clickDownloadButton(tauriBrowser, targetLargeFileName);
+        await waitForText(
+          tauriBrowser,
+          `Downloaded ${targetLargeFileName}`,
+          180_000,
+        );
+      }
 
       const clientRoot = process.env.SYNCPEER_LAN_CLIENT_ROOT ?? path.resolve(".tmp/syncpeer-dev-client");
       const uploadName = `ui-upload-${Date.now()}.txt`;
@@ -273,9 +301,10 @@ describe("Syncpeer Tauri UI smoke", () => {
       await clickTestId("tab-folders");
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         await returnToFolderRoot();
-        await waitForText(tauriBrowser, LAN_FIXTURE_FOLDER_ID, folderWaitTimeout());
-        await clickItemTitle(tauriBrowser, LAN_FIXTURE_FOLDER_ID);
-        await waitForText(tauriBrowser, "hello.txt", folderWaitTimeout());
+        await waitForText(tauriBrowser, targetFolderTitle, folderWaitTimeout());
+        await unlockTargetFolder();
+        await clickItemTitle(tauriBrowser, targetFolderTitle);
+        await waitForText(tauriBrowser, targetFileName, folderWaitTimeout());
 
         await tauriBrowser.execute(() => {
           window.dispatchEvent(new Event("focus"));
@@ -286,11 +315,41 @@ describe("Syncpeer Tauri UI smoke", () => {
         await waitForText(tauriBrowser, "This Device");
         await clickTestId("tab-folders");
         await returnToFolderRoot();
-        await waitForText(tauriBrowser, LAN_FIXTURE_FOLDER_ID, folderWaitTimeout());
-        await clickItemTitle(tauriBrowser, LAN_FIXTURE_FOLDER_ID);
-        await waitForText(tauriBrowser, "hello.txt", folderWaitTimeout());
+        await waitForText(tauriBrowser, targetFolderTitle, folderWaitTimeout());
+        await unlockTargetFolder();
+        await clickItemTitle(tauriBrowser, targetFolderTitle);
+        await waitForText(tauriBrowser, targetFileName, folderWaitTimeout());
         console.log(`Foreground folder refresh ${attempt} passed.`);
       }
+    } finally {
+      await disconnectIfConnected();
+    }
+  });
+
+  it("keeps the last browsed folders and files while disconnected", async () => {
+    await connectToServer();
+    try {
+      await clickTestId("tab-folders");
+      await returnToFolderRoot();
+      await waitForText(tauriBrowser, targetFolderTitle, folderWaitTimeout());
+      await unlockTargetFolder();
+      await clickItemTitle(tauriBrowser, targetFolderTitle);
+      await waitForText(tauriBrowser, targetFileName, folderWaitTimeout());
+      assert.match(
+        await $("[data-testid='folder-view-status']").getText(),
+        /Live · in sync/,
+      );
+
+      await disconnectIfConnected();
+      await waitForText(tauriBrowser, targetFileName, 5_000);
+      assert.match(
+        await $("[data-testid='folder-view-status']").getText(),
+        /Offline · last seen/,
+      );
+      await returnToFolderRoot();
+      await waitForText(tauriBrowser, targetFolderTitle, 5_000);
+      await clickItemTitle(tauriBrowser, targetFolderTitle);
+      await waitForText(tauriBrowser, targetFileName, 5_000);
     } finally {
       await disconnectIfConnected();
     }

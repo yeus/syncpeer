@@ -43,6 +43,10 @@ const main = async (): Promise<void> => {
       name: "Core protocol, session, and runtime diagnostics",
     },
     {
+      ...tsxScript("scripts/test-harness-diagnostics.ts"),
+      name: "Test harness configuration diagnostics",
+    },
+    {
       ...nodeScript("scripts/release.mjs", ["--check"]),
       name: "Release metadata diagnostics",
     },

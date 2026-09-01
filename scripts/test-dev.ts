@@ -54,6 +54,7 @@ const runServer = async (serverRoot: string): Promise<number> => {
   console.log("Server device ID: " + fixture.fixture.remoteDeviceId);
   console.log("Syncthing Web UI: " + fixture.syncGuiUrl);
   console.log("Transport: global discovery with relay fallback");
+  console.log("Relay selection: Syncthing dynamic relay pool");
   console.log("No inbound firewall port is required for relay traffic.");
   console.log("Waiting for pending clients. Press Ctrl-C to stop.\n");
 

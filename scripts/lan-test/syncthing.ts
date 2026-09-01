@@ -42,6 +42,13 @@ const ensureDir = (directory: string): void => {
   fs.mkdirSync(directory, { recursive: true });
 };
 
+export const syncthingListenAddresses = (
+  syncPort: number,
+  direct: boolean,
+): string[] => direct
+  ? ["tcp4://0.0.0.0:" + syncPort]
+  : ["tcp4://0.0.0.0:" + syncPort, SYNCTHING_RELAY_POOL];
+
 export const ensureSyncthingTools = (): void => {
   execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "download:syncthing"], {
     stdio: "inherit",
@@ -234,9 +241,7 @@ const configureHome = (home: string, args: {
     /(<gui\b[\s\S]*?<address>)[^<]*(<\/address>)/,
     (_match, prefix, suffix) => prefix + "127.0.0.1:" + args.guiPort + suffix,
   );
-  const addresses = args.direct
-    ? ["tcp4://0.0.0.0:" + args.syncPort]
-    : ["tcp4://0.0.0.0:" + args.syncPort, SYNCTHING_RELAY_POOL];
+  const addresses = syncthingListenAddresses(args.syncPort, args.direct);
   xml = replaceRepeatedTag(xml, "listenAddress", addresses);
   xml = replaceRepeatedTag(xml, "globalAnnounceServer", ["default"]);
   xml = replaceTag(xml, "globalAnnounceEnabled", "true");

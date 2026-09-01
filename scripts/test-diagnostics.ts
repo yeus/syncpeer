@@ -51,6 +51,11 @@ const main = async (): Promise<void> => {
       name: "Release metadata diagnostics",
     },
     {
+      name: "Syncthing identity rotation diagnostics",
+      command: "bash",
+      args: ["scripts/test-rotate-syncthing-identity.sh"],
+    },
+    {
       ...nodeScript("scripts/test-local.ts", localArgs),
       name: "Local Syncthing integration diagnostics",
     },

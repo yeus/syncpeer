@@ -3,7 +3,9 @@ import { decompressBlock } from "lz4js";
 
 const loadSchemaText = async (): Promise<string> => {
   try {
-    const rawModule = (await import("./bep.proto?raw")) as { default?: unknown };
+    const rawModule = (await import("../../../vendor/syncthing/proto/bep.proto?raw")) as {
+      default?: unknown;
+    };
     if (typeof rawModule.default === "string" && rawModule.default.trim() !== "") {
       return rawModule.default;
     }
@@ -15,7 +17,10 @@ const loadSchemaText = async (): Promise<string> => {
     specifier: string,
   ) => Promise<{ readFileSync: (path: URL, encoding: "utf8") => string }>;
   const fs = await dynamicImport("node:fs");
-  return fs.readFileSync(new URL("./bep.proto", import.meta.url), "utf8");
+  return fs.readFileSync(
+    new URL("../../../vendor/syncthing/proto/bep.proto", import.meta.url),
+    "utf8",
+  );
 };
 
 const schemaText = await loadSchemaText();

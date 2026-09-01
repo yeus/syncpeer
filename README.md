@@ -54,3 +54,9 @@ All contributor/development/build-target documentation lives in:
 
 This is an evolving prototype. Protocol coverage and sync behavior are not complete yet.
 If it remains lightweight while becoming more capable over time, that is the intended path.
+
+## License
+
+Syncpeer's original source code is licensed under the MIT License. Vendored
+third-party files retain their respective licenses; see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

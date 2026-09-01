@@ -3,7 +3,7 @@
   "version": "0.4.0-rc.5",
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/core/protocol/bep.proto dist/core/protocol/bep.proto"
+    "build": "tsc -p tsconfig.json"
   },
   "exports": {
     ".": {

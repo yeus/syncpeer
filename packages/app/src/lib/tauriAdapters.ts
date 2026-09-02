@@ -198,10 +198,11 @@ const createTlsSocket = (
   invoke: InvokeFn,
   sessionId: number,
   peerCertificateDer: Uint8Array,
+  commandPrefix = "syncpeer_tls",
 ): SyncpeerTlsSocket => ({
   peerCertificateDer: async () => peerCertificateDer,
   read: async (maxBytes?: number) => {
-    const response = await invoke<TlsReadResponse>("syncpeer_tls_read", {
+    const response = await invoke<TlsReadResponse>(`${commandPrefix}_read`, {
       request: { sessionId, maxBytes: Number.isFinite(maxBytes) ? maxBytes : null },
     });
     if (response.eof) {
@@ -210,12 +211,12 @@ const createTlsSocket = (
     return new Uint8Array(response.bytes);
   },
   write: async (bytes: Uint8Array) => {
-    await invoke<void>("syncpeer_tls_write", {
+    await invoke<void>(`${commandPrefix}_write`, {
       request: { sessionId, bytes: Array.from(bytes) },
     });
   },
   close: async () => {
-    await invoke<void>("syncpeer_tls_close", {
+    await invoke<void>(`${commandPrefix}_close`, {
       request: { sessionId },
     });
   },
@@ -250,6 +251,35 @@ export const createTauriAdapters = (
         invokeWithLogging,
         sessionId,
         new Uint8Array(opened.peerCertificateDer),
+      );
+    },
+    connectQuic: async ({
+      host,
+      port,
+      certPem,
+      keyPem,
+      caPem,
+      timeoutMs,
+      keepaliveMs,
+      idleTimeoutMs,
+    }) => {
+      const opened = await invokeWithLogging<TlsOpenResponse>("syncpeer_quic_open", {
+        request: {
+          host,
+          port,
+          certPem,
+          keyPem,
+          caPem: caPem ?? null,
+          timeoutMs: timeoutMs ?? null,
+          keepaliveMs,
+          idleTimeoutMs,
+        },
+      });
+      return createTlsSocket(
+        invokeWithLogging,
+        Number(opened.sessionId),
+        new Uint8Array(opened.peerCertificateDer),
+        "syncpeer_quic",
       );
     },
     connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs }) => {

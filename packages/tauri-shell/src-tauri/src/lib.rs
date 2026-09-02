@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::{Ipv6Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -299,6 +299,19 @@ struct TlsOpenRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct QuicOpenRequest {
+    host: String,
+    port: u16,
+    cert_pem: String,
+    key_pem: String,
+    ca_pem: Option<String>,
+    timeout_ms: Option<u64>,
+    keepalive_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RelayOpenRequest {
     relay_address: String,
     expected_device_id: String,
@@ -505,6 +518,21 @@ struct TlsSessionStore {
 }
 
 type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
+
+struct QuicSession {
+    _endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+    send: tokio::sync::Mutex<quinn::SendStream>,
+    receive: tokio::sync::Mutex<quinn::RecvStream>,
+}
+
+#[derive(Default)]
+struct QuicSessionStore {
+    next_id: u64,
+    sessions: HashMap<u64, Arc<QuicSession>>,
+}
+
+type SharedQuicStore = Arc<Mutex<QuicSessionStore>>;
 
 const RELAY_MAGIC: u32 = 0x9E79_BC40;
 const LOCAL_DISCOVERY_MAGIC: u32 = 0x2EA7_D90B;
@@ -2561,6 +2589,144 @@ async fn syncpeer_relay_open(
 }
 
 #[tauri::command]
+async fn syncpeer_quic_open(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: QuicOpenRequest,
+) -> Result<TlsOpenResponse, String> {
+    let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
+    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid client certificate PEM: {error}"))?;
+    if cert_chain.is_empty() {
+        return Err("Client certificate PEM did not contain any certificate".to_string());
+    }
+    let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|error| format!("Invalid client private key PEM: {error}"))?
+        .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
+    let mut tls_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_client_auth_cert(cert_chain, private_key)
+        .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
+    tls_config.alpn_protocols = vec![b"bep/1.0".to_vec()];
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|error| format!("Could not create QUIC TLS config: {error}"))?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_millis(
+        request.keepalive_ms.unwrap_or(15_000),
+    )));
+    let idle_timeout = quinn::IdleTimeout::try_from(Duration::from_millis(
+        request.idle_timeout_ms.unwrap_or(30_000),
+    )).map_err(|error| format!("Invalid QUIC idle timeout: {error}"))?;
+    transport.max_idle_timeout(Some(idle_timeout));
+    client_config.transport_config(Arc::new(transport));
+
+    let remote = format!("{}:{}", request.host, request.port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Could not resolve QUIC peer: {error}"))?
+        .next()
+        .ok_or_else(|| "QUIC peer did not resolve to an address".to_string())?;
+    let bind_address = if remote.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let mut endpoint = quinn::Endpoint::client(bind_address)
+        .map_err(|error| format!("Could not create QUIC endpoint: {error}"))?;
+    endpoint.set_default_client_config(client_config);
+    let server_name = resolve_tls_hostname(&request.host);
+    let connecting = endpoint.connect(remote, &server_name)
+        .map_err(|error| format!("Could not start QUIC connection: {error}"))?;
+    let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(15_000));
+    let connection = tokio::time::timeout(timeout, connecting)
+        .await
+        .map_err(|_| "QUIC connection timed out".to_string())?
+        .map_err(|error| format!("QUIC connection failed: {error}"))?;
+    let peer_certificate_der = connection.peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .and_then(|certificates| certificates.first().map(|certificate| certificate.as_ref().to_vec()))
+        .ok_or_else(|| "QUIC peer did not provide a certificate".to_string())?;
+    let (send, receive) = connection.open_bi().await
+        .map_err(|error| format!("Could not open QUIC BEP stream: {error}"))?;
+    let session = Arc::new(QuicSession {
+        _endpoint: endpoint,
+        connection,
+        send: tokio::sync::Mutex::new(send),
+        receive: tokio::sync::Mutex::new(receive),
+    });
+    let session_id = {
+        let mut guard = store.lock()
+            .map_err(|_| "QUIC session store lock poisoned".to_string())?;
+        let next_id = guard.next_id.saturating_add(1).max(1);
+        guard.next_id = next_id;
+        guard.sessions.insert(next_id, session);
+        next_id
+    };
+    Ok(TlsOpenResponse {
+        session_id,
+        peer_certificate_der,
+        connected_via: None,
+    })
+}
+
+fn get_quic_session(
+    store: &tauri::State<SharedQuicStore>,
+    session_id: u64,
+) -> Result<Arc<QuicSession>, String> {
+    store.lock()
+        .map_err(|_| "QUIC session store lock poisoned".to_string())?
+        .sessions
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| format!("Unknown QUIC session: {session_id}"))
+}
+
+#[tauri::command]
+async fn syncpeer_quic_read(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: TlsReadRequest,
+) -> Result<TlsReadResponse, String> {
+    let session = get_quic_session(&store, request.session_id)?;
+    let mut receive = session.receive.lock().await;
+    let chunk = receive.read_chunk(
+        request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
+        true,
+    ).await.map_err(|error| format!("QUIC read failed: {error}"))?;
+    Ok(match chunk {
+        Some(chunk) => TlsReadResponse { bytes: chunk.bytes.to_vec(), eof: false },
+        None => TlsReadResponse { bytes: Vec::new(), eof: true },
+    })
+}
+
+#[tauri::command]
+async fn syncpeer_quic_write(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: TlsWriteRequest,
+) -> Result<(), String> {
+    let session = get_quic_session(&store, request.session_id)?;
+    let result = session.send.lock().await.write_all(&request.bytes).await
+        .map_err(|error| format!("QUIC write failed: {error}"));
+    result
+}
+
+#[tauri::command]
+async fn syncpeer_quic_close(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: TlsCloseRequest,
+) -> Result<(), String> {
+    let session = store.lock()
+        .map_err(|_| "QUIC session store lock poisoned".to_string())?
+        .sessions
+        .remove(&request.session_id);
+    if let Some(session) = session {
+        session.connection.close(0u32.into(), b"closed");
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn syncpeer_tls_read(
     store: tauri::State<'_, SharedTlsStore>,
     request: TlsReadRequest,
@@ -3692,6 +3858,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
+        .manage(Arc::new(Mutex::new(QuicSessionStore::default())))
         .manage(Arc::new(Mutex::new(CacheWriterStore::default())))
         .invoke_handler(tauri::generate_handler![
             syncpeer_read_text_file,
@@ -3704,10 +3871,14 @@ pub fn run() {
             syncpeer_discovery_fetch,
             syncpeer_discovery_local,
             syncpeer_tls_open,
+            syncpeer_quic_open,
             syncpeer_relay_open,
             syncpeer_tls_read,
             syncpeer_tls_write,
             syncpeer_tls_close,
+            syncpeer_quic_read,
+            syncpeer_quic_write,
+            syncpeer_quic_close,
             syncpeer_log_ui_error,
             syncpeer_list_favorites,
             syncpeer_upsert_favorite,

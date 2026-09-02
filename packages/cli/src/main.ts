@@ -3,6 +3,7 @@ import { Command, Option } from "commander";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import type { SharedFolder } from "@syncpeer/core";
 import {
   createNodeSessionTransport,
@@ -16,8 +17,9 @@ import { ensureCliNodeIdentity } from "./identity.js";
 interface CliOptions {
   host: string;
   port: number;
-  discoveryMode: "global" | "lan" | "direct";
+  discoveryMode: "automatic" | "global" | "lan" | "direct";
   relayOnly: boolean;
+  quicOnly: boolean;
   cert?: string;
   key?: string;
   remoteId?: string;
@@ -37,6 +39,23 @@ interface ShareFolderCommandOptions {
   plaintext?: boolean;
   serveMs?: number;
 }
+
+const reexecuteWithNativeQuicIfAvailable = (): void => {
+  const flag = "--experimental-quic";
+  if (process.execArgv.includes(flag) || process.env.SYNCPEER_QUIC_REEXEC === "1") return;
+  const probe = spawnSync(process.execPath, [
+    flag,
+    "--input-type=module",
+    "--eval",
+    "await import('node:quic')",
+  ], { stdio: "ignore" });
+  if (probe.status !== 0) return;
+  const child = spawnSync(process.execPath, [flag, ...process.execArgv, ...process.argv.slice(1)], {
+    stdio: "inherit",
+    env: { ...process.env, SYNCPEER_QUIC_REEXEC: "1" },
+  });
+  process.exit(child.status ?? 1);
+};
 
 function normalizeRelativePath(input: string): string {
   const normalized = input.replaceAll("\\", "/").replace(/^\/+/, "");
@@ -133,6 +152,7 @@ async function openRemoteFs(
     discoveryServer: opts.discoveryServer,
     enableRelayFallback: true,
     relayOnly: opts.relayOnly,
+    quicOnly: opts.quicOnly,
     folderPasswords: parseFolderPasswords(opts.folderPassword),
     sharedFolders,
   });
@@ -257,6 +277,7 @@ async function createFileDownloadSink(localPath: string): Promise<FileDownloadSi
 }
 
 async function main() {
+  reexecuteWithNativeQuicIfAvailable();
   const program = new Command();
   program
     .name("syncpeer")
@@ -284,12 +305,17 @@ async function main() {
     )
     .addOption(
       new Option("--discovery-mode <mode>", "Connection discovery mode")
-        .choices(["global", "lan", "direct"])
-        .default("global"),
+        .choices(["automatic", "global", "lan", "direct"])
+        .default("automatic"),
     )
     .option(
       "--relay-only",
       "Use only the relay candidate returned by global discovery",
+      false,
+    )
+    .option(
+      "--quic-only",
+      "Require QUIC (diagnostics; fails when unavailable)",
       false,
     )
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
@@ -439,7 +465,7 @@ async function main() {
       withSession(async (remoteFs) => {
         let transportKind = "direct";
         const startedAt = Date.now();
-        const onProgress = (progress: { transportKind?: "direct-tcp" | "relay" }) => {
+        const onProgress = (progress: { transportKind?: "direct-tcp" | "direct-quic" | "relay" }) => {
           const nextTransportKind = progress.transportKind === "relay" ? "relay" : "direct";
           if (nextTransportKind === transportKind) return;
           transportKind = nextTransportKind;

@@ -29,6 +29,8 @@ url = "2.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
 x509-parser = "0.16"
 prost = "0.13"
+quinn = "0.11"
+tokio = { version = "1", features = ["sync", "time"] }
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }

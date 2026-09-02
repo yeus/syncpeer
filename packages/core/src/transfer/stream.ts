@@ -12,7 +12,73 @@ export interface FileDownloadSink {
   write: (offset: number, bytes: Uint8Array) => Promise<void> | void;
   commit: () => Promise<void> | void;
   abort: (error: unknown) => Promise<void> | void;
+  hasRange?: (offset: number, size: number) => boolean;
 }
+
+export interface DownloadCheckpoint {
+  metadata: FileDownloadMetadata | null;
+  completedRanges: Array<{ offset: number; size: number }>;
+}
+
+export class RemoteMetadataChangedError extends Error {
+  readonly name = "RemoteMetadataChangedError";
+}
+
+const sameMetadata = (left: FileDownloadMetadata, right: FileDownloadMetadata): boolean =>
+  left.folderId === right.folderId &&
+  left.path === right.path &&
+  left.sizeBytes === right.sizeBytes &&
+  left.encrypted === right.encrypted;
+
+export const createCheckpointedDownloadSink = (
+  sink: FileDownloadSink,
+  checkpoint: DownloadCheckpoint = { metadata: null, completedRanges: [] },
+): { sink: FileDownloadSink; checkpoint: DownloadCheckpoint } => {
+  const hasRange = (offset: number, size: number): boolean =>
+    checkpoint.completedRanges.some(
+      (range) => offset >= range.offset && offset + size <= range.offset + range.size,
+    );
+  const addRange = (offset: number, size: number): void => {
+    const sorted = [...checkpoint.completedRanges, { offset, size }]
+      .sort((left, right) => left.offset - right.offset);
+    checkpoint.completedRanges = sorted.reduce<Array<{ offset: number; size: number }>>(
+      (ranges, range) => {
+        const previous = ranges.at(-1);
+        if (!previous || previous.offset + previous.size < range.offset) {
+          ranges.push({ ...range });
+        } else {
+          previous.size = Math.max(previous.offset + previous.size, range.offset + range.size) - previous.offset;
+        }
+        return ranges;
+      },
+      [],
+    );
+  };
+  return {
+    checkpoint,
+    sink: {
+      begin: async (metadata) => {
+        if (checkpoint.metadata && !sameMetadata(checkpoint.metadata, metadata)) {
+          const error = new RemoteMetadataChangedError("Remote file metadata changed during download recovery.");
+          await sink.abort(error);
+          throw error;
+        }
+        if (!checkpoint.metadata) {
+          await sink.begin(metadata);
+          checkpoint.metadata = { ...metadata };
+        }
+      },
+      write: async (offset, bytes) => {
+        if (hasRange(offset, bytes.length)) return;
+        await sink.write(offset, bytes);
+        addRange(offset, bytes.length);
+      },
+      commit: () => sink.commit(),
+      abort: (error) => sink.abort(error),
+      hasRange,
+    },
+  };
+};
 
 export type FileTransferMessage =
   | { type: "transfer.begin"; transferId: string; metadata: FileDownloadMetadata }

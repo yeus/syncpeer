@@ -40,6 +40,10 @@ export const createInitialSessionState = (): SessionState => ({
   requestEpoch: 0,
   directoryLoadSeq: 0,
   lastError: null,
+  attempt: 0,
+  nextRetryAtMs: null,
+  closureReason: null,
+  upgradeStatus: "idle",
 });
 
 export const resolveOverviewSourceDeviceId = (

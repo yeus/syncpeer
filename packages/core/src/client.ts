@@ -22,6 +22,7 @@ import {
   type BepResponse,
 } from "./core/protocol/bep.js";
 import {
+  isTransportFailure,
   RemoteFs,
   type FileDownloadProgress,
   type FileUploadOptions,
@@ -51,6 +52,12 @@ export interface SyncpeerTlsConnectOptions {
   keyPem: string;
   caPem?: string;
   timeoutMs?: number;
+}
+
+export interface SyncpeerQuicConnectOptions extends SyncpeerTlsConnectOptions {
+  alpn: "bep/1.0";
+  keepaliveMs: number;
+  idleTimeoutMs: number;
 }
 
 export interface SyncpeerTlsSocket {
@@ -92,6 +99,9 @@ export interface SyncpeerHostAdapter {
   connectTls: (
     options: SyncpeerTlsConnectOptions,
   ) => Promise<SyncpeerTlsSocket>;
+  connectQuic?: (
+    options: SyncpeerQuicConnectOptions,
+  ) => Promise<SyncpeerTlsSocket>;
   connectRelay?: (
     options: SyncpeerRelayConnectOptions,
   ) => Promise<SyncpeerRelayConnectResult>;
@@ -119,10 +129,11 @@ export interface SyncpeerConnectOptions {
   clientName?: string;
   clientVersion?: string;
   timeoutMs?: number;
-  discoveryMode?: "global" | "lan" | "direct";
+  discoveryMode?: "automatic" | "global" | "lan" | "direct";
   discoveryServer?: string;
   enableRelayFallback?: boolean;
   relayOnly?: boolean;
+  quicOnly?: boolean;
   folderPasswords?: Record<string, string>;
   sharedFolders?: SharedFolder[];
   requestTimeoutMs?: number;
@@ -151,7 +162,7 @@ type DiscoverySource = "local" | "global" | "manual";
 
 export interface DiscoveredCandidate {
   address: string;
-  protocol: "tcp" | "relay" | "unknown";
+  protocol: "tcp" | "quic" | "relay" | "unknown";
   host?: string;
   port?: number;
   deviceId?: string;
@@ -167,10 +178,16 @@ export interface SyncpeerGlobalDiscoveryResult {
 export interface SyncpeerSessionHandle {
   remoteFs: RemoteFs;
   connectedVia: string;
-  transportKind: "direct-tcp" | "relay";
+  transportKind: "direct-tcp" | "direct-quic" | "relay";
   connectionScope?: ConnectionScope;
   isClosed: () => boolean;
   close: () => Promise<void>;
+  closed: Promise<SyncpeerSessionClosure>;
+}
+
+export interface SyncpeerSessionClosure {
+  kind: "manual" | "transport" | "protocol";
+  message: string;
 }
 
 export const withSessionTransportProgress = (
@@ -211,6 +228,37 @@ export async function withRecoveringSession<TOptions, TResult>(
     }
   }
   throw new Error("Session recovery exhausted unexpectedly.");
+}
+
+export class UploadOutcomeUnknownError extends Error {
+  readonly name = "UploadOutcomeUnknownError";
+
+  constructor(message = "Upload outcome is unknown after the connection closed.", options?: ErrorOptions) {
+    super(message, options);
+  }
+}
+
+export async function withMetadataSession<TOptions, TResult>(
+  options: TOptions | null,
+  ensureSession: (options: TOptions) => Promise<SyncpeerSessionHandle>,
+  focusedFolderId: string | null,
+  operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
+): Promise<TResult> {
+  if (options === null) throw new Error("No active connection. Connect first.");
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const session = await ensureSession(options);
+    if (focusedFolderId) session.remoteFs.setFocusedFolder(focusedFolderId);
+    try {
+      return await operation(session);
+    } catch (error) {
+      lastError = error;
+      if (isAbortError(error) || !isTransportFailure(error) || !session.isClosed() || attempt === 2) {
+        throw error;
+      }
+    }
+  }
+  throw lastError;
 }
 
 interface FolderState {
@@ -545,6 +593,18 @@ function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
       source: "global",
     };
   }
+  if (/^quic(?:4|6)?:\/\//.test(value)) {
+    const parsed = new URL(value);
+    if (!parsed.hostname || !parsed.port) return null;
+    return {
+      address: value,
+      protocol: "quic",
+      host: parsed.hostname.replace(/^\[|\]$/g, ""),
+      port: Number(parsed.port),
+      scope: connectionScopeForHost(parsed.hostname),
+      source: "global",
+    };
+  }
   if (value.startsWith("relay://")) {
     const parsed = new URL(value);
     return {
@@ -583,14 +643,17 @@ function connectionScopeForHost(host: string): ConnectionScope {
   return "unknown";
 }
 
-function scoreCandidate(candidate: DiscoveredCandidate): number {
+export function candidatePreferenceScore(candidate: DiscoveredCandidate): number {
   if (candidate.protocol === "relay") return 0;
-  if (candidate.protocol !== "tcp") return -1;
+  if (candidate.protocol !== "tcp" && candidate.protocol !== "quic") return -1;
   if (!candidate.host) return -1;
-  // Prefer LAN/private routes first; on mobile this is often the fastest
-  // reliable path when both private and public candidates are present.
-  return isPrivateIpv4(candidate.host) ? 200 : 100;
+  const scope = candidate.scope ?? connectionScopeForHost(candidate.host);
+  if (scope === "lan") return candidate.protocol === "tcp" ? 500 : 400;
+  return candidate.protocol === "tcp" ? 300 : 200;
 }
+
+export const candidateCooldownMs = (failures: number): number =>
+  [5000, 10_000, 20_000, 40_000][Math.max(0, failures - 1)] ?? 60_000;
 
 function describeCandidate(candidate: DiscoveredCandidate): string {
   return `${candidate.address} (${candidate.protocol}${candidate.host ? ` ${candidate.host}` : ""}${candidate.port ? `:${candidate.port}` : ""})`;
@@ -600,13 +663,47 @@ function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidat
   const seen = new Set<string>();
   const out: DiscoveredCandidate[] = [];
   for (const candidate of candidates) {
-    const key = `${candidate.protocol}:${candidate.host ?? ""}:${candidate.port ?? ""}:${candidate.address}`;
+    const key = `${candidate.protocol}:${candidate.host?.toLowerCase() ?? ""}:${candidate.port ?? ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(candidate);
   }
   return out;
 }
+
+interface CandidateHealth {
+  failures: number;
+  cooldownUntilMs: number;
+}
+
+const candidateKey = (candidate: DiscoveredCandidate): string =>
+  `${candidate.protocol}:${candidate.host?.toLowerCase() ?? ""}:${candidate.port ?? ""}`;
+
+const recordCandidateFailure = (
+  health: Map<string, CandidateHealth>,
+  candidate: DiscoveredCandidate,
+): void => {
+  const key = candidateKey(candidate);
+  const failures = (health.get(key)?.failures ?? 0) + 1;
+  const cooldownMs = candidateCooldownMs(failures);
+  health.set(key, { failures, cooldownUntilMs: Date.now() + cooldownMs });
+};
+
+const trackCandidateSession = (
+  health: Map<string, CandidateHealth>,
+  candidate: DiscoveredCandidate,
+  session: SyncpeerSessionHandle,
+): void => {
+  const connectedAtMs = Date.now();
+  void session.closed.then((closure) => {
+    if (closure.kind === "manual") return;
+    if (Date.now() - connectedAtMs >= 30_000) {
+      health.delete(candidateKey(candidate));
+    } else {
+      recordCandidateFailure(health, candidate);
+    }
+  });
+};
 
 function extractDiscoveryAuth(url: URL): {
   pinServerDeviceId?: string;
@@ -695,6 +792,8 @@ class BepSession {
   private readyResolve!: () => void;
   private readyState: "pending" | "ready" | "closed" = "pending";
   private closeReason: Error | null = null;
+  private closureResolve!: (closure: SyncpeerSessionClosure) => void;
+  readonly closurePromise: Promise<SyncpeerSessionClosure>;
   private closed = false;
   private echoedClusterConfig = false;
   private localIndexId: string;
@@ -710,6 +809,7 @@ class BepSession {
   >();
   private readonly localVersionCounterId: string;
   private activeFolderIds = new Set<string>();
+  private sentIndexBootstrapFolderIds = new Set<string>();
   private socket: SyncpeerTlsSocket;
   private adapter: SyncpeerHostAdapter;
   private localDeviceId: Uint8Array;
@@ -747,6 +847,9 @@ class BepSession {
     );
     this.requestTimeoutMs = Math.max(1_000, requestTimeoutMs ?? 20_000);
     this.parser = new FrameParser((type, msg) => this.onFrame(type, msg));
+    this.closurePromise = new Promise<SyncpeerSessionClosure>((resolve) => {
+      this.closureResolve = resolve;
+    });
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
     });
@@ -883,11 +986,12 @@ class BepSession {
     }
   }
 
-  private onSocketClosed(error: Error): void {
+  private onSocketClosed(error: Error, kind: SyncpeerSessionClosure["kind"] = "transport"): void {
     if (this.closed) return;
     this.closed = true;
     this.readyState = "closed";
     this.closeReason = error;
+    this.closureResolve({ kind, message: error.message });
     this.stopKeepalive();
     this.log("socket.closed", { message: error.message });
     for (const { reject, cleanup } of this.pending.values()) {
@@ -982,7 +1086,7 @@ class BepSession {
             ? close.reason.trim()
             : "Remote sent CLOSE";
         this.log("frame.close", { reason });
-        this.onSocketClosed(new Error(`BEP close from remote: ${reason}`));
+        this.onSocketClosed(new Error(`BEP close from remote: ${reason}`), "protocol");
         break;
       }
       default:
@@ -1027,6 +1131,7 @@ class BepSession {
     const normalizedFolderId = String(folderId ?? "").trim();
     if (!normalizedFolderId) return;
     this.activeFolderIds = new Set([normalizedFolderId]);
+    if (this.sentIndexBootstrapFolderIds.has(normalizedFolderId)) return;
     const folder = this.folders.get(normalizedFolderId);
     if (!folder) throw new Error(`Unknown folder: ${normalizedFolderId}`);
     const stopReason = Number(folder.stopReason ?? 0);
@@ -1045,6 +1150,7 @@ class BepSession {
       0,
     );
     await this.writeFrame(indexFrame);
+    this.sentIndexBootstrapFolderIds.add(normalizedFolderId);
     this.log("index.bootstrap.sent", {
       folderId: normalizedFolderId,
       bytes: indexFrame.length,
@@ -2040,6 +2146,7 @@ class BepSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.closureResolve({ kind: "manual", message: "Session closed by request" });
     this.stopKeepalive();
     const closeError = this.closeReason ?? new Error("Connection closed");
     for (const { reject, cleanup } of this.pending.values()) {
@@ -2104,7 +2211,7 @@ async function openBepSessionOnSocket(
   connectedHost: string,
   connectedPort: number,
   connectedVia: string,
-  transportKind: "direct-tcp" | "relay",
+  transportKind: "direct-tcp" | "direct-quic" | "relay",
   connectionScope: ConnectionScope,
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.bep.handshake.start", {
@@ -2192,6 +2299,7 @@ async function openBepSessionOnSocket(
     connectionScope,
     isClosed: () => session.isClosed(),
     close: () => session.close(),
+    closed: session.closurePromise,
   };
 }
 
@@ -2236,6 +2344,38 @@ async function openDirectSession(
     port,
   });
   return session;
+}
+
+async function openQuicSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  host: string,
+  port: number,
+  timeoutMs?: number,
+  connectionScope = connectionScopeForHost(host),
+): Promise<SyncpeerSessionHandle> {
+  if (!adapter.connectQuic) throw new Error("QUIC transport is unavailable");
+  const socket = await adapter.connectQuic({
+    host,
+    port,
+    certPem: opts.certPem,
+    keyPem: opts.keyPem,
+    caPem: opts.caPem,
+    timeoutMs,
+    alpn: "bep/1.0",
+    keepaliveMs: 15_000,
+    idleTimeoutMs: 30_000,
+  });
+  return openBepSessionOnSocket(
+    adapter,
+    socket,
+    opts,
+    host,
+    port,
+    `quic://${host}:${port}`,
+    "direct-quic",
+    connectionScope,
+  );
 }
 
 async function openRelaySession(
@@ -2287,8 +2427,9 @@ async function openSessionAttempt(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
   totalTimeout: number,
+  candidateHealth: Map<string, CandidateHealth>,
 ): Promise<SyncpeerSessionHandle> {
-  const discoveryMode = opts.discoveryMode ?? "direct";
+  const discoveryMode = opts.discoveryMode ?? "automatic";
   const localDiscoveryTimeoutMs = discoveryMode === "lan"
     ? totalTimeout
     : Math.max(250, Math.min(2000, Math.floor(totalTimeout * 0.15)));
@@ -2337,7 +2478,16 @@ async function openSessionAttempt(
     });
   }
 
+  const manualCandidates: DiscoveredCandidate[] = opts.host.trim() === "" ? [] : [{
+    address: `tcp://${opts.host}:${opts.port}`,
+    protocol: "tcp",
+    host: opts.host,
+    port: opts.port,
+    scope: connectionScopeForHost(opts.host),
+    source: "manual",
+  }];
   const mergedCandidates = dedupeCandidates([
+    ...(discoveryMode === "automatic" ? manualCandidates : []),
     ...localCandidates,
     ...globalCandidates,
   ]);
@@ -2363,18 +2513,23 @@ async function openSessionAttempt(
     );
   }
 
-  const ordered = [...mergedCandidates].sort(
-    (a, b) => scoreCandidate(b) - scoreCandidate(a),
+  const viableCandidates = mergedCandidates.filter(
+    (candidate) => (candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) <= Date.now(),
+  );
+  const ordered = [...viableCandidates].sort(
+    (a, b) => candidatePreferenceScore(b) - candidatePreferenceScore(a),
   );
 
   const directCandidates = opts.relayOnly ? [] : ordered.filter(
     (candidate) =>
-      candidate.protocol === "tcp" &&
+      (candidate.protocol === "tcp" || candidate.protocol === "quic") &&
+      (!opts.quicOnly || candidate.protocol === "quic") &&
       candidate.host &&
-      Number.isFinite(candidate.port),
+      Number.isFinite(candidate.port) &&
+      (candidate.protocol !== "quic" || adapter.connectQuic !== undefined),
   );
 
-  const relayCandidates = ordered.filter(
+  const relayCandidates = opts.quicOnly ? [] : ordered.filter(
     (candidate) => candidate.protocol === "relay",
   );
 
@@ -2405,6 +2560,9 @@ async function openSessionAttempt(
   if (opts.relayOnly && relayCandidates.length === 0) {
     throw new Error("Relay-only mode requires a relay address from global discovery.");
   }
+  if (opts.quicOnly && !adapter.connectQuic) {
+    throw new Error("QUIC is unavailable in this runtime.");
+  }
   let winningSession: SyncpeerSessionHandle | null = null;
   const claimSession = async (session: SyncpeerSessionHandle) => {
     if (winningSession) {
@@ -2430,8 +2588,9 @@ async function openSessionAttempt(
         perCandidateTimeout: candidateTimeoutMs,
         strategy: "parallel-with-relay-fallback",
       });
+      const openCandidate = candidate.protocol === "quic" ? openQuicSession : openDirectSession;
       const session = await withSessionTimeout(
-        openDirectSession(
+        openCandidate(
           adapter,
           opts,
           candidate.host!,
@@ -2441,6 +2600,7 @@ async function openSessionAttempt(
         ),
         candidateTimeoutMs,
       );
+      trackCandidateSession(candidateHealth, candidate, session);
       return await claimSession(session);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2451,6 +2611,7 @@ async function openSessionAttempt(
         message,
       });
       errors.push(`${candidate.address}: ${message}`);
+      recordCandidateFailure(candidateHealth, candidate);
       throw error;
     }
   };
@@ -2489,6 +2650,7 @@ async function openSessionAttempt(
                 openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs),
                 attemptTimeoutMs,
               );
+              trackCandidateSession(candidateHealth, candidate, session);
               return await claimSession(session);
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
@@ -2501,6 +2663,7 @@ async function openSessionAttempt(
               errors.push(
                 `${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`,
               );
+              recordCandidateFailure(candidateHealth, candidate);
               const isLastAttempt = attempt >= relayMaxAttempts;
               const shouldRetry =
                 !isLastAttempt &&
@@ -2535,9 +2698,13 @@ async function openSessionAttempt(
 async function openSession(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
+  candidateHealth: Map<string, CandidateHealth>,
 ): Promise<SyncpeerSessionHandle> {
-  const discoveryMode = opts.discoveryMode ?? "direct";
+  const discoveryMode = opts.discoveryMode ?? "automatic";
   if (discoveryMode === "direct") {
+    if (opts.quicOnly) {
+      return openQuicSession(adapter, opts, opts.host, opts.port, opts.timeoutMs);
+    }
     return openDirectSession(adapter, opts, opts.host, opts.port, opts.timeoutMs);
   }
 
@@ -2554,6 +2721,7 @@ async function openSession(
         adapter,
         { ...opts, timeoutMs: remainingMs },
         remainingMs,
+        candidateHealth,
       );
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
@@ -2582,10 +2750,11 @@ export interface SyncpeerCoreClient {
 export function createSyncpeerCoreClient(
   adapter: SyncpeerHostAdapter,
 ): SyncpeerCoreClient {
+  const candidateHealth = new Map<string, CandidateHealth>();
   return {
     openSession: async (options: SyncpeerConnectOptions) => {
       try {
-        return await openSession(adapter, options);
+        return await openSession(adapter, options, candidateHealth);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (

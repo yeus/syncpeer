@@ -1,4 +1,4 @@
-export { createSyncpeerCoreClient } from "./client.js";
+export { createSyncpeerCoreClient, UploadOutcomeUnknownError, withMetadataSession } from "./client.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
@@ -7,6 +7,8 @@ export type {
   SyncpeerHostAdapter,
   SharedFolder,
   SyncpeerSessionHandle,
+  SyncpeerSessionClosure,
+  SyncpeerQuicConnectOptions,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
 } from "./client.js";
@@ -19,17 +21,21 @@ export {
 export { isTransportFailure, RemoteFs } from "./core/model/remoteFs.js";
 export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
+export { createConnectionLifecycle, retryDelayMs } from "./ui/connectionLifecycle.js";
+export type { ConnectionLifecycle, ConnectionLifecyclePhase, ConnectionLifecycleState } from "./ui/connectionLifecycle.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export { createDuplexChannel, createStream } from "./transfer/frpBus.js";
 export { createPortFromTransport } from "./transfer/frpTransport.js";
 export type { DuplexChannel, Port, Stream } from "./transfer/frpBus.js";
 export type { DuplexTransport } from "./transfer/frpTransport.js";
 export type {
+  DownloadCheckpoint,
   FileDownloadMetadata,
   FileDownloadResult,
   FileDownloadSink,
   FileTransferMessage,
 } from "./transfer/stream.js";
+export { createCheckpointedDownloadSink, RemoteMetadataChangedError } from "./transfer/stream.js";
 export {
   canonicalRecordPath,
   collectionRootPath,

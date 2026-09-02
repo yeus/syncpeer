@@ -34,7 +34,7 @@ export const makeWaitForFoldersToPopulateFlow =
     pollOverview: () => Promise<{
       folderCount: number;
       connectedVia: string;
-      transportKind: "direct-tcp" | "relay";
+      transportKind: "direct-tcp" | "direct-quic" | "relay";
     }>;
     timeoutMs?: number;
     pollIntervalMs?: number;

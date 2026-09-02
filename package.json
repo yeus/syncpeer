@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "test": "npm run test:diagnostics",
+    "test:connection": "npm run build:core && node --experimental-strip-types --test scripts/test-connection-management.ts",
     "test:diagnostics": "node --experimental-strip-types scripts/test-diagnostics.ts",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
     "test:e2e:android": "node scripts/test-android-e2e.mjs",

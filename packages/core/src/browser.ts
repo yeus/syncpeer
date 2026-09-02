@@ -1,4 +1,4 @@
-export { createSyncpeerCoreClient } from "./client.js";
+export { createSyncpeerCoreClient, UploadOutcomeUnknownError, withMetadataSession } from "./client.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,
@@ -8,6 +8,8 @@ export type {
   SyncpeerHostAdapter,
   SharedFolder,
   SyncpeerSessionHandle,
+  SyncpeerSessionClosure,
+  SyncpeerQuicConnectOptions,
   SyncpeerTlsConnectOptions,
   SyncpeerTlsSocket,
 } from "./client.js";
@@ -69,6 +71,8 @@ export {
   reportClientError,
 } from "./ui/browserClient.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
+export { createConnectionLifecycle, retryDelayMs } from "./ui/connectionLifecycle.js";
+export type { ConnectionLifecycle, ConnectionLifecyclePhase, ConnectionLifecycleState } from "./ui/connectionLifecycle.js";
 export {
   makeReadDirWithRetryFlow,
   makeWaitForFolderIndexToArriveFlow,
@@ -84,9 +88,12 @@ export { createPortFromTransport } from "./transfer/frpTransport.js";
 export type { DuplexChannel, Port, Stream } from "./transfer/frpBus.js";
 export type { DuplexTransport } from "./transfer/frpTransport.js";
 export {
+  createCheckpointedDownloadSink,
   createPortDownloadSink,
+  RemoteMetadataChangedError,
 } from "./transfer/stream.js";
 export type {
+  DownloadCheckpoint,
   FileDownloadMetadata,
   FileDownloadResult,
   FileDownloadSink,

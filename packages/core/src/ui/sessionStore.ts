@@ -139,9 +139,6 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       }));
 
       try {
-        if (depsInput.transport.disconnect) {
-          await depsInput.transport.disconnect();
-        }
         const fs = await depsInput.transport.connectAndSync(options);
         const overview = await depsInput.transport.connectAndGetOverview(options);
         setState((current) => {
@@ -212,7 +209,7 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       const disconnectEpoch = state.requestEpoch + 1;
       setState((current) => ({
         ...current,
-        phase: "idle",
+        phase: "stopping",
         remoteFs: null,
         directory: {
           ...directoryToIdle(current).directory,
@@ -462,7 +459,67 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
         };
       });
     },
+
+    setOnline: async (online: boolean): Promise<void> => {
+      await depsInput.transport.setOnline?.(online);
+    },
+
+    setForeground: async (foreground: boolean): Promise<void> => {
+      await depsInput.transport.setForeground?.(foreground);
+    },
+
+    setTransferActive: async (active: boolean): Promise<void> => {
+      await depsInput.transport.setTransferActive?.(active);
+    },
   };
+
+  let lifecycleRecovery: Promise<void> | null = null;
+  const recoverLifecycleSession = (options: ConnectOptions): void => {
+    if (lifecycleRecovery) return;
+    const recovery = Promise.resolve()
+      .then(() => actions.connect(options))
+      .catch((error) => {
+        emitTrace(
+          "warning",
+          "session.lifecycle_recovery.failed",
+          "Could not restore session state after reconnect.",
+          { error: resolveErrorMessage(error) },
+        );
+      });
+    lifecycleRecovery = recovery;
+    void recovery.finally(() => {
+      if (lifecycleRecovery === recovery) lifecycleRecovery = null;
+    });
+  };
+
+  depsInput.transport.subscribeLifecycle?.((lifecycle) => {
+    let recoveryOptions: ConnectOptions | null = null;
+    setState((current) => {
+      const needsRecovery =
+        lifecycle.phase === "connected" &&
+        current.remoteFs === null &&
+        !current.pending.connecting &&
+        current.connectOptions !== null;
+      if (needsRecovery) recoveryOptions = { ...current.connectOptions! };
+      return {
+        ...current,
+        phase: needsRecovery ? "reconnecting" : lifecycle.phase,
+        attempt: lifecycle.attempt,
+        nextRetryAtMs: lifecycle.nextRetryAtMs,
+        closureReason: lifecycle.closureReason,
+        upgradeStatus: lifecycle.upgradeStatus,
+        remoteFs: current.remoteFs,
+        pending: {
+          ...current.pending,
+          connecting:
+            needsRecovery ||
+            lifecycle.phase === "connecting" ||
+            lifecycle.phase === "reconnecting",
+        },
+      };
+    });
+    if (recoveryOptions) recoverLifecycleSession(recoveryOptions);
+  });
 
   return {
     getState: () => cloneState(state),

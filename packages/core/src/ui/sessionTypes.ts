@@ -1,8 +1,9 @@
 import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from "../core/model/remoteFs.js";
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./browserClient.js";
 import type { ConnectionScope } from "../client.js";
+import type { ConnectionLifecycleState } from "./connectionLifecycle.js";
 
-export type SessionPhase = "idle" | "connecting" | "connected" | "refreshing" | "error";
+export type SessionPhase = "idle" | "connecting" | "connected" | "waiting" | "reconnecting" | "suspended" | "stopping" | "refreshing" | "error";
 export type DirectoryStatus = "idle" | "loading" | "ready" | "stale" | "locked" | "error";
 
 export interface SessionDirectoryState {
@@ -35,7 +36,7 @@ export interface SessionState {
   remoteFs: RemoteFsLike | null;
   remoteDevice: RemoteDeviceInfo | null;
   connectionPath: string;
-  connectionTransport: "direct-tcp" | "relay" | "";
+  connectionTransport: "direct-tcp" | "direct-quic" | "relay" | "";
   connectionScope: ConnectionScope | "";
   folders: FolderInfo[];
   folderSyncStates: FolderSyncState[];
@@ -50,6 +51,10 @@ export interface SessionState {
   requestEpoch: number;
   directoryLoadSeq: number;
   lastError: string | null;
+  attempt: number;
+  nextRetryAtMs: number | null;
+  closureReason: string | null;
+  upgradeStatus: "idle" | "probing" | "switching";
 }
 
 export interface SessionTraceEvent {
@@ -65,6 +70,10 @@ export interface SessionTransport {
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   disconnect?: () => Promise<void>;
+  subscribeLifecycle?: (listener: (state: ConnectionLifecycleState) => void) => () => void;
+  setOnline?: (online: boolean) => Promise<void>;
+  setForeground?: (foreground: boolean) => Promise<void>;
+  setTransferActive?: (active: boolean) => Promise<void>;
 }
 
 export interface SessionRuntimeDeps {
@@ -84,6 +93,9 @@ export interface SessionRuntimeActions {
   goToPath: (folderId: string, path: string, options?: ConnectOptions) => Promise<void>;
   reloadCurrentDirectory: (options?: ConnectOptions) => Promise<void>;
   setFolderPasswords: (folderPasswords: Record<string, string>) => Promise<void>;
+  setOnline: (online: boolean) => Promise<void>;
+  setForeground: (foreground: boolean) => Promise<void>;
+  setTransferActive: (active: boolean) => Promise<void>;
 }
 
 export interface SyncpeerSessionStore {

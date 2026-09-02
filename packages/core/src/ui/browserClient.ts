@@ -1,10 +1,6 @@
-import {
-  createSyncpeerCoreClient,
-  withSessionTransportProgress,
-  type SyncpeerHostAdapter,
-  type SyncpeerSessionHandle,
-  withRecoveringSession,
-} from "../client.js";
+import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle, withMetadataSession } from "../client.js";
+import { createConnectionLifecycle, type ConnectionLifecycleState } from "./connectionLifecycle.js";
+import { createRecoveringRemoteFs } from "./recoveringRemoteFs.js";
 import type { ConnectionScope } from "../client.js";
 import type { SharedFolder } from "../client.js";
 import { normalizeDiscoveryServer } from "./discoveryServer.js";
@@ -22,7 +18,7 @@ import type { FileDownloadResult, FileDownloadSink } from "../transfer/stream.js
 export interface ConnectOptions {
   host: string;
   port: number;
-  discoveryMode?: "global" | "lan" | "direct";
+  discoveryMode?: "automatic" | "global" | "lan" | "direct";
   discoveryServer?: string;
   cert?: string;
   key?: string;
@@ -31,6 +27,7 @@ export interface ConnectOptions {
   timeoutMs?: number;
   enableRelayFallback?: boolean;
   relayOnly?: boolean;
+  quicOnly?: boolean;
   folderPasswords?: Record<string, string>;
   sharedFolders?: SharedFolder[];
 }
@@ -73,7 +70,7 @@ export interface ConnectionOverview {
   device: RemoteDeviceInfo | null;
   folderSyncStates: FolderSyncState[];
   connectedVia: string;
-  transportKind: "direct-tcp" | "relay";
+  transportKind: "direct-tcp" | "direct-quic" | "relay";
   connectionScope?: ConnectionScope;
 }
 
@@ -226,6 +223,10 @@ export interface SyncpeerBrowserClient {
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<LocalDiscoveredDevice[]>;
   disconnect: () => Promise<void>;
+  subscribeLifecycle: (listener: (state: ConnectionLifecycleState) => void) => () => void;
+  setOnline: (online: boolean) => Promise<void>;
+  setForeground: (foreground: boolean) => Promise<void>;
+  setTransferActive: (active: boolean) => Promise<void>;
   listFavorites: () => Promise<FavoriteRecord[]>;
   upsertFavorite: (favorite: FavoriteRecord) => Promise<FavoriteRecord[]>;
   removeFavorite: (key: string) => Promise<FavoriteRecord[]>;
@@ -313,7 +314,7 @@ const logClient = (
 const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   host: options.host,
   port: options.port,
-  discoveryMode: options.discoveryMode ?? "global",
+  discoveryMode: options.discoveryMode ?? "automatic",
   discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
   cert: options.cert && options.cert.trim() !== "" ? options.cert.trim() : undefined,
   key: options.key && options.key.trim() !== "" ? options.key.trim() : undefined,
@@ -322,6 +323,7 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   timeoutMs: options.timeoutMs,
   enableRelayFallback: options.enableRelayFallback ?? true,
   relayOnly: options.relayOnly === true,
+  quicOnly: options.quicOnly === true,
   folderPasswords: Object.fromEntries(
     Object.entries(options.folderPasswords ?? {})
       .map(([folderId, password]) => [folderId.trim(), password.trim()])
@@ -369,13 +371,14 @@ const serializeConnectionKey = (
   JSON.stringify({
     host: options.host,
     port: options.port,
-    discoveryMode: options.discoveryMode ?? "global",
+    discoveryMode: options.discoveryMode ?? "automatic",
     discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
     remoteId: options.remoteId ?? "",
     deviceName: options.deviceName,
     certPem,
     keyPem,
     relayOnly: options.relayOnly === true,
+    quicOnly: options.quicOnly === true,
     folderPasswords: options.folderPasswords ?? {},
     sharedFolders: options.sharedFolders ?? [],
   });
@@ -438,22 +441,8 @@ export const createSyncpeerBrowserClient = (
   const coreClient = createSyncpeerCoreClient(coreAdapter);
 
   let cachedDefaultIdentity: SyncpeerIdentityRecord | null = null;
-  let activeSession: SyncpeerSessionHandle | null = null;
-  let activeConnectionKey: string | null = null;
-  let openingSession: Promise<SyncpeerSessionHandle> | null = null;
-  let openingConnectionKey: string | null = null;
   let activeConnectOptions: ConnectOptions | null = null;
   let focusedFolderId: string | null = null;
-  let sessionGeneration = 0;
-
-  const closeActiveSession = async (): Promise<void> => {
-    const previous = activeSession;
-    activeSession = null;
-    activeConnectionKey = null;
-    if (previous) {
-      await previous.close();
-    }
-  };
 
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
     if (cachedDefaultIdentity) return cachedDefaultIdentity;
@@ -464,9 +453,7 @@ export const createSyncpeerBrowserClient = (
     return cachedDefaultIdentity;
   };
 
-  const ensureSession = async (
-    connectOptions: ConnectOptions,
-  ): Promise<SyncpeerSessionHandle> => {
+  const openSession = async (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> => {
     const normalized = normalizeConnectOptions(connectOptions);
     let certPem: string | null = null;
     let keyPem: string | null = null;
@@ -502,181 +489,64 @@ export const createSyncpeerBrowserClient = (
       throw new Error("Missing key. Provide PEM text or a readable file path.");
     }
 
-    const key = serializeConnectionKey(normalized, certPem, keyPem);
-    if (activeSession && activeConnectionKey === key) {
-      if (!activeSession.isClosed()) {
-        logClient(options.onLog, "client.session.ensure.reuse", {
-          connectedVia: activeSession.connectedVia,
-          transportKind: activeSession.transportKind,
-        });
-        return activeSession;
-      }
-      logClient(options.onLog, "client.session.reopen.closed", {
-        connectedVia: activeSession.connectedVia,
-        transportKind: activeSession.transportKind,
-      });
-    }
-
-    if (openingSession) {
-      if (openingConnectionKey === key) {
-        logClient(options.onLog, "client.session.ensure.wait_existing_open", {
-          reason: "same_connection_key",
-        });
-        return openingSession;
-      }
-      logClient(options.onLog, "client.session.ensure.wait_existing_open", {
-        reason: "different_connection_key",
-      });
-      try {
-        await openingSession;
-      } catch {
-        // Ignore prior open failure; we are about to attempt another open.
-      }
-      if (activeSession && activeConnectionKey === key && !activeSession.isClosed()) {
-        return activeSession;
-      }
-    }
-
-    const openingGeneration = sessionGeneration;
-    openingConnectionKey = key;
-    openingSession = (async () => {
-      await closeActiveSession();
-      logClient(options.onLog, "client.session.open.start", {
-        discoveryMode: normalized.discoveryMode ?? "global",
-        host: normalized.host,
-        port: normalized.port,
-        hasRemoteId: !!normalized.remoteId,
-      });
-      const session = await coreClient.openSession({
-        host: normalized.host,
-        port: normalized.port,
-        discoveryMode: normalized.discoveryMode,
-        discoveryServer: normalized.discoveryServer,
-        certPem,
-        keyPem,
-        expectedDeviceId: normalized.remoteId,
-        deviceName: normalized.deviceName,
-        timeoutMs: normalized.timeoutMs,
-        enableRelayFallback: normalized.enableRelayFallback,
-        relayOnly: normalized.relayOnly,
-        folderPasswords: normalized.folderPasswords,
-        sharedFolders: normalized.sharedFolders,
-      });
-      if (sessionGeneration !== openingGeneration) {
-        await session.close().catch(() => undefined);
-        throw new Error("Connection attempt was cancelled by disconnect");
-      }
-      activeSession = session;
-      activeConnectionKey = key;
-      logClient(options.onLog, "client.session.open.ready", {
-        connectedVia: session.connectedVia,
-        transportKind: session.transportKind,
-      });
-      return session;
-    })();
-
-    try {
-      return await openingSession;
-    } finally {
-      if (openingSession && openingConnectionKey === key) {
-        openingSession = null;
-        openingConnectionKey = null;
-      }
-    }
+    const session = await coreClient.openSession({
+      host: normalized.host,
+      port: normalized.port,
+      discoveryMode: normalized.discoveryMode,
+      discoveryServer: normalized.discoveryServer,
+      certPem,
+      keyPem,
+      expectedDeviceId: normalized.remoteId,
+      deviceName: normalized.deviceName,
+      timeoutMs: normalized.timeoutMs,
+      enableRelayFallback: normalized.enableRelayFallback,
+      relayOnly: normalized.relayOnly,
+      quicOnly: normalized.quicOnly,
+      folderPasswords: normalized.folderPasswords,
+      sharedFolders: normalized.sharedFolders,
+    });
+    logClient(options.onLog, "client.session.open.ready", {
+      transportKind: session.transportKind,
+      connectionScope: session.connectionScope,
+    });
+    return session;
   };
+
+  const lifecycle = createConnectionLifecycle<ConnectOptions>({
+    open: openSession,
+    keyFor: (connectOptions) => serializeConnectionKey(
+      normalizeConnectOptions(connectOptions),
+      connectOptions.cert ?? "default-cert",
+      connectOptions.key ?? "default-key",
+    ),
+  });
+
+  const ensureSession = (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> =>
+    lifecycle.ensureSession(connectOptions);
 
   const withSessionOperation = async <TResult>(
     connectOptions: ConnectOptions | null,
     operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
   ): Promise<TResult> => {
-    const operationGeneration = sessionGeneration;
-    const result = await withRecoveringSession(
+    return withMetadataSession(
       connectOptions,
       ensureSession,
       focusedFolderId,
       operation,
-      () => sessionGeneration === operationGeneration,
     );
-    if (sessionGeneration !== operationGeneration) {
-      throw new Error("Session operation was cancelled by disconnect");
-    }
-    return result;
   };
 
-  const remoteFsLike: RemoteFsLike = {
-    listFolders: () =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.listFolders(),
-      ),
-    requestFolderIndex: (folderId: string) =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.requestFolderIndex(folderId),
-      ),
-    setFocusedFolder: (folderId: string | null) => {
-      focusedFolderId = folderId;
-      if (activeSession && !activeSession.isClosed()) {
-        activeSession.remoteFs.setFocusedFolder(folderId);
-      }
-    },
-    waitForFolderIndex: (folderId: string, timeoutMs?: number, pollMs?: number) =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
-      ),
-    readDir: (folderId: string, path: string) =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.readDir(folderId, path),
-      ),
-    readFileFully: (
-      folderId: string,
-      path: string,
-      onProgress?: (progress: FileDownloadProgress) => void,
-      signal?: AbortSignal,
-    ) =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.readFileFully(
-          folderId,
-          path,
-          withSessionTransportProgress(session, onProgress),
-          signal,
-        ),
-      ),
-    readFileToSink: (
-      folderId: string,
-      path: string,
-      sink: FileDownloadSink,
-      onProgress?: (progress: FileDownloadProgress) => void,
-      signal?: AbortSignal,
-    ) =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.readFileToSink(
-          folderId,
-          path,
-          sink,
-          withSessionTransportProgress(session, onProgress),
-          signal,
-        ),
-      ),
-    writeFileFully: (
-      folderId: string,
-      path: string,
-      bytes: Uint8Array,
-      options?: { modifiedMs?: number },
-    ) =>
-      withSessionOperation(
-        activeConnectOptions,
-        (session) => session.remoteFs.writeFileFully(folderId, path, bytes, options),
-      ),
-  };
+  const remoteFsLike = createRecoveringRemoteFs({
+    getOptions: () => activeConnectOptions,
+    ensureSession,
+    getFocusedFolderId: () => focusedFolderId,
+    setFocusedFolderId: (folderId) => { focusedFolderId = folderId; },
+    getActiveSession: lifecycle.getSession,
+  });
 
   return {
     connectAndSync: async (connectOptions: ConnectOptions): Promise<RemoteFsLike> => {
-      await ensureSession(connectOptions);
+      await lifecycle.connect(connectOptions);
       activeConnectOptions = connectOptions;
       return remoteFsLike;
     },
@@ -741,11 +611,14 @@ export const createSyncpeerBrowserClient = (
       return [...known, ...anonymous];
     },
     disconnect: async (): Promise<void> => {
-      sessionGeneration += 1;
       activeConnectOptions = null;
       focusedFolderId = null;
-      await closeActiveSession();
+      await lifecycle.disconnect();
     },
+    subscribeLifecycle: lifecycle.subscribe,
+    setOnline: lifecycle.setOnline,
+    setForeground: lifecycle.setForeground,
+    setTransferActive: lifecycle.setTransferActive,
     listFavorites: async (): Promise<FavoriteRecord[]> =>
       platformAdapter.listFavorites
         ? platformAdapter.listFavorites()
@@ -771,12 +644,22 @@ export const createSyncpeerBrowserClient = (
     createFileDownloadSink: platformAdapter.createFileDownloadSink
       ? (args) => platformAdapter.createFileDownloadSink!(args)
       : undefined,
-    startTransfer: platformAdapter.startTransfer
-      ? (label) => platformAdapter.startTransfer!(label)
-      : undefined,
-    stopTransfer: platformAdapter.stopTransfer
-      ? () => platformAdapter.stopTransfer!()
-      : undefined,
+    startTransfer: async (label) => {
+      await lifecycle.setTransferActive(true);
+      try {
+        await platformAdapter.startTransfer?.(label);
+      } catch (error) {
+        await lifecycle.setTransferActive(false);
+        throw error;
+      }
+    },
+    stopTransfer: async () => {
+      try {
+        await platformAdapter.stopTransfer?.();
+      } finally {
+        await lifecycle.setTransferActive(false);
+      }
+    },
     updateTransferNotification: platformAdapter.updateTransferNotification
       ? (args) => platformAdapter.updateTransferNotification!(args)
       : undefined,

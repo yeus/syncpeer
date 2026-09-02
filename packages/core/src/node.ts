@@ -8,8 +8,7 @@ import tls from "node:tls";
 import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
-  withSessionTransportProgress,
-  withRecoveringSession,
+  withMetadataSession,
   type DiscoveredCandidate,
   type SyncpeerRelayConnectOptions,
   type SyncpeerRelayConnectResult,
@@ -23,6 +22,9 @@ import {
 } from "./client.js";
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.js";
 import type { SessionTransport } from "./ui/sessionTypes.js";
+import { createConnectionLifecycle } from "./ui/connectionLifecycle.js";
+import { createRecoveringRemoteFs } from "./ui/recoveringRemoteFs.js";
+import { connectNodeQuic } from "./core/transport/nodeQuic.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export type { FileDownloadSink } from "./transfer/stream.js";
 export {
@@ -833,6 +835,7 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
   const enableLogs = process.env.SYNCPEER_DEBUG === "1";
   return {
     connectTls: connectNodeTls,
+    connectQuic: connectNodeQuic,
     connectRelay: connectNodeRelay,
     async sha256(data: Uint8Array): Promise<Uint8Array> {
       const digest = crypto.createHash("sha256").update(Buffer.from(data)).digest();
@@ -889,116 +892,31 @@ const resolvePemValue = async (
 
 export const createNodeSessionTransport = (): SessionTransport => {
   const coreClient = createNodeSyncpeerClient();
-  let activeSession: Awaited<ReturnType<typeof coreClient.openSession>> | null = null;
-  let activeKey = "";
-  let opening: Promise<Awaited<ReturnType<typeof coreClient.openSession>>> | null = null;
   let activeOptions: ConnectOptions | null = null;
   let focusedFolderId: string | null = null;
 
-  const keyFor = (options: ConnectOptions, certPem: string, keyPem: string): string =>
+  const keyFor = (options: ConnectOptions): string =>
     JSON.stringify({
       host: options.host,
       port: options.port,
-      discoveryMode: options.discoveryMode ?? "global",
+      discoveryMode: options.discoveryMode ?? "automatic",
       discoveryServer: options.discoveryServer ?? "",
       remoteId: options.remoteId ?? "",
       deviceName: options.deviceName,
       timeoutMs: options.timeoutMs ?? 0,
       enableRelayFallback: options.enableRelayFallback ?? true,
       relayOnly: options.relayOnly ?? false,
+      quicOnly: options.quicOnly ?? false,
       folderPasswords: options.folderPasswords ?? {},
       sharedFolders: options.sharedFolders ?? [],
-      certPem,
-      keyPem,
+      cert: options.cert ?? "",
+      key: options.key ?? "",
     });
 
-  const asRemoteFsLike = (): RemoteFsLike => ({
-    listFolders: () =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.listFolders(),
-      ),
-    requestFolderIndex: (folderId) =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.requestFolderIndex(folderId),
-      ),
-    setFocusedFolder: (folderId) => {
-      focusedFolderId = folderId;
-      if (activeSession && !activeSession.isClosed()) {
-        activeSession.remoteFs.setFocusedFolder(folderId);
-      }
-    },
-    waitForFolderIndex: (folderId, timeoutMs, pollMs) =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs),
-      ),
-    readDir: (folderId, path) =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.readDir(folderId, path),
-      ),
-    readFileFully: (folderId, path, onProgress, signal) =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.readFileFully(
-          folderId,
-          path,
-          withSessionTransportProgress(session, onProgress),
-          signal,
-        ),
-      ),
-    readFileToSink: (folderId, path, sink, onProgress, signal) =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.readFileToSink(
-          folderId,
-          path,
-          sink,
-          withSessionTransportProgress(session, onProgress),
-          signal,
-        ),
-      ),
-    writeFileFully: (folderId, path, bytes, options) =>
-      withRecoveringSession(
-        activeOptions,
-        ensureSession,
-        focusedFolderId,
-        (session) => session.remoteFs.writeFileFully(folderId, path, bytes, options),
-      ),
-  });
-
-  const ensureSession = async (options: ConnectOptions) => {
+  const openSession = async (options: ConnectOptions) => {
     const certPem = await resolvePemValue(options.cert, "cert");
     const keyPem = await resolvePemValue(options.key, "key");
-    const sessionKey = keyFor(options, certPem, keyPem);
-
-    if (activeSession && !activeSession.isClosed() && activeKey === sessionKey) {
-      return activeSession;
-    }
-    if (opening) {
-      const opened = await opening;
-      if (!opened.isClosed() && activeKey === sessionKey) {
-        return opened;
-      }
-    }
-    if (activeSession) {
-      await activeSession.close().catch(() => undefined);
-    }
-    opening = coreClient.openSession({
+    return coreClient.openSession({
       host: options.host,
       port: options.port,
       discoveryMode: options.discoveryMode,
@@ -1012,22 +930,28 @@ export const createNodeSessionTransport = (): SessionTransport => {
       folderPasswords: options.folderPasswords,
       sharedFolders: options.sharedFolders,
       relayOnly: options.relayOnly,
+      quicOnly: options.quicOnly,
     });
-    const session = await opening;
-    opening = null;
-    activeSession = session;
-    activeKey = sessionKey;
-    return session;
   };
+
+  const lifecycle = createConnectionLifecycle<ConnectOptions>({ open: openSession, keyFor });
+  const ensureSession = (options: ConnectOptions) => lifecycle.ensureSession(options);
+  const remoteFs = createRecoveringRemoteFs({
+    getOptions: () => activeOptions,
+    ensureSession,
+    getFocusedFolderId: () => focusedFolderId,
+    setFocusedFolderId: (folderId) => { focusedFolderId = folderId; },
+    getActiveSession: lifecycle.getSession,
+  });
 
   return {
     connectAndSync: async (options: ConnectOptions): Promise<RemoteFsLike> => {
-      await ensureSession(options);
+      await lifecycle.connect(options);
       activeOptions = options;
-      return asRemoteFsLike();
+      return remoteFs;
     },
     connectAndGetOverview: async (options: ConnectOptions): Promise<ConnectionOverview> => {
-      const overview = await withRecoveringSession(
+      const overview = await withMetadataSession(
         options,
         ensureSession,
         focusedFolderId,
@@ -1051,7 +975,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
       return overview;
     },
     connectAndGetFolderVersions: async (options: ConnectOptions) => {
-      const versions = await withRecoveringSession(
+      const versions = await withMetadataSession(
         options,
         ensureSession,
         focusedFolderId,
@@ -1064,14 +988,13 @@ export const createNodeSessionTransport = (): SessionTransport => {
       return versions;
     },
     disconnect: async () => {
-      const previous = activeSession;
-      activeSession = null;
-      activeKey = "";
       activeOptions = null;
       focusedFolderId = null;
-      if (previous) {
-        await previous.close();
-      }
+      await lifecycle.disconnect();
     },
+    subscribeLifecycle: lifecycle.subscribe,
+    setOnline: lifecycle.setOnline,
+    setForeground: lifecycle.setForeground,
+    setTransferActive: lifecycle.setTransferActive,
   };
 };

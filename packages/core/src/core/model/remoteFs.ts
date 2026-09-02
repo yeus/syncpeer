@@ -57,7 +57,7 @@ export interface FolderSyncState {
 export interface FileDownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
-  transportKind?: "direct-tcp" | "relay";
+  transportKind?: "direct-tcp" | "direct-quic" | "relay";
   connectedVia?: string;
   connectionScope?: "lan" | "wan" | "unknown";
 }
@@ -172,8 +172,8 @@ function toEntry(path: string, file: BepFileInfo): FileEntry {
     deleted: Boolean(file.deleted),
     blocks: rawBlocks
       ? rawBlocks.map((b) => ({
-          offset: b.offset,
-          size: b.size,
+          offset: Number(b.offset),
+          size: Number(b.size),
           hash: b.hash,
         }))
       : undefined,
@@ -803,7 +803,13 @@ export class RemoteFs {
   ): Promise<FileDownloadResult> {
     throwIfAborted(signal);
     await sink.begin({ folderId, path, sizeBytes: totalBytes, encrypted });
-    let downloaded = 0;
+    const remainingPlan = sink.hasRange
+      ? plan.filter((item) => !sink.hasRange!(item.offset, item.size))
+      : plan;
+    let downloaded = plan
+      .filter((item) => !remainingPlan.includes(item))
+      .reduce((sum, item) => sum + item.size, 0);
+    onProgress?.({ downloadedBytes: downloaded, totalBytes });
     let pending: Array<{ offset: number; bytes: Uint8Array }> = [];
     let pendingBytes = 0;
     const flushPending = async (): Promise<void> => {
@@ -827,13 +833,13 @@ export class RemoteFs {
     let nextRequestIndex = 0;
     let nextWriteIndex = 0;
     const startRequest = (index: number) => {
-      const pendingRequest = request(plan[index]).then(
+      const pendingRequest = request(remainingPlan[index]).then(
         (bytes) => ({ index, bytes }),
         (error: unknown) => ({ index, error }),
       );
       inFlight.set(index, pendingRequest);
     };
-    while (nextRequestIndex < Math.min(plan.length, Math.max(1, concurrency))) {
+    while (nextRequestIndex < Math.min(remainingPlan.length, Math.max(1, concurrency))) {
       startRequest(nextRequestIndex);
       nextRequestIndex += 1;
     }
@@ -842,7 +848,7 @@ export class RemoteFs {
       const result = await Promise.race(inFlight.values());
       inFlight.delete(result.index);
       if ("error" in result) throw result.error;
-      const item = plan[result.index];
+      const item = remainingPlan[result.index];
       if (result.bytes.length === 0) {
         throw new Error(`Unexpected empty block while reading ${path} at offset ${item.offset}`);
       }
@@ -853,7 +859,7 @@ export class RemoteFs {
         );
       }
       completed.set(result.index, result.bytes);
-      if (nextRequestIndex < plan.length) {
+      if (nextRequestIndex < remainingPlan.length) {
         startRequest(nextRequestIndex);
         nextRequestIndex += 1;
       }
@@ -861,7 +867,7 @@ export class RemoteFs {
         throwIfAborted(signal);
         const chunk = completed.get(nextWriteIndex)!;
         completed.delete(nextWriteIndex);
-        const next = plan[nextWriteIndex];
+        const next = remainingPlan[nextWriteIndex];
         const previous = pending[pending.length - 1];
         const contiguous = previous
           ? previous.offset + previous.bytes.length === next.offset

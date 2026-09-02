@@ -20,6 +20,7 @@ import {
   runDiagnosticsTests,
   type DiagnosticsBuiltinTest,
 } from "../packages/shared/modules/diagnosticsRunner.ts";
+import { sanitizeDiagnosticArtifact } from "../packages/shared/modules/diagnosticSanitizer.ts";
 
 const fixtureFolderId = LAN_FIXTURE_FOLDER_ID;
 const fixtureHello = LAN_FIXTURE_HELLO_CONTENT;
@@ -262,12 +263,13 @@ const run = async (): Promise<void> => {
     results,
   };
   fs.mkdirSync(reportRoot(), { recursive: true });
+  const sanitizedReport = sanitizeDiagnosticArtifact(report);
   fs.writeFileSync(
     path.join(reportRoot(), "cli-report.json"),
-    JSON.stringify(report, null, 2) + "\n",
+    JSON.stringify(sanitizedReport, null, 2) + "\n",
     "utf8",
   );
-  console.log(JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(sanitizedReport, null, 2));
   if (failed.length > 0) process.exitCode = 1;
 };
 

@@ -38,7 +38,7 @@ export async function waitForFoldersToPopulateFlow(args: {
   applyOverview: (overview: {
     folders: FolderInfo[];
     connectedVia: string;
-    transportKind: "direct-tcp" | "relay";
+    transportKind: "direct-tcp" | "direct-quic" | "relay";
   }) => void;
   logger?: FlowLogger;
 }): Promise<{ populated: boolean; attempts: number; finalFolderCount: number }> {

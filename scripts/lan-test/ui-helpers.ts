@@ -167,3 +167,19 @@ export const readCachedHash = async (
   ) as number[];
   return createHash("sha256").update(Buffer.from(bytes)).digest("hex");
 };
+
+export const readSessionEventNames = async (
+  browser: TauriBrowser,
+): Promise<string[]> => {
+  await $("[data-testid='tab-devices']").click();
+  const events = await browser.execute(() =>
+    [...document.querySelectorAll(".item-meta")]
+      .map((element) => element.textContent?.trim() ?? "")
+      .filter((text) => text.includes(" | "))
+      .map((text) => text.split(" | ").at(-1) ?? "")
+      .filter(Boolean)
+      .slice(0, 80),
+  );
+  await $("[data-testid='tab-folders']").click();
+  return events;
+};

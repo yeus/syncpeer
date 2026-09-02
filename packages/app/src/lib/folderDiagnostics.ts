@@ -40,14 +40,14 @@ export interface FolderDiagnosticsReport {
   finishedAtIso: string;
   durationMs: number;
   connection: {
-    discoveryMode?: "global" | "lan" | "direct";
+    discoveryMode?: "automatic" | "global" | "lan" | "direct";
     remoteId?: string;
     host: string;
     port: number;
   };
   overview: {
     connectedVia: string;
-    transportKind: "direct-tcp" | "relay";
+    transportKind: "direct-tcp" | "direct-quic" | "relay";
     connectionScope?: ConnectionScope;
     folderCount: number;
     folderIds: string[];

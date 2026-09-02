@@ -144,9 +144,14 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       isConnecting: false,
       isRefreshing: false,
       isLoadingDirectory: false,
+      lifecyclePhase: "idle" as SessionState["phase"],
+      reconnectAttempt: 0,
+      nextRetryAtMs: null as number | null,
+      closureReason: null as string | null,
+      upgradeStatus: "idle" as SessionState["upgradeStatus"],
       remoteDevice: null as RemoteDeviceInfo | null,
       connectionPath: "",
-      connectionTransport: "" as "direct-tcp" | "relay" | "",
+      connectionTransport: "" as "direct-tcp" | "direct-quic" | "relay" | "",
       connectionScope: "" as ConnectionScope | "",
       folders: [] as FolderInfo[],
       folderSyncStates: [] as FolderSyncState[],
@@ -300,7 +305,7 @@ export interface OfflineFolderSnapshot {
   folders: FolderInfo[];
   folderSyncStates: FolderSyncState[];
   connectedVia: string;
-  transportKind: "direct-tcp" | "relay" | "";
+  transportKind: "direct-tcp" | "direct-quic" | "relay" | "";
   connectionScope?: ConnectionScope | "";
   directories?: Record<string, OfflineDirectorySnapshot>;
   activeDirectoryKey?: string;
@@ -400,6 +405,11 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.isConnecting = next.pending.connecting;
   state.session.isRefreshing = next.pending.refreshingOverview;
   state.session.isLoadingDirectory = next.pending.loadingDirectory;
+  state.session.lifecyclePhase = next.phase;
+  state.session.reconnectAttempt = next.attempt;
+  state.session.nextRetryAtMs = next.nextRetryAtMs;
+  state.session.closureReason = next.closureReason;
+  state.session.upgradeStatus = next.upgradeStatus;
   state.session.folders = next.folders;
   state.session.folderSyncStates = next.folderSyncStates;
   state.session.directory = {
@@ -594,6 +604,7 @@ export const hasSuccessfulConnectionHistory = (
 };
 
 export const connectionModeLabel = (state: AppState) => {
+  if (state.connection.discoveryMode === "automatic") return "Automatic path selection";
   if (state.connection.discoveryMode === "global") {
     return `Global discovery via ${state.connection.discoveryServer}`;
   }
@@ -663,7 +674,7 @@ export const downloadProgressText = (
 };
 
 export const downloadTransportText = (
-  transportKind: "direct-tcp" | "relay" | "" | undefined,
+  transportKind: "direct-tcp" | "direct-quic" | "relay" | "" | undefined,
   connectionScope?: ConnectionScope | "",
 ) => {
   const transport = transportKind === "relay" ? "relay" : "direct";

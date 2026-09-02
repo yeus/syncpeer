@@ -11,6 +11,7 @@ import {
   clickDownloadButton,
   clickItemTitle,
   readCachedHash,
+  readSessionEventNames,
   selectDiscoveryMode,
   setUploadFile,
   setValue,
@@ -155,6 +156,9 @@ describe("Syncpeer LAN integration", () => {
       await waitForText(lanBrowser, "Uploaded upload.txt.", 90_000);
       const uploaded = await request<{ sha256: string; size: number }>("POST", "/v1/action", {
         action: "verify-upload",
+      }).catch(async (error) => {
+        console.log(`Safe session events: ${(await readSessionEventNames(lanBrowser)).join(", ")}`);
+        throw error;
       });
       assert.equal(uploaded.sha256, createHash("sha256")
         .update("uploaded from Syncpeer LAN test\n")
@@ -240,7 +244,10 @@ describe("Syncpeer LAN integration", () => {
       }
       await setValue(`folder-password-${currentFixture.encryptedFolderId}`, currentFixture.encryptedPassword);
       await clickTestId(`unlock-folder-${currentFixture.encryptedFolderId}`);
-      await waitForText(lanBrowser, "unlocked", 90_000);
+      await waitForText(lanBrowser, "unlocked", 90_000).catch(async (error) => {
+        console.log(`Safe session events: ${(await readSessionEventNames(lanBrowser)).join(", ")}`);
+        throw error;
+      });
       await clickItemTitle(lanBrowser, currentFixture.encryptedFolderId);
       await waitForText(lanBrowser, "secret.txt", 90_000);
       await downloadByName("secret.txt");

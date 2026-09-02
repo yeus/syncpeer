@@ -74,6 +74,12 @@
   let currentFavoriteKeys = $derived(favoriteKeys(app));
   let currentBreadcrumbs = $derived(visibleBreadcrumbs(app));
   let currentRootFolders = $derived(rootFolderEntries(app));
+  let hasManagedConnection = $derived(
+    app.session.lifecyclePhase === "connecting" ||
+    app.session.lifecyclePhase === "connected" ||
+    app.session.lifecyclePhase === "waiting" ||
+    app.session.lifecyclePhase === "reconnecting",
+  );
   let currentConnectionModeLabel = $derived(connectionModeLabel(app));
   let currentConnectTargetLabel = $derived(connectTargetLabel(app));
   let currentDirectoryEntries = $derived(paginatedDirectoryEntries(app));
@@ -102,7 +108,8 @@
 
   $effect(() => {
     if (
-      (app.connection.discoveryMode === "global" ||
+      (app.connection.discoveryMode === "automatic" ||
+        app.connection.discoveryMode === "global" ||
         app.connection.discoveryMode === "lan") &&
       app.connection.host === "127.0.0.1"
     ) {
@@ -132,6 +139,9 @@
       void actions.onNetworkOnline();
       void actions.refreshActiveView();
     };
+    const handleOffline = () => {
+      void sessionStore.actions.setOnline(false);
+    };
     const handleVisibilityChange = () => {
       const isVisible = document.visibilityState === "visible";
       actions.setAppVisibility(isVisible);
@@ -151,12 +161,14 @@
       void actions.refreshActiveView();
     };
     window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleFocus);
     window.addEventListener("pageshow", handlePageShow);
 
     return () => {
       window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("pageshow", handlePageShow);
@@ -255,14 +267,20 @@
         <button
           data-testid="global-connect-button"
           class="ghost compact-connect"
-          onclick={() => (app.session.isConnected ? actions.disconnect() : actions.connect())}
-          disabled={app.session.isConnecting}
+          onclick={() => (hasManagedConnection ? actions.disconnect() : actions.connect())}
+          disabled={app.session.lifecyclePhase === "stopping"}
         >
-          {app.session.isConnecting
-            ? "Connecting..."
-            : app.session.isConnected
-              ? "Disconnect"
-              : "Connect"}
+          {app.session.lifecyclePhase === "stopping"
+            ? "Disconnecting..."
+            : app.session.lifecyclePhase === "connecting"
+              ? "Connecting..."
+              : app.session.lifecyclePhase === "reconnecting"
+                ? "Reconnecting..."
+                : app.session.lifecyclePhase === "waiting"
+                  ? "Cancel retry"
+                  : app.session.lifecyclePhase === "connected"
+                    ? "Disconnect"
+                    : "Connect"}
         </button>
         <div class="global-connect-meta">
           {#if currentConnectTargetLabel}

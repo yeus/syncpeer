@@ -1,5 +1,6 @@
 <svelte:options runes={true} />
 <script lang="ts">
+  import { sanitizeDiagnosticArtifact } from "../../shared/modules/diagnosticSanitizer.ts";
   import { normalizeDeviceId } from "@syncpeer/core/browser";
 
   interface RunDiagnosticsArgs {
@@ -84,7 +85,7 @@
         expectedAdvertisedDeviceIds,
         failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
       });
-      resultJson = JSON.stringify(result, null, 2);
+      resultJson = JSON.stringify(sanitizeDiagnosticArtifact(result), null, 2);
       lastRunAt = new Date().toLocaleString();
     } catch (error) {
       runError = error instanceof Error ? error.message : String(error);
@@ -104,7 +105,7 @@
         expectedAdvertisedDeviceIds,
         failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
       });
-      resultJson = JSON.stringify(result, null, 2);
+      resultJson = JSON.stringify(sanitizeDiagnosticArtifact(result), null, 2);
       lastRunAt = new Date().toLocaleString();
     } catch (error) {
       runError = error instanceof Error ? error.message : String(error);
@@ -124,7 +125,7 @@
         expectedAdvertisedDeviceIds,
         failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
       });
-      resultJson = JSON.stringify(result, null, 2);
+      resultJson = JSON.stringify(sanitizeDiagnosticArtifact(result), null, 2);
       lastRunAt = new Date().toLocaleString();
     } catch (error) {
       runError = error instanceof Error ? error.message : String(error);

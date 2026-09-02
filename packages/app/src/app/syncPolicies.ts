@@ -60,7 +60,7 @@ export const saveOfflineSnapshot = (
     remoteDevice: RemoteDeviceInfo | null;
     folderSyncStates: FolderSyncState[];
     connectedVia: string;
-    transportKind: "direct-tcp" | "relay" | "";
+    transportKind: "direct-tcp" | "direct-quic" | "relay" | "";
     connectionScope?: ConnectionScope | "";
   },
 ) => {

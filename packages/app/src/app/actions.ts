@@ -437,7 +437,8 @@ const migrateActiveLegacyFolderPasswords = (state: AppState) => {
 
 const validateConnection = (state: AppState) => {
   if (
-    (state.connection.discoveryMode === "global" ||
+    (state.connection.discoveryMode === "automatic" ||
+      state.connection.discoveryMode === "global" ||
       state.connection.discoveryMode === "lan") &&
     !normalizeDeviceId(state.connection.remoteId) &&
     state.devices.selectedSavedDeviceId
@@ -445,8 +446,7 @@ const validateConnection = (state: AppState) => {
     state.connection.remoteId = state.devices.selectedSavedDeviceId;
   }
   if (
-    (state.connection.discoveryMode === "global" ||
-      state.connection.discoveryMode === "lan") &&
+    (state.connection.discoveryMode === "global" || state.connection.discoveryMode === "lan") &&
     !normalizeDeviceId(state.connection.remoteId)
   ) {
     throw new Error(
@@ -454,15 +454,15 @@ const validateConnection = (state: AppState) => {
     );
   }
   if (
-    (state.connection.discoveryMode === "global" ||
-      state.connection.discoveryMode === "lan") &&
+    state.connection.discoveryMode !== "direct" &&
+    normalizeDeviceId(state.connection.remoteId) !== "" &&
     !isValidSyncthingDeviceId(state.connection.remoteId)
   ) {
     throw new Error(
       "Remote Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.",
     );
   }
-  if (state.connection.discoveryMode === "global") {
+  if (state.connection.discoveryMode === "automatic" || state.connection.discoveryMode === "global") {
     state.connection.discoveryServer = normalizeDiscoveryServer(
       state.connection.discoveryServer,
     );
@@ -799,7 +799,7 @@ export const createAppActions = (args: {
     if (targetDeviceId) {
       state.devices.selectedSavedDeviceId = targetDeviceId;
       state.connection.remoteId = targetDeviceId;
-      state.connection.discoveryMode = "global";
+      state.connection.discoveryMode = "automatic";
       state.connection.host = "";
       state.session.activeConnectDeviceId = targetDeviceId;
     }
@@ -1179,7 +1179,6 @@ export const createAppActions = (args: {
   };
 
   const disconnect = async () => {
-    if (state.session.isConnecting) return;
     state.ui.autoConnectPaused = true;
     try {
       await sessionStore.actions.disconnect();
@@ -1616,7 +1615,7 @@ export const createAppActions = (args: {
       }: {
         downloadedBytes: number;
         totalBytes: number;
-        transportKind?: "direct-tcp" | "relay";
+        transportKind?: "direct-tcp" | "direct-quic" | "relay";
         connectedVia?: string;
         connectionScope?: "lan" | "wan" | "unknown";
       }) => {
@@ -1862,7 +1861,7 @@ export const createAppActions = (args: {
     });
     state.devices.selectedSavedDeviceId = normalized;
     state.connection.remoteId = normalized;
-    state.connection.discoveryMode = "global";
+    state.connection.discoveryMode = "automatic";
     state.connection.host = "";
     state.devices.newSavedDeviceId = "";
     state.devices.newSavedDeviceCustomName = "";
@@ -1890,7 +1889,7 @@ export const createAppActions = (args: {
   const useSavedDevice = (deviceId: string) => {
     state.devices.selectedSavedDeviceId = deviceId;
     state.connection.remoteId = deviceId;
-    state.connection.discoveryMode = "global";
+    state.connection.discoveryMode = "automatic";
     state.connection.host = "";
     if (!state.session.isConnected) {
       restoreOfflineSnapshot(state, clearDirectoryView, deviceId, "use_saved_device");
@@ -1946,7 +1945,7 @@ export const createAppActions = (args: {
     upsertSavedDevice(state, device.id, device.name, { customName: false });
     state.devices.selectedSavedDeviceId = device.id;
     state.connection.remoteId = device.id;
-    state.connection.discoveryMode = "global";
+    state.connection.discoveryMode = "automatic";
     state.connection.host = "";
     state.ui.recentError = null;
   };
@@ -2232,6 +2231,7 @@ export const createAppActions = (args: {
 
   const setAppVisibility = (isVisible: boolean) => {
     state.ui.isAppVisible = isVisible;
+    void sessionStore.actions.setForeground(isVisible);
   };
 
   const pickAndroidPimDirectory = async () => {
@@ -2560,6 +2560,7 @@ export const createAppActions = (args: {
   };
 
   const onNetworkOnline = async () => {
+    await sessionStore.actions.setOnline(true);
     if (state.ui.autoConnectPaused) return;
     await discoverLocalDevices({ timeoutMs: 1200 });
     if (!hasAutoConnectTarget(state)) return;

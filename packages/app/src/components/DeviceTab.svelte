@@ -296,13 +296,14 @@
         <label>
           Discovery Method
           <select data-testid="connection-discovery-mode" bind:value={app.connection.discoveryMode}>
-            <option value="global">Global Discovery (default)</option>
+            <option value="automatic">Automatic (default)</option>
+            <option value="global">Global Discovery</option>
             <option value="lan">LAN Discovery</option>
             <option value="direct">Direct Host/Port</option>
           </select>
         </label>
 
-        {#if app.connection.discoveryMode === "global"}
+        {#if app.connection.discoveryMode === "automatic" || app.connection.discoveryMode === "global"}
           <label>
             Discovery Server
             <input data-testid="connection-discovery-server" type="text" bind:value={app.connection.discoveryServer} />
@@ -316,7 +317,7 @@
           </p>
         {/if}
 
-        {#if app.connection.discoveryMode === "direct"}
+        {#if app.connection.discoveryMode === "direct" || app.connection.discoveryMode === "automatic"}
           <label>
             Host
             <input
@@ -342,6 +343,12 @@
             Global discovery ignores manual host/port. The official Syncthing
             discovery server pin is applied automatically when you use
             discovery.syncthing.net.
+          </div>
+        {/if}
+
+        {#if app.connection.discoveryMode === "automatic"}
+          <div class="hint">
+            Automatic mode races saved, LAN, global, direct, and relay paths and keeps the best available connection.
           </div>
         {/if}
 
@@ -444,7 +451,7 @@
           type="button"
           class="ghost"
           onclick={onResetDiscoveryServer}
-          disabled={app.connection.discoveryMode !== "global"}
+          disabled={app.connection.discoveryMode !== "global" && app.connection.discoveryMode !== "automatic"}
         >
           Use Official Discovery Server
         </button>

@@ -6,15 +6,22 @@ assert.equal(isUiE2eBuildMode("lan-e2e"), true);
 assert.equal(isUiE2eBuildMode("android-e2e"), true);
 assert.equal(isUiE2eBuildMode("production"), false);
 
-assert.deepEqual(syncthingListenAddresses(22000, false), [
+assert.deepEqual(syncthingListenAddresses(22000, "relay"), [
   "tcp4://0.0.0.0:22000",
   "dynamic+https://relays.syncthing.net/endpoint",
 ]);
-assert.deepEqual(syncthingListenAddresses(22000, true), [
+assert.deepEqual(syncthingListenAddresses(22000, "tcp"), [
   "tcp4://0.0.0.0:22000",
 ]);
+assert.deepEqual(syncthingListenAddresses(22000, "quic"), [
+  "quic4://0.0.0.0:22000",
+]);
+assert.deepEqual(syncthingListenAddresses(22000, "tcp-quic"), [
+  "tcp4://0.0.0.0:22000",
+  "quic4://0.0.0.0:22000",
+]);
 assert.equal(
-  syncthingListenAddresses(22000, false).some((address) =>
+  syncthingListenAddresses(22000, "relay").some((address) =>
     address.startsWith("relay://")
   ),
   false,

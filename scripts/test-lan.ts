@@ -221,6 +221,14 @@ const runServer = async (args: {
       await fixture.switchToRelayOnly();
       return { status: "relay-only" };
     }
+    if (action === "switch-transport") {
+      const profile = String((details as { profile?: string } | undefined)?.profile ?? "");
+      if (profile !== "tcp" && profile !== "quic" && profile !== "tcp-quic" && profile !== "relay") {
+        throw new Error("Unknown Syncthing transport profile.");
+      }
+      await fixture.switchTransport(profile);
+      return { status: profile };
+    }
     if (action === "add-untrusted") {
       const deviceId = String((details as { deviceId?: string } | undefined)?.deviceId ?? "").trim();
       if (!deviceId) throw new Error("The untrusted profile requires a device ID.");
@@ -268,6 +276,7 @@ const runServer = async (args: {
     });
     if (args.openFirewall) {
       firewall.open({ protocol: "tcp", port: fixture.fixture.directPort });
+      firewall.open({ protocol: "udp", port: fixture.fixture.directPort });
     }
     coordinator.setFixture(fixture.fixture);
     console.log(

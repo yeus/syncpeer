@@ -37,10 +37,14 @@ const promptForApproval = async (
 };
 
 const runServer = async (serverRoot: string): Promise<number> => {
+  const configuredTransport = process.env.SYNCPEER_DEV_SERVER_TRANSPORT?.trim() ?? "relay";
+  if (configuredTransport !== "relay" && configuredTransport !== "direct" && configuredTransport !== "quic") {
+    throw new Error("SYNCPEER_DEV_SERVER_TRANSPORT must be relay, direct, or quic.");
+  }
   const fixture = await createLanFixture({
     root: serverRoot,
     serverHost: "relay-only",
-    mode: "relay",
+    mode: configuredTransport,
   });
   const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
   const controller = new AbortController();
@@ -53,9 +57,13 @@ const runServer = async (serverRoot: string): Promise<number> => {
   console.log("\nSyncpeer development server is running.");
   console.log("Server device ID: " + fixture.fixture.remoteDeviceId);
   console.log("Syncthing Web UI: " + fixture.syncGuiUrl);
-  console.log("Transport: global discovery with relay fallback");
-  console.log("Relay selection: Syncthing dynamic relay pool");
-  console.log("No inbound firewall port is required for relay traffic.");
+  console.log("Transport profile: " + configuredTransport);
+  if (configuredTransport === "relay") {
+    console.log("Relay selection: Syncthing dynamic relay pool");
+    console.log("No inbound firewall port is required for relay traffic.");
+  } else {
+    console.log("Direct tests require the advertised TCP/UDP port to be reachable.");
+  }
   console.log("Waiting for pending clients. Press Ctrl-C to stop.\n");
 
   try {

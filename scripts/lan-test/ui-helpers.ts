@@ -67,7 +67,7 @@ export const clickDownloadButton = async (
 
 export const selectDiscoveryMode = async (
   browser: TauriBrowser,
-  mode: "direct" | "lan" | "global",
+  mode: "automatic" | "direct" | "lan" | "global",
 ): Promise<void> => {
   const selector = "[data-testid='connection-discovery-mode']";
   await browser.waitUntil(

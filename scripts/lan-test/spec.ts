@@ -37,7 +37,7 @@ const request = <T>(method: "GET" | "POST", pathname: string, body?: unknown) =>
   coordinatorRequest<T>({ baseUrl, token, method, pathname, body });
 
 const reportPhase = async (
-  phase: "direct" | "lan-discovery" | "global" | "relay" | "public-smoke" | "encrypted-direct",
+  phase: "direct" | "lan-discovery" | "quic" | "global" | "relay" | "public-smoke" | "encrypted-direct",
   status: "running" | "passed" | "failed" | "skipped",
   details?: unknown,
 ): Promise<void> => {
@@ -77,7 +77,7 @@ const clickTestId = async (testId: string): Promise<void> => {
 };
 const connect = async (
   currentFixture: LanFixture,
-  mode: "direct" | "lan" | "global",
+  mode: "automatic" | "direct" | "lan" | "global",
   identity?: { cert: string; key: string },
 ): Promise<void> => {
   await clickTestId("tab-devices");
@@ -87,7 +87,7 @@ const connect = async (
   const remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim()
     || currentFixture.remoteDeviceId;
   await setValue("connection-remote-id", remoteDeviceId);
-  if (mode === "direct") {
+  if (mode === "direct" || mode === "automatic") {
     await setValue("connection-host", currentFixture.serverHost);
     await setValue("connection-port", String(currentFixture.directPort));
   } else if (mode === "global") {
@@ -97,7 +97,16 @@ const connect = async (
   await setValue("connection-cert", identity?.cert ?? "");
   await setValue("connection-key", identity?.key ?? "");
   await clickTestId("global-connect-button");
-  await waitForText(lanBrowser, "Connected");
+  try {
+    await waitForText(lanBrowser, "Connected");
+  } catch (error) {
+    const diagnostics = await lanBrowser.execute(() => ({
+      error: document.querySelector(".error")?.textContent?.trim() ?? "",
+      status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "",
+      button: document.querySelector("[data-testid='global-connect-button']")?.textContent?.trim() ?? "",
+    }));
+    throw new Error(`${String(error)} (${JSON.stringify(diagnostics)})`, { cause: error });
+  }
 };
 
 const disconnect = async (): Promise<void> => {
@@ -188,6 +197,59 @@ describe("Syncpeer LAN integration", () => {
     await runPhase("lan-discovery", async () => {
       await disconnect();
       await connect(currentFixture, "lan");
+    });
+  });
+
+  it("connects to a real Syncthing QUIC listener through Tauri", async function () {
+    if (process.env.SYNCPEER_LAN_SELF !== "1") {
+      await reportPhase("quic", "skipped", {
+        reason: "dedicated QUIC transport switching is exercised by the self-hosted fixture",
+      });
+      this.skip();
+      return;
+    }
+    await runPhase("quic", async () => {
+      if (!currentFixture) {
+        await clickTestId("tab-devices");
+        await waitForText(lanBrowser, "This Device", 60_000);
+        const deviceId = await $("[data-testid='current-device-id']").getText();
+        await request("POST", "/v1/register", { profile: "trusted", deviceId });
+        currentFixture = await fixture();
+      }
+      await request("POST", "/v1/action", {
+        action: "switch-transport",
+        details: { profile: "quic" },
+      });
+      await disconnect();
+      const identity = await lanBrowser.tauri.execute((tauri) =>
+        tauri.core.invoke("syncpeer_read_default_cli_identity"),
+      ) as { certPem: string; keyPem: string };
+      const probe = await lanBrowser.tauri.execute(
+        (tauri, request) => tauri.core.invoke("syncpeer_quic_open", { request }),
+        {
+          host: currentFixture.serverHost,
+          port: currentFixture.directPort,
+          certPem: identity.certPem,
+          keyPem: identity.keyPem,
+          caPem: null,
+          timeoutMs: 15_000,
+          keepaliveMs: 15_000,
+          idleTimeoutMs: 30_000,
+        },
+      ) as { sessionId: number; peerCertificateDer: number[] };
+      assert.ok(probe.peerCertificateDer.length > 0);
+      await lanBrowser.tauri.execute(
+        (tauri, sessionId) => tauri.core.invoke("syncpeer_quic_close", {
+          request: { sessionId },
+        }),
+        probe.sessionId,
+      );
+      await connect(currentFixture, "automatic");
+      await waitForText(lanBrowser, "quic://", 60_000);
+      await request("POST", "/v1/action", {
+        action: "switch-transport",
+        details: { profile: "tcp-quic" },
+      });
     });
   });
 

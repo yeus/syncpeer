@@ -22,6 +22,7 @@ import {
 
 export const SYNCTHING_LOCAL_DISCOVERY_PORT = 21027;
 const SYNCTHING_RELAY_POOL = "dynamic+https://relays.syncthing.net/endpoint";
+export type SyncthingTransportProfile = "tcp" | "quic" | "tcp-quic" | "relay";
 
 const version = process.env.SYNCTHING_VERSION ?? "v2.1.2";
 const relayVersion = process.env.SYNCTHING_RELAY_VERSION ?? "v2.1.3";
@@ -44,10 +45,15 @@ const ensureDir = (directory: string): void => {
 
 export const syncthingListenAddresses = (
   syncPort: number,
-  direct: boolean,
-): string[] => direct
-  ? ["tcp4://0.0.0.0:" + syncPort]
-  : ["tcp4://0.0.0.0:" + syncPort, SYNCTHING_RELAY_POOL];
+  profile: SyncthingTransportProfile,
+): string[] => {
+  if (profile === "tcp") return ["tcp4://0.0.0.0:" + syncPort];
+  if (profile === "quic") return ["quic4://0.0.0.0:" + syncPort];
+  if (profile === "tcp-quic") {
+    return ["tcp4://0.0.0.0:" + syncPort, "quic4://0.0.0.0:" + syncPort];
+  }
+  return ["tcp4://0.0.0.0:" + syncPort, SYNCTHING_RELAY_POOL];
+};
 
 export const ensureSyncthingTools = (): void => {
   execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "download:syncthing"], {
@@ -225,7 +231,7 @@ const addFolder = (xml: string, args: {
 const configureHome = (home: string, args: {
   guiPort: number;
   syncPort: number;
-  direct: boolean;
+  transport: SyncthingTransportProfile;
   localAnnounce: boolean;
   trustedDeviceId?: string;
   untrustedDeviceId?: string;
@@ -241,7 +247,7 @@ const configureHome = (home: string, args: {
     /(<gui\b[\s\S]*?<address>)[^<]*(<\/address>)/,
     (_match, prefix, suffix) => prefix + "127.0.0.1:" + args.guiPort + suffix,
   );
-  const addresses = syncthingListenAddresses(args.syncPort, args.direct);
+  const addresses = syncthingListenAddresses(args.syncPort, args.transport);
   xml = replaceRepeatedTag(xml, "listenAddress", addresses);
   xml = replaceRepeatedTag(xml, "globalAnnounceServer", ["default"]);
   xml = replaceTag(xml, "globalAnnounceEnabled", "true");
@@ -351,6 +357,7 @@ export interface RunningLanFixture {
   apiKey: string;
   syncGuiUrl: string;
   switchToRelayOnly: () => Promise<void>;
+  switchTransport: (profile: SyncthingTransportProfile) => Promise<void>;
   addUntrustedProfile: (deviceId: string) => Promise<void>;
   verifyUploadedFile: () => Promise<{ sha256: string; size: number }>;
   churn: (durationMs: number) => Promise<number>;
@@ -372,7 +379,7 @@ export const createLanFixture = async (args: {
   trustedDeviceId?: string;
   untrustedDeviceId?: string;
   home?: string;
-  mode: "direct" | "relay";
+  mode: "direct" | "relay" | "quic";
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
   const root = args.root;
@@ -407,10 +414,10 @@ export const createLanFixture = async (args: {
     path: "secret.txt",
     ...hashFile(path.join(encryptedSharePath, "secret.txt")),
   };
-  const configure = (direct: boolean, localAnnounce: boolean, untrustedDeviceId?: string) => configureHome(home, {
+  const configure = (transport: SyncthingTransportProfile, localAnnounce: boolean, untrustedDeviceId?: string) => configureHome(home, {
     guiPort,
     syncPort,
-    direct,
+    transport,
     localAnnounce,
     trustedDeviceId: args.trustedDeviceId,
     untrustedDeviceId,
@@ -427,7 +434,7 @@ export const createLanFixture = async (args: {
     ], root, path.join(root, "syncthing.log"));
     await waitForTcp("127.0.0.1", guiPort, 30000, "Syncthing GUI");
   };
-  configure(args.mode !== "relay", args.mode !== "relay", args.untrustedDeviceId);
+  configure(args.mode === "relay" ? "relay" : args.mode === "quic" ? "quic" : "tcp-quic", args.mode !== "relay", args.untrustedDeviceId);
   await start();
   const apiKey = apiKeyFor(home);
   const syncGuiUrl = "http://127.0.0.1:" + guiPort;
@@ -461,13 +468,19 @@ export const createLanFixture = async (args: {
     switchToRelayOnly: async () => {
       await stopProcess(syncthingProcess);
       syncthingProcess = null;
-      configure(false, false);
+      configure("relay", false);
+      await start();
+    },
+    switchTransport: async (profile) => {
+      await stopProcess(syncthingProcess);
+      syncthingProcess = null;
+      configure(profile, profile !== "relay", args.untrustedDeviceId);
       await start();
     },
     addUntrustedProfile: async (deviceId: string) => {
       await stopProcess(syncthingProcess);
       syncthingProcess = null;
-      configure(true, false, deviceId);
+      configure("tcp-quic", false, deviceId);
       await start();
     },
     verifyUploadedFile: async () => {

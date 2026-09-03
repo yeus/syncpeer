@@ -13,6 +13,7 @@
     "test:diagnostics": "node --experimental-strip-types scripts/test-diagnostics.ts",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
     "test:e2e:android": "node scripts/test-android-e2e.mjs",
+    "security:export-dependabot": "node scripts/export-dependabot-alerts.mjs",
     "release": "node scripts/release.mjs",
     "lint": "eslint eslint.config.mjs \"packages/**/*.{js,mjs,cjs,ts,svelte}\" \"scripts/**/*.{js,mjs,cjs,ts,svelte}\"",
     "download:syncthing": "node scripts/download-syncthing.mjs",

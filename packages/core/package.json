@@ -27,7 +27,7 @@
     "@noble/ciphers": "^2.1.1",
     "@noble/hashes": "^2.0.1",
     "lz4js": "^0.2.0",
-    "protobufjs": "^8.0.1"
+    "protobufjs": "^8.8.0"
   },
   "devDependencies": {
     "@types/lz4js": "^0.2.2",

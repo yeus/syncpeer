@@ -1539,10 +1539,11 @@ fn normalize_local_discovery_address(address: &str, source_ip: &str) -> Option<S
     if !trimmed.contains("://") {
         return Some(format!("tcp://{source_ip}:{trimmed}"));
     }
-    if !trimmed.starts_with("tcp://") {
+    let parsed = Url::parse(trimmed).ok()?;
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "tcp" | "tcp4" | "tcp6" | "quic" | "quic4" | "quic6") {
         return Some(trimmed.to_string());
     }
-    let parsed = Url::parse(trimmed).ok()?;
     let port = parsed.port()?;
     let host = parsed.host_str().unwrap_or("");
     let normalized_host = if host == "0.0.0.0" || host == "::" || host.is_empty() {
@@ -1550,7 +1551,12 @@ fn normalize_local_discovery_address(address: &str, source_ip: &str) -> Option<S
     } else {
         host
     };
-    Some(format!("tcp://{normalized_host}:{port}"))
+    let formatted_host = if normalized_host.contains(':') {
+        format!("[{normalized_host}]")
+    } else {
+        normalized_host.to_string()
+    };
+    Some(format!("{scheme}://{formatted_host}:{port}"))
 }
 
 fn parse_local_discovery_candidate(address: &str, device_id: Option<&str>) -> Option<DiscoveryLocalCandidate> {
@@ -1569,23 +1575,30 @@ fn parse_local_discovery_candidate(address: &str, device_id: Option<&str>) -> Op
             device_id: normalized_device_id,
         });
     }
-    if trimmed.starts_with("tcp://") {
-        let parsed = Url::parse(trimmed).ok()?;
+    let parsed = Url::parse(trimmed).ok()?;
+    let protocol = match parsed.scheme() {
+        "tcp" | "tcp4" | "tcp6" => "tcp",
+        "quic" | "quic4" | "quic6" => "quic",
+        _ => {
+            return Some(DiscoveryLocalCandidate {
+                address: trimmed.to_string(),
+                protocol: "unknown".to_string(),
+                host: None,
+                port: None,
+                device_id: normalized_device_id,
+            });
+        }
+    };
+    if parsed.host_str().is_some() && parsed.port().is_some() {
         return Some(DiscoveryLocalCandidate {
             address: trimmed.to_string(),
-            protocol: "tcp".to_string(),
+            protocol: protocol.to_string(),
             host: parsed.host_str().map(|value| value.to_string()),
             port: parsed.port(),
             device_id: normalized_device_id,
         });
     }
-    Some(DiscoveryLocalCandidate {
-        address: trimmed.to_string(),
-        protocol: "unknown".to_string(),
-        host: None,
-        port: None,
-        device_id: normalized_device_id,
-    })
+    None
 }
 
 fn make_syncpeer_packet(kind: u8, body: &[u8]) -> Vec<u8> {
@@ -3960,6 +3973,22 @@ mod tests {
     fn syncpeer_packet_rejects_invalid_magic() {
         let invalid = vec![0_u8, 1, 2, 3, SYNCPEER_DISCOVERY_KIND_REPLY, 1, 2, 3];
         assert!(parse_syncpeer_packet(&invalid).is_none());
+    }
+
+    #[test]
+    fn local_discovery_normalizes_and_parses_quic_addresses() {
+        let address = normalize_local_discovery_address(
+            "quic4://0.0.0.0:22000",
+            "192.0.2.10",
+        )
+        .expect("QUIC address should normalize");
+        assert_eq!(address, "quic4://192.0.2.10:22000");
+
+        let candidate = parse_local_discovery_candidate(&address, Some("DEVICE"))
+            .expect("QUIC candidate should parse");
+        assert_eq!(candidate.protocol, "quic");
+        assert_eq!(candidate.host.as_deref(), Some("192.0.2.10"));
+        assert_eq!(candidate.port, Some(22000));
     }
 
     #[cfg(target_os = "linux")]

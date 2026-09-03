@@ -39,19 +39,6 @@ const recentDirectories = (
   );
 };
 
-export const folderSignature = (folders: FolderInfo[]) =>
-  folders
-    .map((folder) =>
-      [
-        folder.id,
-        folder.label,
-        folder.stopReason ?? 0,
-        folder.localDevicePresentInFolder ? 1 : 0,
-      ].join(":"),
-    )
-    .sort()
-    .join("|");
-
 export const saveOfflineSnapshot = (
   state: AppState,
   sourceDeviceId: string,

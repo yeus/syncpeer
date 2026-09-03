@@ -10,6 +10,8 @@ import { createSyncpeerSessionStore } from "../packages/core/dist/ui/sessionStor
 import {
   candidateCooldownMs,
   candidatePreferenceScore,
+  normalizeDiscoveredCandidates,
+  UploadOutcomeUnknownError,
   withMetadataSession,
   type SyncpeerSessionHandle,
 } from "../packages/core/dist/client.js";
@@ -17,6 +19,7 @@ import {
   createCheckpointedDownloadSink,
   RemoteMetadataChangedError,
 } from "../packages/core/dist/transfer/stream.js";
+import { createRecoveringRemoteFs } from "../packages/core/dist/ui/recoveringRemoteFs.js";
 import { RemoteFs } from "../packages/core/dist/core/model/remoteFs.js";
 import { sanitizeDiagnosticArtifact } from "../packages/shared/modules/diagnosticSanitizer.ts";
 
@@ -28,7 +31,7 @@ const deferred = <T>() => {
   return { promise, resolve };
 };
 
-const session = () => {
+const session = (sessionRemoteFs = remoteFs) => {
   const closed = deferred<Awaited<SyncpeerSessionHandle["closed"]>>();
   let isClosed = false;
   const finish = (closure: Awaited<SyncpeerSessionHandle["closed"]>) => {
@@ -36,7 +39,7 @@ const session = () => {
     closed.resolve(closure);
   };
   return {
-    remoteFs,
+    remoteFs: sessionRemoteFs,
     connectedVia: "redacted-test-path",
     transportKind: "direct-tcp" as const,
     connectionScope: "lan" as const,
@@ -93,6 +96,24 @@ test("candidate preference and cooldown match Syncthing ordering", () => {
   assert.deepEqual([1, 2, 3, 4, 5, 9].map(candidateCooldownMs), [5000, 10000, 20000, 40000, 60000, 60000]);
 });
 
+test("automatic candidates combine, normalize, deduplicate, and rank all sources", () => {
+  const candidates = normalizeDiscoveredCandidates([
+    { address: "tcp://HOST.invalid:22000", protocol: "tcp", host: "HOST.invalid", port: 22000, scope: "wan", source: "manual" },
+    { address: "quic://HOST.invalid:22000", protocol: "quic", host: "HOST.invalid", port: 22000, scope: "wan", source: "manual" },
+    { address: "tcp://host.invalid:22000", protocol: "tcp", host: "host.invalid", port: 22000, scope: "wan", source: "global" },
+    { address: "relay://relay.invalid:22067", protocol: "relay", host: "relay.invalid", port: 22067, scope: "wan", source: "global" },
+    { address: "quic://192.168.1.3:22000", protocol: "quic", host: "192.168.1.3", port: 22000, scope: "lan", source: "local" },
+    { address: "tcp://192.168.1.2:22000", protocol: "tcp", host: "192.168.1.2", port: 22000, scope: "lan", source: "local" },
+  ]);
+  assert.deepEqual(candidates.map((candidate) => candidate.address), [
+    "tcp://192.168.1.2:22000",
+    "quic://192.168.1.3:22000",
+    "tcp://HOST.invalid:22000",
+    "quic://HOST.invalid:22000",
+    "relay://relay.invalid:22067",
+  ]);
+});
+
 test("socket closure updates state and reconnects without polling", async () => {
   const first = session();
   const second = session();
@@ -136,6 +157,30 @@ test("manual disconnect cancels a pending retry", async () => {
   sleeps.shift()?.();
   await Promise.resolve();
   assert.equal(opens, 1);
+  assert.equal(lifecycle.getState().phase, "idle");
+});
+
+test("manual disconnect aborts and cleans up a pending opening", async () => {
+  const pending = deferred<ReturnType<typeof session>>();
+  let openingSignal: AbortSignal | undefined;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async (_options, signal) => {
+      openingSignal = signal;
+      return pending.promise;
+    },
+    keyFor: (value) => value,
+  });
+  const connecting = lifecycle.connect("peer");
+  await Promise.resolve();
+  await lifecycle.disconnect();
+  assert.equal(openingSignal?.aborted, true);
+  const opened = session();
+  let closes = 0;
+  const close = opened.close;
+  opened.close = async () => { closes += 1; await close(); };
+  pending.resolve(opened);
+  await assert.rejects(connecting, /cancelled/i);
+  assert.equal(closes, 1);
   assert.equal(lifecycle.getState().phase, "idle");
 });
 
@@ -288,6 +333,90 @@ test("background transfer defers suspension until transfer ends", async () => {
   assert.equal(lifecycle.getState().phase, "suspended");
 });
 
+test("foreground and online transitions retry immediately", async () => {
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => { opens += 1; return session(); },
+    keyFor: (value) => value,
+  });
+  await lifecycle.setOnline(false);
+  await assert.rejects(lifecycle.connect("peer"), /suspended|offline/i);
+  assert.equal(opens, 0);
+  await lifecycle.setOnline(true);
+  assert.equal(opens, 1);
+  await lifecycle.setForeground(false);
+  assert.equal(lifecycle.getState().phase, "suspended");
+  await lifecycle.setForeground(true);
+  assert.equal(opens, 2);
+  await lifecycle.disconnect();
+});
+
+test("upgrade probes swap only after replacement readiness and then close the old path", async () => {
+  const relay = { ...session(), transportKind: "relay" as const, connectionScope: "wan" as const };
+  const direct = { ...session(), transportKind: "direct-tcp" as const, connectionScope: "lan" as const };
+  const replacement = deferred<typeof direct>();
+  const sleeps: Array<{ ms: number; resolve: () => void }> = [];
+  const events: string[] = [];
+  relay.close = async () => { events.push("close:relay"); relay.finish({ kind: "manual", message: "upgraded" }); };
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => {
+      opens += 1;
+      return opens === 1 ? relay : replacement.promise;
+    },
+    keyFor: (value) => value,
+    sleep: (ms) => new Promise<void>((resolve) => sleeps.push({ ms, resolve })),
+  });
+  await lifecycle.connect("peer");
+  assert.equal(sleeps[0]?.ms, 60_000);
+  sleeps.shift()?.resolve();
+  await Promise.resolve();
+  assert.equal(lifecycle.getSession(), relay);
+  replacement.resolve(direct);
+  for (let index = 0; index < 10 && lifecycle.getSession() !== direct; index += 1) await Promise.resolve();
+  assert.equal(lifecycle.getSession(), direct);
+  assert.deepEqual(events, ["close:relay"]);
+  await lifecycle.disconnect();
+});
+
+test("failure streak survives flaps and resets after a stable session", async () => {
+  let now = 0;
+  const first = session();
+  const second = session();
+  const third = session();
+  const opened = [first, second, third, session()];
+  const sleeps: Array<{ ms: number; resolve: () => void }> = [];
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => opened.shift()!,
+    keyFor: (value) => value,
+    now: () => now,
+    random: () => 0.5,
+    sleep: (ms) => new Promise<void>((resolve) => sleeps.push({ ms, resolve })),
+  });
+  await lifecycle.connect("peer");
+  now = 10_000;
+  first.finish({ kind: "transport", message: "flap one" });
+  await Promise.resolve();
+  const firstRetry = sleeps.shift();
+  assert.equal(firstRetry?.ms, 1000);
+  firstRetry?.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  now = 20_000;
+  second.finish({ kind: "transport", message: "flap two" });
+  await Promise.resolve();
+  const secondRetry = sleeps.shift();
+  assert.equal(secondRetry?.ms, 2000);
+  secondRetry?.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  now = 51_000;
+  third.finish({ kind: "transport", message: "stable closure" });
+  await Promise.resolve();
+  assert.equal(sleeps.shift()?.ms, 1000);
+  await lifecycle.disconnect();
+});
+
 test("download checkpoints keep sinks open and skip completed ranges", async () => {
   const writes: number[] = [];
   let aborts = 0;
@@ -297,7 +426,13 @@ test("download checkpoints keep sinks open and skip completed ranges", async () 
     commit: () => undefined,
     abort: () => { aborts += 1; },
   });
-  const metadata = { folderId: "folder", path: "file", sizeBytes: 8, encrypted: false };
+  const metadata = {
+    folderId: "folder",
+    path: "file",
+    sizeBytes: 8,
+    encrypted: false,
+    contentId: "blocks:first",
+  };
   await checkpointed.sink.begin(metadata);
   await checkpointed.sink.write(0, new Uint8Array(4));
   assert.equal(checkpointed.sink.hasRange?.(0, 4), true);
@@ -310,6 +445,142 @@ test("download checkpoints keep sinks open and skip completed ranges", async () 
     RemoteMetadataChangedError,
   );
   assert.equal(aborts, 1);
+});
+
+test("download checkpoints reject same-size remote content changes", async () => {
+  let aborts = 0;
+  const checkpointed = createCheckpointedDownloadSink({
+    begin: () => undefined,
+    write: () => undefined,
+    commit: () => undefined,
+    abort: () => { aborts += 1; },
+  });
+  const metadata = {
+    folderId: "folder",
+    path: "file",
+    sizeBytes: 8,
+    encrypted: false,
+    contentId: "blocks:first",
+  };
+  await checkpointed.sink.begin(metadata);
+  await checkpointed.sink.write(0, new Uint8Array(4));
+  await assert.rejects(
+    checkpointed.sink.begin({ ...metadata, contentId: "blocks:second" }),
+    RemoteMetadataChangedError,
+  );
+  assert.equal(aborts, 1);
+});
+
+test("terminal download failures abort the retained sink exactly once", async () => {
+  const active = {
+    ...session(),
+    remoteFs: {
+      readFileToSink: async () => { throw new Error("Unknown folder"); },
+    } as SyncpeerSessionHandle["remoteFs"],
+  };
+  let aborts = 0;
+  const recovering = createRecoveringRemoteFs({
+    getOptions: () => ({ host: "test.invalid", port: 22000, deviceName: "test" }),
+    ensureSession: async () => active,
+    getFocusedFolderId: () => null,
+    setFocusedFolderId: () => undefined,
+    getActiveSession: () => active,
+  });
+  await assert.rejects(recovering.readFileToSink!(
+    "folder",
+    "file",
+    {
+      begin: () => undefined,
+      write: () => undefined,
+      commit: () => undefined,
+      abort: () => { aborts += 1; },
+    },
+    undefined,
+    undefined,
+  ), /Unknown folder/);
+  assert.equal(aborts, 1);
+});
+
+test("download recovery resumes missing ranges without duplicating sink writes", async () => {
+  const metadata = {
+    folderId: "folder",
+    path: "file",
+    sizeBytes: 8,
+    encrypted: false,
+    contentId: "blocks:stable",
+  };
+  const first = session({
+    readFileToSink: async (_folderId, _path, sink) => {
+      await sink.begin(metadata);
+      await sink.write(0, new Uint8Array(4));
+      first.finish({ kind: "transport", message: "connection closed" });
+      throw new Error("connection closed");
+    },
+  } as SyncpeerSessionHandle["remoteFs"]);
+  const second = session({
+    readFileToSink: async (_folderId, _path, sink) => {
+      await sink.begin(metadata);
+      await sink.write(0, new Uint8Array(4));
+      await sink.write(4, new Uint8Array(4));
+      await sink.commit();
+    },
+  } as SyncpeerSessionHandle["remoteFs"]);
+  const sessions = [first, second];
+  const writes: number[] = [];
+  let aborts = 0;
+  const recovering = createRecoveringRemoteFs({
+    getOptions: () => ({ host: "test.invalid", port: 22000, deviceName: "test" }),
+    ensureSession: async () => sessions.shift()!,
+    getFocusedFolderId: () => null,
+    setFocusedFolderId: () => undefined,
+    getActiveSession: () => sessions[0] ?? null,
+  });
+
+  await recovering.readFileToSink!("folder", "file", {
+    begin: () => undefined,
+    write: (offset) => { writes.push(offset); },
+    commit: () => undefined,
+    abort: () => { aborts += 1; },
+  });
+  assert.deepEqual(writes, [0, 4]);
+  assert.equal(aborts, 0);
+});
+
+test("ambiguous uploads are verified by hashes and never replayed", async () => {
+  const run = async (matches: boolean) => {
+    let publications = 0;
+    const first = session({
+      writeFileFully: async () => {
+        publications += 1;
+        first.finish({ kind: "transport", message: "connection closed" });
+        throw new Error("connection closed");
+      },
+    } as SyncpeerSessionHandle["remoteFs"]);
+    const replacement = session({
+      setFocusedFolder: () => undefined,
+      requestFolderIndex: async () => undefined,
+      matchesFileContent: async () => matches,
+    } as SyncpeerSessionHandle["remoteFs"]);
+    const sessions = [first, replacement];
+    const recovering = createRecoveringRemoteFs({
+      getOptions: () => ({ host: "test.invalid", port: 22000, deviceName: "test" }),
+      ensureSession: async () => sessions.shift()!,
+      getFocusedFolderId: () => null,
+      setFocusedFolderId: () => undefined,
+      getActiveSession: () => sessions[0] ?? null,
+    });
+    const upload = recovering.writeFileFully(
+      "folder",
+      "file",
+      new Uint8Array([1, 2, 3]),
+    );
+    if (matches) await upload;
+    else await assert.rejects(upload, UploadOutcomeUnknownError);
+    assert.equal(publications, 1);
+  };
+
+  await run(true);
+  await run(false);
 });
 
 test("remote file block offsets normalize protobuf long values", async () => {

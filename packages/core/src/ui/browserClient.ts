@@ -453,7 +453,10 @@ export const createSyncpeerBrowserClient = (
     return cachedDefaultIdentity;
   };
 
-  const openSession = async (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> => {
+  const openSession = async (
+    connectOptions: ConnectOptions,
+    signal: AbortSignal,
+  ): Promise<SyncpeerSessionHandle> => {
     const normalized = normalizeConnectOptions(connectOptions);
     let certPem: string | null = null;
     let keyPem: string | null = null;
@@ -504,7 +507,7 @@ export const createSyncpeerBrowserClient = (
       quicOnly: normalized.quicOnly,
       folderPasswords: normalized.folderPasswords,
       sharedFolders: normalized.sharedFolders,
-    });
+    }, signal);
     logClient(options.onLog, "client.session.open.ready", {
       transportKind: session.transportKind,
       connectionScope: session.connectionScope,

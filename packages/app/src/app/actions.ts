@@ -88,7 +88,6 @@ import {
 } from "./sessionViewPolicies.ts";
 import { updateCachedKey } from "./downloadPolicies.ts";
 import {
-  folderSignature,
   hasAutoConnectTarget,
   restoreOfflineSnapshot,
   restoreOfflineDirectory,
@@ -107,8 +106,6 @@ import {
 } from "./devicePolicies.ts";
 
 const nowTime = () => new Date().toLocaleTimeString();
-const FOLDER_SYNC_STALE_MS = 5 * 60 * 1000;
-const FOLDER_SYNC_RECOVERY_THROTTLE_MS = 10 * 60 * 1000;
 const TRANSFER_NOTIFICATION_ID = 22067;
 const TRANSFER_NOTIFICATION_CHANNEL_ID = "syncpeer-transfers-v2";
 const TRANSFER_NOTIFICATION_ACTION_TYPE = "syncpeer-transfer";
@@ -489,16 +486,6 @@ const loadDirectorySideEffects = async (
   saveOfflineDirectorySnapshot(state, activeSourceDeviceId(state));
 };
 
-const updateOverviewSyncTracking = (state: AppState) => {
-  const nextSignature = folderSignature(state.session.folders);
-  const now = Date.now();
-  state.sync.lastOverviewAtMs = now;
-  if (state.sync.folderSignature !== nextSignature) {
-    state.sync.folderSignature = nextSignature;
-    state.sync.folderSignatureChangedAtMs = now;
-  }
-};
-
 export const createAppActions = (args: {
   state: AppState;
   client: SyncpeerBrowserClient;
@@ -725,64 +712,6 @@ export const createAppActions = (args: {
     state.ui.uploadProgressActive ||
     state.sync.isSyncingStarredFiles;
 
-  const canAttemptFolderSyncRecovery = () => {
-    if (!state.session.isConnected) return false;
-    if (!state.ui.isAppVisible) return false;
-    if (transferInProgress()) return false;
-    if (state.sync.isRecoveringFolderSync) return false;
-    if (
-      state.session.isConnecting ||
-      state.session.isRefreshing ||
-      state.session.isLoadingDirectory
-    ) {
-      return false;
-    }
-    const now = Date.now();
-    if (
-      state.sync.lastRecoveryReconnectAtMs > 0 &&
-      now - state.sync.lastRecoveryReconnectAtMs < FOLDER_SYNC_RECOVERY_THROTTLE_MS
-    ) {
-      return false;
-    }
-    if (!state.sync.folderSignatureChangedAtMs) return false;
-    return now - state.sync.folderSignatureChangedAtMs >= FOLDER_SYNC_STALE_MS;
-  };
-
-  const recoverFolderSyncByReconnect = async () => {
-    if (!canAttemptFolderSyncRecovery()) return;
-    state.sync.isRecoveringFolderSync = true;
-    state.sync.lastRecoveryReconnectAtMs = Date.now();
-    pushSessionLog(
-      state,
-      "info",
-      "folder_sync.recovery.reconnect.start",
-      "Starting conservative reconnect to recover folder list updates.",
-    );
-    try {
-      await sessionStore.actions.connect(connectionDetails(state));
-      const session = sessionStore.getState();
-      applySessionState(state, session);
-      await refreshFolderRootCachedStatuses(
-        state,
-        client,
-        session.folders.map((folder) => folder.id),
-      );
-      updateOverviewSyncTracking(state);
-      state.session.lastUpdatedAt = nowTime();
-      pushSessionLog(
-        state,
-        "info",
-        "folder_sync.recovery.reconnect.done",
-        "Conservative reconnect completed.",
-        { folderCount: session.folders.length },
-      );
-    } catch (error) {
-      reportActionError(state, "folder_sync.recovery.reconnect.failed", error);
-    } finally {
-      state.sync.isRecoveringFolderSync = false;
-    }
-  };
-
   const connect = async (targetDeviceId?: string) => {
     if (connectInFlight) {
       await connectInFlight;
@@ -851,7 +780,6 @@ export const createAppActions = (args: {
       });
       applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       state.session.lastUpdatedAt = nowTime();
-      updateOverviewSyncTracking(state);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       state.ui.recentError = message;
@@ -866,7 +794,6 @@ export const createAppActions = (args: {
       reportUiError("connect.failed", error, connectionDetails(state));
       resetRuntimeState(state);
       restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_failed");
-      updateOverviewSyncTracking(state);
     } finally {
       state.session.activeConnectDeviceId = "";
     }
@@ -953,7 +880,6 @@ export const createAppActions = (args: {
         await loadDirectorySideEffects(state, client);
       }
       state.session.lastUpdatedAt = nowTime();
-      updateOverviewSyncTracking(state);
     } catch (error) {
       reportActionError(state, "refresh_overview.failed", error, connectionDetails(state));
       restoreAfterTransportFailure(state, error);
@@ -963,7 +889,6 @@ export const createAppActions = (args: {
   const refreshActiveView = async () => {
     if (transferInProgress()) return;
     await refreshOverview();
-    await recoverFolderSyncByReconnect();
     await syncStarredFiles();
   };
 
@@ -1189,7 +1114,6 @@ export const createAppActions = (args: {
       clearDirectoryView(state);
       restoreOfflineSnapshot(state, clearDirectoryView, undefined, "disconnect");
       state.ui.recentError = null;
-      updateOverviewSyncTracking(state);
     }
   };
 

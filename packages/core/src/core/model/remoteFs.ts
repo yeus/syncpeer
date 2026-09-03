@@ -29,6 +29,19 @@ export interface FileBlock {
   hash: Uint8Array;
 }
 
+const contentIdForBlocks = (blocks: FileBlock[]): string => blocks
+  .map((block) => `${block.offset}:${block.size}:${Array.from(block.hash, (byte) => byte.toString(16).padStart(2, "0")).join("")}`)
+  .join("|");
+
+const contentIdForBytes = (bytes: Uint8Array): string => {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `bytes:${hash.toString(16).padStart(16, "0")}`;
+};
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -205,6 +218,7 @@ export class RemoteFs {
   ) => Promise<void>;
   private requestFolderIndexUpdate: (folderId: string) => Promise<void>;
   private setFocusedFolderId: (folderId: string | null) => void;
+  private hashBytes?: (bytes: Uint8Array) => Promise<Uint8Array> | Uint8Array;
 
   constructor(
     folders: Map<string, FolderState>,
@@ -231,6 +245,7 @@ export class RemoteFs {
       bytes: Uint8Array,
       options?: FileUploadOptions,
     ) => Promise<void>,
+    hashBytes?: (bytes: Uint8Array) => Promise<Uint8Array> | Uint8Array,
   ) {
     this.folders = folders;
     this.requestBlock = requestBlock;
@@ -240,6 +255,7 @@ export class RemoteFs {
     this.publishFile = publishFile;
     this.requestFolderIndexUpdate = requestFolderIndexUpdate;
     this.setFocusedFolderId = setFocusedFolderId;
+    this.hashBytes = hashBytes;
   }
 
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
@@ -604,6 +620,7 @@ export class RemoteFs {
         normalizePath(path),
         entry.size,
         false,
+        `unhashed:${entry.modifiedMs}:${entry.size}`,
         plan,
         6,
         (next) => requestWithTemporaryFallback(next.offset, next.size, { signal }),
@@ -624,6 +641,7 @@ export class RemoteFs {
       normalizePath(path),
       totalBytes,
       false,
+      contentIdForBlocks(entry.blocks),
       plan,
       6,
       (next) => requestWithTemporaryFallback(next.offset, next.size, {
@@ -651,6 +669,23 @@ export class RemoteFs {
       throw new Error("Upload path must not be empty.");
     }
     await this.publishFile(folderId, normalizedPath, bytes, options);
+  }
+
+  async matchesFileContent(folderId: string, path: string, bytes: Uint8Array): Promise<boolean> {
+    if (!this.hashBytes) return false;
+    const folder = this.folders.get(folderId);
+    const storedFile = folder ? resolveStoredFile(folder, path) : null;
+    if (!storedFile) return false;
+    const entry = toEntry(normalizePath(path), storedFile.indexFile);
+    if (entry.type !== "file" || entry.size !== bytes.length || !entry.blocks) return false;
+    for (const block of entry.blocks) {
+      const chunk = bytes.slice(block.offset, block.offset + block.size);
+      if (chunk.length !== block.size) return false;
+      const digest = await this.hashBytes(chunk);
+      if (digest.length !== block.hash.length) return false;
+      if (!digest.every((value, index) => value === block.hash[index])) return false;
+    }
+    return entry.blocks.reduce((size, block) => size + block.size, 0) === bytes.length;
   }
 
   private async readEncryptedFileToSink(
@@ -692,6 +727,7 @@ export class RemoteFs {
         path: normalizePath(path),
         sizeBytes: 0,
         encrypted: true,
+        contentId: "blocks:empty",
       };
       await sink.begin(metadata);
       throwIfAborted(signal);
@@ -714,6 +750,7 @@ export class RemoteFs {
       normalizePath(path),
       entry.size,
       true,
+      contentIdForBlocks(entry.blocks),
       plan,
       6,
       async (next) => {
@@ -779,8 +816,9 @@ export class RemoteFs {
       path: normalizePath(path),
       sizeBytes: trimmed.length,
       encrypted: false,
+      contentId: contentIdForBytes(trimmed),
     });
-    await sink.write(0, trimmed);
+    if (!sink.hasRange?.(0, trimmed.length)) await sink.write(0, trimmed);
     onProgress?.({
       downloadedBytes: trimmed.length,
       totalBytes: trimmed.length,
@@ -794,6 +832,7 @@ export class RemoteFs {
     path: string,
     totalBytes: number,
     encrypted: boolean,
+    contentId: string,
     plan: T[],
     concurrency: number,
     request: (item: T) => Promise<Uint8Array>,
@@ -802,7 +841,7 @@ export class RemoteFs {
     signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
     throwIfAborted(signal);
-    await sink.begin({ folderId, path, sizeBytes: totalBytes, encrypted });
+    await sink.begin({ folderId, path, sizeBytes: totalBytes, encrypted, contentId });
     const remainingPlan = sink.hasRange
       ? plan.filter((item) => !sink.hasRange!(item.offset, item.size))
       : plan;

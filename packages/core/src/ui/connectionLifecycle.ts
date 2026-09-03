@@ -47,7 +47,7 @@ export const retryDelayMs = (
 };
 
 export const createConnectionLifecycle = <TOptions>(deps: {
-  open: (options: TOptions) => Promise<SyncpeerSessionHandle>;
+  open: (options: TOptions, signal: AbortSignal) => Promise<SyncpeerSessionHandle>;
   keyFor: (options: TOptions) => string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -63,6 +63,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
   let desired: TOptions | null = null;
   let opening: Promise<SyncpeerSessionHandle> | null = null;
   let openingKey = "";
+  let openingController: AbortController | null = null;
   let generation = 0;
   let failureStreak = 0;
   let connectedAtMs = 0;
@@ -70,6 +71,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
   let foreground = true;
   let transferActive = false;
   let upgradeTimerGeneration: number | null = null;
+  let upgradeController: AbortController | null = null;
 
   const update = (next: Partial<ConnectionLifecycleState>): void => {
     state = { ...state, ...next };
@@ -78,6 +80,14 @@ export const createConnectionLifecycle = <TOptions>(deps: {
   };
 
   const eligible = (): boolean => online && (foreground || transferActive) && desired !== null;
+  const cancelOpening = (): void => {
+    openingController?.abort();
+    openingController = null;
+    opening = null;
+    openingKey = "";
+    upgradeController?.abort();
+    upgradeController = null;
+  };
   const pathRank = (session: SyncpeerSessionHandle): number => {
     if (session.transportKind === "relay") return 1;
     const lan = session.connectionScope === "lan";
@@ -100,9 +110,11 @@ export const createConnectionLifecycle = <TOptions>(deps: {
         transferActive
       ) return;
       const previous = active;
+      const controller = new AbortController();
+      upgradeController = controller;
       update({ upgradeStatus: "probing" });
       try {
-        const replacement = await deps.open(desired);
+        const replacement = await deps.open(desired, controller.signal);
         if (sessionGeneration !== generation || active !== previous) {
           await replacement.close().catch(() => undefined);
           return;
@@ -119,6 +131,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       } catch {
         // A failed optional probe does not disturb the steady session.
       } finally {
+        if (upgradeController === controller) upgradeController = null;
         if (sessionGeneration === generation) {
           update({ upgradeStatus: "idle" });
           scheduleUpgrade(sessionGeneration);
@@ -174,6 +187,8 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       nextRetryAtMs: null,
       closureReason: null,
     });
+    const controller = new AbortController();
+    openingController = controller;
     const pending = (async () => {
       if (active && activeKey !== key) {
         const previous = active;
@@ -181,8 +196,8 @@ export const createConnectionLifecycle = <TOptions>(deps: {
         activeKey = "";
         await previous.close().catch(() => undefined);
       }
-      const session = await deps.open(options);
-      if (openGeneration !== generation || !eligible()) {
+      const session = await deps.open(options, controller.signal);
+      if (controller.signal.aborted || openGeneration !== generation || !eligible()) {
         await session.close().catch(() => undefined);
         throw new Error("Connection attempt was cancelled.");
       }
@@ -210,12 +225,14 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       if (opening === pending) {
         opening = null;
         openingKey = "";
+        openingController = null;
       }
     }
   };
 
   const suspend = async (): Promise<void> => {
     generation += 1;
+    cancelOpening();
     const previous = active;
     active = null;
     activeKey = "";
@@ -240,11 +257,12 @@ export const createConnectionLifecycle = <TOptions>(deps: {
   return {
     connect: async (options) => {
       desired = options;
+      if (!eligible()) throw new Error("Connection is suspended or offline.");
       const key = deps.keyFor(options);
       if (active && !active.isClosed() && activeKey === key) return active;
       if (opening && openingKey === key) return opening;
       generation += 1;
-      if (opening) await opening.catch(() => undefined);
+      cancelOpening();
       if (!desired || deps.keyFor(desired) !== key) {
         throw new Error("Connection attempt was cancelled.");
       }
@@ -253,6 +271,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
     disconnect: async () => {
       desired = null;
       generation += 1;
+      cancelOpening();
       update({ phase: "stopping", nextRetryAtMs: null });
       const previous = active;
       active = null;

@@ -32,19 +32,23 @@ export const createRecoveringRemoteFs = (deps: {
     if (!options) throw new Error("No active connection. Connect first.");
     const checkpointed = createCheckpointedDownloadSink(sink);
     for (let attempt = 0; attempt <= 2; attempt += 1) {
-      if (signal?.aborted) {
-        const error = new Error("Download cancelled.");
-        error.name = "AbortError";
-        throw error;
-      }
-      const session = await deps.ensureSession(options);
-      const folderId = deps.getFocusedFolderId();
-      if (folderId) session.remoteFs.setFocusedFolder(folderId);
+      let session: SyncpeerSessionHandle | null = null;
       try {
+        if (signal?.aborted) {
+          const error = new Error("Download cancelled.");
+          error.name = "AbortError";
+          throw error;
+        }
+        session = await deps.ensureSession(options);
+        const folderId = deps.getFocusedFolderId();
+        if (folderId) session.remoteFs.setFocusedFolder(folderId);
         return await operation(session, checkpointed.sink);
       } catch (error) {
         const abort = signal?.aborted || (error instanceof Error && error.name === "AbortError");
-        if (abort || !isTransportFailure(error) || !session.isClosed() || attempt === 2) throw error;
+        const retryable = !abort && isTransportFailure(error) && (!session || session.isClosed());
+        if (retryable && attempt < 2) continue;
+        await checkpointed.sink.abort(error);
+        throw error;
       }
     }
     throw new Error("Download recovery exhausted unexpectedly.");
@@ -67,10 +71,7 @@ export const createRecoveringRemoteFs = (deps: {
         const replacement = await deps.ensureSession(connectOptions);
         replacement.remoteFs.setFocusedFolder(folderId);
         await replacement.remoteFs.requestFolderIndex(folderId);
-        const remoteBytes = await replacement.remoteFs.readFileFully(folderId, path);
-        const equal = bytes.length === remoteBytes.length &&
-          bytes.every((value, index) => value === remoteBytes[index]);
-        if (equal) return;
+        if (await replacement.remoteFs.matchesFileContent(folderId, path, bytes)) return;
       } catch {
         // Verification did not prove success, so publication must not be replayed.
       }

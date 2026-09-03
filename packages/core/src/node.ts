@@ -143,8 +143,18 @@ async function connectNodeTls(options: SyncpeerTlsConnectOptions): Promise<Syncp
     rejectUnauthorized: false,
   });
   await new Promise<void>((resolve, reject) => {
-    socket.once("secureConnect", () => resolve());
-    socket.once("error", reject);
+    const cleanup = () => options.signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      socket.destroy();
+      cleanup();
+      const error = new Error("Connection attempt was cancelled.");
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (options.signal?.aborted) return onAbort();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    socket.once("secureConnect", () => { cleanup(); resolve(); });
+    socket.once("error", (error) => { cleanup(); reject(error); });
   });
   return new NodeTlsSocket(socket);
 }
@@ -267,17 +277,27 @@ function relayAddressHost(value: Buffer, fallback: string): string {
   return text || fallback;
 }
 
-function connectNodeTcp(host: string, port: number): Promise<net.Socket> {
+function connectNodeTcp(host: string, port: number, signal?: AbortSignal): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host, port });
-    socket.once("connect", () => resolve(socket));
-    socket.once("error", reject);
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      socket.destroy();
+      cleanup();
+      const error = new Error("Connection attempt was cancelled.");
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => { cleanup(); resolve(socket); });
+    socket.once("error", (error) => { cleanup(); reject(error); });
   });
 }
 
 function connectNodeRelayTls(
   socket: net.Socket | undefined,
-  options: { host: string; port: number; certPem: string; keyPem: string; alpn: string },
+  options: { host: string; port: number; certPem: string; keyPem: string; alpn: string; signal?: AbortSignal },
 ): Promise<tls.TLSSocket> {
   return new Promise((resolve, reject) => {
     const secureSocket = tls.connect({
@@ -288,8 +308,18 @@ function connectNodeRelayTls(
       key: options.keyPem,
       rejectUnauthorized: false,
     });
-    secureSocket.once("secureConnect", () => resolve(secureSocket));
-    secureSocket.once("error", reject);
+    const cleanup = () => options.signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      secureSocket.destroy();
+      cleanup();
+      const error = new Error("Connection attempt was cancelled.");
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (options.signal?.aborted) return onAbort();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    secureSocket.once("secureConnect", () => { cleanup(); resolve(secureSocket); });
+    secureSocket.once("error", (error) => { cleanup(); reject(error); });
   });
 }
 
@@ -304,6 +334,7 @@ async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<S
     certPem: options.certPem,
     keyPem: options.keyPem,
     alpn: "bep-relay",
+    signal: options.signal,
   });
   const relayPeer = relaySocket.getPeerCertificate(true);
   const expectedRelayId = relayUrl.searchParams.get("id");
@@ -335,7 +366,7 @@ async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<S
   relaySocket.destroy();
 
   const sessionHost = relayAddressHost(address.value, relayHost);
-  const sessionTcp = await connectNodeTcp(sessionHost, sessionPort || relayPort);
+  const sessionTcp = await connectNodeTcp(sessionHost, sessionPort || relayPort, options.signal);
   const sessionReader = new NodeSocketReader(sessionTcp);
   await new Promise<void>((resolve, reject) => sessionTcp.write(
     relayMessage(RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST, xdrOpaque(key.value)),
@@ -352,6 +383,7 @@ async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<S
     certPem: options.certPem,
     keyPem: options.keyPem,
     alpn: "bep/1.0",
+    signal: options.signal,
   });
   return {
     socket: new NodeTlsSocket(bepSocket),
@@ -753,6 +785,9 @@ async function rawPinnedDiscoveryFetch(
     ALPNProtocols: ["http/1.1"],
     rejectUnauthorized: false,
   });
+  const onAbort = () => socket.destroy(new Error("Discovery request cancelled."));
+  if (init?.signal?.aborted) onAbort();
+  else init?.signal?.addEventListener("abort", onAbort, { once: true });
 
   await new Promise<void>((resolve, reject) => {
     socket.once("secureConnect", () => resolve());
@@ -795,6 +830,7 @@ async function rawPinnedDiscoveryFetch(
     socket.once("error", reject);
   });
   socket.destroy();
+  init?.signal?.removeEventListener("abort", onAbort);
   return parseRawHttpResponse(Buffer.concat(chunks));
 }
 
@@ -812,6 +848,7 @@ async function nodeDiscoveryFetch(
       {
         method: init?.method ?? "GET",
         headers: init?.headers,
+        signal: init?.signal,
       },
       (response) => {
         const chunks: ByteBuffer[] = [];
@@ -913,7 +950,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
       key: options.key ?? "",
     });
 
-  const openSession = async (options: ConnectOptions) => {
+  const openSession = async (options: ConnectOptions, signal: AbortSignal) => {
     const certPem = await resolvePemValue(options.cert, "cert");
     const keyPem = await resolvePemValue(options.key, "key");
     return coreClient.openSession({
@@ -931,7 +968,7 @@ export const createNodeSessionTransport = (): SessionTransport => {
       sharedFolders: options.sharedFolders,
       relayOnly: options.relayOnly,
       quicOnly: options.quicOnly,
-    });
+    }, signal);
   };
 
   const lifecycle = createConnectionLifecycle<ConnectOptions>({ open: openSession, keyFor });

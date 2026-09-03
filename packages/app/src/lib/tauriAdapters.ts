@@ -235,7 +235,7 @@ export const createTauriAdapters = (
   };
 
   const hostAdapter: SyncpeerHostAdapter = {
-    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs }) => {
+    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal }) => {
       const opened = await invokeWithLogging<TlsOpenResponse>("syncpeer_tls_open", {
         request: {
           host,
@@ -247,6 +247,10 @@ export const createTauriAdapters = (
         },
       });
       const sessionId = Number(opened.sessionId);
+      if (signal?.aborted) {
+        await invokeWithLogging("syncpeer_tls_close", { request: { sessionId } });
+        throw new DOMException("Connection attempt was cancelled.", "AbortError");
+      }
       return createTlsSocket(
         invokeWithLogging,
         sessionId,
@@ -262,6 +266,7 @@ export const createTauriAdapters = (
       timeoutMs,
       keepaliveMs,
       idleTimeoutMs,
+      signal,
     }) => {
       const opened = await invokeWithLogging<TlsOpenResponse>("syncpeer_quic_open", {
         request: {
@@ -275,6 +280,12 @@ export const createTauriAdapters = (
           idleTimeoutMs,
         },
       });
+      if (signal?.aborted) {
+        await invokeWithLogging("syncpeer_quic_close", {
+          request: { sessionId: Number(opened.sessionId) },
+        });
+        throw new DOMException("Connection attempt was cancelled.", "AbortError");
+      }
       return createTlsSocket(
         invokeWithLogging,
         Number(opened.sessionId),
@@ -282,7 +293,7 @@ export const createTauriAdapters = (
         "syncpeer_quic",
       );
     },
-    connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs }) => {
+    connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs, signal }) => {
       const opened = await invokeWithLogging<RelayOpenResponse>("syncpeer_relay_open", {
         request: {
           relayAddress,
@@ -294,6 +305,10 @@ export const createTauriAdapters = (
         },
       });
       const sessionId = Number(opened.sessionId);
+      if (signal?.aborted) {
+        await invokeWithLogging("syncpeer_tls_close", { request: { sessionId } });
+        throw new DOMException("Connection attempt was cancelled.", "AbortError");
+      }
       return {
         connectedVia: opened.connectedVia || relayAddress,
         socket: createTlsSocket(
@@ -362,7 +377,7 @@ export const createTauriAdapters = (
         .map((candidate) => ({
           address: candidate.address.trim(),
           protocol:
-            candidate.protocol === "tcp" || candidate.protocol === "relay"
+            candidate.protocol === "tcp" || candidate.protocol === "quic" || candidate.protocol === "relay"
               ? candidate.protocol
               : "unknown",
           host: candidate.host ?? undefined,

@@ -256,11 +256,6 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       directoryViewMode: normalizeDirectoryViewMode(persisted?.directoryViewMode),
     },
     sync: {
-      lastOverviewAtMs: 0,
-      folderSignature: "",
-      folderSignatureChangedAtMs: 0,
-      lastRecoveryReconnectAtMs: 0,
-      isRecoveringFolderSync: false,
       isSyncingStarredFiles: false,
       starredFileSyncState: {} as Record<
         string,
@@ -548,7 +543,9 @@ export const isSavedDeviceAwaitingRemoteApproval = (
 
 export const connectionDetails = (state: AppState) => ({
   ...buildConnectionDetails(state.connection, activeFolderPasswords(state)),
-  relayOnly: import.meta.env.SYNCPEER_LAN_E2E === true,
+  relayOnly:
+    import.meta.env.SYNCPEER_LAN_E2E === true &&
+    state.connection.discoveryMode === "global",
 });
 
 export const downloadButtonLabel = (

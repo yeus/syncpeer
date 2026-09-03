@@ -12,8 +12,10 @@ interface NodeQuicStream extends AsyncIterable<Uint8Array[]> {
 
 interface NodeQuicSession {
   peerCertificate?: X509Certificate;
+  opened: Promise<{ protocol: string }>;
   createBidirectionalStream: () => Promise<NodeQuicStream>;
   close: () => Promise<void>;
+  destroy?: (error?: Error) => void;
 }
 
 interface NodeQuicModule {
@@ -51,6 +53,14 @@ export const connectNodeQuic = async (
     keepAlive: options.keepaliveMs,
     transportParams: { maxIdleTimeout: options.idleTimeoutMs },
   });
+  const onAbort = () => session.destroy?.(new Error("Connection attempt was cancelled."));
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (options.signal?.aborted) onAbort();
+  const opened = await session.opened;
+  if (opened.protocol !== options.alpn) {
+    await session.close().catch(() => undefined);
+    throw new Error(`QUIC negotiated unexpected ALPN '${opened.protocol}'.`);
+  }
   const peerCertificate = session.peerCertificate;
   if (!peerCertificate) {
     await session.close().catch(() => undefined);
@@ -80,6 +90,7 @@ export const connectNodeQuic = async (
     },
     write: (bytes) => stream.writer.write(bytes),
     close: async () => {
+      options.signal?.removeEventListener("abort", onAbort);
       await stream.writer.end().catch(() => undefined);
       await session.close().catch(() => undefined);
     },

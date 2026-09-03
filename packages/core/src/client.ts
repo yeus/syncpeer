@@ -45,6 +45,13 @@ import {
   type UntrustedFolderCrypto,
 } from "./core/model/untrusted.js";
 
+const throwIfConnectionAborted = (signal?: AbortSignal): void => {
+  if (!signal?.aborted) return;
+  const error = new Error("Connection attempt was cancelled.");
+  error.name = "AbortError";
+  throw error;
+};
+
 export interface SyncpeerTlsConnectOptions {
   host: string;
   port: number;
@@ -52,6 +59,7 @@ export interface SyncpeerTlsConnectOptions {
   keyPem: string;
   caPem?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface SyncpeerQuicConnectOptions extends SyncpeerTlsConnectOptions {
@@ -74,6 +82,7 @@ export interface SyncpeerRelayConnectOptions {
   keyPem: string;
   caPem?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface SyncpeerRelayConnectResult {
@@ -86,6 +95,7 @@ export interface SyncpeerDiscoveryFetchInit {
   headers?: Record<string, string>;
   pinServerDeviceId?: string;
   allowInsecureTls?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface SyncpeerDiscoveryResponse {
@@ -114,6 +124,7 @@ export interface SyncpeerHostAdapter {
   discoverLocalCandidates?: (options: {
     expectedDeviceId: string;
     timeoutMs?: number;
+    signal?: AbortSignal;
   }) => Promise<DiscoveredCandidate[]>;
   log?: (event: string, details?: Record<string, unknown>) => void;
 }
@@ -671,9 +682,21 @@ function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidat
   return out;
 }
 
+export const normalizeDiscoveredCandidates = (
+  candidates: DiscoveredCandidate[],
+): DiscoveredCandidate[] => dedupeCandidates(candidates)
+  .sort((left, right) => candidatePreferenceScore(right) - candidatePreferenceScore(left));
+
 interface CandidateHealth {
   failures: number;
+  successes: number;
+  shortLived: number;
   cooldownUntilMs: number;
+}
+
+interface CandidateRuntime {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
 }
 
 const candidateKey = (candidate: DiscoveredCandidate): string =>
@@ -682,25 +705,43 @@ const candidateKey = (candidate: DiscoveredCandidate): string =>
 const recordCandidateFailure = (
   health: Map<string, CandidateHealth>,
   candidate: DiscoveredCandidate,
+  now: () => number,
 ): void => {
   const key = candidateKey(candidate);
   const failures = (health.get(key)?.failures ?? 0) + 1;
   const cooldownMs = candidateCooldownMs(failures);
-  health.set(key, { failures, cooldownUntilMs: Date.now() + cooldownMs });
+  const previous = health.get(key);
+  health.set(key, {
+    failures,
+    successes: previous?.successes ?? 0,
+    shortLived: previous?.shortLived ?? 0,
+    cooldownUntilMs: now() + cooldownMs,
+  });
 };
 
 const trackCandidateSession = (
   health: Map<string, CandidateHealth>,
   candidate: DiscoveredCandidate,
   session: SyncpeerSessionHandle,
+  now: () => number,
 ): void => {
-  const connectedAtMs = Date.now();
+  const key = candidateKey(candidate);
+  const previous = health.get(key);
+  health.set(key, {
+    failures: previous?.failures ?? 0,
+    successes: (previous?.successes ?? 0) + 1,
+    shortLived: previous?.shortLived ?? 0,
+    cooldownUntilMs: previous?.cooldownUntilMs ?? 0,
+  });
+  const connectedAtMs = now();
   void session.closed.then((closure) => {
     if (closure.kind === "manual") return;
-    if (Date.now() - connectedAtMs >= 30_000) {
-      health.delete(candidateKey(candidate));
+    if (now() - connectedAtMs >= 30_000) {
+      health.delete(key);
     } else {
-      recordCandidateFailure(health, candidate);
+      const current = health.get(key);
+      if (current) health.set(key, { ...current, shortLived: current.shortLived + 1 });
+      recordCandidateFailure(health, candidate, now);
     }
   });
 };
@@ -720,6 +761,7 @@ function extractDiscoveryAuth(url: URL): {
 async function resolveGlobalDiscoveryInternal(
   adapter: SyncpeerHostAdapter,
   options: SyncpeerGlobalDiscoveryOptions,
+  signal?: AbortSignal,
 ): Promise<SyncpeerGlobalDiscoveryResult> {
   if (!options.expectedDeviceId) {
     throw new Error(
@@ -734,6 +776,7 @@ async function resolveGlobalDiscoveryInternal(
     headers: { Accept: "application/json" },
     pinServerDeviceId: auth.pinServerDeviceId,
     allowInsecureTls: auth.allowInsecureTls,
+    signal,
   });
   if (response.status === 404) {
     throw new Error(
@@ -2140,6 +2183,7 @@ class BepSession {
       },
       (folderId, path, bytes, options) =>
         this.publishFile(folderId, path, bytes, options),
+      (bytes) => this.adapter.sha256(bytes),
     );
   }
 
@@ -2310,6 +2354,7 @@ async function openDirectSession(
   port: number,
   timeoutMs?: number,
   connectionScope = connectionScopeForHost(host),
+  signal?: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.direct.connect.start", {
     host,
@@ -2324,6 +2369,7 @@ async function openDirectSession(
     keyPem: opts.keyPem,
     caPem: opts.caPem,
     timeoutMs,
+    signal,
   });
   adapter.log?.("core.direct.connect.tls_ready", {
     host,
@@ -2353,6 +2399,7 @@ async function openQuicSession(
   port: number,
   timeoutMs?: number,
   connectionScope = connectionScopeForHost(host),
+  signal?: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
   if (!adapter.connectQuic) throw new Error("QUIC transport is unavailable");
   const socket = await adapter.connectQuic({
@@ -2365,6 +2412,7 @@ async function openQuicSession(
     alpn: "bep/1.0",
     keepaliveMs: 15_000,
     idleTimeoutMs: 30_000,
+    signal,
   });
   return openBepSessionOnSocket(
     adapter,
@@ -2383,6 +2431,7 @@ async function openRelaySession(
   opts: SyncpeerConnectOptions,
   relayAddress: string,
   timeoutMs = opts.timeoutMs,
+  signal?: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
   if (!adapter.connectRelay) {
     throw new Error("Relay transport is not available in this host adapter");
@@ -2401,6 +2450,7 @@ async function openRelaySession(
     keyPem: opts.keyPem,
     caPem: opts.caPem,
     timeoutMs,
+    signal,
   });
   adapter.log?.("core.relay.connect.tunnel_ready", {
     relayAddress,
@@ -2428,6 +2478,8 @@ async function openSessionAttempt(
   opts: SyncpeerConnectOptions,
   totalTimeout: number,
   candidateHealth: Map<string, CandidateHealth>,
+  runtime: CandidateRuntime,
+  signal?: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
   const discoveryMode = opts.discoveryMode ?? "automatic";
   const localDiscoveryTimeoutMs = discoveryMode === "lan"
@@ -2438,13 +2490,14 @@ async function openSessionAttempt(
     : resolveGlobalDiscoveryInternal(adapter, {
         expectedDeviceId: opts.expectedDeviceId ?? "",
         discoveryServer: opts.discoveryServer,
-      });
+      }, signal);
   const localDiscoveryPromise = discoveryMode === "global"
     ? Promise.resolve([])
     : adapter.discoverLocalCandidates
     ? adapter.discoverLocalCandidates({
         expectedDeviceId: opts.expectedDeviceId ?? "",
         timeoutMs: localDiscoveryTimeoutMs,
+        signal,
       })
     : Promise.resolve([]);
   const [globalDiscoveryResult, localDiscoveryResult] = await Promise.allSettled([
@@ -2478,14 +2531,24 @@ async function openSessionAttempt(
     });
   }
 
-  const manualCandidates: DiscoveredCandidate[] = opts.host.trim() === "" ? [] : [{
-    address: `tcp://${opts.host}:${opts.port}`,
-    protocol: "tcp",
-    host: opts.host,
-    port: opts.port,
-    scope: connectionScopeForHost(opts.host),
-    source: "manual",
-  }];
+  const manualCandidates: DiscoveredCandidate[] = opts.host.trim() === "" ? [] : [
+    {
+      address: `tcp://${opts.host}:${opts.port}`,
+      protocol: "tcp",
+      host: opts.host,
+      port: opts.port,
+      scope: connectionScopeForHost(opts.host),
+      source: "manual",
+    },
+    ...(adapter.connectQuic ? [{
+      address: `quic://${opts.host}:${opts.port}`,
+      protocol: "quic" as const,
+      host: opts.host,
+      port: opts.port,
+      scope: connectionScopeForHost(opts.host),
+      source: "manual" as const,
+    }] : []),
+  ];
   const mergedCandidates = dedupeCandidates([
     ...(discoveryMode === "automatic" ? manualCandidates : []),
     ...localCandidates,
@@ -2514,11 +2577,9 @@ async function openSessionAttempt(
   }
 
   const viableCandidates = mergedCandidates.filter(
-    (candidate) => (candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) <= Date.now(),
+    (candidate) => (candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) <= runtime.now(),
   );
-  const ordered = [...viableCandidates].sort(
-    (a, b) => candidatePreferenceScore(b) - candidatePreferenceScore(a),
-  );
+  const ordered = normalizeDiscoveredCandidates(viableCandidates);
 
   const directCandidates = opts.relayOnly ? [] : ordered.filter(
     (candidate) =>
@@ -2538,7 +2599,7 @@ async function openSessionAttempt(
     relayCandidates,
   });
 
-  const connectDeadline = Date.now() + totalTimeout;
+  const connectDeadline = runtime.now() + totalTimeout;
   const relayEnabled = opts.enableRelayFallback !== false;
   const relayStartDelayMs = relayEnabled && relayCandidates.length > 0 && !opts.relayOnly
     ? Math.min(2500, Math.max(0, Math.floor(totalTimeout * 0.25)))
@@ -2577,7 +2638,8 @@ async function openSessionAttempt(
     candidate: DiscoveredCandidate,
   ): Promise<SyncpeerSessionHandle> => {
     if (winningSession) throw new Error("Direct connection race cancelled");
-    const remainingMs = Math.max(0, connectDeadline - Date.now());
+    throwIfConnectionAborted(signal);
+    const remainingMs = Math.max(0, connectDeadline - runtime.now());
     if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
     const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
     try {
@@ -2597,10 +2659,11 @@ async function openSessionAttempt(
           candidate.port!,
           candidateTimeoutMs,
           candidate.scope ?? (candidate.source === "local" ? "lan" : connectionScopeForHost(candidate.host!)),
+          signal,
         ),
         candidateTimeoutMs,
       );
-      trackCandidateSession(candidateHealth, candidate, session);
+      trackCandidateSession(candidateHealth, candidate, session, runtime.now);
       return await claimSession(session);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2611,7 +2674,7 @@ async function openSessionAttempt(
         message,
       });
       errors.push(`${candidate.address}: ${message}`);
-      recordCandidateFailure(candidateHealth, candidate);
+      recordCandidateFailure(candidateHealth, candidate, runtime.now);
       throw error;
     }
   };
@@ -2623,13 +2686,14 @@ async function openSessionAttempt(
   const relayTask = !relayEnabled || relayCandidates.length === 0
     ? null
     : (async (): Promise<SyncpeerSessionHandle> => {
-        if (relayStartDelayMs > 0) await waitMs(relayStartDelayMs);
+        if (relayStartDelayMs > 0) await runtime.sleep(relayStartDelayMs);
+        throwIfConnectionAborted(signal);
         if (winningSession) throw new Error("Relay connection race cancelled");
         const relayMaxAttempts = 2;
         for (const candidate of relayCandidates) {
           for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
             if (winningSession) throw new Error("Relay connection race cancelled");
-            const remainingMs = Math.max(0, connectDeadline - Date.now());
+            const remainingMs = Math.max(0, connectDeadline - runtime.now());
             if (remainingMs <= 0) break;
             const attemptTimeoutMs = Math.min(
               remainingMs,
@@ -2647,10 +2711,10 @@ async function openSessionAttempt(
                 strategy: relayStartDelayMs > 0 ? "parallel-fallback" : "preferred",
               });
               const session = await withSessionTimeout(
-                openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs),
+                openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs, signal),
                 attemptTimeoutMs,
               );
-              trackCandidateSession(candidateHealth, candidate, session);
+              trackCandidateSession(candidateHealth, candidate, session, runtime.now);
               return await claimSession(session);
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
@@ -2663,13 +2727,13 @@ async function openSessionAttempt(
               errors.push(
                 `${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`,
               );
-              recordCandidateFailure(candidateHealth, candidate);
+              recordCandidateFailure(candidateHealth, candidate, runtime.now);
               const isLastAttempt = attempt >= relayMaxAttempts;
               const shouldRetry =
                 !isLastAttempt &&
                 (isTimeoutLikeError(message) || isTransientRelayError(message));
               if (!shouldRetry) break;
-              await waitMs(250);
+              await runtime.sleep(250);
             }
           }
         }
@@ -2699,42 +2763,49 @@ async function openSession(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
   candidateHealth: Map<string, CandidateHealth>,
+  runtime: CandidateRuntime,
+  signal?: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
   const discoveryMode = opts.discoveryMode ?? "automatic";
   if (discoveryMode === "direct") {
     if (opts.quicOnly) {
-      return openQuicSession(adapter, opts, opts.host, opts.port, opts.timeoutMs);
+      throwIfConnectionAborted(signal);
+      return openQuicSession(adapter, opts, opts.host, opts.port, opts.timeoutMs, undefined, signal);
     }
-    return openDirectSession(adapter, opts, opts.host, opts.port, opts.timeoutMs);
+    throwIfConnectionAborted(signal);
+    return openDirectSession(adapter, opts, opts.host, opts.port, opts.timeoutMs, undefined, signal);
   }
 
   const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
     ? opts.timeoutMs
     : 15000;
-  const deadline = Date.now() + totalTimeout;
+  const deadline = runtime.now() + totalTimeout;
   let lastError: Error | null = null;
 
-  while (Date.now() < deadline) {
-    const remainingMs = deadline - Date.now();
+  while (runtime.now() < deadline) {
+    throwIfConnectionAborted(signal);
+    const remainingMs = deadline - runtime.now();
     try {
       return await openSessionAttempt(
         adapter,
         { ...opts, timeoutMs: remainingMs },
         remainingMs,
         candidateHealth,
+        runtime,
+        signal,
       );
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
       lastError = normalized;
       if (!isTransientDiscoveryError(error)) throw normalized;
-      const waitForMs = Math.min(1000, Math.max(0, deadline - Date.now()));
+      const waitForMs = Math.min(1000, Math.max(0, deadline - runtime.now()));
       if (waitForMs <= 0) break;
       adapter.log?.("core.discovery.retry", {
-        remainingMs: deadline - Date.now(),
+        remainingMs: deadline - runtime.now(),
         message: normalized.message,
         waitMs: waitForMs,
       });
-      await waitMs(waitForMs);
+      await runtime.sleep(waitForMs);
     }
   }
 
@@ -2744,17 +2815,23 @@ async function openSession(
 export interface SyncpeerCoreClient {
   openSession: (
     options: SyncpeerConnectOptions,
+    signal?: AbortSignal,
   ) => Promise<SyncpeerSessionHandle>;
 }
 
 export function createSyncpeerCoreClient(
   adapter: SyncpeerHostAdapter,
+  runtimeInput?: { now?: () => number; sleep?: (ms: number) => Promise<void> },
 ): SyncpeerCoreClient {
   const candidateHealth = new Map<string, CandidateHealth>();
+  const runtime: CandidateRuntime = {
+    now: runtimeInput?.now ?? Date.now,
+    sleep: runtimeInput?.sleep ?? waitMs,
+  };
   return {
-    openSession: async (options: SyncpeerConnectOptions) => {
+    openSession: async (options: SyncpeerConnectOptions, signal?: AbortSignal) => {
       try {
-        return await openSession(adapter, options, candidateHealth);
+        return await openSession(adapter, options, candidateHealth, runtime, signal);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (

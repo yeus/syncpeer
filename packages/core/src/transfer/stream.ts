@@ -5,6 +5,7 @@ export interface FileDownloadMetadata {
   path: string;
   sizeBytes: number;
   encrypted: boolean;
+  contentId?: string;
 }
 
 export interface FileDownloadSink {
@@ -28,12 +29,19 @@ const sameMetadata = (left: FileDownloadMetadata, right: FileDownloadMetadata): 
   left.folderId === right.folderId &&
   left.path === right.path &&
   left.sizeBytes === right.sizeBytes &&
-  left.encrypted === right.encrypted;
+  left.encrypted === right.encrypted &&
+  left.contentId === right.contentId;
 
 export const createCheckpointedDownloadSink = (
   sink: FileDownloadSink,
   checkpoint: DownloadCheckpoint = { metadata: null, completedRanges: [] },
 ): { sink: FileDownloadSink; checkpoint: DownloadCheckpoint } => {
+  let aborted = false;
+  const abort = async (error: unknown): Promise<void> => {
+    if (aborted) return;
+    aborted = true;
+    await sink.abort(error);
+  };
   const hasRange = (offset: number, size: number): boolean =>
     checkpoint.completedRanges.some(
       (range) => offset >= range.offset && offset + size <= range.offset + range.size,
@@ -60,7 +68,7 @@ export const createCheckpointedDownloadSink = (
       begin: async (metadata) => {
         if (checkpoint.metadata && !sameMetadata(checkpoint.metadata, metadata)) {
           const error = new RemoteMetadataChangedError("Remote file metadata changed during download recovery.");
-          await sink.abort(error);
+          await abort(error);
           throw error;
         }
         if (!checkpoint.metadata) {
@@ -74,7 +82,7 @@ export const createCheckpointedDownloadSink = (
         addRange(offset, bytes.length);
       },
       commit: () => sink.commit(),
-      abort: (error) => sink.abort(error),
+      abort,
       hasRange,
     },
   };

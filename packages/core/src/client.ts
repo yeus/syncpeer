@@ -1257,6 +1257,12 @@ class BepSession {
   }
 
   private async handleClusterConfig(cfg: BepClusterConfig): Promise<void> {
+    if (cfg.secondary) {
+      this.log("cluster.secondary.received", {
+        folderCount: cfg.folders?.length ?? 0,
+      });
+      return;
+    }
     for (const folder of cfg.folders ?? []) {
       const folderDevices = folder.devices ?? [];
       const advertisedDevices: AdvertisedDeviceInfo[] = folderDevices
@@ -2248,7 +2254,7 @@ async function readRemoteHello(
   }
 }
 
-async function openBepSessionOnSocket(
+async function openBepSessionOnSocketUncancelled(
   adapter: SyncpeerHostAdapter,
   socket: SyncpeerTlsSocket,
   opts: SyncpeerConnectOptions,
@@ -2347,6 +2353,43 @@ async function openBepSessionOnSocket(
   };
 }
 
+async function openBepSessionOnSocket(
+  adapter: SyncpeerHostAdapter,
+  socket: SyncpeerTlsSocket,
+  opts: SyncpeerConnectOptions,
+  connectedHost: string,
+  connectedPort: number,
+  connectedVia: string,
+  transportKind: "direct-tcp" | "direct-quic" | "relay",
+  connectionScope: ConnectionScope,
+  signal?: AbortSignal,
+): Promise<SyncpeerSessionHandle> {
+  throwIfConnectionAborted(signal);
+  const closeOnAbort = (): void => {
+    void socket.close().catch(() => undefined);
+  };
+  signal?.addEventListener("abort", closeOnAbort, { once: true });
+  try {
+    return await openBepSessionOnSocketUncancelled(
+      adapter,
+      socket,
+      opts,
+      connectedHost,
+      connectedPort,
+      connectedVia,
+      transportKind,
+      connectionScope,
+    );
+  } catch (error) {
+    if (!signal?.aborted) throw error;
+    const abortError = new Error("Connection attempt was cancelled.", { cause: error });
+    abortError.name = "AbortError";
+    throw abortError;
+  } finally {
+    signal?.removeEventListener("abort", closeOnAbort);
+  }
+}
+
 async function openDirectSession(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
@@ -2384,6 +2427,7 @@ async function openDirectSession(
     `tcp://${host}:${port}`,
     "direct-tcp",
     connectionScope,
+    signal,
   );
   adapter.log?.("core.direct.connect.ready", {
     host,
@@ -2423,6 +2467,7 @@ async function openQuicSession(
     `quic://${host}:${port}`,
     "direct-quic",
     connectionScope,
+    signal,
   );
 }
 
@@ -2465,6 +2510,7 @@ async function openRelaySession(
     relay.connectedVia,
     "relay",
     "wan",
+    signal,
   );
   adapter.log?.("core.relay.connect.ready", {
     relayAddress,
@@ -2624,6 +2670,11 @@ async function openSessionAttempt(
   if (opts.quicOnly && !adapter.connectQuic) {
     throw new Error("QUIC is unavailable in this runtime.");
   }
+  const raceController = new AbortController();
+  const abortRace = (): void => raceController.abort();
+  if (signal?.aborted) abortRace();
+  else signal?.addEventListener("abort", abortRace, { once: true });
+  const raceSignal = raceController.signal;
   let winningSession: SyncpeerSessionHandle | null = null;
   const claimSession = async (session: SyncpeerSessionHandle) => {
     if (winningSession) {
@@ -2631,6 +2682,7 @@ async function openSessionAttempt(
       throw new Error("Connection attempt lost the connection race");
     }
     winningSession = session;
+    abortRace();
     return session;
   };
 
@@ -2638,7 +2690,7 @@ async function openSessionAttempt(
     candidate: DiscoveredCandidate,
   ): Promise<SyncpeerSessionHandle> => {
     if (winningSession) throw new Error("Direct connection race cancelled");
-    throwIfConnectionAborted(signal);
+    throwIfConnectionAborted(raceSignal);
     const remainingMs = Math.max(0, connectDeadline - runtime.now());
     if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
     const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
@@ -2659,13 +2711,14 @@ async function openSessionAttempt(
           candidate.port!,
           candidateTimeoutMs,
           candidate.scope ?? (candidate.source === "local" ? "lan" : connectionScopeForHost(candidate.host!)),
-          signal,
+          raceSignal,
         ),
         candidateTimeoutMs,
       );
       trackCandidateSession(candidateHealth, candidate, session, runtime.now);
       return await claimSession(session);
     } catch (error) {
+      if (raceSignal.aborted) throw error;
       const message = error instanceof Error ? error.message : String(error);
       adapter.log?.("core.discovery.candidate.failed", {
         address: candidate.address,
@@ -2687,7 +2740,7 @@ async function openSessionAttempt(
     ? null
     : (async (): Promise<SyncpeerSessionHandle> => {
         if (relayStartDelayMs > 0) await runtime.sleep(relayStartDelayMs);
-        throwIfConnectionAborted(signal);
+        throwIfConnectionAborted(raceSignal);
         if (winningSession) throw new Error("Relay connection race cancelled");
         const relayMaxAttempts = 2;
         for (const candidate of relayCandidates) {
@@ -2711,12 +2764,13 @@ async function openSessionAttempt(
                 strategy: relayStartDelayMs > 0 ? "parallel-fallback" : "preferred",
               });
               const session = await withSessionTimeout(
-                openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs, signal),
+                openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs, raceSignal),
                 attemptTimeoutMs,
               );
               trackCandidateSession(candidateHealth, candidate, session, runtime.now);
               return await claimSession(session);
             } catch (error) {
+              if (raceSignal.aborted) throw error;
               const message = error instanceof Error ? error.message : String(error);
               adapter.log?.("core.discovery.relay.failed", {
                 address: candidate.address,
@@ -2746,17 +2800,22 @@ async function openSessionAttempt(
   const attempts = [directTask, relayTask].filter(
     (attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null,
   );
-  if (attempts.length > 0) {
-    try {
-      return await Promise.any(attempts);
-    } catch {
-      // The detailed candidate errors below are more useful than AggregateError.
+  try {
+    if (attempts.length > 0) {
+      try {
+        return await Promise.any(attempts);
+      } catch {
+        // The detailed candidate errors below are more useful than AggregateError.
+      }
     }
-  }
 
-  const hint = maybeConnectionHint(opts, errors);
-  const technical = `Could not connect using discovered candidates. ${errors.join(" | ")}`;
-  throw new Error(hint ? `${hint} Technical details: ${technical}` : technical);
+    const hint = maybeConnectionHint(opts, errors);
+    const technical = `Could not connect using discovered candidates. ${errors.join(" | ")}`;
+    throw new Error(hint ? `${hint} Technical details: ${technical}` : technical);
+  } finally {
+    signal?.removeEventListener("abort", abortRace);
+    abortRace();
+  }
 }
 
 async function openSession(

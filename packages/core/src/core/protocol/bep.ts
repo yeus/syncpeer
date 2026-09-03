@@ -121,6 +121,7 @@ export interface BepFolderInfo {
 
 export interface BepClusterConfig {
   folders?: BepFolderInfo[];
+  secondary?: boolean;
 }
 
 export interface BepIndex {

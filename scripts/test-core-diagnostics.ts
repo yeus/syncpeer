@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
+  Close,
   ClusterConfig,
   encodeHelloFrame,
   encodeMessageFrame,
@@ -272,31 +273,49 @@ const remoteHandshake = new Uint8Array([
   ),
 ]);
 
-const createFakeTlsSocket = (initialHandshake = remoteHandshake) => {
-  let handshake = initialHandshake;
+const createFakeTlsSocket = (
+  initialHandshake = remoteHandshake,
+  onWrite?: (data: Uint8Array, enqueue: (data: Uint8Array) => void) => void,
+) => {
+  const reads = initialHandshake.length > 0 ? [initialHandshake] : [];
   let closed = false;
-  let rejectRead: ((error: Error) => void) | null = null;
+  let pendingRead: {
+    resolve: (data: Uint8Array) => void;
+    reject: (error: Error) => void;
+  } | null = null;
   const writes: Uint8Array[] = [];
+  const enqueue = (data: Uint8Array): void => {
+    if (closed) return;
+    if (pendingRead) {
+      const read = pendingRead;
+      pendingRead = null;
+      read.resolve(data);
+      return;
+    }
+    reads.push(data);
+  };
   return {
+    enqueue,
+    isClosed: () => closed,
     writes,
     socket: {
       read: async (): Promise<Uint8Array> => {
-        if (handshake.length > 0) {
-          const next = handshake;
-          handshake = new Uint8Array();
-          return next;
-        }
+        const next = reads.shift();
+        if (next) return next;
         if (closed) throw new Error("Connection closed");
-        return new Promise<Uint8Array>((_resolve, reject) => {
-          rejectRead = reject;
+        return new Promise<Uint8Array>((resolve, reject) => {
+          pendingRead = { resolve, reject };
         });
       },
       write: async (data: Uint8Array): Promise<void> => {
-        writes.push(new Uint8Array(data));
+        const copy = new Uint8Array(data);
+        writes.push(copy);
+        onWrite?.(copy, enqueue);
       },
       close: async (): Promise<void> => {
         closed = true;
-        rejectRead?.(new Error("Connection closed"));
+        pendingRead?.reject(new Error("Connection closed"));
+        pendingRead = null;
       },
       peerCertificateDer: async (): Promise<Uint8Array> =>
         new Uint8Array([4, 5, 6]),
@@ -334,6 +353,144 @@ const closeParser = new FrameParser((type, message) => {
 });
 for (const write of fakeSocket.writes.slice(1)) closeParser.feed(write);
 assert.equal(closeReason, "Client closed");
+
+const secondaryHandshake = new Uint8Array([
+  ...encodeHelloFrame({
+    device_name: "fake-syncthing",
+    client_name: "syncthing",
+    client_version: "v2.1.2",
+  }),
+  ...encodeMessageFrame(
+    MessageTypeValues.CLUSTER_CONFIG,
+    ClusterConfig,
+    { folders: [], secondary: true },
+  ),
+]);
+let promotionWriteCount = 0;
+let promotedIndexHandlerReady = false;
+const promotionParser = new FrameParser((type, message) => {
+  if (type === MessageTypeValues.CLUSTER_CONFIG) {
+    const config = message as BepClusterConfig;
+    promotedIndexHandlerReady = Boolean(
+      config.folders?.some((folder) => folder.id === "documents"),
+    );
+  }
+});
+const promotionSocket = createFakeTlsSocket(
+  secondaryHandshake,
+  (data, enqueue) => {
+    promotionWriteCount += 1;
+    if (promotionWriteCount === 1) return;
+    const peerParser = new FrameParser((type) => {
+      if (type !== MessageTypeValues.INDEX) return;
+      enqueue(
+        promotedIndexHandlerReady
+          ? encodeMessageFrame(
+              MessageTypeValues.INDEX,
+              Index,
+              {
+                folder: "documents",
+                files: [{ name: "example.txt", type: 0, size: 1 }],
+                last_sequence: 1,
+              },
+            )
+          : encodeMessageFrame(
+              MessageTypeValues.CLOSE,
+              Close,
+              { reason: "handling index for documents: documents: folder is not running" },
+            ),
+      );
+    });
+    promotionParser.feed(data);
+    peerParser.feed(data);
+  },
+);
+const promotionClient = createSyncpeerCoreClient({
+  connectTls: async () => promotionSocket.socket,
+  sha256: (data) => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: (length) => new Uint8Array(length),
+  discoveryFetch: async () => {
+    throw new Error("Discovery is not used by this promotion regression test.");
+  },
+});
+let promotionSettled = false;
+const promotionOpening = promotionClient.openSession({
+  host: "127.0.0.1",
+  port: 22000,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  deviceName: "syncpeer-promotion-regression",
+  discoveryMode: "direct",
+}).finally(() => {
+  promotionSettled = true;
+});
+await new Promise<void>((resolve) => setImmediate(resolve));
+const settledBeforePromotion = promotionSettled;
+promotionSocket.enqueue(
+  encodeMessageFrame(
+    MessageTypeValues.CLUSTER_CONFIG,
+    ClusterConfig,
+    {
+      folders: [{ id: "documents", label: "Documents", type: 0, devices: [] }],
+      secondary: false,
+    },
+  ),
+);
+const promotionSession = await promotionOpening;
+await new Promise<void>((resolve) => setImmediate(resolve));
+assert.equal(
+  await promotionSession.remoteFs.waitForFolderIndex("documents", 100, 1),
+  true,
+  "promoted connection should receive an index instead of being closed as not running",
+);
+assert.equal(settledBeforePromotion, false, "secondary ClusterConfig must not make a session ready");
+assert.equal(promotionSession.isClosed(), false);
+await promotionSession.close();
+
+const primaryRaceSocket = createFakeTlsSocket(remoteHandshake);
+const secondaryRaceSocket = createFakeTlsSocket(secondaryHandshake);
+const raceClient = createSyncpeerCoreClient({
+  connectTls: async ({ host }) =>
+    host === "primary.test" ? primaryRaceSocket.socket : secondaryRaceSocket.socket,
+  sha256: (data) => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: (length) => new Uint8Array(length),
+  discoveryFetch: async () => {
+    throw new Error("Global discovery is not used by this LAN race test.");
+  },
+  discoverLocalCandidates: async () => [
+    {
+      address: "tcp://primary.test:22000",
+      protocol: "tcp",
+      host: "primary.test",
+      port: 22000,
+      scope: "lan",
+    },
+    {
+      address: "tcp://secondary.test:22000",
+      protocol: "tcp",
+      host: "secondary.test",
+      port: 22000,
+      scope: "lan",
+    },
+  ],
+});
+const raceSession = await raceClient.openSession({
+  host: "",
+  port: 22000,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  deviceName: "syncpeer-race-regression",
+  discoveryMode: "lan",
+  timeoutMs: 1_000,
+});
+await new Promise<void>((resolve) => setImmediate(resolve));
+assert.equal(
+  secondaryRaceSocket.isClosed(),
+  true,
+  "a secondary candidate must close as soon as a primary-ready candidate wins",
+);
+assert.equal(raceSession.isClosed(), false);
+await raceSession.close();
 
 const timeoutSocket = createFakeTlsSocket();
 const timeoutClient = createSyncpeerCoreClient({

@@ -1,6 +1,6 @@
 {
   "name": "@syncpeer/tauri-shell",
-  "version": "0.4.0-rc.6",
+  "version": "0.4.0-rc.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,7 +27,7 @@
     "@tauri-apps/cli": "^2.10.1"
   },
   "dependencies": {
-    "@syncpeer/app": "0.4.0-rc.6",
+    "@syncpeer/app": "0.4.0-rc.7",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-notification": "^2.3.3"
   }

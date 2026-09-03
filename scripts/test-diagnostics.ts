@@ -20,6 +20,7 @@ const remoteApiUrl = (): string | undefined =>
   process.env.SYNCTHING_API_URL?.trim();
 
 const main = async (): Promise<void> => {
+  const requireExternal = process.env.SYNCPEER_REQUIRE_EXTERNAL_CHECKS === "1";
   const localArgs = process.env.SYNCPEER_DIAGNOSTICS_KEEP === "1" ? ["--keep"] : [];
   const apiUrl = remoteApiUrl();
   const phases: TestSuitePhase[] = [
@@ -37,6 +38,16 @@ const main = async (): Promise<void> => {
       name: "CLI help command",
       command: process.execPath,
       args: ["packages/cli/dist/main.js", "--help"],
+    },
+    {
+      name: "Node QUIC runtime preflight",
+      command: process.platform === "win32" ? "npm.cmd" : "npm",
+      args: ["run", "test:quic:runtime"],
+    },
+    {
+      name: "Node QUIC Syncthing integration",
+      command: process.platform === "win32" ? "npm.cmd" : "npm",
+      args: ["run", "test:quic:cli"],
     },
     {
       ...nodeScript("scripts/test-core-diagnostics.ts"),
@@ -111,6 +122,7 @@ const main = async (): Promise<void> => {
       skipReason: () => hasRemoteServer()
         ? undefined
         : "no SYNCPEER_DEV_SERVER_DEVICE_ID or saved server-device-id",
+      required: requireExternal,
     },
     {
       ...nodeScript("scripts/test-syncthing-client-diagnostics.ts", [
@@ -121,6 +133,7 @@ const main = async (): Promise<void> => {
       skipReason: () => apiUrl
         ? undefined
         : "set SYNCPEER_SYNCTHING_API_URL to enable this external check",
+      required: requireExternal,
     },
   ];
   const exitCode = await runTestSuite({

@@ -8,6 +8,7 @@ export interface TestSuitePhase {
   args: string[];
   env?: NodeJS.ProcessEnv;
   skipReason?: () => string | undefined;
+  required?: boolean;
 }
 
 export const nodeScript = (script: string, args: string[] = []): TestSuitePhase => ({
@@ -62,6 +63,11 @@ export const runTestSuite = async (args: {
   for (const phase of args.phases) {
     const reason = phase.skipReason?.();
     if (reason) {
+      if (phase.required) {
+        console.error(`\n=== ${phase.name}: failed (${reason}) ===`);
+        results.push({ name: phase.name, status: "failed", reason, exitCode: 1 });
+        continue;
+      }
       console.log(`\n=== ${phase.name}: skipped (${reason}) ===`);
       results.push({ name: phase.name, status: "skipped", reason });
       continue;

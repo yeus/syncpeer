@@ -557,7 +557,10 @@ const runAndroidDownloadNotificationRegression = async () => {
     stopTransferService();
   }
 
-  cdp = await launchAndroidApp();
+  // Keep notification cancellation and in-app cancellation independent. The
+  // notification action can resume an existing WebView whose rejected
+  // download promise is still unwinding after the native transfer has stopped.
+  cdp = await launchAndroidApp(true);
   try {
     if (!await openAndroidConnection(cdp)) {
       throw new Error("In-app download cancellation test could not connect to the remote test server.");
@@ -775,7 +778,20 @@ const openAndroidConnection = async (cdp) => {
 };
 
 const openAndroidFolder = async (cdp, clearCache = false) => {
-  if (clearCache) await tauriInvoke(cdp, "syncpeer_clear_cache");
+  if (clearCache) {
+    await clickUiTestId(cdp, "tab-devices");
+    const settingsExpanded = await cdp.evaluate(
+      'document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"',
+    );
+    if (!settingsExpanded) await clickUiTestId(cdp, "connection-settings-toggle");
+    await clickUiTestId(cdp, "clear-cache-button");
+    await waitForUiCondition(
+      cdp,
+      'document.querySelector("[data-testid=clear-cache-button]")?.textContent?.includes("Clear Cache") === true',
+      "cleared Android cache",
+      30_000,
+    );
+  }
   await clickUiTestId(cdp, "tab-folders");
   const returnedToRoot = await cdp.evaluate(`(() => {
     const root = [...document.querySelectorAll(".crumb-button")]

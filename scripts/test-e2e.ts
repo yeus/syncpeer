@@ -11,6 +11,7 @@ const hasRemoteServer = (): boolean => {
 };
 
 const main = async (): Promise<void> => {
+  const requireExternal = process.env.SYNCPEER_REQUIRE_EXTERNAL_CHECKS === "1";
   const localTauriArgs = process.env.SYNCPEER_E2E_KEEP === "1"
     ? ["--self", "--keep"]
     : ["--self"];
@@ -26,6 +27,7 @@ const main = async (): Promise<void> => {
       skipReason: () => hasRemoteServer()
         ? undefined
         : "no SYNCPEER_DEV_SERVER_DEVICE_ID or saved server-device-id",
+      required: requireExternal,
     },
     {
       ...nodeScript("scripts/test-lan.ts"),
@@ -33,6 +35,16 @@ const main = async (): Promise<void> => {
       skipReason: () => process.env.SYNCPEER_RUN_TWO_COMPUTER_E2E === "1"
         ? undefined
         : "set SYNCPEER_RUN_TWO_COMPUTER_E2E=1 to use the two-host harness",
+      required: requireExternal,
+    },
+    {
+      name: "Android end-to-end workflows",
+      command: process.execPath,
+      args: ["scripts/test-android-e2e.mjs"],
+      skipReason: () => process.env.SYNCPEER_RUN_ANDROID_E2E === "1"
+        ? undefined
+        : "set SYNCPEER_RUN_ANDROID_E2E=1 to use the Android harness",
+      required: requireExternal,
     },
   ];
   const exitCode = await runTestSuite({

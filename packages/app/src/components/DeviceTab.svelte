@@ -458,6 +458,7 @@
         <button
           type="button"
           class="ghost"
+          data-testid="clear-cache-button"
           onclick={onClearAllCache}
           disabled={app.favorites.isClearingCache}
         >

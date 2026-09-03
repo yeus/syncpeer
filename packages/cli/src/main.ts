@@ -13,6 +13,7 @@ import {
 } from "@syncpeer/core/node";
 import type { FileDownloadSink } from "@syncpeer/core/node";
 import { ensureCliNodeIdentity } from "./identity.js";
+import { formatAppBuildInfo, getCliBuildInfo } from "./appInfo.js";
 
 interface CliOptions {
   host: string;
@@ -279,9 +280,11 @@ async function createFileDownloadSink(localPath: string): Promise<FileDownloadSi
 async function main() {
   reexecuteWithNativeQuicIfAvailable();
   const program = new Command();
+  const appInfo = getCliBuildInfo();
   program
     .name("syncpeer")
     .description("Read-only Syncthing BEP client")
+    .version(appInfo.appVersion, "-V, --version", "Show Syncpeer version")
     .option("--host <host>", "Remote host", "127.0.0.1")
     .option(
       "--port <port>",
@@ -331,6 +334,13 @@ async function main() {
       (value) => parseInt(value, 10),
       15000,
     );
+
+  program
+    .command("about")
+    .description("Show build and runtime information")
+    .action(() => {
+      console.log(formatAppBuildInfo(appInfo));
+    });
 
   const withSession = async (
     run: (

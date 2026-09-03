@@ -197,6 +197,22 @@ describe("Syncpeer Tauri UI smoke", () => {
     await disconnectIfConnected();
   });
 
+  it("shows reproducible build and runtime metadata in About", async () => {
+    await clickTestId("tab-devices");
+    const aboutButton = $("[data-testid='open-about']");
+    await aboutButton.waitForExist({ timeout: 10_000 });
+    await aboutButton.click();
+    await $("[data-testid='about-page']").waitForExist({ timeout: 10_000 });
+    assert.match(await $("[data-testid='about-version']").getText(), /.+/);
+    assert.match(await $("[data-testid='about-commit']").getText(), /[0-9a-f]{8,}|unknown/i);
+    assert.match(await $("[data-testid='about-runtime']").getText(), /\//);
+    assert.match(await $("[data-testid='about-support-summary']").getValue(), /build_commit:/);
+    await $("[data-testid='about-copy']").click();
+    await $("[data-testid='about-copy-notice']").waitForExist({ timeout: 5_000 });
+    await $("[data-testid='about-back']").click();
+    await $("[data-testid='global-connect-button']").waitForExist({ timeout: 10_000 });
+  });
+
   it("runs all registered diagnostics through the Tauri UI", async () => {
     await clickTestId("tab-devices");
     const diagnosticsButton = $("[data-testid='open-diagnostics']");
@@ -214,6 +230,7 @@ describe("Syncpeer Tauri UI smoke", () => {
       },
     );
     assert.match(String(await result.getValue()), /"allPassed": true/);
+    assert.match(String(await result.getValue()), /"buildInfo":/);
     await $("[data-testid='diagnostics-back']").click();
     await $("[data-testid='global-connect-button']").waitForExist({ timeout: 10_000 });
   });

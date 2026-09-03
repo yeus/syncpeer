@@ -42,6 +42,7 @@
     visibleBreadcrumbs,
     createInitialState,
   } from "./app/state.ts";
+  import AboutPage from "./AboutPage.svelte";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
   import Star from "lucide-svelte/icons/star";
@@ -306,6 +307,7 @@
           onClearAllCache={actions.clearAllCache}
           onClearOfflineFolderState={actions.clearOfflineFolderState}
           onOpenDiagnosticsPage={actions.openDiagnosticsPage}
+          onOpenAboutPage={actions.openAboutPage}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
           onCopySessionLogs={actions.copySessionLogs}
           onEditLocalDeviceName={actions.editLocalDeviceName}
@@ -432,7 +434,7 @@
       </button>
     </nav>
   </div>
-{:else}
+{:else if app.currentPage === "diagnostics"}
   <DiagnosticsPage
     onBack={actions.closeDiagnosticsPage}
     onLoadCatalog={actions.loadDiagnosticsCatalog}
@@ -440,6 +442,8 @@
     onRunCategory={actions.runDiagnosticsCategory}
     onRunAll={actions.runAllDiagnostics}
   />
+{:else}
+  <AboutPage onBack={actions.closeAboutPage} />
 {/if}
 
 <style>

@@ -1,5 +1,16 @@
-export type RuntimeSurface = "cli" | "desktop-ui" | "android-ui" | "web-ui";
-export type RuntimeEnvironment = "tauri" | "browser" | "node";
+import {
+  classifyRuntimeArchitecture,
+  classifyRuntimePlatform,
+  type AppRuntimeArchitecture,
+  type AppRuntimePlatform,
+  type AppRuntimeSurface,
+  type AppRuntimeEnvironment,
+} from "@syncpeer/core/browser";
+
+export type RuntimeSurface = AppRuntimeSurface;
+export type RuntimeEnvironment = AppRuntimeEnvironment;
+export type RuntimePlatform = AppRuntimePlatform;
+export type RuntimeArchitecture = AppRuntimeArchitecture;
 
 export const supportsOngoingTransferNotifications = (surface: RuntimeSurface) =>
   surface === "android-ui";
@@ -19,6 +30,24 @@ const userAgentText = () =>
   hasNavigator()
     ? `${navigator.userAgent ?? ""} ${(navigator as Navigator & { platform?: string }).platform ?? ""}`.toLowerCase()
     : "";
+
+const runtimeSignalText = () => {
+  const runtimeProcess = typeof process !== "undefined" ? process : undefined;
+  const runtimeNavigator = hasNavigator()
+    ? (navigator as Navigator & {
+        platform?: string;
+        userAgentData?: { platform?: string };
+      })
+    : undefined;
+  return [
+    runtimeProcess?.platform,
+    runtimeNavigator?.platform,
+    runtimeNavigator?.userAgentData?.platform,
+    userAgentText(),
+  ]
+    .filter(Boolean)
+    .join(" ");
+};
 
 export const detectRuntimeEnvironment = (): RuntimeEnvironment => {
   const runtimeGlobal = globalThis as {
@@ -40,4 +69,19 @@ export const detectRuntimeSurface = (): RuntimeSurface => {
     return userAgentText().includes("android") ? "android-ui" : "desktop-ui";
   }
   return "web-ui";
+};
+
+export const detectRuntimePlatform = (): RuntimePlatform =>
+  classifyRuntimePlatform(runtimeSignalText());
+
+export const detectRuntimeArchitecture = (): RuntimeArchitecture => {
+  const runtimeProcess = typeof process !== "undefined" ? process : undefined;
+  const runtimeNavigator = hasNavigator()
+    ? (navigator as Navigator & { userAgentData?: { architecture?: string } })
+    : undefined;
+  return classifyRuntimeArchitecture([
+    runtimeProcess?.arch,
+    runtimeNavigator?.userAgentData?.architecture,
+    runtimeSignalText(),
+  ].filter(Boolean).join(" "));
 };

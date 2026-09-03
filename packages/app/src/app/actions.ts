@@ -42,11 +42,11 @@ import {
 import { addPluginListener } from "@tauri-apps/api/core";
 import { reportUiError } from "../lib/tauriAdapters.js";
 import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
+import { supportsOngoingTransferNotifications } from "../lib/runtimeInfo.ts";
 import {
-  detectRuntimeEnvironment,
-  detectRuntimeSurface,
-  supportsOngoingTransferNotifications,
-} from "../lib/runtimeInfo.ts";
+  formatAppBuildInfo,
+  getAppBuildInfo,
+} from "../lib/appInfo.ts";
 import {
   buildDiagnosticsRegistry,
   runDiagnosticsTests,
@@ -111,12 +111,6 @@ const TRANSFER_NOTIFICATION_CHANNEL_ID = "syncpeer-transfers-v2";
 const TRANSFER_NOTIFICATION_ACTION_TYPE = "syncpeer-transfer";
 const TRANSFER_NOTIFICATION_CANCEL_ACTION = "cancel";
 const TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS = 1000;
-const appVersion = String(import.meta.env.SYNCPEER_APP_VERSION || "0.0.0");
-const buildCommit = String(import.meta.env.SYNCPEER_BUILD_COMMIT || "unknown");
-const buildTimeUtc = String(import.meta.env.SYNCPEER_BUILD_TIME_UTC || "unknown");
-const runtimeEnvironment = detectRuntimeEnvironment();
-const runtimeSurface = detectRuntimeSurface();
-const appBuildMode = import.meta.env.DEV ? "development" : "production";
 const sortByName = <T extends { name: string }>(items: T[]) =>
   [...items].sort((left, right) => left.name.localeCompare(right.name));
 
@@ -515,6 +509,8 @@ export const createAppActions = (args: {
   }
 
   const { state, client, sessionStore } = args;
+  const appInfo = getAppBuildInfo();
+  const runtimeSurface = appInfo.runtimeSurface;
   let downloadNoticeTimer: number | null = null;
   let lastTransferNotificationAtMs = 0;
   let notificationPermissionRequested = false;
@@ -894,12 +890,7 @@ export const createAppActions = (args: {
 
   const hydrate = async () => {
     pushSessionLog(state, "info", "app.build.info", "Build metadata", {
-      appVersion,
-      buildCommit,
-      buildTimeUtc,
-      buildMode: appBuildMode,
-      runtimeEnvironment,
-      runtimeSurface,
+      ...appInfo,
     });
     try {
       state.favorites.items = await client.listFavorites();
@@ -1232,13 +1223,7 @@ export const createAppActions = (args: {
       })
       .join("\n\n");
     const metadata = [
-      "# Syncpeer Log Export Metadata",
-      `app_version: ${appVersion}`,
-      `build_commit: ${buildCommit}`,
-      `build_time_utc: ${buildTimeUtc}`,
-      `build_mode: ${appBuildMode}`,
-      `runtime_environment: ${runtimeEnvironment}`,
-      `runtime_surface: ${runtimeSurface}`,
+      formatAppBuildInfo(appInfo),
       "",
       "# Session Logs",
     ].join("\n");
@@ -2508,6 +2493,14 @@ export const createAppActions = (args: {
     state.currentPage = "main";
   };
 
+  const openAboutPage = () => {
+    state.currentPage = "about";
+  };
+
+  const closeAboutPage = () => {
+    state.currentPage = "main";
+  };
+
   const runFolderDiagnosticsTest = async (args?: {
     expectedAdvertisedDeviceIds?: string[];
     failOnExpectedMissing?: boolean;
@@ -2612,6 +2605,7 @@ export const createAppActions = (args: {
     });
     const passed = results.filter((result: { ok: boolean }) => result.ok).length;
     return {
+      buildInfo: appInfo,
       summary: {
         runAtIso: new Date().toISOString(),
         allPassed: passed === results.length,
@@ -2821,7 +2815,7 @@ export const createAppActions = (args: {
         categoryId: "android",
       },
       fn: async () => {
-        if (detectRuntimeSurface() !== "android-ui") {
+        if (appInfo.runtimeSurface !== "android-ui") {
           return { skipped: true, reason: "Android UI runtime required." };
         }
         if (!client.startTransfer || !client.stopTransfer) {
@@ -2851,6 +2845,7 @@ export const createAppActions = (args: {
     const results = await runDiagnosticsTests({ [definition.test.name]: definition.fn }, { details: true });
     const passed = results.filter((item) => item.ok).length;
     return {
+      buildInfo: appInfo,
       summary: {
         runAtIso: new Date().toISOString(),
         mode: "single",
@@ -2880,6 +2875,7 @@ export const createAppActions = (args: {
     const results = await runDiagnosticsTests(tests, { details: true });
     const passed = results.filter((item) => item.ok).length;
     return {
+      buildInfo: appInfo,
       summary: {
         runAtIso: new Date().toISOString(),
         mode: "category",
@@ -2903,6 +2899,7 @@ export const createAppActions = (args: {
     const results = await runDiagnosticsTests(tests, { details: true });
     const passed = results.filter((item) => item.ok).length;
     return {
+      buildInfo: appInfo,
       summary: {
         runAtIso: new Date().toISOString(),
         mode: "all",
@@ -2973,6 +2970,8 @@ export const createAppActions = (args: {
     importProviderPimFromSyncthingFolder,
     openDiagnosticsPage,
     closeDiagnosticsPage,
+    openAboutPage,
+    closeAboutPage,
     runFolderDiagnosticsTest,
     loadDiagnosticsCatalog,
     runDiagnosticsTestById,

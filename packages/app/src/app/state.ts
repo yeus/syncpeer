@@ -120,7 +120,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       persisted?.activeTab === "pim"
         ? persisted.activeTab
         : ("favorites" as const),
-    currentPage: "main" as "main" | "diagnostics",
+    currentPage: "main" as "main" | "diagnostics" | "about",
     connection: {
       host: initialConnection.host,
       port: initialConnection.port,

@@ -39,6 +39,12 @@ import {
   supportsOngoingTransferNotifications,
 } from "../packages/app/src/lib/runtimeInfo.ts";
 import {
+  classifyRuntimeArchitecture,
+  classifyRuntimePlatform,
+  createAppBuildInfo,
+  formatAppBuildInfo,
+} from "../packages/core/src/appInfo.ts";
+import {
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
 } from "../packages/core/src/ui/discoveryServer.ts";
@@ -188,6 +194,36 @@ assert.equal(
 assert.equal(supportsOngoingTransferNotifications("android-ui"), true);
 assert.equal(supportsOngoingTransferNotifications("desktop-ui"), false);
 assert.equal(supportsOngoingTransferNotifications("web-ui"), false);
+assert.equal(classifyRuntimePlatform("Linux x86_64"), "linux");
+assert.equal(classifyRuntimePlatform("Android 15"), "android");
+assert.equal(classifyRuntimeArchitecture("aarch64"), "arm64");
+assert.equal(classifyRuntimeArchitecture("x86_64"), "x64");
+
+const appBuildInfo = createAppBuildInfo({
+  appVersion: "0.4.0-test",
+  coreVersion: "0.4.0-core",
+  buildCommit: "0123456789abcdef",
+  buildTimeUtc: "2026-09-03T12:34:56.000Z",
+  buildMode: "production",
+  runtimeEnvironment: "tauri",
+  runtimeSurface: "android-ui",
+  platform: "android",
+  architecture: "arm64",
+});
+assert.deepEqual(appBuildInfo, {
+  appName: "Syncpeer",
+  appVersion: "0.4.0-test",
+  coreVersion: "0.4.0-core",
+  buildCommit: "0123456789abcdef",
+  buildTimeUtc: "2026-09-03T12:34:56.000Z",
+  buildMode: "production",
+  runtimeEnvironment: "tauri",
+  runtimeSurface: "android-ui",
+  platform: "android",
+  architecture: "arm64",
+});
+assert.match(formatAppBuildInfo(appBuildInfo), /runtime_surface: android-ui/);
+assert.doesNotMatch(formatAppBuildInfo(appBuildInfo), /device|folder|127\.0\.0\.1/i);
 
 const runtimeGlobal = globalThis as { __TAURI_INTERNALS__?: unknown };
 const previousTauriInternals = runtimeGlobal.__TAURI_INTERNALS__;

@@ -40,6 +40,10 @@ const main = async (): Promise<void> => {
       args: ["packages/cli/dist/main.js", "--help"],
     },
     {
+      ...nodeScript("scripts/test-cli-build-info.ts"),
+      name: "CLI build information diagnostics",
+    },
+    {
       name: "Node QUIC runtime preflight",
       command: process.platform === "win32" ? "npm.cmd" : "npm",
       args: ["run", "test:quic:runtime"],

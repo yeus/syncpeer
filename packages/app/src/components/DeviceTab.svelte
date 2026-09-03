@@ -4,7 +4,7 @@
   import Panel from "./Panel.svelte";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
-  import { detectRuntimeEnvironment, detectRuntimeSurface } from "../lib/runtimeInfo.ts";
+  import { formatBuildTimeLocal, getAppBuildInfo } from "../lib/appInfo.ts";
   import { downloadTransportText, type AppState } from "../app/state.ts";
 
   interface Props {
@@ -19,6 +19,7 @@
     onClearAllCache: () => void;
     onClearOfflineFolderState: () => void;
     onOpenDiagnosticsPage: () => void;
+    onOpenAboutPage: () => void;
     onCopyCurrentDeviceId: () => void;
     onCopySessionLogs: () => void;
     onEditLocalDeviceName: () => void;
@@ -45,6 +46,7 @@
     onClearAllCache,
     onClearOfflineFolderState,
     onOpenDiagnosticsPage,
+    onOpenAboutPage,
     onCopyCurrentDeviceId,
     onCopySessionLogs,
     onEditLocalDeviceName,
@@ -59,17 +61,8 @@
     onConnectLocalCandidate,
   }: Props = $props();
 
-  const appVersion = String(import.meta.env.SYNCPEER_APP_VERSION || "0.0.0");
-  const buildCommit = String(import.meta.env.SYNCPEER_BUILD_COMMIT || "unknown");
-  const buildTimeUtc = String(import.meta.env.SYNCPEER_BUILD_TIME_UTC || "");
-  const runtimeEnvironment = detectRuntimeEnvironment();
-  const runtimeSurface = detectRuntimeSurface();
-  const buildMode = import.meta.env.DEV ? "development" : "production";
-  const buildTimeLocalLabel = (() => {
-    const parsed = buildTimeUtc ? new Date(buildTimeUtc) : null;
-    if (!parsed || Number.isNaN(parsed.getTime())) return "unknown";
-    return parsed.toLocaleString();
-  })();
+  const appInfo = getAppBuildInfo();
+  const buildTimeLocalLabel = formatBuildTimeLocal(appInfo.buildTimeUtc);
 
   let advertisedById = $derived.by(() => new Map(
     advertisedDevices
@@ -190,6 +183,11 @@
       data-testid="open-diagnostics"
       onclick={onOpenDiagnosticsPage}
     >Diagnostics</button>
+    <button
+      class="ghost small"
+      data-testid="open-about"
+      onclick={onOpenAboutPage}
+    >About</button>
   </div>
 
   <div class="this-device-summary">
@@ -204,10 +202,10 @@
       Advertised name: {app.connection.deviceName.trim() || "syncpeer-ui"}
     </div>
     <div class="item-meta">
-      Version: {appVersion}
+      Version: {appInfo.appVersion}
     </div>
     <div class="item-meta">
-      Commit: <code>{buildCommit}</code>
+      Commit: <code>{appInfo.buildCommit}</code>
     </div>
     <div class="item-meta">
       Built (local): {buildTimeLocalLabel}
@@ -433,7 +431,7 @@
         </label>
 
         <div class="hint version-meta">
-          Version: <strong>{appVersion}</strong> | Commit: <code>{buildCommit}</code> | Built (local): {buildTimeLocalLabel} | Mode: {buildMode} | Runtime: {runtimeEnvironment}/{runtimeSurface}
+          Version: <strong>{appInfo.appVersion}</strong> | Commit: <code>{appInfo.buildCommit}</code> | Built (local): {buildTimeLocalLabel} | Mode: {appInfo.buildMode} | Runtime: {appInfo.runtimeEnvironment}/{appInfo.runtimeSurface}
         </div>
 
       </form>

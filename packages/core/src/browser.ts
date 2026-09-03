@@ -1,4 +1,18 @@
 export { createSyncpeerCoreClient, UploadOutcomeUnknownError, withMetadataSession } from "./client.js";
+export {
+  classifyRuntimeArchitecture,
+  classifyRuntimePlatform,
+  createAppBuildInfo,
+  formatAppBuildInfo,
+} from "./appInfo.js";
+export type {
+  AppBuildInfo,
+  AppBuildMode,
+  AppRuntimeArchitecture,
+  AppRuntimeEnvironment,
+  AppRuntimePlatform,
+  AppRuntimeSurface,
+} from "./appInfo.js";
 export type {
   SyncpeerCoreClient,
   SyncpeerConnectOptions,

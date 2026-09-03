@@ -25,6 +25,20 @@ import type { SessionTransport } from "./ui/sessionTypes.js";
 import { createConnectionLifecycle } from "./ui/connectionLifecycle.js";
 import { createRecoveringRemoteFs } from "./ui/recoveringRemoteFs.js";
 import { connectNodeQuic } from "./core/transport/nodeQuic.js";
+export {
+  classifyRuntimeArchitecture,
+  classifyRuntimePlatform,
+  createAppBuildInfo,
+  formatAppBuildInfo,
+} from "./appInfo.js";
+export type {
+  AppBuildInfo,
+  AppBuildMode,
+  AppRuntimeArchitecture,
+  AppRuntimeEnvironment,
+  AppRuntimePlatform,
+  AppRuntimeSurface,
+} from "./appInfo.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export type { FileDownloadSink } from "./transfer/stream.js";
 export {

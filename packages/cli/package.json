@@ -6,7 +6,7 @@
     "syncpeer": "dist/main.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "node ../../scripts/build-cli.mjs"
   },
   "dependencies": {
     "@syncpeer/core": "0.4.0-rc.6",

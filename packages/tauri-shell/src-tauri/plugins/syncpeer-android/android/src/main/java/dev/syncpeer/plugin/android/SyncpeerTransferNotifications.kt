@@ -57,11 +57,10 @@ internal object SyncpeerTransferNotifications {
     ongoing: Boolean,
     cancellable: Boolean,
   ): Notification {
-    val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      NotificationCompat.Builder(context, SyncpeerTransferConstants.CHANNEL_ID)
-    } else {
-      NotificationCompat.Builder(context)
-    }
+    val builder = NotificationCompat.Builder(
+      context,
+      SyncpeerTransferConstants.CHANNEL_ID,
+    )
       .setContentTitle(title)
       .setContentText(body)
       .setSmallIcon(android.R.drawable.stat_sys_download)

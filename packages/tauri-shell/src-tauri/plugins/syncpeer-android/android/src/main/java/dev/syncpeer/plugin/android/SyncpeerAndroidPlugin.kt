@@ -180,6 +180,10 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       scheduler?.cancel(SyncpeerTransferConstants.JOB_ID)
     }
     activity.stopService(Intent(activity, SyncpeerTransferService::class.java))
+    val notifications = activity.getSystemService(
+      Context.NOTIFICATION_SERVICE,
+    ) as? android.app.NotificationManager
+    notifications?.cancel(SyncpeerTransferConstants.NOTIFICATION_ID)
   }
 
   private fun handleTransferCancellation() {

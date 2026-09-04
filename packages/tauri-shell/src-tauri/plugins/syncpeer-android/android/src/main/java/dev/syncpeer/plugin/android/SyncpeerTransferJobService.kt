@@ -34,7 +34,7 @@ class SyncpeerTransferJobService : JobService() {
       params,
       SyncpeerTransferConstants.NOTIFICATION_ID,
       notification,
-      JOB_END_NOTIFICATION_POLICY_REMOVE,
+      JOB_END_NOTIFICATION_POLICY_DETACH,
     )
 
     // The transfer itself remains owned by the shared TypeScript core. Keeping

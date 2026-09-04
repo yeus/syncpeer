@@ -77,6 +77,7 @@ export interface FileDownloadProgress {
 
 export interface FileUploadOptions {
   modifiedMs?: number;
+  signal?: AbortSignal;
   onProgress?: (progress: {
     processedBytes: number;
     totalBytes: number;

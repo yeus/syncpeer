@@ -88,6 +88,18 @@ export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export { createConnectionLifecycle, retryDelayMs } from "./ui/connectionLifecycle.js";
 export type { ConnectionLifecycle, ConnectionLifecyclePhase, ConnectionLifecycleState } from "./ui/connectionLifecycle.js";
 export {
+  createTransferNotificationState,
+  reduceTransferNotification,
+  transferNotificationView,
+} from "./ui/transferNotification.js";
+export type {
+  ActiveTransfer,
+  TransferDirection,
+  TransferNotificationEvent,
+  TransferNotificationState,
+  TransferNotificationView,
+} from "./ui/transferNotification.js";
+export {
   makeReadDirWithRetryFlow,
   makeWaitForFolderIndexToArriveFlow,
   makeWaitForFoldersToPopulateFlow,

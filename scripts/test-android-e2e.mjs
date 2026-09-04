@@ -454,7 +454,11 @@ const waitForNotificationBounds = async (text, timeout = 15_000) => {
     const bounds = notificationBounds(xml, text);
     if (bounds) return bounds;
     if (!expanded) {
-      const notificationRow = notificationRowBounds(xml, ["Syncpeer download", "Syncpeer transfer"]);
+      const notificationRow = notificationRowBounds(xml, [
+        "Syncpeer download",
+        "Syncpeer transfer",
+        "Syncpeer transfers",
+      ]);
       if (notificationRow) {
         runAdb(["shell", "input", "tap", String(notificationRow.x), String(notificationRow.y)]);
         expanded = true;
@@ -523,6 +527,34 @@ const waitForActiveTransferNotification = async (timeout = 15_000) => {
   );
 };
 
+const waitForTransferNotificationText = async (texts, timeout = 15_000) => {
+  const deadline = Date.now() + timeout;
+  let latest = { transferRecords: [] };
+  while (Date.now() < deadline) {
+    latest = appNotificationRecords();
+    if (
+      latest.transferRecords.length === 1 &&
+      texts.every((text) => latest.transferRecords[0].includes(text))
+    ) {
+      return latest.transferRecords[0];
+    }
+    await wait(250);
+  }
+  throw new Error(
+    `Expected one transfer notification containing ${texts.join(", ")}; ` +
+    `found ${latest.transferRecords.length}.`,
+  );
+};
+
+const waitForNoTransferNotification = async (timeout = 15_000) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (appNotificationRecords().transferRecords.length === 0) return;
+    await wait(250);
+  }
+  throw new Error("Android transfer notification remained visible after cancellation.");
+};
+
 const runAndroidDownloadNotificationRegression = async () => {
   let cdp = await launchAndroidApp(true);
   try {
@@ -548,6 +580,7 @@ const runAndroidDownloadNotificationRegression = async () => {
     runAdb(["shell", "input", "tap", String(cancelBounds.x), String(cancelBounds.y)]);
     await assertForeground();
     await waitForTransferRuntime(false, downloadTimeoutMs);
+    await waitForNoTransferNotification();
     const cancelledSummary = await cachedFileSummary(cdp, targetLargeFileName);
     if (cancelledSummary.found) {
       throw new Error(`Notification cancellation left a cached blob: ${JSON.stringify(cancelledSummary)}`);
@@ -580,6 +613,7 @@ const runAndroidDownloadNotificationRegression = async () => {
       30_000,
     );
     await waitForTransferRuntime(false, downloadTimeoutMs);
+    await waitForNoTransferNotification();
     const cancelledSummary = await cachedFileSummary(cdp, targetLargeFileName);
     if (cancelledSummary.found) {
       throw new Error(`In-app cancellation left a cached blob: ${JSON.stringify(cancelledSummary)}`);
@@ -596,6 +630,26 @@ const runUserInitiatedTransferLifecycle = async (cdp) => {
     request: { label: "Android UIDT E2E transfer" },
   });
   const scheduledState = await waitForTransferJob(true, 15_000);
+  await tauriInvoke(cdp, "syncpeer_android_update_transfer_notification", {
+    request: {
+      title: "Syncpeer download",
+      body: "fixture.bin: 37%",
+      progress: 37,
+      ongoing: true,
+      cancellable: true,
+    },
+  });
+  await waitForTransferNotificationText(["Syncpeer download", "fixture.bin: 37%"]);
+  await tauriInvoke(cdp, "syncpeer_android_update_transfer_notification", {
+    request: {
+      title: "Syncpeer transfers",
+      body: "2 active · 1 download · 1 upload",
+      progress: 25,
+      ongoing: true,
+      cancellable: true,
+    },
+  });
+  await waitForTransferNotificationText(["Syncpeer transfers", "2 active"]);
   runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
   await wait(1_000);
   const backgroundState = await waitForTransferJob(true, 15_000);
@@ -612,11 +666,22 @@ const runUserInitiatedTransferLifecycle = async (cdp) => {
     `states=${scheduledState}/${backgroundState}, notification channel present: true`,
   );
 
-  await tapNotification("Syncpeer transfer");
+  await tapNotification("Syncpeer transfers");
   console.log("Android UIDT notification tap returned to the app.");
 
   await tauriInvoke(cdp, "syncpeer_android_stop_transfer_service");
   await waitForTransferJob(false);
+  await tauriInvoke(cdp, "syncpeer_android_update_transfer_notification", {
+    request: {
+      title: "Syncpeer transfers complete",
+      body: "2 transfers completed",
+      progress: 100,
+      ongoing: false,
+      cancellable: false,
+    },
+  });
+  await waitForTransferNotificationText(["Syncpeer transfers complete", "2 transfers completed"]);
+  await clearTransferNotifications(cdp);
 };
 
 const packagePid = () => {

@@ -12,12 +12,16 @@ import {
   normalizeDeviceId,
   normalizeDiscoveryServer,
   normalizePath,
+  createTransferNotificationState,
+  reduceTransferNotification,
   resolveDirectoryPath,
   sameDeviceId,
+  transferNotificationView,
   type BreadcrumbSegment,
   type FileEntry,
   type FileDownloadResult,
   type FileDownloadSink,
+  type ActiveTransfer,
 } from "@syncpeer/core/browser";
 import {
   canonicalRecordPath,
@@ -526,7 +530,13 @@ export const createAppActions = (args: {
     progressPercent?: number;
     cancellable: boolean;
   } | null = null;
-  let activeTransferCancellation: (() => void) | null = null;
+  let transferState = createTransferNotificationState();
+  const transferCancellations = new Map<
+    string,
+    { direction: ActiveTransfer["direction"]; cancel: () => void }
+  >();
+  let transferRuntimeStarted = false;
+  let transferRuntimeTransition = Promise.resolve();
   let connectInFlight: Promise<void> | null = null;
 
   const setDownloadNotice = (message: string, clearAfterMs = 0) => {
@@ -569,7 +579,7 @@ export const createAppActions = (args: {
                 event.actionId === TRANSFER_NOTIFICATION_CANCEL_ACTION &&
                 Number(event.notification?.id) === TRANSFER_NOTIFICATION_ID
               ) {
-                activeTransferCancellation?.();
+                for (const transfer of transferCancellations.values()) transfer.cancel();
               }
             },
           );
@@ -596,7 +606,7 @@ export const createAppActions = (args: {
             data.actionId === TRANSFER_NOTIFICATION_CANCEL_ACTION &&
             Number(data.notification?.id) === TRANSFER_NOTIFICATION_ID
           ) {
-            activeTransferCancellation?.();
+            for (const transfer of transferCancellations.values()) transfer.cancel();
           }
         });
       })().catch(() => undefined);
@@ -696,11 +706,111 @@ export const createAppActions = (args: {
 
   const clearTransferNotification = async (id: number) => {
     if (!supportsOngoingTransferNotifications(runtimeSurface)) return;
+    pendingTransferNotification = null;
+    if (transferNotificationTimer) {
+      clearTimeout(transferNotificationTimer);
+      transferNotificationTimer = null;
+    }
+    if (transferNotificationInFlight) {
+      await transferNotificationInFlight.catch(() => undefined);
+    }
+    if (transferState.active.length > 0) return;
     try {
       await removeActiveNativeNotifications([{ id }]);
     } catch {
       // Best-effort only.
     }
+  };
+
+  const reconcileTransferRuntime = () => {
+    transferRuntimeTransition = transferRuntimeTransition
+      .catch(() => undefined)
+      .then(async () => {
+        const shouldRun = transferState.active.length > 0;
+        if (shouldRun === transferRuntimeStarted) return;
+        if (shouldRun) {
+          transferRuntimeStarted = true;
+          try {
+            await client.startTransfer?.(
+              transferState.active.length === 1
+                ? transferState.active[0].label
+                : `${transferState.active.length} transfers`,
+            );
+          } catch (error) {
+            transferRuntimeStarted = false;
+            reportActionError(state, "transfer_runtime.start_failed", error);
+          }
+          return;
+        }
+        transferRuntimeStarted = false;
+        try {
+          await client.stopTransfer?.();
+        } catch (error) {
+          reportActionError(state, "transfer_runtime.stop_failed", error);
+        }
+      });
+    return transferRuntimeTransition;
+  };
+
+  const renderTransferNotification = async (force = false) => {
+    const view = transferNotificationView(transferState);
+    if (!view) {
+      await clearTransferNotification(TRANSFER_NOTIFICATION_ID);
+      return;
+    }
+    await maybeTransferNotification(
+      TRANSFER_NOTIFICATION_ID,
+      view.title,
+      view.body,
+      {
+        ongoing: view.ongoing,
+        force,
+        progress: view.ongoing,
+        progressPercent: view.progress,
+        cancellable: view.cancellable,
+      },
+    );
+  };
+
+  const beginManagedTransfer = async (
+    transfer: ActiveTransfer,
+    cancel: () => void,
+  ) => {
+    transferState = reduceTransferNotification(transferState, {
+      type: "begin",
+      transfer,
+    });
+    transferCancellations.set(transfer.id, { direction: transfer.direction, cancel });
+    await reconcileTransferRuntime();
+    await renderTransferNotification(true);
+  };
+
+  const updateManagedTransfer = (
+    id: string,
+    completedBytes: number,
+    totalBytes: number,
+  ) => {
+    transferState = reduceTransferNotification(transferState, {
+      type: "progress",
+      id,
+      completedBytes,
+      totalBytes,
+    });
+    void renderTransferNotification();
+  };
+
+  const finishManagedTransfer = async (
+    id: string,
+    outcome: "completed" | "failed" | "cancelled",
+  ) => {
+    transferCancellations.delete(id);
+    transferState = reduceTransferNotification(transferState, {
+      type: "finish",
+      id,
+      outcome,
+    });
+    await reconcileTransferRuntime();
+    await renderTransferNotification(true);
   };
 
   const transferInProgress = () =>
@@ -935,8 +1045,86 @@ export const createAppActions = (args: {
       const cachedFiles = await client.listCachedFiles();
       const cachedByKey = new Map(cachedFiles.map((item) => [item.key, item]));
       const dirCache = new Map<string, FileEntry[]>();
+      const syncController = new AbortController();
+
+      const downloadStarredFile = async (
+        folderId: string,
+        path: string,
+        name: string,
+        size: number,
+        modifiedMs: number,
+      ) => {
+        const id = `starred-download:${cachedFileKey(folderId, path)}`;
+        let outcome: "completed" | "failed" | "cancelled" = "failed";
+        await beginManagedTransfer({
+          id,
+          direction: "download",
+          label: name,
+          completedBytes: 0,
+          totalBytes: size,
+          cancellable: true,
+        }, () => syncController.abort());
+        try {
+          const bytes = await remoteFs.readFileFully(
+            folderId,
+            path,
+            (progress) => updateManagedTransfer(
+              id,
+              progress.downloadedBytes,
+              progress.totalBytes,
+            ),
+            syncController.signal,
+          );
+          await client.cacheFile(folderId, path, name, bytes, modifiedMs || Date.now());
+          outcome = "completed";
+          return bytes;
+        } catch (error) {
+          if (error instanceof Error && error.name === "AbortError") outcome = "cancelled";
+          throw error;
+        } finally {
+          await finishManagedTransfer(id, outcome);
+        }
+      };
+
+      const uploadStarredFile = async (
+        folderId: string,
+        path: string,
+        name: string,
+        bytes: Uint8Array,
+        modifiedMs: number,
+      ) => {
+        const id = `starred-upload:${cachedFileKey(folderId, path)}`;
+        let outcome: "completed" | "failed" | "cancelled" = "failed";
+        await beginManagedTransfer({
+          id,
+          direction: "upload",
+          label: name,
+          completedBytes: 0,
+          totalBytes: bytes.length,
+          cancellable: true,
+        }, () => syncController.abort());
+        try {
+          await remoteFs.writeFileFully(folderId, path, bytes, {
+            modifiedMs,
+            signal: syncController.signal,
+            onProgress: (progress) => updateManagedTransfer(
+              id,
+              progress.processedBytes,
+              progress.totalBytes,
+            ),
+          });
+          await client.cacheFile(folderId, path, name, bytes, modifiedMs);
+          outcome = "completed";
+        } catch (error) {
+          if (error instanceof Error && error.name === "AbortError") outcome = "cancelled";
+          throw error;
+        } finally {
+          await finishManagedTransfer(id, outcome);
+        }
+      };
 
       for (const favorite of starredFiles) {
+        if (syncController.signal.aborted) break;
         const targetPath = normalizePath(favorite.path);
         if (!targetPath) continue;
         const { parent, name } = splitPath(targetPath);
@@ -954,12 +1142,11 @@ export const createAppActions = (args: {
         const cached = cachedByKey.get(key);
 
         if (!cached) {
-          const bytes = await remoteFs.readFileFully(favorite.folderId, targetPath);
-          await client.cacheFile(
+          const bytes = await downloadStarredFile(
             favorite.folderId,
             targetPath,
             favorite.name,
-            bytes,
+            remoteEntry.size,
             remoteEntry.modifiedMs || Date.now(),
           );
           state.sync.starredFileSyncState[key] = {
@@ -999,12 +1186,11 @@ export const createAppActions = (args: {
         const remoteChanged = remoteModifiedMs > previous.lastRemoteModifiedMs;
 
         if (remoteChanged && !localChanged) {
-          const bytes = await remoteFs.readFileFully(favorite.folderId, targetPath);
-          await client.cacheFile(
+          const bytes = await downloadStarredFile(
             favorite.folderId,
             targetPath,
             favorite.name,
-            bytes,
+            remoteEntry.size,
             remoteModifiedMs || Date.now(),
           );
           state.sync.starredFileSyncState[key] = {
@@ -1019,13 +1205,7 @@ export const createAppActions = (args: {
 
         if (localChanged && !remoteChanged && localBytes) {
           const uploadModifiedMs = Date.now();
-          await remoteFs.writeFileFully(
-            favorite.folderId,
-            targetPath,
-            localBytes,
-            { modifiedMs: uploadModifiedMs },
-          );
-          await client.cacheFile(
+          await uploadStarredFile(
             favorite.folderId,
             targetPath,
             favorite.name,
@@ -1043,12 +1223,11 @@ export const createAppActions = (args: {
         }
 
         if (localChanged && remoteChanged) {
-          const bytes = await remoteFs.readFileFully(favorite.folderId, targetPath);
-          await client.cacheFile(
+          const bytes = await downloadStarredFile(
             favorite.folderId,
             targetPath,
             favorite.name,
-            bytes,
+            remoteEntry.size,
             remoteModifiedMs || Date.now(),
           );
           state.sync.starredFileSyncState[key] = {
@@ -1086,9 +1265,11 @@ export const createAppActions = (args: {
         );
       }
     } catch (error) {
-      reportActionError(state, "starred.sync.failed", error, {
-        durationMs: elapsedMsSince(startedAtMs),
-      });
+      if (!(error instanceof Error && error.name === "AbortError")) {
+        reportActionError(state, "starred.sync.failed", error, {
+          durationMs: elapsedMsSince(startedAtMs),
+        });
+      }
     } finally {
       state.sync.isSyncingStarredFiles = false;
     }
@@ -1484,15 +1665,15 @@ export const createAppActions = (args: {
     let activeTransportKind = state.session.connectionTransport;
     let activeConnectedVia = state.session.connectionPath;
     let activeConnectionScope = state.session.connectionScope;
-    let downloadCompleted = false;
     let activeSink: FileDownloadSink | null = null;
-    let transferServiceStarted = false;
+    let transferOutcome: "completed" | "failed" | "cancelled" = "failed";
     const abortController = new AbortController();
-    activeTransferCancellation = () => {
+    const cancelTransfer = () => {
       abortController.abort();
       setDownloadNotice(`Cancelling download ${name}…`);
     };
     const downloadKey = cachedFileKey(folderId, path);
+    const transferId = `download:${downloadKey}`;
     const remoteFs = state.session.remoteFs;
     state.favorites.activeDownloadKey = downloadKey;
     state.favorites.activeDownloadText =
@@ -1507,14 +1688,14 @@ export const createAppActions = (args: {
       fileName: name,
     });
     try {
-      await client.startTransfer?.(name);
-      transferServiceStarted = true;
-      await maybeTransferNotification(
-        TRANSFER_NOTIFICATION_ID,
-        "Syncpeer download",
-        `Downloading ${name}: 0%`,
-        { ongoing: true, force: true, progressPercent: 0, cancellable: true },
-      );
+      await beginManagedTransfer({
+        id: transferId,
+        direction: "download",
+        label: name,
+        completedBytes: 0,
+        totalBytes: 0,
+        cancellable: true,
+      }, cancelTransfer);
       const onProgress = ({
         downloadedBytes,
         totalBytes,
@@ -1542,19 +1723,7 @@ export const createAppActions = (args: {
           connectionScope ?? state.session.connectionScope,
         )}`;
         setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
-        maybeTransferNotification(
-          TRANSFER_NOTIFICATION_ID,
-          "Syncpeer download",
-          `${name}: ${state.favorites.activeDownloadText}`,
-          {
-            ongoing: true,
-            progress: true,
-            progressPercent: totalBytes > 0
-              ? Math.floor((downloadedBytes / totalBytes) * 100)
-              : undefined,
-            cancellable: true,
-          },
-        );
+        updateManagedTransfer(transferId, downloadedBytes, totalBytes);
         const now = Date.now();
         if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
           lastTransferLogAtMs = now;
@@ -1599,16 +1768,10 @@ export const createAppActions = (args: {
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
       state.favorites.activeDownloadText =
         `100% • Done • ${downloadTransportText(activeTransportKind, activeConnectionScope)}`;
-      downloadCompleted = true;
+      transferOutcome = "completed";
       setDownloadNotice(
         `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}`,
         4000,
-      );
-      maybeTransferNotification(
-        TRANSFER_NOTIFICATION_ID,
-        "Syncpeer download complete",
-        name,
-        { ongoing: false, force: true },
       );
       pushSessionLog(state, "info", "download.complete", `Downloaded ${name}`, {
         folderId,
@@ -1633,49 +1796,28 @@ export const createAppActions = (args: {
         }
       }
       if (error instanceof Error && error.name === "AbortError") {
+        transferOutcome = "cancelled";
         setDownloadNotice(`Download cancelled: ${name}`, 4000);
-        maybeTransferNotification(
-          TRANSFER_NOTIFICATION_ID,
-          "Syncpeer download cancelled",
-          name,
-          { ongoing: false, force: true },
-        );
       } else {
         reportActionError(state, "download_file.failed", error, { folderId, path });
         restoreAfterTransportFailure(state, error);
         setDownloadNotice(`Download failed: ${name}`, 6000);
-        maybeTransferNotification(
-          TRANSFER_NOTIFICATION_ID,
-          "Syncpeer download failed",
-          name,
-          { ongoing: false, force: true },
-        );
       }
     } finally {
-      if (transferServiceStarted) {
-        try {
-          await client.stopTransfer?.();
-        } catch (error) {
-          reportActionError(state, "download_file.stop_service_failed", error, { folderId, path });
-        }
-      }
+      await finishManagedTransfer(transferId, transferOutcome);
       state.favorites.isDownloading = false;
       if (state.favorites.activeDownloadKey === downloadKey) {
         state.favorites.activeDownloadKey = "";
         state.favorites.activeDownloadText = "";
-      }
-      activeTransferCancellation = null;
-      if (downloadCompleted) {
-        window.setTimeout(() => {
-          void clearTransferNotification(TRANSFER_NOTIFICATION_ID);
-        }, 2500);
       }
     }
   };
 
   const cancelDownload = () => {
     if (!state.favorites.isDownloading) return;
-    activeTransferCancellation?.();
+    for (const transfer of transferCancellations.values()) {
+      if (transfer.direction === "download") transfer.cancel();
+    }
   };
 
   const openOrDownloadFile = async (folderId: string, path: string, name: string) => {
@@ -1974,15 +2116,18 @@ export const createAppActions = (args: {
     fileName: string,
     bytes: Uint8Array,
     modifiedMs?: number,
+    managed?: { id: string; controller: AbortController },
   ) => {
     const connected = await ensureConnectedForTransfer("upload");
     if (!connected || !state.session.remoteFs) {
       state.ui.uploadMessage = "Connect to a folder before uploading.";
+      if (managed) await finishManagedTransfer(managed.id, "failed");
       return;
     }
     const remoteFs = state.session.remoteFs;
     if (!state.session.currentFolderId) {
       state.ui.uploadMessage = "Open a folder first, then upload into the current directory.";
+      if (managed) await finishManagedTransfer(managed.id, "failed");
       return;
     }
     const relativePath = normalizePath(
@@ -1990,6 +2135,7 @@ export const createAppActions = (args: {
     );
     if (!relativePath) {
       state.ui.uploadMessage = "Invalid upload target path.";
+      if (managed) await finishManagedTransfer(managed.id, "failed");
       return;
     }
     state.ui.uploadProgressActive = true;
@@ -1999,12 +2145,19 @@ export const createAppActions = (args: {
     state.ui.uploadMessage = `Uploading ${fileName}...`;
     const startedAtMs = Date.now();
     let lastTransferLogAtMs = 0;
-    maybeTransferNotification(
-      TRANSFER_NOTIFICATION_ID,
-      "Syncpeer upload",
-      `Uploading ${fileName}: 0%`,
-      { ongoing: true, force: true, progressPercent: 0 },
-    );
+    const controller = managed?.controller ?? new AbortController();
+    const transferId = managed?.id ?? `upload:${relativePath}:${startedAtMs}`;
+    let transferOutcome: "completed" | "failed" | "cancelled" = "failed";
+    if (!managed) {
+      await beginManagedTransfer({
+        id: transferId,
+        direction: "upload",
+        label: fileName,
+        completedBytes: 0,
+        totalBytes: bytes.length,
+        cancellable: true,
+      }, () => controller.abort());
+    }
     pushSessionLog(state, "info", "upload.start", `Uploading ${fileName}`, {
       folderId: state.session.currentFolderId,
       path: relativePath,
@@ -2038,12 +2191,7 @@ export const createAppActions = (args: {
       }
       const uploadNotice = `Upload ${pct}%${state.ui.uploadProgressEta ? ` · ETA ${state.ui.uploadProgressEta}` : ""}`;
       setDownloadNotice(uploadNotice);
-      maybeTransferNotification(
-        TRANSFER_NOTIFICATION_ID,
-        "Syncpeer upload",
-        `${fileName}: ${uploadNotice}`,
-        { ongoing: pct < 100, progress: true, progressPercent: pct },
-      );
+      updateManagedTransfer(transferId, processedBytes, totalBytes);
     };
     try {
       await remoteFs.writeFileFully(
@@ -2052,6 +2200,7 @@ export const createAppActions = (args: {
         bytes,
         {
           modifiedMs: modifiedMs || Date.now(),
+          signal: controller.signal,
           onProgress: (progress) => {
             updateUploadProgress(progress.processedBytes, progress.totalBytes);
           },
@@ -2063,12 +2212,7 @@ export const createAppActions = (args: {
       await loadDirectorySideEffects(state, client);
       state.ui.uploadMessage = `Uploaded ${fileName}.`;
       setDownloadNotice(`Uploaded ${fileName}`, 4000);
-      maybeTransferNotification(
-        TRANSFER_NOTIFICATION_ID,
-        "Syncpeer upload complete",
-        fileName,
-        { ongoing: false, force: true },
-      );
+      transferOutcome = "completed";
       const elapsedMs = elapsedMsSince(startedAtMs);
       const rateBps = averageRateBps(bytes.length, elapsedMs);
       pushSessionLog(state, "info", "upload.complete", `Uploaded ${fileName}`, {
@@ -2080,6 +2224,12 @@ export const createAppActions = (args: {
         rate: formatRateSafe(rateBps),
       });
     } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        transferOutcome = "cancelled";
+        state.ui.uploadMessage = `Upload cancelled: ${fileName}`;
+        setDownloadNotice(`Upload cancelled: ${fileName}`, 4000);
+        return;
+      }
       reportActionError(state, "upload_file.failed", error, {
         folderId: state.session.currentFolderId,
         path: relativePath,
@@ -2087,51 +2237,71 @@ export const createAppActions = (args: {
         sizeBytes: bytes.length,
       });
       setDownloadNotice(`Upload failed: ${fileName}`, 6000);
-      maybeTransferNotification(
-        TRANSFER_NOTIFICATION_ID,
-        "Syncpeer upload failed",
-        fileName,
-        { ongoing: false, force: true },
-      );
     } finally {
-      if (state.ui.uploadProgressPercent >= 100) {
-        window.setTimeout(() => {
-          state.ui.uploadProgressActive = false;
-          state.ui.uploadProgressPercent = 0;
-          state.ui.uploadProgressEta = "";
-          state.ui.uploadProgressRate = "";
-        }, 1200);
-      } else {
+      await finishManagedTransfer(transferId, transferOutcome);
+      if (transferState.active.every((item) => item.direction !== "upload")) {
         state.ui.uploadProgressActive = false;
         state.ui.uploadProgressPercent = 0;
         state.ui.uploadProgressEta = "";
         state.ui.uploadProgressRate = "";
-      }
-      if (state.ui.uploadProgressPercent >= 100) {
-        window.setTimeout(() => {
-          void clearTransferNotification(TRANSFER_NOTIFICATION_ID);
-        }, 2500);
       }
     }
   };
 
   const handleUploadSelected = (event: Event) => {
     const input = event.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    if (!file) {
+    const files = Array.from(input.files ?? []);
+    if (files.length === 0) {
       state.ui.uploadMessage = "";
       input.value = "";
       return;
     }
     void (async () => {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      await uploadPreparedFile(file.name, bytes, file.lastModified || Date.now());
+      const batchId = Date.now();
+      const prepared = files.map((file, index) => ({
+        file,
+        id: `upload:${batchId}:${index}`,
+      }));
+      const controller = new AbortController();
+      for (const item of prepared) {
+        await beginManagedTransfer({
+          id: item.id,
+          direction: "upload",
+          label: item.file.name,
+          completedBytes: 0,
+          totalBytes: item.file.size,
+          cancellable: true,
+        }, () => controller.abort());
+      }
+      for (const item of prepared) {
+        let bytes: Uint8Array;
+        try {
+          bytes = new Uint8Array(await item.file.arrayBuffer());
+        } catch (error) {
+          reportActionError(state, "upload_file.read_failed", error, {
+            fileName: item.file.name,
+            sizeBytes: item.file.size,
+          });
+          await finishManagedTransfer(item.id, "failed");
+          continue;
+        }
+        await uploadPreparedFile(
+          item.file.name,
+          bytes,
+          item.file.lastModified || Date.now(),
+          { id: item.id, controller },
+        );
+      }
     })();
     input.value = "";
   };
 
   const handleUploadClick = () => {
     document.getElementById("folder-upload-input")?.click();
+  };
+
+  const cancelTransfers = () => {
+    for (const transfer of transferCancellations.values()) transfer.cancel();
   };
 
   const setAutoConnectPaused = (paused: boolean) => {
@@ -2960,6 +3130,7 @@ export const createAppActions = (args: {
     switchTab,
     handleUploadClick,
     handleUploadSelected,
+    cancelTransfers,
     setAutoConnectPaused,
     setAppVisibility,
     onNetworkOnline,

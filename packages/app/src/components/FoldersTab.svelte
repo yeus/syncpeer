@@ -33,6 +33,7 @@
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
     onCancelDownload: () => void;
+    onCancelTransfers: () => void;
     onToggleFavorite: (folderId: string, path: string, name: string, kind: "folder" | "file") => void;
     onSetPasswordVisible: (folderId: string, visible: boolean) => void;
     onUpdateFolderPasswordDraft: (folderId: string, password: string) => void;
@@ -73,6 +74,7 @@
     onOpenOrDownloadFile,
     onDownloadFile,
     onCancelDownload,
+    onCancelTransfers,
     onToggleFavorite,
     onSetPasswordVisible,
     onUpdateFolderPasswordDraft,
@@ -250,7 +252,7 @@
 
     {#if app.session.currentFolderId}
       <div class="actions">
-        <input id="folder-upload-input" class="upload-input" type="file" onchange={onHandleUploadSelected} />
+        <input id="folder-upload-input" class="upload-input" type="file" multiple onchange={onHandleUploadSelected} />
         <button class="primary" onclick={onHandleUploadClick}>
           Upload
         </button>
@@ -291,6 +293,7 @@
             {app.ui.uploadProgressPercent}%{app.ui.uploadProgressRate ? ` · ${app.ui.uploadProgressRate}` : ""}
             {app.ui.uploadProgressEta ? ` · ETA ${app.ui.uploadProgressEta}` : ""}
           </span>
+          <button class="ghost" onclick={onCancelTransfers}>Cancel</button>
         </div>
       {/if}
       {#if app.ui.uploadMessage}

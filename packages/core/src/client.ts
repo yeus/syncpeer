@@ -1797,6 +1797,13 @@ class BepSession {
     if (!normalizedPath) {
       throw new Error("Upload path must not be empty.");
     }
+    const throwIfCancelled = () => {
+      if (!options?.signal?.aborted) return;
+      const error = new Error("Upload cancelled.");
+      error.name = "AbortError";
+      throw error;
+    };
+    throwIfCancelled();
     const blockSize = 128 * 1024;
     const uploadStartedAtMs = Date.now();
     const uploadRateBps = (processedBytes: number) =>
@@ -1825,6 +1832,7 @@ class BepSession {
     let encryptedName: string | undefined;
     if (!folder.encrypted) {
       for (let offset = 0; offset < bytes.length; offset += blockSize) {
+        throwIfCancelled();
         const end = Math.min(bytes.length, offset + blockSize);
         const chunk = bytes.slice(offset, end);
         const hash = await this.adapter.sha256(chunk);
@@ -1848,6 +1856,7 @@ class BepSession {
       const originalBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
       const fakeBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
       for (let offset = 0; offset < bytes.length; offset += blockSize) {
+        throwIfCancelled();
         const end = Math.min(bytes.length, offset + blockSize);
         const chunk = bytes.slice(offset, end);
         const hashPlain = toUint8Array(await this.adapter.sha256(chunk));
@@ -1938,6 +1947,7 @@ class BepSession {
         })),
         encrypted: encryptedMetadata,
       };
+      throwIfCancelled();
       folder.files.set(normalizedPath, {
         indexFile: advertisedFileInfo,
         request: {
@@ -2018,6 +2028,7 @@ class BepSession {
         hash: block.hash,
       })),
     };
+    throwIfCancelled();
     folder.files.set(normalizedPath, { indexFile: fileInfo });
     this.log("upload.prepared", {
       folderId,

@@ -373,6 +373,7 @@
           onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
           onCancelDownload={actions.cancelDownload}
+          onCancelTransfers={actions.cancelTransfers}
           onToggleFavorite={actions.toggleFavorite}
           onSetPasswordVisible={actions.setFolderPasswordInputVisible}
           onUpdateFolderPasswordDraft={actions.updateFolderPasswordDraft}

@@ -71,11 +71,12 @@ internal object SyncpeerTransferNotifications {
       .setOnlyAlertOnce(true)
       .setSilent(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)
-      .setProgress(
-        100,
-        progress?.coerceIn(0, 100) ?: 0,
-        progress == null,
-      )
+
+    if (progress != null) {
+      builder.setProgress(100, progress.coerceIn(0, 100), false)
+    } else if (ongoing) {
+      builder.setProgress(0, 0, true)
+    }
 
     val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
     if (launchIntent != null) {

@@ -20,7 +20,7 @@ export const nodeScript = (script: string, args: string[] = []): TestSuitePhase 
 export const tsxScript = (script: string, args: string[] = []): TestSuitePhase => ({
   name: script,
   command: process.execPath,
-  args: [path.resolve("node_modules/tsx/dist/cli.mjs"), script, ...args],
+  args: ["--import", "tsx/esm", script, ...args],
 });
 
 type PhaseResult = {

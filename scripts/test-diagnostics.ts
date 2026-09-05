@@ -60,6 +60,11 @@ const main = async (): Promise<void> => {
       name: "Core protocol, session, and runtime diagnostics",
     },
     {
+      name: "Sensitive identifier scanner unit tests",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-sensitive-identifiers.ts"],
+    },
+    {
       name: "Incremental block reuse diagnostics",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-block-reuse.ts"],

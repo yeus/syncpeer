@@ -256,6 +256,23 @@ The two suites are the supported test entry points. The long-running server
 and client commands below are operational harness controls, not additional
 test suites.
 
+Every supported suite starts with the sensitive-identifier scan. The
+standalone server/client harness commands invoke the same scan before they
+start as well. Run it directly when reviewing a change:
+
+```bash
+npm run security:scan
+node scripts/scan-sensitive-identifiers.mjs --verbose
+node scripts/scan-sensitive-identifiers.mjs \
+  --all --verbose
+```
+
+The default mode checks tracked files and non-ignored untracked files. It
+reports redacted locations and fails on credential, token, private-key, or
+non-fixture device/folder identifier findings. `--all` also audits ignored
+logs and generated text; use `--strict` when warnings such as addresses and
+local paths should fail the scan too.
+
 ## Local Syncthing Integration Harness
 
 Download pinned Syncthing binary:

@@ -59,8 +59,16 @@ export const runTestSuite = async (args: {
   const env = testEnvironment();
   const startedAtMs = Date.now();
   const results: PhaseResult[] = [];
+  const phases: TestSuitePhase[] = [
+    {
+      name: "Sensitive repository scan",
+      command: process.execPath,
+      args: ["scripts/scan-sensitive-identifiers.mjs"],
+    },
+    ...args.phases,
+  ];
 
-  for (const phase of args.phases) {
+  for (const phase of phases) {
     const reason = phase.skipReason?.();
     if (reason) {
       if (phase.required) {

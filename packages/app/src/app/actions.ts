@@ -1,5 +1,6 @@
 import {
   createSyncpeerSessionStore,
+  createSha256DownloadSink,
   cachedFileKey,
   downloadRemoteFile,
   favoriteKey,
@@ -21,6 +22,7 @@ import {
   type FileEntry,
   type FileDownloadResult,
   type FileDownloadSink,
+  type FileEntrySortMode,
   type ActiveTransfer,
 } from "@syncpeer/core/browser";
 import {
@@ -86,6 +88,7 @@ import {
 import {
   suggestedClientName,
 } from "./suggestedNames.ts";
+import { remoteFavoriteNeedsDownload } from "./favoriteSyncPolicies.ts";
 import {
   clearDirectoryViewState,
   resetRuntimeSessionState,
@@ -1043,7 +1046,6 @@ export const createAppActions = (args: {
     const startedAtMs = Date.now();
     let uploaded = 0;
     let downloaded = 0;
-    let conflicts = 0;
 
     try {
       const remoteFs = state.session.remoteFs;
@@ -1058,9 +1060,10 @@ export const createAppActions = (args: {
         name: string,
         size: number,
         modifiedMs: number,
-      ) => {
+      ): Promise<string> => {
         const id = `starred-download:${cachedFileKey(folderId, path)}`;
         let outcome: "completed" | "failed" | "cancelled" = "failed";
+        let activeSink: FileDownloadSink | null = null;
         await beginManagedTransfer({
           id,
           direction: "download",
@@ -1070,21 +1073,41 @@ export const createAppActions = (args: {
           cancellable: true,
         }, () => syncController.abort());
         try {
-          const bytes = await remoteFs.readFileFully(
-            folderId,
-            path,
-            (progress) => updateManagedTransfer(
-              id,
-              progress.downloadedBytes,
-              progress.totalBytes,
-            ),
-            syncController.signal,
-          );
-          await client.cacheFile(folderId, path, name, bytes, modifiedMs || Date.now());
+          const onProgress = (progress: { downloadedBytes: number; totalBytes: number }) =>
+            updateManagedTransfer(id, progress.downloadedBytes, progress.totalBytes);
+          let localHash: string;
+          if (remoteFs.readFileToSink && client.createFileDownloadSink) {
+            const nativeSink = await client.createFileDownloadSink({
+              folderId,
+              path,
+              name,
+              modifiedMs,
+            });
+            const hashingSink = createSha256DownloadSink(nativeSink);
+            activeSink = hashingSink.sink;
+            await remoteFs.readFileToSink(
+              folderId,
+              path,
+              hashingSink.sink,
+              onProgress,
+              syncController.signal,
+            );
+            localHash = hashingSink.digestHex();
+          } else {
+            const bytes = await remoteFs.readFileFully(
+              folderId,
+              path,
+              onProgress,
+              syncController.signal,
+            );
+            await client.cacheFile(folderId, path, name, bytes, modifiedMs);
+            localHash = await digestBytesHex(bytes);
+          }
           outcome = "completed";
-          return bytes;
+          return localHash;
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") outcome = "cancelled";
+          if (activeSink) await activeSink.abort(error);
           throw error;
         } finally {
           await finishManagedTransfer(id, outcome);
@@ -1147,7 +1170,7 @@ export const createAppActions = (args: {
         const cached = cachedByKey.get(key);
 
         if (!cached) {
-          const bytes = await downloadStarredFile(
+          const localHash = await downloadStarredFile(
             favorite.folderId,
             targetPath,
             favorite.name,
@@ -1155,8 +1178,35 @@ export const createAppActions = (args: {
             remoteEntry.modifiedMs || Date.now(),
           );
           state.sync.starredFileSyncState[key] = {
-            lastLocalHash: await digestBytesHex(bytes),
+            lastLocalHash: localHash,
             lastRemoteModifiedMs: remoteEntry.modifiedMs || Date.now(),
+            lastRemoteSizeBytes: remoteEntry.size,
+            lastSyncAtMs: Date.now(),
+            lastDirection: "download",
+          };
+          downloaded += 1;
+          continue;
+        }
+
+        const remoteModifiedMs = remoteEntry.modifiedMs || 0;
+        const previous = state.sync.starredFileSyncState[key];
+        const remoteChanged = remoteFavoriteNeedsDownload(
+          { sizeBytes: remoteEntry.size, modifiedMs: remoteModifiedMs },
+          previous,
+          cached,
+        );
+        if (remoteChanged) {
+          const localHash = await downloadStarredFile(
+            favorite.folderId,
+            targetPath,
+            favorite.name,
+            remoteEntry.size,
+            remoteModifiedMs || Date.now(),
+          );
+          state.sync.starredFileSyncState[key] = {
+            lastLocalHash: localHash,
+            lastRemoteModifiedMs: remoteModifiedMs || Date.now(),
+            lastRemoteSizeBytes: remoteEntry.size,
             lastSyncAtMs: Date.now(),
             lastDirection: "download",
           };
@@ -1172,14 +1222,13 @@ export const createAppActions = (args: {
             localBytes = null;
           }
         }
-        const remoteModifiedMs = remoteEntry.modifiedMs || 0;
-        const previous = state.sync.starredFileSyncState[key];
 
         if (!previous) {
           const baselineHash = localBytes ? await digestBytesHex(localBytes) : "";
           state.sync.starredFileSyncState[key] = {
             lastLocalHash: baselineHash,
             lastRemoteModifiedMs: remoteModifiedMs,
+            lastRemoteSizeBytes: remoteEntry.size,
             lastSyncAtMs: Date.now(),
             lastDirection: "baseline",
           };
@@ -1188,27 +1237,8 @@ export const createAppActions = (args: {
 
         const localHash = localBytes ? await digestBytesHex(localBytes) : previous.lastLocalHash;
         const localChanged = Boolean(localBytes) && localHash !== previous.lastLocalHash;
-        const remoteChanged = remoteModifiedMs > previous.lastRemoteModifiedMs;
 
-        if (remoteChanged && !localChanged) {
-          const bytes = await downloadStarredFile(
-            favorite.folderId,
-            targetPath,
-            favorite.name,
-            remoteEntry.size,
-            remoteModifiedMs || Date.now(),
-          );
-          state.sync.starredFileSyncState[key] = {
-            lastLocalHash: await digestBytesHex(bytes),
-            lastRemoteModifiedMs: remoteModifiedMs || Date.now(),
-            lastSyncAtMs: Date.now(),
-            lastDirection: "download",
-          };
-          downloaded += 1;
-          continue;
-        }
-
-        if (localChanged && !remoteChanged && localBytes) {
+        if (localChanged && localBytes) {
           const uploadModifiedMs = Date.now();
           await uploadStarredFile(
             favorite.folderId,
@@ -1220,6 +1250,7 @@ export const createAppActions = (args: {
           state.sync.starredFileSyncState[key] = {
             lastLocalHash: localHash,
             lastRemoteModifiedMs: uploadModifiedMs,
+            lastRemoteSizeBytes: localBytes.length,
             lastSyncAtMs: Date.now(),
             lastDirection: "upload",
           };
@@ -1227,43 +1258,24 @@ export const createAppActions = (args: {
           continue;
         }
 
-        if (localChanged && remoteChanged) {
-          const bytes = await downloadStarredFile(
-            favorite.folderId,
-            targetPath,
-            favorite.name,
-            remoteEntry.size,
-            remoteModifiedMs || Date.now(),
-          );
-          state.sync.starredFileSyncState[key] = {
-            lastLocalHash: await digestBytesHex(bytes),
-            lastRemoteModifiedMs: remoteModifiedMs || Date.now(),
-            lastSyncAtMs: Date.now(),
-            lastDirection: "download",
-          };
-          conflicts += 1;
-          downloaded += 1;
-          continue;
-        }
-
         state.sync.starredFileSyncState[key] = {
           ...previous,
           lastLocalHash: localHash,
-          lastRemoteModifiedMs: Math.max(previous.lastRemoteModifiedMs, remoteModifiedMs),
+          lastRemoteModifiedMs: remoteModifiedMs,
+          lastRemoteSizeBytes: remoteEntry.size,
           lastSyncAtMs: previous.lastSyncAtMs,
         };
       }
 
-      if (uploaded > 0 || downloaded > 0 || conflicts > 0) {
+      if (uploaded > 0 || downloaded > 0) {
         pushSessionLog(
           state,
           "info",
           "starred.sync.complete",
-          `Starred sync finished: uploaded=${uploaded}, downloaded=${downloaded}, conflicts=${conflicts}.`,
+          `Starred sync finished: uploaded=${uploaded}, downloaded=${downloaded}.`,
           {
             uploaded,
             downloaded,
-            conflicts,
             durationMs: elapsedMsSince(startedAtMs),
             fileCount: starredFiles.length,
           },
@@ -1509,6 +1521,16 @@ export const createAppActions = (args: {
     state.session.directoryPage = 1;
   };
 
+  const setDirectorySortMode = (sortMode: FileEntrySortMode) => {
+    state.ui.directorySortMode = sortMode;
+    state.session.directoryPage = 1;
+  };
+
+  const setDirectoryNameFilter = (nameFilter: string) => {
+    state.ui.directoryNameFilter = nameFilter;
+    state.session.directoryPage = 1;
+  };
+
   const toggleFavorite = async (
     folderId: string,
     path: string,
@@ -1671,6 +1693,7 @@ export const createAppActions = (args: {
     let activeConnectedVia = state.session.connectionPath;
     let activeConnectionScope = state.session.connectionScope;
     let activeSink: FileDownloadSink | null = null;
+    let downloadedHash: string;
     let transferOutcome: "completed" | "failed" | "cancelled" = "failed";
     const abortController = new AbortController();
     const cancelTransfer = () => {
@@ -1747,16 +1770,27 @@ export const createAppActions = (args: {
         }
       };
       let downloadResult: FileDownloadResult;
+      const remoteEntry = state.session.entries.find(
+        (entry) => entry.type === "file" && normalizePath(entry.path) === normalizePath(path),
+      );
+      const remoteModifiedMs = remoteEntry?.modifiedMs || Date.now();
       if (remoteFs.readFileToSink && client.createFileDownloadSink) {
-        const sink = await client.createFileDownloadSink({ folderId, path, name });
-        activeSink = sink;
+        const sink = await client.createFileDownloadSink({
+          folderId,
+          path,
+          name,
+          modifiedMs: remoteModifiedMs,
+        });
+        const hashingSink = createSha256DownloadSink(sink);
+        activeSink = hashingSink.sink;
         downloadResult = await remoteFs.readFileToSink(
           folderId,
           path,
-          sink,
+          hashingSink.sink,
           onProgress,
           abortController.signal,
         );
+        downloadedHash = hashingSink.digestHex();
       } else {
         const bytes = await downloadRemoteFile(remoteFs, {
           folderId,
@@ -1764,12 +1798,20 @@ export const createAppActions = (args: {
           onProgress,
           signal: abortController.signal,
         });
-        await client.cacheFile(folderId, path, name, bytes);
+        await client.cacheFile(folderId, path, name, bytes, remoteModifiedMs);
+        downloadedHash = await digestBytesHex(bytes);
         downloadResult = { bytesWritten: bytes.length, totalBytes: bytes.length };
       }
       const elapsedMs = elapsedMsSince(startedAt);
       const rateBps = averageRateBps(downloadResult.bytesWritten, elapsedMs);
       updateCachedKey(state, folderId, path, true);
+      state.sync.starredFileSyncState[downloadKey] = {
+        lastLocalHash: downloadedHash,
+        lastRemoteModifiedMs: remoteModifiedMs,
+        lastRemoteSizeBytes: downloadResult.totalBytes,
+        lastSyncAtMs: Date.now(),
+        lastDirection: "download",
+      };
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
       state.favorites.activeDownloadText =
         `100% • Done • ${downloadTransportText(activeTransportKind, activeConnectionScope)}`;
@@ -3103,6 +3145,8 @@ export const createAppActions = (args: {
     goToRootView,
     setDirectoryPage,
     setDirectoryPageSize,
+    setDirectorySortMode,
+    setDirectoryNameFilter,
     toggleFavorite,
     removeFavorite,
     openFavorite,

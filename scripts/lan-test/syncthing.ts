@@ -361,6 +361,11 @@ export interface RunningLanFixture {
   addUntrustedProfile: (deviceId: string) => Promise<void>;
   verifyUploadedFile: () => Promise<{ sha256: string; size: number }>;
   churn: (durationMs: number) => Promise<number>;
+  updateFixtureFile: (relativePath: string, content: string) => Promise<{
+    path: string;
+    sha256: string;
+    size: number;
+  }>;
   listPendingDevices: () => Promise<PendingSyncthingDevice[]>;
   waitForPendingDeviceChange: (
     since: number,
@@ -502,6 +507,22 @@ export const createLanFixture = async (args: {
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       return ticks;
+    },
+    updateFixtureFile: async (relativePath, content) => {
+      const normalized = relativePath.replace(/^\/+|\/+$/g, "");
+      if (!normalized || normalized.includes("..")) {
+        throw new Error("Fixture update path must stay inside the shared folder.");
+      }
+      const target = path.join(sharePath, normalized);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content, "utf8");
+      const future = new Date(Date.now() + 2_000);
+      fs.utimesSync(target, future, future);
+      await request({
+        pathname: "/rest/db/scan?folder=" + encodeURIComponent(folderId),
+        method: "POST",
+      });
+      return { path: normalized, ...hashFile(target) };
     },
     listPendingDevices: () => listPendingDevices(request),
     waitForPendingDeviceChange: (since, signal) =>

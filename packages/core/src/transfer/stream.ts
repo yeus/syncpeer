@@ -1,4 +1,6 @@
 import type { Port } from "./frpBus.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 
 export interface FileDownloadMetadata {
   folderId: string;
@@ -24,6 +26,38 @@ export interface DownloadCheckpoint {
 export class RemoteMetadataChangedError extends Error {
   readonly name = "RemoteMetadataChangedError";
 }
+
+export const createSha256DownloadSink = (
+  sink: FileDownloadSink,
+): { sink: FileDownloadSink; digestHex: () => string } => {
+  const hash = sha256.create();
+  let nextOffset = 0;
+  let committed = false;
+  let digest = "";
+  return {
+    sink: {
+      begin: (metadata) => sink.begin(metadata),
+      write: async (offset, bytes) => {
+        if (offset !== nextOffset) {
+          throw new Error(`Hashing download sink expected offset ${nextOffset}, received ${offset}.`);
+        }
+        await sink.write(offset, bytes);
+        hash.update(bytes);
+        nextOffset += bytes.length;
+      },
+      commit: async () => {
+        await sink.commit();
+        committed = true;
+      },
+      abort: (error) => sink.abort(error),
+    },
+    digestHex: () => {
+      if (!committed) throw new Error("Download hash is unavailable before commit.");
+      if (!digest) digest = bytesToHex(hash.digest());
+      return digest;
+    },
+  };
+};
 
 const sameMetadata = (left: FileDownloadMetadata, right: FileDownloadMetadata): boolean =>
   left.folderId === right.folderId &&

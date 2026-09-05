@@ -16,10 +16,12 @@ import {
   resolvePreferredSourceDeviceId,
   resolveFolderPasswordsForDevice,
   sameDeviceId,
+  sortAndFilterFileEntries,
   toConnectionSettings,
   type CachedFileRecord,
   type ConnectionScope,
   type FileEntry,
+  type FileEntrySortMode,
   type FolderInfo,
   type FolderSyncState,
   type RemoteDeviceInfo,
@@ -65,6 +67,7 @@ export const loadPersistedState = () => {
     offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
     directoryPageSize?: number;
     directoryViewMode?: "list" | "grid";
+    directorySortMode?: FileEntrySortMode;
     pim?: {
       enabled?: boolean;
       contactsEnabled?: boolean;
@@ -91,6 +94,9 @@ const normalizeDirectoryPageSize = (value: unknown) => {
 const normalizeDirectoryViewMode = (value: unknown): "list" | "grid" =>
   value === "grid" ? "grid" : "list";
 
+const normalizeDirectorySortMode = (value: unknown): FileEntrySortMode =>
+  value === "modified" || value === "size" || value === "type" ? value : "name";
+
 export const persistState = (state: AppState) => {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(
@@ -105,6 +111,7 @@ export const persistState = (state: AppState) => {
       offlineFolderSnapshots: state.offline.snapshots,
       directoryPageSize: state.ui.directoryPageSize,
       directoryViewMode: state.ui.directoryViewMode,
+      directorySortMode: state.ui.directorySortMode,
       pim: state.pim,
     }),
   );
@@ -254,6 +261,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       lastLoggedError: "",
       directoryPageSize: normalizeDirectoryPageSize(persisted?.directoryPageSize),
       directoryViewMode: normalizeDirectoryViewMode(persisted?.directoryViewMode),
+      directorySortMode: normalizeDirectorySortMode(persisted?.directorySortMode),
+      directoryNameFilter: "",
     },
     sync: {
       isSyncingStarredFiles: false,
@@ -262,6 +271,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         {
           lastLocalHash: string;
           lastRemoteModifiedMs: number;
+          lastRemoteSizeBytes: number;
           lastSyncAtMs: number;
           lastDirection: "upload" | "download" | "baseline";
         }
@@ -420,10 +430,7 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   ) {
     state.session.directoryPage = 1;
   }
-  const totalPages = Math.max(
-    1,
-    Math.ceil(state.session.entries.length / state.ui.directoryPageSize),
-  );
+  const totalPages = directoryTotalPages(state);
   if (state.session.directoryPage > totalPages) {
     state.session.directoryPage = totalPages;
   }
@@ -621,8 +628,15 @@ export const connectTargetLabel = (state: AppState) => {
   return savedName ? `${savedName} (${targetId})` : targetId;
 };
 
+export const visibleDirectoryEntries = (state: AppState) =>
+  sortAndFilterFileEntries(
+    state.session.entries,
+    state.ui.directorySortMode,
+    state.ui.directoryNameFilter,
+  );
+
 export const directoryTotalPages = (state: AppState) =>
-  Math.max(1, Math.ceil(state.session.entries.length / state.ui.directoryPageSize));
+  Math.max(1, Math.ceil(visibleDirectoryEntries(state).length / state.ui.directoryPageSize));
 
 export const directoryCurrentPage = (state: AppState) =>
   Math.min(
@@ -634,7 +648,7 @@ export const paginatedDirectoryEntries = (state: AppState) => {
   const pageSize = state.ui.directoryPageSize;
   const page = directoryCurrentPage(state);
   const start = (page - 1) * pageSize;
-  return state.session.entries.slice(start, start + pageSize);
+  return visibleDirectoryEntries(state).slice(start, start + pageSize);
 };
 
 export const folderVersionKeyFromState = (state: AppState, folderId: string) => {

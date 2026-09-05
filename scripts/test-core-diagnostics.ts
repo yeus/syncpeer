@@ -20,9 +20,11 @@ import { RemoteFs as BuiltRemoteFs } from "../packages/core/dist/core/model/remo
 import {
   createDuplexChannel,
   createPortDownloadSink,
+  createSha256DownloadSink,
   createSyncpeerSessionStore,
   isTransportFailure,
   makeReadDirWithRetryFlow,
+  sortAndFilterFileEntries,
   type FileTransferMessage,
   type RemoteFsLike,
 } from "../packages/core/dist/browser.js";
@@ -53,6 +55,55 @@ import {
 assert.equal(isTransportFailure(new Error("TLS flush failed: Broken pipe")), true);
 assert.equal(isTransportFailure(new Error("Request timeout for file at offset 0")), true);
 assert.equal(isTransportFailure(new Error("No such file")), false);
+
+const directoryEntries = [
+  { name: "zeta.txt", path: "zeta.txt", type: "file" as const, size: 10, modifiedMs: 100 },
+  { name: "Alpha", path: "Alpha", type: "directory" as const, size: 0, modifiedMs: 50 },
+  { name: "beta.png", path: "beta.png", type: "file" as const, size: 20, modifiedMs: 200 },
+  { name: "apple.txt", path: "apple.txt", type: "file" as const, size: 5, modifiedMs: 300 },
+];
+assert.deepEqual(
+  sortAndFilterFileEntries(directoryEntries, "name", "").map((entry) => entry.name),
+  ["Alpha", "apple.txt", "beta.png", "zeta.txt"],
+);
+assert.deepEqual(
+  sortAndFilterFileEntries(directoryEntries, "modified", "").map((entry) => entry.name),
+  ["Alpha", "apple.txt", "beta.png", "zeta.txt"],
+);
+assert.deepEqual(
+  sortAndFilterFileEntries(directoryEntries, "size", "").map((entry) => entry.name),
+  ["Alpha", "beta.png", "zeta.txt", "apple.txt"],
+);
+assert.deepEqual(
+  sortAndFilterFileEntries(directoryEntries, "type", "").map((entry) => entry.name),
+  ["Alpha", "beta.png", "apple.txt", "zeta.txt"],
+);
+assert.deepEqual(
+  sortAndFilterFileEntries(directoryEntries, "name", "BE").map((entry) => entry.name),
+  ["beta.png"],
+);
+
+const writtenChunks: Array<{ offset: number; bytes: Uint8Array }> = [];
+const hashingDownload = createSha256DownloadSink({
+  begin: () => undefined,
+  write: (offset, bytes) => writtenChunks.push({ offset, bytes: new Uint8Array(bytes) }),
+  commit: () => undefined,
+  abort: () => undefined,
+});
+await hashingDownload.sink.begin({
+  folderId: "folder",
+  path: "file.bin",
+  sizeBytes: 6,
+  encrypted: false,
+});
+await hashingDownload.sink.write(0, new TextEncoder().encode("abc"));
+await hashingDownload.sink.write(3, new TextEncoder().encode("def"));
+await hashingDownload.sink.commit();
+assert.equal(writtenChunks.length, 2);
+assert.equal(
+  hashingDownload.digestHex(),
+  createHash("sha256").update("abcdef").digest("hex"),
+);
 
 const defaultDiscoveryServer = getDefaultDiscoveryServer();
 assert.ok(new URL(defaultDiscoveryServer).searchParams.get("id"));

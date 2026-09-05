@@ -243,6 +243,13 @@ const runServer = async (args: {
       const durationMs = Number((details as { durationMs?: number } | undefined)?.durationMs ?? 12000);
       return { ticks: await fixture.churn(Math.min(Math.max(durationMs, 1000), 30000)) };
     }
+    if (action === "update-fixture-file") {
+      const input = details as { path?: string; content?: string } | undefined;
+      return fixture.updateFixtureFile(
+        String(input?.path ?? ""),
+        String(input?.content ?? ""),
+      );
+    }
     throw new Error("Unknown LAN fixture action: " + action);
   });
   try {

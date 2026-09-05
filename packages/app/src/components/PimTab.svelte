@@ -31,9 +31,12 @@
 </script>
 
 <Panel title="PIM Settings">
+  <p class="hint" data-testid="pim-experimental-notice">
+    PIM synchronization is experimental and is turned off by default.
+  </p>
   <form class="settings-grid">
     <label class="checkbox-row">
-      <input type="checkbox" bind:checked={app.pim.enabled} />
+      <input data-testid="pim-enabled" type="checkbox" bind:checked={app.pim.enabled} />
       <span>Enable Contacts + Calendar Sync (PIM)</span>
     </label>
 

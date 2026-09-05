@@ -9,6 +9,7 @@
     "test": "npm run test:diagnostics",
     "test:connection": "npm run build:core && node --experimental-strip-types --test scripts/test-connection-management.ts",
     "test:transfer-notifications": "npm run build:core && node --experimental-strip-types --test scripts/test-transfer-notifications.ts",
+    "test:favorite-sync": "node --experimental-strip-types --test scripts/test-favorite-sync-policies.ts",
     "test:quic:runtime": "node --experimental-quic --experimental-strip-types scripts/test-node-quic-runtime.ts",
     "test:quic:cli": "npm run build:cli && node --experimental-quic --experimental-strip-types scripts/test-node-quic-integration.ts",
     "test:diagnostics": "node --experimental-strip-types scripts/test-diagnostics.ts",

@@ -518,6 +518,7 @@
         class="row-action"
         onclick={() => onToggleFavorite(item.folderId, "", item.name, "folder")}
         aria-label="Toggle favorite"
+        aria-pressed={item.isFavorite}
       >
         {#if item.isFavorite}
           <Star size={16} class="favorite-star-on" fill="currentColor" />
@@ -567,6 +568,7 @@
             item.entryType === "directory" ? "folder" : "file",
           )}
         aria-label="Toggle favorite"
+        aria-pressed={item.isFavorite}
       >
         {#if item.isFavorite}
           <Star size={16} class="favorite-star-on" fill="currentColor" />

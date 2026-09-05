@@ -105,6 +105,8 @@ export {
   makeWaitForFoldersToPopulateFlow,
 } from "./ui/sessionFlows.js";
 export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.js";
+export { sortAndFilterFileEntries } from "./ui/fileEntries.js";
+export type { FileEntrySortMode } from "./ui/fileEntries.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export {
   createDuplexChannel,
@@ -116,6 +118,7 @@ export type { DuplexTransport } from "./transfer/frpTransport.js";
 export {
   createCheckpointedDownloadSink,
   createPortDownloadSink,
+  createSha256DownloadSink,
   RemoteMetadataChangedError,
 } from "./transfer/stream.js";
 export type {

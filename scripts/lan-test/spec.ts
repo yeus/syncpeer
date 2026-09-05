@@ -175,6 +175,55 @@ describe("Syncpeer LAN integration", () => {
     });
   });
 
+  it("updates a downloaded favorite after the remote file changes", async () => {
+    const favoriteClicked = await lanBrowser.execute((name) => {
+      const title = [...document.querySelectorAll(".item-title")]
+        .find((element) => element.textContent?.trim() === name);
+      const row = title?.closest("li");
+      const button = row?.querySelector("button[aria-label='Toggle favorite']") as
+        | HTMLButtonElement
+        | null;
+      if (button?.getAttribute("aria-pressed") !== "true") button?.click();
+      return Boolean(button);
+    }, "hello.txt");
+    assert.equal(favoriteClicked, true, "Could not mark the downloaded fixture as a favorite.");
+
+    const content = `updated remotely at ${Date.now()}\n`;
+    const updated = await request<{ sha256: string }>("POST", "/v1/action", {
+      action: "update-fixture-file",
+      details: { path: "hello.txt", content },
+    });
+    await lanBrowser.waitUntil(
+      async () => await readCachedHash(lanBrowser, "hello.txt") === updated.sha256,
+      {
+        timeout: 75_000,
+        interval: 1_000,
+        timeoutMsg: "Downloaded favorite did not update during periodic synchronization.",
+      },
+    );
+  });
+
+  it("sorts and filters folder entries", async () => {
+    await setValue("folder-name-filter", "hello");
+    await waitForText(lanBrowser, "hello.txt");
+    assert.equal((await lanBrowser.getPageSource()).includes("blob.bin"), false);
+
+    await setValue("folder-name-filter", "");
+    const sort = $("[data-testid='folder-sort-mode']");
+    await sort.selectByAttribute("value", "size");
+    await lanBrowser.waitUntil(async () => {
+      const names = await lanBrowser.execute(() =>
+        [...document.querySelectorAll(".item-title")]
+          .map((element) => element.textContent?.trim() ?? "")
+          .filter(Boolean),
+      );
+      return names.indexOf("blob.bin") >= 0 && names.indexOf("blob.bin") < names.indexOf("hello.txt");
+    }, {
+      timeout: 10_000,
+      timeoutMsg: "Folder entries were not sorted by descending size.",
+    });
+  });
+
   it("keeps a large transfer active while metadata churn runs", async () => {
     await runPhase("direct", async () => {
       const churn = request<{ ticks: number }>("POST", "/v1/action", {

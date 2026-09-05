@@ -4,6 +4,7 @@
     CachedFileRecord,
     FileEntry,
     FolderInfo,
+    FileEntrySortMode,
   } from "@syncpeer/core/browser";
   import type { AppState } from "../app/state.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
@@ -26,6 +27,8 @@
     onOpenDirectory: (path: string) => void;
     onSetDirectoryPage: (page: number) => void;
     onSetDirectoryPageSize: (size: number) => void;
+    onSetDirectorySortMode: (mode: FileEntrySortMode) => void;
+    onSetDirectoryNameFilter: (nameFilter: string) => void;
     onSetDirectoryViewMode: (mode: "list" | "grid") => void;
     onOpenCachedDirectory: (folderId: string, path: string) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
@@ -50,6 +53,8 @@
     directoryTotalPages: number;
     directoryPageSize: number;
     directoryViewMode: "list" | "grid";
+    directorySortMode: FileEntrySortMode;
+    directoryNameFilter: string;
     formatBytes: (value: number) => string;
     formatModified: (value: number) => string;
     onHandleUploadClick: () => void;
@@ -67,6 +72,8 @@
     onOpenDirectory,
     onSetDirectoryPage,
     onSetDirectoryPageSize,
+    onSetDirectorySortMode,
+    onSetDirectoryNameFilter,
     onSetDirectoryViewMode,
     onOpenCachedDirectory,
     onOpenCachedFile,
@@ -91,6 +98,8 @@
     directoryTotalPages,
     directoryPageSize,
     directoryViewMode,
+    directorySortMode,
+    directoryNameFilter,
     formatBytes,
     formatModified,
     onHandleUploadClick,
@@ -251,6 +260,32 @@
     {/if}
 
     {#if app.session.currentFolderId}
+      <div class="directory-tools">
+        <label>
+          Filter by name
+          <input
+            data-testid="folder-name-filter"
+            type="search"
+            value={directoryNameFilter}
+            placeholder="Search this folder"
+            oninput={(event) => onSetDirectoryNameFilter(event.currentTarget.value)}
+          />
+        </label>
+        <label>
+          Sort by
+          <select
+            data-testid="folder-sort-mode"
+            value={directorySortMode}
+            onchange={(event) =>
+              onSetDirectorySortMode(event.currentTarget.value as FileEntrySortMode)}
+          >
+            <option value="name">Name</option>
+            <option value="modified">Date changed</option>
+            <option value="size">Size</option>
+            <option value="type">Type</option>
+          </select>
+        </label>
+      </div>
       <div class="actions">
         <input id="folder-upload-input" class="upload-input" type="file" multiple onchange={onHandleUploadSelected} />
         <button class="primary" onclick={onHandleUploadClick}>
@@ -343,7 +378,9 @@
         {:else if app.session.directory?.status === "error"}
           <li class="empty">{app.session.directory.error || "Could not load folder contents."}</li>
         {:else if entryRows.length === 0}
-          <li class="empty">Folder is empty.</li>
+          <li class="empty">
+            {directoryNameFilter.trim() ? "No files match this filter." : "Folder is empty."}
+          </li>
         {:else}
           {#each entryRows as item (item.path)}
             <FileSystemListItem
@@ -366,7 +403,7 @@
         {/if}
       </ul>
 
-      {#if app.session.entries.length > 0}
+      {#if entryRows.length > 0}
         <div class="actions">
           <label>
             Files per page
@@ -423,6 +460,26 @@
     font-size: 0.82rem;
     color: var(--text-secondary);
     margin-bottom: 0.45rem;
+  }
+
+  .directory-tools {
+    display: grid;
+    grid-template-columns: minmax(10rem, 1fr) minmax(8rem, 0.4fr);
+    gap: 0.55rem;
+    margin-bottom: 0.55rem;
+  }
+
+  .directory-tools label {
+    display: grid;
+    gap: 0.25rem;
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+  }
+
+  @media (max-width: 520px) {
+    .directory-tools {
+      grid-template-columns: 1fr;
+    }
   }
 
   .actions {

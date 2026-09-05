@@ -364,6 +364,8 @@
           onOpenDirectory={actions.openDirectory}
           onSetDirectoryPage={actions.setDirectoryPage}
           onSetDirectoryPageSize={actions.setDirectoryPageSize}
+          onSetDirectorySortMode={actions.setDirectorySortMode}
+          onSetDirectoryNameFilter={actions.setDirectoryNameFilter}
           onSetDirectoryViewMode={(mode) => {
             app.ui.directoryViewMode = mode;
           }}
@@ -390,6 +392,8 @@
           directoryTotalPages={currentDirectoryTotalPages}
           directoryPageSize={app.ui.directoryPageSize}
           directoryViewMode={app.ui.directoryViewMode}
+          directorySortMode={app.ui.directorySortMode}
+          directoryNameFilter={app.ui.directoryNameFilter}
           {formatBytes}
           {formatModified}
           onHandleUploadClick={actions.handleUploadClick}
@@ -426,6 +430,7 @@
         <span class="sr-only">Devices</span>
       </button>
       <button
+        data-testid="tab-pim"
         type="button"
         class={`tab-button ${app.activeTab === "pim" ? "active" : ""}`}
         onclick={(event) => actions.switchTab("pim", event)}

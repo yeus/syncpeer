@@ -42,6 +42,10 @@ This project should prefer explicit, minimal, functional-style architecture.
 ## Testing Expectations
 
 - Add tests that reproduce real workload patterns, not only happy paths.
+- Use only repository-managed local fixtures or an explicitly configured test
+  server as test peers. Real-world peer identifiers, addresses, and devices
+  found in logs are diagnostic evidence only and must never be contacted or
+  reused as test targets.
 - Do not weaken tests to make them pass.
 - Prefer root-cause fixes over timeout inflation.
 - Include stress tests for:
@@ -55,4 +59,3 @@ This project should prefer explicit, minimal, functional-style architecture.
 - Keep compatibility/migration in mind (data should be portable when possible).
 - Keep visual/style changes minimal unless explicitly requested.
 - Run lightweight checks after edits (typecheck/tests relevant to changes).
-

@@ -442,6 +442,14 @@ export const createTauriAdapters = (
     createFileDownloadSink: async ({ folderId, path, name, modifiedMs }): Promise<FileDownloadSink> => {
       let transferId: string | null = null;
       let committed = false;
+      let sizeBytes = 0;
+      const digestRanges = async (source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) => {
+        if (!transferId || committed) throw new Error("Download sink is not readable.");
+        const result = await invokeWithLogging<Array<{ offset: number; size: number; hash: number[] }>>(
+          "syncpeer_cache_digest_ranges", { request: { transferId, source, ranges } },
+        );
+        return result.map((range) => ({ ...range, hash: new Uint8Array(range.hash) }));
+      };
       return {
         begin: async (metadata) => {
           if (transferId) return;
@@ -458,6 +466,18 @@ export const createTauriAdapters = (
             },
           );
           transferId = response.transferId;
+          sizeBytes = metadata.sizeBytes;
+        },
+        digestCachedRanges: (ranges) => digestRanges("cached", ranges),
+        digestPartialRanges: (ranges) => digestRanges("partial", ranges),
+        copyCachedRanges: async (ranges) => {
+          if (!transferId || committed) throw new Error("Download sink is not writable.");
+          await invokeWithLogging("syncpeer_cache_copy_ranges", { request: { transferId, source: "cached", ranges } });
+        },
+        digestFile: async () => {
+          const [digest] = await digestRanges("partial", [{ offset: 0, size: sizeBytes }]);
+          if (!digest) throw new Error("Complete download digest is unavailable.");
+          return Array.from(digest.hash, (byte) => byte.toString(16).padStart(2, "0")).join("");
         },
         write: async (offset, bytes) => {
           if (!transferId || committed) throw new Error("Download sink is not writable.");

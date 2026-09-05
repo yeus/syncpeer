@@ -5,7 +5,7 @@ import {
   type SyncpeerSessionHandle,
 } from "../client.js";
 import { isTransportFailure } from "../core/model/remoteFs.js";
-import { createCheckpointedDownloadSink, type FileDownloadSink } from "../transfer/stream.js";
+import { createCheckpointedDownloadSink, DownloadInterruptedError, type FileDownloadSink } from "../transfer/stream.js";
 import type { ConnectOptions, RemoteFsLike } from "./browserClient.js";
 
 export const createRecoveringRemoteFs = (deps: {
@@ -47,6 +47,10 @@ export const createRecoveringRemoteFs = (deps: {
         const abort = signal?.aborted || (error instanceof Error && error.name === "AbortError");
         const retryable = !abort && isTransportFailure(error) && (!session || session.isClosed());
         if (retryable && attempt < 2) continue;
+        if (retryable && sink.suspend) {
+          await sink.suspend();
+          throw new DownloadInterruptedError("Download interrupted; verified data is retained for the next attempt.", { cause: error });
+        }
         await checkpointed.sink.abort(error);
         throw error;
       }

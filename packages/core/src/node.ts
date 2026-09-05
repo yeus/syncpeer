@@ -40,7 +40,9 @@ export type {
   AppRuntimeSurface,
 } from "./appInfo.js";
 export { downloadRemoteFile } from "./transfer/download.js";
+export { createNodeFileDownloadSink } from "./transfer/nodeStorage.js";
 export type { FileDownloadSink } from "./transfer/stream.js";
+export { DownloadInterruptedError } from "./transfer/stream.js";
 export {
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,

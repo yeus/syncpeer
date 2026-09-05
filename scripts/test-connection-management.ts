@@ -18,6 +18,7 @@ import {
 import {
   createCheckpointedDownloadSink,
   RemoteMetadataChangedError,
+  DownloadInterruptedError,
 } from "../packages/core/dist/transfer/stream.js";
 import { createRecoveringRemoteFs } from "../packages/core/dist/ui/recoveringRemoteFs.js";
 import { RemoteFs } from "../packages/core/dist/core/model/remoteFs.js";
@@ -544,6 +545,23 @@ test("download recovery resumes missing ranges without duplicating sink writes",
   });
   assert.deepEqual(writes, [0, 4]);
   assert.equal(aborts, 0);
+});
+
+test("exhausted transport retries suspend resumable downloads instead of aborting", async () => {
+  let suspends = 0;
+  const recovering = createRecoveringRemoteFs({
+    getOptions: () => ({ host: "test.invalid", port: 22000, deviceName: "test" }),
+    ensureSession: async () => { throw new Error("connection closed"); },
+    getFocusedFolderId: () => null,
+    setFocusedFolderId: () => {},
+    getActiveSession: () => null,
+  });
+  await assert.rejects(recovering.readFileToSink!("folder", "file", {
+    begin: () => {}, write: () => {}, commit: () => {},
+    abort: () => assert.fail("interrupted download was discarded"),
+    suspend: async () => { suspends += 1; },
+  }), DownloadInterruptedError);
+  assert.equal(suspends, 1);
 });
 
 test("ambiguous uploads are verified by hashes and never replayed", async () => {

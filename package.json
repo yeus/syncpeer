@@ -7,6 +7,7 @@
     "packages/*"
   ],
   "scripts": {
+    "test:block-reuse": "npm run build:core && node --experimental-strip-types --test scripts/test-block-reuse.ts",
     "test": "npm run test:diagnostics",
     "test:connection": "npm run build:core && node --experimental-strip-types --test scripts/test-connection-management.ts",
     "test:transfer-notifications": "npm run build:core && node --experimental-strip-types --test scripts/test-transfer-notifications.ts",

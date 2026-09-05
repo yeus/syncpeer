@@ -7,11 +7,12 @@ import { spawnSync } from "node:child_process";
 import type { SharedFolder } from "@syncpeer/core";
 import {
   createNodeSessionTransport,
+  createNodeFileDownloadSink,
+  DownloadInterruptedError,
   downloadRemoteFile,
   getDefaultDiscoveryServer,
   resolveNodeGlobalDiscovery,
 } from "@syncpeer/core/node";
-import type { FileDownloadSink } from "@syncpeer/core/node";
 import { ensureCliNodeIdentity } from "./identity.js";
 import { formatAppBuildInfo, getCliBuildInfo } from "./appInfo.js";
 
@@ -233,50 +234,6 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.floor(ms)));
 }
 
-async function createFileDownloadSink(localPath: string): Promise<FileDownloadSink> {
-  const finalPath = path.resolve(localPath);
-  const partialPath = `${finalPath}.syncpeer-part`;
-  await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
-  const handle = await fs.promises.open(partialPath, "w+");
-  let committed = false;
-  let closed = false;
-  const close = async () => {
-    if (closed) return;
-    closed = true;
-    await handle.close();
-  };
-  return {
-    begin: () => undefined,
-    write: async (offset, bytes) => {
-      if (closed || committed) throw new Error("Download sink is not writable.");
-      let written = 0;
-      while (written < bytes.byteLength) {
-        const result = await handle.write(
-          bytes,
-          written,
-          bytes.byteLength - written,
-          offset + written,
-        );
-        if (result.bytesWritten <= 0) {
-          throw new Error("Download sink made no progress while writing.");
-        }
-        written += result.bytesWritten;
-      }
-    },
-    commit: async () => {
-      if (committed) return;
-      await handle.sync();
-      await close();
-      await fs.promises.rename(partialPath, finalPath);
-      committed = true;
-    },
-    abort: async () => {
-      await close();
-      await fs.promises.rm(partialPath, { force: true });
-    },
-  };
-}
-
 async function main() {
   reexecuteWithNativeQuicIfAvailable();
   const program = new Command();
@@ -482,7 +439,7 @@ async function main() {
           console.log(`Transfer transport: ${transportKind}`);
         };
         const sink = remoteFs.readFileToSink
-          ? await createFileDownloadSink(localPath)
+          ? await createNodeFileDownloadSink(localPath)
           : null;
         try {
           const result = remoteFs.readFileToSink
@@ -503,7 +460,7 @@ async function main() {
             `in ${elapsedMs} ms (${mibPerSecond.toFixed(2)} MiB/s)`,
           );
         } catch (error) {
-          await sink?.abort(error);
+          if (!(error instanceof DownloadInterruptedError)) await sink?.abort(error);
           throw error;
         }
       }),

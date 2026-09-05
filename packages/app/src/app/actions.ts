@@ -1,6 +1,7 @@
 import {
   createSyncpeerSessionStore,
   createSha256DownloadSink,
+  DownloadInterruptedError,
   cachedFileKey,
   downloadRemoteFile,
   favoriteKey,
@@ -1108,7 +1109,7 @@ export const createAppActions = (args: {
           return localHash;
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") outcome = "cancelled";
-          if (activeSink) await activeSink.abort(error);
+          if (activeSink && !(error instanceof DownloadInterruptedError)) await activeSink.abort(error);
           throw error;
         } finally {
           await finishManagedTransfer(id, outcome);
@@ -1772,9 +1773,15 @@ export const createAppActions = (args: {
         transportKind,
         connectedVia,
         connectionScope,
+        networkBytes,
+        reusedBytes,
+        resumedBytes,
       }: {
         downloadedBytes: number;
         totalBytes: number;
+        networkBytes?: number;
+        reusedBytes?: number;
+        resumedBytes?: number;
         transportKind?: "direct-tcp" | "direct-quic" | "relay";
         connectedVia?: string;
         connectionScope?: "lan" | "wan" | "unknown";
@@ -1783,7 +1790,7 @@ export const createAppActions = (args: {
         activeConnectedVia = connectedVia ?? activeConnectedVia;
         activeConnectionScope = connectionScope ?? activeConnectionScope;
         const elapsedMs = elapsedMsSince(startedAt);
-        const rateBps = averageRateBps(downloadedBytes, elapsedMs);
+        const rateBps = averageRateBps(networkBytes ?? downloadedBytes, elapsedMs);
         state.favorites.activeDownloadText = downloadProgressText(
           downloadedBytes,
           totalBytes,
@@ -1801,6 +1808,9 @@ export const createAppActions = (args: {
             folderId,
             path,
             downloadedBytes,
+            networkBytes,
+            reusedBytes,
+            resumedBytes,
             totalBytes,
             elapsedMs,
             rateBps: Math.round(rateBps),
@@ -1859,13 +1869,19 @@ export const createAppActions = (args: {
         `100% • Done • ${downloadTransportText(activeTransportKind, activeConnectionScope)}`;
       transferOutcome = "completed";
       setDownloadNotice(
-        `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}`,
+        `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}` +
+        ((downloadResult.reusedBytes ?? 0) + (downloadResult.resumedBytes ?? 0) > 0
+          ? ` · ${Math.round(((downloadResult.reusedBytes ?? 0) + (downloadResult.resumedBytes ?? 0)) / Math.max(1, downloadResult.totalBytes) * 100)}% recovered locally`
+          : ""),
         4000,
       );
       pushSessionLog(state, "info", "download.complete", `Downloaded ${name}`, {
         folderId,
         path,
         sizeBytes: downloadResult.bytesWritten,
+        networkBytes: downloadResult.networkBytes,
+        reusedBytes: downloadResult.reusedBytes,
+        resumedBytes: downloadResult.resumedBytes,
         elapsedMs,
         rateBps: Math.round(rateBps),
         rate: formatRateSafe(rateBps),
@@ -1877,7 +1893,7 @@ export const createAppActions = (args: {
         await openCachedFile(folderId, path);
       }
     } catch (error) {
-      if (activeSink) {
+      if (activeSink && !(error instanceof DownloadInterruptedError)) {
         try {
           await activeSink.abort(error);
         } catch (abortError) {

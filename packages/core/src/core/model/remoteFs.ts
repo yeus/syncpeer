@@ -1,5 +1,6 @@
 import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
 import type { BepFileInfo } from "../protocol/bep.js";
+import { prepareCachedBlocks, verifyBlockDigests, type RangeDigest } from "../../transfer/blockReuse.js";
 import type {
   FileDownloadMetadata,
   FileDownloadResult,
@@ -70,6 +71,9 @@ export interface FolderSyncState {
 export interface FileDownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
+  networkBytes?: number;
+  reusedBytes?: number;
+  resumedBytes?: number;
   transportKind?: "direct-tcp" | "direct-quic" | "relay";
   connectedVia?: string;
   connectionScope?: "lan" | "wan" | "unknown";
@@ -605,6 +609,12 @@ export class RemoteFs {
       throw new Error(`Remote reports this file as deleted: ${path}`);
     }
     if (!entry.blocks || entry.blocks.length == 0) {
+      if (entry.size === 0) {
+        await sink.begin({ folderId, path: normalizePath(path), sizeBytes: 0, encrypted: false, contentId: "blocks:empty" });
+        throwIfAborted(signal);
+        await sink.commit();
+        return { bytesWritten: 0, totalBytes: 0, networkBytes: 0, reusedBytes: 0 };
+      }
       if (!Number.isFinite(entry.size) || entry.size <= 0) {
         return this.readFileByProbing(folderId, path, sink, onProgress, signal);
       }
@@ -636,6 +646,7 @@ export class RemoteFs {
       size: block.size,
       block,
       blockNo: index,
+      hash: block.hash,
     }));
     return this.downloadPlannedChunks(
       folderId,
@@ -743,7 +754,9 @@ export class RemoteFs {
       offset: block.offset,
       size: block.size,
       originalBlock: block,
+      hash: block.hash,
       encryptedBlock: encryptedBlocks[index],
+      networkSize: encryptedBlocks[index].size,
       blockNo: index,
     }));
     return this.downloadPlannedChunks(
@@ -828,7 +841,7 @@ export class RemoteFs {
     return { bytesWritten: trimmed.length, totalBytes: trimmed.length };
   }
 
-  private async downloadPlannedChunks<T extends { offset: number; size: number }>(
+  private async downloadPlannedChunks<T extends { offset: number; size: number; hash?: Uint8Array; networkSize?: number }>(
     folderId: string,
     path: string,
     totalBytes: number,
@@ -842,14 +855,23 @@ export class RemoteFs {
     signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
     throwIfAborted(signal);
-    await sink.begin({ folderId, path, sizeBytes: totalBytes, encrypted, contentId });
-    const remainingPlan = sink.hasRange
-      ? plan.filter((item) => !sink.hasRange!(item.offset, item.size))
-      : plan;
+    await sink.begin({ sourceDeviceId: this.remoteDevice?.id, folderId, path, sizeBytes: totalBytes, encrypted, contentId });
+    const blocks: RangeDigest[] = plan.flatMap((item) => item.hash?.length === 32
+      ? [{ offset: item.offset, size: item.size, hash: item.hash }] : []);
+    const resumed = blocks.length === plan.length && sink.digestPartialRanges && sink.resumeStorage
+      ? await prepareCachedBlocks(blocks, totalBytes, sink.resumeStorage, signal) : [];
+    const reusable = blocks.length === plan.length && sink.digestPartialRanges
+      ? await prepareCachedBlocks(blocks, totalBytes, sink, signal, resumed) : [];
+    const resumedBytes = resumed.reduce((total, range) => total + range.size, 0);
+    const reusedBytes = reusable.reduce((total, range) => total + range.size, 0);
+    const copied = new Set([...reusable, ...resumed].map((range) => `${range.offset}:${range.size}`));
+    let networkBytes = 0;
+    const remainingPlan = plan.filter((item) =>
+      !sink.hasRange?.(item.offset, item.size) && !copied.has(`${item.offset}:${item.size}`));
     let downloaded = plan
       .filter((item) => !remainingPlan.includes(item))
       .reduce((sum, item) => sum + item.size, 0);
-    onProgress?.({ downloadedBytes: downloaded, totalBytes });
+    onProgress?.({ downloadedBytes: downloaded, totalBytes, reusedBytes, resumedBytes, networkBytes });
     let pending: Array<{ offset: number; bytes: Uint8Array }> = [];
     let pendingBytes = 0;
     const flushPending = async (): Promise<void> => {
@@ -898,6 +920,10 @@ export class RemoteFs {
           `expected ${item.size} bytes, received ${result.bytes.length}`,
         );
       }
+      if (item.hash?.length === 32 && this.hashBytes) {
+        verifyBlockDigests([{ ...item, hash: item.hash }], [{ ...item, hash: await this.hashBytes(result.bytes) }]);
+      }
+      networkBytes += item.networkSize ?? result.bytes.length;
       completed.set(result.index, result.bytes);
       if (nextRequestIndex < remainingPlan.length) {
         startRequest(nextRequestIndex);
@@ -921,6 +947,9 @@ export class RemoteFs {
         onProgress?.({
           downloadedBytes: downloaded,
           totalBytes: Math.max(totalBytes, downloaded),
+          networkBytes,
+          reusedBytes,
+          resumedBytes,
         });
         nextWriteIndex += 1;
       }
@@ -933,10 +962,21 @@ export class RemoteFs {
       );
     }
     throwIfAborted(signal);
+    if (blocks.length === plan.length && sink.digestPartialRanges) {
+      for (let start = 0; start < blocks.length; start += 256) {
+        throwIfAborted(signal);
+        const batch = blocks.slice(start, start + 256);
+        verifyBlockDigests(batch, await sink.digestPartialRanges(batch));
+      }
+    }
+    throwIfAborted(signal);
     await sink.commit();
     return {
       bytesWritten: downloaded,
       totalBytes,
+      networkBytes,
+      reusedBytes,
+      resumedBytes,
     };
   }
 

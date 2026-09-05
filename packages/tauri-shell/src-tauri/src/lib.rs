@@ -1,4 +1,6 @@
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+mod cache_ranges;
+use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use prost::Message;
@@ -96,6 +98,18 @@ struct CacheWriteChunkRequest {
 struct CacheTransferRequest {
     transfer_id: String,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheRangesRequest {
+    transfer_id: String,
+    ranges: Vec<CacheRange>,
+    source: CacheRangeSource,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CacheRangeSource { Cached, Partial }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -497,6 +511,7 @@ struct CacheWriter {
     modified_ms: Option<f64>,
     temp_path: PathBuf,
     file: Arc<Mutex<fs::File>>,
+    cached_source: Option<Arc<Mutex<fs::File>>>,
 }
 
 #[derive(Default)]
@@ -2973,6 +2988,17 @@ async fn syncpeer_cache_begin_file(
         guard.next_id = guard.next_id.wrapping_add(1);
         format!("{}-{}", now_ms(), guard.next_id)
     };
+    let cached_index = read_json_or_default::<CacheIndex>(&cache_index_path(&app)?)?;
+    let cached_path = cached_index.files.iter()
+        .find(|entry| entry.key == cache_key(&request.folder_id, &normalized_path))
+        .and_then(|entry| entry.local_path.as_ref());
+    let cached_source = match cached_path.map(fs::File::open) {
+        Some(Ok(file)) => Some(Arc::new(Mutex::new(file))),
+        Some(Err(error)) if error.kind() != ErrorKind::NotFound => {
+            return Err(format!("Could not open cached source: {error}"));
+        }
+        _ => None,
+    };
     let partial_root = app_cache_files_root(&app)?.join(".partial");
     fs::create_dir_all(&partial_root).map_err(|error| {
         format!(
@@ -3001,12 +3027,63 @@ async fn syncpeer_cache_begin_file(
         modified_ms: request.modified_ms,
         temp_path,
         file: Arc::new(Mutex::new(file)),
+        cached_source,
     };
     let mut guard = store
         .lock()
         .map_err(|_| "Cache writer store lock poisoned".to_string())?;
     guard.writers.insert(transfer_id.clone(), writer);
     Ok(CacheBeginFileResponse { transfer_id })
+}
+
+#[tauri::command]
+async fn syncpeer_cache_digest_ranges(
+    store: tauri::State<'_, SharedCacheWriterStore>, request: CacheRangesRequest,
+) -> Result<Vec<RangeDigest>, String> {
+    let writer = cache_range_writer(&store, &request)?;
+    let source = match request.source {
+        CacheRangeSource::Cached => writer.cached_source,
+        CacheRangeSource::Partial => Some(writer.file),
+    };
+    let Some(source) = source else { return Ok(vec![]); };
+    let mut file = source.lock().map_err(|_| "Cache source lock poisoned")?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut digests = Vec::new();
+    for range in request.ranges {
+        if range.offset > size || range.size > size - range.offset { continue; }
+        let hash = digest_range(&mut *file, &range).map_err(|e| e.to_string())?;
+        digests.push(RangeDigest { offset: range.offset, size: range.size, hash });
+    }
+    Ok(digests)
+}
+
+fn cache_range_writer(store: &SharedCacheWriterStore, request: &CacheRangesRequest) -> Result<CacheWriter, String> {
+    if request.ranges.len() > 256 { return Err("Too many requested ranges".into()); }
+    let writer = store.lock().map_err(|_| "Cache writer lock poisoned")?
+        .writers.get(&request.transfer_id).cloned().ok_or("Unknown cache transfer")?;
+    for range in &request.ranges {
+        if range.offset > writer.expected_size || range.size > writer.expected_size - range.offset {
+            return Err("Cache range is outside destination".into());
+        }
+    }
+    Ok(writer)
+}
+
+#[tauri::command]
+async fn syncpeer_cache_copy_ranges(
+    store: tauri::State<'_, SharedCacheWriterStore>, request: CacheRangesRequest,
+) -> Result<(), String> {
+    if !matches!(request.source, CacheRangeSource::Cached) { return Err("Copy source must be cached".into()); }
+    let writer = cache_range_writer(&store, &request)?;
+    let source = writer.cached_source.ok_or("Cached source unavailable")?;
+    let mut source = source.lock().map_err(|_| "Cache source lock poisoned")?;
+    let mut target = writer.file.lock().map_err(|_| "Cache destination lock poisoned")?;
+    let size = source.metadata().map_err(|e| e.to_string())?.len();
+    for range in request.ranges {
+        if range.offset > size || range.size > size - range.offset { return Err("Cached source truncated".into()); }
+        copy_range(&mut *source, &mut *target, &range).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3062,7 +3139,7 @@ async fn syncpeer_cache_commit(
         .file
         .lock()
         .map_err(|_| "Cache writer file lock poisoned".to_string())?
-        .flush()
+        .sync_all()
         .map_err(|error| format!("Could not flush partial cached file: {error}"))?;
     let actual_size = fs::metadata(&writer.temp_path)
         .map_err(|error| format!("Could not inspect partial cached file: {error}"))?
@@ -3105,11 +3182,6 @@ async fn syncpeer_cache_commit(
         if let Some(parent) = local_abs_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
-        }
-        if local_abs_path.exists() {
-            fs::remove_file(&local_abs_path).map_err(|error| {
-                format!("Could not replace cached file {}: {error}", local_abs_path.display())
-            })?;
         }
         fs::rename(&writer.temp_path, &local_abs_path).map_err(|error| {
             format!(
@@ -3914,6 +3986,8 @@ pub fn run() {
             syncpeer_remove_favorite,
             syncpeer_cache_file,
             syncpeer_cache_begin_file,
+            syncpeer_cache_digest_ranges,
+            syncpeer_cache_copy_ranges,
             syncpeer_cache_write_chunk,
             syncpeer_cache_commit,
             syncpeer_cache_abort,

@@ -620,7 +620,7 @@ const streamed = await streamFs.readFileToSink("stream-documents", "large.bin", 
 assert.equal(streamRequests, 3);
 assert.equal(streamBegan, true);
 assert.equal(streamCommitted, true);
-assert.deepEqual(streamed, { bytesWritten: 9, totalBytes: 9 });
+assert.deepEqual(streamed, { bytesWritten: 9, totalBytes: 9, networkBytes: 9, reusedBytes: 0, resumedBytes: 0 });
 assert.deepEqual(streamWrites, [
   { offset: 0, bytes: [1, 2, 3, 4, 5, 6, 7, 8, 9] },
 ]);

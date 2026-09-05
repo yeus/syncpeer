@@ -58,6 +58,11 @@ const main = async (): Promise<void> => {
       name: "Core protocol, session, and runtime diagnostics",
     },
     {
+      name: "Incremental block reuse diagnostics",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-block-reuse.ts"],
+    },
+    {
       name: "Application theme and icon diagnostics",
       command: process.execPath,
       args: [

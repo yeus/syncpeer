@@ -1,8 +1,10 @@
 import type { Port } from "./frpBus.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import type { CachedRangeStorage, DownloadRange, RangeDigest } from "./blockReuse.js";
 
 export interface FileDownloadMetadata {
+  sourceDeviceId?: string;
   folderId: string;
   path: string;
   sizeBytes: number;
@@ -10,12 +12,16 @@ export interface FileDownloadMetadata {
   contentId?: string;
 }
 
-export interface FileDownloadSink {
+export interface FileDownloadSink extends CachedRangeStorage {
   begin: (metadata: FileDownloadMetadata) => Promise<void> | void;
   write: (offset: number, bytes: Uint8Array) => Promise<void> | void;
   commit: () => Promise<void> | void;
   abort: (error: unknown) => Promise<void> | void;
   hasRange?: (offset: number, size: number) => boolean;
+  digestPartialRanges?: (ranges: readonly DownloadRange[]) => Promise<readonly RangeDigest[]>;
+  digestFile?: () => Promise<string>;
+  suspend?: () => Promise<void>;
+  resumeStorage?: CachedRangeStorage;
 }
 
 export interface DownloadCheckpoint {
@@ -27,6 +33,10 @@ export class RemoteMetadataChangedError extends Error {
   readonly name = "RemoteMetadataChangedError";
 }
 
+export class DownloadInterruptedError extends Error {
+  readonly name = "DownloadInterruptedError";
+}
+
 export const createSha256DownloadSink = (
   sink: FileDownloadSink,
 ): { sink: FileDownloadSink; digestHex: () => string } => {
@@ -36,8 +46,13 @@ export const createSha256DownloadSink = (
   let digest = "";
   return {
     sink: {
+      ...(sink.digestFile ? sink : {}),
       begin: (metadata) => sink.begin(metadata),
       write: async (offset, bytes) => {
+        if (sink.digestFile) {
+          await sink.write(offset, bytes);
+          return;
+        }
         if (offset !== nextOffset) {
           throw new Error(`Hashing download sink expected offset ${nextOffset}, received ${offset}.`);
         }
@@ -46,6 +61,7 @@ export const createSha256DownloadSink = (
         nextOffset += bytes.length;
       },
       commit: async () => {
+        if (sink.digestFile) digest = await sink.digestFile();
         await sink.commit();
         committed = true;
       },
@@ -59,7 +75,8 @@ export const createSha256DownloadSink = (
   };
 };
 
-const sameMetadata = (left: FileDownloadMetadata, right: FileDownloadMetadata): boolean =>
+export const sameDownloadMetadata = (left: FileDownloadMetadata, right: FileDownloadMetadata): boolean =>
+  left.sourceDeviceId === right.sourceDeviceId &&
   left.folderId === right.folderId &&
   left.path === right.path &&
   left.sizeBytes === right.sizeBytes &&
@@ -99,8 +116,9 @@ export const createCheckpointedDownloadSink = (
   return {
     checkpoint,
     sink: {
+      ...sink,
       begin: async (metadata) => {
-        if (checkpoint.metadata && !sameMetadata(checkpoint.metadata, metadata)) {
+        if (checkpoint.metadata && !sameDownloadMetadata(checkpoint.metadata, metadata)) {
           const error = new RemoteMetadataChangedError("Remote file metadata changed during download recovery.");
           await abort(error);
           throw error;
@@ -116,6 +134,10 @@ export const createCheckpointedDownloadSink = (
         addRange(offset, bytes.length);
       },
       commit: () => sink.commit(),
+      copyCachedRanges: sink.copyCachedRanges ? async (ranges) => {
+        await sink.copyCachedRanges!(ranges);
+        for (const range of ranges) addRange(range.offset, range.size);
+      } : undefined,
       abort,
       hasRange,
     },
@@ -133,6 +155,9 @@ export type FileTransferMessage =
 export interface FileDownloadResult {
   bytesWritten: number;
   totalBytes: number;
+  networkBytes?: number;
+  reusedBytes?: number;
+  resumedBytes?: number;
 }
 
 const transferTimeoutMs = 30_000;

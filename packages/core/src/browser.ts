@@ -120,6 +120,7 @@ export {
   createPortDownloadSink,
   createSha256DownloadSink,
   RemoteMetadataChangedError,
+  DownloadInterruptedError,
 } from "./transfer/stream.js";
 export type {
   DownloadCheckpoint,
@@ -128,6 +129,7 @@ export type {
   FileDownloadSink,
   FileTransferMessage,
 } from "./transfer/stream.js";
+export type { DownloadRange, RangeDigest, CachedRangeStorage } from "./transfer/blockReuse.js";
 export type {
   CachedFileRecord,
   CachedFileStatus,

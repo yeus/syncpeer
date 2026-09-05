@@ -1,6 +1,38 @@
 # Incremental Block Reuse for Cached Downloads
 
-Status: proposed and intentionally deferred
+Status: implementation in progress
+
+## Implementation status
+
+The core block planner and Node filesystem download adapter are implemented.
+CLI downloads use verified cached-range copying and request missing ranges.
+Node partials retain source-device/file/content metadata across process exit;
+recovery rehashes saved bytes against the remote block plan and copies verified
+ranges into a new partial. Active writers are excluded from recovery. Exhausted
+transport retries suspend capable sinks instead of discarding their partials.
+Tauri native-cache range hashing/copying and native whole-file hashing are wired
+into the app. Native-cache commit no longer deletes the old file before rename.
+Android SAF sources still require their own range and guarded-commit adapter.
+Tests cover plaintext/encrypted reuse, unhashed fallback, corrupted copies,
+adapter response validation, cancellation, empty files, and safe Node replacement.
+
+Still required: Tauri persistent partial recovery, Android SAF storage support,
+per-file two-way reconciliation, versioning/deletion/restore, UI integration, and
+the managed-server/desktop/Android release gate. Passing the initial unit and
+storage checks does not establish completion of the 0.5 milestone.
+
+The accepted milestone also requires every cached file to become a foreground
+two-way subscription. Keep durable version vectors and local baselines; use
+Syncthing conflict copies for concurrent edits. Distinguish local unsubscribe
+from explicit delete-everywhere. External deletions are configurable per folder
+and disabled by default. Offer disabled, trash-can, simple, and staggered
+versioning; default to retaining the latest archived version forever. Add a
+Trash/Versions restore interface and a CLI `sync-file` command. Do not bump the
+release version until the complete validation gate passes.
+
+Android SAF replacement uses a verified private temporary file and guarded
+backup/restore during commit. Provider failures must be surfaced; this does not
+promise filesystem-level atomic replacement for arbitrary document providers.
 
 ## Goal
 

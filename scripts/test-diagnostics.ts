@@ -23,6 +23,8 @@ const main = async (): Promise<void> => {
   const requireExternal = process.env.SYNCPEER_REQUIRE_EXTERNAL_CHECKS === "1";
   const localArgs = process.env.SYNCPEER_DIAGNOSTICS_KEEP === "1" ? ["--keep"] : [];
   const apiUrl = remoteApiUrl();
+  const quicFlags = process.allowedNodeEnvironmentFlags.has("--experimental-quic")
+    ? ["--experimental-quic"] : [];
   const phases: TestSuitePhase[] = [
     {
       name: "Build core diagnostics target",
@@ -45,13 +47,13 @@ const main = async (): Promise<void> => {
     },
     {
       name: "Node QUIC runtime preflight",
-      command: process.platform === "win32" ? "npm.cmd" : "npm",
-      args: ["run", "test:quic:runtime"],
+      command: process.execPath,
+      args: [...quicFlags, "--experimental-strip-types", "scripts/test-node-quic-runtime.ts"],
     },
     {
       name: "Node QUIC Syncthing integration",
-      command: process.platform === "win32" ? "npm.cmd" : "npm",
-      args: ["run", "test:quic:cli"],
+      command: process.execPath,
+      args: [...quicFlags, "--experimental-strip-types", "scripts/test-node-quic-integration.ts"],
     },
     {
       ...nodeScript("scripts/test-core-diagnostics.ts"),
@@ -61,6 +63,40 @@ const main = async (): Promise<void> => {
       name: "Incremental block reuse diagnostics",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-block-reuse.ts"],
+    },
+    {
+      name: "Tauri partial sink recovery",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-tauri-download-sink.ts"],
+    },
+    {
+      name: "Native cache range unit tests",
+      command: "cargo",
+      args: ["test", "--lib", "--manifest-path", "packages/tauri-shell/src-tauri/Cargo.toml", "cache_ranges"],
+    },
+    {
+      name: "Android document replacement unit tests",
+      command: "bash",
+      args: ["packages/tauri-shell/src-tauri/gen/android/gradlew", "-p", "packages/tauri-shell/src-tauri/gen/android",
+        ":tauri-plugin-syncpeer-android:testDebugUnitTest", "--no-daemon"],
+      skipReason: () => (process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT)
+        && fs.existsSync("packages/tauri-shell/src-tauri/gen/android/gradlew")
+        ? undefined : "Android SDK/generated project is not configured",
+    },
+    {
+      name: "Folder synchronization diagnostics",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-folder-sync.ts"],
+    },
+    {
+      name: "Connection lifecycle diagnostics",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-connection-management.ts"],
+    },
+    {
+      name: "Transfer notification diagnostics",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-transfer-notifications.ts"],
     },
     {
       name: "Application theme and icon diagnostics",
@@ -98,6 +134,10 @@ const main = async (): Promise<void> => {
     {
       ...nodeScript("scripts/test-local.ts", localArgs),
       name: "Local Syncthing integration diagnostics",
+    },
+    {
+      ...nodeScript("scripts/test-folder-sync-integration.ts"),
+      name: "Folder CLI publication and deletion integration",
     },
     {
       ...nodeScript("scripts/test-local.ts", ["--skip-encrypted", "--download-iterations", "8", ...localArgs]),
@@ -166,8 +206,8 @@ const main = async (): Promise<void> => {
     },
   ];
   const exitCode = await runTestSuite({
-    name: "diagnostics",
-    reportPath: ".tmp/syncpeer-test-reports/diagnostics-report.json",
+    name: "headless",
+    reportPath: ".tmp/syncpeer-test-reports/headless-report.json",
     phases,
   });
   process.exitCode = exitCode;

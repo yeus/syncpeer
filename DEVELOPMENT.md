@@ -223,17 +223,18 @@ npm run android:dev
 The repository has two test umbrellas:
 
 ```bash
-npm run test:diagnostics
+npm run test:headless
 npm run test:e2e
 ```
 
-`test:diagnostics` runs the headless core/protocol checks, local Syncthing
+`test:headless` runs the headless core/protocol checks, local Syncthing
 integration, CLI checks, PIM checks, approval checks, discovery checks, the
-NixOS firewall helper checks, and the native Tauri packet checks. It also runs
+NixOS firewall helper checks, native Tauri packet/range checks, and Android
+document replacement unit tests when the Android SDK/project is available. It also runs
 the remote CLI and Syncthing REST checks when the corresponding external
 server/API is configured. Optional external checks are reported as skipped,
 never silently omitted. Its report is written to
-`.tmp/syncpeer-test-reports/diagnostics-report.json`.
+`.tmp/syncpeer-test-reports/headless-report.json`.
 
 `test:e2e` runs the local Tauri workflows and, when a saved or configured
 development server ID is available, the remote Tauri UI workflows. The remote
@@ -248,7 +249,7 @@ homes for debugging with:
 
 ```bash
 SYNCPEER_DIAGNOSTICS_KEEP=1 \
-  npm run test:diagnostics
+  npm run test:headless
 ```
 
 The two suites are the supported test entry points. The long-running server
@@ -267,7 +268,7 @@ Run all headless diagnostics, including the local automated integration
 harness:
 
 ```bash
-npm run test:diagnostics
+npm run test:headless
 ```
 
 ## Long-Running Development Test Server

@@ -764,6 +764,31 @@ const fixtureBlobHash = () => {
   return hash.digest("hex");
 };
 
+const setAndroidAutomaticConnectionPaused = async (cdp, paused) => {
+  await clickUiTestId(cdp, "tab-devices");
+  const settingsExpanded = await cdp.evaluate(
+    'document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"',
+  );
+  if (!settingsExpanded) await clickUiTestId(cdp, "connection-settings-toggle");
+  const expertEnabled = await cdp.evaluate(
+    'document.querySelector("[data-testid=expert-view]")?.checked === true',
+  );
+  if (!expertEnabled) await clickUiTestId(cdp, "expert-view");
+  const detailsExpanded = await cdp.evaluate(
+    'document.querySelector("[data-testid=connection-status-toggle]")?.getAttribute("aria-expanded") === "true"',
+  );
+  if (!detailsExpanded) await clickUiTestId(cdp, "connection-status-toggle");
+  const label = await cdp.evaluate(
+    'document.querySelector("[data-testid=expert-connection-control]")?.textContent?.trim() || ""',
+  );
+  if (paused && label === "Pause automatic connection") {
+    await clickUiTestId(cdp, "expert-connection-control");
+  }
+  if (!paused && label === "Resume automatic connection") {
+    await clickUiTestId(cdp, "expert-connection-control");
+  }
+};
+
 const openAndroidConnection = async (cdp) => {
   if (!serverDeviceId) {
     console.log("Android network UI workflow skipped: no server device ID configured.");
@@ -785,25 +810,14 @@ const openAndroidConnection = async (cdp) => {
     await clickUiTestId(cdp, "connection-settings-toggle");
     await waitForUiText(cdp, "Remote Device ID", 10_000);
   }
-  await waitForUiCondition(
-    cdp,
-    `(() => {
-      const button = document.querySelector("[data-testid=global-connect-button]");
-      return button instanceof HTMLButtonElement &&
-        !button.disabled &&
-        ["Connect", "Disconnect"].includes(button.textContent?.trim() || "");
-    })()`,
-    "initial connection attempt to settle",
-    Math.max(30_000, connectionTimeoutMs + 10_000),
+  const initiallyConnected = await cdp.evaluate(
+    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
   );
-  const initialState = await cdp.evaluate(`(() => ({
-    label: document.querySelector("[data-testid=global-connect-button]")?.textContent?.trim() || "",
-  }))()`);
-  if (initialState?.label === "Disconnect") {
-    await clickUiTestId(cdp, "global-connect-button");
+  if (initiallyConnected) {
+    await setAndroidAutomaticConnectionPaused(cdp, true);
     await waitForUiCondition(
       cdp,
-      'document.querySelector("[data-testid=global-connect-button]")?.textContent?.trim() === "Connect"',
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() !== "Connected"',
       "disconnecting stale Android session",
       30_000,
     );
@@ -821,20 +835,18 @@ const openAndroidConnection = async (cdp) => {
     "persisting Android server device ID",
     5_000,
   );
+  await setAndroidAutomaticConnectionPaused(cdp, false);
   const deadline = Date.now() + 10 * 60_000;
   let lastError = "";
   while (Date.now() < deadline) {
     const state = await cdp.evaluate(`(() => {
-      const button = document.querySelector("[data-testid=global-connect-button]");
       return {
-        label: button?.textContent?.trim() || "",
-        disabled: button instanceof HTMLButtonElement ? button.disabled : true,
+        label: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() || "",
         error: document.querySelector("p.error")?.textContent?.trim() || "",
       };
     })()`);
-    if (state?.label === "Disconnect") return true;
+    if (state?.label === "Connected") return true;
     if (state?.error) lastError = state.error;
-    if (state?.label === "Connect" && !state.disabled) await clickUiTestId(cdp, "global-connect-button");
     await wait(10_000);
   }
   throw new Error(
@@ -963,13 +975,13 @@ const assertCompleteBlob = async (cdp, context) => {
 
 const disconnectAndroidSession = async (cdp) => {
   const connected = await cdp.evaluate(
-    'document.querySelector("[data-testid=global-connect-button]")?.textContent?.trim() === "Disconnect"',
+    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
   );
   if (!connected) return;
-  await clickUiTestId(cdp, "global-connect-button");
+  await setAndroidAutomaticConnectionPaused(cdp, true);
   await waitForUiCondition(
     cdp,
-    'document.querySelector("[data-testid=global-connect-button]")?.textContent?.trim() === "Connect"',
+    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() !== "Connected"',
     "graceful Android test disconnect",
     30_000,
   );

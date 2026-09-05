@@ -2215,20 +2215,35 @@ class BepSession {
       reject(closeError);
     }
     this.pending.clear();
+    let closeFrameTimedOut = false;
+    let closeFrameTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await this.writeFrame(
-        encodeMessageFrame(
-          MessageTypeValues.CLOSE,
-          Close,
-          { reason: "Client closed" },
-          0,
+      await Promise.race([
+        this.writeFrame(
+          encodeMessageFrame(
+            MessageTypeValues.CLOSE,
+            Close,
+            { reason: "Client closed" },
+            0,
+          ),
+          true,
         ),
-        true,
-      );
+        new Promise<void>((resolve) => {
+          closeFrameTimer = setTimeout(() => {
+            closeFrameTimedOut = true;
+            resolve();
+          }, 1_000);
+        }),
+      ]);
     } catch (error) {
       this.log("close.frame_failed", {
         message: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      if (closeFrameTimer) clearTimeout(closeFrameTimer);
+    }
+    if (closeFrameTimedOut) {
+      this.log("close.frame_timeout");
     }
     await this.socket.close();
   }

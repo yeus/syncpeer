@@ -1,6 +1,7 @@
 {
   "name": "syncpeer",
   "version": "0.4.0-rc.7",
+  "type": "module",
   "private": true,
   "workspaces": [
     "packages/*"
@@ -9,6 +10,8 @@
     "test": "npm run test:diagnostics",
     "test:connection": "npm run build:core && node --experimental-strip-types --test scripts/test-connection-management.ts",
     "test:transfer-notifications": "npm run build:core && node --experimental-strip-types --test scripts/test-transfer-notifications.ts",
+    "test:app-theme": "node --experimental-strip-types --test scripts/test-app-theme.ts scripts/test-icon-theme.ts",
+    "test:app-notices": "node --experimental-strip-types --test scripts/test-connection-notices.ts",
     "test:favorite-sync": "node --experimental-strip-types --test scripts/test-favorite-sync-policies.ts",
     "test:quic:runtime": "node --experimental-quic --experimental-strip-types scripts/test-node-quic-runtime.ts",
     "test:quic:cli": "npm run build:cli && node --experimental-quic --experimental-strip-types scripts/test-node-quic-integration.ts",

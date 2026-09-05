@@ -14,6 +14,7 @@ import {
   connectUntilApproved,
   readCachedHash,
   selectDiscoveryMode,
+  setAutomaticConnectionPaused,
   setUploadFile,
   setValue,
   waitForDisconnected,
@@ -112,9 +113,9 @@ const configureGlobalConnection = async (): Promise<void> => {
 };
 
 const disconnectIfConnected = async (): Promise<void> => {
-  const button = $("[data-testid='global-connect-button']");
-  if ((await button.getText()).trim() !== "Disconnect") return;
-  await button.click();
+  const status = $("[data-testid='connection-status']");
+  if ((await status.getText()).trim() !== "Connected") return;
+  await setAutomaticConnectionPaused(tauriBrowser, true);
   await waitForDisconnected(tauriBrowser);
 };
 
@@ -125,14 +126,21 @@ const connectToServer = async (): Promise<void> => {
   const statusText = (await $("[data-testid='connection-status']").getText())
     .replace(/\s+/g, " ")
     .trim();
+  const disclosure = $("[data-testid='connection-status-toggle']");
+  if (await disclosure.getAttribute("aria-expanded") !== "true") await disclosure.click();
+  const connectionDetails = (await $("[data-testid='connection-details']").getText())
+    .replace(/\s+/g, " ")
+    .trim();
   console.log(
     "UI connection state: " +
     JSON.stringify({
-      connected: (await $("[data-testid='global-connect-button']").getText()).trim() === "Disconnect",
+      connected: (await $("[data-testid='connection-status']").getText()).trim() === "Connected",
       statusText,
+      connectionDetails,
     }),
   );
-  assert.match(statusText, /Path: (direct|relay) · (LAN|WAN|unknown)/);
+  assert.equal(statusText, "Connected");
+  assert.match(connectionDetails, /Path:/);
 };
 
 const returnToFolderRoot = async (): Promise<void> => {
@@ -176,6 +184,61 @@ describe("Syncpeer Tauri UI smoke", () => {
     await waitForText(tauriBrowser, "Global discovery ignores manual host/port.");
   });
 
+  it("applies light, dark, automatic, and custom theme settings", async () => {
+    await clickTestId("tab-devices");
+    await openConnectionSettings();
+    const setThemeMode = async (mode: "auto" | "light" | "dark") => {
+      await tauriBrowser.execute((nextMode: string) => {
+        const select = document.querySelector("[data-testid='theme-mode']") as HTMLSelectElement;
+        select.value = nextMode;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }, mode);
+      await tauriBrowser.waitUntil(
+        async () => await tauriBrowser.execute(
+          (expected: string) => document.documentElement.dataset.theme === expected,
+          mode === "auto"
+            ? await tauriBrowser.execute(() => matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+            : mode,
+        ),
+        { timeout: 5_000, timeoutMsg: `Theme ${mode} was not applied.` },
+      );
+    };
+    await setThemeMode("light");
+    const lightBackground = await tauriBrowser.execute(() => getComputedStyle(document.body).backgroundColor);
+    await setThemeMode("dark");
+    const darkBackground = await tauriBrowser.execute(() => getComputedStyle(document.body).backgroundColor);
+    assert.notEqual(lightBackground, darkBackground);
+    await tauriBrowser.execute(() => {
+      const primary = document.querySelector("[data-testid='theme-primary-color']") as HTMLInputElement;
+      const secondary = document.querySelector("[data-testid='theme-secondary-color']") as HTMLInputElement;
+      primary.value = "#123456";
+      primary.dispatchEvent(new Event("input", { bubbles: true }));
+      secondary.value = "#abcdef";
+      secondary.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const colors = await tauriBrowser.execute(() => {
+      const style = getComputedStyle(document.documentElement);
+      return [
+        style.getPropertyValue("--brand-primary").trim(),
+        style.getPropertyValue("--brand-secondary").trim(),
+      ];
+    });
+    assert.deepEqual(colors.map((color) => color.toUpperCase()), ["#123456", "#ABCDEF"]);
+    await setThemeMode("auto");
+  });
+
+  it("keeps connection state in the header and reveals details on demand", async () => {
+    const status = $("[data-testid='connection-status']");
+    const disclosure = $("[data-testid='connection-status-toggle']");
+    await status.waitForExist({ timeout: 10_000 });
+    assert.equal(await $("[data-testid='global-connect-button']").isExisting(), false);
+    if (await disclosure.getAttribute("aria-expanded") === "true") await disclosure.click();
+    assert.equal(await $("[data-testid='connection-details']").isExisting(), false);
+    await disclosure.click();
+    await $("[data-testid='connection-details']").waitForExist({ timeout: 5_000 });
+    assert.equal(await disclosure.getAttribute("aria-expanded"), "true");
+  });
+
   it("reaches the configured discovery server through Tauri", async () => {
     const payload = await tauriBrowser.tauri.execute((tauri, request) =>
       tauri.core.invoke("syncpeer_discovery_fetch", { request }),
@@ -210,7 +273,15 @@ describe("Syncpeer Tauri UI smoke", () => {
     await $("[data-testid='about-copy']").click();
     await $("[data-testid='about-copy-notice']").waitForExist({ timeout: 5_000 });
     await $("[data-testid='about-back']").click();
-    await $("[data-testid='global-connect-button']").waitForExist({ timeout: 10_000 });
+    await $("[data-testid='connection-status-toggle']").waitForExist({ timeout: 10_000 });
+  });
+
+  it("marks PIM sync as experimental and disabled by default", async () => {
+    await clickTestId("tab-pim");
+    const notice = $("[data-testid='pim-experimental-notice']");
+    await notice.waitForExist({ timeout: 10_000 });
+    assert.match(await notice.getText(), /experimental/i);
+    assert.equal(await $("[data-testid='pim-enabled']").isSelected(), false);
   });
 
   it("runs all registered diagnostics through the Tauri UI", async () => {
@@ -232,7 +303,7 @@ describe("Syncpeer Tauri UI smoke", () => {
     assert.match(String(await result.getValue()), /"allPassed": true/);
     assert.match(String(await result.getValue()), /"buildInfo":/);
     await $("[data-testid='diagnostics-back']").click();
-    await $("[data-testid='global-connect-button']").waitForExist({ timeout: 10_000 });
+    await $("[data-testid='connection-status-toggle']").waitForExist({ timeout: 10_000 });
   });
 
   it("browses a remote folder and downloads through the Tauri cache", async () => {
@@ -358,6 +429,8 @@ describe("Syncpeer Tauri UI smoke", () => {
       );
 
       await disconnectIfConnected();
+      await clickTestId("tab-folders");
+      await waitForText(tauriBrowser, "Offline · last seen", 5_000);
       await waitForText(tauriBrowser, targetFileName, 5_000);
       assert.match(
         await $("[data-testid='folder-view-status']").getText(),

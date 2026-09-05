@@ -88,6 +88,7 @@ import {
 import {
   suggestedClientName,
 } from "./suggestedNames.ts";
+import { localDiscoveryUnavailableNotice } from "./connectionNotices.ts";
 import { remoteFavoriteNeedsDownload } from "./favoriteSyncPolicies.ts";
 import {
   clearDirectoryViewState,
@@ -127,6 +128,18 @@ const clearDirectoryView = (state: AppState) => {
 
 const resetRuntimeState = (state: AppState) => {
   state.session = resetRuntimeSessionState(state.session);
+};
+
+const saveCurrentOfflineState = (state: AppState, sourceDeviceId: string) => {
+  saveOfflineSnapshot(state, sourceDeviceId, {
+    folders: state.session.folders,
+    remoteDevice: state.session.remoteDevice,
+    folderSyncStates: state.session.folderSyncStates,
+    connectedVia: state.session.connectionPath,
+    transportKind: state.session.connectionTransport,
+    connectionScope: state.session.connectionScope,
+  });
+  saveOfflineDirectorySnapshot(state, sourceDeviceId);
 };
 
 const restoreAfterTransportFailure = (state: AppState, error: unknown) => {
@@ -541,6 +554,8 @@ export const createAppActions = (args: {
   let transferRuntimeStarted = false;
   let transferRuntimeTransition = Promise.resolve();
   let connectInFlight: Promise<void> | null = null;
+  let connectionSettingsTimer: ReturnType<typeof setTimeout> | null = null;
+  let connectionSettingsGeneration = 0;
 
   const setDownloadNotice = (message: string, clearAfterMs = 0) => {
     state.ui.downloadNotice = message;
@@ -884,14 +899,7 @@ export const createAppActions = (args: {
       ) {
         state.approvals.pendingApprovalPromptDeviceId = "";
       }
-      saveOfflineSnapshot(state, sourceDeviceId, {
-        folders: session.folders,
-        remoteDevice: session.remoteDevice,
-        folderSyncStates: session.folderSyncStates,
-        connectedVia: session.connectionPath,
-        transportKind: session.connectionTransport,
-        connectionScope: session.connectionScope,
-      });
+      saveCurrentOfflineState(state, sourceDeviceId);
       applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       state.session.lastUpdatedAt = nowTime();
     } catch (error) {
@@ -977,14 +985,7 @@ export const createAppActions = (args: {
       } else {
         setRemoteApprovalPending(state, sourceDeviceId, false);
       }
-      saveOfflineSnapshot(state, sourceDeviceId, {
-        folders: session.folders,
-        remoteDevice: session.remoteDevice,
-        folderSyncStates: session.folderSyncStates,
-        connectedVia: session.connectionPath,
-        transportKind: session.connectionTransport,
-        connectionScope: session.connectionScope,
-      });
+      saveCurrentOfflineState(state, sourceDeviceId);
       applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
       if (
         state.activeTab === "folders" &&
@@ -1293,6 +1294,10 @@ export const createAppActions = (args: {
   };
 
   const disconnect = async () => {
+    saveCurrentOfflineState(state, activeSourceDeviceId(state));
+    connectionSettingsGeneration += 1;
+    if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
+    connectionSettingsTimer = null;
     state.ui.autoConnectPaused = true;
     try {
       await sessionStore.actions.disconnect();
@@ -1304,6 +1309,32 @@ export const createAppActions = (args: {
       restoreOfflineSnapshot(state, clearDirectoryView, undefined, "disconnect");
       state.ui.recentError = null;
     }
+  };
+
+  const applyConnectionSettings = async (generation: number) => {
+    if (connectInFlight) await connectInFlight;
+    if (generation !== connectionSettingsGeneration) return;
+    if (!hasAutoConnectTarget(state)) return;
+    state.ui.autoConnectPaused = false;
+    if (
+      state.session.lifecyclePhase !== "idle" &&
+      state.session.lifecyclePhase !== "error"
+    ) {
+      await sessionStore.actions.disconnect();
+      resetRuntimeState(state);
+    }
+    await connect();
+  };
+
+  const scheduleConnectionSettingsApply = () => {
+    if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
+    const generation = ++connectionSettingsGeneration;
+    connectionSettingsTimer = setTimeout(() => {
+      connectionSettingsTimer = null;
+      void applyConnectionSettings(generation).catch((error) => {
+        reportActionError(state, "connection_settings.apply_failed", error);
+      });
+    }, 500);
   };
 
   const refreshCurrentDeviceId = async () => {
@@ -1367,8 +1398,19 @@ export const createAppActions = (args: {
       state.devices.lanDiscoveredDeviceIds = nextSeenIds;
       state.devices.lanDiscoveryByDeviceId = nextByDeviceId;
       state.devices.lanAnonymousCandidates = nextAnonymous;
+      state.devices.localDiscoveryNotice = "";
     } catch (error) {
-      reportActionError(state, "lan_discovery.failed", error, options);
+      const notice = localDiscoveryUnavailableNotice(error);
+      if (notice) {
+        const changed = state.devices.localDiscoveryNotice !== notice;
+        state.devices.localDiscoveryNotice = notice;
+        if (changed) {
+          pushSessionLog(state, "warning", "lan_discovery.unavailable", notice);
+        }
+      } else {
+        state.devices.localDiscoveryNotice = "";
+        reportActionError(state, "lan_discovery.failed", error, options);
+      }
     } finally {
       state.devices.isDiscoveringLanDevices = false;
     }
@@ -3132,6 +3174,7 @@ export const createAppActions = (args: {
     hydrate,
     connect,
     disconnect,
+    scheduleConnectionSettingsApply,
     refreshOverview,
     refreshActiveView,
     refreshCurrentDeviceId,
@@ -3200,6 +3243,10 @@ export const createAppActions = (args: {
     persist: () => persistState(state),
     restoreOfflineSnapshot: (deviceId?: string, reason?: string) =>
       restoreOfflineSnapshot(state, clearDirectoryView, deviceId, reason),
+    dispose: () => {
+      if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
+      connectionSettingsTimer = null;
+    },
   };
 };
 

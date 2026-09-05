@@ -1653,7 +1653,6 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
 
     let mut sockets: Vec<(&'static str, UdpSocket)> = Vec::new();
     let mut bind_errors: Vec<String> = Vec::new();
-    let mut bind_kinds: Vec<ErrorKind> = Vec::new();
     let mut packets_received = 0_u64;
     let mut packets_by_socket_udp4 = 0_u64;
     let mut packets_by_socket_udp6 = 0_u64;
@@ -1672,7 +1671,6 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
             syncthing_lan_available = true;
         }
         Err(error) => {
-            bind_kinds.push(error.kind());
             bind_errors.push(format!("udp4 bind failed: {error}"));
         }
     }
@@ -1685,7 +1683,6 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
             syncthing_lan_available = true;
         }
         Err(error) => {
-            bind_kinds.push(error.kind());
             bind_errors.push(format!("udp6 bind failed: {error}"));
         }
     }
@@ -1714,7 +1711,26 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
         }
     };
     if sockets.is_empty() && syncpeer_udp4.is_none() && syncpeer_udp6.is_none() {
-        return Err(format!("Local discovery sockets unavailable ({}).", bind_errors.join(" | ")));
+        return Ok(DiscoveryLocalResponse {
+            candidates: Vec::new(),
+            diagnostics: DiscoveryLocalDiagnostics {
+                timeout_ms,
+                sockets_bound: 0,
+                bind_errors,
+                packets_received: 0,
+                packets_by_socket_udp4: 0,
+                packets_by_socket_udp6: 0,
+                packets_magic_mismatch: 0,
+                packets_decode_failed: 0,
+                packets_missing_id: 0,
+                packets_filtered_expected_id: 0,
+                announcements_accepted: 0,
+                discovered_device_ids: Vec::new(),
+                syncthing_lan_available: false,
+                syncpeer_lan_active: false,
+                status_message: "LAN discovery unavailable".to_string(),
+            },
+        });
     }
 
     let started = SystemTime::now();

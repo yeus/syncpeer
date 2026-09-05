@@ -17,6 +17,7 @@ body {
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  transition: background-color 140ms ease, color 140ms ease;
 }
 
 button,
@@ -118,13 +119,13 @@ label {
 
 .panel {
   background: var(--bg-surface-soft);
-  border: 1px solid var(--border-default);
-  box-shadow: var(--shadow-soft);
+  border-block: 1px solid var(--border-default);
+  border-inline: 0;
   padding: var(--space-3);
 }
 
 .panel + .panel {
-  margin-top: var(--space-2);
+  margin-top: var(--space-1);
 }
 
 .heading {
@@ -138,8 +139,9 @@ label {
   list-style: none;
   padding: 0;
   margin: 0;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
+  border-block: 1px solid var(--border-soft);
+  border-inline: 0;
+  border-radius: 0;
   overflow: hidden;
   background: var(--bg-surface);
 }

@@ -10,10 +10,12 @@ import type { LanFixture } from "./protocol.ts";
 import {
   clickDownloadButton,
   clickItemTitle,
+  connectUntilApproved,
   readCachedHash,
   readSessionEventNames,
   selectDiscoveryMode,
   setUploadFile,
+  setAutomaticConnectionPaused,
   setValue,
   waitForDisconnected,
   waitForText,
@@ -96,23 +98,22 @@ const connect = async (
   await setValue("connection-timeout", "60000");
   await setValue("connection-cert", identity?.cert ?? "");
   await setValue("connection-key", identity?.key ?? "");
-  await clickTestId("global-connect-button");
+  await setAutomaticConnectionPaused(lanBrowser, false);
   try {
-    await waitForText(lanBrowser, "Connected");
+    await connectUntilApproved(lanBrowser);
   } catch (error) {
     const diagnostics = await lanBrowser.execute(() => ({
       error: document.querySelector(".error")?.textContent?.trim() ?? "",
       status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "",
-      button: document.querySelector("[data-testid='global-connect-button']")?.textContent?.trim() ?? "",
     }));
     throw new Error(`${String(error)} (${JSON.stringify(diagnostics)})`, { cause: error });
   }
 };
 
 const disconnect = async (): Promise<void> => {
-  const button = $("[data-testid='global-connect-button']");
-  if ((await button.getText()).trim() === "Connect") return;
-  await button.click();
+  const status = $("[data-testid='connection-status']");
+  if ((await status.getText()).trim() !== "Connected") return;
+  await setAutomaticConnectionPaused(lanBrowser, true);
   await waitForDisconnected(lanBrowser, 30_000);
 };
 

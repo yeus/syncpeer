@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -105,10 +106,23 @@ const readJsonOrNull = (filePath) => {
 const manifestContent = fs.existsSync(manifestPath)
   ? fs.readFileSync(manifestPath, "utf8")
   : "";
+const manifest = readJsonOrNull(manifestPath);
+const iconSourcePath = typeof manifest?.default === "string"
+  ? path.resolve(path.dirname(manifestPath), manifest.default)
+  : null;
+const iconSourceDigest = iconSourcePath && fs.existsSync(iconSourcePath)
+  ? createHash("sha256").update(fs.readFileSync(iconSourcePath)).digest("hex")
+  : "";
 const previousMarker = readJsonOrNull(markerPath);
 const manifestChanged = previousMarker?.manifestContent !== manifestContent;
+const iconSourceChanged = previousMarker?.iconSourceDigest !== iconSourceDigest;
 
-if (missingDesktop.length === 0 && missingAndroid.length === 0 && !manifestChanged) {
+if (
+  missingDesktop.length === 0 &&
+  missingAndroid.length === 0 &&
+  !manifestChanged &&
+  !iconSourceChanged
+) {
   ensureAndroidAdaptiveIconInset();
   console.log("Tauri icons already exist; skipping generation.");
   process.exit(0);
@@ -125,12 +139,15 @@ if (missingAndroid.length > 0) {
 if (manifestChanged) {
   console.log("Icon manifest changed; regenerating icon assets.");
 }
+if (iconSourceChanged) {
+  console.log("Icon source changed; regenerating icon assets.");
+}
 
 console.log("Generating Tauri icons from manifest...");
 run("npm", ["run", "icons:generate"], "Icon generation");
 ensureAndroidAdaptiveIconInset();
 fs.writeFileSync(
   markerPath,
-  JSON.stringify({ manifestContent, generatedAtMs: Date.now() }, null, 2),
+  JSON.stringify({ manifestContent, iconSourceDigest, generatedAtMs: Date.now() }, null, 2),
   "utf8",
 );

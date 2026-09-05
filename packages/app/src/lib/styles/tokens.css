@@ -1,60 +1,98 @@
 :root {
+  color-scheme: light;
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, Arial, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
-
-  --bg-canvas: #f3f5f8;
-  --bg-shell: linear-gradient(180deg, #f7f9fc 0%, #edf2f7 100%);
+  --brand-primary: #2a3548;
+  --brand-secondary: #f78f3b;
+  --bg-canvas: #f5f6f8;
+  --bg-shell: #f5f6f8;
   --bg-surface: #ffffff;
-  --bg-surface-soft: #fbfdff;
-  --bg-surface-muted: #f4f8fc;
-  --bg-nav: rgba(255, 255, 255, 0.92);
-
-  --text-primary: #1f2933;
-  --text-strong: #1d334a;
-  --text-secondary: #445366;
-  --text-muted: #61778f;
-
-  --color-primary: #0f4a93;
-  --color-primary-strong: #0d3668;
-  --color-primary-soft: #eaf3ff;
-  --color-primary-hover: #0d4385;
+  --bg-surface-soft: #ffffff;
+  --bg-surface-muted: color-mix(in oklch, var(--brand-primary) 4%, white);
+  --bg-nav: rgba(255, 255, 255, 0.96);
+  --text-primary: #202632;
+  --text-strong: color-mix(in oklch, var(--brand-primary) 88%, #111827);
+  --text-secondary: #4f5968;
+  --text-muted: #6c7685;
+  --color-primary: color-mix(in oklch, var(--brand-primary) 82%, #111827);
+  --color-primary-strong: color-mix(in oklch, var(--brand-primary) 90%, #111827);
+  --color-primary-soft: color-mix(in oklch, var(--brand-primary) 8%, white);
+  --color-primary-hover: color-mix(in oklch, var(--brand-primary) 88%, black);
+  --color-secondary: color-mix(in oklch, var(--brand-secondary) 92%, #c65c16);
+  --color-secondary-soft: color-mix(in oklch, var(--brand-secondary) 12%, white);
   --color-on-primary: #ffffff;
-
-  --border-soft: #dde5ef;
-  --border-default: #dbe3ee;
-  --border-strong: #c7d2df;
-  --border-accent: #d7e7fb;
-  --border-hover: #9eb6d3;
-  --border-list-divider: #eef2f7;
-  --border-log: #d8e2ee;
-
-  --state-success-bg: #d7f4e4;
-  --state-success-text: #0d7044;
-  --state-offline-bg: #fde3e3;
-  --state-offline-text: #9c2d2d;
+  --border-soft: color-mix(in oklch, var(--brand-primary) 11%, white);
+  --border-default: color-mix(in oklch, var(--brand-primary) 16%, white);
+  --border-strong: color-mix(in oklch, var(--brand-primary) 24%, white);
+  --border-accent: color-mix(in oklch, var(--brand-primary) 24%, white);
+  --border-hover: color-mix(in oklch, var(--brand-primary) 45%, white);
+  --border-list-divider: color-mix(in oklch, var(--brand-primary) 10%, white);
+  --border-log: color-mix(in oklch, var(--brand-primary) 18%, white);
+  --state-success-bg: #dff5e8;
+  --state-success-text: #11663f;
+  --state-success-dot: #19a561;
+  --state-offline-bg: var(--color-secondary-soft);
+  --state-offline-text: color-mix(in oklch, var(--brand-secondary) 78%, #78350f);
   --state-danger-bg: #fff1f1;
-  --state-danger-border: #f0c6c6;
+  --state-danger-border: #efcaca;
   --state-danger-text: #a61b1b;
-  --state-warning-text: #9a5c00;
-  --state-star: #d9a300;
-  --state-hint-text: #7c2d12;
-
-  --radius-xs: 6px;
-  --radius-sm: 8px;
-  --radius-md: 10px;
-
+  --state-warning-text: #92520b;
+  --state-star: var(--color-secondary);
+  --state-hint-text: #7c3b16;
+  --radius-xs: 5px;
+  --radius-sm: 7px;
+  --radius-md: 9px;
   --space-1: 0.35rem;
   --space-2: 0.5rem;
-  --space-3: 0.75rem;
+  --space-3: 0.7rem;
   --space-4: 1rem;
+  --button-hover-bg: color-mix(in oklch, var(--brand-primary) 5%, white);
+  --text-item-title: var(--text-strong);
+  --text-summary: var(--text-strong);
+  --text-separator: var(--text-muted);
+  --text-empty: var(--text-muted);
+  --text-log: var(--text-primary);
+  --shadow-soft: none;
+  --focus-ring: 0 0 0 3px color-mix(in oklch, var(--brand-secondary) 28%, transparent);
+}
 
-  --button-hover-bg: #f7fbff;
-  --text-item-title: #163554;
-  --text-summary: #304a66;
-  --text-separator: #6f8297;
-  --text-empty: #607286;
-  --text-log: #263b52;
-
-  --shadow-soft: 0 1px 2px rgba(16, 29, 46, 0.06);
-  --focus-ring: 0 0 0 3px rgba(15, 74, 147, 0.18);
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-canvas: #0d1117;
+  --bg-shell: #0d1117;
+  --bg-surface: color-mix(in oklch, var(--brand-primary) 22%, #10151d);
+  --bg-surface-soft: color-mix(in oklch, var(--brand-primary) 17%, #10151d);
+  --bg-surface-muted: color-mix(in oklch, var(--brand-primary) 28%, #10151d);
+  --bg-nav: rgba(13, 17, 23, 0.96);
+  --text-primary: #f3f5f8;
+  --text-strong: #ffffff;
+  --text-secondary: #c4cad3;
+  --text-muted: #9da7b5;
+  --color-primary: color-mix(in oklch, var(--brand-primary) 45%, white);
+  --color-primary-strong: color-mix(in oklch, var(--brand-primary) 28%, white);
+  --color-primary-soft: color-mix(in oklch, var(--brand-primary) 42%, transparent);
+  --color-primary-hover: color-mix(in oklch, var(--brand-primary) 35%, white);
+  --color-secondary: color-mix(in oklch, var(--brand-secondary) 92%, white);
+  --color-secondary-soft: color-mix(in oklch, var(--brand-secondary) 16%, transparent);
+  --color-on-primary: #10151d;
+  --border-soft: color-mix(in oklch, white 10%, transparent);
+  --border-default: color-mix(in oklch, white 14%, transparent);
+  --border-strong: color-mix(in oklch, white 22%, transparent);
+  --border-accent: color-mix(in oklch, var(--brand-secondary) 35%, transparent);
+  --border-hover: color-mix(in oklch, var(--brand-secondary) 55%, transparent);
+  --border-list-divider: color-mix(in oklch, white 11%, transparent);
+  --border-log: color-mix(in oklch, white 16%, transparent);
+  --state-success-bg: #123b2a;
+  --state-success-text: #8de0b4;
+  --state-success-dot: #4ad489;
+  --state-offline-bg: var(--color-secondary-soft);
+  --state-offline-text: var(--color-secondary);
+  --state-danger-bg: #391b20;
+  --state-danger-border: #69313a;
+  --state-danger-text: #ffadb7;
+  --state-warning-text: #ffc17d;
+  --state-star: var(--color-secondary);
+  --state-hint-text: #ffc38b;
+  --button-hover-bg: color-mix(in oklch, white 7%, transparent);
+  --shadow-soft: none;
 }

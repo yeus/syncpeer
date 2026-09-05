@@ -227,6 +227,7 @@ export const createTauriAdapters = (
 ): { hostAdapter: SyncpeerHostAdapter; platformAdapter: SyncpeerPlatformAdapter } => {
   let invoke: InvokeFn | null = null;
   let multicastLockPrepared = false;
+  let localDiscoveryQueue = Promise.resolve();
   const invokeWithLogging: InvokeFn = <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
     if (!invoke) {
       invoke = createLoggedInvoke(resolveInvoke(), options);
@@ -340,53 +341,72 @@ export const createTauriAdapters = (
       return createDiscoveryResponseFromPayload(payload);
     },
     discoverLocalCandidates: async ({ expectedDeviceId, timeoutMs }) => {
-      if (!multicastLockPrepared) {
-        multicastLockPrepared = true;
-        try {
-          await invokeWithLogging<boolean>("syncpeer_android_enable_multicast_lock");
-        } catch {
-          // Best-effort on Android; command returns false on non-Android.
+      const previousDiscovery = localDiscoveryQueue;
+      let releaseDiscovery = () => {};
+      localDiscoveryQueue = new Promise<void>((resolve) => {
+        releaseDiscovery = resolve;
+      });
+      await previousDiscovery;
+      try {
+        if (!multicastLockPrepared) {
+          multicastLockPrepared = true;
+          try {
+            await invokeWithLogging<boolean>("syncpeer_android_enable_multicast_lock");
+          } catch {
+            // Best-effort on Android; command returns false on non-Android.
+          }
         }
+        const payload = await invokeWithLogging<DiscoveryLocalResponsePayload>("syncpeer_discovery_local", {
+          request: {
+            expectedDeviceId: expectedDeviceId || null,
+            timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : null,
+          } as DiscoveryLocalRequestPayload,
+        });
+        logUi(options, "tauri.discovery.local.result", {
+          timeoutMs: payload.diagnostics?.timeoutMs ?? timeoutMs ?? null,
+          socketsBound: payload.diagnostics?.socketsBound ?? null,
+          bindErrors: payload.diagnostics?.bindErrors ?? [],
+          packetsReceived: payload.diagnostics?.packetsReceived ?? 0,
+          packetsBySocketUdp4: payload.diagnostics?.packetsBySocketUdp4 ?? 0,
+          packetsBySocketUdp6: payload.diagnostics?.packetsBySocketUdp6 ?? 0,
+          packetsMagicMismatch: payload.diagnostics?.packetsMagicMismatch ?? 0,
+          packetsDecodeFailed: payload.diagnostics?.packetsDecodeFailed ?? 0,
+          packetsMissingId: payload.diagnostics?.packetsMissingId ?? 0,
+          packetsFilteredExpectedId: payload.diagnostics?.packetsFilteredExpectedId ?? 0,
+          announcementsAccepted: payload.diagnostics?.announcementsAccepted ?? 0,
+          discoveredDeviceIds: payload.diagnostics?.discoveredDeviceIds ?? [],
+          syncthingLanAvailable: payload.diagnostics?.syncthingLanAvailable ?? false,
+          syncpeerLanActive: payload.diagnostics?.syncpeerLanActive ?? false,
+          statusMessage: payload.diagnostics?.statusMessage ?? "LAN discovery status unknown",
+          candidateCount: payload.candidates?.length ?? 0,
+        });
+        if (
+          payload.diagnostics?.socketsBound === 0 &&
+          payload.diagnostics.syncpeerLanActive !== true
+        ) {
+          const bindErrors = payload.diagnostics.bindErrors ?? [];
+          throw new Error(
+            `Local discovery sockets unavailable (${bindErrors.join(" | ")}).`,
+          );
+        }
+        return (payload.candidates ?? [])
+          .filter((candidate) => typeof candidate?.address === "string" && candidate.address.trim() !== "")
+          .map((candidate) => ({
+            address: candidate.address.trim(),
+            protocol:
+              candidate.protocol === "tcp" || candidate.protocol === "quic" || candidate.protocol === "relay"
+                ? candidate.protocol
+                : "unknown",
+            host: candidate.host ?? undefined,
+            port: Number.isFinite(candidate.port) ? Number(candidate.port) : undefined,
+            deviceId:
+              typeof candidate.deviceId === "string" && candidate.deviceId.trim() !== ""
+                ? candidate.deviceId.trim()
+                : undefined,
+          }));
+      } finally {
+        releaseDiscovery();
       }
-      const payload = await invokeWithLogging<DiscoveryLocalResponsePayload>("syncpeer_discovery_local", {
-        request: {
-          expectedDeviceId: expectedDeviceId || null,
-          timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : null,
-        } as DiscoveryLocalRequestPayload,
-      });
-      logUi(options, "tauri.discovery.local.result", {
-        timeoutMs: payload.diagnostics?.timeoutMs ?? timeoutMs ?? null,
-        socketsBound: payload.diagnostics?.socketsBound ?? null,
-        bindErrors: payload.diagnostics?.bindErrors ?? [],
-        packetsReceived: payload.diagnostics?.packetsReceived ?? 0,
-        packetsBySocketUdp4: payload.diagnostics?.packetsBySocketUdp4 ?? 0,
-        packetsBySocketUdp6: payload.diagnostics?.packetsBySocketUdp6 ?? 0,
-        packetsMagicMismatch: payload.diagnostics?.packetsMagicMismatch ?? 0,
-        packetsDecodeFailed: payload.diagnostics?.packetsDecodeFailed ?? 0,
-        packetsMissingId: payload.diagnostics?.packetsMissingId ?? 0,
-        packetsFilteredExpectedId: payload.diagnostics?.packetsFilteredExpectedId ?? 0,
-        announcementsAccepted: payload.diagnostics?.announcementsAccepted ?? 0,
-        discoveredDeviceIds: payload.diagnostics?.discoveredDeviceIds ?? [],
-        syncthingLanAvailable: payload.diagnostics?.syncthingLanAvailable ?? false,
-        syncpeerLanActive: payload.diagnostics?.syncpeerLanActive ?? false,
-        statusMessage: payload.diagnostics?.statusMessage ?? "LAN discovery status unknown",
-        candidateCount: payload.candidates?.length ?? 0,
-      });
-      return (payload.candidates ?? [])
-        .filter((candidate) => typeof candidate?.address === "string" && candidate.address.trim() !== "")
-        .map((candidate) => ({
-          address: candidate.address.trim(),
-          protocol:
-            candidate.protocol === "tcp" || candidate.protocol === "quic" || candidate.protocol === "relay"
-              ? candidate.protocol
-              : "unknown",
-          host: candidate.host ?? undefined,
-          port: Number.isFinite(candidate.port) ? Number(candidate.port) : undefined,
-          deviceId:
-            typeof candidate.deviceId === "string" && candidate.deviceId.trim() !== ""
-              ? candidate.deviceId.trim()
-              : undefined,
-        }));
     },
     log: (event, details) => logUi(options, event, details),
   };

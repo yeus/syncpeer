@@ -7,6 +7,7 @@
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
   import type { AppState } from "../app/state.ts";
+  import { folderRootEmptyNotice } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -230,11 +231,15 @@
         : "Offline",
     };
   });
+
+  let rootEmptyNotice = $derived(
+    folderRootEmptyNotice(app.session.isConnected, app.session.folders.length),
+  );
 </script>
 
 <Panel title="Folders">
   {#if !app.session.isConnected && app.session.folders.length === 0}
-    <p class="empty">Connect to browse folders.</p>
+    <p class="empty" data-testid="folder-root-empty-notice">{rootEmptyNotice}</p>
   {:else}
     <div class="status-row">
       <span data-testid="folder-view-status">
@@ -339,7 +344,9 @@
     {#if !app.session.currentFolderId}
       <ul class="list">
         {#if rootRows.length === 0}
-          <li class="empty">No folders shared by the remote device.</li>
+          <li class="empty" data-testid="folder-root-empty-notice">
+            {rootEmptyNotice ?? "No folders available."}
+          </li>
         {:else}
           {#each rootRows as item (item.folderId)}
             <FileSystemListItem

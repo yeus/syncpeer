@@ -6,6 +6,7 @@
     createSyncpeerSessionStore,
   } from "@syncpeer/core/browser";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
+  import AppHeader from "./components/AppHeader.svelte";
   import DeviceTab from "./components/DeviceTab.svelte";
   import FavoritesTab from "./components/FavoritesTab.svelte";
   import FoldersTab from "./components/FoldersTab.svelte";
@@ -43,12 +44,14 @@
     createInitialState,
   } from "./app/state.ts";
   import AboutPage from "./AboutPage.svelte";
+  import { applyTheme } from "./app/theme.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
   import Star from "lucide-svelte/icons/star";
   import CalendarDays from "lucide-svelte/icons/calendar-days";
 
   let app = $state(createInitialState());
+  let systemPrefersDark = $state(false);
 
   const { hostAdapter, platformAdapter } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
@@ -75,12 +78,6 @@
   let currentFavoriteKeys = $derived(favoriteKeys(app));
   let currentBreadcrumbs = $derived(visibleBreadcrumbs(app));
   let currentRootFolders = $derived(rootFolderEntries(app));
-  let hasManagedConnection = $derived(
-    app.session.lifecyclePhase === "connecting" ||
-    app.session.lifecyclePhase === "connected" ||
-    app.session.lifecyclePhase === "waiting" ||
-    app.session.lifecyclePhase === "reconnecting",
-  );
   let currentConnectionModeLabel = $derived(connectionModeLabel(app));
   let currentConnectTargetLabel = $derived(connectTargetLabel(app));
   let currentDirectoryEntries = $derived(paginatedDirectoryEntries(app));
@@ -89,6 +86,11 @@
 
   $effect(() => {
     persistState(app);
+  });
+
+  $effect(() => {
+    if (typeof document === "undefined") return;
+    applyTheme(document.documentElement, app.ui.theme, systemPrefersDark);
   });
 
   $effect(() => {
@@ -130,11 +132,21 @@
   });
 
   onMount(() => {
-    void actions.hydrate();
-    void actions.refreshCurrentDeviceId();
-    void actions.discoverLocalDevices();
-    actions.restoreOfflineSnapshot(undefined, "startup");
+    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const updateSystemTheme = () => {
+      systemPrefersDark = colorScheme.matches;
+    };
+    updateSystemTheme();
+    colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
+    void (async () => {
+      await Promise.all([
+        actions.hydrate(),
+        actions.refreshCurrentDeviceId(),
+      ]);
+      actions.restoreOfflineSnapshot(undefined, "startup");
+      await actions.onAppForeground();
+    })();
 
     const handleOnline = () => {
       void actions.onNetworkOnline();
@@ -173,6 +185,7 @@
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("pageshow", handlePageShow);
+      colorScheme.removeEventListener("change", updateSystemTheme);
     };
   });
 
@@ -214,12 +227,62 @@
       localDiscoveryTimer = null;
     }
     unsubscribe();
+    actions.dispose();
     void client.disconnect();
   });
 </script>
 
 {#if app.currentPage === "main"}
   <div class="app-shell">
+    <AppHeader
+      phase={app.session.lifecyclePhase}
+      connected={app.session.isConnected}
+      paused={app.ui.autoConnectPaused}
+      expanded={app.ui.isConnectionDetailsExpanded}
+      onToggleDetails={() => {
+        app.ui.isConnectionDetailsExpanded = !app.ui.isConnectionDetailsExpanded;
+      }}
+    />
+    {#if app.ui.isConnectionDetailsExpanded}
+      <section id="connection-details" class="connection-details" data-testid="connection-details">
+        <div class="connection-details-main">
+          <span>{currentConnectionModeLabel}</span>
+          {#if app.session.connectionPath}
+            <span>Path: {app.session.connectionPath}</span>
+          {/if}
+          {#if currentConnectTargetLabel}
+            <span>Target: {currentConnectTargetLabel}</span>
+          {/if}
+        </div>
+        {#if app.ui.expertView}
+          <div class="connection-details-expert" data-testid="connection-expert-details">
+            <span>Phase: {app.session.lifecyclePhase}</span>
+            <span>Attempt: {app.session.reconnectAttempt}</span>
+            {#if app.session.nextRetryAtMs}
+              <span>Next retry: {new Date(app.session.nextRetryAtMs).toLocaleTimeString()}</span>
+            {/if}
+            {#if app.session.upgradeStatus !== "idle"}
+              <span>Upgrade: {app.session.upgradeStatus}</span>
+            {/if}
+            {#if app.session.closureReason}
+              <span>Last closure: {app.session.closureReason}</span>
+            {/if}
+            <button
+              type="button"
+              class="ghost expert-connection-control"
+              data-testid="expert-connection-control"
+              onclick={() => app.ui.autoConnectPaused
+                ? actions.connect()
+                : actions.disconnect()}
+            >
+              {app.ui.autoConnectPaused
+                ? "Resume automatic connection"
+                : "Pause automatic connection"}
+            </button>
+          </div>
+        {/if}
+      </section>
+    {/if}
     <main class="content">
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
@@ -236,21 +299,11 @@
         <section class="panel">
           <p class="hint">
             Waiting for remote approval for <strong>{app.approvals.pendingApprovalPromptDeviceId}</strong>.
-            The remote peer device should now show a prompt to accept this client. Accept
-            it there, then connect again.
+            The remote peer device should now show a prompt to accept this client. Once
+            accepted, Syncpeer will retry automatically.
           </p>
           <div class="item-meta">{app.approvals.pendingApprovalPromptDeviceId}</div>
           <div class="actions">
-            <button
-              class="primary"
-              onclick={() => actions.connect(app.approvals.pendingApprovalPromptDeviceId)}
-              disabled={app.session.isConnecting}
-            >
-              {app.session.isConnecting &&
-              app.session.activeConnectDeviceId === app.approvals.pendingApprovalPromptDeviceId
-                ? "Connecting..."
-                : "Connect Again"}
-            </button>
             <button
               class="ghost"
               onclick={() => {
@@ -263,35 +316,6 @@
           </div>
         </section>
       {/if}
-
-      <div class="global-connect compact">
-        <button
-          data-testid="global-connect-button"
-          class="ghost compact-connect"
-          onclick={() => (hasManagedConnection ? actions.disconnect() : actions.connect())}
-          disabled={app.session.lifecyclePhase === "stopping"}
-        >
-          {app.session.lifecyclePhase === "stopping"
-            ? "Disconnecting..."
-            : app.session.lifecyclePhase === "connecting"
-              ? "Connecting..."
-              : app.session.lifecyclePhase === "reconnecting"
-                ? "Reconnecting..."
-                : app.session.lifecyclePhase === "waiting"
-                  ? "Cancel retry"
-                  : app.session.lifecyclePhase === "connected"
-                    ? "Disconnect"
-                    : "Connect"}
-        </button>
-        <div class="global-connect-meta">
-          {#if currentConnectTargetLabel}
-            <p>Target: {currentConnectTargetLabel}</p>
-          {/if}
-          {#if currentConnectionModeLabel}
-            <p>{currentConnectionModeLabel}</p>
-          {/if}
-        </div>
-      </div>
 
       {#if app.activeTab === "devices"}
         <DeviceTab
@@ -320,6 +344,7 @@
           onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
           onRemoveSavedDevice={actions.removeSavedDevice}
           onConnectLocalCandidate={actions.connectViaLanAnonymousCandidate}
+          onConnectionSettingsChanged={actions.scheduleConnectionSettingsApply}
         />
       {/if}
 
@@ -467,7 +492,7 @@
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 0.9rem 0.0rem;
+    padding: 0.5rem 0;
     max-width: 960px;
     margin: 0 auto;
     width: 100%;
@@ -486,41 +511,35 @@
     padding: 0.45rem 0.6rem;
   }
 
-  .global-connect {
-    margin-bottom: 0.55rem;
-    padding: 0.5rem 0.6rem;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
+  .connection-details {
+    flex: 0 0 auto;
     display: flex;
     flex-wrap: wrap;
-    align-items: flex-start;
-    gap: 0.55rem;
-  }
-
-  .compact-connect {
-    min-height: 30px;
-    padding: 0.15rem 0.5rem;
-    font-size: 0.79rem;
-  }
-
-  .global-connect button {
-    flex: 0 0 auto;
-  }
-
-  .global-connect-meta {
-    display: grid;
-    gap: 0.2rem;
-    min-width: 0;
-    flex: 1 1 20rem;
-  }
-
-  .global-connect-meta p {
-    margin: 0;
+    gap: 0.35rem 1rem;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border-default);
+    background: var(--bg-surface-muted);
     color: var(--text-secondary);
-    font-size: 0.84rem;
-    line-height: 1.35;
-    overflow-wrap: anywhere;
+    font-size: 0.78rem;
+  }
+
+  .connection-details-main,
+  .connection-details-expert {
+    display: flex;
+    flex: 1 1 18rem;
+    flex-wrap: wrap;
+    gap: 0.2rem 0.85rem;
+  }
+
+  .connection-details-expert {
+    color: var(--text-muted);
+    align-items: center;
+  }
+
+  .expert-connection-control {
+    min-height: 30px;
+    padding: 0.2rem 0.5rem;
+    font-size: 0.76rem;
   }
 
   .error {
@@ -559,9 +578,20 @@
   }
 
   .tab-button.active {
-    background: var(--color-primary-soft);
-    color: var(--color-primary-strong);
-    border-color: var(--border-accent);
+    position: relative;
+    background: transparent;
+    color: var(--color-primary);
+  }
+
+  .tab-button.active::after {
+    content: "";
+    position: absolute;
+    right: 24%;
+    bottom: -0.1rem;
+    left: 24%;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--color-secondary);
   }
 
   .sr-only {
@@ -578,7 +608,7 @@
 
   @media (max-width: 640px) {
     .content {
-      padding: 0.7rem 0.6rem 0.7rem;
+      padding: 0.35rem 0 0.5rem;
     }
   }
 </style>

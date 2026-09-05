@@ -31,6 +31,7 @@ import {
   type StoredConnectionSettingsLike,
   type UiLogEntry,
 } from "@syncpeer/core/browser";
+import { normalizeThemePreferences, type ThemePreferences } from "./theme.ts";
 
 const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
 const SESSION_LOG_LIMIT = 2000;
@@ -68,6 +69,8 @@ export const loadPersistedState = () => {
     directoryPageSize?: number;
     directoryViewMode?: "list" | "grid";
     directorySortMode?: FileEntrySortMode;
+    theme?: Partial<ThemePreferences>;
+    expertView?: boolean;
     pim?: {
       enabled?: boolean;
       contactsEnabled?: boolean;
@@ -112,6 +115,8 @@ export const persistState = (state: AppState) => {
       directoryPageSize: state.ui.directoryPageSize,
       directoryViewMode: state.ui.directoryViewMode,
       directorySortMode: state.ui.directorySortMode,
+      theme: state.ui.theme,
+      expertView: state.ui.expertView,
       pim: state.pim,
     }),
   );
@@ -227,6 +232,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         lastSeenAtMs: number;
       }>,
       isDiscoveringLanDevices: false,
+      localDiscoveryNotice: "",
     },
     approvals: {
       syncApprovedFolderKeys: normalizeSyncApprovedIntroducedFolderKeys(
@@ -246,6 +252,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
     },
     ui: {
       isSettingsExpanded: false,
+      isConnectionDetailsExpanded: false,
       isLogPanelExpanded: false,
       isDeviceBackupExpanded: false,
       showRestoreFromBackup: false,
@@ -263,6 +270,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       directoryViewMode: normalizeDirectoryViewMode(persisted?.directoryViewMode),
       directorySortMode: normalizeDirectorySortMode(persisted?.directorySortMode),
       directoryNameFilter: "",
+      theme: normalizeThemePreferences(persisted?.theme),
+      expertView: persisted?.expertView === true,
     },
     sync: {
       isSyncingStarredFiles: false,

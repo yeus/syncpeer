@@ -58,6 +58,26 @@ const main = async (): Promise<void> => {
       name: "Core protocol, session, and runtime diagnostics",
     },
     {
+      name: "Application theme and icon diagnostics",
+      command: process.execPath,
+      args: [
+        "--experimental-strip-types",
+        "--test",
+        "scripts/test-app-theme.ts",
+        "scripts/test-icon-theme.ts",
+      ],
+    },
+    {
+      name: "Application connection notice diagnostics",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-connection-notices.ts"],
+    },
+    {
+      name: "Favorite synchronization policy diagnostics",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-favorite-sync-policies.ts"],
+    },
+    {
       ...tsxScript("scripts/test-harness-diagnostics.ts"),
       name: "Test harness configuration diagnostics",
     },

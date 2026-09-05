@@ -115,25 +115,20 @@ export const connectUntilApproved = async (
   browser: TauriBrowser,
   timeout = 10 * 60_000,
 ): Promise<void> => {
-  const button = $("[data-testid='global-connect-button']");
+  const status = $("[data-testid='connection-status']");
   const deadline = Date.now() + timeout;
   let lastState = "";
   let lastError = "";
   while (Date.now() < deadline) {
-    const label = (await button.getText()).trim();
-    const state = label + "/enabled=" + (await button.isEnabled());
-    if (state !== lastState) {
-      console.log("UI connect state: " + state);
-      lastState = state;
+    const label = (await status.getText()).trim();
+    if (label !== lastState) {
+      console.log("UI connect state: " + label);
+      lastState = label;
     }
-    if (label === "Disconnect") return;
-    if (label === "Connect" && await button.isEnabled()) {
-      await button.click();
-      const error = $("p.error");
-      if (await error.isExisting()) {
-        lastError = await error.getText();
-        console.log("UI connection attempt failed; retrying: " + lastError);
-      }
+    if (label === "Connected") return;
+    const error = $("p.error");
+    if (await error.isExisting()) {
+      lastError = await error.getText();
     }
     await browser.pause(2_000);
   }
@@ -145,11 +140,28 @@ export const waitForDisconnected = async (
   browser: TauriBrowser,
   timeout = 30_000,
 ): Promise<void> => {
-  const button = $("[data-testid='global-connect-button']");
+  const status = $("[data-testid='connection-status-toggle']");
   await browser.waitUntil(
-    async () => (await button.getText()).trim() === "Connect",
+    async () => await status.getAttribute("data-phase") === "idle",
     { timeout, timeoutMsg: "Timed out waiting for the UI to disconnect." },
   );
+};
+
+export const setAutomaticConnectionPaused = async (
+  browser: TauriBrowser,
+  paused: boolean,
+): Promise<void> => {
+  await $("[data-testid='tab-devices']").click();
+  const settings = $("[data-testid='connection-settings-toggle']");
+  if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
+  const expert = $("[data-testid='expert-view']");
+  if (!(await expert.isSelected())) await expert.click();
+  const disclosure = $("[data-testid='connection-status-toggle']");
+  if (await disclosure.getAttribute("aria-expanded") !== "true") await disclosure.click();
+  const control = $("[data-testid='expert-connection-control']");
+  const label = (await control.getText()).trim();
+  if (paused && label === "Pause automatic connection") await control.click();
+  if (!paused && label === "Resume automatic connection") await control.click();
 };
 
 export const readCachedHash = async (

@@ -32,6 +32,7 @@
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
     onConnectLocalCandidate: (candidateId: string) => void;
+    onConnectionSettingsChanged: () => void;
   }
 
   let {
@@ -59,6 +60,7 @@
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
     onConnectLocalCandidate,
+    onConnectionSettingsChanged,
   }: Props = $props();
 
   const appInfo = getAppBuildInfo();
@@ -151,22 +153,6 @@
 </script>
 
 <Panel title="Devices">
-  <div class="status-row" data-testid="connection-status">
-    <StatusChip tone={app.session.isConnected ? "online" : "offline"}>
-      {app.session.isConnected ? "Connected" : "Disconnected"}
-    </StatusChip>
-    {#if app.session.lastUpdatedAt}
-      <span>Updated {app.session.lastUpdatedAt}</span>
-    {/if}
-    {#if app.session.isConnected && app.session.connectionPath}
-      <span>
-        Path:
-        {downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}
-        ({app.session.connectionPath})
-      </span>
-    {/if}
-  </div>
-
   <div class="top-actions">
     <button
       class="ghost small"
@@ -214,6 +200,12 @@
       <div class="item-meta">{app.devices.identityNotice}</div>
     {/if}
   </div>
+
+  {#if app.devices.localDiscoveryNotice}
+    <p class="hint" data-testid="local-discovery-notice">
+      {app.devices.localDiscoveryNotice}
+    </p>
+  {/if}
 
   <details bind:open={app.ui.isDeviceBackupExpanded}>
     <summary>This Device Details</summary>
@@ -285,8 +277,52 @@
 
   {#if app.ui.isSettingsExpanded}
     <div class="settings-block">
+      <div class="appearance-settings" data-testid="appearance-settings">
+        <h3>Appearance</h3>
+        <div class="appearance-grid">
+          <label>
+            Theme
+            <select data-testid="theme-mode" bind:value={app.ui.theme.mode}>
+              <option value="auto">Automatic</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <label>
+            Primary color
+            <span class="color-field">
+              <input
+                data-testid="theme-primary-color"
+                type="color"
+                bind:value={app.ui.theme.primaryColor}
+              />
+              <code>{app.ui.theme.primaryColor}</code>
+            </span>
+          </label>
+          <label>
+            Secondary color
+            <span class="color-field">
+              <input
+                data-testid="theme-secondary-color"
+                type="color"
+                bind:value={app.ui.theme.secondaryColor}
+              />
+              <code>{app.ui.theme.secondaryColor}</code>
+            </span>
+          </label>
+          <label class="checkbox-row expert-toggle">
+            <input
+              data-testid="expert-view"
+              type="checkbox"
+              bind:checked={app.ui.expertView}
+            />
+            <span>Expert view</span>
+          </label>
+        </div>
+      </div>
       <form
         class="settings"
+        onchange={onConnectionSettingsChanged}
         onsubmit={(event) => {
           event.preventDefault();
         }}
@@ -578,14 +614,43 @@
 </Panel>
 
 <style>
-  .status-row {
+  .appearance-settings {
+    padding-bottom: 0.7rem;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .appearance-settings h3 {
+    margin: 0 0 0.55rem;
+    font-size: 0.9rem;
+  }
+
+  .appearance-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+    gap: 0.55rem;
+    align-items: end;
+  }
+
+  .color-field {
     display: flex;
-    gap: 0.45rem;
     align-items: center;
-    flex-wrap: wrap;
-    font-size: 0.82rem;
+    gap: 0.45rem;
+    min-height: 42px;
+  }
+
+  .color-field input {
+    width: 3rem;
+    height: 2.35rem;
+    padding: 0.15rem;
+  }
+
+  .color-field code {
     color: var(--text-secondary);
-    margin-bottom: 0.45rem;
+    font-size: 0.76rem;
+  }
+
+  .expert-toggle {
+    min-height: 42px;
   }
 
   .top-actions {

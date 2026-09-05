@@ -601,6 +601,31 @@ test("ambiguous uploads are verified by hashes and never replayed", async () => 
   await run(false);
 });
 
+test("ambiguous deletions are not replayed after a transport closure", async () => {
+  let publications = 0;
+  const first = session({
+    deleteFile: async () => {
+      publications += 1;
+      first.finish({ kind: "transport", message: "connection closed" });
+      throw new Error("connection closed");
+    },
+  } as SyncpeerSessionHandle["remoteFs"]);
+  let ensured = 0;
+  const recovering = createRecoveringRemoteFs({
+    getOptions: () => ({ host: "test.invalid", port: 22000, deviceName: "test" }),
+    ensureSession: async () => {
+      ensured += 1;
+      return first;
+    },
+    getFocusedFolderId: () => null,
+    setFocusedFolderId: () => undefined,
+    getActiveSession: () => first,
+  });
+  await assert.rejects(recovering.deleteFile!("folder", "file"), /connection closed/);
+  assert.equal(publications, 1);
+  assert.equal(ensured, 1);
+});
+
 test("remote file block offsets normalize protobuf long values", async () => {
   const longOffset = {
     valueOf: () => 131072,

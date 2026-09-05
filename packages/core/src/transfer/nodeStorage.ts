@@ -22,7 +22,7 @@ const readRange = async (file: FileHandle, range: DownloadRange, consume: (bytes
   }
 };
 
-const digestRanges = async (file: FileHandle, ranges: readonly DownloadRange[], skipMissing: boolean) => {
+export const digestRanges = async (file: FileHandle, ranges: readonly DownloadRange[], skipMissing: boolean) => {
   const size = (await file.stat()).size;
   const results = [];
   for (const range of ranges) {

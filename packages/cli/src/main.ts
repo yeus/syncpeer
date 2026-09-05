@@ -8,11 +8,19 @@ import type { SharedFolder } from "@syncpeer/core";
 import {
   createNodeSessionTransport,
   createNodeFileDownloadSink,
+  createNodeFolderSyncStorage,
   DownloadInterruptedError,
   downloadRemoteFile,
   getDefaultDiscoveryServer,
   resolveNodeGlobalDiscovery,
 } from "@syncpeer/core/node";
+import {
+  deleteFolderFile,
+  defaultFolderSyncPolicy,
+  synchronizeFolder,
+  unsubscribeFolder,
+  type FolderSyncPolicy,
+} from "@syncpeer/core";
 import { ensureCliNodeIdentity } from "./identity.js";
 import { formatAppBuildInfo, getCliBuildInfo } from "./appInfo.js";
 
@@ -40,6 +48,10 @@ interface ShareFolderCommandOptions {
   password?: string;
   plaintext?: boolean;
   serveMs?: number;
+  once?: boolean;
+  deleteRemote?: boolean;
+  versioning?: "disabled" | "trash" | "simple" | "staggered";
+  maxVersions?: number;
 }
 
 const reexecuteWithNativeQuicIfAvailable = (): void => {
@@ -164,46 +176,96 @@ async function openRemoteFs(
   };
 }
 
-function collectLocalFiles(
-  rootPath: string,
-  relativePath = "",
-): Array<{ path: string; bytes: Uint8Array; modifiedMs: number }> {
-  const directoryPath = path.join(rootPath, relativePath);
-  const files: Array<{ path: string; bytes: Uint8Array; modifiedMs: number }> = [];
-  for (const entry of fs.readdirSync(directoryPath, { withFileTypes: true })) {
-    const filePath = relativePath
-      ? `${relativePath}/${entry.name}`
-      : entry.name;
-    if (entry.isDirectory()) {
-      files.push(...collectLocalFiles(rootPath, filePath));
-      continue;
-    }
-    if (!entry.isFile()) continue;
-    const absolutePath = path.join(rootPath, filePath);
-    files.push({
-      path: filePath,
-      bytes: new Uint8Array(fs.readFileSync(absolutePath)),
-      modifiedMs: fs.statSync(absolutePath).mtimeMs,
-    });
-  }
-  return files;
-}
-
 function generatedFolderPassword(): string {
   return randomBytes(24).toString("base64url");
 }
 
-function waitForSignal(): Promise<void> {
-  return new Promise((resolve) => {
-    const stop = () => {
-      process.off("SIGINT", stop);
-      process.off("SIGTERM", stop);
-      resolve();
-    };
-    process.on("SIGINT", stop);
-    process.on("SIGTERM", stop);
-  });
-}
+const folderSyncPolicy = (options: ShareFolderCommandOptions): FolderSyncPolicy => ({
+  ...defaultFolderSyncPolicy(),
+  externalDeletion: options.deleteRemote ? "propagate" : "ignore",
+  versioning: options.versioning ?? "staggered",
+  ...(Number.isFinite(options.maxVersions) && (options.maxVersions ?? 0) > 0
+    ? { maxVersions: Math.floor(options.maxVersions!) }
+    : {}),
+});
+
+const runFolderSyncService = async (args: {
+  folderId: string;
+  rootPath: string;
+  remoteFs: Awaited<ReturnType<typeof openRemoteFs>>["remoteFs"];
+  options: ShareFolderCommandOptions;
+}): Promise<void> => {
+  const storage = await createNodeFolderSyncStorage(args.rootPath);
+  await storage.setSubscribed?.(true);
+  const policy = folderSyncPolicy(args.options);
+  if (!args.remoteFs.listFiles) throw new Error("This connection does not expose folder listings.");
+  const remote = {
+    listFiles: (folderId: string) => args.remoteFs.listFiles!(folderId),
+    readFileFully: (folderId: string, filePath: string, signal?: AbortSignal) =>
+      args.remoteFs.readFileFully(folderId, filePath, undefined, signal),
+    writeFileFully: (...writeArgs: Parameters<typeof args.remoteFs.writeFileFully>) =>
+      args.remoteFs.writeFileFully(...writeArgs),
+    deleteFile: args.remoteFs.deleteFile
+      ? (...deleteArgs: Parameters<NonNullable<typeof args.remoteFs.deleteFile>>) =>
+        args.remoteFs.deleteFile!(...deleteArgs)
+      : undefined,
+  };
+  let running: Promise<void> | null = null;
+  const syncOnce = async (): Promise<void> => {
+    if (running) return running;
+    running = synchronizeFolder({
+      folderId: args.folderId,
+      remote,
+      storage,
+      policy,
+      onEvent: (event) => {
+        if (event.status === "completed") {
+          console.log(`Folder sync ${event.action.kind}: ${event.action.path}`);
+        }
+      },
+    }).then((result) => {
+      if (result.actions.length > 0) {
+        console.log(
+          `Folder sync completed: ${result.completed} action(s), ` +
+          `${result.conflicts.length} conflict(s).`,
+        );
+      }
+    }).finally(() => {
+      running = null;
+    });
+    return running;
+  };
+  await syncOnce();
+  if (args.options.once || Number(args.options.serveMs ?? 0) > 0) {
+    if (!args.options.once) await sleepMs(Math.max(0, Number(args.options.serveMs ?? 0)));
+    return;
+  }
+  let stop: () => void = () => {};
+  console.log("Folder subscription active.");
+  const stopped = new Promise<void>(resolve => { stop = resolve; });
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  let unsubscribed = false;
+  const timer = setInterval(() => {
+    void (async () => {
+      if (await storage.isSubscribed?.() === false) {
+        unsubscribed = true;
+        stop();
+        return;
+      }
+      await syncOnce();
+    })().catch((error) => console.error(String(error)));
+  }, 2_000);
+  try {
+    await stopped;
+  } finally {
+    clearInterval(timer);
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    await running;
+  }
+  if (unsubscribed) console.log("Folder subscription stopped.");
+};
 
 async function renderTree(
   readDir: (
@@ -240,7 +302,7 @@ async function main() {
   const appInfo = getCliBuildInfo();
   program
     .name("syncpeer")
-    .description("Read-only Syncthing BEP client")
+    .description("Syncthing BEP client with read and folder-sync support")
     .version(appInfo.appVersion, "-V, --version", "Show Syncpeer version")
     .option("--host <host>", "Remote host", "127.0.0.1")
     .option(
@@ -334,6 +396,10 @@ async function main() {
       (value) => parseInt(value, 10),
       0,
     )
+    .option("--once", "Synchronize once and exit", false)
+    .option("--delete-remote", "Propagate local deletions to the peer", false)
+    .addOption(new Option("--versioning <mode>", "Archive replaced/deleted files").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
+    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
     .action(async (
       folderId: string,
       localPath: string,
@@ -358,24 +424,102 @@ async function main() {
       };
       const session = await openRemoteFs(opts, [sharedFolder]);
       try {
-        const files = collectLocalFiles(rootPath);
-        for (const file of files) {
-          await session.remoteFs.writeFileFully(
-            normalizedFolderId,
-            file.path,
-            file.bytes,
-            { modifiedMs: file.modifiedMs },
-          );
-        }
         console.log(`Shared folder ID: ${normalizedFolderId}`);
         console.log(`Shared folder path: ${rootPath}`);
-        console.log(`Files advertised: ${files.length}`);
         console.log(`Encryption: ${password ? "enabled" : "disabled"}`);
         if (password) console.log(`Folder password: ${password}`);
-        console.log("Waiting for the peer to accept and synchronize. Press Ctrl-C to stop.");
-        const serveMs = Math.max(0, Number(shareOpts.serveMs ?? 0));
-        if (serveMs > 0) await sleepMs(serveMs);
-        else await waitForSignal();
+        await runFolderSyncService({
+          folderId: normalizedFolderId,
+          rootPath,
+          remoteFs: session.remoteFs,
+          options: shareOpts,
+        });
+      } finally {
+        await session.close();
+      }
+    });
+
+  program
+    .command("sync-folder <folderId> <localPath>")
+    .description("Synchronize a local folder with a writable syncpeer folder")
+    .option("--once", "Synchronize once and exit", false)
+    .option("--delete-remote", "Propagate local deletions to the peer", false)
+    .addOption(new Option("--versioning <mode>", "Archive replaced/deleted files").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
+    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
+    .action(async (folderId: string, localPath: string, syncOpts: ShareFolderCommandOptions) => {
+      const opts = program.opts<CliOptions>();
+      const normalizedFolderId = folderId.trim();
+      if (!normalizedFolderId) throw new Error("folderId must not be empty");
+      const rootPath = fs.realpathSync(localPath);
+      if (!fs.statSync(rootPath).isDirectory()) throw new Error(`Local sync path is not a directory: ${rootPath}`);
+      const session = await openRemoteFs(opts);
+      try {
+        await runFolderSyncService({ folderId: normalizedFolderId, rootPath, remoteFs: session.remoteFs, options: syncOpts });
+      } finally {
+        await session.close();
+      }
+    });
+
+  program
+    .command("versions <localPath> [relativePath]")
+    .description("List archived folder versions")
+    .action(async (localPath: string, relativePath?: string) => {
+      const rootPath = fs.realpathSync(localPath);
+      const storage = await createNodeFolderSyncStorage(rootPath);
+      for (const version of await storage.listVersions(relativePath)) {
+        console.log(`${version.archivePath}\t${version.path}\t${new Date(version.modifiedMs).toISOString()}`);
+      }
+    });
+
+  program
+    .command("restore <localPath> <archivePath> [targetPath]")
+    .description("Restore an archived folder version")
+    .action(async (localPath: string, archivePath: string, targetPath?: string) => {
+      const rootPath = fs.realpathSync(localPath);
+      const storage = await createNodeFolderSyncStorage(rootPath);
+      await storage.restoreVersion(archivePath, targetPath);
+      console.log(`Restored ${archivePath}${targetPath ? ` to ${targetPath}` : ""}.`);
+    });
+
+  program
+    .command("unsubscribe-folder <localPath>")
+    .description("Remove local folder contents while leaving the remote folder unchanged")
+    .addOption(new Option("--versioning <mode>", "Archive removed files").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
+    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
+    .action(async (localPath: string, unsubscribeOpts: ShareFolderCommandOptions) => {
+      const rootPath = fs.realpathSync(localPath);
+      const storage = await createNodeFolderSyncStorage(rootPath);
+      const result = await unsubscribeFolder({ storage, policy: folderSyncPolicy(unsubscribeOpts) });
+      console.log(`Unsubscribed local folder: removed ${result.removed.length} file(s), archived ${result.archived.length}.`);
+    });
+
+  program
+    .command("delete-file <folderId> <localPath> <relativePath>")
+    .description("Delete one local file and publish a remote tombstone")
+    .addOption(new Option("--versioning <mode>", "Archive the local file").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
+    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
+    .action(async (folderId: string, localPath: string, relativePath: string, deleteOpts: ShareFolderCommandOptions) => {
+      const opts = program.opts<CliOptions>();
+      const normalizedFolderId = folderId.trim();
+      if (!normalizedFolderId) throw new Error("folderId must not be empty");
+      const rootPath = fs.realpathSync(localPath);
+      if (!fs.statSync(rootPath).isDirectory()) throw new Error(`Local sync path is not a directory: ${rootPath}`);
+      const storage = await createNodeFolderSyncStorage(rootPath);
+      const session = await openRemoteFs(opts);
+      try {
+        const result = await deleteFolderFile({
+          folderId: normalizedFolderId,
+          path: relativePath,
+          remote: {
+            deleteFile: session.remoteFs.deleteFile
+              ? (...deleteArgs: Parameters<NonNullable<typeof session.remoteFs.deleteFile>>) =>
+                session.remoteFs.deleteFile!(...deleteArgs)
+              : undefined,
+          },
+          storage,
+          policy: folderSyncPolicy(deleteOpts),
+        });
+        console.log(`Deleted ${result.path}; remote tombstone published.`);
       } finally {
         await session.close();
       }

@@ -83,6 +83,17 @@ export const createRecoveringRemoteFs = (deps: {
     }
   };
 
+  const deleteRemote = async (
+    folderId: string,
+    path: string,
+    options?: Parameters<NonNullable<RemoteFsLike["deleteFile"]>>[2],
+  ): Promise<void> => {
+    const connectOptions = deps.getOptions();
+    if (!connectOptions) throw new Error("No active connection. Connect first.");
+    const session = await deps.ensureSession(connectOptions);
+    await session.remoteFs.deleteFile(folderId, path, options);
+  };
+
   return {
     listFolders: () => metadata((session) => session.remoteFs.listFolders()),
     requestFolderIndex: (folderId) => metadata((session) => session.remoteFs.requestFolderIndex(folderId)),
@@ -94,6 +105,7 @@ export const createRecoveringRemoteFs = (deps: {
     waitForFolderIndex: (folderId, timeoutMs, pollMs) =>
       metadata((session) => session.remoteFs.waitForFolderIndex(folderId, timeoutMs, pollMs)),
     readDir: (folderId, path) => metadata((session) => session.remoteFs.readDir(folderId, path)),
+    listFiles: (folderId) => metadata((session) => session.remoteFs.listFiles(folderId)),
     readFileFully: async (folderId, path, onProgress, signal) => {
       let output = new Uint8Array(0);
       await download({
@@ -119,5 +131,6 @@ export const createRecoveringRemoteFs = (deps: {
         signal,
       ), signal) as ReturnType<NonNullable<RemoteFsLike["readFileToSink"]>>,
     writeFileFully: upload,
+    deleteFile: deleteRemote,
   };
 };

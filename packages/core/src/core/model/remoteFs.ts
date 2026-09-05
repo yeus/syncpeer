@@ -1,5 +1,5 @@
 import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
-import type { BepFileInfo } from "../protocol/bep.js";
+import type { BepFileInfo, BepVersionVector } from "../protocol/bep.js";
 import { prepareCachedBlocks, verifyBlockDigests, type RangeDigest } from "../../transfer/blockReuse.js";
 import type {
   FileDownloadMetadata,
@@ -52,6 +52,9 @@ export interface FileEntry {
   invalid?: boolean;
   deleted?: boolean;
   blocks?: FileBlock[];
+  version?: BepVersionVector;
+  sequence?: number | string;
+  fingerprint?: string;
 }
 
 export interface RemoteDeviceInfo {
@@ -80,6 +83,8 @@ export interface FileDownloadProgress {
 }
 
 export interface FileUploadOptions {
+  /** Keep serving blocks until the peer advertises the published content. */
+  waitForRemote?: boolean;
   modifiedMs?: number;
   signal?: AbortSignal;
   onProgress?: (progress: {
@@ -88,6 +93,13 @@ export interface FileUploadOptions {
     elapsedMs: number;
     phase: "preparing" | "publishing";
   }) => void;
+}
+
+export interface FileDeleteOptions {
+  modifiedMs?: number;
+  signal?: AbortSignal;
+  /** Wait for the peer's index to confirm the tombstone, not just its publication. */
+  waitForRemote?: boolean;
 }
 
 interface FolderState {
@@ -180,21 +192,34 @@ function toEntry(path: string, file: BepFileInfo): FileEntry {
     typeValue === 4 || typeValue === 2 || typeValue === 3 ? "symlink" :
     "file";
 
+  const blocks = rawBlocks
+    ? rawBlocks.map((b) => ({
+        offset: Number(b.offset),
+        size: Number(b.size),
+        hash: b.hash,
+      }))
+    : undefined;
+  const size = Number(file.size ?? 0);
+  const modifiedMs = Number(file.modified_s ?? 0) * 1000 + Math.floor(Number(file.modified_ns ?? 0) / 1e6);
+  const fingerprint = blocks
+    ? blocks.length > 0
+      ? blocks.map((block) => `${block.offset}:${block.size}:${Array.from(block.hash).join(",")}`).join("|")
+      : `empty:${size}`
+    : `metadata:${size}:${modifiedMs}`;
   return {
     name: path.split("/").filter(Boolean).at(-1) ?? path,
     path,
     type,
-    size: Number(file.size ?? 0),
-    modifiedMs: Number(file.modified_s ?? 0) * 1000 + Math.floor(Number(file.modified_ns ?? 0) / 1e6),
+    size,
+    modifiedMs,
     invalid: Boolean(file.invalid),
     deleted: Boolean(file.deleted),
-    blocks: rawBlocks
-      ? rawBlocks.map((b) => ({
-          offset: Number(b.offset),
-          size: Number(b.size),
-          hash: b.hash,
-        }))
-      : undefined,
+    blocks,
+    version: file.version,
+    ...(file.sequence != null
+      ? { sequence: typeof file.sequence === "string" ? file.sequence : Number(file.sequence) }
+      : {}),
+    fingerprint,
   };
 }
 
@@ -220,6 +245,11 @@ export class RemoteFs {
     path: string,
     bytes: Uint8Array,
     options?: FileUploadOptions,
+  ) => Promise<void>;
+  private publishDeletion?: (
+    folderId: string,
+    path: string,
+    options?: FileDeleteOptions,
   ) => Promise<void>;
   private requestFolderIndexUpdate: (folderId: string) => Promise<void>;
   private setFocusedFolderId: (folderId: string | null) => void;
@@ -251,6 +281,11 @@ export class RemoteFs {
       options?: FileUploadOptions,
     ) => Promise<void>,
     hashBytes?: (bytes: Uint8Array) => Promise<Uint8Array> | Uint8Array,
+    publishDeletion?: (
+      folderId: string,
+      path: string,
+      options?: FileDeleteOptions,
+    ) => Promise<void>,
   ) {
     this.folders = folders;
     this.requestBlock = requestBlock;
@@ -258,6 +293,7 @@ export class RemoteFs {
     this.remoteDevice = remoteDevice;
     this.closeConnection = closeConnection;
     this.publishFile = publishFile;
+    this.publishDeletion = publishDeletion;
     this.requestFolderIndexUpdate = requestFolderIndexUpdate;
     this.setFocusedFolderId = setFocusedFolderId;
     this.hashBytes = hashBytes;
@@ -395,6 +431,20 @@ export class RemoteFs {
       if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
+  }
+
+  async listFiles(folderId: string): Promise<FileEntry[]> {
+    const folder = this.folders.get(folderId);
+    if (!folder) throw new Error(`Unknown folder: ${folderId}`);
+    if (!folder.indexReceived && !await this.waitForFolderIndex(folderId, 6000, 120)) {
+      throw new Error("Folder index is unavailable; synchronization cannot proceed.");
+    }
+    if (folder.needsPassword || folder.passwordError || folder.stopReason) {
+      throw new Error("Folder is unavailable; synchronization cannot proceed.");
+    }
+    return [...folder.files.entries()]
+      .map(([key, stored]) => toEntry(normalizePath(key), stored.indexFile))
+      .filter((entry) => entry.type === "file");
   }
 
   async readFileRange(
@@ -681,6 +731,20 @@ export class RemoteFs {
       throw new Error("Upload path must not be empty.");
     }
     await this.publishFile(folderId, normalizedPath, bytes, options);
+  }
+
+  async deleteFile(
+    folderId: string,
+    path: string,
+    options?: FileDeleteOptions,
+  ): Promise<void> {
+    if (!this.publishDeletion) {
+      throw new Error("Remote deletion is not supported by this session transport.");
+    }
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath) throw new Error("Deletion path must not be empty.");
+    await this.listFiles(folderId);
+    await this.publishDeletion(folderId, normalizedPath, options);
   }
 
   async matchesFileContent(folderId: string, path: string, bytes: Uint8Array): Promise<boolean> {

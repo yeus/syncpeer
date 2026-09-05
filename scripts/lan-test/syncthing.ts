@@ -240,6 +240,7 @@ const configureHome = (home: string, args: {
   folderId: string;
   encryptedFolderId: string;
   password: string;
+  encryptedFolderType?: "sendonly" | "sendreceive";
 }): void => {
   const configPath = path.join(home, "config.xml");
   let xml = removeDefaultFolder(fs.readFileSync(configPath, "utf8"));
@@ -271,7 +272,7 @@ const configureHome = (home: string, args: {
     encryptionPasswords: args.untrustedDeviceId
       ? { [args.untrustedDeviceId]: args.password }
       : undefined,
-    type: "sendonly",
+    type: args.encryptedFolderType ?? "sendonly",
   });
   fs.writeFileSync(configPath, xml);
 };
@@ -385,6 +386,7 @@ export const createLanFixture = async (args: {
   untrustedDeviceId?: string;
   home?: string;
   mode: "direct" | "relay" | "quic";
+  encryptedFolderType?: "sendonly" | "sendreceive";
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
   const root = args.root;
@@ -431,6 +433,7 @@ export const createLanFixture = async (args: {
     folderId,
     encryptedFolderId,
     password: encryptedPassword,
+    encryptedFolderType: args.encryptedFolderType,
   });
   let syncthingProcess: ChildProcess | null = null;
   const start = async () => {

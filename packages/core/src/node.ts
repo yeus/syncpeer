@@ -41,6 +41,8 @@ export type {
 } from "./appInfo.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export { createNodeFileDownloadSink } from "./transfer/nodeStorage.js";
+export { createNodeFolderSyncStorage } from "./sync/nodeFolderStorage.js";
+export type { NodeFolderSyncStorage, NodeFolderSyncStorageOptions } from "./sync/nodeFolderStorage.js";
 export type { FileDownloadSink } from "./transfer/stream.js";
 export { DownloadInterruptedError } from "./transfer/stream.js";
 export {

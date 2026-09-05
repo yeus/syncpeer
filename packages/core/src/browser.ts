@@ -33,6 +33,7 @@ export type {
   FileBlock,
   FileDownloadProgress,
   FileEntry,
+  FileDeleteOptions,
   FolderInfo,
   FolderSyncState,
   RemoteDeviceInfo,
@@ -130,6 +131,30 @@ export type {
   FileTransferMessage,
 } from "./transfer/stream.js";
 export type { DownloadRange, RangeDigest, CachedRangeStorage } from "./transfer/blockReuse.js";
+export {
+  compareVersionVectors,
+  deleteFolderFile,
+  defaultFolderSyncPolicy,
+  planFolderSync,
+  synchronizeFolder,
+  unsubscribeFolder,
+} from "./sync/folderSync.js";
+export type {
+  ExternalDeletionPolicy,
+  FolderDeleteResult,
+  FolderSyncAction,
+  FolderSyncBaseline,
+  FolderSyncBaselineFile,
+  FolderSyncEvent,
+  FolderSyncPlan,
+  FolderSyncPolicy,
+  FolderSyncRemote,
+  FolderSyncResult,
+  FolderSyncStorage,
+  FolderUnsubscribeResult,
+  FolderVersioningMode,
+  LocalSyncFile,
+} from "./sync/folderSync.js";
 export type {
   CachedFileRecord,
   CachedFileStatus,

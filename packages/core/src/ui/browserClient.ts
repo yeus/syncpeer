@@ -8,6 +8,7 @@ export { getDefaultDiscoveryServer, normalizeDiscoveryServer } from "./discovery
 import type {
   FileDownloadProgress,
   FileEntry,
+  FileDeleteOptions,
   FileUploadOptions,
   FolderInfo,
   FolderSyncState,
@@ -57,11 +58,17 @@ export interface RemoteFsLike {
     onProgress?: (progress: FileDownloadProgress) => void,
     signal?: AbortSignal,
   ) => Promise<FileDownloadResult>;
+  listFiles?: (folderId: string) => Promise<FileEntry[]>;
   writeFileFully: (
     folderId: string,
     path: string,
     bytes: Uint8Array,
     options?: FileUploadOptions,
+  ) => Promise<void>;
+  deleteFile?: (
+    folderId: string,
+    path: string,
+    options?: FileDeleteOptions,
   ) => Promise<void>;
 }
 

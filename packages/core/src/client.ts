@@ -25,9 +25,12 @@ import {
   isTransportFailure,
   RemoteFs,
   type FileDownloadProgress,
+  type FileDeleteOptions,
   type FileUploadOptions,
 } from "./core/model/remoteFs.js";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
+import { advanceVersionVector } from "./core/protocol/versionVector.js";
+import { compareVersionVectors } from "./sync/folderSync.js";
 import {
   coalescePendingIndexFrame,
   type FolderIndexMessage,
@@ -845,6 +848,7 @@ class BepSession {
   private pendingIndexByFolder = new Map<string, PendingIndexFrame>();
   private indexApplyInFlight = new Set<string>();
   private uploadedFilesByFolder = new Map<string, Map<string, UploadedFileRecord>>();
+  private awaitingPublications = new Map<string, { expected: BepFileInfo; received: boolean }>();
   private readonly folderPasswords: Map<string, string>;
   private readonly sharedFolders = new Map<
     string,
@@ -983,7 +987,7 @@ class BepSession {
         folderCrypto,
         localDevicePresentInFolder: true,
         stopReason: 0,
-        indexReceived: true,
+        indexReceived: false,
         remoteIndexId: "0",
         remoteMaxSequence: "0",
         files: new Map(),
@@ -1539,6 +1543,7 @@ class BepSession {
     for (const file of files) {
       if (!state.encrypted) {
         state.files.set(file.name, { indexFile: file });
+        this.acknowledgePublication(folderId, file.name, file);
         decryptedStored += 1;
         continue;
       }
@@ -1576,6 +1581,7 @@ class BepSession {
             encryptedBlocks,
           },
         });
+        this.acknowledgePublication(folderId, plaintextName, originalFile);
         decryptedStored += 1;
       } catch (error) {
         decryptFailed += 1;
@@ -1889,9 +1895,7 @@ class BepSession {
       }
       const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
       const sequence = this.nextFolderSequence(folderId);
-      const baseVersion = {
-        counters: [{ id: this.localVersionCounterId, value: String(sequence) }],
-      };
+      const baseVersion = advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId);
       const originalFileInfo = {
         name: normalizedPath,
         type: 0,
@@ -1977,7 +1981,7 @@ class BepSession {
         },
         0,
       );
-      await this.writeFrame(frame);
+      await this.publishAndWait(frame, folderId, normalizedPath, originalFileInfo, options);
       notifyProgress(bytes.length, "publishing");
       this.log("upload.index_update.sent", {
         folderId,
@@ -2012,14 +2016,7 @@ class BepSession {
       deleted: false,
       invalid: false,
       no_permissions: false,
-      version: {
-        counters: [
-          {
-            id: this.localVersionCounterId,
-            value: String(sequence),
-          },
-        ],
-      },
+      version: advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId),
       sequence,
       block_size: blockSize,
       blocks: blocks.map((block) => ({
@@ -2055,7 +2052,7 @@ class BepSession {
       },
       0,
     );
-    await this.writeFrame(frame);
+    await this.publishAndWait(frame, folderId, normalizedPath, fileInfo, options);
     notifyProgress(bytes.length, "publishing");
     this.log("upload.index_update.sent", {
       folderId,
@@ -2074,6 +2071,91 @@ class BepSession {
       elapsedMs: Date.now() - uploadStartedAtMs,
       avgRateBps: uploadRateBps(bytes.length),
     });
+  }
+
+  private acknowledgePublication(folderId: string, path: string, file: BepFileInfo): void {
+    const pending = this.awaitingPublications.get(`${folderId}\0${path}`);
+    if (!pending) return;
+    const order = compareVersionVectors(file.version, pending.expected.version);
+    const signature = (value: BepFileInfo) => JSON.stringify({ size: String(value.size ?? 0), deleted: !!value.deleted,
+      blocks: (value.blocks ?? []).map(block => [String(block.offset), block.size, Array.from(block.hash)]) });
+    pending.received = (order === "equal" || order === "after") && signature(file) === signature(pending.expected);
+  }
+
+  private async publishAndWait(frame: Uint8Array, folderId: string, path: string, expected: BepFileInfo, options?: FileUploadOptions): Promise<void> {
+    if (!options?.waitForRemote) { await this.writeFrame(frame); return; }
+    const key = `${folderId}\0${path}`;
+    if (this.awaitingPublications.has(key)) throw new Error("A publication for this file is already pending.");
+    const pending = { expected, received: false };
+    this.awaitingPublications.set(key, pending);
+    try {
+      await this.writeFrame(frame);
+      const deadline = Date.now() + 120000;
+      while (!pending.received) {
+        options.signal?.throwIfAborted();
+        if (this.closed) throw new Error("Connection closed before remote upload confirmation.");
+        if (Date.now() >= deadline) throw new UploadOutcomeUnknownError("Peer has not confirmed the uploaded file.");
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    } finally { this.awaitingPublications.delete(key); }
+  }
+
+  async publishDeletion(
+    folderId: string,
+    path: string,
+    options?: FileDeleteOptions,
+  ): Promise<void> {
+    const folder = this.folders.get(folderId);
+    if (!folder) throw new Error(`Unknown folder: ${folderId}`);
+    if (folder.readOnly) throw new Error(`Folder ${folderId} is read-only for this client.`);
+    if (folder.stopReason !== 0) {
+      throw new Error(`Folder ${folderId} is stopped on remote (stopReason=${folder.stopReason}).`);
+    }
+    if (folder.encrypted && (!folder.folderCrypto || folder.needsPassword)) {
+      throw new Error(`Folder ${folderId} requires a valid encryption password before deletion.`);
+    }
+    const normalizedPath = normalizePathValue(path);
+    if (!normalizedPath) throw new Error("Deletion path must not be empty.");
+    const sequence = this.nextFolderSequence(folderId);
+    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
+    let advertisedName = normalizedPath;
+    if (folder.encrypted && folder.folderCrypto) {
+      advertisedName = await encryptUntrustedFilename(folder.folderCrypto.folderKey, normalizedPath);
+    }
+    const fileInfo = {
+      name: advertisedName,
+      type: 0,
+      size: 0,
+      permissions: 0o644,
+      modified_s: folder.encrypted ? 1_234_567_890 : Math.floor(modifiedMs / 1000),
+      modified_ns: folder.encrypted ? 0 : (modifiedMs % 1000) * 1_000_000,
+      modified_by: this.localVersionCounterId,
+      deleted: true,
+      invalid: false,
+      no_permissions: false,
+      version: advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId),
+      sequence,
+      block_size: 128 * 1024,
+      blocks: [],
+    };
+    const originalFileInfo = { ...fileInfo, name: normalizedPath, modified_s: Math.floor(modifiedMs / 1000), modified_ns: (modifiedMs % 1000) * 1000000 };
+    const advertisedFileInfo = folder.encrypted && folder.folderCrypto ? {
+      ...fileInfo,
+      encrypted: encryptUntrustedBytes(deriveUntrustedFileKey(folder.folderCrypto.folderKey, normalizedPath),
+        FileInfo.encode(originalFileInfo).finish(), toUint8Array(await this.adapter.randomBytes(24))),
+    } : fileInfo;
+    folder.files.set(normalizedPath, { indexFile: originalFileInfo });
+    const uploaded = this.uploadedFilesByFolder.get(folderId);
+    uploaded?.delete(normalizedPath);
+    if (advertisedName !== normalizedPath) uploaded?.delete(advertisedName);
+    const frame = encodeMessageFrame(
+      MessageTypeValues.INDEX_UPDATE,
+      IndexUpdate,
+      { folder: folderId, files: [advertisedFileInfo], last_sequence: sequence, prev_sequence: sequence - 1 },
+      0,
+    );
+    await this.publishAndWait(frame, folderId, normalizedPath, originalFileInfo, options);
+    this.log("delete.index_update.sent", { folderId, path: normalizedPath, sequence });
   }
 
   async waitForReady(): Promise<void> {
@@ -2201,6 +2283,8 @@ class BepSession {
       (folderId, path, bytes, options) =>
         this.publishFile(folderId, path, bytes, options),
       (bytes) => this.adapter.sha256(bytes),
+      (folderId, path, options) =>
+        this.publishDeletion(folderId, path, options),
     );
   }
 

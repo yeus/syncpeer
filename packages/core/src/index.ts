@@ -33,12 +33,36 @@ export {
   resolveNodeLocalDiscovery,
 } from "./node.js";
 export { isTransportFailure, RemoteFs } from "./core/model/remoteFs.js";
-export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState } from "./core/model/remoteFs.js";
+export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState, FileDeleteOptions } from "./core/model/remoteFs.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export { createConnectionLifecycle, retryDelayMs } from "./ui/connectionLifecycle.js";
 export type { ConnectionLifecycle, ConnectionLifecyclePhase, ConnectionLifecycleState } from "./ui/connectionLifecycle.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export type { DownloadRange, RangeDigest, CachedRangeStorage } from "./transfer/blockReuse.js";
+export {
+  compareVersionVectors,
+  deleteFolderFile,
+  defaultFolderSyncPolicy,
+  planFolderSync,
+  synchronizeFolder,
+  unsubscribeFolder,
+} from "./sync/folderSync.js";
+export type {
+  ExternalDeletionPolicy,
+  FolderDeleteResult,
+  FolderSyncAction,
+  FolderSyncBaseline,
+  FolderSyncBaselineFile,
+  FolderSyncEvent,
+  FolderSyncPlan,
+  FolderSyncPolicy,
+  FolderSyncRemote,
+  FolderSyncResult,
+  FolderSyncStorage,
+  FolderUnsubscribeResult,
+  FolderVersioningMode,
+  LocalSyncFile,
+} from "./sync/folderSync.js";
 export { createDuplexChannel, createStream } from "./transfer/frpBus.js";
 export { createPortFromTransport } from "./transfer/frpTransport.js";
 export type { DuplexChannel, Port, Stream } from "./transfer/frpBus.js";

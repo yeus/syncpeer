@@ -84,6 +84,15 @@ export interface BepBlockInfo {
   hash: Uint8Array;
 }
 
+export interface BepVersionCounter {
+  id: number | string;
+  value: number | string;
+}
+
+export interface BepVersionVector {
+  counters?: BepVersionCounter[];
+}
+
 export interface BepFileInfo {
   name: string;
   type?: number;
@@ -95,6 +104,8 @@ export interface BepFileInfo {
   encrypted?: Uint8Array;
   blocks?: BepBlockInfo[];
   Blocks?: BepBlockInfo[];
+  version?: BepVersionVector;
+  sequence?: number | string;
 }
 
 export interface BepDeviceInfo {

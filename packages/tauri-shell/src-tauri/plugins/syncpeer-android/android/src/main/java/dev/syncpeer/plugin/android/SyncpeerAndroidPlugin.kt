@@ -116,6 +116,7 @@ class AndroidCalendarDeleteArgs {
 @TauriPlugin
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private var multicastLock: WifiManager.MulticastLock? = null
+  private var notificationCancellationPending = false
 
   override fun load(webView: WebView) {
     super.load(webView)
@@ -134,6 +135,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun startTransferService(invoke: Invoke) {
     try {
+      notificationCancellationPending = false
       val args = invoke.parseArgs(TransferServiceArgs::class.java)
       val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
         scheduleUserInitiatedTransfer(args.label)
@@ -159,6 +161,10 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun updateTransferNotification(invoke: Invoke) {
     try {
+      if (notificationCancellationPending) {
+        invoke.resolveObject(mapOf("updated" to false))
+        return
+      }
       val args = invoke.parseArgs(TransferNotificationArgs::class.java)
       SyncpeerTransferNotifications.update(
         activity,
@@ -187,6 +193,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun handleTransferCancellation() {
+    notificationCancellationPending = true
     stopTransferRuntime()
     triggerObject(
       SyncpeerTransferConstants.EVENT_TRANSFER_ACTION,

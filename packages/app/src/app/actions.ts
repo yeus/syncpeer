@@ -716,6 +716,11 @@ export const createAppActions = (args: {
     }
     if (transferState.active.length > 0) return;
     try {
+      await client.stopTransfer?.();
+    } catch {
+      // The runtime transition already reported failures; notification cleanup is best-effort.
+    }
+    try {
       await removeActiveNativeNotifications([{ id }]);
     } catch {
       // Best-effort only.

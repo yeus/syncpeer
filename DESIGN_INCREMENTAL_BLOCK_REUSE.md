@@ -1,6 +1,6 @@
 # Incremental Block Reuse for Cached Downloads
 
-Status: implementation in progress
+Status: core/CLI implemented; native validation and wider sync UI remain separate gates
 
 ## Implementation status
 
@@ -10,25 +10,41 @@ Node partials retain source-device/file/content metadata across process exit;
 recovery rehashes saved bytes against the remote block plan and copies verified
 ranges into a new partial. Active writers are excluded from recovery. Exhausted
 transport retries suspend capable sinks instead of discarding their partials.
-Tauri native-cache range hashing/copying and native whole-file hashing are wired
-into the app. Native-cache commit no longer deletes the old file before rename.
-Android SAF sources still require their own range and guarded-commit adapter.
-Tests cover plaintext/encrypted reuse, unhashed fallback, corrupted copies,
-adapter response validation, cancellation, empty files, and safe Node replacement.
+Tauri native-cache range hashing/copying, persistent partial recovery, and native
+whole-file hashing are wired into the app. Native-cache commit no longer deletes
+the old file before rename. Android SAF sources use native range hashing/copying
+and guarded replacement through a private temporary document. Tests cover
+plaintext/encrypted reuse, unhashed fallback, corrupted copies, adapter response
+validation, cancellation, empty files, safe Node replacement, folder
+reconciliation, deletion policy, and version restore.
 
-Still required: Tauri persistent partial recovery, Android SAF storage support,
-per-file two-way reconciliation, versioning/deletion/restore, UI integration, and
-the managed-server/desktop/Android release gate. Passing the initial unit and
-storage checks does not establish completion of the 0.5 milestone.
+The CLI exposes continuous `sync-folder`, local-only `unsubscribe-folder`, explicit
+delete-everywhere, version listing, and restore operations.
+The supported validation gate is split into the `test:headless` and `test:e2e`
+umbrellas; the long-running Syncthing server/client commands remain operational
+harness controls rather than separate test suites.
 
-The accepted milestone also requires every cached file to become a foreground
-two-way subscription. Keep durable version vectors and local baselines; use
-Syncthing conflict copies for concurrent edits. Distinguish local unsubscribe
-from explicit delete-everywhere. External deletions are configurable per folder
-and disabled by default. Offer disabled, trash-can, simple, and staggered
-versioning; default to retaining the latest archived version forever. Add a
-Trash/Versions restore interface and a CLI `sync-file` command. Do not bump the
-release version until the complete validation gate passes.
+Folder-level two-way reconciliation now keeps durable version vectors and local
+baselines, preserves concurrent edits as conflict copies, and exposes configurable
+external-deletion and versioning policies through the CLI. Local unsubscribe and
+explicit delete-everywhere have separate operations. The CLI provides folder-level
+restore/list operations. A graphical Trash/Versions surface and a
+foreground subscription for the Tauri download cache remain unimplemented:
+that cache is not a user-selected sync root, while it still preserves and restores
+interrupted downloads safely.
+
+The folder reconciliation unit tests use in-memory peer doubles; they do not
+prove networking between two standalone Syncpeer instances. The managed
+Syncthing integration checks CLI publication acknowledgment and remote deletion.
+Neither result replaces a real two-Syncpeer interoperability test or Android
+emulator/provider tests. Folder transfers currently buffer individual files;
+scanning is bounded and caches digests using filesystem change metadata.
+
+Node folder operations reject existing symlink paths and serialize participating
+Syncpeer processes with a root lock. This is not a security boundary against a
+hostile local process concurrently replacing directory ancestors. A lock left by
+a crashed process requires manual verification before removal. Files are checked
+again after downloads/archiving and immediately before atomic replacement.
 
 Android SAF replacement uses a verified private temporary file and guarded
 backup/restore during commit. Provider failures must be surfaced; this does not

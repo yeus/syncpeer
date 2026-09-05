@@ -8,7 +8,7 @@ pub struct CacheRange {
     pub size: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct RangeDigest {
     pub offset: u64,
     pub size: u64,

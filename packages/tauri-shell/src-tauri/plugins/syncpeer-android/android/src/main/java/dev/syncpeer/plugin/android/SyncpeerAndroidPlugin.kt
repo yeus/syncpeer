@@ -31,6 +31,7 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
 
 @InvokeArg
 class OpenWithChooserArgs {
@@ -74,6 +75,20 @@ class SafPathArgs {
   var treeUri: String = ""
   var relativePath: String = ""
   var openParent: Boolean = false
+}
+
+@InvokeArg
+class SafRange {
+  var offset: Long = 0
+  var size: Long = 0
+}
+
+@InvokeArg
+class SafRangesArgs {
+  var treeUri: String = ""
+  var relativePath: String = ""
+  var targetPath: String? = null
+  var ranges: List<SafRange> = emptyList()
 }
 
 @InvokeArg
@@ -330,12 +345,40 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.reject("Source file does not exist: ${args.sourcePath}")
         return
       }
-      val target = resolveOrCreateSafFile(args.treeUri, args.relativePath, args.mimeType)
-      FileInputStream(source).use { input ->
-        activity.contentResolver.openOutputStream(target.uri, "w").use { output ->
-          if (output == null) {
-            throw IllegalStateException("Could not open SAF output stream.")
-          }
+      replaceSafFileFromPath(args.treeUri, args.relativePath, args.sourcePath, args.mimeType)
+      invoke.resolve()
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not copy file to SAF tree.")
+    }
+  }
+
+  private fun replaceSafFileFromPath(
+    treeUri: String,
+    relativePath: String,
+    sourcePath: String,
+    requestedMimeType: String?,
+  ) {
+    val parts = relativePath.split('/').filter { it.isNotBlank() }
+    if (parts.isEmpty() || parts.any { it == "." || it == ".." }) {
+      throw IllegalArgumentException("relativePath is invalid.")
+    }
+    val tree = DocumentFile.fromTreeUri(activity, Uri.parse(treeUri))
+      ?: throw IllegalArgumentException("Invalid tree URI.")
+    var parent = tree
+    for (segment in parts.dropLast(1)) {
+      val existing = parent.findFile(segment)
+      parent = if (existing != null && existing.isDirectory) existing else
+        parent.createDirectory(segment) ?: throw IllegalStateException("Could not create SAF directory: $segment")
+    }
+    val name = parts.last()
+    val mime = requestedMimeType ?: guessMimeType(name)
+    val tempName = ".syncpeer-temp-${System.currentTimeMillis()}-${name}"
+    val temp = parent.createFile(mime, tempName)
+      ?: throw IllegalStateException("Could not create guarded SAF temporary file.")
+    try {
+      FileInputStream(File(sourcePath)).use { input ->
+        activity.contentResolver.openOutputStream(temp.uri, "w").use { output ->
+          if (output == null) throw IllegalStateException("Could not open SAF output stream.")
           val buffer = ByteArray(64 * 1024)
           while (true) {
             val count = input.read(buffer)
@@ -345,10 +388,13 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
           output.flush()
         }
       }
-      invoke.resolve()
     } catch (error: Exception) {
-      invoke.reject(error.message ?: "Could not copy file to SAF tree.")
+      temp.delete()
+      throw error
     }
+    finishDocumentReplacement(temp, parent.findFile(name), name,
+      ".syncpeer-backup-${System.currentTimeMillis()}-${name}",
+      { doc, newName -> doc.renameTo(newName) }, { doc -> doc.delete() })
   }
 
   @Command
@@ -387,6 +433,48 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolveObject(target.delete())
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not delete SAF path.")
+    }
+  }
+
+  @Command
+  fun digestSafRanges(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(SafRangesArgs::class.java)
+      val target = findSafDocument(args.treeUri, args.relativePath)
+      if (target == null) { invoke.resolveObject(emptyList<Any>()); return }
+      val output = digestAvailableSafRanges({
+        activity.contentResolver.openInputStream(target.uri)
+          ?: throw IllegalStateException("Could not open SAF source stream.")
+      }, args.ranges.map { it.offset to it.size }).map { (offset, size, hash) ->
+        mapOf("offset" to offset, "size" to size, "hash" to hash.map { it.toInt() and 0xff })
+      }
+      invoke.resolveObject(output)
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not hash SAF ranges.")
+    }
+  }
+
+  @Command
+  fun copySafRangesToPath(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(SafRangesArgs::class.java)
+      val targetPath = args.targetPath ?: throw IllegalArgumentException("targetPath is required")
+      val source = findSafDocument(args.treeUri, args.relativePath)
+        ?: throw IllegalStateException("SAF source does not exist: ${args.relativePath}")
+      RandomAccessFile(targetPath, "rw").use { output ->
+        for (range in args.ranges) {
+          if (range.offset < 0 || range.size < 0) throw IllegalArgumentException("Invalid SAF range")
+          activity.contentResolver.openInputStream(source.uri).use { input ->
+            if (input == null) throw IllegalStateException("Could not open SAF source stream.")
+            skipFully(input, range.offset)
+            output.seek(range.offset)
+            copyExact(input, output, range.size)
+          }
+        }
+      }
+      invoke.resolveObject(mapOf("copied" to true))
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not copy SAF ranges.")
     }
   }
 
@@ -740,6 +828,31 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
     return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
       ?: "application/octet-stream"
+  }
+
+  private fun skipFully(input: java.io.InputStream, count: Long) {
+    var remaining = count
+    while (remaining > 0) {
+      val skipped = input.skip(remaining)
+      if (skipped > 0) {
+        remaining -= skipped
+      } else if (input.read() < 0) {
+        throw IllegalStateException("SAF source ended before requested range.")
+      } else {
+        remaining -= 1
+      }
+    }
+  }
+
+  private fun copyExact(input: java.io.InputStream, output: RandomAccessFile, count: Long) {
+    val buffer = ByteArray(64 * 1024)
+    var remaining = count
+    while (remaining > 0) {
+      val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+      if (read < 0) throw IllegalStateException("SAF source ended before requested range.")
+      output.write(buffer, 0, read)
+      remaining -= read
+    }
   }
 
   private fun resolveOrCreateSafFile(

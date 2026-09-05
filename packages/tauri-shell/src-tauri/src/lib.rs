@@ -77,6 +77,7 @@ struct CacheBeginFileRequest {
     name: String,
     size_bytes: u64,
     modified_ms: Option<f64>,
+    content_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +98,19 @@ struct CacheWriteChunkRequest {
 #[serde(rename_all = "camelCase")]
 struct CacheTransferRequest {
     transfer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachePartialMetadata {
+    transfer_id: String,
+    folder_id: String,
+    path: String,
+    name: String,
+    expected_size: u64,
+    modified_ms: Option<f64>,
+    content_id: Option<String>,
+    created_at_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -510,8 +524,10 @@ struct CacheWriter {
     expected_size: u64,
     modified_ms: Option<f64>,
     temp_path: PathBuf,
+    metadata_path: PathBuf,
     file: Arc<Mutex<fs::File>>,
     cached_source: Option<Arc<Mutex<fs::File>>>,
+    cached_saf_source: Option<(String, String)>,
 }
 
 #[derive(Default)]
@@ -920,6 +936,14 @@ fn favorites_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 fn cache_index_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_root(app)?.join("cache-index.json"))
+}
+
+fn cache_partial_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_cache_files_root(app)?.join(".partial"))
+}
+
+fn cache_partial_metadata_path(partial_root: &Path, transfer_id: &str) -> PathBuf {
+    partial_root.join(format!("{transfer_id}.json"))
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -2981,17 +3005,17 @@ async fn syncpeer_cache_begin_file(
         return Err("path is required.".to_string());
     }
 
-    let transfer_id = {
-        let mut guard = store
-            .lock()
-            .map_err(|_| "Cache writer store lock poisoned".to_string())?;
-        guard.next_id = guard.next_id.wrapping_add(1);
-        format!("{}-{}", now_ms(), guard.next_id)
-    };
+    let active_ids = store
+        .lock()
+        .map_err(|_| "Cache writer store lock poisoned".to_string())?
+        .writers
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let cached_index = read_json_or_default::<CacheIndex>(&cache_index_path(&app)?)?;
-    let cached_path = cached_index.files.iter()
-        .find(|entry| entry.key == cache_key(&request.folder_id, &normalized_path))
-        .and_then(|entry| entry.local_path.as_ref());
+    let cached_record = cached_index.files.iter()
+        .find(|entry| entry.key == cache_key(&request.folder_id, &normalized_path));
+    let cached_path = cached_record.and_then(|entry| entry.local_path.as_ref());
     let cached_source = match cached_path.map(fs::File::open) {
         Some(Ok(file)) => Some(Arc::new(Mutex::new(file))),
         Some(Err(error)) if error.kind() != ErrorKind::NotFound => {
@@ -2999,35 +3023,85 @@ async fn syncpeer_cache_begin_file(
         }
         _ => None,
     };
-    let partial_root = app_cache_files_root(&app)?.join(".partial");
+    let cached_saf_source = configured_android_saf_tree_uri(&app)?
+        .zip(cached_record.and_then(|entry| entry.saf_relative_path.clone()));
+    let partial_root = cache_partial_root(&app)?;
     fs::create_dir_all(&partial_root).map_err(|error| {
         format!(
             "Could not create partial cache directory {}: {error}",
             partial_root.display()
         )
     })?;
-    let temp_path = partial_root.join(format!("{transfer_id}.part"));
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|error| {
-        format!(
-            "Could not create partial cached file {}: {error}",
-            temp_path.display()
-        )
-    })?;
+    let requested_name = cache_display_name(&normalized_path, &request.name);
+    let mut resume: Option<CachePartialMetadata> = None;
+    for entry in fs::read_dir(&partial_root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else { continue };
+        let Ok(metadata) = serde_json::from_str::<CachePartialMetadata>(&raw) else { continue };
+        if request.content_id.is_none() || request.content_id.as_deref().is_some_and(|value| value.starts_with("unhashed:"))
+            || active_ids.contains(&metadata.transfer_id)
+            || metadata.folder_id != request.folder_id.trim()
+            || metadata.path != normalized_path
+            || metadata.expected_size != request.size_bytes
+            || metadata.name != requested_name
+            || metadata.content_id != request.content_id
+        {
+            continue;
+        }
+        let partial_path = partial_root.join(format!("{}.part", metadata.transfer_id));
+        if !partial_path.exists() { continue; }
+        if resume.as_ref().map(|current| current.created_at_ms).unwrap_or(0) < metadata.created_at_ms {
+            resume = Some(metadata);
+        }
+    }
+    let (transfer_id, temp_path, metadata_path, file) = if let Some(metadata) = resume {
+        let transfer_id = metadata.transfer_id.clone();
+        let temp_path = partial_root.join(format!("{transfer_id}.part"));
+        let metadata_path = cache_partial_metadata_path(&partial_root, &transfer_id);
+        let file = fs::OpenOptions::new().read(true).write(true).open(&temp_path)
+            .map_err(|error| format!("Could not resume partial cached file {}: {error}", temp_path.display()))?;
+        (transfer_id, temp_path, metadata_path, file)
+    } else {
+        let transfer_id = {
+            let mut guard = store
+                .lock()
+                .map_err(|_| "Cache writer store lock poisoned".to_string())?;
+            guard.next_id = guard.next_id.wrapping_add(1);
+            format!("{}-{}", now_ms(), guard.next_id)
+        };
+        let temp_path = partial_root.join(format!("{transfer_id}.part"));
+        let metadata_path = cache_partial_metadata_path(&partial_root, &transfer_id);
+        let file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&temp_path)
+            .map_err(|error| format!("Could not create partial cached file {}: {error}", temp_path.display()))?;
+        (transfer_id, temp_path, metadata_path, file)
+    };
+    let metadata = CachePartialMetadata {
+        transfer_id: transfer_id.clone(),
+        folder_id: request.folder_id.trim().to_string(),
+        path: normalized_path.clone(),
+        name: requested_name.clone(),
+        expected_size: request.size_bytes,
+        modified_ms: request.modified_ms,
+        content_id: request.content_id.clone(),
+        created_at_ms: now_ms(),
+    };
+    write_json(&metadata_path, &metadata)?;
 
     let writer = CacheWriter {
         folder_id: request.folder_id.trim().to_string(),
         path: normalized_path.clone(),
-        name: cache_display_name(&normalized_path, &request.name),
+        name: requested_name,
         expected_size: request.size_bytes,
         modified_ms: request.modified_ms,
         temp_path,
+        metadata_path,
         file: Arc::new(Mutex::new(file)),
         cached_source,
+        cached_saf_source,
     };
     let mut guard = store
         .lock()
@@ -3038,9 +3112,35 @@ async fn syncpeer_cache_begin_file(
 
 #[tauri::command]
 async fn syncpeer_cache_digest_ranges(
-    store: tauri::State<'_, SharedCacheWriterStore>, request: CacheRangesRequest,
+    _app: tauri::AppHandle,
+    store: tauri::State<'_, SharedCacheWriterStore>,
+    request: CacheRangesRequest,
 ) -> Result<Vec<RangeDigest>, String> {
     let writer = cache_range_writer(&store, &request)?;
+    if matches!(request.source, CacheRangeSource::Cached)
+        && writer.cached_source.is_none()
+        && writer.cached_saf_source.is_some()
+    {
+        #[cfg(target_os = "android")]
+        {
+            let (tree_uri, relative_path) = writer.cached_saf_source.as_ref().unwrap();
+            let ranges = request
+                .ranges
+                .iter()
+                .map(|range| (range.offset, range.size))
+                .collect::<Vec<_>>();
+            let value = _app
+                .syncpeer_android()
+                .digest_saf_ranges(tree_uri, relative_path, &ranges)
+                .map_err(|error| error.to_string())?;
+            return serde_json::from_value(value)
+                .map_err(|error| format!("Invalid SAF range digest response: {error}"));
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            return Err("Android SAF storage is unavailable on this platform.".to_string());
+        }
+    }
     let source = match request.source {
         CacheRangeSource::Cached => writer.cached_source,
         CacheRangeSource::Partial => Some(writer.file),
@@ -3071,10 +3171,37 @@ fn cache_range_writer(store: &SharedCacheWriterStore, request: &CacheRangesReque
 
 #[tauri::command]
 async fn syncpeer_cache_copy_ranges(
-    store: tauri::State<'_, SharedCacheWriterStore>, request: CacheRangesRequest,
+    _app: tauri::AppHandle,
+    store: tauri::State<'_, SharedCacheWriterStore>,
+    request: CacheRangesRequest,
 ) -> Result<(), String> {
     if !matches!(request.source, CacheRangeSource::Cached) { return Err("Copy source must be cached".into()); }
     let writer = cache_range_writer(&store, &request)?;
+    if writer.cached_source.is_none() && writer.cached_saf_source.is_some() {
+        #[cfg(target_os = "android")]
+        {
+            let (tree_uri, relative_path) = writer.cached_saf_source.as_ref().unwrap();
+            let ranges = request
+                .ranges
+                .iter()
+                .map(|range| (range.offset, range.size))
+                .collect::<Vec<_>>();
+            _app
+                .syncpeer_android()
+                .copy_saf_ranges_to_path(
+                    tree_uri,
+                    relative_path,
+                    &writer.temp_path.to_string_lossy(),
+                    &ranges,
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            return Err("Android SAF storage is unavailable on this platform.".to_string());
+        }
+    }
     let source = writer.cached_source.ok_or("Cached source unavailable")?;
     let mut source = source.lock().map_err(|_| "Cache source lock poisoned")?;
     let mut target = writer.file.lock().map_err(|_| "Cache destination lock poisoned")?;
@@ -3213,6 +3340,11 @@ async fn syncpeer_cache_commit(
         .lock()
         .map_err(|_| "Cache writer store lock poisoned".to_string())?;
     guard.writers.remove(&request.transfer_id);
+    if writer.metadata_path.exists() {
+        fs::remove_file(&writer.metadata_path).map_err(|error| {
+            format!("Could not remove partial metadata {}: {error}", writer.metadata_path.display())
+        })?;
+    }
     Ok(record)
 }
 
@@ -3233,7 +3365,33 @@ async fn syncpeer_cache_abort(
                 format!("Could not remove partial cached file: {error}")
             })?;
         }
+        if writer.metadata_path.exists() {
+            fs::remove_file(&writer.metadata_path).map_err(|error| {
+                format!("Could not remove partial metadata: {error}")
+            })?;
+        }
     }
+    Ok(())
+}
+
+#[tauri::command]
+async fn syncpeer_cache_suspend(
+    store: tauri::State<'_, SharedCacheWriterStore>,
+    request: CacheTransferRequest,
+) -> Result<(), String> {
+    let writer = {
+        let mut guard = store
+            .lock()
+            .map_err(|_| "Cache writer store lock poisoned".to_string())?;
+        guard.writers.remove(&request.transfer_id)
+    };
+    let Some(writer) = writer else { return Ok(()); };
+    writer
+        .file
+        .lock()
+        .map_err(|_| "Cache writer file lock poisoned".to_string())?
+        .sync_all()
+        .map_err(|error| format!("Could not flush suspended partial: {error}"))?;
     Ok(())
 }
 
@@ -3991,6 +4149,7 @@ pub fn run() {
             syncpeer_cache_write_chunk,
             syncpeer_cache_commit,
             syncpeer_cache_abort,
+            syncpeer_cache_suspend,
             syncpeer_android_open_with_chooser,
             syncpeer_android_start_transfer_service,
             syncpeer_android_stop_transfer_service,

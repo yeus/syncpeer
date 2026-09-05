@@ -462,6 +462,7 @@ export const createTauriAdapters = (
                 name,
                 sizeBytes: metadata.sizeBytes,
                 modifiedMs: modifiedMs ?? null,
+                contentId: metadata.contentId ?? null,
               },
             },
           );
@@ -470,6 +471,12 @@ export const createTauriAdapters = (
         },
         digestCachedRanges: (ranges) => digestRanges("cached", ranges),
         digestPartialRanges: (ranges) => digestRanges("partial", ranges),
+        resumeStorage: {
+          digestCachedRanges: (ranges) => digestRanges("partial", ranges),
+          // Recovered bytes already occupy the correct destination offsets.
+          // Core verifies their digests before excluding them from downloads.
+          copyCachedRanges: async () => {},
+        },
         copyCachedRanges: async (ranges) => {
           if (!transferId || committed) throw new Error("Download sink is not writable.");
           await invokeWithLogging("syncpeer_cache_copy_ranges", { request: { transferId, source: "cached", ranges } });
@@ -489,6 +496,11 @@ export const createTauriAdapters = (
           if (!transferId || committed) return;
           await invokeWithLogging("syncpeer_cache_commit", { request: { transferId } });
           committed = true;
+        },
+        suspend: async () => {
+          if (!transferId || committed) return;
+          await invokeWithLogging("syncpeer_cache_suspend", { request: { transferId } });
+          transferId = null;
         },
         abort: async () => {
           if (!transferId || committed) return;

@@ -181,6 +181,55 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .map_err(Into::into)
   }
 
+  pub fn digest_saf_ranges(
+    &self,
+    tree_uri: &str,
+    relative_path: &str,
+    ranges: &[(u64, u64)],
+  ) -> crate::Result<serde_json::Value> {
+    let ranges = ranges
+      .iter()
+      .map(|(offset, size)| json!({"offset": offset, "size": size}))
+      .collect::<Vec<_>>();
+    self
+      .0
+      .run_mobile_plugin(
+        "digestSafRanges",
+        json!({
+          "treeUri": tree_uri,
+          "relativePath": relative_path,
+          "ranges": ranges,
+        }),
+      )
+      .map_err(Into::into)
+  }
+
+  pub fn copy_saf_ranges_to_path(
+    &self,
+    tree_uri: &str,
+    relative_path: &str,
+    target_path: &str,
+    ranges: &[(u64, u64)],
+  ) -> crate::Result<()> {
+    let ranges = ranges
+      .iter()
+      .map(|(offset, size)| json!({"offset": offset, "size": size}))
+      .collect::<Vec<_>>();
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>(
+        "copySafRangesToPath",
+        json!({
+          "treeUri": tree_uri,
+          "relativePath": relative_path,
+          "targetPath": target_path,
+          "ranges": ranges,
+        }),
+      )
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
   pub fn pick_saf_directory(&self) -> crate::Result<String> {
     let value = self
       .0

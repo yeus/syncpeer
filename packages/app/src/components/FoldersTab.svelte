@@ -20,7 +20,12 @@
   interface Props {
     app: AppState;
     breadcrumbs: BreadcrumbSegment[];
-    rootFolders: Array<{ id: string; name: string; readOnly: boolean }>;
+    rootFolders: Array<{
+      id: string;
+      name: string;
+      readOnly: boolean;
+      stats?: FolderInfo["stats"];
+    }>;
     favoriteKeys: Set<string>;
     onGoToRootView: () => void;
     onGoToBreadcrumb: (segment: BreadcrumbSegment) => void;
@@ -139,6 +144,25 @@
     cachedLocalPathByKey(app.favorites.downloadedFiles),
   );
 
+  const plural = (count: number, singular: string) =>
+    `${count.toLocaleString()} ${singular}${count === 1 ? "" : "s"}`;
+
+  const folderStatsText = (folder: { stats?: FolderInfo["stats"] }) => {
+    const stats = folder.stats;
+    if (!stats?.indexReceived) return "index pending";
+    const parts = [
+      plural(stats.fileCount, "file"),
+      formatBytes(stats.totalBytes),
+    ];
+    if (stats.directoryCount > 0) {
+      parts.push(plural(stats.directoryCount, "folder"));
+    }
+    if (stats.symlinkCount > 0) {
+      parts.push(plural(stats.symlinkCount, "link"));
+    }
+    return parts.join(" | ");
+  };
+
   let rootRows = $derived.by(() =>
     rootFolders.map(
       (folder): RootFolderItem => ({
@@ -155,6 +179,7 @@
         locked: isFolderLocked(folder.id),
         isFavorite: favoriteKeys.has(`folder:${folder.id}:`),
         hasCachedRoot: app.favorites.cachedFileKeys.has(`${folder.id}:`),
+        statsText: folderStatsText(folder),
       }),
     ),
   );

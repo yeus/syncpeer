@@ -119,6 +119,11 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-connection-notices.ts"],
     },
     {
+      name: "Application state merge diagnostics",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test", "scripts/test-app-state.ts"],
+    },
+    {
       name: "Favorite synchronization policy diagnostics",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-favorite-sync-policies.ts"],

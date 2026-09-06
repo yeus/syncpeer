@@ -568,6 +568,96 @@ await assert.rejects(
 assert.equal(timeoutSession.isClosed(), false);
 await timeoutSession.close();
 
+const folderStatsFs = new BuiltRemoteFs(
+  new Map([[
+    "stats-folder",
+    {
+      id: "stats-folder",
+      label: "Stats Folder",
+      readOnly: false,
+      advertisedDevices: [],
+      encrypted: false,
+      needsPassword: false,
+      indexReceived: true,
+      files: new Map([
+        ["alpha.bin", {
+          indexFile: { name: "alpha.bin", type: 0, size: 8 },
+        }],
+        ["nested", {
+          indexFile: { name: "nested", type: 1, size: 0 },
+        }],
+        ["nested/beta.bin", {
+          indexFile: { name: "nested/beta.bin", type: 0, size: 13, invalid: true },
+        }],
+        ["shortcut", {
+          indexFile: { name: "shortcut", type: 2, size: 99 },
+        }],
+        ["removed.bin", {
+          indexFile: { name: "removed.bin", type: 0, size: 512, deleted: true },
+        }],
+      ]),
+    },
+  ], [
+    "pending-folder",
+    {
+      id: "pending-folder",
+      label: "Pending Folder",
+      readOnly: true,
+      advertisedDevices: [],
+      encrypted: false,
+      needsPassword: false,
+      indexReceived: false,
+      files: new Map(),
+    },
+  ], [
+    "locked-folder",
+    {
+      id: "locked-folder",
+      label: "Locked Folder",
+      readOnly: true,
+      advertisedDevices: [],
+      encrypted: true,
+      needsPassword: true,
+      indexReceived: true,
+      files: new Map([
+        ["sealed-name", {
+          indexFile: { name: "sealed-name", type: 0, size: 1024 },
+        }],
+      ]),
+    },
+  ]]),
+  async () => new Uint8Array(),
+  async () => undefined,
+  () => undefined,
+);
+const folderStats = await folderStatsFs.listFolders();
+assert.deepEqual(
+  folderStats.find((folder) => folder.id === "stats-folder")?.stats,
+  {
+    fileCount: 2,
+    directoryCount: 1,
+    symlinkCount: 1,
+    invalidCount: 1,
+    totalBytes: 21,
+    indexReceived: true,
+  },
+);
+assert.deepEqual(
+  folderStats.find((folder) => folder.id === "pending-folder")?.stats,
+  {
+    fileCount: 0,
+    directoryCount: 0,
+    symlinkCount: 0,
+    invalidCount: 0,
+    totalBytes: 0,
+    indexReceived: false,
+  },
+);
+assert.equal(
+  folderStats.find((folder) => folder.id === "locked-folder")?.stats?.indexReceived,
+  false,
+);
+
 const streamPayload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 let streamRequests = 0;
 const streamFolder = {

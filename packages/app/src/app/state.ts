@@ -406,9 +406,22 @@ export const setError = (
   pushSessionLog(state, "error", event, message, details);
 };
 
+const shouldKeepOfflineSnapshotView = (
+  state: AppState,
+  next: SessionState,
+) =>
+  state.session.isOfflineSnapshot &&
+  next.remoteFs === null &&
+  next.folders.length === 0 &&
+  (next.phase === "connecting" ||
+    next.phase === "reconnecting" ||
+    next.phase === "waiting");
+
 export const applySessionState = (state: AppState, next: SessionState) => {
   const previousFolderId = state.session.currentFolderId;
   const previousPath = state.session.currentPath;
+  const keepOfflineSnapshotView = shouldKeepOfflineSnapshotView(state, next);
+  const currentDirectory = keepOfflineSnapshotView ? state.session.directory : null;
   state.session.remoteFs = next.remoteFs;
   state.session.isConnected =
     next.phase === "connected" || next.phase === "refreshing";
@@ -424,15 +437,17 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.nextRetryAtMs = next.nextRetryAtMs;
   state.session.closureReason = next.closureReason;
   state.session.upgradeStatus = next.upgradeStatus;
-  state.session.folders = next.folders;
-  state.session.folderSyncStates = next.folderSyncStates;
+  state.session.folders = keepOfflineSnapshotView ? state.session.folders : next.folders;
+  state.session.folderSyncStates = keepOfflineSnapshotView
+    ? state.session.folderSyncStates
+    : next.folderSyncStates;
   state.session.directory = {
-    ...next.directory,
-    entries: [...next.directory.entries],
+    ...(currentDirectory ?? next.directory),
+    entries: [...(currentDirectory ?? next.directory).entries],
   };
-  state.session.currentFolderId = next.directory.folderId;
-  state.session.currentPath = next.directory.path;
-  state.session.entries = next.directory.entries;
+  state.session.currentFolderId = state.session.directory.folderId;
+  state.session.currentPath = state.session.directory.path;
+  state.session.entries = state.session.directory.entries;
   if (
     previousFolderId !== state.session.currentFolderId ||
     previousPath !== state.session.currentPath
@@ -443,11 +458,19 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   if (state.session.directoryPage > totalPages) {
     state.session.directoryPage = totalPages;
   }
-  state.session.currentFolderVersionKey = next.directory.versionKey;
-  state.session.remoteDevice = next.remoteDevice;
-  state.session.connectionPath = next.connectionPath;
-  state.session.connectionTransport = next.connectionTransport;
-  state.session.connectionScope = next.connectionScope;
+  state.session.currentFolderVersionKey = state.session.directory.versionKey;
+  state.session.remoteDevice = keepOfflineSnapshotView
+    ? state.session.remoteDevice
+    : next.remoteDevice;
+  state.session.connectionPath = keepOfflineSnapshotView
+    ? state.session.connectionPath
+    : next.connectionPath;
+  state.session.connectionTransport = keepOfflineSnapshotView
+    ? state.session.connectionTransport
+    : next.connectionTransport;
+  state.session.connectionScope = keepOfflineSnapshotView
+    ? state.session.connectionScope
+    : next.connectionScope;
   if (next.lastError) {
     state.ui.recentError = next.lastError;
   }
@@ -502,6 +525,7 @@ export const rootFolderEntries = (state: AppState) =>
       id: folder.id,
       name: folderDisplayName(folder),
       readOnly: folder.readOnly,
+      stats: folder.stats,
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 

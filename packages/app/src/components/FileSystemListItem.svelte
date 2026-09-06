@@ -35,6 +35,7 @@
     locked: boolean;
     isFavorite: boolean;
     hasCachedRoot: boolean;
+    statsText: string;
   }
 
   export interface FolderEntryItem {
@@ -345,7 +346,7 @@
       </div>
 
       {#if item.kind === "root-folder"}
-        <div class="item-meta">{item.readOnly ? "read-only" : "read-write"}</div>
+        <div class="item-meta">{item.readOnly ? "read-only" : "read-write"} | {item.statsText}</div>
         {#if item.encrypted}
           <div class="item-meta">receive-encrypted | {item.lockLabel}</div>
           {#if item.passwordError}
@@ -429,7 +430,7 @@
     </div>
 
     {#if item.kind === "root-folder"}
-      <div class="item-meta">{item.readOnly ? "read-only" : "read-write"}</div>
+      <div class="item-meta">{item.readOnly ? "read-only" : "read-write"} | {item.statsText}</div>
       {#if item.encrypted}
         <div class="item-meta">receive-encrypted | {item.lockLabel}</div>
         {#if item.passwordError}

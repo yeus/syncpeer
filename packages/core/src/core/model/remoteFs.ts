@@ -11,12 +11,22 @@ export interface FolderInfo {
   id: string;
   label: string;
   readOnly: boolean;
+  stats?: FolderStats;
   advertisedDevices?: AdvertisedDeviceInfo[];
   encrypted?: boolean;
   needsPassword?: boolean;
   passwordError?: string;
   localDevicePresentInFolder?: boolean;
   stopReason?: number;
+}
+
+export interface FolderStats {
+  fileCount: number;
+  directoryCount: number;
+  symlinkCount: number;
+  invalidCount: number;
+  totalBytes: number;
+  indexReceived: boolean;
 }
 
 export interface AdvertisedDeviceInfo {
@@ -223,6 +233,30 @@ function toEntry(path: string, file: BepFileInfo): FileEntry {
   };
 }
 
+function folderStats(folder: FolderState): FolderStats {
+  const readableIndex = !folder.encrypted || (!folder.needsPassword && !folder.passwordError);
+  const initial = {
+    fileCount: 0,
+    directoryCount: 0,
+    symlinkCount: 0,
+    invalidCount: 0,
+    totalBytes: 0,
+    indexReceived: Boolean(folder.indexReceived && readableIndex),
+  };
+  return [...folder.files.entries()].reduce((stats, [path, stored]) => {
+    const entry = toEntry(normalizePath(path), stored.indexFile);
+    if (entry.deleted) return stats;
+    return {
+      fileCount: stats.fileCount + (entry.type === "file" ? 1 : 0),
+      directoryCount: stats.directoryCount + (entry.type === "directory" ? 1 : 0),
+      symlinkCount: stats.symlinkCount + (entry.type === "symlink" ? 1 : 0),
+      invalidCount: stats.invalidCount + (entry.invalid ? 1 : 0),
+      totalBytes: stats.totalBytes + (entry.type === "file" ? entry.size : 0),
+      indexReceived: stats.indexReceived,
+    };
+  }, initial);
+}
+
 export class RemoteFs {
   private folders: Map<string, FolderState>;
   private requestBlock: (
@@ -308,6 +342,7 @@ export class RemoteFs {
       id: f.id,
       label: f.label,
       readOnly: f.readOnly,
+      stats: folderStats(f),
       advertisedDevices: [...f.advertisedDevices],
       encrypted: f.encrypted,
       needsPassword: f.needsPassword,

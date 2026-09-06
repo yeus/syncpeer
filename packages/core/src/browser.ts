@@ -35,6 +35,7 @@ export type {
   FileEntry,
   FileDeleteOptions,
   FolderInfo,
+  FolderStats,
   FolderSyncState,
   RemoteDeviceInfo,
 } from "./core/model/remoteFs.js";

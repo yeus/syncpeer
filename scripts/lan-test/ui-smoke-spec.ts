@@ -41,6 +41,90 @@ const targetFileSha256 = process.env.SYNCPEER_E2E_FILE_SHA256?.trim() ||
 const targetLargeFileName = process.env.SYNCPEER_E2E_LARGE_FILE_NAME === undefined
   ? "blob.bin"
   : process.env.SYNCPEER_E2E_LARGE_FILE_NAME.trim();
+const uiStateStorageKey = "syncpeer.ui.state.v1";
+const syntheticDeviceId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const syntheticFolderId = "synthetic-encrypted-folder";
+
+const syntheticDirectoryEntries = () =>
+  Array.from({ length: 80 }, (_, index) => ({
+    name: `fixture-${String(index + 1).padStart(2, "0")}.txt`,
+    path: `fixture-${String(index + 1).padStart(2, "0")}.txt`,
+    type: "file",
+    size: 1024 + index,
+    modifiedMs: 1_800_000_000_000 + index,
+    invalid: false,
+  }));
+
+const seedOfflineFolderState = async (): Promise<void> => {
+  const activeDirectoryKey = JSON.stringify([syntheticFolderId, ""]);
+  await tauriBrowser.execute(
+    (storageKey: string, deviceId: string, folderId: string, directoryKey: string, entries) => {
+      localStorage.setItem(storageKey, JSON.stringify({
+        activeTab: "folders",
+        selectedSavedDeviceId: "",
+        connection: {
+          host: "",
+          port: 22000,
+          cert: "",
+          key: "",
+          remoteId: "",
+          deviceName: "syncpeer-ui-e2e",
+          timeoutMs: 15000,
+          discoveryMode: "automatic",
+          discoveryServer: "https://discovery.syncthing.net/v2/",
+          enableRelayFallback: true,
+          autoAcceptNewDevices: false,
+          autoAcceptIntroducedFolders: false,
+        },
+        savedDevices: [],
+        folderPasswords: { [`${deviceId}:${folderId}`]: "synthetic-password" },
+        offlineFolderSnapshots: {
+          [deviceId]: {
+            deviceId,
+            remoteDevice: { id: deviceId, deviceName: "Synthetic peer" },
+            folders: [{
+              id: folderId,
+              label: "Synthetic encrypted folder",
+              readOnly: false,
+              encrypted: true,
+              needsPassword: false,
+              passwordError: null,
+            }],
+            folderSyncStates: [],
+            connectedVia: "offline fixture",
+            transportKind: "direct-tcp",
+            connectionScope: "lan",
+            directories: {
+              [directoryKey]: {
+                folderId,
+                path: "",
+                entries,
+                versionKey: "synthetic-version",
+                loadedAtMs: Date.now(),
+              },
+            },
+            activeDirectoryKey: directoryKey,
+            lastSeenAtMs: Date.now(),
+          },
+        },
+        directoryViewMode: "list",
+        directorySortMode: "name",
+        theme: { mode: "dark", primary: "#2a3548", secondary: "#f78f3b" },
+      }));
+    },
+    uiStateStorageKey,
+    syntheticDeviceId,
+    syntheticFolderId,
+    activeDirectoryKey,
+    syntheticDirectoryEntries(),
+  );
+  await tauriBrowser.refresh();
+};
+
+const clearSeededOfflineFolderState = async (): Promise<void> => {
+  await tauriBrowser.execute((storageKey: string) => localStorage.removeItem(storageKey), uiStateStorageKey);
+  await tauriBrowser.refresh();
+};
 
 const nativeDiscoveryRequest = (): { url: string; method: string; headers: Record<string, string>; pinServerDeviceId: string | null; allowInsecureTls: boolean } => {
   const url = new URL(discoveryServer());
@@ -237,6 +321,42 @@ describe("Syncpeer Tauri UI smoke", () => {
     await disclosure.click();
     await $("[data-testid='connection-details']").waitForExist({ timeout: 5_000 });
     assert.equal(await disclosure.getAttribute("aria-expanded"), "true");
+  });
+
+  it("resets folder scroll when returning to a password-backed folder view", async () => {
+    await seedOfflineFolderState();
+    try {
+      await $(`[data-testid='folder-name-filter']`).waitForExist({ timeout: 10_000 });
+      await tauriBrowser.execute(() => {
+        const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
+        if (!content) throw new Error("App content container is not mounted.");
+        content.scrollTop = 96;
+      });
+      await clickTestId("tab-devices");
+      await clickTestId("tab-folders");
+      await tauriBrowser.waitUntil(
+        async () => await tauriBrowser.execute(() => {
+          const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
+          return content?.scrollTop === 0;
+        }),
+        {
+          timeout: 5_000,
+          timeoutMsg: "Folder content did not reset to the top after tab navigation.",
+        },
+      );
+      const geometry = await tauriBrowser.execute(() => {
+        const header = document.querySelector(".app-header")?.getBoundingClientRect();
+        const tools = document.querySelector(".directory-tools")?.getBoundingClientRect();
+        if (!header || !tools) throw new Error("Folder geometry targets are not mounted.");
+        return { headerBottom: header.bottom, toolsTop: tools.top };
+      });
+      assert.ok(
+        geometry.toolsTop >= geometry.headerBottom,
+        `Folder controls overlap the app header: ${JSON.stringify(geometry)}`,
+      );
+    } finally {
+      await clearSeededOfflineFolderState();
+    }
   });
 
   it("reaches the configured discovery server through Tauri", async () => {

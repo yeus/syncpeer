@@ -1,6 +1,6 @@
 <svelte:options runes={true} />
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
@@ -52,6 +52,7 @@
 
   let app = $state(createInitialState());
   let systemPrefersDark = $state(false);
+  let contentElement = $state<HTMLElement | null>(null);
 
   const { hostAdapter, platformAdapter } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
@@ -83,6 +84,28 @@
   let currentDirectoryEntries = $derived(paginatedDirectoryEntries(app));
   let currentDirectoryPage = $derived(directoryCurrentPage(app));
   let currentDirectoryTotalPages = $derived(directoryTotalPages(app));
+  let contentScrollKey = $derived(
+    `${app.currentPage}:${app.activeTab}:${app.session.currentFolderId}:${app.session.currentPath}`,
+  );
+
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let localDiscoveryTimer: ReturnType<typeof setInterval> | null = null;
+
+  const cleanupAppRuntime = () => {
+    if (refreshTimer) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+    if (localDiscoveryTimer) {
+      clearInterval(localDiscoveryTimer);
+      localDiscoveryTimer = null;
+    }
+    unsubscribe();
+    actions.dispose();
+    void client.disconnect();
+  };
+
+  import.meta.hot?.dispose(cleanupAppRuntime);
 
   $effect(() => {
     persistState(app);
@@ -129,6 +152,16 @@
       app.ui.lastLoggedError = app.ui.recentError;
       pushSessionLog(app, "error", "ui.error", app.ui.recentError);
     }
+  });
+
+  $effect(() => {
+    const scrollKey = contentScrollKey;
+    const element = contentElement;
+    if (!element) return;
+    void tick().then(() => {
+      if (contentScrollKey !== scrollKey) return;
+      element.scrollTop = 0;
+    });
   });
 
   onMount(() => {
@@ -189,9 +222,6 @@
     };
   });
 
-  let refreshTimer: ReturnType<typeof setInterval> | null = null;
-  let localDiscoveryTimer: ReturnType<typeof setInterval> | null = null;
-
   $effect(() => {
     if (app.currentPage !== "main") return;
     const intervalMs = app.activeTab === "folders" ? 15000 : 60000;
@@ -217,19 +247,7 @@
     };
   });
 
-  onDestroy(() => {
-    if (refreshTimer) {
-      clearInterval(refreshTimer);
-      refreshTimer = null;
-    }
-    if (localDiscoveryTimer) {
-      clearInterval(localDiscoveryTimer);
-      localDiscoveryTimer = null;
-    }
-    unsubscribe();
-    actions.dispose();
-    void client.disconnect();
-  });
+  onDestroy(cleanupAppRuntime);
 </script>
 
 {#if app.currentPage === "main"}
@@ -283,7 +301,7 @@
         {/if}
       </section>
     {/if}
-    <main class="content">
+    <main class="content" data-testid="app-content" bind:this={contentElement}>
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
           <p class="error">{app.ui.recentError}</p>

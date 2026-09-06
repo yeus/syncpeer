@@ -33,7 +33,7 @@ export {
   resolveNodeLocalDiscovery,
 } from "./node.js";
 export { isTransportFailure, RemoteFs } from "./core/model/remoteFs.js";
-export type { FolderInfo, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState, FileDeleteOptions } from "./core/model/remoteFs.js";
+export type { FolderInfo, FolderStats, FileEntry, FileBlock, RemoteDeviceInfo, FolderSyncState, FileDeleteOptions } from "./core/model/remoteFs.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
 export { createConnectionLifecycle, retryDelayMs } from "./ui/connectionLifecycle.js";
 export type { ConnectionLifecycle, ConnectionLifecyclePhase, ConnectionLifecycleState } from "./ui/connectionLifecycle.js";

@@ -45,15 +45,32 @@ const uiStateStorageKey = "syncpeer.ui.state.v1";
 const syntheticDeviceId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const syntheticFolderId = "synthetic-encrypted-folder";
 
-const syntheticDirectoryEntries = () =>
-  Array.from({ length: 80 }, (_, index) => ({
+const syntheticDirectoryEntries = () => [
+  {
+    name: "nested",
+    path: "nested",
+    type: "directory",
+    size: 0,
+    modifiedMs: 1_800_000_000_000,
+    invalid: false,
+    stats: {
+      fileCount: 3,
+      directoryCount: 1,
+      symlinkCount: 0,
+      invalidCount: 1,
+      totalBytes: 25,
+      indexReceived: true,
+    },
+  },
+  ...Array.from({ length: 80 }, (_, index) => ({
     name: `fixture-${String(index + 1).padStart(2, "0")}.txt`,
     path: `fixture-${String(index + 1).padStart(2, "0")}.txt`,
     type: "file",
     size: 1024 + index,
     modifiedMs: 1_800_000_000_000 + index,
     invalid: false,
-  }));
+  })),
+];
 
 const seedOfflineFolderState = async (): Promise<void> => {
   const activeDirectoryKey = JSON.stringify([syntheticFolderId, ""]);
@@ -327,6 +344,8 @@ describe("Syncpeer Tauri UI smoke", () => {
     await seedOfflineFolderState();
     try {
       await $(`[data-testid='folder-name-filter']`).waitForExist({ timeout: 10_000 });
+      const nestedFolder = await $(`[data-testid='folder-entry-nested']`);
+      assert.include(await nestedFolder.getText(), "3 files | 25 B | 1 folder");
       await tauriBrowser.execute(() => {
         const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
         if (!content) throw new Error("App content container is not mounted.");

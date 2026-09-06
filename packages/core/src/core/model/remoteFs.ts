@@ -58,6 +58,7 @@ export interface FileEntry {
   path: string;
   type: "file" | "directory" | "symlink";
   size: number;
+  stats?: FolderStats;
   modifiedMs: number;
   invalid?: boolean;
   deleted?: boolean;
@@ -233,7 +234,9 @@ function toEntry(path: string, file: BepFileInfo): FileEntry {
   };
 }
 
-function folderStats(folder: FolderState): FolderStats {
+function folderStats(folder: FolderState, path = ""): FolderStats {
+  const normalizedPath = normalizePath(path);
+  const prefix = normalizedPath ? `${normalizedPath}/` : "";
   const readableIndex = !folder.encrypted || (!folder.needsPassword && !folder.passwordError);
   const initial = {
     fileCount: 0,
@@ -244,7 +247,14 @@ function folderStats(folder: FolderState): FolderStats {
     indexReceived: Boolean(folder.indexReceived && readableIndex),
   };
   return [...folder.files.entries()].reduce((stats, [path, stored]) => {
-    const entry = toEntry(normalizePath(path), stored.indexFile);
+    const normalizedEntryPath = normalizePath(path);
+    if (
+      normalizedEntryPath === normalizedPath ||
+      (prefix && !normalizedEntryPath.startsWith(prefix))
+    ) {
+      return stats;
+    }
+    const entry = toEntry(normalizedEntryPath, stored.indexFile);
     if (entry.deleted) return stats;
     return {
       fileCount: stats.fileCount + (entry.type === "file" ? 1 : 0),
@@ -255,6 +265,12 @@ function folderStats(folder: FolderState): FolderStats {
       indexReceived: stats.indexReceived,
     };
   }, initial);
+}
+
+function addDirectoryStats(folder: FolderState, entry: FileEntry): FileEntry {
+  return entry.type === "directory"
+    ? { ...entry, stats: folderStats(folder, entry.path) }
+    : entry;
 }
 
 export class RemoteFs {
@@ -393,7 +409,7 @@ export class RemoteFs {
     for (const [key, value] of folder.files) {
       const keyPath = normalizePath(key);
       const entry = toEntry(keyPath, value.indexFile);
-      if (keyPath === normalized && !entry.deleted) return entry;
+      if (keyPath === normalized && !entry.deleted) return addDirectoryStats(folder, entry);
     }
     const prefix = normalized ? normalized + "/" : "";
     for (const key of folder.files.keys()) {
@@ -409,6 +425,7 @@ export class RemoteFs {
           type: "directory",
           size: 0,
           modifiedMs: 0,
+          stats: folderStats(folder, normalized),
         };
       }
     }
@@ -447,7 +464,7 @@ export class RemoteFs {
       if (!rest) continue;
       const firstSlash = rest.indexOf("/");
       if (firstSlash === -1) {
-        out.set(rest, entry);
+        out.set(rest, addDirectoryStats(folder, entry));
       } else {
         const childName = rest.slice(0, firstSlash);
         const childPath = normalized ? `${normalized}/${childName}` : childName;
@@ -458,6 +475,7 @@ export class RemoteFs {
             type: "directory",
             size: 0,
             modifiedMs: 0,
+            stats: folderStats(folder, childPath),
           });
         }
       }

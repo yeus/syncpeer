@@ -589,6 +589,15 @@ const folderStatsFs = new BuiltRemoteFs(
         ["nested/beta.bin", {
           indexFile: { name: "nested/beta.bin", type: 0, size: 13, invalid: true },
         }],
+        ["nested/deep/gamma.bin", {
+          indexFile: { name: "nested/deep/gamma.bin", type: 0, size: 5 },
+        }],
+        ["nested/deep", {
+          indexFile: { name: "nested/deep", type: 1, size: 0 },
+        }],
+        ["nested/deep/leaf.txt", {
+          indexFile: { name: "nested/deep/leaf.txt", type: 0, size: 7 },
+        }],
         ["shortcut", {
           indexFile: { name: "shortcut", type: 2, size: 99 },
         }],
@@ -634,11 +643,35 @@ const folderStats = await folderStatsFs.listFolders();
 assert.deepEqual(
   folderStats.find((folder) => folder.id === "stats-folder")?.stats,
   {
-    fileCount: 2,
-    directoryCount: 1,
+    fileCount: 4,
+    directoryCount: 2,
     symlinkCount: 1,
     invalidCount: 1,
-    totalBytes: 21,
+    totalBytes: 33,
+    indexReceived: true,
+  },
+);
+const rootDirectoryEntries = await folderStatsFs.readDir("stats-folder", "");
+assert.deepEqual(
+  rootDirectoryEntries.find((entry) => entry.path === "nested")?.stats,
+  {
+    fileCount: 3,
+    directoryCount: 1,
+    symlinkCount: 0,
+    invalidCount: 1,
+    totalBytes: 25,
+    indexReceived: true,
+  },
+);
+const nestedDirectoryEntries = await folderStatsFs.readDir("stats-folder", "nested");
+assert.deepEqual(
+  nestedDirectoryEntries.find((entry) => entry.path === "nested/deep")?.stats,
+  {
+    fileCount: 2,
+    directoryCount: 0,
+    symlinkCount: 0,
+    invalidCount: 0,
+    totalBytes: 12,
     indexReceived: true,
   },
 );

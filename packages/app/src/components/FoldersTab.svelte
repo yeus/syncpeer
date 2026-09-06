@@ -147,8 +147,7 @@
   const plural = (count: number, singular: string) =>
     `${count.toLocaleString()} ${singular}${count === 1 ? "" : "s"}`;
 
-  const folderStatsText = (folder: { stats?: FolderInfo["stats"] }) => {
-    const stats = folder.stats;
+  const folderStatsText = (stats: FolderInfo["stats"]) => {
     if (!stats?.indexReceived) return "index pending";
     const parts = [
       plural(stats.fileCount, "file"),
@@ -179,7 +178,7 @@
         locked: isFolderLocked(folder.id),
         isFavorite: favoriteKeys.has(`folder:${folder.id}:`),
         hasCachedRoot: app.favorites.cachedFileKeys.has(`${folder.id}:`),
-        statsText: folderStatsText(folder),
+        statsText: folderStatsText(folder.stats),
       }),
     ),
   );
@@ -192,6 +191,7 @@
         name: entry.name,
         path: entry.path,
         entryType: entry.type,
+        statsText: folderStatsText(entry.stats),
         sizeText: formatBytes(entry.size),
         modifiedText: formatModified(entry.modifiedMs),
         invalid: Boolean(entry.invalid),

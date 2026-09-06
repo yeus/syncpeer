@@ -44,6 +44,7 @@
     name: string;
     path: string;
     entryType: "directory" | "file" | "symlink";
+    statsText: string;
     sizeText: string;
     modifiedText: string;
     invalid: boolean;
@@ -297,6 +298,7 @@
   {#if canClickMain(item)}
     <div
       class="item-main-hit item-main-hit-clickable"
+      data-testid={item.kind === "folder-entry" ? `folder-entry-${item.path}` : undefined}
       role="button"
       tabindex={0}
       onclick={(event) => handleMainClick(item, event)}
@@ -372,7 +374,11 @@
           {/if}
         {/if}
       {:else if item.kind === "folder-entry"}
-        <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+        {#if item.entryType === "directory"}
+          <div class="item-meta">{item.entryType} | {item.statsText}</div>
+        {:else}
+          <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+        {/if}
         {#if item.isDownloadingActive && item.downloadProgressText}
           <div class="item-meta">Download: {item.downloadProgressText}</div>
         {/if}
@@ -390,7 +396,10 @@
       {/if}
     </div>
   {:else}
-    <div class="item-main-hit">
+    <div
+      class="item-main-hit"
+      data-testid={item.kind === "folder-entry" ? `folder-entry-${item.path}` : undefined}
+    >
     <div class="item-title-row">
     <span class={`item-icon ${viewMode === "grid" ? "item-icon-grid" : ""}`} aria-hidden="true">
       {#if leadingKind(item) === "folder"}
@@ -456,7 +465,11 @@
         {/if}
       {/if}
     {:else if item.kind === "folder-entry"}
-      <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+      {#if item.entryType === "directory"}
+        <div class="item-meta">{item.entryType} | {item.statsText}</div>
+      {:else}
+        <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
+      {/if}
       {#if item.isDownloadingActive && item.downloadProgressText}
         <div class="item-meta">Download: {item.downloadProgressText}</div>
       {/if}

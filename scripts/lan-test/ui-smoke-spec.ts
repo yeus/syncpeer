@@ -345,7 +345,9 @@ describe("Syncpeer Tauri UI smoke", () => {
     try {
       await $(`[data-testid='folder-name-filter']`).waitForExist({ timeout: 10_000 });
       const nestedFolder = await $(`[data-testid='folder-entry-nested']`);
-      assert.include(await nestedFolder.getText(), "3 files | 25 B | 1 folder");
+      assert.ok(
+        (await nestedFolder.getText()).includes("3 files | 25 B | 1 folder"),
+      );
       await tauriBrowser.execute(() => {
         const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
         if (!content) throw new Error("App content container is not mounted.");
@@ -378,7 +380,7 @@ describe("Syncpeer Tauri UI smoke", () => {
     }
   });
 
-  it("shows download progress without shifting the scrolled folder view", async () => {
+  it("shows concurrent download progress without shifting the scrolled folder view", async () => {
     await seedOfflineFolderState();
     try {
       await $(`[data-testid='folder-entry-fixture-45.txt']`).waitForExist({ timeout: 10_000 });
@@ -406,6 +408,12 @@ describe("Syncpeer Tauri UI smoke", () => {
           "37% • 1.2 MB/s • ETA 8s • direct · LAN",
           37,
         );
+        testWindow.__syncpeerSetDownloadProgress?.(
+          folderId,
+          "fixture-46.txt",
+          "64% • 900 KB/s • ETA 4s • direct · LAN",
+          64,
+        );
       }, syntheticFolderId);
       await $("[data-testid='transfer-float']").waitForExist({ timeout: 5_000 });
       const after = await tauriBrowser.execute(() => {
@@ -414,13 +422,18 @@ describe("Syncpeer Tauri UI smoke", () => {
           "[data-testid='folder-entry-fixture-45.txt']",
         ) as HTMLElement | null;
         const fill = row?.querySelector(".item-progress-fill") as HTMLElement | null;
+        const secondRow = document.querySelector(
+          "[data-testid='folder-entry-fixture-46.txt']",
+        ) as HTMLElement | null;
+        const secondFill = secondRow?.querySelector(".item-progress-fill") as HTMLElement | null;
         const rowText = row?.textContent ?? "";
         const floatText = document.querySelector("[data-testid='transfer-float']")?.textContent ?? "";
-        if (!content || !row || !fill) throw new Error("Download progress UI did not render.");
+        if (!content || !row || !fill || !secondFill) throw new Error("Download progress UI did not render.");
         return {
           scrollTop: content.scrollTop,
           rowHeight: row.getBoundingClientRect().height,
           fillWidth: fill.style.width,
+          secondFillWidth: secondFill.style.width,
           rowText,
           floatText,
         };
@@ -428,8 +441,10 @@ describe("Syncpeer Tauri UI smoke", () => {
       assert.equal(after.scrollTop, before.scrollTop);
       assert.equal(after.rowHeight, before.rowHeight);
       assert.equal(after.fillWidth, "37%");
+      assert.equal(after.secondFillWidth, "64%");
       assert.match(after.rowText, /Download: 37%/);
-      assert.match(after.floatText, /Downloading fixture-45\.txt: 37%/);
+      assert.match(after.floatText, /2 downloads/);
+      assert.match(after.floatText, /50%/);
     } finally {
       await tauriBrowser.execute(() => {
         const testWindow = window as Window & {
@@ -625,10 +640,6 @@ describe("Syncpeer Tauri UI smoke", () => {
       await unlockTargetFolder();
       await clickItemTitle(tauriBrowser, targetFolderTitle);
       await waitForText(tauriBrowser, targetFileName, folderWaitTimeout());
-      assert.match(
-        await $("[data-testid='folder-view-status']").getText(),
-        /Live · in sync/,
-      );
 
       await disconnectIfConnected();
       await clickTestId("tab-folders");

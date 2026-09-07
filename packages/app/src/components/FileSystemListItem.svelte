@@ -95,7 +95,6 @@
     isOpeningCachedFile: boolean;
     isRemovingCachedFile: boolean;
     isClearingCache: boolean;
-    isDownloading: boolean;
     viewMode?: "list" | "grid";
     onOpenFolderRoot?: (folderId: string) => void;
     onOpenDirectory?: (folderId: string, path: string) => void;
@@ -107,7 +106,7 @@
     onOpenCachedFileDirectory?: (folderId: string, path: string) => void;
     onRemoveCachedFile?: (folderId: string, path: string) => void;
     onDownloadFile?: (folderId: string, path: string, name: string) => void;
-    onCancelDownload?: () => void;
+    onCancelDownload?: (folderId?: string, path?: string) => void;
     onOpenOrDownloadFile?: (folderId: string, path: string, name: string) => void;
     onSetPasswordVisible?: (folderId: string, visible: boolean) => void;
     onUpdateFolderPasswordDraft?: (folderId: string, password: string) => void;
@@ -120,7 +119,6 @@
     isOpeningCachedFile,
     isRemovingCachedFile,
     isClearingCache,
-    isDownloading,
     viewMode = "list",
     onOpenFolderRoot = () => {},
     onOpenDirectory = () => {},
@@ -570,7 +568,7 @@
       {#if item.isDownloadingActive}
         <button
           class="row-action"
-          onclick={onCancelDownload}
+          onclick={() => onCancelDownload(item.folderId, item.path)}
           aria-label="Cancel download"
           title="Cancel download"
         >
@@ -591,7 +589,7 @@
         <button
           class="row-action"
           onclick={() => onDownloadFile(item.folderId, item.path, item.name)}
-          disabled={isDownloading || item.invalid}
+          disabled={item.isDownloadingActive || item.invalid}
           title={item.downloadLabel}
           aria-label={item.downloadLabel}
         >
@@ -620,7 +618,7 @@
       {#if item.isDownloadingActive}
         <button
           class="row-action"
-          onclick={onCancelDownload}
+          onclick={() => onCancelDownload(item.folderId, item.path)}
           aria-label="Cancel download"
           title="Cancel download"
         >
@@ -630,7 +628,7 @@
         <button
           class="row-action"
           onclick={() => onDownloadFile(item.folderId, item.path, item.name)}
-          disabled={isDownloading || !item.connected}
+          disabled={item.isDownloadingActive || !item.connected}
           title={item.downloadLabel}
           aria-label={item.downloadLabel}
         >

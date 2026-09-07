@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { CachedFileRecord, FavoriteRecord } from "@syncpeer/core/browser";
-  import type { AppState } from "../app/state.ts";
+  import { activeDownloadForFile, type AppState } from "../app/state.ts";
   import type { CachedFileItem, FavoriteItem } from "./FileSystemListItem.svelte";
   import FileSystemListItem from "./FileSystemListItem.svelte";
   import Panel from "./Panel.svelte";
@@ -15,7 +15,7 @@
     onRemoveCachedFile: (folderId: string, path: string) => void;
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
-    onCancelDownload: () => void;
+    onCancelDownload: (folderId?: string, path?: string) => void;
     onRemoveFavorite: (favorite: FavoriteRecord) => void;
     onClearAllCache: () => void;
     formatBytes: (value: number) => string;
@@ -40,9 +40,9 @@
   }: Props = $props();
 
   const downloadLabel = (folderId: string, path: string) => {
-    const key = `${folderId}:${path}`;
-    return key === app.favorites.activeDownloadKey
-      ? app.favorites.activeDownloadText || "Downloading..."
+    const activeDownload = activeDownloadForFile(app, folderId, path);
+    return activeDownload
+      ? activeDownload.text || "Downloading..."
       : "Download";
   };
 
@@ -58,28 +58,28 @@
 
   let favoriteRows = $derived.by(() =>
     app.favorites.items.map(
-      (favorite): FavoriteItem => ({
-        kind: "favorite",
-        key: favorite.key,
-        folderId: favorite.folderId,
-        name: favorite.name,
-        path: favorite.path,
-        favoriteKind: favorite.kind,
-        connected: app.session.isConnected,
-        isCached: app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`),
-        thumbnailPath: downloadedLocalPaths.get(`${favorite.folderId}:${favorite.path}`) ?? null,
-        downloadLabel: downloadLabel(favorite.folderId, favorite.path),
-        isDownloadingActive:
-          app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`,
-        downloadProgressText:
-          app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`
-            ? app.favorites.activeDownloadText
-            : "",
-        downloadProgressPercent:
-          app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`
-            ? app.favorites.activeDownloadProgressPercent
-            : 0,
-      }),
+      (favorite): FavoriteItem => {
+        const activeDownload = activeDownloadForFile(
+          app,
+          favorite.folderId,
+          favorite.path,
+        );
+        return {
+          kind: "favorite",
+          key: favorite.key,
+          folderId: favorite.folderId,
+          name: favorite.name,
+          path: favorite.path,
+          favoriteKind: favorite.kind,
+          connected: app.session.isConnected,
+          isCached: app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`),
+          thumbnailPath: downloadedLocalPaths.get(`${favorite.folderId}:${favorite.path}`) ?? null,
+          downloadLabel: downloadLabel(favorite.folderId, favorite.path),
+          isDownloadingActive: Boolean(activeDownload),
+          downloadProgressText: activeDownload?.text ?? "",
+          downloadProgressPercent: activeDownload?.progressPercent ?? 0,
+        };
+      },
     ),
   );
 
@@ -123,7 +123,6 @@
           isOpeningCachedFile={app.favorites.isOpeningCachedFile}
           isRemovingCachedFile={app.favorites.isRemovingCachedFile}
           isClearingCache={app.favorites.isClearingCache}
-          isDownloading={app.favorites.isDownloading}
           onOpenFavorite={onOpenFavorite}
           onOpenCachedFile={onOpenCachedFile}
           onOpenCachedFileDirectory={onOpenCachedFileDirectory}
@@ -159,7 +158,6 @@
             isOpeningCachedFile={app.favorites.isOpeningCachedFile}
             isRemovingCachedFile={app.favorites.isRemovingCachedFile}
             isClearingCache={app.favorites.isClearingCache}
-            isDownloading={app.favorites.isDownloading}
             onOpenCachedFile={onOpenCachedFile}
             onOpenCachedFileDirectory={onOpenCachedFileDirectory}
             onRemoveCachedFile={onRemoveCachedFile}

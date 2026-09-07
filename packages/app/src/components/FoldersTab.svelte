@@ -6,7 +6,7 @@
     FolderInfo,
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
-  import type { AppState } from "../app/state.ts";
+  import { activeDownloadForFile, type AppState } from "../app/state.ts";
   import { folderRootEmptyNotice } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
@@ -41,7 +41,7 @@
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
-    onCancelDownload: () => void;
+    onCancelDownload: (folderId?: string, path?: string) => void;
     onCancelTransfers: () => void;
     onToggleFavorite: (folderId: string, path: string, name: string, kind: "folder" | "file") => void;
     onSetPasswordVisible: (folderId: string, visible: boolean) => void;
@@ -185,36 +185,33 @@
 
   let entryRows = $derived.by(() =>
     entries.map(
-      (entry): FolderEntryItem => ({
-        kind: "folder-entry",
-        folderId: app.session.currentFolderId,
-        name: entry.name,
-        path: entry.path,
-        entryType: entry.type,
-        statsText: folderStatsText(entry.stats),
-        sizeText: formatBytes(entry.size),
-        modifiedText: formatModified(entry.modifiedMs),
-        invalid: Boolean(entry.invalid),
-        isFavorite: favoriteKeys.has(
-          `${entry.type === "directory" ? "folder" : "file"}:${app.session.currentFolderId}:${entry.path}`,
-        ),
-        isCached: app.favorites.cachedFileKeys.has(`${app.session.currentFolderId}:${entry.path}`),
-        thumbnailPath: downloadedLocalPaths.get(`${app.session.currentFolderId}:${entry.path}`) ?? null,
-        downloadLabel: downloadButtonLabel(app.session.currentFolderId, entry.path),
-        isDownloadingActive:
-          app.favorites.activeDownloadKey ===
-          `${app.session.currentFolderId}:${entry.path}`,
-        downloadProgressText:
-          app.favorites.activeDownloadKey ===
-          `${app.session.currentFolderId}:${entry.path}`
-            ? app.favorites.activeDownloadText
-            : "",
-        downloadProgressPercent:
-          app.favorites.activeDownloadKey ===
-          `${app.session.currentFolderId}:${entry.path}`
-            ? app.favorites.activeDownloadProgressPercent
-            : 0,
-      }),
+      (entry): FolderEntryItem => {
+        const activeDownload = activeDownloadForFile(
+          app,
+          app.session.currentFolderId,
+          entry.path,
+        );
+        return {
+          kind: "folder-entry",
+          folderId: app.session.currentFolderId,
+          name: entry.name,
+          path: entry.path,
+          entryType: entry.type,
+          statsText: folderStatsText(entry.stats),
+          sizeText: formatBytes(entry.size),
+          modifiedText: formatModified(entry.modifiedMs),
+          invalid: Boolean(entry.invalid),
+          isFavorite: favoriteKeys.has(
+            `${entry.type === "directory" ? "folder" : "file"}:${app.session.currentFolderId}:${entry.path}`,
+          ),
+          isCached: app.favorites.cachedFileKeys.has(`${app.session.currentFolderId}:${entry.path}`),
+          thumbnailPath: downloadedLocalPaths.get(`${app.session.currentFolderId}:${entry.path}`) ?? null,
+          downloadLabel: downloadButtonLabel(app.session.currentFolderId, entry.path),
+          isDownloadingActive: Boolean(activeDownload),
+          downloadProgressText: activeDownload?.text ?? "",
+          downloadProgressPercent: activeDownload?.progressPercent ?? 0,
+        };
+      },
     ),
   );
 
@@ -384,7 +381,6 @@
               isOpeningCachedFile={app.favorites.isOpeningCachedFile}
               isRemovingCachedFile={app.favorites.isRemovingCachedFile}
               isClearingCache={app.favorites.isClearingCache}
-              isDownloading={app.favorites.isDownloading}
               {onOpenFolderRoot}
               onOpenCachedDirectory={onOpenCachedDirectory}
               onToggleFavorite={onToggleFavorite}
@@ -425,7 +421,6 @@
               isOpeningCachedFile={app.favorites.isOpeningCachedFile}
               isRemovingCachedFile={app.favorites.isRemovingCachedFile}
               isClearingCache={app.favorites.isClearingCache}
-              isDownloading={app.favorites.isDownloading}
               onOpenDirectory={openDirectoryFromItem}
               onOpenCachedDirectory={onOpenCachedDirectory}
               onOpenCachedFile={onOpenCachedFile}

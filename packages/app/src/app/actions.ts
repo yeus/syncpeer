@@ -572,6 +572,27 @@ export const createAppActions = (args: {
     }
   };
 
+  const setActiveDownload = (
+    key: string,
+    value: { name: string; text: string; progressPercent: number },
+  ) => {
+    state.favorites.activeDownloads = {
+      ...state.favorites.activeDownloads,
+      [key]: {
+        ...value,
+        progressPercent: Math.max(0, Math.min(100, value.progressPercent)),
+      },
+    };
+    state.favorites.isDownloading = Object.keys(state.favorites.activeDownloads).length > 0;
+  };
+
+  const clearActiveDownload = (key: string) => {
+    const remaining = { ...state.favorites.activeDownloads };
+    delete remaining[key];
+    state.favorites.activeDownloads = remaining;
+    state.favorites.isDownloading = Object.keys(remaining).length > 0;
+  };
+
   const ensureNativeNotificationPermission = async () => {
     try {
       const alreadyGranted = await isNativeNotificationPermissionGranted();
@@ -838,7 +859,7 @@ export const createAppActions = (args: {
   };
 
   const transferInProgress = () =>
-    state.favorites.isDownloading ||
+    Object.keys(state.favorites.activeDownloads).length > 0 ||
     state.ui.uploadProgressActive ||
     state.sync.isSyncingStarredFiles;
 
@@ -1726,7 +1747,8 @@ export const createAppActions = (args: {
     name: string,
     options?: { openAfterDownload?: boolean },
   ) => {
-    if (state.favorites.isDownloading) return;
+    const downloadKey = cachedFileKey(folderId, path);
+    if (state.favorites.activeDownloads[downloadKey]) return;
     const connected = await ensureConnectedForTransfer("download");
     if (!connected || !state.session.remoteFs) return;
     state.favorites.isDownloading = true;
@@ -1743,17 +1765,17 @@ export const createAppActions = (args: {
       abortController.abort();
       setDownloadNotice(`Cancelling download ${name}…`);
     };
-    const downloadKey = cachedFileKey(folderId, path);
     const transferId = `download:${downloadKey}`;
     const remoteFs = state.session.remoteFs;
-    state.favorites.activeDownloadKey = downloadKey;
-    state.favorites.activeDownloadProgressPercent = 0;
-    state.favorites.activeDownloadText =
-      `0% • 0 B/s • ETA -- • ${downloadTransportText(
-        state.session.connectionTransport,
-        state.session.connectionScope,
-      )}`;
-    setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
+    const initialProgressText = `0% • 0 B/s • ETA -- • ${downloadTransportText(
+      state.session.connectionTransport,
+      state.session.connectionScope,
+    )}`;
+    setActiveDownload(downloadKey, {
+      name,
+      text: initialProgressText,
+      progressPercent: 0,
+    });
     pushSessionLog(state, "info", "download.start", `Downloading ${name}`, {
       folderId,
       path,
@@ -1792,7 +1814,7 @@ export const createAppActions = (args: {
         activeConnectionScope = connectionScope ?? activeConnectionScope;
         const elapsedMs = elapsedMsSince(startedAt);
         const rateBps = averageRateBps(networkBytes ?? downloadedBytes, elapsedMs);
-        state.favorites.activeDownloadText = downloadProgressText(
+        const progressText = downloadProgressText(
           downloadedBytes,
           totalBytes,
           elapsedMs / 1000,
@@ -1800,9 +1822,15 @@ export const createAppActions = (args: {
           transportKind ?? state.session.connectionTransport,
           connectionScope ?? state.session.connectionScope,
         )}`;
-        state.favorites.activeDownloadProgressPercent =
-          totalBytes > 0 ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100)) : 0;
-        setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
+        const progressPercent =
+          totalBytes > 0
+            ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100))
+            : 0;
+        setActiveDownload(downloadKey, {
+          name,
+          text: progressText,
+          progressPercent,
+        });
         updateManagedTransfer(transferId, downloadedBytes, totalBytes);
         const now = Date.now();
         if (now - lastTransferLogAtMs >= 2000 || downloadedBytes >= totalBytes) {
@@ -1868,9 +1896,13 @@ export const createAppActions = (args: {
         lastDirection: "download",
       };
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
-      state.favorites.activeDownloadText =
+      const doneProgressText =
         `100% • Done • ${downloadTransportText(activeTransportKind, activeConnectionScope)}`;
-      state.favorites.activeDownloadProgressPercent = 100;
+      setActiveDownload(downloadKey, {
+        name,
+        text: doneProgressText,
+        progressPercent: 100,
+      });
       transferOutcome = "completed";
       setDownloadNotice(
         `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}` +
@@ -1914,17 +1946,16 @@ export const createAppActions = (args: {
       }
     } finally {
       await finishManagedTransfer(transferId, transferOutcome);
-      state.favorites.isDownloading = false;
-      if (state.favorites.activeDownloadKey === downloadKey) {
-        state.favorites.activeDownloadKey = "";
-        state.favorites.activeDownloadText = "";
-        state.favorites.activeDownloadProgressPercent = 0;
-      }
+      clearActiveDownload(downloadKey);
     }
   };
 
-  const cancelDownload = () => {
+  const cancelDownload = (folderId?: string, path?: string) => {
     if (!state.favorites.isDownloading) return;
+    if (folderId !== undefined && path !== undefined) {
+      transferCancellations.get(`download:${cachedFileKey(folderId, path)}`)?.cancel();
+      return;
+    }
     for (const transfer of transferCancellations.values()) {
       if (transfer.direction === "download") transfer.cancel();
     }

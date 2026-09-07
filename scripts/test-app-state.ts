@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createInitialSessionState } from "../packages/core/src/ui/sessionPolicies.ts";
-import { applySessionState, createInitialState } from "../packages/app/src/app/state.ts";
+import {
+  activeDownloadForFile,
+  activeDownloadProgressPercent,
+  activeDownloadSummary,
+  applySessionState,
+  createInitialState,
+  downloadButtonLabel,
+} from "../packages/app/src/app/state.ts";
 
 test("keeps restored folders visible while reconnecting before live state arrives", () => {
   const app = createInitialState(null);
@@ -91,4 +98,35 @@ test("replaces restored folders once live connected state arrives", () => {
   assert.equal(app.session.isConnected, true);
   assert.equal(app.session.isOfflineSnapshot, false);
   assert.deepEqual(app.session.folders.map((folder) => folder.id), ["live-folder"]);
+});
+
+test("tracks active manual downloads independently", () => {
+  const app = createInitialState(null);
+  app.favorites.activeDownloads = {
+    "documents:alpha.bin": {
+      name: "alpha.bin",
+      text: "25% | 1 MB/s | ETA 12s | direct | LAN",
+      progressPercent: 25,
+    },
+    "documents:beta.bin": {
+      name: "beta.bin",
+      text: "75% | 2 MB/s | ETA 4s | direct | LAN",
+      progressPercent: 75,
+    },
+  };
+
+  assert.equal(
+    activeDownloadForFile(app, "documents", "alpha.bin")?.progressPercent,
+    25,
+  );
+  assert.equal(downloadButtonLabel(app, "documents", "beta.bin"), "75% | 2 MB/s | ETA 4s | direct | LAN");
+  assert.equal(downloadButtonLabel(app, "documents", "gamma.bin"), "Download");
+  assert.equal(
+    activeDownloadProgressPercent(Object.values(app.favorites.activeDownloads)),
+    50,
+  );
+  assert.equal(
+    activeDownloadSummary(Object.values(app.favorites.activeDownloads)),
+    "2 downloads: 50%",
+  );
 });

@@ -23,6 +23,8 @@
     activeFolderPasswords,
     advertisedDevices,
     applySessionState,
+    activeDownloadProgressPercent as downloadProgressPercent,
+    activeDownloadSummary as downloadSummary,
     connectTargetLabel,
     directoryCurrentPage,
     directoryTotalPages,
@@ -95,6 +97,9 @@
   let currentDirectoryEntries = $derived(paginatedDirectoryEntries(app));
   let currentDirectoryPage = $derived(directoryCurrentPage(app));
   let currentDirectoryTotalPages = $derived(directoryTotalPages(app));
+  let activeDownloads = $derived(Object.values(app.favorites.activeDownloads));
+  let activeDownloadProgressPercent = $derived(downloadProgressPercent(activeDownloads));
+  let activeDownloadSummary = $derived(downloadSummary(activeDownloads));
   let contentScrollKey = $derived(
     `${app.currentPage}:${app.activeTab}:${app.session.currentFolderId}:${app.session.currentPath}`,
   );
@@ -232,16 +237,18 @@
         percent: number,
       ) => {
         app.favorites.isDownloading = true;
-        app.favorites.activeDownloadKey = cachedFileKey(folderId, path);
-        app.favorites.activeDownloadText = text;
-        app.favorites.activeDownloadProgressPercent = Math.max(0, Math.min(100, percent));
-        app.ui.downloadNotice = `Downloading ${path.split("/").pop() || path}: ${text}`;
+        app.favorites.activeDownloads = {
+          ...app.favorites.activeDownloads,
+          [cachedFileKey(folderId, path)]: {
+            name: path.split("/").pop() || path,
+            text,
+            progressPercent: Math.max(0, Math.min(100, percent)),
+          },
+        };
       };
       testWindow.__syncpeerClearDownloadProgress = () => {
         app.favorites.isDownloading = false;
-        app.favorites.activeDownloadKey = "";
-        app.favorites.activeDownloadText = "";
-        app.favorites.activeDownloadProgressPercent = 0;
+        app.favorites.activeDownloads = {};
         app.ui.downloadNotice = "";
       };
     }
@@ -479,15 +486,15 @@
       {/if}
     </main>
 
-    {#if app.ui.downloadNotice || app.favorites.activeDownloadText}
+    {#if app.ui.downloadNotice || activeDownloadSummary}
       <aside class="transfer-float" data-testid="transfer-float" aria-live="polite">
         <div class="transfer-float-text">
-          {app.ui.downloadNotice || `Downloading: ${app.favorites.activeDownloadText}`}
+          {activeDownloadSummary || app.ui.downloadNotice}
         </div>
-        {#if app.favorites.activeDownloadText}
+        {#if activeDownloadSummary}
           <div class="transfer-float-track" aria-hidden="true">
             <span
-              style={`width: ${Math.max(0, Math.min(100, app.favorites.activeDownloadProgressPercent))}%`}
+              style={`width: ${activeDownloadProgressPercent}%`}
             ></span>
           </div>
         {/if}

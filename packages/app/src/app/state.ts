@@ -40,6 +40,12 @@ const DEFAULT_DIRECTORY_PAGE_SIZE = 200;
 const MIN_DIRECTORY_PAGE_SIZE = 10;
 const MAX_DIRECTORY_PAGE_SIZE = 2000;
 
+export interface ActiveDownloadView {
+  name: string;
+  text: string;
+  progressPercent: number;
+}
+
 const parseJson = <T,>(raw: string | null) => {
   if (!raw) return null;
   try {
@@ -200,9 +206,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       showDownloadedFiles: false,
       isLoadingDownloadedFiles: false,
       isDownloading: false,
-      activeDownloadKey: "",
-      activeDownloadText: "",
-      activeDownloadProgressPercent: 0,
+      activeDownloads: {} as Record<string, ActiveDownloadView>,
       isOpeningCachedFile: false,
       isRemovingCachedFile: false,
       isClearingCache: false,
@@ -595,9 +599,38 @@ export const downloadButtonLabel = (
   path: string,
 ) => {
   const key = cachedFileKey(folderId, path);
-  return key === state.favorites.activeDownloadKey
-    ? state.favorites.activeDownloadText || "Downloading..."
+  return state.favorites.activeDownloads[key]
+    ? state.favorites.activeDownloads[key].text || "Downloading..."
     : "Download";
+};
+
+export const activeDownloadForFile = (
+  state: AppState,
+  folderId: string,
+  path: string,
+): ActiveDownloadView | undefined =>
+  state.favorites.activeDownloads[cachedFileKey(folderId, path)];
+
+export const activeDownloadProgressPercent = (
+  downloads: ActiveDownloadView[],
+) => {
+  if (downloads.length === 0) return 0;
+  const completed = downloads.reduce(
+    (sum, item) => sum + Math.max(0, Math.min(100, item.progressPercent)),
+    0,
+  );
+  return Math.floor(completed / downloads.length);
+};
+
+export const activeDownloadSummary = (
+  downloads: ActiveDownloadView[],
+) => {
+  if (downloads.length === 0) return "";
+  if (downloads.length === 1) {
+    const download = downloads[0];
+    return `Downloading ${download.name}: ${download.text}`;
+  }
+  return `${downloads.length} downloads: ${activeDownloadProgressPercent(downloads)}%`;
 };
 
 export const formatBytes = (size: number) => {

@@ -202,6 +202,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       isDownloading: false,
       activeDownloadKey: "",
       activeDownloadText: "",
+      activeDownloadProgressPercent: 0,
       isOpeningCachedFile: false,
       isRemovingCachedFile: false,
       isClearingCache: false,

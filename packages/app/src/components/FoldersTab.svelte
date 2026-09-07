@@ -209,6 +209,11 @@
           `${app.session.currentFolderId}:${entry.path}`
             ? app.favorites.activeDownloadText
             : "",
+        downloadProgressPercent:
+          app.favorites.activeDownloadKey ===
+          `${app.session.currentFolderId}:${entry.path}`
+            ? app.favorites.activeDownloadProgressPercent
+            : 0,
       }),
     ),
   );

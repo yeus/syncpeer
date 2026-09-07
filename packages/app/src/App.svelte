@@ -4,6 +4,7 @@
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
+    cachedFileKey,
   } from "@syncpeer/core/browser";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
   import AppHeader from "./components/AppHeader.svelte";
@@ -49,6 +50,16 @@
   import Smartphone from "lucide-svelte/icons/smartphone";
   import Star from "lucide-svelte/icons/star";
   import CalendarDays from "lucide-svelte/icons/calendar-days";
+
+  type SyncpeerTestWindow = Window & {
+    __syncpeerSetDownloadProgress?: (
+      folderId: string,
+      path: string,
+      text: string,
+      percent: number,
+    ) => void;
+    __syncpeerClearDownloadProgress?: () => void;
+  };
 
   let app = $state(createInitialState());
   let systemPrefersDark = $state(false);
@@ -212,7 +223,35 @@
     window.addEventListener("focus", handleFocus);
     window.addEventListener("pageshow", handlePageShow);
 
+    if (import.meta.env.SYNCPEER_LAN_E2E === true) {
+      const testWindow = window as SyncpeerTestWindow;
+      testWindow.__syncpeerSetDownloadProgress = (
+        folderId: string,
+        path: string,
+        text: string,
+        percent: number,
+      ) => {
+        app.favorites.isDownloading = true;
+        app.favorites.activeDownloadKey = cachedFileKey(folderId, path);
+        app.favorites.activeDownloadText = text;
+        app.favorites.activeDownloadProgressPercent = Math.max(0, Math.min(100, percent));
+        app.ui.downloadNotice = `Downloading ${path.split("/").pop() || path}: ${text}`;
+      };
+      testWindow.__syncpeerClearDownloadProgress = () => {
+        app.favorites.isDownloading = false;
+        app.favorites.activeDownloadKey = "";
+        app.favorites.activeDownloadText = "";
+        app.favorites.activeDownloadProgressPercent = 0;
+        app.ui.downloadNotice = "";
+      };
+    }
+
     return () => {
+      if (import.meta.env.SYNCPEER_LAN_E2E === true) {
+        const testWindow = window as SyncpeerTestWindow;
+        delete testWindow.__syncpeerSetDownloadProgress;
+        delete testWindow.__syncpeerClearDownloadProgress;
+      }
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
@@ -305,11 +344,6 @@
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
           <p class="error">{app.ui.recentError}</p>
-        </section>
-      {/if}
-      {#if app.ui.downloadNotice}
-        <section class="panel download-banner-panel">
-          <p class="hint">{app.ui.downloadNotice}</p>
         </section>
       {/if}
 
@@ -445,6 +479,21 @@
       {/if}
     </main>
 
+    {#if app.ui.downloadNotice || app.favorites.activeDownloadText}
+      <aside class="transfer-float" data-testid="transfer-float" aria-live="polite">
+        <div class="transfer-float-text">
+          {app.ui.downloadNotice || `Downloading: ${app.favorites.activeDownloadText}`}
+        </div>
+        {#if app.favorites.activeDownloadText}
+          <div class="transfer-float-track" aria-hidden="true">
+            <span
+              style={`width: ${Math.max(0, Math.min(100, app.favorites.activeDownloadProgressPercent))}%`}
+            ></span>
+          </div>
+        {/if}
+      </aside>
+    {/if}
+
     <nav class="bottom-tabs">
       <button
         type="button"
@@ -524,11 +573,6 @@
     background: var(--state-danger-bg);
   }
 
-  .download-banner-panel {
-    margin-bottom: 0.5rem;
-    padding: 0.45rem 0.6rem;
-  }
-
   .connection-details {
     flex: 0 0 auto;
     display: flex;
@@ -578,6 +622,49 @@
     gap: 0.35rem;
     z-index: 1000;
     pointer-events: auto;
+  }
+
+  .transfer-float {
+    position: fixed;
+    right: max(0.75rem, env(safe-area-inset-right));
+    bottom: calc(4.45rem + env(safe-area-inset-bottom));
+    left: max(0.75rem, env(safe-area-inset-left));
+    z-index: 1100;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-width: 32rem;
+    margin: 0 auto;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
+    box-shadow: var(--shadow-soft);
+    color: var(--text-secondary);
+    pointer-events: none;
+  }
+
+  .transfer-float-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.78rem;
+  }
+
+  .transfer-float-track {
+    height: 2px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--bg-surface-muted);
+  }
+
+  .transfer-float-track span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--color-secondary);
+    transition: width 120ms ease;
   }
 
   .tab-button {

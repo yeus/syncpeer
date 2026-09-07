@@ -378,6 +378,69 @@ describe("Syncpeer Tauri UI smoke", () => {
     }
   });
 
+  it("shows download progress without shifting the scrolled folder view", async () => {
+    await seedOfflineFolderState();
+    try {
+      await $(`[data-testid='folder-entry-fixture-45.txt']`).waitForExist({ timeout: 10_000 });
+      const before = await tauriBrowser.execute(() => {
+        const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
+        const row = document.querySelector(
+          "[data-testid='folder-entry-fixture-45.txt']",
+        ) as HTMLElement | null;
+        if (!content || !row) throw new Error("Folder progress test targets are not mounted.");
+        content.scrollTop = 420;
+        return { scrollTop: content.scrollTop, rowHeight: row.getBoundingClientRect().height };
+      });
+      await tauriBrowser.execute((folderId: string) => {
+        const testWindow = window as Window & {
+          __syncpeerSetDownloadProgress?: (
+            folderId: string,
+            path: string,
+            text: string,
+            percent: number,
+          ) => void;
+        };
+        testWindow.__syncpeerSetDownloadProgress?.(
+          folderId,
+          "fixture-45.txt",
+          "37% • 1.2 MB/s • ETA 8s • direct · LAN",
+          37,
+        );
+      }, syntheticFolderId);
+      await $("[data-testid='transfer-float']").waitForExist({ timeout: 5_000 });
+      const after = await tauriBrowser.execute(() => {
+        const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
+        const row = document.querySelector(
+          "[data-testid='folder-entry-fixture-45.txt']",
+        ) as HTMLElement | null;
+        const fill = row?.querySelector(".item-progress-fill") as HTMLElement | null;
+        const rowText = row?.textContent ?? "";
+        const floatText = document.querySelector("[data-testid='transfer-float']")?.textContent ?? "";
+        if (!content || !row || !fill) throw new Error("Download progress UI did not render.");
+        return {
+          scrollTop: content.scrollTop,
+          rowHeight: row.getBoundingClientRect().height,
+          fillWidth: fill.style.width,
+          rowText,
+          floatText,
+        };
+      });
+      assert.equal(after.scrollTop, before.scrollTop);
+      assert.equal(after.rowHeight, before.rowHeight);
+      assert.equal(after.fillWidth, "37%");
+      assert.match(after.rowText, /Download: 37%/);
+      assert.match(after.floatText, /Downloading fixture-45\.txt: 37%/);
+    } finally {
+      await tauriBrowser.execute(() => {
+        const testWindow = window as Window & {
+          __syncpeerClearDownloadProgress?: () => void;
+        };
+        testWindow.__syncpeerClearDownloadProgress?.();
+      });
+      await clearSeededOfflineFolderState();
+    }
+  });
+
   it("reaches the configured discovery server through Tauri", async () => {
     const payload = await tauriBrowser.tauri.execute((tauri, request) =>
       tauri.core.invoke("syncpeer_discovery_fetch", { request }),

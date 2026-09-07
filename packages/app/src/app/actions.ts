@@ -1747,6 +1747,7 @@ export const createAppActions = (args: {
     const transferId = `download:${downloadKey}`;
     const remoteFs = state.session.remoteFs;
     state.favorites.activeDownloadKey = downloadKey;
+    state.favorites.activeDownloadProgressPercent = 0;
     state.favorites.activeDownloadText =
       `0% • 0 B/s • ETA -- • ${downloadTransportText(
         state.session.connectionTransport,
@@ -1799,6 +1800,8 @@ export const createAppActions = (args: {
           transportKind ?? state.session.connectionTransport,
           connectionScope ?? state.session.connectionScope,
         )}`;
+        state.favorites.activeDownloadProgressPercent =
+          totalBytes > 0 ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100)) : 0;
         setDownloadNotice(`Downloading ${name}: ${state.favorites.activeDownloadText}`);
         updateManagedTransfer(transferId, downloadedBytes, totalBytes);
         const now = Date.now();
@@ -1867,6 +1870,7 @@ export const createAppActions = (args: {
       await refreshFolderRootCachedStatuses(state, client, [folderId]);
       state.favorites.activeDownloadText =
         `100% • Done • ${downloadTransportText(activeTransportKind, activeConnectionScope)}`;
+      state.favorites.activeDownloadProgressPercent = 100;
       transferOutcome = "completed";
       setDownloadNotice(
         `Downloaded ${name} via ${downloadTransportText(activeTransportKind, activeConnectionScope)}` +
@@ -1914,6 +1918,7 @@ export const createAppActions = (args: {
       if (state.favorites.activeDownloadKey === downloadKey) {
         state.favorites.activeDownloadKey = "";
         state.favorites.activeDownloadText = "";
+        state.favorites.activeDownloadProgressPercent = 0;
       }
     }
   };

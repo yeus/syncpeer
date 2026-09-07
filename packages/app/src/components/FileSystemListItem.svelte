@@ -54,6 +54,7 @@
     downloadLabel: string;
     isDownloadingActive: boolean;
     downloadProgressText: string;
+    downloadProgressPercent: number;
   }
 
   export interface FavoriteItem {
@@ -69,6 +70,7 @@
     downloadLabel: string;
     isDownloadingActive: boolean;
     downloadProgressText: string;
+    downloadProgressPercent: number;
   }
 
   export interface CachedFileItem {
@@ -292,6 +294,16 @@
 
   const thumbnailSrc = (value: FileSystemItem) =>
     leadingKind(value) === "image" ? localPathForThumbnail(value) : null;
+
+  const progressPercent = (value: FileSystemItem) => {
+    if (
+      (value.kind === "folder-entry" || value.kind === "favorite") &&
+      value.isDownloadingActive
+    ) {
+      return Math.max(0, Math.min(100, value.downloadProgressPercent));
+    }
+    return 0;
+  };
 </script>
 
 <ListRow>
@@ -309,6 +321,13 @@
         }
       }}
     >
+      {#if progressPercent(item) > 0}
+        <span
+          class="item-progress-fill"
+          aria-hidden="true"
+          style={`width: ${progressPercent(item)}%`}
+        ></span>
+      {/if}
       <div class="item-title-row">
       <span class={`item-icon ${viewMode === "grid" ? "item-icon-grid" : ""}`} aria-hidden="true">
         {#if leadingKind(item) === "folder"}
@@ -376,19 +395,19 @@
       {:else if item.kind === "folder-entry"}
         {#if item.entryType === "directory"}
           <div class="item-meta">{item.entryType} | {item.statsText}</div>
+        {:else if item.isDownloadingActive && item.downloadProgressText}
+          <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
         {:else}
           <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
-        {/if}
-        {#if item.isDownloadingActive && item.downloadProgressText}
-          <div class="item-meta">Download: {item.downloadProgressText}</div>
         {/if}
         {#if item.invalid}
           <div class="item-meta">Unavailable on remote (invalid)</div>
         {/if}
       {:else if item.kind === "favorite"}
-        <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
         {#if item.isDownloadingActive && item.downloadProgressText}
-          <div class="item-meta">Download: {item.downloadProgressText}</div>
+          <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
+        {:else}
+          <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
         {/if}
       {:else}
         <div class="item-meta">{item.folderId}:{item.path}</div>
@@ -400,6 +419,13 @@
       class="item-main-hit"
       data-testid={item.kind === "folder-entry" ? `folder-entry-${item.path}` : undefined}
     >
+    {#if progressPercent(item) > 0}
+      <span
+        class="item-progress-fill"
+        aria-hidden="true"
+        style={`width: ${progressPercent(item)}%`}
+      ></span>
+    {/if}
     <div class="item-title-row">
     <span class={`item-icon ${viewMode === "grid" ? "item-icon-grid" : ""}`} aria-hidden="true">
       {#if leadingKind(item) === "folder"}
@@ -467,19 +493,19 @@
     {:else if item.kind === "folder-entry"}
       {#if item.entryType === "directory"}
         <div class="item-meta">{item.entryType} | {item.statsText}</div>
+      {:else if item.isDownloadingActive && item.downloadProgressText}
+        <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
       {:else}
         <div class="item-meta">{item.entryType} | {item.sizeText} | {item.modifiedText}</div>
-      {/if}
-      {#if item.isDownloadingActive && item.downloadProgressText}
-        <div class="item-meta">Download: {item.downloadProgressText}</div>
       {/if}
       {#if item.invalid}
         <div class="item-meta">Unavailable on remote (invalid)</div>
       {/if}
     {:else if item.kind === "favorite"}
-      <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
       {#if item.isDownloadingActive && item.downloadProgressText}
-        <div class="item-meta">Download: {item.downloadProgressText}</div>
+        <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
+      {:else}
+        <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
       {/if}
     {:else}
       <div class="item-meta">{item.folderId}:{item.path}</div>
@@ -642,10 +668,33 @@
   .item-main-hit {
     min-width: 0;
     border-radius: var(--radius-sm);
+    overflow: hidden;
+    position: relative;
     transition:
       background-color 120ms ease,
       box-shadow 120ms ease,
       transform 120ms ease;
+  }
+
+  .item-progress-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    border-radius: inherit;
+    background: color-mix(in srgb, var(--color-secondary) 18%, transparent);
+    pointer-events: none;
+  }
+
+  .item-progress-text {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .item-title-row,
+  .item-meta,
+  .inline-input {
+    position: relative;
   }
 
   .item-main-hit-clickable {

@@ -75,6 +75,10 @@
           app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`
             ? app.favorites.activeDownloadText
             : "",
+        downloadProgressPercent:
+          app.favorites.activeDownloadKey === `${favorite.folderId}:${favorite.path}`
+            ? app.favorites.activeDownloadProgressPercent
+            : 0,
       }),
     ),
   );

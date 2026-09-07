@@ -463,6 +463,8 @@ export const createTauriAdapters = (
                 sizeBytes: metadata.sizeBytes,
                 modifiedMs: modifiedMs ?? null,
                 contentId: metadata.contentId ?? null,
+                sourceDeviceId: metadata.sourceDeviceId ?? null,
+                encrypted: metadata.encrypted,
               },
             },
           );

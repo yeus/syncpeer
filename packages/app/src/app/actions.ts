@@ -1108,7 +1108,7 @@ export const createAppActions = (args: {
             });
             const hashingSink = createSha256DownloadSink(nativeSink);
             activeSink = hashingSink.sink;
-            await remoteFs.readFileToSink(
+            const result = await remoteFs.readFileToSink(
               folderId,
               path,
               hashingSink.sink,
@@ -1116,6 +1116,12 @@ export const createAppActions = (args: {
               syncController.signal,
             );
             localHash = hashingSink.digestHex();
+            pushSessionLog(state, "info", "favorites.download.complete", "Favorite download completed", {
+              totalBytes: result.totalBytes,
+              networkBytes: result.networkBytes,
+              reusedBytes: result.reusedBytes,
+              resumedBytes: result.resumedBytes,
+            });
           } else {
             const bytes = await remoteFs.readFileFully(
               folderId,

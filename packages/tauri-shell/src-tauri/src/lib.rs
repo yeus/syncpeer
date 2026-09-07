@@ -78,6 +78,8 @@ struct CacheBeginFileRequest {
     size_bytes: u64,
     modified_ms: Option<f64>,
     content_id: Option<String>,
+    source_device_id: Option<String>,
+    encrypted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,9 @@ struct CachePartialMetadata {
     expected_size: u64,
     modified_ms: Option<f64>,
     content_id: Option<String>,
+    source_device_id: Option<String>,
+    #[serde(default)]
+    encrypted: bool,
     created_at_ms: u64,
 }
 
@@ -2991,6 +2996,22 @@ async fn syncpeer_cache_file(
     Ok(record)
 }
 
+fn partial_matches_download(
+    metadata: &CachePartialMetadata,
+    request: &CacheBeginFileRequest,
+    normalized_path: &str,
+    requested_name: &str,
+) -> bool {
+    request.content_id.as_deref().is_some_and(|value| !value.starts_with("unhashed:"))
+        && metadata.folder_id == request.folder_id.trim()
+        && metadata.path == normalized_path
+        && metadata.expected_size == request.size_bytes
+        && metadata.name == requested_name
+        && metadata.content_id == request.content_id
+        && metadata.source_device_id == request.source_device_id
+        && metadata.encrypted == request.encrypted
+}
+
 #[tauri::command]
 async fn syncpeer_cache_begin_file(
     app: tauri::AppHandle,
@@ -3042,13 +3063,8 @@ async fn syncpeer_cache_begin_file(
         }
         let Ok(raw) = fs::read_to_string(&path) else { continue };
         let Ok(metadata) = serde_json::from_str::<CachePartialMetadata>(&raw) else { continue };
-        if request.content_id.is_none() || request.content_id.as_deref().is_some_and(|value| value.starts_with("unhashed:"))
-            || active_ids.contains(&metadata.transfer_id)
-            || metadata.folder_id != request.folder_id.trim()
-            || metadata.path != normalized_path
-            || metadata.expected_size != request.size_bytes
-            || metadata.name != requested_name
-            || metadata.content_id != request.content_id
+        if active_ids.contains(&metadata.transfer_id)
+            || !partial_matches_download(&metadata, &request, &normalized_path, &requested_name)
         {
             continue;
         }
@@ -3087,6 +3103,8 @@ async fn syncpeer_cache_begin_file(
         expected_size: request.size_bytes,
         modified_ms: request.modified_ms,
         content_id: request.content_id.clone(),
+        source_device_id: request.source_device_id.clone(),
+        encrypted: request.encrypted,
         created_at_ms: now_ms(),
     };
     write_json(&metadata_path, &metadata)?;
@@ -4201,6 +4219,41 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_recovery_requires_the_same_source_and_encryption_identity() {
+        let request = CacheBeginFileRequest {
+            folder_id: "fixture-folder".into(), path: "file".into(), name: "file".into(),
+            size_bytes: 6, modified_ms: None, content_id: Some("blocks:test".into()),
+            source_device_id: Some("device".into()), encrypted: true,
+        };
+        let mut saved = CachePartialMetadata {
+            transfer_id: "partial".into(), folder_id: "fixture-folder".into(),
+            path: "file".into(), name: "file".into(), expected_size: 6,
+            modified_ms: None, content_id: request.content_id.clone(),
+            source_device_id: request.source_device_id.clone(), encrypted: true,
+            created_at_ms: 1,
+        };
+        assert!(partial_matches_download(&saved, &request, "file", "file"));
+        saved.source_device_id = Some("other-device".into());
+        assert!(!partial_matches_download(&saved, &request, "file", "file"));
+        saved.source_device_id = request.source_device_id.clone();
+        saved.encrypted = false;
+        assert!(!partial_matches_download(&saved, &request, "file", "file"));
+        saved.encrypted = true;
+        saved.content_id = Some("blocks:changed".into());
+        assert!(!partial_matches_download(&saved, &request, "file", "file"));
+
+        // Old metadata remains readable, but cannot impersonate a known source.
+        saved.content_id = request.content_id.clone();
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("sourceDeviceId");
+        legacy.as_object_mut().unwrap().remove("encrypted");
+        let legacy: CachePartialMetadata = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.source_device_id.is_none());
+        assert!(!legacy.encrypted);
+        assert!(!partial_matches_download(&legacy, &request, "file", "file"));
+    }
 
     #[test]
     fn syncpeer_packet_roundtrip_probe() {

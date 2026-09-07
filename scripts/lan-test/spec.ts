@@ -127,6 +127,19 @@ const downloadByName = async (name: string): Promise<void> => {
   await waitForText(lanBrowser, "Downloaded " + name, 90_000);
 };
 
+const markFavorite = async (name: string): Promise<void> => {
+  const clicked = await lanBrowser.execute((name) => {
+    const title = [...document.querySelectorAll(".item-title")]
+      .find((element) => element.textContent?.trim() === name);
+    const button = title?.closest("li")?.querySelector<HTMLButtonElement>(
+      "button[aria-label='Toggle favorite']",
+    );
+    if (button?.getAttribute("aria-pressed") !== "true") button?.click();
+    return Boolean(button);
+  }, name);
+  assert.equal(clicked, true, "Could not mark the downloaded fixture as a favorite.");
+};
+
 const uploadTextFile = async (name: string, content: string): Promise<void> => {
   const uploadPath = path.join(clientRoot, name);
   fs.mkdirSync(clientRoot, { recursive: true });
@@ -177,17 +190,7 @@ describe("Syncpeer LAN integration", () => {
   });
 
   it("updates a downloaded favorite after the remote file changes", async () => {
-    const favoriteClicked = await lanBrowser.execute((name) => {
-      const title = [...document.querySelectorAll(".item-title")]
-        .find((element) => element.textContent?.trim() === name);
-      const row = title?.closest("li");
-      const button = row?.querySelector("button[aria-label='Toggle favorite']") as
-        | HTMLButtonElement
-        | null;
-      if (button?.getAttribute("aria-pressed") !== "true") button?.click();
-      return Boolean(button);
-    }, "hello.txt");
-    assert.equal(favoriteClicked, true, "Could not mark the downloaded fixture as a favorite.");
+    await markFavorite("hello.txt");
 
     const content = `updated remotely at ${Date.now()}\n`;
     const updated = await request<{ sha256: string }>("POST", "/v1/action", {
@@ -202,6 +205,43 @@ describe("Syncpeer LAN integration", () => {
         timeoutMsg: "Downloaded favorite did not update during periodic synchronization.",
       },
     );
+  });
+
+  it("reuses cached blocks when automatically updating a favorite", async () => {
+    const name = "incremental.txt";
+    const original = "a".repeat(512 * 1024);
+    const initial = await request<{ sha256: string }>("POST", "/v1/action", {
+      action: "update-fixture-file",
+      details: { path: name, content: original },
+    });
+    await downloadByName(name);
+    assert.equal(await readCachedHash(lanBrowser, name), initial.sha256);
+
+    await markFavorite(name);
+    // Change one published block; the other three must come from native cache.
+    const updated = await request<{ sha256: string }>("POST", "/v1/action", {
+      action: "update-fixture-file",
+      details: { path: name, content: "b" + original.slice(1) },
+    });
+    await lanBrowser.waitUntil(
+      async () => await readCachedHash(lanBrowser, name) === updated.sha256,
+      { timeout: 75_000, interval: 1_000, timeoutMsg: "Incremental favorite did not update." },
+    );
+    await clickTestId("tab-devices");
+    const counters = await lanBrowser.execute(() => {
+      const event = [...document.querySelectorAll(".item-meta")].find(
+        (element) => element.textContent?.trim().endsWith("favorites.download.complete"),
+      );
+      const details = event?.closest("li")?.querySelector(".log-details")?.textContent;
+      return details ? JSON.parse(details) as {
+        networkBytes: number; reusedBytes: number; totalBytes: number;
+      } : null;
+    });
+    assert.ok(counters, "Automatic download must report transfer counters.");
+    assert.equal(counters.totalBytes, original.length);
+    assert.equal(counters.networkBytes, 128 * 1024, "Only the changed block should be downloaded.");
+    assert.equal(counters.reusedBytes, 384 * 1024);
+    await openFolders();
   });
 
   it("sorts and filters folder entries", async () => {

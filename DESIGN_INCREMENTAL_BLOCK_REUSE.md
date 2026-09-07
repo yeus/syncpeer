@@ -1,6 +1,7 @@
 # Incremental Block Reuse for Cached Downloads
 
-Status: core/CLI implemented; native validation and wider sync UI remain separate gates
+Status: core/CLI/Tauri cache implemented; desktop reuse verified end to end;
+Android provider validation and wider sync UI remain separate gates
 
 ## Implementation status
 
@@ -17,6 +18,17 @@ and guarded replacement through a private temporary document. Tests cover
 plaintext/encrypted reuse, unhashed fallback, corrupted copies, adapter response
 validation, cancellation, empty files, safe Node replacement, folder
 reconciliation, deletion policy, and version restore.
+
+Tauri partial recovery now also matches the source device and encryption mode,
+with regression coverage for different identities and older saved metadata.
+Automatic favorite downloads report network, reused, and resumed byte totals in
+session diagnostics without including peer identifiers or filenames in that event.
+The managed desktop Tauri/Syncthing E2E updates one block of a 512 KiB favorite,
+verifies its final checksum, and asserts 128 KiB downloaded plus 384 KiB reused
+through native storage. This check runs in the existing local/two-host LAN spec.
+The focused desktop run passed on 2026-09-07, along with 20 targeted TypeScript
+tests, eight native Rust tests, lint, and app typechecking. Android provider E2E
+was not run in that validation: the configured ADB server was unreachable.
 
 The CLI exposes continuous `sync-folder`, local-only `unsubscribe-folder`, explicit
 delete-everywhere, version listing, and restore operations.

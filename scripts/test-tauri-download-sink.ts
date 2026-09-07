@@ -36,3 +36,63 @@ test("a new Tauri sink reuses verified partial bytes after suspension", async ()
     assert.deepEqual(partial, source);
   } finally { native.__TAURI__ = previous; }
 });
+
+test("Tauri sink forwards full download identity to native partial storage", async () => {
+  const native = globalThis as typeof globalThis & { __TAURI__?: unknown };
+  const previous = native.__TAURI__;
+  let beginRequest:
+    | {
+        folderId: string;
+        path: string;
+        name: string;
+        sizeBytes: number;
+        modifiedMs: number | null;
+        contentId: string | null;
+        sourceDeviceId: string | null;
+        encrypted: boolean;
+      }
+    | null = null;
+  native.__TAURI__ = {
+    core: {
+      invoke: async (command: string, args: {
+        request: typeof beginRequest & { transferId?: string };
+      }) => {
+        if (command === "syncpeer_cache_begin_file") {
+          beginRequest = args.request;
+          return { transferId: "identity-check" };
+        }
+        if (command === "syncpeer_cache_abort") return;
+        throw new Error(`Unexpected native command ${command}`);
+      },
+    },
+  };
+  try {
+    const sink = await createTauriAdapters().platformAdapter.createFileDownloadSink!({
+      folderId: "folder",
+      path: "file",
+      name: "file",
+      modifiedMs: 123,
+    });
+    await sink.begin({
+      sourceDeviceId: "device",
+      folderId: "folder",
+      path: "file",
+      sizeBytes: 6,
+      encrypted: true,
+      contentId: "blocks:test",
+    });
+    await sink.abort(new Error("done"));
+    assert.deepEqual(beginRequest, {
+      folderId: "folder",
+      path: "file",
+      name: "file",
+      sizeBytes: 6,
+      modifiedMs: 123,
+      contentId: "blocks:test",
+      sourceDeviceId: "device",
+      encrypted: true,
+    });
+  } finally {
+    native.__TAURI__ = previous;
+  }
+});

@@ -8,6 +8,9 @@ import tls from "node:tls";
 import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
+  acceptSyncpeerSession,
+  type SyncpeerConnectOptions,
+  type SyncpeerSessionHandle,
   withMetadataSession,
   type DiscoveredCandidate,
   type SyncpeerRelayConnectOptions,
@@ -42,6 +45,8 @@ export type {
 export { downloadRemoteFile } from "./transfer/download.js";
 export { createNodeFileDownloadSink } from "./transfer/nodeStorage.js";
 export { createNodeFolderSyncStorage } from "./sync/nodeFolderStorage.js";
+export { createNodeFolderReplica } from "./sync/nodeReplica.js";
+export { versionCounterId } from "./core/protocol/versionVector.js";
 export type { NodeFolderSyncStorage, NodeFolderSyncStorageOptions } from "./sync/nodeFolderStorage.js";
 export type { FileDownloadSink } from "./transfer/stream.js";
 export { DownloadInterruptedError } from "./transfer/stream.js";
@@ -920,6 +925,55 @@ export async function resolveNodeGlobalDiscovery(
 }
 
 export const createNodeSyncpeerClient = () => createSyncpeerCoreClient(createNodeHostAdapter());
+
+/** One explicitly approved peer per listener; the common core owns BEP. */
+export async function listenNodePeer(options: SyncpeerConnectOptions & {
+  expectedDeviceId: string;
+  onSession: (session: SyncpeerSessionHandle) => void;
+  onError?: (error: unknown) => void;
+}): Promise<{ port: number; close: () => Promise<void> }> {
+  if (!options.expectedDeviceId.trim()) throw new Error("An approved peer identity is required.");
+  const adapter = createNodeHostAdapter();
+  const sockets = new Set<net.Socket>();
+  const pending = new Set<Promise<void>>();
+  const sessions = new Set<SyncpeerSessionHandle>();
+  const server = tls.createServer({ cert: options.certPem, key: options.keyPem,
+    requestCert: true, rejectUnauthorized: false, ALPNProtocols: ["bep/1.0"],
+    handshakeTimeout: options.timeoutMs ?? 10000,
+  }, socket => {
+    if (socket.alpnProtocol !== "bep/1.0" || sockets.size > 1) { socket.destroy(); return; }
+    const task = acceptSyncpeerSession(adapter, new NodeTlsSocket(socket), {
+      ...options, host: socket.remoteAddress ?? options.host, port: socket.remotePort ?? 0,
+    }).then(session => {
+      sessions.add(session);
+      void session.closed.then(() => session.close()).finally(() => sessions.delete(session));
+      options.onSession(session);
+    }).catch(error => {
+      socket.destroy();
+      options.onError?.(error);
+    });
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  });
+  server.on("connection", socket => {
+    // Track connections before TLS completes so shutdown also cancels handshakes.
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port, options.host, resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Listener address unavailable.");
+  return { port: address.port, close: async () => {
+    const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    for (const socket of sockets) socket.destroy();
+    await Promise.allSettled(pending);
+    await Promise.allSettled([...sessions].map(session => session.close()));
+    await closed;
+  } };
+}
 
 const maybeInlinePem = (value: string | undefined): string | null => {
   if (!value) return null;

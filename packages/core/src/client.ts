@@ -8,7 +8,6 @@ import {
   ClusterConfig,
   Index,
   IndexUpdate,
-  FileInfo,
   Request,
   Response,
   Ping,
@@ -21,6 +20,8 @@ import {
   type BepRequest,
   type BepResponse,
 } from "./core/protocol/bep.js";
+import type { createCiphertextReplica } from "./sync/ciphertextReplica.js";
+import { createCiphertextIndex, selectCiphertextPublication } from "./sync/ciphertextIndex.js";
 import {
   isTransportFailure,
   RemoteFs,
@@ -29,19 +30,21 @@ import {
   type FileUploadOptions,
 } from "./core/model/remoteFs.js";
 import type { AdvertisedDeviceInfo, RemoteDeviceInfo } from "./core/model/remoteFs.js";
-import { advanceVersionVector } from "./core/protocol/versionVector.js";
+import { advanceVersionVector, versionCounterId } from "./core/protocol/versionVector.js";
 import { compareVersionVectors } from "./sync/folderSync.js";
+import type { LocalFolderReplica } from "./sync/replicaIndex.js";
+import { replicaContentSignature } from "./sync/replicaMerge.js";
+import { assertReplicaPath, isInternalReplicaPath } from "./sync/replicaPaths.js";
+import { decryptUntrustedFileInfo, encryptUntrustedFileInfo } from "./core/model/untrustedMetadata.js";
 import {
   coalescePendingIndexFrame,
   type FolderIndexMessage,
   type PendingIndexFrame,
 } from "./core/protocol/indexQueue.js";
 import {
-  decryptEncryptedFilename,
   encryptUntrustedBlockHash,
-  encryptUntrustedBytes,
+  encryptUntrustedBlock,
   encryptUntrustedFilename,
-  decryptUntrustedBytes,
   deriveUntrustedFileKey,
   deriveUntrustedFolderCrypto,
   verifyUntrustedPasswordToken,
@@ -150,6 +153,7 @@ export interface SyncpeerConnectOptions {
   quicOnly?: boolean;
   folderPasswords?: Record<string, string>;
   sharedFolders?: SharedFolder[];
+  replicaScanIntervalMs?: number;
   requestTimeoutMs?: number;
   keepalive?: {
     pingIntervalMs?: number;
@@ -157,13 +161,20 @@ export interface SyncpeerConnectOptions {
   };
 }
 
-export interface SharedFolder {
+export type SharedFolder = {
   id: string;
   label?: string;
+} & ({
+  replica?: LocalFolderReplica;
+  ciphertextReplica?: never;
   encryption:
     | { mode: "encrypted"; password: string }
     | { mode: "plaintext" };
-}
+} | {
+  replica?: never;
+  ciphertextReplica: ReturnType<typeof createCiphertextReplica>;
+  encryption: { mode: "ciphertext"; passwordToken: Uint8Array };
+});
 
 export interface SyncpeerGlobalDiscoveryOptions {
   expectedDeviceId: string;
@@ -385,18 +396,6 @@ function normalizePathValue(input: string): string {
   return String(input ?? "")
     .replaceAll("\\", "/")
     .replace(/^\/+|\/+$/g, "");
-}
-
-function padBytesWithRandom(
-  input: Uint8Array,
-  targetLength: number,
-  randomBytes: Uint8Array,
-): Uint8Array {
-  if (input.length >= targetLength) return input;
-  const padded = new Uint8Array(targetLength);
-  padded.set(input, 0);
-  padded.set(randomBytes.slice(0, targetLength - input.length), input.length);
-  return padded;
 }
 
 function toUint8Array(input: Uint8Array | ArrayBuffer): Uint8Array {
@@ -847,6 +846,11 @@ class BepSession {
   private localSequencesByFolder = new Map<string, number>();
   private pendingIndexByFolder = new Map<string, PendingIndexFrame>();
   private indexApplyInFlight = new Set<string>();
+  private stateTasks = new Set<Promise<void>>();
+  private replicaScanTimer: ReturnType<typeof setInterval> | null = null;
+  private replicaScanInFlight = false;
+  private sentReplicaSequences = new Map<string, number>();
+  private advertisedReplicaFiles = new Map<string, Map<string, { original: BepFileInfo; advertised: BepFileInfo }>>();
   private uploadedFilesByFolder = new Map<string, Map<string, UploadedFileRecord>>();
   private awaitingPublications = new Map<string, { expected: BepFileInfo; received: boolean }>();
   private readonly folderPasswords: Map<string, string>;
@@ -901,7 +905,7 @@ class BepSession {
       this.readyResolve = resolve;
     });
     this.localIndexId = "1";
-    this.localVersionCounterId = this.computeLocalVersionCounterId();
+    this.localVersionCounterId = versionCounterId(this.localDeviceId);
     this.folderPasswords = new Map(
       Object.entries(folderPasswords ?? {})
         .map(([folderId, password]) => [folderId.trim(), password.trim()] as const)
@@ -914,6 +918,14 @@ class BepSession {
         throw new Error(`Shared folder ID must be unique: ${id}`);
       }
       const label = folder.label?.trim() || id;
+      if (folder.encryption.mode === "ciphertext") {
+        if (!folder.ciphertextReplica || folder.replica) throw new Error("Ciphertext sharing requires exactly one ciphertext replica.");
+        const identity = createCiphertextIndex({ folderId: id, passwordToken: folder.encryption.passwordToken }).identity;
+        this.sharedFolders.set(id, { id, label, ciphertextReplica: folder.ciphertextReplica,
+          encryption: { mode: "ciphertext", passwordToken: identity.passwordToken } });
+        continue;
+      }
+      if (folder.ciphertextReplica) throw new Error("Ciphertext replica requires explicit ciphertext sharing.");
       if (folder.encryption.mode === "encrypted") {
         const password = folder.encryption.password.trim();
         if (!password) {
@@ -924,26 +936,17 @@ class BepSession {
           id,
           label,
           encryption: { mode: "encrypted", password },
+          replica: folder.replica,
         });
       } else {
         this.sharedFolders.set(id, {
           id,
           label,
           encryption: { mode: "plaintext" },
+          replica: folder.replica,
         });
       }
     }
-  }
-
-  private computeLocalVersionCounterId(): string {
-    const view = new DataView(
-      this.localDeviceId.buffer,
-      this.localDeviceId.byteOffset,
-      Math.min(this.localDeviceId.byteLength, 8),
-    );
-    const high = BigInt(view.getUint32(0, false));
-    const low = BigInt(view.getUint32(4, false));
-    return ((high << 32n) | low).toString();
   }
 
   async initialize(leftover: Uint8Array): Promise<void> {
@@ -968,8 +971,21 @@ class BepSession {
     );
   }
 
+  async advertiseSharedFolders(): Promise<void> {
+    this.echoedClusterConfig = true;
+    await this.writeFrame(encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, {
+      folders: [...this.sharedFolders.keys()].map(id => this.sharedFolderConfig(id)),
+    }, 0));
+  }
+
   private async initializeSharedFolders(): Promise<void> {
     for (const [folderId, sharedFolder] of this.sharedFolders) {
+      if (sharedFolder.encryption.mode === "ciphertext") {
+        const snapshot = await sharedFolder.ciphertextReplica!.snapshot();
+        if (snapshot.identity.folderId !== folderId || !bytesEqual(snapshot.identity.passwordToken, sharedFolder.encryption.passwordToken)) {
+          throw new Error("Ciphertext replica identity does not match shared folder.");
+        }
+      }
       const folderCrypto = sharedFolder.encryption.mode === "encrypted"
         ? await deriveUntrustedFolderCrypto(
             folderId,
@@ -982,10 +998,10 @@ class BepSession {
         label: sharedFolder.label ?? folderId,
         readOnly: false,
         advertisedDevices: [],
-        encrypted: !!folderCrypto,
-        needsPassword: false,
+        encrypted: !!folderCrypto || sharedFolder.encryption.mode === "ciphertext",
+        needsPassword: sharedFolder.encryption.mode === "ciphertext",
         folderCrypto,
-        localDevicePresentInFolder: true,
+        localDevicePresentInFolder: sharedFolder.encryption.mode !== "ciphertext",
         stopReason: 0,
         indexReceived: false,
         remoteIndexId: "0",
@@ -1092,9 +1108,30 @@ class BepSession {
   }
 
   private stopKeepalive(): void {
-    if (!this.keepaliveTimer) return;
-    clearInterval(this.keepaliveTimer);
+    if (this.replicaScanTimer) clearInterval(this.replicaScanTimer);
+    this.replicaScanTimer = null;
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     this.keepaliveTimer = null;
+  }
+
+  startReplicaSync(intervalMs = 5000): void {
+    if (![...this.sharedFolders.values()].some(folder => folder.replica || folder.ciphertextReplica)) return;
+    if (!Number.isFinite(intervalMs) || intervalMs < 100) throw new Error("Replica scan interval must be at least 100 ms.");
+    this.replicaScanTimer = setInterval(() => {
+      if (this.closed || this.replicaScanInFlight) return;
+      this.replicaScanInFlight = true;
+      this.trackStateTask((async () => {
+        for (const [folderId, shared] of this.sharedFolders) {
+          const state = this.folders.get(folderId);
+          if (!shared.replica?.receive || shared.replica.isPaused?.() || !state?.indexReceived || state.needsPassword || this.indexApplyInFlight.has(folderId)) continue;
+          await shared.replica.receive(folderId, [...state.files.values()].map(file => file.indexFile),
+            (path, offset, size, hash) => this.requestReplicaRange(folderId, path, offset, size, hash));
+        }
+        await this.sendSharedFolderIndexes(true);
+      })().catch(error => {
+        if (!this.closed) this.log("replica.scan.failed", { message: error instanceof Error ? error.message : String(error) });
+      }).finally(() => { this.replicaScanInFlight = false; }));
+    }, intervalMs);
   }
 
   private onFrame(type: number, msg: unknown): void {
@@ -1114,7 +1151,7 @@ class BepSession {
     }
     switch (type) {
       case MessageTypeValues.CLUSTER_CONFIG:
-        void this.handleClusterConfig(msg as BepClusterConfig);
+        this.trackStateTask(this.handleClusterConfig(msg as BepClusterConfig));
         break;
       case MessageTypeValues.INDEX:
       case MessageTypeValues.INDEX_UPDATE:
@@ -1154,10 +1191,18 @@ class BepSession {
     const pending = this.pendingIndexByFolder.get(folderId);
     this.pendingIndexByFolder.set(
       folderId,
-      pending ? coalescePendingIndexFrame(pending, incoming) : incoming,
+      pending ? coalescePendingIndexFrame(pending, incoming, this.sharedFolders.get(folderId)?.ciphertextReplica ? "history" : "latest") : incoming,
     );
     if (this.indexApplyInFlight.has(folderId)) return;
-    void this.drainIndexQueue(folderId);
+    this.trackStateTask(this.drainIndexQueue(folderId));
+  }
+
+  private trackStateTask(operation: Promise<void>): void {
+    const task = operation.catch(error => {
+      if (!this.closed) this.onSocketClosed(error instanceof Error ? error : new Error(String(error)), "protocol");
+    });
+    this.stateTasks.add(task);
+    void task.finally(() => this.stateTasks.delete(task));
   }
 
   private async drainIndexQueue(folderId: string): Promise<void> {
@@ -1214,7 +1259,7 @@ class BepSession {
     return {
       id: folderId,
       label: sharedFolder.label ?? folderId,
-      type: 0,
+      type: sharedFolder.encryption.mode === "ciphertext" ? 3 : 0,
       read_only: false,
       devices: [
         {
@@ -1231,27 +1276,56 @@ class BepSession {
           compression: 0,
           max_sequence: 0,
           index_id: 0,
-          encryption_password_token: sharedFolder.folderCrypto?.passwordToken,
+          encryption_password_token: sharedFolder.encryption.mode === "ciphertext"
+            ? sharedFolder.encryption.passwordToken : sharedFolder.folderCrypto?.passwordToken,
         },
       ],
     };
   }
 
-  private async sendSharedFolderIndexes(): Promise<void> {
+  private async sendSharedFolderIndexes(changedOnly = false): Promise<void> {
     for (const folderId of this.sharedFolders.keys()) {
       const folder = this.folders.get(folderId);
       if (!folder) continue;
+      const ciphertextReplica = this.sharedFolders.get(folderId)?.ciphertextReplica;
+      if (ciphertextReplica) {
+        if (!folder.localDevicePresentInFolder || folder.stopReason) continue;
+        const snapshot = await ciphertextReplica.snapshot();
+        if (changedOnly && this.sentReplicaSequences.get(folderId) === snapshot.sequence) continue;
+        const files = selectCiphertextPublication(snapshot).map(entry => entry.info);
+        await this.writeFrame(encodeMessageFrame(MessageTypeValues.INDEX, Index, {
+          folder: folderId, files, last_sequence: snapshot.sequence,
+        }, 0));
+        this.localSequencesByFolder.set(folderId, snapshot.sequence);
+        this.sentReplicaSequences.set(folderId, snapshot.sequence);
+        continue;
+      }
+      const replica = this.sharedFolders.get(folderId)?.replica;
+      if (replica?.isPaused?.()) continue;
+      if (changedOnly && !replica) continue;
+      const files = replica ? await replica.scan() : [...folder.files.values()].map(file => file.indexFile);
+      const advertisedFiles = folder.folderCrypto
+        ? await Promise.all(files.map(async file => encryptUntrustedFileInfo(
+          folder.folderCrypto!.folderKey, file, await this.adapter.randomBytes(24))))
+        : files;
+      if (replica?.isPaused?.()) continue;
+      if (replica) this.localSequencesByFolder.set(folderId, files.reduce((max, file) => Math.max(max, Number(file.sequence ?? 0)), 0));
+      const sequence = this.localSequencesByFolder.get(folderId) ?? 0;
+      if (changedOnly && this.sentReplicaSequences.get(folderId) === sequence) continue;
+      if (replica) this.advertisedReplicaFiles.set(folderId, new Map(advertisedFiles.map((advertised, index) =>
+        [advertised.name, { original: files[index], advertised }])));
       const frame = encodeMessageFrame(
         MessageTypeValues.INDEX,
         Index,
         {
           folder: folderId,
-          files: [...folder.files.values()].map((file) => file.indexFile),
+          files: advertisedFiles,
           last_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
         },
         0,
       );
       await this.writeFrame(frame);
+      if (replica) this.sentReplicaSequences.set(folderId, sequence);
       this.log("shared_folder.index.sent", {
         folderId,
         fileCount: folder.files.size,
@@ -1307,12 +1381,20 @@ class BepSession {
       const announcedToken = localToken ?? remoteToken;
       const sharedFolder = this.sharedFolders.get(folderId);
       if (sharedFolder) {
+        if (sharedFolder.encryption.mode === "ciphertext") {
+          const offered = [localToken, remoteToken].filter((token): token is Uint8Array => !!token?.length);
+          const expected = sharedFolder.encryption.passwordToken;
+          if (!offered.length || offered.some(token => !bytesEqual(token, expected))) {
+            throw new Error("Remote encrypted folder identity mismatch.");
+          }
+        }
         const state = this.folders.get(folderId);
         if (state) {
           state.advertisedDevices = advertisedDevices;
           state.localDevicePresentInFolder = !!localDeviceEntry;
           state.remoteIndexId = remoteIndexId;
           state.remoteMaxSequence = remoteMaxSequence;
+          state.stopReason = stopReason;
         }
         this.log("shared_folder.acceptance.received", {
           folderId,
@@ -1530,6 +1612,17 @@ class BepSession {
     // Keep that authoritative snapshot; an empty INDEX frame from the client
     // does not make Syncthing resend an unchanged index.
     const files = index.files ?? [];
+    const ciphertextShared = this.sharedFolders.get(folderId);
+    if (ciphertextShared?.ciphertextReplica && ciphertextShared.encryption.mode === "ciphertext") {
+      if (!state.localDevicePresentInFolder || state.stopReason) throw new Error("Encrypted folder is not shared by the remote peer.");
+      for (const file of files) {
+        await ciphertextShared.ciphertextReplica.receive({ folderId, passwordToken: ciphertextShared.encryption.passwordToken }, file,
+          (offset, size, hash, signal) => this.requestBlock(folderId, file.name, offset, size, { hash, signal }));
+      }
+      state.indexReceived = true;
+      await this.sendSharedFolderIndexes(true);
+      return;
+    }
     this.log("index.received", {
       folderId,
       fileCount: files.length,
@@ -1540,9 +1633,11 @@ class BepSession {
     state.indexReceived = true;
     let decryptedStored = 0;
     let decryptFailed = 0;
+    const replicaFiles: BepFileInfo[] = [];
     for (const file of files) {
       if (!state.encrypted) {
         state.files.set(file.name, { indexFile: file });
+        replicaFiles.push(file);
         this.acknowledgePublication(folderId, file.name, file);
         decryptedStored += 1;
         continue;
@@ -1552,22 +1647,9 @@ class BepSession {
       }
       try {
         const encryptedName = String(file.name ?? "");
-        const plaintextName = await decryptEncryptedFilename(
-          state.folderCrypto.folderKey,
-          encryptedName,
-        );
-        const fileKey = deriveUntrustedFileKey(
-          state.folderCrypto.folderKey,
-          plaintextName,
-        );
-        const encryptedMetadata =
-          file.encrypted instanceof Uint8Array
-            ? file.encrypted
-            : new Uint8Array(file.encrypted ?? []);
-        const originalFile =
-          encryptedMetadata.length > 0
-          ? FileInfo.decode(decryptUntrustedBytes(fileKey, encryptedMetadata)) as unknown as BepFileInfo
-            : file;
+        const { fileInfo: originalFile, fileKey } = await decryptUntrustedFileInfo(state.folderCrypto.folderKey, file);
+        const plaintextName = originalFile.name;
+        replicaFiles.push(originalFile);
         const encryptedBlocks = (file.blocks ?? file.Blocks ?? []).map((block) => ({
           offset: Number(block.offset),
           size: Number(block.size),
@@ -1605,6 +1687,15 @@ class BepSession {
       needsPassword: state.needsPassword,
       passwordError: state.passwordError ?? null,
     });
+    const replica = this.sharedFolders.get(folderId)?.replica;
+    if (replica?.receive && !replica.isPaused?.() && !state.needsPassword) {
+      try {
+        if (await replica.receive(folderId, replicaFiles,
+          (path, offset, size, hash) => this.requestReplicaRange(folderId, path, offset, size, hash))) await this.sendSharedFolderIndexes();
+      } catch (error) {
+        if (!this.closed) this.log("replica.receive.failed", { message: error instanceof Error ? error.message : String(error) });
+      }
+    }
   }
 
   private handleResponse(resp: BepResponse): void {
@@ -1682,6 +1773,21 @@ class BepSession {
     return next;
   }
 
+  private async readEncryptedReplicaRequest(folderId: string, req: BepRequest, replica: LocalFolderReplica, crypto: UntrustedFolderCrypto): Promise<Uint8Array> {
+    const file = this.advertisedReplicaFiles.get(folderId)?.get(String(req.name));
+    if (!file || file.original.deleted || Number(file.original.type ?? 0) !== 0) throw new Error("Encrypted replica file is not advertised.");
+    const index = file.advertised.blocks?.findIndex(block => Number(block.offset) === Number(req.offset) && block.size === Number(req.size)) ?? -1;
+    const original = file.original.blocks?.[index];
+    const advertised = file.advertised.blocks?.[index];
+    if (!original || !advertised || (req.hash?.length && !bytesEqual(req.hash, advertised.hash))) {
+      throw new Error("Encrypted replica block is not advertised.");
+    }
+    const bytes = await replica.readBlock(file.original.name, Number(original.offset), original.size, original.hash);
+    const key = deriveUntrustedFileKey(crypto.folderKey, file.original.name);
+    try { return await encryptUntrustedBlock(key, bytes, size => this.adapter.randomBytes(size)); }
+    finally { bytes.fill(0); key.fill(0); }
+  }
+
   private async handleRequest(req: BepRequest): Promise<void> {
     const id = Number(req?.id ?? 0);
     const folderId = String(req?.folder ?? "").trim();
@@ -1690,9 +1796,22 @@ class BepSession {
     const size = Math.max(0, Number(req?.size ?? 0));
     const record = this.getUploadedFile(folderId, path);
     let code = 0;
-    let data = new Uint8Array(0);
+    let data: Uint8Array = new Uint8Array(0);
     try {
-      if (!record) {
+      assertReplicaPath(path);
+      if (isInternalReplicaPath(path)) throw new Error("Internal file requests are not allowed.");
+      const shared = this.sharedFolders.get(folderId);
+      const replica = shared?.replica;
+      if (shared?.ciphertextReplica) {
+        const state = this.folders.get(folderId);
+        if (!state?.localDevicePresentInFolder || state.stopReason) throw new Error("Encrypted folder is not shared by the remote peer.");
+        if (!(req.hash instanceof Uint8Array)) throw new Error("Ciphertext block token is required.");
+        data = await shared.ciphertextReplica.readNamedBlock(path, offset, size, req.hash);
+      } else if (!record && replica) {
+        data = shared.folderCrypto
+          ? await this.readEncryptedReplicaRequest(folderId, req, replica, shared.folderCrypto)
+          : await replica.readBlock(path, offset, size, req.hash);
+      } else if (!record) {
         code = 2;
       } else if (
         record.encryptedName &&
@@ -1803,6 +1922,8 @@ class BepSession {
     if (!normalizedPath) {
       throw new Error("Upload path must not be empty.");
     }
+    assertReplicaPath(normalizedPath);
+    if (isInternalReplicaPath(normalizedPath)) throw new Error("Internal files cannot be published.");
     const throwIfCancelled = () => {
       if (!options?.signal?.aborted) return;
       const error = new Error("Upload cancelled.");
@@ -1860,30 +1981,14 @@ class BepSession {
       );
       let encryptedOffset = 0;
       const originalBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
-      const fakeBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
       for (let offset = 0; offset < bytes.length; offset += blockSize) {
         throwIfCancelled();
         const end = Math.min(bytes.length, offset + blockSize);
         const chunk = bytes.slice(offset, end);
         const hashPlain = toUint8Array(await this.adapter.sha256(chunk));
-        const isLastBlock = end >= bytes.length;
-        const paddedChunk =
-          isLastBlock && chunk.length < 1024
-            ? padBytesWithRandom(
-                chunk,
-                1024,
-                toUint8Array(await this.adapter.randomBytes(1024 - chunk.length)),
-              )
-            : chunk;
-        const nonce = toUint8Array(await this.adapter.randomBytes(24));
-        const encryptedData = encryptUntrustedBytes(fileKey, paddedChunk, nonce);
-        const encryptedHash = encryptUntrustedBlockHash(fileKey, hashPlain);
+        const encryptedData = await encryptUntrustedBlock(fileKey, chunk, size => this.adapter.randomBytes(size));
+        const encryptedHash = encryptUntrustedBlockHash(fileKey, hashPlain, offset);
         originalBlocks.push({ offset, size: chunk.length, hash: hashPlain });
-        fakeBlocks.push({
-          offset: encryptedOffset,
-          size: encryptedData.length,
-          hash: encryptedHash,
-        });
         blocks.push({
           offset: encryptedOffset,
           size: encryptedData.length,
@@ -1916,11 +2021,12 @@ class BepSession {
           hash: block.hash,
         })),
       };
-      const encryptedMetadata = encryptUntrustedBytes(
-        fileKey,
-        FileInfo.encode(originalFileInfo).finish(),
+      const advertisedFileInfo = await encryptUntrustedFileInfo(
+        folder.folderCrypto.folderKey,
+        originalFileInfo,
         toUint8Array(await this.adapter.randomBytes(24)),
       );
+      const fakeBlocks = advertisedFileInfo.blocks ?? [];
       this.log("upload.prepared", {
         folderId,
         path: normalizedPath,
@@ -1930,30 +2036,9 @@ class BepSession {
         elapsedMs: Date.now() - uploadStartedAtMs,
         avgRateBps: uploadRateBps(bytes.length),
       });
-      const advertisedFileInfo = {
-        name: encryptedName,
-        type: 0,
-        size: fakeBlocks.reduce((sum, block) => sum + block.size, 0),
-        permissions: 0o644,
-        modified_s: 1_234_567_890,
-        modified_ns: 0,
-        modified_by: this.localVersionCounterId,
-        deleted: false,
-        invalid: false,
-        no_permissions: false,
-        version: baseVersion,
-        sequence,
-        block_size: blockSize + 40,
-        blocks: fakeBlocks.map((block) => ({
-          offset: block.offset,
-          size: block.size,
-          hash: block.hash,
-        })),
-        encrypted: encryptedMetadata,
-      };
       throwIfCancelled();
       folder.files.set(normalizedPath, {
-        indexFile: advertisedFileInfo,
+        indexFile: originalFileInfo,
         request: {
           encryptedName,
           fileKey,
@@ -2077,9 +2162,7 @@ class BepSession {
     const pending = this.awaitingPublications.get(`${folderId}\0${path}`);
     if (!pending) return;
     const order = compareVersionVectors(file.version, pending.expected.version);
-    const signature = (value: BepFileInfo) => JSON.stringify({ size: String(value.size ?? 0), deleted: !!value.deleted,
-      blocks: (value.blocks ?? []).map(block => [String(block.offset), block.size, Array.from(block.hash)]) });
-    pending.received = (order === "equal" || order === "after") && signature(file) === signature(pending.expected);
+    pending.received = (order === "equal" || order === "after") && replicaContentSignature(file) === replicaContentSignature(pending.expected);
   }
 
   private async publishAndWait(frame: Uint8Array, folderId: string, path: string, expected: BepFileInfo, options?: FileUploadOptions): Promise<void> {
@@ -2116,6 +2199,8 @@ class BepSession {
     }
     const normalizedPath = normalizePathValue(path);
     if (!normalizedPath) throw new Error("Deletion path must not be empty.");
+    assertReplicaPath(normalizedPath);
+    if (isInternalReplicaPath(normalizedPath)) throw new Error("Internal files cannot be deleted remotely.");
     const sequence = this.nextFolderSequence(folderId);
     const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
     let advertisedName = normalizedPath;
@@ -2139,11 +2224,10 @@ class BepSession {
       blocks: [],
     };
     const originalFileInfo = { ...fileInfo, name: normalizedPath, modified_s: Math.floor(modifiedMs / 1000), modified_ns: (modifiedMs % 1000) * 1000000 };
-    const advertisedFileInfo = folder.encrypted && folder.folderCrypto ? {
-      ...fileInfo,
-      encrypted: encryptUntrustedBytes(deriveUntrustedFileKey(folder.folderCrypto.folderKey, normalizedPath),
-        FileInfo.encode(originalFileInfo).finish(), toUint8Array(await this.adapter.randomBytes(24))),
-    } : fileInfo;
+    const advertisedFileInfo = folder.encrypted && folder.folderCrypto
+      ? await encryptUntrustedFileInfo(folder.folderCrypto.folderKey, originalFileInfo,
+        toUint8Array(await this.adapter.randomBytes(24)))
+      : fileInfo;
     folder.files.set(normalizedPath, { indexFile: originalFileInfo });
     const uploaded = this.uploadedFilesByFolder.get(folderId);
     uploaded?.delete(normalizedPath);
@@ -2166,6 +2250,13 @@ class BepSession {
         new Error("Connection closed before initial cluster config")
       );
     }
+  }
+
+  private requestReplicaRange(folderId: string, path: string, offset: number, size: number, hash?: Uint8Array): Promise<Uint8Array> {
+    const folder = this.folders.get(folderId);
+    if (!folder || folder.needsPassword) return Promise.reject(new Error("Replica folder metadata is unavailable."));
+    if (folder.encrypted) return this.buildRemoteFs().readFileRange(folderId, path, offset, size);
+    return this.requestBlock(folderId, path, offset, size, { hash });
   }
 
   requestBlock(
@@ -2265,7 +2356,7 @@ class BepSession {
     });
   }
 
-  buildRemoteFs(metadata: RemoteDeviceInfo): RemoteFs {
+  buildRemoteFs(metadata?: RemoteDeviceInfo): RemoteFs {
     return new RemoteFs(
       this.folders,
       (folder, name, offset, size, options) =>
@@ -2289,7 +2380,7 @@ class BepSession {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed) { await Promise.allSettled(this.stateTasks); return; }
     this.closed = true;
     this.closureResolve({ kind: "manual", message: "Session closed by request" });
     this.stopKeepalive();
@@ -2330,6 +2421,7 @@ class BepSession {
       this.log("close.frame_timeout");
     }
     await this.socket.close();
+    await Promise.allSettled(this.stateTasks);
   }
 
   isClosed(): boolean {
@@ -2373,6 +2465,7 @@ async function openBepSessionOnSocketUncancelled(
   connectedVia: string,
   transportKind: "direct-tcp" | "direct-quic" | "relay",
   connectionScope: ConnectionScope,
+  incoming = false,
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.bep.handshake.start", {
     connectedHost,
@@ -2442,11 +2535,13 @@ async function openBepSessionOnSocketUncancelled(
     opts.requestTimeoutMs,
   );
   await session.initialize(leftover);
+  if (incoming) await session.advertiseSharedFolders();
   adapter.log?.("core.bep.cluster_config.wait", {
     connectedHost,
     connectedPort,
   });
   await session.waitForReady();
+  session.startReplicaSync(opts.replicaScanIntervalMs);
   adapter.log?.("core.bep.handshake.ready", {
     connectedHost,
     connectedPort,
@@ -2497,6 +2592,28 @@ async function openBepSessionOnSocket(
     throw abortError;
   } finally {
     signal?.removeEventListener("abort", closeOnAbort);
+  }
+}
+
+/** Accept only an explicitly trusted certificate identity on an established socket. */
+export async function acceptSyncpeerSession(
+  adapter: SyncpeerHostAdapter,
+  socket: SyncpeerTlsSocket,
+  options: SyncpeerConnectOptions & { expectedDeviceId: string },
+): Promise<SyncpeerSessionHandle> {
+  if (!options.expectedDeviceId.trim()) {
+    await socket.close();
+    throw new Error("Incoming peers require an approved device identity.");
+  }
+  const timer = setTimeout(() => void socket.close().catch(() => undefined), options.timeoutMs ?? 10000);
+  try {
+    return await openBepSessionOnSocketUncancelled(adapter, socket, options,
+      options.host, options.port, "incoming-tcp", "direct-tcp", connectionScopeForHost(options.host), true);
+  } catch (error) {
+    await socket.close().catch(() => undefined);
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

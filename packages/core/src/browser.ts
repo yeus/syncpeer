@@ -183,3 +183,5 @@ export type {
   SyncpeerSessionStore,
 } from "./ui/sessionTypes.js";
 export type { FolderIndexPollAttempt, ReadDirAttempt } from "./ui/sessionFlows.js";
+export { createReplicaController } from "./sync/replicaControl.js";
+export type { ReplicaState } from "./sync/replicaControl.js";

@@ -97,6 +97,10 @@ export interface BepFileInfo {
   name: string;
   type?: number;
   size?: number;
+  permissions?: number;
+  no_permissions?: boolean;
+  block_size?: number;
+  modified_by?: number | string;
   modified_s?: number;
   modified_ns?: number;
   invalid?: boolean;
@@ -152,6 +156,7 @@ export interface BepRequest {
   name?: string;
   offset?: number;
   size?: number;
+  hash?: Uint8Array;
 }
 
 export interface BepClose {

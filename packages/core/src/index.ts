@@ -1,4 +1,6 @@
 export { createSyncpeerCoreClient, UploadOutcomeUnknownError, withMetadataSession } from "./client.js";
+export { createReplicaController } from "./sync/replicaControl.js";
+export type { ReplicaState } from "./sync/replicaControl.js";
 export {
   classifyRuntimeArchitecture,
   classifyRuntimePlatform,

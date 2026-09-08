@@ -14,6 +14,10 @@
       "import": "./dist/pim/index.js",
       "types": "./dist/pim/index.d.ts"
     },
+    "./filesystem": {
+      "import": "./dist/filesystem.js",
+      "types": "./dist/filesystem.d.ts"
+    },
     "./node": {
       "import": "./dist/node.js",
       "types": "./dist/node.d.ts"

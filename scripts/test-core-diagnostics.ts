@@ -191,7 +191,7 @@ const update = (
 
 const firstUpdate = update([{ name: "first.txt" }], 1);
 const secondUpdate = update([{ name: "second.txt" }], 2);
-const mergedUpdates = coalescePendingIndexFrame(firstUpdate, secondUpdate);
+const mergedUpdates = coalescePendingIndexFrame(firstUpdate, secondUpdate, "latest");
 
 assert.equal(mergedUpdates.kind, "update");
 assert.deepEqual(
@@ -203,6 +203,7 @@ assert.equal(mergedUpdates.index.last_sequence, 2);
 const mergedDeletion = coalescePendingIndexFrame(
   mergedUpdates,
   update([{ name: "first.txt", deleted: true }], 3),
+  "latest",
 );
 assert.deepEqual(
   mergedDeletion.index.files.find((file) => file.name === "first.txt"),
@@ -218,18 +219,25 @@ const replacementIndex: PendingIndexFrame = {
   },
 };
 assert.deepEqual(
-  coalescePendingIndexFrame(mergedDeletion, replacementIndex),
+  coalescePendingIndexFrame(mergedDeletion, replacementIndex, "latest"),
   replacementIndex,
 );
 const snapshotWithUpdate = coalescePendingIndexFrame(
   replacementIndex,
   update([{ name: "later.txt" }], 5),
+  "latest",
 );
 assert.equal(snapshotWithUpdate.kind, "index");
 assert.deepEqual(
   snapshotWithUpdate.index.files.map((file) => file.name),
   ["snapshot.txt", "later.txt"],
 );
+const retainedHistory = coalescePendingIndexFrame(firstUpdate,
+  update([{ name: "first.txt", deleted: true }], 2), "history");
+assert.equal(retainedHistory.index.files.length, 2, "Locked histories must not be collapsed by name");
+assert.equal(coalescePendingIndexFrame(retainedHistory, replacementIndex, "history").index.files.length, 3);
+assert.throws(() => coalescePendingIndexFrame({ kind: "update", index: { files: Array(100000).fill({ name: "opaque" }) } },
+  secondUpdate, "history"), /capacity/);
 
 assert.equal(
   classifyRuntimeEnvironment({ hasNodeRuntime: false, hasTauriRuntime: true }),

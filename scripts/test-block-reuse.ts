@@ -15,6 +15,27 @@ const blocks = [0, 4, 8].map((offset) => ({
   offset, size: 4, hash: sha256(new Uint8Array(4).fill(offset)),
 }));
 
+test("Syncthing empty-file blocks publish without requesting zero bytes", async () => {
+  for (const hash of [sha256(new Uint8Array()), new Uint8Array(32)]) {
+    let committed = false;
+    const view = new RemoteFs(new Map([["fixture-folder", { id: "fixture-folder", label: "Fixture", readOnly: false,
+      indexReceived: true, advertisedDevices: [], encrypted: false, needsPassword: false,
+      files: new Map([["empty", { indexFile: { name: "empty", type: 0, size: 0,
+        blocks: [{ offset: 0, size: 0, hash }] } }]]) }]]),
+    async () => assert.fail("Empty file must not request content"), async () => {}, () => {});
+    const download = view.readFileToSink("fixture-folder", "empty", { begin: async () => {},
+      write: async () => assert.fail("Empty file must not write content"),
+      commit: async () => { committed = true; }, abort: async () => {} });
+    if (hash.some(byte => byte !== 0)) {
+      assert.equal((await download).bytesWritten, 0);
+      assert.equal(committed, true);
+    } else {
+      await assert.rejects(download, /block|digest/i);
+      assert.equal(committed, false);
+    }
+  }
+});
+
 test("copies only exact cached block matches", async () => {
   const copied: number[] = [];
   const ranges = await prepareCachedBlocks(blocks, 12, {

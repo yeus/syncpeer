@@ -79,6 +79,16 @@ function normalizeEncryptedName(value: string): string {
   return deslashed.replace(/\//g, "");
 }
 
+/** Structural directories used to shard Syncthing encrypted names. */
+export function isEncryptedPathPrefix(path: string): boolean {
+  const [first, second, ...rest] = path.split("/");
+  if (first.length !== 1 + ENCRYPTED_DIR_EXTENSION.length ||
+      !first.endsWith(ENCRYPTED_DIR_EXTENSION) || !BASE32_ALPHABET.includes(first[0])) return false;
+  if (second === undefined) return true;
+  if (second.length !== 2 || [...second].some(char => !BASE32_ALPHABET.includes(char))) return false;
+  return rest.every(part => part.length === 200 && [...part].every(char => BASE32_ALPHABET.includes(char)));
+}
+
 function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
@@ -94,6 +104,10 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+export function untrustedPasswordToken(folderId: string, folderKey: Uint8Array): Uint8Array {
+  return aessiv(folderKey, EMPTY_AAD).encrypt(textEncoder.encode(`${PASSWORD_TOKEN_PREFIX}${folderId}`));
+}
+
 export async function deriveUntrustedFolderCrypto(
   folderId: string,
   password: string,
@@ -106,7 +120,7 @@ export async function deriveUntrustedFolderCrypto(
     p: 1,
     dkLen: 32,
   });
-  const passwordToken = aessiv(folderKey, EMPTY_AAD).encrypt(salt);
+  const passwordToken = untrustedPasswordToken(folderId, folderKey);
   return {
     folderId,
     folderKey,
@@ -166,8 +180,12 @@ export function deriveUntrustedFileKey(
 export function encryptUntrustedBlockHash(
   fileKey: Uint8Array,
   hash: Uint8Array,
+  offset: number,
 ): Uint8Array {
-  return aessiv(fileKey, EMPTY_AAD).encrypt(hash);
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid encrypted block offset.");
+  const additional = new Uint8Array(8);
+  new DataView(additional.buffer).setBigUint64(0, BigInt(offset), false);
+  return aessiv(fileKey, additional).encrypt(hash);
 }
 
 export function encryptUntrustedBytes(
@@ -192,4 +210,24 @@ export function decryptUntrustedBytes(
   const nonce = payload.slice(0, XCHACHA_NONCE_SIZE);
   const ciphertext = payload.slice(XCHACHA_NONCE_SIZE);
   return xchacha20poly1305(fileKey, nonce).decrypt(ciphertext);
+}
+
+/** Encrypt one Syncthing data block, including minimum-size random padding. */
+export async function encryptUntrustedBlock(
+  fileKey: Uint8Array,
+  bytes: Uint8Array,
+  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>,
+): Promise<Uint8Array> {
+  const padded = new Uint8Array(Math.max(1024, bytes.length));
+  try {
+    padded.set(bytes);
+    if (padded.length > bytes.length) {
+      const padding = await randomBytes(padded.length - bytes.length);
+      if (padding.length !== padded.length - bytes.length) throw new Error("Invalid random padding length.");
+      padded.set(padding, bytes.length);
+    }
+    return encryptUntrustedBytes(fileKey, padded, await randomBytes(24));
+  } finally {
+    padded.fill(0);
+  }
 }

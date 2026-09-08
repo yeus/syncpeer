@@ -125,6 +125,9 @@ export interface CachedFileRecord {
   sizeBytes: number;
   cachedAtMs: number;
   modifiedMs?: number;
+  syncBaseline?: { hash: string; sizeBytes: number; modifiedMs: number };
+  /** Writable providers cannot safely infer a remote baseline from local timestamps. */
+  syncBaselineRequired?: boolean;
 }
 
 export interface AndroidContactRecord {
@@ -147,6 +150,7 @@ export interface AndroidCalendarEventRecord {
 }
 
 export interface SyncpeerPlatformAdapter {
+  acknowledgeCachedSync?: (folderId: string, path: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => Promise<boolean>;
   readTextFile?: (path: string) => Promise<string>;
   readBinaryFile?: (path: string) => Promise<Uint8Array>;
   pickUploadFile?: () => Promise<string | null | undefined>;
@@ -166,6 +170,8 @@ export interface SyncpeerPlatformAdapter {
     path: string;
     name: string;
     modifiedMs?: number;
+    /** Optimistic local guard for automatic updates; null requires an absent file. */
+    expectedLocalHash?: string | null;
   }) => Promise<FileDownloadSink>;
   startTransfer?: (label: string) => Promise<void>;
   stopTransfer?: () => Promise<void>;
@@ -225,6 +231,7 @@ export interface CreateSyncpeerBrowserClientOptions {
 }
 
 export interface SyncpeerBrowserClient {
+  acknowledgeCachedSync?: SyncpeerPlatformAdapter["acknowledgeCachedSync"];
   connectAndSync: (options: ConnectOptions) => Promise<RemoteFsLike>;
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
@@ -336,7 +343,10 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
       .map(([folderId, password]) => [folderId.trim(), password.trim()])
       .filter(([folderId, password]) => folderId !== "" && password !== ""),
   ),
-  sharedFolders: options.sharedFolders?.map((folder) => ({
+  sharedFolders: options.sharedFolders?.map((folder) => folder.ciphertextReplica ? {
+    ...folder,
+    encryption: { ...folder.encryption, passwordToken: folder.encryption.passwordToken.slice() },
+  } : ({
     ...folder,
     encryption: { ...folder.encryption },
   })),
@@ -629,6 +639,7 @@ export const createSyncpeerBrowserClient = (
     setOnline: lifecycle.setOnline,
     setForeground: lifecycle.setForeground,
     setTransferActive: lifecycle.setTransferActive,
+    acknowledgeCachedSync: platformAdapter.acknowledgeCachedSync,
     listFavorites: async (): Promise<FavoriteRecord[]> =>
       platformAdapter.listFavorites
         ? platformAdapter.listFavorites()

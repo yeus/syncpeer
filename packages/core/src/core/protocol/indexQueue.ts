@@ -26,7 +26,14 @@ const mergeFilesByName = (
 export const coalescePendingIndexFrame = (
   pending: PendingIndexFrame,
   incoming: PendingIndexFrame,
+  mode: "latest" | "history",
 ): PendingIndexFrame => {
+  if (mode === "history") {
+    const earlier = pending.index.files ?? [];
+    const later = incoming.index.files ?? [];
+    if (earlier.length + later.length > 100000) throw new Error("Pending encrypted history capacity exceeded.");
+    return { kind: "update", index: { ...pending.index, ...incoming.index, files: [...earlier, ...later] } };
+  }
   if (incoming.kind === "index") return incoming;
   return {
     kind: pending.kind,

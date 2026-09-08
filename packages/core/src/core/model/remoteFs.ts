@@ -1,6 +1,8 @@
 import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import type { BepFileInfo, BepVersionVector } from "../protocol/bep.js";
-import { prepareCachedBlocks, verifyBlockDigests, type RangeDigest } from "../../transfer/blockReuse.js";
+import { BEP_MAX_BLOCK_SIZE } from "../protocol/blockLimits.js";
+import { prepareCachedBlocks, verifyBlockDigests, validateBlockPlan, planBlockRange, type RangeDigest } from "../../transfer/blockReuse.js";
 import type {
   FileDownloadMetadata,
   FileDownloadResult,
@@ -509,8 +511,47 @@ export class RemoteFs {
   ): Promise<Uint8Array> {
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
+    if (folder.encrypted) {
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0 || length > BEP_MAX_BLOCK_SIZE) {
+        throw new Error("Invalid encrypted file range.");
+      }
+      const record = resolveStoredFile(folder, path);
+      if (folder.needsPassword || !record?.request || record.indexFile.deleted || Number(record.indexFile.type ?? 0) !== 0) {
+        throw new Error("Encrypted file metadata is unavailable.");
+      }
+      throwIfAborted(signal);
+      const blocks = (record.indexFile.blocks ?? []).map(block => ({ offset: Number(block.offset), size: Number(block.size), hash: block.hash }));
+      const fileSize = Number(record.indexFile.size ?? 0);
+      if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error("Invalid encrypted file size metadata.");
+      const plan = planBlockRange(blocks, fileSize, offset, length);
+      const bytes = new Uint8Array(plan.size);
+      for (const part of plan.blocks) {
+        const block = await this.readEncryptedBlock(folderId, record, part.index, signal);
+        try {
+          bytes.set(block.subarray(part.sourceOffset, part.sourceOffset + part.size), part.targetOffset);
+        } finally { block.fill(0); }
+      }
+      throwIfAborted(signal);
+      return bytes;
+    }
     const requestName = resolveRequestName(folder, path);
     return this.requestBlockWithRetry(folderId, requestName, offset, length, { signal });
+  }
+
+  private async readEncryptedBlock(folderId: string, record: StoredFileRecord, blockNo: number, signal?: AbortSignal): Promise<Uint8Array> {
+    const original = record.indexFile.blocks?.[blockNo];
+    const block = record.request?.encryptedBlocks[blockNo];
+    if (!original || !block || !record.request) throw new Error("Encrypted block metadata is unavailable.");
+    const payload = await this.requestBlockWithRetry(folderId, record.request.encryptedName, block.offset, block.size,
+      { hash: block.hash, blockNo, fromTemporary: false, signal });
+    const plaintext = decryptEncryptedBytes(record.request.fileKey, payload);
+    try {
+      if (plaintext.length < original.size) throw new Error("Encrypted block was shorter than expected.");
+      const bytes = plaintext.subarray(0, original.size);
+      verifyBlockDigests([{ offset: Number(original.offset), size: original.size, hash: original.hash }],
+        [{ offset: Number(original.offset), size: original.size, hash: await (this.hashBytes ?? sha256)(bytes) }]);
+      return bytes.slice();
+    } finally { plaintext.fill(0); }
   }
 
   private async requestBlockWithRetry(
@@ -711,13 +752,14 @@ export class RemoteFs {
     if (entry.deleted) {
       throw new Error(`Remote reports this file as deleted: ${path}`);
     }
+    if (entry.size === 0) {
+      validateBlockPlan(entry.blocks ?? [], 0);
+      await sink.begin({ folderId, path: normalizePath(path), sizeBytes: 0, encrypted: false, contentId: "blocks:empty" });
+      throwIfAborted(signal);
+      await sink.commit();
+      return { bytesWritten: 0, totalBytes: 0, networkBytes: 0, reusedBytes: 0 };
+    }
     if (!entry.blocks || entry.blocks.length == 0) {
-      if (entry.size === 0) {
-        await sink.begin({ folderId, path: normalizePath(path), sizeBytes: 0, encrypted: false, contentId: "blocks:empty" });
-        throwIfAborted(signal);
-        await sink.commit();
-        return { bytesWritten: 0, totalBytes: 0, networkBytes: 0, reusedBytes: 0 };
-      }
       if (!Number.isFinite(entry.size) || entry.size <= 0) {
         return this.readFileByProbing(folderId, path, sink, onProgress, signal);
       }
@@ -884,28 +926,7 @@ export class RemoteFs {
       contentIdForBlocks(entry.blocks),
       plan,
       6,
-      async (next) => {
-        const payload = await this.requestBlockWithRetry(
-          folder.id,
-          resolvedFile!.request!.encryptedName,
-          next.encryptedBlock.offset,
-          next.encryptedBlock.size,
-          {
-            hash: next.encryptedBlock.hash,
-            blockNo: next.blockNo,
-            fromTemporary: false,
-            signal,
-          },
-        );
-        if (payload.length === 0) {
-          throw new Error(`Unexpected empty encrypted block for ${path} at block ${next.blockNo}`);
-        }
-        const plaintext = decryptEncryptedBytes(resolvedFile!.request!.fileKey, payload);
-        if (plaintext.length < next.originalBlock.size) {
-          throw new Error(`Encrypted block for ${path} was shorter than expected`);
-        }
-        return plaintext.slice(0, next.originalBlock.size);
-      },
+      next => this.readEncryptedBlock(folder.id, resolvedFile!, next.blockNo, signal),
       sink,
       onProgress,
       signal,

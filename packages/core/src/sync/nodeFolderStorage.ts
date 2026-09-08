@@ -2,6 +2,8 @@ import { copyFile, lstat, open, mkdir, readFile, readdir, rename, rm, stat, utim
 import { constants } from "node:fs";
 import type { FileEntry } from "../core/model/remoteFs.js";
 import { digestRanges } from "../transfer/nodeStorage.js";
+import type { ReplicaEntry } from "./replicaIndex.js";
+import { isInternalReplicaPath } from "./replicaPaths.js";
 import path from "node:path";
 import type {
   FolderSyncBaseline,
@@ -23,7 +25,7 @@ export interface NodeFolderSyncStorage extends FolderSyncStorage {
 
 const normalizePath = (value: string): string => value.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
 
-const safePath = (value: string): string => {
+export const safePath = (value: string): string => {
   const normalized = normalizePath(value);
   if (!normalized || normalized.split("/").some((part) => part === "." || part === "..")) {
     throw new Error("Folder sync paths must stay inside the selected root.");
@@ -31,7 +33,7 @@ const safePath = (value: string): string => {
   return normalized;
 };
 
-const assertNoSymlinks = async (root: string, target: string): Promise<void> => {
+export const assertNoSymlinks = async (root: string, target: string): Promise<void> => {
   const relative = path.relative(root, target);
   if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) throw new Error("Path is outside the selected root.");
   let current = root;
@@ -62,26 +64,31 @@ const fingerprintFile = async (absolute: string, size: number, blocks?: FileEntr
   } finally { await file.close(); }
 };
 
-const ignoredEntry = (name: string, stateName: string): boolean =>
-  name === stateName ||
-  name === ".stversions" ||
-  name === ".syncpeer-trash" ||
-  name.startsWith(".syncpeer-") ||
-  name.includes(".syncpeer-conflict-");
-
-const listDirectory = async (root: string, directory: string, stateName: string, remote: readonly FileEntry[], cache: Map<string, { key: string; fingerprint: string; layout?: string; remoteFingerprint?: string }>): Promise<LocalSyncFile[]> => {
+export const listNodeReplicaEntries = async (root: string, directory: string, stateName: string): Promise<ReplicaEntry[]> => {
   const absolute = path.join(root, directory);
   await assertNoSymlinks(root, absolute);
   const entries = await readdir(absolute, { withFileTypes: true });
-  const files: LocalSyncFile[] = [];
+  const files: ReplicaEntry[] = [];
   for (const entry of entries) {
     const relative = normalizePath(directory ? `${directory}/${entry.name}` : entry.name);
-    if (ignoredEntry(entry.name, stateName)) continue;
+    if (entry.name === stateName || isInternalReplicaPath(relative)) continue;
+    if (!entry.isDirectory() && !entry.isFile()) continue;
+    const metadata = await lstat(path.join(root, relative));
+    if (metadata.isSymbolicLink()) throw new Error("Folder storage refuses symlink paths.");
+    files.push({ path: relative, type: entry.isDirectory() ? "directory" : "file",
+      size: entry.isDirectory() ? 0 : metadata.size, modifiedMs: metadata.mtimeMs, revision: metadataKey(metadata) });
     if (entry.isDirectory()) {
-      files.push(...await listDirectory(root, relative, stateName, remote, cache));
-      continue;
+      files.push(...await listNodeReplicaEntries(root, relative, stateName));
     }
-    if (!entry.isFile()) continue;
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+};
+
+const listDirectory = async (root: string, directory: string, stateName: string, remote: readonly FileEntry[], cache: Map<string, { key: string; fingerprint: string; layout?: string; remoteFingerprint?: string }>): Promise<LocalSyncFile[]> => {
+  const files: LocalSyncFile[] = [];
+  for (const entry of await listNodeReplicaEntries(root, directory, stateName)) {
+    if (entry.type !== "file") continue;
+    const relative = entry.path;
     const absolutePath = path.join(root, relative);
     const metadata = await stat(absolutePath);
     const key = metadataKey(metadata);

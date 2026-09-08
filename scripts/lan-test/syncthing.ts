@@ -34,7 +34,7 @@ if (!platform || !arch) {
   throw new Error("LAN Syncthing tests support Linux and macOS x64/arm64 only.");
 }
 
-const binaryPath = (name: string): string => {
+export const binaryPath = (name: string): string => {
   const selectedVersion = name === "strelaysrv" ? relayVersion : version;
   return path.join(toolsRoot, name + "-" + platform + "-" + arch + "-" + selectedVersion, name);
 };
@@ -357,6 +357,7 @@ export interface RunningLanFixture {
   home: string;
   apiKey: string;
   syncGuiUrl: string;
+  receiveEncryptedFrom: (sender: RunningLanFixture) => Promise<string>;
   switchToRelayOnly: () => Promise<void>;
   switchTransport: (profile: SyncthingTransportProfile) => Promise<void>;
   addUntrustedProfile: (deviceId: string) => Promise<void>;
@@ -473,6 +474,39 @@ export const createLanFixture = async (args: {
     home,
     apiKey,
     syncGuiUrl,
+    receiveEncryptedFrom: async (sender) => {
+      const received = path.join(root, "received-encrypted");
+      ensureDir(received);
+      const senderRequest = <T>(call: SyncthingApiCall) => apiRequest<T>(sender.syncGuiUrl, sender.apiKey, call);
+      await sender.approveDevice({ deviceId: fixture.remoteDeviceId, untrusted: true });
+      const defaults = await request<Record<string, unknown>>({ pathname: "/rest/config/defaults/device" });
+      await request({ pathname: "/rest/config/devices", method: "POST", body: {
+        ...defaults, deviceID: sender.fixture.remoteDeviceId, name: "encrypted-fixture-sender",
+        addresses: [`tcp://127.0.0.1:${sender.fixture.directPort}`],
+      } });
+      const folderPath = "/rest/config/folders/" + encodeURIComponent(encryptedFolderId);
+      const folder = await request<Record<string, unknown>>({ pathname: folderPath });
+      // Syncthing forbids changing an existing folder across the encryption boundary.
+      // Remove only this fixture registration; its original source files stay intact.
+      await request({ pathname: folderPath, method: "DELETE" });
+      await request({ pathname: "/rest/config/folders", method: "POST", body: {
+        ...folder, path: received, type: "receiveencrypted",
+        devices: [{ deviceID: fixture.remoteDeviceId }, { deviceID: sender.fixture.remoteDeviceId }],
+      } });
+      const query = "?folder=" + encodeURIComponent(encryptedFolderId);
+      await senderRequest({ pathname: "/rest/db/scan" + query, method: "POST" });
+      const expected = await senderRequest<{ localFiles: number }>({ pathname: "/rest/db/status" + query });
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        const status = await request<{ localFiles: number; globalFiles: number; needTotalItems: number; state: string }>({
+          pathname: "/rest/db/status" + query,
+        });
+        if (status.state === "idle" && status.localFiles === expected.localFiles &&
+          status.globalFiles === expected.localFiles && status.needTotalItems === 0) return received;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      throw new Error("Encrypted test receiver did not finish synchronizing.");
+    },
     switchToRelayOnly: async () => {
       await stopProcess(syncthingProcess);
       syncthingProcess = null;

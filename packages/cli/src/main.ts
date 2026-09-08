@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash, X509Certificate } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import type { SharedFolder } from "@syncpeer/core";
 import {
   createNodeSessionTransport,
+  createNodeSyncpeerClient,
+  createNodeFolderReplica,
+  listenNodePeer,
+  versionCounterId,
   createNodeFileDownloadSink,
   createNodeFolderSyncStorage,
   DownloadInterruptedError,
@@ -138,21 +142,15 @@ function parseFolderPasswords(values: string[] | undefined): Record<string, stri
   return out;
 }
 
-async function openRemoteFs(
-  opts: CliOptions,
-  sharedFolders?: SharedFolder[],
-) {
-  let cert: string;
-  let key: string;
+function resolveIdentityPaths(opts: CliOptions) {
   if (opts.cert || opts.key) {
-    cert = requiredPath("cert", opts.cert);
-    key = requiredPath("key", opts.key);
-  } else {
-    const identity = ensureCliNodeIdentity();
-    cert = identity.cert;
-    key = identity.key;
+    return { cert: requiredPath("cert", opts.cert), key: requiredPath("key", opts.key) };
   }
+  return ensureCliNodeIdentity();
+}
 
+async function openRemoteFs(opts: CliOptions, sharedFolders?: SharedFolder[]) {
+  const { cert, key } = resolveIdentityPaths(opts);
   const transport = createNodeSessionTransport();
   const remoteFs = await transport.connectAndSync({
     host: opts.host,
@@ -374,6 +372,53 @@ async function main() {
       await session.close();
     }
   };
+
+  program
+    .command("peer-folder <folderId> <localPath>")
+    .description("Synchronize a local folder with an explicitly trusted Syncpeer over TLS")
+    .option("--listen", "Accept the approved peer instead of initiating the connection", false)
+    .option("--bind <host>", "Local listener interface", "127.0.0.1")
+    .option("--listen-port <port>", "Local listener port", Number, 22000)
+    .option("--scan-interval <ms>", "Local change scan interval", Number, 5000)
+    .action(async (folderId: string, localPath: string, config: { listen: boolean; bind: string; listenPort: number; scanInterval: number }) => {
+      const opts = program.opts<CliOptions>();
+      if (!opts.remoteId?.trim()) throw new Error("peer-folder requires --remote-id for the approved peer.");
+      if (!folderId.trim()) throw new Error("Folder ID must not be empty.");
+      if (!Number.isSafeInteger(config.scanInterval) || config.scanInterval < 100) throw new Error("Scan interval must be at least 100 ms.");
+      if (!Number.isSafeInteger(config.listenPort) || config.listenPort < 0 || config.listenPort > 65535) throw new Error("Invalid listener port.");
+      const identity = resolveIdentityPaths(opts);
+      const certPem = fs.readFileSync(identity.cert, "utf8");
+      const keyPem = fs.readFileSync(identity.key, "utf8");
+      const counter = versionCounterId(createHash("sha256").update(new X509Certificate(certPem).raw).digest());
+      const replica = await createNodeFolderReplica(fs.realpathSync(localPath), counter);
+      const options = { certPem, keyPem, expectedDeviceId: opts.remoteId, deviceName: opts.deviceName,
+        host: opts.host, port: opts.port, timeoutMs: opts.timeoutMs, replicaScanIntervalMs: config.scanInterval,
+        sharedFolders: [{ id: folderId.trim(), encryption: { mode: "plaintext" as const }, replica }] };
+      const controller = new AbortController();
+      let stop!: () => void;
+      const stopped = new Promise<void>(resolve => { stop = () => { controller.abort(); resolve(); }; });
+      process.once("SIGINT", stop); process.once("SIGTERM", stop);
+      try {
+        if (config.listen) {
+          const listener = await listenNodePeer({ ...options, host: config.bind, port: config.listenPort,
+            onSession: () => console.log("Approved peer connected."), onError: () => console.error("Peer connection failed.") });
+          console.log(`Peer listener ready: ${listener.port}`);
+          try { await stopped; } finally { await listener.close(); }
+        } else {
+          const client = createNodeSyncpeerClient();
+          while (!controller.signal.aborted) {
+            try {
+              const session = await client.openSession({ ...options, discoveryMode: opts.discoveryMode }, controller.signal);
+              console.log("Peer folder synchronization active.");
+              try { await Promise.race([stopped, session.closed]); } finally { await session.close(); }
+            } catch (error) {
+              if (!controller.signal.aborted) console.error(error instanceof Error ? error.message : String(error));
+            }
+            if (!controller.signal.aborted) await Promise.race([stopped, sleepMs(1000)]);
+          }
+        }
+      } finally { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
+    });
 
   program
     .command("share-folder <folderId> <localPath>")

@@ -67,7 +67,7 @@
   let systemPrefersDark = $state(false);
   let contentElement = $state<HTMLElement | null>(null);
 
-  const { hostAdapter, platformAdapter } = createTauriAdapters({
+  const { hostAdapter, platformAdapter, connectDocumentFolder } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
@@ -379,6 +379,7 @@
       {#if app.activeTab === "devices"}
         <DeviceTab
           {app}
+          onConnectDocumentFolder={connectDocumentFolder}
           advertisedDevices={currentAdvertisedDevices}
           isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>

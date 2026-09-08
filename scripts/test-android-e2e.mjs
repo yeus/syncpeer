@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { build } from "vite";
 
 const config = JSON.parse(
   fs.readFileSync("packages/tauri-shell/src-tauri/tauri.conf.json", "utf8"),
@@ -13,11 +14,18 @@ const transferJobServiceClass = process.env.SYNCPEER_ANDROID_TRANSFER_JOB_SERVIC
   || "dev.syncpeer.plugin.android.SyncpeerTransferJobService";
 const transferJobServiceComponent = `${packageName}/${transferJobServiceClass}`;
 const transferJobId = Number(process.env.SYNCPEER_ANDROID_TRANSFER_JOB_ID || 22067);
+const documentsProviderAuthority = process.env.SYNCPEER_ANDROID_DOCUMENTS_AUTHORITY?.trim()
+  || `${packageName}.documents`;
 const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim()
   || (fs.existsSync(".tmp/syncpeer-dev-client/server-device-id")
     ? fs.readFileSync(".tmp/syncpeer-dev-client/server-device-id", "utf8").trim()
     : "");
 const discoveryServer = process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || "";
+// Global mode is relay-only in E2E builds; local TCP fixtures opt into automatic.
+const discoveryMode = process.env.SYNCPEER_ANDROID_DISCOVERY_MODE?.trim() || "global";
+if (!["automatic", "global"].includes(discoveryMode)) {
+  throw new Error("SYNCPEER_ANDROID_DISCOVERY_MODE must be automatic or global.");
+}
 const connectionTimeoutMs = Number(process.env.SYNCPEER_LAN_TIMEOUT_MS || 120_000);
 const downloadTimeoutMs = Number(process.env.SYNCPEER_ANDROID_DOWNLOAD_TIMEOUT_MS || 240_000);
 const targetFolderId = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-lan";
@@ -269,6 +277,38 @@ const waitForUiText = (cdp, text, timeout = 60_000) => waitForUiCondition(
   `text ${JSON.stringify(text)}`,
   timeout,
 );
+
+const runAndroidDocumentsProviderChecks = async () => {
+  const packageDump = runAdb(["shell", "dumpsys", "package", packageName]);
+  if (!packageDump.includes(documentsProviderAuthority) ||
+      !packageDump.includes("dev.syncpeer.plugin.android.SyncpeerDocumentsProvider")) {
+    throw new Error(`Syncpeer DocumentsProvider is not registered for ${documentsProviderAuthority}.`);
+  }
+  runAdb(["shell", "am", "force-stop", packageName]);
+  runAdb([
+    "shell",
+    "am",
+    "start",
+    "-a",
+    "android.intent.action.OPEN_DOCUMENT",
+    "-c",
+    "android.intent.category.OPENABLE",
+    "-t",
+    "text/plain",
+  ]);
+  await wait(1_000);
+  runAdb([
+    "shell",
+    "uiautomator",
+    "dump",
+    "/sdcard/syncpeer-documents-provider.xml",
+  ]);
+  const picker = runAdb(["shell", "cat", "/sdcard/syncpeer-documents-provider.xml"]);
+  if (!picker.includes("com.google.android.documentsui") || !picker.includes("Syncpeer")) {
+    throw new Error("Android document picker did not offer the Syncpeer provider.");
+  }
+  console.log(`Android DocumentsProvider registered and offered by DocumentsUI at ${documentsProviderAuthority}.`);
+};
 
 const readUiDownloadState = async (cdp, name) => cdp.evaluate(`(() => {
   const text = document.body?.innerText || "";
@@ -823,7 +863,7 @@ const openAndroidConnection = async (cdp) => {
     );
   }
   await setUiValue(cdp, "connection-saved-device", "");
-  await setUiValue(cdp, "connection-discovery-mode", "global");
+  await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
   await setUiValue(cdp, "connection-remote-id", serverDeviceId);
   await setUiValue(cdp, "connection-timeout", String(connectionTimeoutMs));
   if (discoveryServer) {
@@ -1222,6 +1262,59 @@ const runOptionalAndroidNetworkWorkflow = async () => {
   await runAndroidDozeScenario();
 };
 
+const runAndroidFilesystemChecks = async (cdp) => {
+  if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1") {
+    await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=tab-devices]")', "application navigation ready");
+    await clickUiTestId(cdp, "tab-devices");
+    if (!await cdp.evaluate('document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"')) {
+      await clickUiTestId(cdp, "connection-settings-toggle");
+    }
+    await clickUiTestId(cdp, "document-vault-status");
+    await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=document-vault-phase]")', "document vault status from service");
+    console.log("Android Settings reaches the service-owned document vault.");
+  }
+  const built = await build({ configFile: false, publicDir: false, logLevel: "error", build: {
+    write: false, target: "esnext", minify: false,
+    lib: { entry: "scripts/android-filesystem-conformance.ts", formats: ["es"] },
+    rollupOptions: { output: { inlineDynamicImports: true } },
+  } });
+  const output = (Array.isArray(built) ? built[0] : built).output;
+  const code = output.find(item => item.type === "chunk" && item.isEntry)?.code;
+  if (!code) throw new Error("Android filesystem conformance bundle is missing.");
+  const relativeRoot = runAdb(["shell", "run-as", packageName, "mktemp", "-d", "cache/syncpeer-native-e2e-XXXXXX"]).trim();
+  if (!/^cache\/syncpeer-native-e2e-[a-zA-Z0-9]+$/.test(relativeRoot)) throw new Error("Unexpected Android test directory.");
+  try {
+    const appRoot = runAdb(["shell", "run-as", packageName, "pwd"]).trim();
+    const url = `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`;
+    const result = await cdp.evaluate(`(async () => {
+      const profileId = ${JSON.stringify(relativeRoot.split("/").at(-1))};
+      const secret = (operation, value) => globalThis.__TAURI_INTERNALS__.invoke("syncpeer_vault_secret", {
+        request: { profileId, operation, secret: value },
+      });
+      try {
+        if (await secret("isDeviceUnlocked") !== true) throw new Error("Synthetic credential test requires an unlocked emulator.");
+        await secret("save", "synthetic-test-master");
+        if (await secret("load") !== "synthetic-test-master") throw new Error("Native remembered-secret round trip failed.");
+        await secret("remove");
+        if (await secret("load") !== null) throw new Error("Native remembered secret was not removed.");
+      } finally { await secret("remove"); }
+      const { runFilesystemConformance } = await import(${JSON.stringify(url)});
+      return runFilesystemConformance(async request => {
+        try { return await globalThis.__TAURI_INTERNALS__.invoke("syncpeer_replica_storage", { request }); }
+        catch (error) { throw new Error("Native filesystem " + request.operation + " failed: " + String(error)); }
+      },
+        ${JSON.stringify(`${appRoot}/${relativeRoot}`)}, {
+          load: () => secret("load"), save: value => secret("save", value), remove: () => secret("remove"),
+          isDeviceUnlocked: () => secret("isDeviceUnlocked"),
+        }).catch(error => { throw new Error(error.message ?? String(error)); }).finally(() => secret("remove"));
+    })()`, 90_000);
+    if (!result?.encrypted || !result?.reopenVerified || !result?.cancellationPreservedOriginal || !result?.replicaLifecycleVerified) throw new Error("Incomplete Android filesystem conformance result.");
+    console.log(`Android core/native encrypted filesystem passed: ${result.bytes} bytes, cancellation, reopen, replica receive and recoverable deletion verified.`);
+  } finally {
+    runAdb(["shell", "run-as", packageName, "rm", "-r", "--", relativeRoot]);
+  }
+};
+
 const main = async () => {
   runAdb(["wait-for-device"], 60_000);
 
@@ -1253,10 +1346,39 @@ const main = async () => {
     return;
   }
 
+  execFileSync("bash", [
+    "packages/tauri-shell/src-tauri/gen/android/gradlew",
+    "-p", "packages/tauri-shell/src-tauri/gen/android",
+    ":tauri-plugin-syncpeer-android:connectedDebugAndroidTest",
+    "--no-daemon", "--console=plain",
+  ], { stdio: "inherit", timeout: 240_000 });
+  if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1") {
+    // Gradle removes its test package after the suite. Install a fresh synthetic
+    // fixture for the multi-process acceptance sequence, then remove it below.
+    const testApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/build/outputs/apk/androidTest/debug/tauri-plugin-syncpeer-android-debug-androidTest.apk";
+    runAdb(["install", "-r", testApk], 60_000);
+    try { for (const phase of ["seed", "unlocked", "lock", "locked"]) {
+      runAdb(["shell", "am", "force-stop", "dev.syncpeer.plugin.android.test"]);
+      const result = runAdb(["shell", "am", "instrument", "-w", "-r", "-e", "class",
+        `dev.syncpeer.plugin.android.DocumentRuntimeServiceTest#${phase === "seed" ? "pickerUsesRegisteredEncryptedFilesAndKeystoreWithoutAnActivity" : "vaultReopensAfterProcessRestart"}`,
+        "-e", "documentsRestartPhase", phase,
+        "dev.syncpeer.plugin.android.test/androidx.test.runner.AndroidJUnitRunner"], 60_000);
+      if (!result.includes("OK (1 test)")) throw new Error(`Document runtime process-restart check failed (${phase}).`);
+    } } finally { runAdb(["uninstall", "dev.syncpeer.plugin.android.test"]); }
+    console.log("Android document vault process-restart and persistent-lock checks passed.");
+  }
+  await runAndroidDocumentsProviderChecks();
+
   runAdb(["shell", "am", "force-stop", packageName]);
   runAdb(["shell", "monkey", "-p", packageName, "1"]);
   await wait(1_000);
   await assertForeground();
+
+  if (process.env.SYNCPEER_ANDROID_FILESYSTEM_ONLY === "1") {
+    const cdp = await connectCdp();
+    try { await runAndroidFilesystemChecks(cdp); } finally { cdp.close(); }
+    return;
+  }
 
   runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
   await wait(300);
@@ -1266,6 +1388,7 @@ const main = async () => {
 
   const lifecycleCdp = await connectCdp();
   try {
+    await runAndroidFilesystemChecks(lifecycleCdp);
     await runUserInitiatedTransferLifecycle(lifecycleCdp);
   } finally {
     lifecycleCdp.close();

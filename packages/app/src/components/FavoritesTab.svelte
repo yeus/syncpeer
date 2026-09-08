@@ -8,7 +8,7 @@
   interface Props {
     app: AppState;
     onOpenDownloadedFilesPanel: () => void;
-    onOpenFavorite: (favorite: FavoriteRecord) => void;
+    onOpenFavorite: (favorite: Pick<FavoriteRecord, "folderId" | "path" | "kind">) => void;
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
     onOpenCachedDirectory: (folderId: string, path: string) => void;

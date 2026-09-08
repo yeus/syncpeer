@@ -1,5 +1,10 @@
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 mod cache_ranges;
+mod replica_storage;
+mod documents;
+#[cfg(target_os = "android")]
+mod document_storage;
+mod vault_secret;
 use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
@@ -4137,7 +4142,12 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .manage(Arc::new(Mutex::new(QuicSessionStore::default())))
         .manage(Arc::new(Mutex::new(CacheWriterStore::default())))
+        .manage(Arc::new(Mutex::new(replica_storage::ReplicaRoots::default())))
+        .manage(Arc::new(Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
+            vault_secret::syncpeer_vault_secret,
+            replica_storage::syncpeer_replica_storage,
+            documents::syncpeer_document_command,
             syncpeer_read_text_file,
             syncpeer_read_binary_file,
             syncpeer_read_default_cli_identity,

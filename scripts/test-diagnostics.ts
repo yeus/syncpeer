@@ -70,6 +70,31 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-block-reuse.ts"],
     },
     {
+      name: "Syncpeer peer TLS interoperability",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-syncpeer-peers.ts"],
+    },
+    {
+      name: "Durable folder replica indexes",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-replica-index.ts"],
+    },
+    {
+      name: "Folder replica pause and status controls",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-replica-control.ts", "scripts/test-folder-registry.ts", "scripts/test-document-filesystem.ts", "scripts/test-document-drafts.ts", "scripts/test-document-cache.ts", "scripts/test-encrypted-scratch.ts", "scripts/test-document-runtime.mjs"],
+    },
+    {
+      name: "Shared replica storage ownership",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-replica-storage.ts", "scripts/test-replica-file-source.ts", "scripts/test-replica-writable-file.ts"],
+    },
+    {
+      name: "Encrypted filesystem format",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-encrypted-filesystem.ts", "scripts/test-native-filesystem.ts", "scripts/test-replica-persistence.ts", "scripts/test-encrypted-replica.ts", "scripts/test-credential-vault.ts"],
+    },
+    {
       name: "Tauri partial sink recovery",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-tauri-download-sink.ts"],
@@ -78,6 +103,11 @@ const main = async (): Promise<void> => {
       name: "Native cache range unit tests",
       command: "cargo",
       args: ["test", "--lib", "--manifest-path", "packages/tauri-shell/src-tauri/Cargo.toml", "cache_ranges"],
+    },
+    {
+      name: "Native selected-folder storage",
+      command: "cargo",
+      args: ["test", "--lib", "--manifest-path", "packages/tauri-shell/src-tauri/Cargo.toml", "replica_storage"],
     },
     {
       name: "Android document replacement unit tests",
@@ -121,7 +151,7 @@ const main = async (): Promise<void> => {
     {
       name: "Application state merge diagnostics",
       command: process.execPath,
-      args: ["--import", "tsx/esm", "--test", "scripts/test-app-state.ts"],
+      args: ["--import", "tsx/esm", "--test", "scripts/test-app-state.ts", "scripts/test-app-connection-settings.ts"],
     },
     {
       name: "Favorite synchronization policy diagnostics",

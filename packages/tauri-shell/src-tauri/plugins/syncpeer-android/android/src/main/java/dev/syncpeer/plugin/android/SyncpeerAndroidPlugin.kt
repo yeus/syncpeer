@@ -18,6 +18,8 @@ import android.app.Activity
 import android.content.Context
 import android.provider.CalendarContract
 import android.provider.ContactsContract
+import android.provider.DocumentsContract
+import org.json.JSONObject
 import androidx.activity.result.ActivityResult
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -32,6 +34,18 @@ import app.tauri.plugin.Plugin
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
+
+@InvokeArg
+class DocumentCommandArgs {
+  var request: String = ""
+}
+
+@InvokeArg
+class VaultSecretArgs {
+  var profileId: String = ""
+  var operation: String = ""
+  var secret: String? = null
+}
 
 @InvokeArg
 class OpenWithChooserArgs {
@@ -130,6 +144,56 @@ class AndroidCalendarDeleteArgs {
 
 @TauriPlugin
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
+  private val vaultSecrets by lazy { VaultSecretStore(activity.applicationContext) }
+
+  @Command
+  fun documentCommand(invoke: Invoke) {
+    val args = invoke.parseArgs(DocumentCommandArgs::class.java)
+    if (args.request.length > 1024 * 1024) {
+      invoke.reject("Document access requires Android 8 or newer and a supported WebView."); return
+    }
+    // Provider and service own the lifetime; never block the main thread while binding.
+    Thread {
+      try {
+        val uri = Uri.parse("content://${activity.packageName}.documents")
+        val request = JSONObject(args.request)
+        // A never-configured vault must not require JavaScriptEngine just to use the legacy cache.
+        if (request.optString("operation") == "cacheRegistrations" && !File(activity.noBackupFilesDir, "documents/profile").exists()) {
+          invoke.resolve(app.tauri.plugin.JSObject("{\"result\":{\"folders\":[]}}")); return@Thread
+        }
+        if (Build.VERSION.SDK_INT < 26) {
+          invoke.reject("Document access requires Android 8 or newer."); return@Thread
+        }
+        val show = request.optString("operation") == "show"
+        if (show) request.put("operation", "stat")
+        val result = activity.applicationContext.contentResolver.call(uri, "syncpeerDocumentCommand", request.toString(), null)
+        if (show) {
+          val metadata = JSONObject(checkNotNull(result?.getString("result"))).getJSONObject("result")
+          val document = DocumentsContract.buildDocumentUri("${activity.packageName}.documents", request.getString("id"))
+          val mime = if (metadata.getBoolean("directory")) DocumentsContract.Document.MIME_TYPE_DIR else guessMimeType(metadata.getString("name"))
+          val intent = Intent(Intent.ACTION_VIEW).setDataAndType(document, mime)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+          activity.runOnUiThread {
+            try { activity.startActivity(Intent.createChooser(intent, "Open with")); invoke.resolve() }
+            catch (_: Exception) { invoke.reject("No application can open this document.") }
+          }
+          return@Thread
+        }
+        invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(result?.getString("result"))))
+      } catch (_: Exception) { invoke.reject("Document operation failed. Check the vault password and Android System WebView.") }
+    }.start()
+  }
+
+  @Command
+  fun vaultSecret(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(VaultSecretArgs::class.java)
+      val result = vaultSecrets.execute(args.profileId, args.operation, args.secret)
+      if (result == null) invoke.resolve() else invoke.resolveObject(result)
+    } catch (_: Exception) {
+      invoke.reject("Protected credential operation failed; use manual unlock.")
+    }
+  }
   private var multicastLock: WifiManager.MulticastLock? = null
   private var notificationCancellationPending = false
 

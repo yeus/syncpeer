@@ -21,6 +21,7 @@ import {
   transferNotificationView,
   type BreadcrumbSegment,
   type FileEntry,
+  type FavoriteRecord,
   type FileDownloadResult,
   type FileDownloadSink,
   type FileEntrySortMode,
@@ -935,7 +936,10 @@ export const createAppActions = (args: {
         setRemoteApprovalPending(state, attemptedDeviceId, true);
         state.approvals.pendingApprovalPromptDeviceId = attemptedDeviceId;
       }
-      reportUiError("connect.failed", error, connectionDetails(state));
+      reportUiError("connect.failed", error, {
+        discoveryMode: state.connection.discoveryMode,
+        timeoutMs: state.connection.timeoutMs,
+      });
       resetRuntimeState(state);
       restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_failed");
     } finally {
@@ -1083,6 +1087,7 @@ export const createAppActions = (args: {
         name: string,
         size: number,
         modifiedMs: number,
+        expectedLocalHash?: string,
       ): Promise<string> => {
         const id = `starred-download:${cachedFileKey(folderId, path)}`;
         let outcome: "completed" | "failed" | "cancelled" = "failed";
@@ -1105,6 +1110,7 @@ export const createAppActions = (args: {
               path,
               name,
               modifiedMs,
+              expectedLocalHash,
             });
             const hashingSink = createSha256DownloadSink(nativeSink);
             activeSink = hashingSink.sink;
@@ -1170,7 +1176,12 @@ export const createAppActions = (args: {
               progress.totalBytes,
             ),
           });
-          await client.cacheFile(folderId, path, name, bytes, modifiedMs);
+          // Picker edits can continue while uploading. Acknowledge the sent snapshot
+          // without rewriting newer local bytes in the service-owned document.
+          const acknowledged = await client.acknowledgeCachedSync?.(folderId, path, {
+            hash: await digestBytesHex(bytes), sizeBytes: bytes.length, modifiedMs,
+          });
+          if (!acknowledged) await client.cacheFile(folderId, path, name, bytes, modifiedMs);
           outcome = "completed";
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") outcome = "cancelled";
@@ -1218,19 +1229,39 @@ export const createAppActions = (args: {
         }
 
         const remoteModifiedMs = remoteEntry.modifiedMs || 0;
-        const previous = state.sync.starredFileSyncState[key];
+        const previous = state.sync.starredFileSyncState[key] ?? (cached.syncBaseline ? {
+          lastLocalHash: cached.syncBaseline.hash,
+          lastRemoteModifiedMs: cached.syncBaseline.modifiedMs,
+          lastRemoteSizeBytes: cached.syncBaseline.sizeBytes,
+          lastSyncAtMs: cached.cachedAtMs,
+          lastDirection: "baseline" as const,
+        } : undefined);
+        if (cached.syncBaselineRequired && !previous) {
+          throw new Error("This local document has no verified remote baseline. Upload or download it explicitly before enabling automatic updates.");
+        }
+        let localBytes: Uint8Array | null = null;
+        if (cached.localPath) {
+          try { localBytes = await client.readBinaryFile(cached.localPath); }
+          catch { localBytes = null; }
+        }
+        const localHash = localBytes ? await digestBytesHex(localBytes) : previous?.lastLocalHash ?? "";
+        const localChanged = Boolean(localBytes && previous) && localHash !== previous!.lastLocalHash;
         const remoteChanged = remoteFavoriteNeedsDownload(
           { sizeBytes: remoteEntry.size, modifiedMs: remoteModifiedMs },
           previous,
           cached,
         );
         if (remoteChanged) {
+          if (cached.syncBaseline && (!localBytes || localChanged)) {
+            throw new Error("Both the document and remote file may have changed. Local edits were preserved; resolve the conflict before downloading a replacement.");
+          }
           const localHash = await downloadStarredFile(
             favorite.folderId,
             targetPath,
             favorite.name,
             remoteEntry.size,
             remoteModifiedMs || Date.now(),
+            cached.syncBaselineRequired ? previous?.lastLocalHash : undefined,
           );
           state.sync.starredFileSyncState[key] = {
             lastLocalHash: localHash,
@@ -1241,15 +1272,6 @@ export const createAppActions = (args: {
           };
           downloaded += 1;
           continue;
-        }
-
-        let localBytes: Uint8Array | null = null;
-        if (cached.localPath) {
-          try {
-            localBytes = await client.readBinaryFile(cached.localPath);
-          } catch {
-            localBytes = null;
-          }
         }
 
         if (!previous) {
@@ -1263,9 +1285,6 @@ export const createAppActions = (args: {
           };
           continue;
         }
-
-        const localHash = localBytes ? await digestBytesHex(localBytes) : previous.lastLocalHash;
-        const localChanged = Boolean(localBytes) && localHash !== previous.lastLocalHash;
 
         if (localChanged && localBytes) {
           const uploadModifiedMs = Date.now();
@@ -1340,17 +1359,22 @@ export const createAppActions = (args: {
   };
 
   const applyConnectionSettings = async (generation: number) => {
-    if (connectInFlight) await connectInFlight;
     if (generation !== connectionSettingsGeneration) return;
     if (!hasAutoConnectTarget(state)) return;
-    state.ui.autoConnectPaused = false;
+    const obsoleteConnect = connectInFlight;
     if (
-      state.session.lifecyclePhase !== "idle" &&
-      state.session.lifecyclePhase !== "error"
+      obsoleteConnect || (
+        state.session.lifecyclePhase !== "idle" &&
+        state.session.lifecyclePhase !== "error"
+      )
     ) {
       await sessionStore.actions.disconnect();
+      if (obsoleteConnect) await obsoleteConnect;
+      if (generation !== connectionSettingsGeneration) return;
       resetRuntimeState(state);
     }
+    if (generation !== connectionSettingsGeneration) return;
+    state.ui.autoConnectPaused = false;
     await connect();
   };
 
@@ -1648,7 +1672,7 @@ export const createAppActions = (args: {
     }
   };
 
-  const openFavorite = async (favorite: AppState["favorites"]["items"][number]) => {
+  const openFavorite = async (favorite: Pick<FavoriteRecord, "folderId" | "path" | "kind">) => {
     if (!state.session.isConnected) return;
     state.activeTab = "folders";
     state.ui.uploadMessage = "";

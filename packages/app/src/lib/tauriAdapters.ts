@@ -10,6 +10,8 @@ import type {
   SyncpeerTlsSocket,
   FileDownloadSink,
 } from "@syncpeer/core/browser";
+import { createDocumentCache, createNativeFilesystem } from "@syncpeer/core/filesystem";
+import { detectRuntimePlatform } from "./runtimeInfo.ts";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -224,7 +226,7 @@ const createTlsSocket = (
 
 export const createTauriAdapters = (
   options?: CreateTauriAdaptersOptions,
-): { hostAdapter: SyncpeerHostAdapter; platformAdapter: SyncpeerPlatformAdapter } => {
+) => {
   let invoke: InvokeFn | null = null;
   let multicastLockPrepared = false;
   let localDiscoveryQueue = Promise.resolve();
@@ -581,7 +583,30 @@ export const createTauriAdapters = (
     },
   };
 
-  return { hostAdapter, platformAdapter };
+  const documents = createDocumentCache({ legacy: platformAdapter, enabled: () => detectRuntimePlatform() === "android",
+    request: async <T>(request: Record<string, unknown>) => {
+      const response = await invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
+      return response.result;
+    },
+    openLegacySource: async file => {
+      if (!file.localPath?.startsWith("/") || file.safRelativePath) {
+        throw new Error("This folder uses external storage. Its existing plaintext files were left unchanged; import them through the file picker explicitly.");
+      }
+      const separator = file.localPath.lastIndexOf("/"), name = file.localPath.slice(separator + 1);
+      const bytes = await createNativeFilesystem(request => invokeWithLogging("syncpeer_replica_storage", { request }), file.localPath.slice(0, separator));
+      try {
+        const original = await bytes.stat(name);
+        if (!original || original.type !== "file") throw new Error("Cached file is unavailable.");
+        return { size: original.size, readRange: (offset, size) => bytes.readRange(name, offset, size),
+          verify: async () => {
+            const current = await bytes.stat(name);
+            if (!current || current.revision !== original.revision) throw new Error("Cached file changed during migration.");
+          }, close: bytes.close };
+      } catch (error) { await bytes.close(); throw error; }
+    },
+    show: async id => { await invokeWithLogging("syncpeer_document_command", { request: { operation: "show", id } }); },
+  });
+  return { hostAdapter, platformAdapter: documents.platformAdapter, connectDocumentFolder: documents.connectFolder };
 };
 
 export const reportUiError = (

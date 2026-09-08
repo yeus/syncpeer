@@ -17,6 +17,15 @@ const main = async (): Promise<void> => {
     : ["--self"];
   const phases: TestSuitePhase[] = [
     {
+      ...nodeScript("scripts/test-native-credentials.mjs"),
+      name: "Private Linux Secret Service credentials",
+      skipReason: () => process.platform !== "linux" ? "Secret Service fixture requires Linux"
+        : ["dbus-run-session", "dbus-send", "gnome-keyring-daemon"].some(command =>
+          !(process.env.PATH ?? "").split(path.delimiter).some(directory => fs.existsSync(path.join(directory, command))))
+          ? "install dbus and gnome-keyring to test the private credential fixture" : undefined,
+      required: requireExternal && process.platform === "linux",
+    },
+    {
       ...nodeScript("scripts/test-lan.ts", localTauriArgs),
       name: "Local Tauri end-to-end workflows",
       env: { SYNCPEER_LAN_XVFB: "1" },

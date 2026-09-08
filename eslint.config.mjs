@@ -13,6 +13,8 @@ export default tseslint.config(
       "**/.tmp/**",
       "**/.tools/**",
       "**/target/**",
+      "**/android/build/**",
+      "**/gen/android/app/build/**",
       "**/Syncpeer.AppDir/**",
     ],
   },

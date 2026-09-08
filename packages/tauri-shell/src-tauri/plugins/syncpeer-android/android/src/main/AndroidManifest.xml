@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:tools="http://schemas.android.com/tools">
+  <!-- Only the document runtime uses this API-26 library; every entry is gated.
+       Retain the existing minimum for the rest of Syncpeer. -->
+  <uses-sdk tools:overrideLibrary="androidx.javascriptengine" />
   <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
   <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
@@ -12,6 +16,10 @@
   <uses-permission android:name="android.permission.READ_CALENDAR" />
   <uses-permission android:name="android.permission.WRITE_CALENDAR" />
   <application>
+    <service
+      android:name="dev.syncpeer.plugin.android.DocumentRuntimeService"
+      android:enabled="@bool/syncpeer_documents_enabled"
+      android:exported="false" />
     <service
       android:name="dev.syncpeer.plugin.android.SyncpeerTransferService"
       android:exported="false"
@@ -28,6 +36,17 @@
       <meta-data
         android:name="android.support.FILE_PROVIDER_PATHS"
         android:resource="@xml/file_paths" />
+    </provider>
+    <provider
+      android:name="dev.syncpeer.plugin.android.SyncpeerDocumentsProvider"
+      android:enabled="@bool/syncpeer_documents_enabled"
+      android:authorities="${applicationId}.documents"
+      android:exported="true"
+      android:grantUriPermissions="true"
+      android:permission="android.permission.MANAGE_DOCUMENTS">
+      <intent-filter>
+        <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+      </intent-filter>
     </provider>
   </application>
 </manifest>

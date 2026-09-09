@@ -3,11 +3,19 @@ import test from "node:test";
 import { createServer } from "vite";
 import type * as AppActions from "../packages/app/src/app/actions.ts";
 import type * as AppState from "../packages/app/src/app/state.ts";
+import type { TransferRuntime } from "../packages/app/src/app/transferRuntime.ts";
 
 test("changing settings cancels an unfinished connection before waiting for it", async (t) => {
   const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
   t.after(() => server.close());
   const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createTransferRuntime } = await server.ssrLoadModule("/packages/app/src/app/transferRuntime.ts") as {
+    createTransferRuntime: (args: {
+      state: Parameters<typeof createAppActions>[0]["state"];
+      client: Parameters<typeof createAppActions>[0]["client"];
+      runtimeSurface: "web-ui";
+    }) => TransferRuntime;
+  };
   const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
   const state = createInitialState(null);
   state.connection.deviceName = "fixture-client";
@@ -34,6 +42,11 @@ test("changing settings cancels an unfinished connection before waiting for it",
         rejectOpening?.(new Error("fixture cancellation"));
       },
     } } as unknown as Parameters<typeof createAppActions>[0]["sessionStore"],
+    transfers: createTransferRuntime({
+      state,
+      client: {} as Parameters<typeof createAppActions>[0]["client"],
+      runtimeSurface: "web-ui",
+    }),
   });
   const opening = actions.connect();
   try {

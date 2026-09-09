@@ -8,6 +8,7 @@ import { createServer } from "vite";
 import { createInitialSessionState } from "../packages/core/dist/ui/sessionPolicies.js";
 import type * as AppActions from "../packages/app/src/app/actions.ts";
 import type * as AppState from "../packages/app/src/app/state.ts";
+import type { TransferRuntime } from "../packages/app/src/app/transferRuntime.ts";
 
 test("opt-in cache migration preserves originals and routes downloads and picker edits through one owner", async t => {
   const { openStorage } = memoryDocumentStorage();
@@ -65,6 +66,13 @@ test("opt-in cache migration preserves originals and routes downloads and picker
   const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
   t.after(() => server.close());
   const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createTransferRuntime } = await server.ssrLoadModule("/packages/app/src/app/transferRuntime.ts") as {
+    createTransferRuntime: (args: {
+      state: Parameters<typeof createAppActions>[0]["state"];
+      client: Parameters<typeof createAppActions>[0]["client"];
+      runtimeSurface: "web-ui";
+    }) => TransferRuntime;
+  };
   const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
   const state = createInitialState(null), session = createInitialSessionState();
   const sample = (await cache.platformAdapter.listCachedFiles!()).find(file => file.path === "sample.bin")!;
@@ -93,6 +101,11 @@ test("opt-in cache migration preserves originals and routes downloads and picker
   const actions = createAppActions({ state,
     client: cache.platformAdapter as Parameters<typeof createAppActions>[0]["client"],
     sessionStore: { actions: { refreshOverview: async () => {} }, getState: () => session } as unknown as Parameters<typeof createAppActions>[0]["sessionStore"],
+    transfers: createTransferRuntime({
+      state,
+      client: cache.platformAdapter as Parameters<typeof createAppActions>[0]["client"],
+      runtimeSurface: "web-ui",
+    }),
   });
   await actions.refreshActiveView();
   assert.equal(uploads, 1, "A fresh UI detects picker edits using the persisted remote baseline");

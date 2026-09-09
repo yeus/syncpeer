@@ -134,6 +134,10 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-transfer-notifications.ts"],
     },
     {
+      ...tsxScript("scripts/test-transfer-runtime.ts"),
+      name: "Application transfer runtime diagnostics",
+    },
+    {
       name: "Application theme and icon diagnostics",
       command: process.execPath,
       args: [
@@ -151,7 +155,14 @@ const main = async (): Promise<void> => {
     {
       name: "Application state merge diagnostics",
       command: process.execPath,
-      args: ["--import", "tsx/esm", "--test", "scripts/test-app-state.ts", "scripts/test-app-connection-settings.ts"],
+      args: [
+        "--import",
+        "tsx/esm",
+        "--test",
+        "scripts/test-app-state.ts",
+        "scripts/test-app-connection-settings.ts",
+        "scripts/test-app-diagnostics.ts",
+      ],
     },
     {
       name: "Favorite synchronization policy diagnostics",

@@ -13,12 +13,21 @@
   import FoldersTab from "./components/FoldersTab.svelte";
   import PimTab from "./components/PimTab.svelte";
   import { createTauriAdapters } from "./lib/tauriAdapters.js";
+  import { getAppBuildInfo } from "./lib/appInfo.ts";
   import {
     createAppActions,
     formatBytes,
     formatModified,
     rootFolderEntries,
   } from "./app/actions.ts";
+  import { createDiagnosticsActions } from "./app/diagnosticsActions.ts";
+  import {
+    importProviderPimFromSyncthingFolder,
+    initializePimFolder,
+    pickAndroidPimDirectory,
+    syncAndroidPimNow,
+  } from "./app/pimActions.ts";
+  import { createTransferRuntime } from "./app/transferRuntime.ts";
   import {
     activeFolderPasswords,
     advertisedDevices,
@@ -81,7 +90,24 @@
       pushSessionLog(app, event.level, event.event, event.message, event.details);
     },
   });
-  const actions = createAppActions({ state: app, client, sessionStore });
+  const appInfo = getAppBuildInfo();
+  const transferRuntime = createTransferRuntime({
+    state: app,
+    client,
+    runtimeSurface: appInfo.runtimeSurface,
+  });
+  const actions = createAppActions({
+    state: app,
+    client,
+    sessionStore,
+    transfers: transferRuntime,
+  });
+  const diagnosticsActions = createDiagnosticsActions({
+    state: app,
+    client,
+    appInfo,
+  });
+  const pimDependencies = { state: app, client, sessionStore };
 
   const unsubscribe = sessionStore.subscribe((next) => {
     applySessionState(app, next);
@@ -118,6 +144,7 @@
     }
     unsubscribe();
     actions.dispose();
+    transferRuntime.dispose();
     void client.disconnect();
   };
 
@@ -411,10 +438,11 @@
       {#if app.activeTab === "pim"}
         <PimTab
           {app}
-          onPickAndroidPimDirectory={actions.pickAndroidPimDirectory}
-          onInitializePimFolder={actions.initializePimFolder}
-          onSyncAndroidPimNow={actions.syncAndroidPimNow}
-          onImportProviderPimFromFolder={actions.importProviderPimFromSyncthingFolder}
+          onPickAndroidPimDirectory={() => pickAndroidPimDirectory(pimDependencies)}
+          onInitializePimFolder={() => initializePimFolder(pimDependencies)}
+          onSyncAndroidPimNow={() => syncAndroidPimNow(pimDependencies)}
+          onImportProviderPimFromFolder={() =>
+            importProviderPimFromSyncthingFolder(pimDependencies)}
         />
       {/if}
 
@@ -429,7 +457,7 @@
           onRemoveCachedFile={actions.removeCachedFile}
           onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
-          onCancelDownload={actions.cancelDownload}
+          onCancelDownload={transferRuntime.cancelDownload}
           onRemoveFavorite={actions.removeFavorite}
           onClearAllCache={actions.clearAllCache}
           {formatBytes}
@@ -459,8 +487,8 @@
           onOpenCachedFileDirectory={actions.openCachedFileDirectory}
           onOpenOrDownloadFile={actions.openOrDownloadFile}
           onDownloadFile={actions.downloadFile}
-          onCancelDownload={actions.cancelDownload}
-          onCancelTransfers={actions.cancelTransfers}
+          onCancelDownload={transferRuntime.cancelDownload}
+          onCancelTransfers={transferRuntime.cancelAll}
           onToggleFavorite={actions.toggleFavorite}
           onSetPasswordVisible={actions.setFolderPasswordInputVisible}
           onUpdateFolderPasswordDraft={actions.updateFolderPasswordDraft}
@@ -543,10 +571,10 @@
 {:else if app.currentPage === "diagnostics"}
   <DiagnosticsPage
     onBack={actions.closeDiagnosticsPage}
-    onLoadCatalog={actions.loadDiagnosticsCatalog}
-    onRunTest={actions.runDiagnosticsTestById}
-    onRunCategory={actions.runDiagnosticsCategory}
-    onRunAll={actions.runAllDiagnostics}
+    onLoadCatalog={diagnosticsActions.loadDiagnosticsCatalog}
+    onRunTest={diagnosticsActions.runDiagnosticsTestById}
+    onRunCategory={diagnosticsActions.runDiagnosticsCategory}
+    onRunAll={diagnosticsActions.runAllDiagnostics}
   />
 {:else}
   <AboutPage onBack={actions.closeAboutPage} />

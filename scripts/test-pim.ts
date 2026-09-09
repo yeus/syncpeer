@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import {
   canonicalRecordPath,
+  createPimBootstrapPlan,
   mergeOperationIntoSnapshot,
+  parseIcsEvent,
+  parseVcard,
   sidecarOpPath,
+  toIcsEvent,
+  toVcard,
   type PimOperationEnvelope,
 } from "../packages/core/src/pim/index.ts";
 
@@ -81,5 +86,49 @@ const tombstoneOp: PimOperationEnvelope = {
 const deleted = mergeOperationIntoSnapshot(third.snapshot, tombstoneOp, "");
 assert.equal(deleted.snapshot.deleted, true);
 assert.equal(deleted.snapshot.active, null);
+
+const contact = parseVcard(
+  toVcard({
+    uid: "alice",
+    displayName: "Alice Example",
+    phones: ["+1-555-1234"],
+    emails: ["alice@example.com"],
+  }),
+);
+assert.deepEqual(contact, {
+  displayName: "Alice Example",
+  phones: ["+1-555-1234"],
+  emails: ["alice@example.com"],
+});
+
+const event = parseIcsEvent(
+  toIcsEvent({
+    uid: "event-1",
+    title: "Example Meeting",
+    startMs: Date.UTC(2026, 0, 1, 9),
+    endMs: Date.UTC(2026, 0, 1, 10),
+    stampMs: Date.UTC(2026, 0, 1, 8),
+  }),
+);
+assert.deepEqual(event, {
+  title: "Example Meeting",
+  startMs: Date.UTC(2026, 0, 1, 9),
+  endMs: Date.UTC(2026, 0, 1, 10),
+});
+
+const bootstrap = createPimBootstrapPlan("personal", 1_767_225_600_000);
+assert.equal(bootstrap.length, 6);
+assert.deepEqual(
+  bootstrap.map((item) => item.path),
+  [
+    "personal/syncpeer/pim/contacts/collections/default/meta/manifest.json",
+    "personal/syncpeer/pim/calendar/collections/default/meta/manifest.json",
+    "personal/syncpeer/pim/contacts/collections/default/meta/ops/2026-01/bootstrap-1767225600000.json",
+    "personal/syncpeer/pim/calendar/collections/default/meta/ops/2026-01/bootstrap-1767225600000.json",
+    "personal/syncpeer/pim/contacts/collections/default/entries/bootstrap-contact.vcf",
+    "personal/syncpeer/pim/calendar/collections/default/entries/bootstrap-event.ics",
+  ],
+);
+assert.ok(bootstrap.every((item) => item.modifiedMs === 1_767_225_600_000));
 
 console.log("pim checks passed");

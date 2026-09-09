@@ -2,6 +2,20 @@ import type { PimDomain, PimRecordFormat, PimRecordRef } from "./types.js";
 
 const ROOT = "syncpeer/pim";
 
+const normalizePath = (value: string): string =>
+  value.replace(/^\/+|\/+$/g, "");
+
+export const normalizePimRoot = (value: string): string =>
+  normalizePath(value) || "syncpeer-pim";
+
+export const joinPimPath = (...parts: string[]): string =>
+  normalizePath(
+    parts
+      .map((part) => String(part ?? "").trim())
+      .filter(Boolean)
+      .join("/"),
+  );
+
 function sanitizeSegment(value: string): string {
   return value.trim().replaceAll(/[^a-zA-Z0-9._-]/g, "_");
 }
@@ -42,4 +56,3 @@ export function sidecarTombstonePath(ref: PimRecordRef): string {
   const root = collectionRootPath(ref.domain, ref.collectionId);
   return `${root}/meta/tombstones/${sanitizeSegment(ref.recordId)}.json`;
 }
-

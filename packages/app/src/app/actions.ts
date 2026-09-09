@@ -1,5 +1,4 @@
 import {
-  createSyncpeerSessionStore,
   createSha256DownloadSink,
   DownloadInterruptedError,
   cachedFileKey,
@@ -14,52 +13,25 @@ import {
   normalizeDeviceId,
   normalizeDiscoveryServer,
   normalizePath,
-  createTransferNotificationState,
-  reduceTransferNotification,
   resolveDirectoryPath,
   sameDeviceId,
-  transferNotificationView,
   type BreadcrumbSegment,
   type FileEntry,
   type FavoriteRecord,
   type FileDownloadResult,
   type FileDownloadSink,
   type FileEntrySortMode,
-  type ActiveTransfer,
 } from "@syncpeer/core/browser";
-import {
-  canonicalRecordPath,
-  sidecarManifestPath,
-  sidecarOpPath,
-} from "../../../core/src/pim/index.ts";
 import {
   FOLDER_PASSWORD_SCOPE_SEPARATOR,
   type SyncpeerBrowserClient,
   type SyncpeerSessionStore,
 } from "@syncpeer/core/browser";
-import {
-  createChannel as createNativeNotificationChannel,
-  Importance as NativeNotificationImportance,
-  isPermissionGranted as isNativeNotificationPermissionGranted,
-  onAction as onNativeNotificationAction,
-  registerActionTypes as registerNativeNotificationActionTypes,
-  requestPermission as requestNativeNotificationPermission,
-  sendNotification as sendNativeNotification,
-  removeActive as removeActiveNativeNotifications,
-} from "@tauri-apps/plugin-notification";
-import { addPluginListener } from "@tauri-apps/api/core";
 import { reportUiError } from "../lib/tauriAdapters.js";
-import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
-import { supportsOngoingTransferNotifications } from "../lib/runtimeInfo.ts";
 import {
   formatAppBuildInfo,
   getAppBuildInfo,
 } from "../lib/appInfo.ts";
-import {
-  buildDiagnosticsRegistry,
-  runDiagnosticsTests,
-  type TaskyonTestFn,
-} from "../../../shared/modules/diagnosticsRunner.ts";
 import {
   activeFolderPasswordScopeDeviceId,
   activeFolderPasswords,
@@ -83,7 +55,6 @@ import {
   persistState,
   pushSessionLog,
   rootFolderEntries,
-  setError,
   shouldHintRemoteApprovalPending,
   type AppState,
 } from "./state.ts";
@@ -97,6 +68,12 @@ import {
   resetRuntimeSessionState,
 } from "./sessionViewPolicies.ts";
 import { updateCachedKey } from "./downloadPolicies.ts";
+import { reportActionError } from "./actionErrors.ts";
+import {
+  refreshCachedStatuses,
+  refreshFolderRootCachedStatuses,
+} from "./cacheStatusActions.ts";
+import type { TransferRuntime } from "./transferRuntime.ts";
 import {
   hasAutoConnectTarget,
   restoreOfflineSnapshot,
@@ -116,11 +93,6 @@ import {
 } from "./devicePolicies.ts";
 
 const nowTime = () => new Date().toLocaleTimeString();
-const TRANSFER_NOTIFICATION_ID = 22067;
-const TRANSFER_NOTIFICATION_CHANNEL_ID = "syncpeer-transfers-v2";
-const TRANSFER_NOTIFICATION_ACTION_TYPE = "syncpeer-transfer";
-const TRANSFER_NOTIFICATION_CANCEL_ACTION = "cancel";
-const TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS = 1000;
 const sortByName = <T extends { name: string }>(items: T[]) =>
   [...items].sort((left, right) => left.name.localeCompare(right.name));
 
@@ -154,58 +126,6 @@ const restoreAfterTransportFailure = (state: AppState, error: unknown) => {
     sourceDeviceId,
     "transport_failed",
   );
-};
-
-const refreshCachedStatuses = async (
-  state: AppState,
-  client: SyncpeerBrowserClient,
-  folderId: string,
-  paths: string[],
-) => {
-  if (!folderId || paths.length === 0) return;
-  const statuses = await client.getCachedStatuses(
-    folderId,
-    paths.map((item) => normalizePath(item)),
-  );
-  const next = new Set(state.favorites.cachedFileKeys);
-  for (const status of statuses) {
-    const key = cachedFileKey(folderId, status.path);
-    if (status.available) next.add(key);
-    else next.delete(key);
-  }
-  state.favorites.cachedFileKeys = next;
-};
-
-const refreshFolderRootCachedStatuses = async (
-  state: AppState,
-  client: SyncpeerBrowserClient,
-  folderIds: string[],
-) => {
-  const uniqueIds = [...new Set(folderIds.map((item) => item.trim()).filter(Boolean))];
-  const responses = await Promise.all(
-    uniqueIds.map(async (folderId) => ({
-      folderId,
-      statuses: await client.getCachedStatuses(folderId, [""]),
-    })),
-  );
-  const next = new Set(state.favorites.cachedFileKeys);
-  for (const response of responses) {
-    const available = response.statuses[0]?.available ?? false;
-    const key = cachedFileKey(response.folderId, "");
-    if (available) next.add(key);
-    else next.delete(key);
-  }
-  state.favorites.cachedFileKeys = next;
-};
-
-const reportActionError = (
-  state: AppState,
-  event: string,
-  error: unknown,
-  details?: unknown,
-) => {
-  setError(state, event, error, details);
-  reportUiError(event, error, details);
 };
 
 const elapsedMsSince = (startedAtMs: number) => Math.max(1, Date.now() - startedAtMs);
@@ -274,151 +194,6 @@ const ensureClientName = (state: AppState) => {
   }
   state.connection.deviceName = normalized;
   return true;
-};
-
-const normalizePimRoot = (raw: string) => {
-  const normalized = normalizePath(raw);
-  return normalized || "syncpeer-pim";
-};
-
-const joinPath = (...parts: string[]) =>
-  normalizePath(parts.map((part) => String(part ?? "").trim()).filter(Boolean).join("/"));
-
-const parseVcard = (text: string) => {
-  const lines = text.split(/\r?\n/).map((line) => line.trim());
-  const fieldValue = (prefix: string) =>
-    lines.find((line) => line.toUpperCase().startsWith(prefix))?.split(":").slice(1).join(":").trim() ?? "";
-  const phoneValues = lines
-    .filter((line) => line.toUpperCase().startsWith("TEL"))
-    .map((line) => line.split(":").slice(1).join(":").trim())
-    .filter(Boolean);
-  const emailValues = lines
-    .filter((line) => line.toUpperCase().startsWith("EMAIL"))
-    .map((line) => line.split(":").slice(1).join(":").trim())
-    .filter(Boolean);
-  return {
-    displayName: fieldValue("FN:"),
-    phones: [...new Set(phoneValues)],
-    emails: [...new Set(emailValues)],
-  };
-};
-
-const splitVcards = (text: string): string[] => {
-  const matches = text.match(/BEGIN:VCARD[\s\S]*?END:VCARD/gim);
-  if (!matches || matches.length === 0) return [];
-  return matches.map((item) => item.trim()).filter(Boolean);
-};
-
-const toVcard = (args: { uid: string; displayName: string; phones: string[]; emails: string[] }) =>
-  [
-    "BEGIN:VCARD",
-    "VERSION:3.0",
-    `UID:${args.uid}`,
-    `FN:${args.displayName || "Unnamed Contact"}`,
-    ...args.phones.map((phone) => `TEL;TYPE=CELL:${phone}`),
-    ...args.emails.map((email) => `EMAIL;TYPE=OTHER:${email}`),
-    "END:VCARD",
-    "",
-  ].join("\n");
-
-const parseIcsUtcToMs = (value: string): number => {
-  const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
-  if (!match) return 0;
-  const [, y, m, d, hh, mm, ss] = match;
-  return Date.UTC(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss));
-};
-
-const toIcsUtc = (ms: number) => {
-  const date = new Date(ms);
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
-};
-
-const parseIcsEvent = (text: string) => {
-  const lines = text.split(/\r?\n/).map((line) => line.trim());
-  const readValue = (prefix: string) =>
-    lines.find((line) => line.toUpperCase().startsWith(prefix))?.split(":").slice(1).join(":").trim() ?? "";
-  const title = readValue("SUMMARY:");
-  const startMs = parseIcsUtcToMs(readValue("DTSTART:"));
-  const endMs = parseIcsUtcToMs(readValue("DTEND:"));
-  return { title, startMs, endMs };
-};
-
-const splitIcsEvents = (text: string): string[] => {
-  const matches = text.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/gim);
-  if (!matches || matches.length === 0) return [];
-  return matches.map((item) => item.trim()).filter(Boolean);
-};
-
-const toIcsEvent = (args: { uid: string; title: string; startMs: number; endMs: number }) =>
-  [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//Syncpeer//PIM//EN",
-    "BEGIN:VEVENT",
-    `UID:${args.uid}`,
-    `DTSTAMP:${toIcsUtc(Date.now())}`,
-    `DTSTART:${toIcsUtc(args.startMs)}`,
-    `DTEND:${toIcsUtc(args.endMs)}`,
-    `SUMMARY:${args.title || "Untitled Event"}`,
-    "END:VEVENT",
-    "END:VCALENDAR",
-    "",
-  ].join("\n");
-
-const readDirectoryEntriesRecursively = async (
-  remoteFs: NonNullable<AppState["session"]["remoteFs"]>,
-  folderId: string,
-  dirPath: string,
-  depthLeft: number,
-): Promise<FileEntry[]> => {
-  if (depthLeft < 0) return [];
-  const entries = await remoteFs.readDir(folderId, dirPath);
-  const nested = await Promise.all(
-    entries
-      .filter((entry) => entry.type === "directory")
-      .map((entry) => readDirectoryEntriesRecursively(remoteFs, folderId, entry.path, depthLeft - 1)),
-  );
-  return [...entries, ...nested.flat()];
-};
-
-const ensurePimFolderFavorite = async (
-  state: AppState,
-  client: SyncpeerBrowserClient,
-  folderId: string,
-  pimRoot: string,
-) => {
-  const path = normalizePath(pimRoot);
-  const key = favoriteKey(folderId, path, "folder");
-  const exists = state.favorites.items.some((item) => item.key === key);
-  if (!exists) {
-    const next = await client.upsertFavorite({
-      key,
-      folderId,
-      path,
-      name: "PIM (Contacts & Calendar)",
-      kind: "folder",
-    });
-    state.favorites.items = next;
-  }
-};
-
-const cachePimTreeOffline = async (
-  state: AppState,
-  client: SyncpeerBrowserClient,
-  folderId: string,
-  remoteFs: NonNullable<AppState["session"]["remoteFs"]>,
-  pimRoot: string,
-) => {
-  const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, pimRoot, 8);
-  const files = entries.filter((entry) => entry.type === "file");
-  for (const entry of files) {
-    const bytes = await remoteFs.readFileFully(folderId, entry.path);
-    const name = entry.path.split("/").pop() ?? "file";
-    await client.cacheFile(folderId, entry.path, name, bytes, entry.modifiedMs);
-    updateCachedKey(state, folderId, entry.path, true);
-  }
-  await refreshFolderRootCachedStatuses(state, client, [folderId]);
 };
 
 const remoteHasUnapprovedFolderShare = (
@@ -506,363 +281,23 @@ export const createAppActions = (args: {
   state: AppState;
   client: SyncpeerBrowserClient;
   sessionStore: SyncpeerSessionStore;
+  transfers: TransferRuntime;
 }) => {
-  interface DiagnosticsCategory {
-    id: string;
-    name: string;
-    description: string;
-  }
-
-  interface DiagnosticsTestItem {
-    id: string;
-    name: string;
-    description: string;
-    categoryId: string;
-  }
-
-  interface DiagnosticsCatalog {
-    categories: DiagnosticsCategory[];
-    tests: DiagnosticsTestItem[];
-  }
-
-  interface DiagnosticsDefinition {
-    test: DiagnosticsTestItem;
-    fn: TaskyonTestFn;
-  }
-
-  const { state, client, sessionStore } = args;
+  const { state, client, sessionStore, transfers } = args;
   const appInfo = getAppBuildInfo();
-  const runtimeSurface = appInfo.runtimeSurface;
-  let downloadNoticeTimer: number | null = null;
-  let lastTransferNotificationAtMs = 0;
-  let notificationPermissionRequested = false;
-  let transferNotificationSetup: Promise<void> | null = null;
-  let transferNotificationTimer: ReturnType<typeof setTimeout> | null = null;
-  let transferNotificationInFlight: Promise<void> | null = null;
-  let pendingTransferNotification: {
-    id: number;
-    title: string;
-    body: string;
-    ongoing: boolean;
-    force: boolean;
-    progressPercent?: number;
-    cancellable: boolean;
-  } | null = null;
-  let transferState = createTransferNotificationState();
-  const transferCancellations = new Map<
-    string,
-    { direction: ActiveTransfer["direction"]; cancel: () => void }
-  >();
-  let transferRuntimeStarted = false;
-  let transferRuntimeTransition = Promise.resolve();
+  const {
+    begin: beginManagedTransfer,
+    update: updateManagedTransfer,
+    finish: finishManagedTransfer,
+    setDownloadNotice,
+    setActiveDownload,
+    clearActiveDownload,
+    transferInProgress,
+    hasActiveDirection,
+  } = transfers;
   let connectInFlight: Promise<void> | null = null;
   let connectionSettingsTimer: ReturnType<typeof setTimeout> | null = null;
   let connectionSettingsGeneration = 0;
-
-  const setDownloadNotice = (message: string, clearAfterMs = 0) => {
-    state.ui.downloadNotice = message;
-    if (downloadNoticeTimer) {
-      clearTimeout(downloadNoticeTimer);
-      downloadNoticeTimer = null;
-    }
-    if (clearAfterMs > 0 && typeof window !== "undefined") {
-      downloadNoticeTimer = window.setTimeout(() => {
-        state.ui.downloadNotice = "";
-        downloadNoticeTimer = null;
-      }, clearAfterMs);
-    }
-  };
-
-  const setActiveDownload = (
-    key: string,
-    value: { name: string; text: string; progressPercent: number },
-  ) => {
-    state.favorites.activeDownloads = {
-      ...state.favorites.activeDownloads,
-      [key]: {
-        ...value,
-        progressPercent: Math.max(0, Math.min(100, value.progressPercent)),
-      },
-    };
-    state.favorites.isDownloading = Object.keys(state.favorites.activeDownloads).length > 0;
-  };
-
-  const clearActiveDownload = (key: string) => {
-    const remaining = { ...state.favorites.activeDownloads };
-    delete remaining[key];
-    state.favorites.activeDownloads = remaining;
-    state.favorites.isDownloading = Object.keys(remaining).length > 0;
-  };
-
-  const ensureNativeNotificationPermission = async () => {
-    try {
-      const alreadyGranted = await isNativeNotificationPermissionGranted();
-      if (alreadyGranted) return true;
-      if (notificationPermissionRequested) return false;
-      notificationPermissionRequested = true;
-      const permission = await requestNativeNotificationPermission();
-      return permission === "granted";
-    } catch {
-      return false;
-    }
-  };
-
-  const ensureTransferNotificationSetup = () => {
-    if (!supportsOngoingTransferNotifications(runtimeSurface)) return Promise.resolve();
-    if (!transferNotificationSetup) {
-      transferNotificationSetup = (async () => {
-        if (client.updateTransferNotification) {
-          await addPluginListener<{ actionId?: string; notification?: { id?: number } }>(
-            "syncpeer-android",
-            "transferAction",
-            (event) => {
-              if (
-                event.actionId === TRANSFER_NOTIFICATION_CANCEL_ACTION &&
-                Number(event.notification?.id) === TRANSFER_NOTIFICATION_ID
-              ) {
-                for (const transfer of transferCancellations.values()) transfer.cancel();
-              }
-            },
-          );
-          return;
-        }
-        await createNativeNotificationChannel({
-          id: TRANSFER_NOTIFICATION_CHANNEL_ID,
-          name: "Syncpeer transfers",
-          description: "File transfer progress",
-          importance: NativeNotificationImportance.Low,
-          vibration: false,
-          lights: false,
-        });
-        await registerNativeNotificationActionTypes([{
-          id: TRANSFER_NOTIFICATION_ACTION_TYPE,
-          actions: [{ id: TRANSFER_NOTIFICATION_CANCEL_ACTION, title: "Cancel" }],
-        }]);
-        await onNativeNotificationAction((event) => {
-          const data = event as unknown as {
-            actionId?: string;
-            notification?: { id?: number };
-          };
-          if (
-            data.actionId === TRANSFER_NOTIFICATION_CANCEL_ACTION &&
-            Number(data.notification?.id) === TRANSFER_NOTIFICATION_ID
-          ) {
-            for (const transfer of transferCancellations.values()) transfer.cancel();
-          }
-        });
-      })().catch(() => undefined);
-    }
-    return transferNotificationSetup;
-  };
-
-  const flushTransferNotification = async () => {
-    if (transferNotificationInFlight || !pendingTransferNotification) return;
-    const next = pendingTransferNotification;
-    pendingTransferNotification = null;
-    transferNotificationInFlight = (async () => {
-      await ensureTransferNotificationSetup();
-      const granted = await ensureNativeNotificationPermission();
-      if (!granted) return;
-      const androidNotification = supportsOngoingTransferNotifications(runtimeSurface);
-      try {
-        if (androidNotification && client.updateTransferNotification) {
-          await client.updateTransferNotification({
-            title: next.title,
-            body: next.body,
-            progress: next.progressPercent,
-            ongoing: next.ongoing,
-            cancellable: next.cancellable,
-          });
-        } else {
-          sendNativeNotification({
-            id: next.id,
-            title: next.title,
-            body: next.body,
-            ...(androidNotification ? {
-              channelId: TRANSFER_NOTIFICATION_CHANNEL_ID,
-              ...(next.ongoing && next.cancellable
-                ? { actionTypeId: TRANSFER_NOTIFICATION_ACTION_TYPE }
-                : {}),
-            } : {}),
-            ongoing: next.ongoing,
-            autoCancel: !next.ongoing,
-            silent: true,
-          });
-        }
-        lastTransferNotificationAtMs = Date.now();
-      } catch {
-        // Best-effort only.
-      }
-    })().finally(() => {
-      transferNotificationInFlight = null;
-      if (pendingTransferNotification) {
-        const elapsed = Date.now() - lastTransferNotificationAtMs;
-        if (pendingTransferNotification.force || elapsed >= TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS) {
-          void flushTransferNotification();
-        } else if (!transferNotificationTimer) {
-          transferNotificationTimer = setTimeout(() => {
-            transferNotificationTimer = null;
-            void flushTransferNotification();
-          }, TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS - elapsed);
-        }
-      }
-    });
-    await transferNotificationInFlight;
-  };
-
-  const maybeTransferNotification = async (
-    id: number,
-    title: string,
-    body: string,
-    options?: {
-      ongoing?: boolean;
-      force?: boolean;
-      progress?: boolean;
-      progressPercent?: number;
-      cancellable?: boolean;
-    },
-  ): Promise<void> => {
-    if (options?.progress && !supportsOngoingTransferNotifications(runtimeSurface)) return;
-    pendingTransferNotification = {
-      id,
-      title,
-      body,
-      ongoing: options?.ongoing ?? true,
-      force: options?.force ?? false,
-      progressPercent: options?.progressPercent,
-      cancellable: options?.cancellable ?? false,
-    };
-    const elapsed = Date.now() - lastTransferNotificationAtMs;
-    if (options?.force || (!transferNotificationInFlight && elapsed >= TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS)) {
-      await flushTransferNotification();
-      return;
-    }
-    if (!transferNotificationTimer) {
-        transferNotificationTimer = setTimeout(() => {
-          transferNotificationTimer = null;
-          void flushTransferNotification();
-        }, Math.max(0, TRANSFER_NOTIFICATION_UPDATE_INTERVAL_MS - elapsed));
-    }
-  };
-
-  const clearTransferNotification = async (id: number) => {
-    if (!supportsOngoingTransferNotifications(runtimeSurface)) return;
-    pendingTransferNotification = null;
-    if (transferNotificationTimer) {
-      clearTimeout(transferNotificationTimer);
-      transferNotificationTimer = null;
-    }
-    if (transferNotificationInFlight) {
-      await transferNotificationInFlight.catch(() => undefined);
-    }
-    if (transferState.active.length > 0) return;
-    try {
-      await client.stopTransfer?.();
-    } catch {
-      // The runtime transition already reported failures; notification cleanup is best-effort.
-    }
-    try {
-      await removeActiveNativeNotifications([{ id }]);
-    } catch {
-      // Best-effort only.
-    }
-  };
-
-  const reconcileTransferRuntime = () => {
-    transferRuntimeTransition = transferRuntimeTransition
-      .catch(() => undefined)
-      .then(async () => {
-        const shouldRun = transferState.active.length > 0;
-        if (shouldRun === transferRuntimeStarted) return;
-        if (shouldRun) {
-          transferRuntimeStarted = true;
-          try {
-            await client.startTransfer?.(
-              transferState.active.length === 1
-                ? transferState.active[0].label
-                : `${transferState.active.length} transfers`,
-            );
-          } catch (error) {
-            transferRuntimeStarted = false;
-            reportActionError(state, "transfer_runtime.start_failed", error);
-          }
-          return;
-        }
-        transferRuntimeStarted = false;
-        try {
-          await client.stopTransfer?.();
-        } catch (error) {
-          reportActionError(state, "transfer_runtime.stop_failed", error);
-        }
-      });
-    return transferRuntimeTransition;
-  };
-
-  const renderTransferNotification = async (force = false) => {
-    const view = transferNotificationView(transferState);
-    if (!view) {
-      await clearTransferNotification(TRANSFER_NOTIFICATION_ID);
-      return;
-    }
-    await maybeTransferNotification(
-      TRANSFER_NOTIFICATION_ID,
-      view.title,
-      view.body,
-      {
-        ongoing: view.ongoing,
-        force,
-        progress: view.ongoing,
-        progressPercent: view.progress,
-        cancellable: view.cancellable,
-      },
-    );
-  };
-
-  const beginManagedTransfer = async (
-    transfer: ActiveTransfer,
-    cancel: () => void,
-  ) => {
-    transferState = reduceTransferNotification(transferState, {
-      type: "begin",
-      transfer,
-    });
-    transferCancellations.set(transfer.id, { direction: transfer.direction, cancel });
-    await reconcileTransferRuntime();
-    await renderTransferNotification(true);
-  };
-
-  const updateManagedTransfer = (
-    id: string,
-    completedBytes: number,
-    totalBytes: number,
-  ) => {
-    transferState = reduceTransferNotification(transferState, {
-      type: "progress",
-      id,
-      completedBytes,
-      totalBytes,
-    });
-    void renderTransferNotification();
-  };
-
-  const finishManagedTransfer = async (
-    id: string,
-    outcome: "completed" | "failed" | "cancelled",
-  ) => {
-    transferCancellations.delete(id);
-    transferState = reduceTransferNotification(transferState, {
-      type: "finish",
-      id,
-      outcome,
-    });
-    await reconcileTransferRuntime();
-    await renderTransferNotification(true);
-  };
-
-  const transferInProgress = () =>
-    Object.keys(state.favorites.activeDownloads).length > 0 ||
-    state.ui.uploadProgressActive ||
-    state.sync.isSyncingStarredFiles;
 
   const connect = async (targetDeviceId?: string) => {
     if (connectInFlight) {
@@ -1980,17 +1415,6 @@ export const createAppActions = (args: {
     }
   };
 
-  const cancelDownload = (folderId?: string, path?: string) => {
-    if (!state.favorites.isDownloading) return;
-    if (folderId !== undefined && path !== undefined) {
-      transferCancellations.get(`download:${cachedFileKey(folderId, path)}`)?.cancel();
-      return;
-    }
-    for (const transfer of transferCancellations.values()) {
-      if (transfer.direction === "download") transfer.cancel();
-    }
-  };
-
   const openOrDownloadFile = async (folderId: string, path: string, name: string) => {
     if (cacheFileKeyExists(state, folderId, path)) {
       await openCachedFile(folderId, path);
@@ -2410,7 +1834,7 @@ export const createAppActions = (args: {
       setDownloadNotice(`Upload failed: ${fileName}`, 6000);
     } finally {
       await finishManagedTransfer(transferId, transferOutcome);
-      if (transferState.active.every((item) => item.direction !== "upload")) {
+      if (!hasActiveDirection("upload")) {
         state.ui.uploadProgressActive = false;
         state.ui.uploadProgressPercent = 0;
         state.ui.uploadProgressEta = "";
@@ -2471,10 +1895,6 @@ export const createAppActions = (args: {
     document.getElementById("folder-upload-input")?.click();
   };
 
-  const cancelTransfers = () => {
-    for (const transfer of transferCancellations.values()) transfer.cancel();
-  };
-
   const setAutoConnectPaused = (paused: boolean) => {
     state.ui.autoConnectPaused = paused;
   };
@@ -2482,331 +1902,6 @@ export const createAppActions = (args: {
   const setAppVisibility = (isVisible: boolean) => {
     state.ui.isAppVisible = isVisible;
     void sessionStore.actions.setForeground(isVisible);
-  };
-
-  const pickAndroidPimDirectory = async () => {
-    try {
-      const treeUri = await client.pickAndroidSafDirectory();
-      await client.setAndroidSafTreeUri(treeUri);
-      state.pim.syncFolderMode = "choose";
-      state.pim.syncFolderPath = treeUri;
-      state.devices.identityNotice = "Android PIM directory selected.";
-    } catch (error) {
-      reportActionError(state, "pim.android.pick_directory.failed", error);
-    }
-  };
-
-  const initializePimFolder = async () => {
-    if (!state.pim.enabled) {
-      state.ui.uploadMessage = "Enable Contacts + Calendar Sync first.";
-      return;
-    }
-    if (!state.session.isConnected || !state.session.remoteFs) {
-      state.ui.uploadMessage = "Connect first to initialize PIM structure.";
-      return;
-    }
-    const folderId = state.session.currentFolderId;
-    if (!folderId) {
-      state.ui.uploadMessage = "Open a folder first, then initialize PIM structure.";
-      return;
-    }
-    if (!state.session.remoteFs.writeFileFully) {
-      state.ui.uploadMessage = "Current connection does not support writing files.";
-      return;
-    }
-    try {
-      const root = normalizePimRoot(state.pim.syncFolderPath);
-      const encoder = new TextEncoder();
-      const now = Date.now();
-      const epoch = new Date(now).toISOString().slice(0, 7);
-      const contactsCollection = "default";
-      const calendarCollection = "default";
-      const contactsManifestPath = `${root}/${sidecarManifestPath("contacts", contactsCollection)}`;
-      const calendarManifestPath = `${root}/${sidecarManifestPath("calendar", calendarCollection)}`;
-      const contactsOpPath = `${root}/${sidecarOpPath({
-        domain: "contacts",
-        collectionId: contactsCollection,
-        epoch,
-        opId: `bootstrap-${now}`,
-      })}`;
-      const calendarOpPath = `${root}/${sidecarOpPath({
-        domain: "calendar",
-        collectionId: calendarCollection,
-        epoch,
-        opId: `bootstrap-${now}`,
-      })}`;
-      const contactsManifest = JSON.stringify(
-        {
-          schemaVersion: 1,
-          domain: "contacts",
-          collectionId: contactsCollection,
-          canonical: "one_entry_per_file_vcf",
-          silentMerge: true,
-          initializedAtMs: now,
-        },
-        null,
-        2,
-      );
-      const calendarManifest = JSON.stringify(
-        {
-          schemaVersion: 1,
-          domain: "calendar",
-          collectionId: calendarCollection,
-          canonical: "one_entry_per_file_ics",
-          silentMerge: true,
-          initializedAtMs: now,
-        },
-        null,
-        2,
-      );
-      const bootstrapContactPath = `${root}/syncpeer/pim/contacts/collections/${contactsCollection}/entries/bootstrap-contact.vcf`;
-      const bootstrapEventPath = `${root}/syncpeer/pim/calendar/collections/${calendarCollection}/entries/bootstrap-event.ics`;
-      const bootstrapContact = `BEGIN:VCARD\nVERSION:3.0\nUID:bootstrap-contact\nFN:Syncpeer Contact Bootstrap\nEND:VCARD\n`;
-      const bootstrapEvent = `BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Syncpeer//PIM//EN\nBEGIN:VEVENT\nUID:bootstrap-event\nDTSTAMP:20260101T000000Z\nDTSTART:20260101T090000Z\nDTEND:20260101T093000Z\nSUMMARY:Syncpeer Calendar Bootstrap\nEND:VEVENT\nEND:VCALENDAR\n`;
-      await state.session.remoteFs.writeFileFully(
-        folderId,
-        contactsManifestPath,
-        encoder.encode(contactsManifest),
-        { modifiedMs: now },
-      );
-      await state.session.remoteFs.writeFileFully(
-        folderId,
-        calendarManifestPath,
-        encoder.encode(calendarManifest),
-        { modifiedMs: now },
-      );
-      await state.session.remoteFs.writeFileFully(
-        folderId,
-        contactsOpPath,
-        encoder.encode(JSON.stringify({ kind: "bootstrap", createdAtMs: now })),
-        { modifiedMs: now },
-      );
-      await state.session.remoteFs.writeFileFully(
-        folderId,
-        calendarOpPath,
-        encoder.encode(JSON.stringify({ kind: "bootstrap", createdAtMs: now })),
-        { modifiedMs: now },
-      );
-      await state.session.remoteFs.writeFileFully(
-        folderId,
-        bootstrapContactPath,
-        encoder.encode(bootstrapContact),
-        { modifiedMs: now },
-      );
-      await state.session.remoteFs.writeFileFully(
-        folderId,
-        bootstrapEventPath,
-        encoder.encode(bootstrapEvent),
-        { modifiedMs: now },
-      );
-      const pimTreeRoot = `${root}/syncpeer/pim`;
-      await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
-      await cachePimTreeOffline(state, client, folderId, state.session.remoteFs, pimTreeRoot);
-      state.ui.uploadMessage = "Initialized contacts/calendar structure in current folder.";
-      await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
-    } catch (error) {
-      reportActionError(state, "pim.initialize_folder.failed", error, {
-        folderId: state.session.currentFolderId,
-      });
-    }
-  };
-
-  const syncAndroidPimNow = async () => {
-    if (!state.pim.enabled) {
-      state.ui.uploadMessage = "Enable Contacts + Calendar Sync first.";
-      return;
-    }
-    if (!state.session.isConnected || !state.session.remoteFs || !state.session.currentFolderId) {
-      state.ui.uploadMessage = "Connect and open a folder first.";
-      return;
-    }
-    if (!state.session.remoteFs.writeFileFully) {
-      state.ui.uploadMessage = "Current connection does not support writing files.";
-      return;
-    }
-    const folderId = state.session.currentFolderId;
-    const remoteFs = state.session.remoteFs;
-    const root = normalizePimRoot(state.pim.syncFolderPath);
-    const contactsEntriesDir = `${root}/syncpeer/pim/contacts/collections/default/entries`;
-    const calendarEntriesDir = `${root}/syncpeer/pim/calendar/collections/default/entries`;
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-    try {
-      let writtenContacts = 0;
-      let writtenEvents = 0;
-      let importedContacts = 0;
-      let importedEvents = 0;
-
-      if (state.pim.contactsEnabled && state.pim.androidContactsIntegration) {
-        const androidContacts = await client.listAndroidContacts();
-        for (const contact of androidContacts) {
-          const filePath = joinPath(contactsEntriesDir, `android-${contact.contactId}.vcf`);
-          const payload = toVcard({
-            uid: `android-${contact.contactId}`,
-            displayName: contact.displayName,
-            phones: contact.phones ?? [],
-            emails: contact.emails ?? [],
-          });
-          await remoteFs.writeFileFully(folderId, filePath, encoder.encode(payload), { modifiedMs: Date.now() });
-          writtenContacts += 1;
-        }
-
-        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, contactsEntriesDir, 3);
-        for (const entry of entries) {
-          if (entry.type !== "file" || !entry.path.endsWith(".vcf")) continue;
-          const name = entry.path.split("/").pop() ?? "";
-          if (!name.startsWith("android-")) continue;
-          const contactId = name.replace(/^android-/, "").replace(/\.vcf$/i, "");
-          if (!contactId.trim()) continue;
-          const bytes = await remoteFs.readFileFully(folderId, entry.path);
-          const parsed = parseVcard(decoder.decode(bytes));
-          if (!parsed.displayName) continue;
-          await client.upsertAndroidContact({
-            contactId,
-            displayName: parsed.displayName,
-            phones: parsed.phones,
-            emails: parsed.emails,
-          });
-          importedContacts += 1;
-        }
-      }
-
-      if (state.pim.calendarEnabled && state.pim.androidCalendarIntegration) {
-        const androidEvents = await client.listAndroidCalendarEvents({});
-        for (const event of androidEvents) {
-          const filePath = joinPath(calendarEntriesDir, `android-${event.eventId}.ics`);
-          const payload = toIcsEvent({
-            uid: `android-${event.eventId}`,
-            title: event.title,
-            startMs: event.startMs,
-            endMs: event.endMs,
-          });
-          await remoteFs.writeFileFully(folderId, filePath, encoder.encode(payload), { modifiedMs: Date.now() });
-          writtenEvents += 1;
-        }
-
-        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, calendarEntriesDir, 3);
-        for (const entry of entries) {
-          if (entry.type !== "file" || !entry.path.endsWith(".ics")) continue;
-          const name = entry.path.split("/").pop() ?? "";
-          if (!name.startsWith("android-")) continue;
-          const eventId = name.replace(/^android-/, "").replace(/\.ics$/i, "");
-          if (!eventId.trim()) continue;
-          const bytes = await remoteFs.readFileFully(folderId, entry.path);
-          const parsed = parseIcsEvent(decoder.decode(bytes));
-          if (!parsed.title || parsed.startMs <= 0 || parsed.endMs <= 0) continue;
-          await client.upsertAndroidCalendarEvent({
-            eventId,
-            title: parsed.title,
-            startMs: parsed.startMs,
-            endMs: parsed.endMs,
-            allDay: false,
-          });
-          importedEvents += 1;
-        }
-      }
-
-      const pimTreeRoot = `${root}/syncpeer/pim`;
-      await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
-      await cachePimTreeOffline(state, client, folderId, remoteFs, pimTreeRoot);
-
-      state.ui.uploadMessage =
-        `PIM sync complete. Wrote ${writtenContacts} contacts + ${writtenEvents} events; imported ${importedContacts} contacts + ${importedEvents} events.`;
-      await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
-    } catch (error) {
-      reportActionError(state, "pim.android.sync_now.failed", error, {
-        folderId: state.session.currentFolderId,
-      });
-    }
-  };
-
-  const importProviderPimFromSyncthingFolder = async () => {
-    if (!state.pim.enabled) {
-      state.ui.uploadMessage = "Enable Contacts + Calendar Sync first.";
-      return;
-    }
-    if (!state.session.isConnected || !state.session.remoteFs || !state.session.currentFolderId) {
-      state.ui.uploadMessage = "Connect and open a folder first.";
-      return;
-    }
-    const folderId = state.session.currentFolderId;
-    const remoteFs = state.session.remoteFs;
-    const root = normalizePimRoot(state.pim.syncFolderPath);
-    const contactsEntriesDir = `${root}/syncpeer/pim/contacts/collections/default/entries`;
-    const calendarEntriesDir = `${root}/syncpeer/pim/calendar/collections/default/entries`;
-    const decoder = new TextDecoder();
-    try {
-      let importedContacts = 0;
-      let importedEvents = 0;
-
-      if (state.pim.contactsEnabled && state.pim.androidContactsIntegration) {
-        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, contactsEntriesDir, 3);
-        for (const entry of entries) {
-          if (entry.type !== "file" || !entry.path.endsWith(".vcf")) continue;
-          const name = entry.path.split("/").pop() ?? "";
-          if (name.startsWith("android-")) continue;
-          const bytes = await remoteFs.readFileFully(folderId, entry.path);
-          const vcards = splitVcards(decoder.decode(bytes));
-          for (const vcardText of vcards) {
-            const parsed = parseVcard(vcardText);
-            if (!parsed.displayName) continue;
-            await client.upsertAndroidContact({
-              displayName: parsed.displayName,
-              phones: parsed.phones,
-              emails: parsed.emails,
-            });
-            importedContacts += 1;
-          }
-        }
-      }
-
-      if (state.pim.calendarEnabled && state.pim.androidCalendarIntegration) {
-        const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, calendarEntriesDir, 3);
-        for (const entry of entries) {
-          if (entry.type !== "file" || !entry.path.endsWith(".ics")) continue;
-          const name = entry.path.split("/").pop() ?? "";
-          if (name.startsWith("android-")) continue;
-          const bytes = await remoteFs.readFileFully(folderId, entry.path);
-          const text = decoder.decode(bytes);
-          const eventBlocks = splitIcsEvents(text);
-          if (eventBlocks.length === 0) {
-            const parsedSingle = parseIcsEvent(text);
-            if (parsedSingle.title && parsedSingle.startMs > 0 && parsedSingle.endMs > 0) {
-              await client.upsertAndroidCalendarEvent({
-                title: parsedSingle.title,
-                startMs: parsedSingle.startMs,
-                endMs: parsedSingle.endMs,
-                allDay: false,
-              });
-              importedEvents += 1;
-            }
-            continue;
-          }
-          for (const eventText of eventBlocks) {
-            const parsed = parseIcsEvent(eventText);
-            if (!parsed.title || parsed.startMs <= 0 || parsed.endMs <= 0) continue;
-            await client.upsertAndroidCalendarEvent({
-              title: parsed.title,
-              startMs: parsed.startMs,
-              endMs: parsed.endMs,
-              allDay: false,
-            });
-            importedEvents += 1;
-          }
-        }
-      }
-
-      const pimTreeRoot = `${root}/syncpeer/pim`;
-      await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
-      await cachePimTreeOffline(state, client, folderId, remoteFs, pimTreeRoot);
-
-      state.ui.uploadMessage =
-        `Provider import complete. Imported ${importedContacts} contacts and ${importedEvents} events into Android.`;
-    } catch (error) {
-      reportActionError(state, "pim.provider_import.failed", error, {
-        folderId: state.session.currentFolderId,
-      });
-    }
   };
 
   const onNetworkOnline = async () => {
@@ -2842,416 +1937,6 @@ export const createAppActions = (args: {
     state.currentPage = "main";
   };
 
-  const runFolderDiagnosticsTest = async (args?: {
-    expectedAdvertisedDeviceIds?: string[];
-    failOnExpectedMissing?: boolean;
-  }) => {
-    const localDeviceId = normalizeDeviceId(state.devices.currentDeviceId);
-    const knownDeviceIds = state.devices.savedDevices
-      .map((device) => normalizeDeviceId(device.id))
-      .filter((deviceId) => deviceId !== "" && deviceId !== localDeviceId);
-    const expectedDeviceIds = (args?.expectedAdvertisedDeviceIds ?? [])
-      .map((deviceId) => normalizeDeviceId(String(deviceId ?? "")))
-      .filter((deviceId) => deviceId !== "");
-    const test: TaskyonTestFn = async () => {
-      const report = await runFolderContentDiagnostics({
-        client,
-        options: connectionDetails(state),
-        knownDeviceIds,
-        expectedDeviceIds,
-        maxPollAttempts: 16,
-        pollIntervalMs: 250,
-      });
-      if (
-        args?.failOnExpectedMissing &&
-        report.advertisedDevices.missingExpectedDeviceIds.length > 0
-      ) {
-        throw new Error(
-          `Expected advertised device IDs missing: ${report.advertisedDevices.missingExpectedDeviceIds.join(", ")}`,
-        );
-      }
-      return report;
-    };
-    test.description = "End-to-end folder/index/readDir diagnostics";
-    test.timeoutMs = 90_000;
-    const uploadProbe: TaskyonTestFn = async () => {
-      const diagSession = createSyncpeerSessionStore({
-        transport: client,
-      });
-      await diagSession.actions.disconnect();
-      await diagSession.actions.connect(connectionDetails(state));
-      const connected = diagSession.getState();
-      const candidateFolder = connected.folders.find(
-        (folder) =>
-          !folder.encrypted &&
-          !folder.readOnly &&
-          !folder.needsPassword &&
-          Number(folder.stopReason ?? 0) === 0 &&
-          folder.localDevicePresentInFolder !== false,
-      );
-      if (!candidateFolder) {
-        return {
-          skipped: true,
-          reason:
-            "No writable non-encrypted folder available for upload probe.",
-        };
-      }
-      await diagSession.actions.openFolder(candidateFolder.id, connectionDetails(state));
-      const current = diagSession.getState();
-      if (!current.remoteFs?.writeFileFully) {
-        throw new Error("Session transport does not expose writeFileFully.");
-      }
-      const payload = `hello_from_syncpeer ${new Date().toISOString()}\n`;
-      const targetPath = normalizePath(
-        [current.currentPath, "hello_from_syncpeer.txt"].filter(Boolean).join("/"),
-      );
-      await current.remoteFs.writeFileFully(
-        candidateFolder.id,
-        targetPath,
-        new TextEncoder().encode(payload),
-        { modifiedMs: Date.now() },
-      );
-      await diagSession.actions.reloadCurrentDirectory(connectionDetails(state));
-      const after = diagSession.getState();
-      const listed = after.entries.some((entry) => entry.path === targetPath);
-      await diagSession.actions.disconnect();
-      return {
-        skipped: false,
-        folderId: candidateFolder.id,
-        targetPath,
-        listedAfterUpload: listed,
-        payloadBytes: payload.length,
-      };
-    };
-    uploadProbe.description = "Upload probe (hello_from_syncpeer.txt)";
-    uploadProbe.timeoutMs = 60_000;
-    const registry = buildDiagnosticsRegistry({
-      builtins: [
-        {
-          testName: "folderContentDiagnostics",
-          func: test,
-          sourcePath: "packages/app/src/lib/folderDiagnostics.ts",
-        },
-        {
-          testName: "uploadProbeDiagnostics",
-          func: uploadProbe,
-          sourcePath: "packages/app/src/lib/folderDiagnostics.ts",
-        },
-      ],
-      modules: [],
-    });
-    const results = await runDiagnosticsTests(registry.tests, {
-      details: true,
-      timeoutMs: 90_000,
-    });
-    const passed = results.filter((result: { ok: boolean }) => result.ok).length;
-    return {
-      buildInfo: appInfo,
-      summary: {
-        runAtIso: new Date().toISOString(),
-        allPassed: passed === results.length,
-        passed,
-        failed: results.length - passed,
-      },
-      results,
-    };
-  };
-
-  const diagnosticsCategories: DiagnosticsCategory[] = [
-    {
-      id: "core",
-      name: "Core Connectivity",
-      description: "Folder/index diagnostics and upload probe checks.",
-    },
-    {
-      id: "pim",
-      name: "PIM",
-      description: "Canonical path and basic .vcf/.ics serialization checks.",
-    },
-    {
-      id: "syncthing",
-      name: "Syncthing",
-      description: "PIM folder favorite/offline pinning and write/read probes.",
-    },
-    {
-      id: "android",
-      name: "Android",
-      description: "Android provider bridge smoke tests.",
-    },
-  ];
-
-  const buildDiagnosticsDefinitions = (args?: {
-    expectedAdvertisedDeviceIds?: string[];
-    failOnExpectedMissing?: boolean;
-  }): DiagnosticsDefinition[] => [
-    {
-      test: {
-        id: "core.folder_diagnostics",
-        name: "Folder Diagnostics",
-        description: "Runs folder/index diagnostics plus upload probe.",
-        categoryId: "core",
-      },
-      fn: async () => runFolderDiagnosticsTest(args),
-    },
-    {
-      test: {
-        id: "pim.canonical_paths",
-        name: "PIM Canonical Paths",
-        description: "Verifies one-entry-per-file .vcf/.ics and sidecar path layout.",
-        categoryId: "pim",
-      },
-      fn: async () => {
-        const contactPath = canonicalRecordPath({
-          domain: "contacts",
-          collectionId: "default",
-          recordId: "alice",
-        });
-        const eventPath = canonicalRecordPath({
-          domain: "calendar",
-          collectionId: "default",
-          recordId: "event-1",
-        });
-        const manifest = sidecarManifestPath("contacts", "default");
-        const opPath = sidecarOpPath({
-          domain: "calendar",
-          collectionId: "default",
-          epoch: "2026-05",
-          opId: "devA-1",
-        });
-        return { contactPath, eventPath, manifest, opPath };
-      },
-    },
-    {
-      test: {
-        id: "pim.vcf_roundtrip",
-        name: "PIM VCF Roundtrip",
-        description: "Serializes and parses contact payload fields.",
-        categoryId: "pim",
-      },
-      fn: async () => {
-        const payload = toVcard({
-          uid: "test-contact",
-          displayName: "Alice Example",
-          phones: ["+1-555-1234"],
-          emails: ["alice@example.com"],
-        });
-        return { parsed: parseVcard(payload) };
-      },
-    },
-    {
-      test: {
-        id: "pim.ics_roundtrip",
-        name: "PIM ICS Roundtrip",
-        description: "Serializes and parses basic event payload fields.",
-        categoryId: "pim",
-      },
-      fn: async () => {
-        const payload = toIcsEvent({
-          uid: "test-event",
-          title: "Example Meeting",
-          startMs: Date.UTC(2026, 0, 1, 9, 0, 0),
-          endMs: Date.UTC(2026, 0, 1, 10, 0, 0),
-        });
-        return { parsed: parseIcsEvent(payload) };
-      },
-    },
-    {
-      test: {
-        id: "syncthing.pim_favorite_cached",
-        name: "PIM Favorite + Cache Status",
-        description: "Checks whether PIM root is favorited and cached offline.",
-        categoryId: "syncthing",
-      },
-      fn: async () => {
-        const folderId = state.session.currentFolderId;
-        if (!state.session.isConnected || !folderId) {
-          return { skipped: true, reason: "Connect and open a folder first." };
-        }
-        const root = normalizePimRoot(state.pim.syncFolderPath);
-        const pimTreeRoot = `${root}/syncpeer/pim`;
-        const key = favoriteKey(folderId, normalizePath(pimTreeRoot), "folder");
-        const favorited = state.favorites.items.some((item) => item.key === key);
-        const statuses = await client.getCachedStatuses(folderId, [pimTreeRoot]);
-        return { favorited, statuses };
-      },
-    },
-    {
-      test: {
-        id: "syncthing.pim_write_read_probe",
-        name: "PIM Write/Read Probe",
-        description: "Writes a probe vCard file and reads it back.",
-        categoryId: "syncthing",
-      },
-      fn: async () => {
-        const folderId = state.session.currentFolderId;
-        const remoteFs = state.session.remoteFs;
-        if (!state.session.isConnected || !folderId || !remoteFs?.writeFileFully) {
-          return { skipped: true, reason: "Writable connected folder required." };
-        }
-        const root = normalizePimRoot(state.pim.syncFolderPath);
-        const probePath = joinPath(
-          root,
-          "syncpeer/pim/contacts/collections/default/entries/probe-contact.vcf",
-        );
-        const payload = toVcard({
-          uid: "probe-contact",
-          displayName: "Probe Contact",
-          phones: ["+1-555-0000"],
-          emails: ["probe@example.com"],
-        });
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        await remoteFs.writeFileFully(folderId, probePath, encoder.encode(payload), {
-          modifiedMs: Date.now(),
-        });
-        const readBack = decoder.decode(await remoteFs.readFileFully(folderId, probePath));
-        return { probePath, parsed: parseVcard(readBack) };
-      },
-    },
-    {
-      test: {
-        id: "android.contacts_list_smoke",
-        name: "Android Contacts List Smoke",
-        description: "Calls Android contacts provider bridge list endpoint.",
-        categoryId: "android",
-      },
-      fn: async () => {
-        try {
-          const contacts = await client.listAndroidContacts();
-          return { supported: true, count: contacts.length };
-        } catch (error) {
-          return {
-            supported: false,
-            skipped: true,
-            reason: error instanceof Error ? error.message : String(error),
-          };
-        }
-      },
-    },
-    {
-      test: {
-        id: "android.calendar_list_smoke",
-        name: "Android Calendar List Smoke",
-        description: "Calls Android calendar provider bridge list endpoint.",
-        categoryId: "android",
-      },
-      fn: async () => {
-        try {
-          const events = await client.listAndroidCalendarEvents({});
-          return { supported: true, count: events.length };
-        } catch (error) {
-          return {
-            supported: false,
-            skipped: true,
-            reason: error instanceof Error ? error.message : String(error),
-          };
-        }
-      },
-    },
-    {
-      test: {
-        id: "android.transfer_runtime_command",
-        name: "Android Transfer Runtime Command",
-        description: "Starts and stops the Android UIDT or legacy transfer runtime.",
-        categoryId: "android",
-      },
-      fn: async () => {
-        if (appInfo.runtimeSurface !== "android-ui") {
-          return { skipped: true, reason: "Android UI runtime required." };
-        }
-        if (!client.startTransfer || !client.stopTransfer) {
-          return { skipped: true, reason: "Transfer service bridge is unavailable." };
-        }
-        await client.startTransfer("Diagnostics transfer");
-        try {
-          return { supported: true, started: true };
-        } finally {
-          await client.stopTransfer();
-        }
-      },
-    },
-  ];
-
-  const loadDiagnosticsCatalog = async (): Promise<DiagnosticsCatalog> => ({
-    categories: diagnosticsCategories,
-    tests: buildDiagnosticsDefinitions().map((item) => item.test),
-  });
-
-  const runDiagnosticsTestById = async (
-    testId: string,
-    args?: { expectedAdvertisedDeviceIds?: string[]; failOnExpectedMissing?: boolean },
-  ) => {
-    const definition = buildDiagnosticsDefinitions(args).find((item) => item.test.id === testId);
-    if (!definition) throw new Error(`Unknown diagnostics test: ${testId}`);
-    const results = await runDiagnosticsTests({ [definition.test.name]: definition.fn }, { details: true });
-    const passed = results.filter((item) => item.ok).length;
-    return {
-      buildInfo: appInfo,
-      summary: {
-        runAtIso: new Date().toISOString(),
-        mode: "single",
-        testId,
-        allPassed: passed === results.length,
-        passed,
-        failed: results.length - passed,
-      },
-      results,
-    };
-  };
-
-  const runDiagnosticsCategory = async (
-    categoryId: string,
-    args?: { expectedAdvertisedDeviceIds?: string[]; failOnExpectedMissing?: boolean },
-  ) => {
-    const definitions = buildDiagnosticsDefinitions(args).filter(
-      (item) => item.test.categoryId === categoryId,
-    );
-    if (definitions.length === 0) {
-      throw new Error(`No diagnostics tests found for category: ${categoryId}`);
-    }
-    const tests: Record<string, TaskyonTestFn> = {};
-    for (const definition of definitions) {
-      tests[definition.test.name] = definition.fn;
-    }
-    const results = await runDiagnosticsTests(tests, { details: true });
-    const passed = results.filter((item) => item.ok).length;
-    return {
-      buildInfo: appInfo,
-      summary: {
-        runAtIso: new Date().toISOString(),
-        mode: "category",
-        categoryId,
-        allPassed: passed === results.length,
-        passed,
-        failed: results.length - passed,
-      },
-      results,
-    };
-  };
-
-  const runAllDiagnostics = async (
-    args?: { expectedAdvertisedDeviceIds?: string[]; failOnExpectedMissing?: boolean },
-  ) => {
-    const definitions = buildDiagnosticsDefinitions(args);
-    const tests: Record<string, TaskyonTestFn> = {};
-    for (const definition of definitions) {
-      tests[definition.test.name] = definition.fn;
-    }
-    const results = await runDiagnosticsTests(tests, { details: true });
-    const passed = results.filter((item) => item.ok).length;
-    return {
-      buildInfo: appInfo,
-      summary: {
-        runAtIso: new Date().toISOString(),
-        mode: "all",
-        allPassed: passed === results.length,
-        passed,
-        failed: results.length - passed,
-      },
-      results,
-    };
-  };
-
   return {
     hydrate,
     connect,
@@ -3283,7 +1968,6 @@ export const createAppActions = (args: {
     openCachedDirectory,
     openOrDownloadFile,
     downloadFile,
-    cancelDownload,
     updateFolderPasswordDraft,
     setFolderPasswordInputVisible,
     saveFolderPassword,
@@ -3304,24 +1988,14 @@ export const createAppActions = (args: {
     switchTab,
     handleUploadClick,
     handleUploadSelected,
-    cancelTransfers,
     setAutoConnectPaused,
     setAppVisibility,
     onNetworkOnline,
     onAppForeground,
-    pickAndroidPimDirectory,
-    initializePimFolder,
-    syncAndroidPimNow,
-    importProviderPimFromSyncthingFolder,
     openDiagnosticsPage,
     closeDiagnosticsPage,
     openAboutPage,
     closeAboutPage,
-    runFolderDiagnosticsTest,
-    loadDiagnosticsCatalog,
-    runDiagnosticsTestById,
-    runDiagnosticsCategory,
-    runAllDiagnostics,
     persist: () => persistState(state),
     restoreOfflineSnapshot: (deviceId?: string, reason?: string) =>
       restoreOfflineSnapshot(state, clearDirectoryView, deviceId, reason),

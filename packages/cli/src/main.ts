@@ -294,14 +294,42 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.floor(ms)));
 }
 
-async function main() {
-  reexecuteWithNativeQuicIfAvailable();
-  const program = new Command();
-  const appInfo = getCliBuildInfo();
+
+function rootCliOptions(command: Command): CliOptions {
+  return (command.parent ?? command).opts<CliOptions>();
+}
+
+type RemoteFileSystem = Awaited<ReturnType<typeof openRemoteFs>>["remoteFs"];
+type SessionAction = (remoteFs: RemoteFileSystem) => Promise<void>;
+
+async function withSession(command: Command, run: SessionAction): Promise<void> {
+  const session = await openRemoteFs(rootCliOptions(command));
+  try {
+    await run(session.remoteFs);
+  } finally {
+    await session.close();
+  }
+}
+
+function configureProgram(
+  program: Command,
+  appInfo: ReturnType<typeof getCliBuildInfo>,
+): void {
   program
     .name("syncpeer")
     .description("Syncthing BEP client with read and folder-sync support")
-    .version(appInfo.appVersion, "-V, --version", "Show Syncpeer version")
+    .version(appInfo.appVersion, "-V, --version", "Show Syncpeer version");
+  configureGlobalOptions(program);
+}
+
+function configureGlobalOptions(program: Command): void {
+  configureConnectionOptions(program);
+  configureDiscoveryOptions(program);
+  configureSessionOptions(program);
+}
+
+function configureConnectionOptions(program: Command): void {
+  program
     .option("--host <host>", "Remote host", "127.0.0.1")
     .option(
       "--port <port>",
@@ -316,7 +344,11 @@ async function main() {
     .option(
       "--key <file>",
       "Path to TLS private key (defaults to persisted cli-node identity)",
-    )
+    );
+}
+
+function configureDiscoveryOptions(program: Command): void {
+  program
     .option("--remote-id <id>", "Expected remote device ID")
     .option(
       "--discovery-server <url>",
@@ -337,7 +369,11 @@ async function main() {
       "--quic-only",
       "Require QUIC (diagnostics; fails when unavailable)",
       false,
-    )
+    );
+}
+
+function configureSessionOptions(program: Command): void {
+  program
     .option("--device-name <name>", "Client device name", "syncpeer-cli")
     .option(
       "--folder-password <folderId=password>",
@@ -351,76 +387,224 @@ async function main() {
       (value) => parseInt(value, 10),
       15000,
     );
+}
 
+function registerAboutCommand(
+  program: Command,
+  appInfo: ReturnType<typeof getCliBuildInfo>,
+): void {
   program
     .command("about")
     .description("Show build and runtime information")
     .action(() => {
       console.log(formatAppBuildInfo(appInfo));
     });
+}
 
-  const withSession = async (
-    run: (
-      remoteFs: Awaited<ReturnType<typeof openRemoteFs>>["remoteFs"],
-    ) => Promise<void>,
-  ) => {
-    const opts = program.opts<CliOptions>();
-    const session = await openRemoteFs(opts);
-    try {
-      await run(session.remoteFs);
-    } finally {
-      await session.close();
-    }
-  };
+function addVersioningOptions(command: Command): void {
+  command
+    .addOption(
+      new Option("--versioning <mode>", "Archive replaced/deleted files")
+        .choices(["disabled", "trash", "simple", "staggered"])
+        .default("staggered"),
+    )
+    .option(
+      "--max-versions <count>",
+      "Maximum archived versions per file",
+      (value) => parseInt(value, 10),
+    );
+}
 
+interface PeerFolderCommandOptions {
+  listen: boolean;
+  bind: string;
+  listenPort: number;
+  scanInterval: number;
+}
+
+function registerFolderCommands(program: Command): void {
+  registerPeerFolderCommand(program);
+  registerShareFolderCommand(program);
+  registerSyncFolderCommand(program);
+  registerVersionsCommand(program);
+  registerRestoreCommand(program);
+  registerUnsubscribeCommand(program);
+  registerDeleteFileCommand(program);
+}
+
+function registerPeerFolderCommand(program: Command): void {
   program
     .command("peer-folder <folderId> <localPath>")
-    .description("Synchronize a local folder with an explicitly trusted Syncpeer over TLS")
-    .option("--listen", "Accept the approved peer instead of initiating the connection", false)
+    .description(
+      "Synchronize a local folder with an explicitly trusted Syncpeer over TLS",
+    )
+    .option(
+      "--listen",
+      "Accept the approved peer instead of initiating the connection",
+      false,
+    )
     .option("--bind <host>", "Local listener interface", "127.0.0.1")
     .option("--listen-port <port>", "Local listener port", Number, 22000)
     .option("--scan-interval <ms>", "Local change scan interval", Number, 5000)
-    .action(async (folderId: string, localPath: string, config: { listen: boolean; bind: string; listenPort: number; scanInterval: number }) => {
-      const opts = program.opts<CliOptions>();
-      if (!opts.remoteId?.trim()) throw new Error("peer-folder requires --remote-id for the approved peer.");
-      if (!folderId.trim()) throw new Error("Folder ID must not be empty.");
-      if (!Number.isSafeInteger(config.scanInterval) || config.scanInterval < 100) throw new Error("Scan interval must be at least 100 ms.");
-      if (!Number.isSafeInteger(config.listenPort) || config.listenPort < 0 || config.listenPort > 65535) throw new Error("Invalid listener port.");
-      const identity = resolveIdentityPaths(opts);
-      const certPem = fs.readFileSync(identity.cert, "utf8");
-      const keyPem = fs.readFileSync(identity.key, "utf8");
-      const counter = versionCounterId(createHash("sha256").update(new X509Certificate(certPem).raw).digest());
-      const replica = await createNodeFolderReplica(fs.realpathSync(localPath), counter);
-      const options = { certPem, keyPem, expectedDeviceId: opts.remoteId, deviceName: opts.deviceName,
-        host: opts.host, port: opts.port, timeoutMs: opts.timeoutMs, replicaScanIntervalMs: config.scanInterval,
-        sharedFolders: [{ id: folderId.trim(), encryption: { mode: "plaintext" as const }, replica }] };
-      const controller = new AbortController();
-      let stop!: () => void;
-      const stopped = new Promise<void>(resolve => { stop = () => { controller.abort(); resolve(); }; });
-      process.once("SIGINT", stop); process.once("SIGTERM", stop);
-      try {
-        if (config.listen) {
-          const listener = await listenNodePeer({ ...options, host: config.bind, port: config.listenPort,
-            onSession: () => console.log("Approved peer connected."), onError: () => console.error("Peer connection failed.") });
-          console.log(`Peer listener ready: ${listener.port}`);
-          try { await stopped; } finally { await listener.close(); }
-        } else {
-          const client = createNodeSyncpeerClient();
-          while (!controller.signal.aborted) {
-            try {
-              const session = await client.openSession({ ...options, discoveryMode: opts.discoveryMode }, controller.signal);
-              console.log("Peer folder synchronization active.");
-              try { await Promise.race([stopped, session.closed]); } finally { await session.close(); }
-            } catch (error) {
-              if (!controller.signal.aborted) console.error(error instanceof Error ? error.message : String(error));
-            }
-            if (!controller.signal.aborted) await Promise.race([stopped, sleepMs(1000)]);
-          }
-        }
-      } finally { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
-    });
+    .action(runPeerFolderCommand);
+}
 
-  program
+
+function validatePeerFolderCommand(
+  opts: CliOptions,
+  folderId: string,
+  config: PeerFolderCommandOptions,
+): { remoteId: string; folderId: string } {
+  const remoteId = opts.remoteId;
+  if (!remoteId?.trim()) {
+    throw new Error("peer-folder requires --remote-id for the approved peer.");
+  }
+  const normalizedFolderId = folderId.trim();
+  if (!normalizedFolderId) throw new Error("Folder ID must not be empty.");
+  if (!Number.isSafeInteger(config.scanInterval) || config.scanInterval < 100) {
+    throw new Error("Scan interval must be at least 100 ms.");
+  }
+  if (
+    !Number.isSafeInteger(config.listenPort) ||
+    config.listenPort < 0 ||
+    config.listenPort > 65535
+  ) {
+    throw new Error("Invalid listener port.");
+  }
+  return { remoteId, folderId: normalizedFolderId };
+}
+
+async function createPeerFolderOptions(
+  opts: CliOptions,
+  remoteId: string,
+  folderId: string,
+  localPath: string,
+  scanInterval: number,
+) {
+  const identity = resolveIdentityPaths(opts);
+  const certPem = fs.readFileSync(identity.cert, "utf8");
+  const keyPem = fs.readFileSync(identity.key, "utf8");
+  const counter = versionCounterId(
+    createHash("sha256").update(new X509Certificate(certPem).raw).digest(),
+  );
+  const replica = await createNodeFolderReplica(
+    fs.realpathSync(localPath),
+    counter,
+  );
+  return {
+    certPem,
+    keyPem,
+    expectedDeviceId: remoteId,
+    deviceName: opts.deviceName,
+    host: opts.host,
+    port: opts.port,
+    timeoutMs: opts.timeoutMs,
+    replicaScanIntervalMs: scanInterval,
+    sharedFolders: [
+      {
+        id: folderId,
+        encryption: { mode: "plaintext" as const },
+        replica,
+      },
+    ],
+  };
+}
+
+type PeerFolderOptions = Awaited<ReturnType<typeof createPeerFolderOptions>>;
+
+function createAbortStopSignal() {
+  const controller = new AbortController();
+  let stop: () => void = () => {};
+  const stopped = new Promise<void>((resolve) => {
+    stop = () => {
+      controller.abort();
+      resolve();
+    };
+  });
+  return { controller, stopped, stop };
+}
+
+async function runPeerFolderListener(
+  options: PeerFolderOptions,
+  config: PeerFolderCommandOptions,
+  stopped: Promise<void>,
+): Promise<void> {
+  const listener = await listenNodePeer({
+    ...options,
+    host: config.bind,
+    port: config.listenPort,
+    onSession: () => console.log("Approved peer connected."),
+    onError: () => console.error("Peer connection failed."),
+  });
+  console.log(`Peer listener ready: ${listener.port}`);
+  try {
+    await stopped;
+  } finally {
+    await listener.close();
+  }
+}
+
+async function runPeerFolderClient(
+  options: PeerFolderOptions,
+  opts: CliOptions,
+  controller: AbortController,
+  stopped: Promise<void>,
+): Promise<void> {
+  const client = createNodeSyncpeerClient();
+  while (!controller.signal.aborted) {
+    try {
+      const session = await client.openSession(
+        { ...options, discoveryMode: opts.discoveryMode },
+        controller.signal,
+      );
+      console.log("Peer folder synchronization active.");
+      try {
+        await Promise.race([stopped, session.closed]);
+      } finally {
+        await session.close();
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        console.error(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (!controller.signal.aborted) {
+      await Promise.race([stopped, sleepMs(1000)]);
+    }
+  }
+}
+
+async function runPeerFolderCommand(
+  folderId: string,
+  localPath: string,
+  config: PeerFolderCommandOptions,
+  command: Command,
+): Promise<void> {
+  const opts = rootCliOptions(command);
+  const validated = validatePeerFolderCommand(opts, folderId, config);
+  const options = await createPeerFolderOptions(
+    opts,
+    validated.remoteId,
+    validated.folderId,
+    localPath,
+    config.scanInterval,
+  );
+  const { controller, stopped, stop } = createAbortStopSignal();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    if (config.listen) {
+      await runPeerFolderListener(options, config, stopped);
+    } else {
+      await runPeerFolderClient(options, opts, controller, stopped);
+    }
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
+  }
+}
+function registerShareFolderCommand(program: Command): void {
+  const command = program
     .command("share-folder <folderId> <localPath>")
     .description(
       "Advertise and serve a local folder; encryption is enabled by default",
@@ -442,219 +626,347 @@ async function main() {
       0,
     )
     .option("--once", "Synchronize once and exit", false)
-    .option("--delete-remote", "Propagate local deletions to the peer", false)
-    .addOption(new Option("--versioning <mode>", "Archive replaced/deleted files").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
-    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
-    .action(async (
-      folderId: string,
-      localPath: string,
-      shareOpts: ShareFolderCommandOptions,
-    ) => {
-      const opts = program.opts<CliOptions>();
-      const normalizedFolderId = folderId.trim();
-      if (!normalizedFolderId) throw new Error("folderId must not be empty");
-      const rootPath = fs.realpathSync(localPath);
-      if (!fs.statSync(rootPath).isDirectory()) {
-        throw new Error(`Local share path is not a directory: ${rootPath}`);
-      }
-      const password = shareOpts.plaintext
-        ? null
-        : shareOpts.password?.trim() || generatedFolderPassword();
-      const sharedFolder: SharedFolder = {
-        id: normalizedFolderId,
-        label: shareOpts.label?.trim() || normalizedFolderId,
-        encryption: password
-          ? { mode: "encrypted", password }
-          : { mode: "plaintext" },
-      };
-      const session = await openRemoteFs(opts, [sharedFolder]);
-      try {
-        console.log(`Shared folder ID: ${normalizedFolderId}`);
-        console.log(`Shared folder path: ${rootPath}`);
-        console.log(`Encryption: ${password ? "enabled" : "disabled"}`);
-        if (password) console.log(`Folder password: ${password}`);
-        await runFolderSyncService({
-          folderId: normalizedFolderId,
-          rootPath,
-          remoteFs: session.remoteFs,
-          options: shareOpts,
-        });
-      } finally {
-        await session.close();
-      }
-    });
+    .option("--delete-remote", "Propagate local deletions to the peer", false);
+  addVersioningOptions(command);
+  command.action(runShareFolderCommand);
+}
 
-  program
+async function runShareFolderCommand(
+  folderId: string,
+  localPath: string,
+  shareOpts: ShareFolderCommandOptions,
+  command: Command,
+): Promise<void> {
+  const opts = rootCliOptions(command);
+  const normalizedFolderId = folderId.trim();
+  if (!normalizedFolderId) throw new Error("folderId must not be empty");
+  const rootPath = fs.realpathSync(localPath);
+  if (!fs.statSync(rootPath).isDirectory()) {
+    throw new Error(`Local share path is not a directory: ${rootPath}`);
+  }
+  const password = shareOpts.plaintext
+    ? null
+    : shareOpts.password?.trim() || generatedFolderPassword();
+  const sharedFolder: SharedFolder = {
+    id: normalizedFolderId,
+    label: shareOpts.label?.trim() || normalizedFolderId,
+    encryption: password
+      ? { mode: "encrypted", password }
+      : { mode: "plaintext" },
+  };
+  const session = await openRemoteFs(opts, [sharedFolder]);
+  try {
+    console.log(`Shared folder ID: ${normalizedFolderId}`);
+    console.log(`Shared folder path: ${rootPath}`);
+    console.log(`Encryption: ${password ? "enabled" : "disabled"}`);
+    if (password) console.log(`Folder password: ${password}`);
+    await runFolderSyncService({
+      folderId: normalizedFolderId,
+      rootPath,
+      remoteFs: session.remoteFs,
+      options: shareOpts,
+    });
+  } finally {
+    await session.close();
+  }
+}
+
+function registerSyncFolderCommand(program: Command): void {
+  const command = program
     .command("sync-folder <folderId> <localPath>")
     .description("Synchronize a local folder with a writable syncpeer folder")
     .option("--once", "Synchronize once and exit", false)
-    .option("--delete-remote", "Propagate local deletions to the peer", false)
-    .addOption(new Option("--versioning <mode>", "Archive replaced/deleted files").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
-    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
-    .action(async (folderId: string, localPath: string, syncOpts: ShareFolderCommandOptions) => {
-      const opts = program.opts<CliOptions>();
-      const normalizedFolderId = folderId.trim();
-      if (!normalizedFolderId) throw new Error("folderId must not be empty");
-      const rootPath = fs.realpathSync(localPath);
-      if (!fs.statSync(rootPath).isDirectory()) throw new Error(`Local sync path is not a directory: ${rootPath}`);
-      const session = await openRemoteFs(opts);
-      try {
-        await runFolderSyncService({ folderId: normalizedFolderId, rootPath, remoteFs: session.remoteFs, options: syncOpts });
-      } finally {
-        await session.close();
-      }
-    });
+    .option("--delete-remote", "Propagate local deletions to the peer", false);
+  addVersioningOptions(command);
+  command.action(runSyncFolderCommand);
+}
 
+async function runSyncFolderCommand(
+  folderId: string,
+  localPath: string,
+  syncOpts: ShareFolderCommandOptions,
+  command: Command,
+): Promise<void> {
+  const opts = rootCliOptions(command);
+  const normalizedFolderId = folderId.trim();
+  if (!normalizedFolderId) throw new Error("folderId must not be empty");
+  const rootPath = fs.realpathSync(localPath);
+  if (!fs.statSync(rootPath).isDirectory()) {
+    throw new Error(`Local sync path is not a directory: ${rootPath}`);
+  }
+  const session = await openRemoteFs(opts);
+  try {
+    await runFolderSyncService({
+      folderId: normalizedFolderId,
+      rootPath,
+      remoteFs: session.remoteFs,
+      options: syncOpts,
+    });
+  } finally {
+    await session.close();
+  }
+}
+
+function registerVersionsCommand(program: Command): void {
   program
     .command("versions <localPath> [relativePath]")
     .description("List archived folder versions")
-    .action(async (localPath: string, relativePath?: string) => {
-      const rootPath = fs.realpathSync(localPath);
-      const storage = await createNodeFolderSyncStorage(rootPath);
-      for (const version of await storage.listVersions(relativePath)) {
-        console.log(`${version.archivePath}\t${version.path}\t${new Date(version.modifiedMs).toISOString()}`);
-      }
-    });
+    .action(runVersionsCommand);
+}
 
+async function runVersionsCommand(
+  localPath: string,
+  relativePath: string | undefined,
+): Promise<void> {
+  const rootPath = fs.realpathSync(localPath);
+  const storage = await createNodeFolderSyncStorage(rootPath);
+  for (const version of await storage.listVersions(relativePath)) {
+    console.log(
+      `${version.archivePath}\t${version.path}\t${new Date(version.modifiedMs).toISOString()}`,
+    );
+  }
+}
+
+function registerRestoreCommand(program: Command): void {
   program
     .command("restore <localPath> <archivePath> [targetPath]")
     .description("Restore an archived folder version")
-    .action(async (localPath: string, archivePath: string, targetPath?: string) => {
-      const rootPath = fs.realpathSync(localPath);
-      const storage = await createNodeFolderSyncStorage(rootPath);
-      await storage.restoreVersion(archivePath, targetPath);
-      console.log(`Restored ${archivePath}${targetPath ? ` to ${targetPath}` : ""}.`);
-    });
+    .action(runRestoreCommand);
+}
 
-  program
+async function runRestoreCommand(
+  localPath: string,
+  archivePath: string,
+  targetPath: string | undefined,
+): Promise<void> {
+  const rootPath = fs.realpathSync(localPath);
+  const storage = await createNodeFolderSyncStorage(rootPath);
+  await storage.restoreVersion(archivePath, targetPath);
+  const suffix = targetPath ? ` to ${targetPath}` : "";
+  console.log(`Restored ${archivePath}${suffix}.`);
+}
+
+function registerUnsubscribeCommand(program: Command): void {
+  const command = program
     .command("unsubscribe-folder <localPath>")
-    .description("Remove local folder contents while leaving the remote folder unchanged")
-    .addOption(new Option("--versioning <mode>", "Archive removed files").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
-    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
-    .action(async (localPath: string, unsubscribeOpts: ShareFolderCommandOptions) => {
-      const rootPath = fs.realpathSync(localPath);
-      const storage = await createNodeFolderSyncStorage(rootPath);
-      const result = await unsubscribeFolder({ storage, policy: folderSyncPolicy(unsubscribeOpts) });
-      console.log(`Unsubscribed local folder: removed ${result.removed.length} file(s), archived ${result.archived.length}.`);
-    });
+    .description(
+      "Remove local folder contents while leaving the remote folder unchanged",
+    );
+  addVersioningOptions(command);
+  command.action(runUnsubscribeCommand);
+}
 
-  program
+async function runUnsubscribeCommand(
+  localPath: string,
+  unsubscribeOpts: ShareFolderCommandOptions,
+): Promise<void> {
+  const rootPath = fs.realpathSync(localPath);
+  const storage = await createNodeFolderSyncStorage(rootPath);
+  const result = await unsubscribeFolder({
+    storage,
+    policy: folderSyncPolicy(unsubscribeOpts),
+  });
+  console.log(
+    `Unsubscribed local folder: removed ${result.removed.length} file(s), archived ${result.archived.length}.`,
+  );
+}
+
+function registerDeleteFileCommand(program: Command): void {
+  const command = program
     .command("delete-file <folderId> <localPath> <relativePath>")
-    .description("Delete one local file and publish a remote tombstone")
-    .addOption(new Option("--versioning <mode>", "Archive the local file").choices(["disabled", "trash", "simple", "staggered"]).default("staggered"))
-    .option("--max-versions <count>", "Maximum archived versions per file", (value) => parseInt(value, 10))
-    .action(async (folderId: string, localPath: string, relativePath: string, deleteOpts: ShareFolderCommandOptions) => {
-      const opts = program.opts<CliOptions>();
-      const normalizedFolderId = folderId.trim();
-      if (!normalizedFolderId) throw new Error("folderId must not be empty");
-      const rootPath = fs.realpathSync(localPath);
-      if (!fs.statSync(rootPath).isDirectory()) throw new Error(`Local sync path is not a directory: ${rootPath}`);
-      const storage = await createNodeFolderSyncStorage(rootPath);
-      const session = await openRemoteFs(opts);
-      try {
-        const result = await deleteFolderFile({
-          folderId: normalizedFolderId,
-          path: relativePath,
-          remote: {
-            deleteFile: session.remoteFs.deleteFile
-              ? (...deleteArgs: Parameters<NonNullable<typeof session.remoteFs.deleteFile>>) =>
-                session.remoteFs.deleteFile!(...deleteArgs)
-              : undefined,
-          },
-          storage,
-          policy: folderSyncPolicy(deleteOpts),
-        });
-        console.log(`Deleted ${result.path}; remote tombstone published.`);
-      } finally {
-        await session.close();
-      }
-    });
+    .description("Delete one local file and publish a remote tombstone");
+  addVersioningOptions(command);
+  command.action(runDeleteFileCommand);
+}
 
+async function runDeleteFileCommand(
+  folderId: string,
+  localPath: string,
+  relativePath: string,
+  deleteOpts: ShareFolderCommandOptions,
+  command: Command,
+): Promise<void> {
+  const opts = rootCliOptions(command);
+  const normalizedFolderId = folderId.trim();
+  if (!normalizedFolderId) throw new Error("folderId must not be empty");
+  const rootPath = fs.realpathSync(localPath);
+  if (!fs.statSync(rootPath).isDirectory()) {
+    throw new Error(`Local sync path is not a directory: ${rootPath}`);
+  }
+  const storage = await createNodeFolderSyncStorage(rootPath);
+  const session = await openRemoteFs(opts);
+  try {
+    const result = await deleteFolderFile({
+      folderId: normalizedFolderId,
+      path: relativePath,
+      remote: {
+        deleteFile: session.remoteFs.deleteFile
+          ? (...deleteArgs: Parameters<NonNullable<typeof session.remoteFs.deleteFile>>) =>
+            session.remoteFs.deleteFile!(...deleteArgs)
+          : undefined,
+      },
+      storage,
+      policy: folderSyncPolicy(deleteOpts),
+    });
+    console.log(`Deleted ${result.path}; remote tombstone published.`);
+  } finally {
+    await session.close();
+  }
+}
+
+function registerRemoteCommands(program: Command): void {
+  registerListCommand(program);
+  registerTreeCommand(program);
+  registerFilesCommand(program);
+  registerDownloadCommand(program);
+  registerUploadCommand(program);
+  registerGlobalDiscoveryCommand(program);
+}
+
+function registerListCommand(program: Command): void {
   program
     .command("list")
     .description("List available folders on the remote peer")
-    .action(async () =>
-      withSession(async (remoteFs) => {
-        const folders = await remoteFs.listFolders();
-        for (const folder of folders) {
-          const mode = folder.readOnly ? "ro" : "rw";
-          console.log(`${folder.id}\t${mode}\t${folder.label}`);
-        }
-      }),
-    );
+    .action(runListCommand);
+}
 
+async function runListCommand(
+  _options: unknown,
+  command: Command,
+): Promise<void> {
+  await withSession(command, async (remoteFs) => {
+    const folders = await remoteFs.listFolders();
+    for (const folder of folders) {
+      const mode = folder.readOnly ? "ro" : "rw";
+      console.log(`${folder.id}\t${mode}\t${folder.label}`);
+    }
+  });
+}
+
+function registerTreeCommand(program: Command): void {
   program
     .command("tree <folderId>")
     .description("Show a tree of files in the specified folder")
-    .action(async (folderId: string) =>
-      withSession(async (remoteFs) => {
-        await remoteFs.waitForFolderIndex(folderId, 7000, 100);
-        console.log(`${folderId}/`);
-        const lines = await renderTree(
-          async (targetPath) => remoteFs.readDir(folderId, targetPath),
-          "",
-          "",
-        );
-        for (const line of lines) console.log(line);
-      }),
-    );
+    .action(runTreeCommand);
+}
 
+async function runTreeCommand(
+  folderId: string,
+  _options: unknown,
+  command: Command,
+): Promise<void> {
+  await withSession(command, async (remoteFs) => {
+    await remoteFs.waitForFolderIndex(folderId, 7000, 100);
+    console.log(`${folderId}/`);
+    const lines = await renderTree(
+      async (targetPath) => remoteFs.readDir(folderId, targetPath),
+      "",
+      "",
+    );
+    for (const line of lines) console.log(line);
+  });
+}
+
+function registerFilesCommand(program: Command): void {
   program
     .command("files <folderId> [dir]")
     .description("List files from a peer folder directory")
-    .action(async (folderId: string, dir = "") =>
-      withSession(async (remoteFs) => {
-        await remoteFs.waitForFolderIndex(folderId, 7000, 100);
-        const entries = await remoteFs.readDir(folderId, dir);
-        for (const entry of entries) {
-          const suffix = entry.type === "directory" ? "/" : "";
-          const type = entry.type.padEnd(9, " ");
-          console.log(`${type}\t${entry.path}${suffix}`);
-        }
-      }),
-    );
+    .action(runFilesCommand);
+}
 
+async function runFilesCommand(
+  folderId: string,
+  dir: string | undefined,
+  _options: unknown,
+  command: Command,
+): Promise<void> {
+  await withSession(command, async (remoteFs) => {
+    await remoteFs.waitForFolderIndex(folderId, 7000, 100);
+    const entries = await remoteFs.readDir(folderId, dir ?? "");
+    for (const entry of entries) {
+      const suffix = entry.type === "directory" ? "/" : "";
+      const type = entry.type.padEnd(9, " ");
+      console.log(`${type}\t${entry.path}${suffix}`);
+    }
+  });
+}
+
+function registerDownloadCommand(program: Command): void {
   program
     .command("download <folderId> <remotePath> <localPath>")
     .description("Download a file from the remote peer")
-    .action(async (folderId: string, remotePath: string, localPath: string) =>
-      withSession(async (remoteFs) => {
-        let transportKind = "direct";
-        const startedAt = Date.now();
-        const onProgress = (progress: { transportKind?: "direct-tcp" | "direct-quic" | "relay" }) => {
-          const nextTransportKind = progress.transportKind === "relay" ? "relay" : "direct";
-          if (nextTransportKind === transportKind) return;
-          transportKind = nextTransportKind;
-          console.log(`Transfer transport: ${transportKind}`);
-        };
-        const sink = remoteFs.readFileToSink
-          ? await createNodeFileDownloadSink(localPath)
-          : null;
-        try {
-          const result = remoteFs.readFileToSink
-            ? await remoteFs.readFileToSink(folderId, remotePath, sink!, onProgress)
-            : await (async () => {
-                const bytes = await downloadRemoteFile(remoteFs, {
-                  folderId,
-                  path: remotePath,
-                  onProgress,
-                });
-                fs.writeFileSync(localPath, Buffer.from(bytes));
-                return { bytesWritten: bytes.length };
-              })();
-          const elapsedMs = Math.max(1, Date.now() - startedAt);
-          const mibPerSecond = result.bytesWritten / 1024 / 1024 * 1000 / elapsedMs;
-          console.log(
-            `Wrote ${result.bytesWritten} bytes to ${localPath} via ${transportKind} ` +
-            `in ${elapsedMs} ms (${mibPerSecond.toFixed(2)} MiB/s)`,
-          );
-        } catch (error) {
-          if (!(error instanceof DownloadInterruptedError)) await sink?.abort(error);
-          throw error;
-        }
-      }),
-    );
+    .action(runDownloadCommand);
+}
 
+async function runDownloadCommand(
+  folderId: string,
+  remotePath: string,
+  localPath: string,
+  _options: unknown,
+  command: Command,
+): Promise<void> {
+  await withSession(command, async (remoteFs) => {
+    let transportKind = "direct";
+    const startedAt = Date.now();
+    const onProgress = (progress: DownloadProgress) => {
+      const nextTransportKind =
+        progress.transportKind === "relay" ? "relay" : "direct";
+      if (nextTransportKind === transportKind) return;
+      transportKind = nextTransportKind;
+      console.log(`Transfer transport: ${transportKind}`);
+    };
+    const result = await downloadRemoteFileToPath(
+      remoteFs,
+      folderId,
+      remotePath,
+      localPath,
+      onProgress,
+    );
+    const elapsedMs = Math.max(1, Date.now() - startedAt);
+    const mibPerSecond =
+      (result.bytesWritten / 1024 / 1024) * (1000 / elapsedMs);
+    console.log(
+      `Wrote ${result.bytesWritten} bytes to ${localPath} via ${transportKind} ` +
+        `in ${elapsedMs} ms (${mibPerSecond.toFixed(2)} MiB/s)`,
+    );
+  });
+}
+
+type DownloadProgress = {
+  transportKind?: "direct-tcp" | "direct-quic" | "relay";
+};
+
+async function downloadRemoteFileToPath(
+  remoteFs: RemoteFileSystem,
+  folderId: string,
+  remotePath: string,
+  localPath: string,
+  onProgress: (progress: DownloadProgress) => void,
+): Promise<{ bytesWritten: number }> {
+  if (remoteFs.readFileToSink) {
+    const sink = await createNodeFileDownloadSink(localPath);
+    try {
+      return await remoteFs.readFileToSink(
+        folderId,
+        remotePath,
+        sink,
+        onProgress,
+      );
+    } catch (error) {
+      if (!(error instanceof DownloadInterruptedError)) await sink.abort(error);
+      throw error;
+    }
+  }
+  const bytes = await downloadRemoteFile(remoteFs, {
+    folderId,
+    path: remotePath,
+    onProgress,
+  });
+  fs.writeFileSync(localPath, Buffer.from(bytes));
+  return { bytesWritten: bytes.length };
+}
+
+function registerUploadCommand(program: Command): void {
   program
     .command("upload <folderId> <localPath> [remotePath]")
     .description("Upload a local file to the remote peer folder")
@@ -664,106 +976,162 @@ async function main() {
       (value) => parseInt(value, 10),
       0,
     )
-    .action(async (folderId: string, localPath: string, remotePath: string | undefined, uploadOpts: UploadCommandOptions) =>
-      withSession(async (remoteFs) => {
-        const payload = fs.readFileSync(localPath);
-        const fileName = path.basename(localPath);
-        const targetPath = normalizeRelativePath(remotePath ?? fileName);
-        if (!targetPath) throw new Error("remotePath must not be empty");
-        await remoteFs.writeFileFully(folderId, targetPath, new Uint8Array(payload), {
-          modifiedMs: fs.statSync(localPath).mtimeMs,
-        });
-        console.log(`Uploaded ${payload.length} bytes to ${folderId}/${targetPath}`);
-        const serveMs = Number.isFinite(uploadOpts.serveMs)
-          ? Math.max(0, Number(uploadOpts.serveMs))
-          : 0;
-        if (serveMs > 0) {
-          console.log(`Serving upload blocks for ${serveMs} ms...`);
-          await sleepMs(serveMs);
-        }
-      }),
-    );
+    .action(runUploadCommand);
+}
 
+async function runUploadCommand(
+  folderId: string,
+  localPath: string,
+  remotePath: string | undefined,
+  uploadOpts: UploadCommandOptions,
+  command: Command,
+): Promise<void> {
+  await withSession(command, async (remoteFs) => {
+    const payload = fs.readFileSync(localPath);
+    const fileName = path.basename(localPath);
+    const targetPath = normalizeRelativePath(remotePath ?? fileName);
+    if (!targetPath) throw new Error("remotePath must not be empty");
+    await remoteFs.writeFileFully(
+      folderId,
+      targetPath,
+      new Uint8Array(payload),
+      {
+        modifiedMs: fs.statSync(localPath).mtimeMs,
+      },
+    );
+    console.log(`Uploaded ${payload.length} bytes to ${folderId}/${targetPath}`);
+    const serveMs = Number.isFinite(uploadOpts.serveMs)
+      ? Math.max(0, Number(uploadOpts.serveMs))
+      : 0;
+    if (serveMs > 0) {
+      console.log(`Serving upload blocks for ${serveMs} ms...`);
+      await sleepMs(serveMs);
+    }
+  });
+}
+
+function registerGlobalDiscoveryCommand(program: Command): void {
   program
     .command("global-discovery-test")
     .description(
       "Resolve a Syncthing device ID through global discovery and dump all candidates",
     )
-    .action(async () => {
-      const opts = program.opts<CliOptions>();
+    .action(runGlobalDiscoveryCommand);
+}
 
-      if (!opts.remoteId) {
-        throw new Error("Missing required option --remote-id");
-      }
+async function runGlobalDiscoveryCommand(
+  _options: unknown,
+  command: Command,
+): Promise<void> {
+  const opts = rootCliOptions(command);
+  if (!opts.remoteId) throw new Error("Missing required option --remote-id");
+  const result = await resolveNodeGlobalDiscovery({
+    expectedDeviceId: opts.remoteId,
+    discoveryServer: opts.discoveryServer ?? getDefaultDiscoveryServer(),
+  });
+  console.log(`deviceId\t${opts.remoteId}`);
+  const payload = result.payload;
+  const addresses =
+    typeof payload === "object" &&
+    payload !== null &&
+    "addresses" in payload &&
+    Array.isArray(payload.addresses)
+      ? payload.addresses
+      : [];
+  console.log(`rawAddresses\t${JSON.stringify(addresses)}`);
+  for (const candidate of result.candidates) {
+    console.log(
+      `candidate\t${candidate.protocol}\t${candidate.host ?? ""}\t${candidate.port ?? ""}\t${candidate.address}`,
+    );
+  }
+}
 
-      const result = await resolveNodeGlobalDiscovery({
-        expectedDeviceId: opts.remoteId,
-        discoveryServer: opts.discoveryServer ?? getDefaultDiscoveryServer(),
-      });
+function registerLocalCommands(program: Command): void {
+  registerUploadTestCommand(program);
+  registerLocalFilesCommand(program);
+  registerLocalIdCommand(program);
+}
 
-      console.log(`deviceId\t${opts.remoteId}`);
-      const payload = result.payload;
-      const addresses =
-        typeof payload === "object" && payload !== null && "addresses" in payload &&
-        Array.isArray(payload.addresses)
-          ? payload.addresses
-          : [];
-      console.log(`rawAddresses\t${JSON.stringify(addresses)}`);
-      for (const candidate of result.candidates) {
-        console.log(
-          `candidate\t${candidate.protocol}\t${candidate.host ?? ""}\t${candidate.port ?? ""}\t${candidate.address}`,
-        );
-      }
-    });
-
+function registerUploadTestCommand(program: Command): void {
   program
     .command("upload-test <peerFolderPath> <remotePath> [content]")
     .description(
       "Write a small test file directly into a local peer folder path",
     )
-    .action((peerFolderPath: string, remotePath: string, content?: string) => {
-      const relative = normalizeRelativePath(remotePath);
-      if (!relative) throw new Error("remotePath must not be empty");
-      const targetPath = fs.realpathSync(peerFolderPath);
-      const outPath = path.resolve(targetPath, relative);
-      const relativeToRoot = path.relative(targetPath, outPath);
-      if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot))
-        throw new Error(`remotePath escapes peerFolderPath: ${remotePath}`);
-      fs.mkdirSync(path.dirname(outPath), { recursive: true });
-      const payload = content ?? "small upload from syncpeer cli\n";
-      fs.writeFileSync(outPath, payload, "utf8");
-      console.log(
-        `Wrote ${Buffer.byteLength(payload, "utf8")} bytes to ${outPath}`,
-      );
-    });
+    .action(runUploadTestCommand);
+}
 
+function runUploadTestCommand(
+  peerFolderPath: string,
+  remotePath: string,
+  content?: string,
+): void {
+  const relative = normalizeRelativePath(remotePath);
+  if (!relative) throw new Error("remotePath must not be empty");
+  const targetPath = fs.realpathSync(peerFolderPath);
+  const outPath = path.resolve(targetPath, relative);
+  const relativeToRoot = path.relative(targetPath, outPath);
+  if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
+    throw new Error(`remotePath escapes peerFolderPath: ${remotePath}`);
+  }
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  const payload = content ?? "small upload from syncpeer cli\n";
+  fs.writeFileSync(outPath, payload, "utf8");
+  console.log(
+    `Wrote ${Buffer.byteLength(payload, "utf8")} bytes to ${outPath}`,
+  );
+}
+
+function registerLocalFilesCommand(program: Command): void {
   program
     .command("files-local <peerFolderPath> [dir]")
     .description("List files from a local peer folder path")
-    .action((peerFolderPath: string, dir = "") => {
-      const entries = listLocalDir(peerFolderPath, dir);
-      for (const entry of entries) {
-        const suffix = entry.type === "directory" ? "/" : "";
-        const type = entry.type.padEnd(9, " ");
-        console.log(`${type}\t${entry.path}${suffix}`);
-      }
-    });
+    .action(runLocalFilesCommand);
+}
 
+function runLocalFilesCommand(peerFolderPath: string, dir = ""): void {
+  const entries = listLocalDir(peerFolderPath, dir);
+  for (const entry of entries) {
+    const suffix = entry.type === "directory" ? "/" : "";
+    const type = entry.type.padEnd(9, " ");
+    console.log(`${type}\t${entry.path}${suffix}`);
+  }
+}
+
+function registerLocalIdCommand(program: Command): void {
   program
     .command("local-id")
     .description("Show the persisted local cli-node identity information")
-    .action(() => {
-      const identity = ensureCliNodeIdentity();
-      console.log(`configDir\t${identity.configDir}`);
-      console.log(`cert\t${identity.cert}`);
-      console.log(`key\t${identity.key}`);
-      if (identity.deviceId) console.log(`deviceId\t${identity.deviceId}`);
-      else
-        console.log(
-          "deviceId\t(unavailable - Syncthing binary not found to resolve it)",
-        );
-    });
+    .action(runLocalIdCommand);
+}
 
+function runLocalIdCommand(): void {
+  const identity = ensureCliNodeIdentity();
+  console.log(`configDir\t${identity.configDir}`);
+  console.log(`cert\t${identity.cert}`);
+  console.log(`key\t${identity.key}`);
+  if (identity.deviceId) console.log(`deviceId\t${identity.deviceId}`);
+  else
+    console.log(
+      "deviceId\t(unavailable - Syncthing binary not found to resolve it)",
+    );
+}
+
+function createProgram(
+  appInfo: ReturnType<typeof getCliBuildInfo>,
+): Command {
+  const program = new Command();
+  configureProgram(program, appInfo);
+  registerAboutCommand(program, appInfo);
+  registerFolderCommands(program);
+  registerRemoteCommands(program);
+  registerLocalCommands(program);
+  return program;
+}
+
+async function main(): Promise<void> {
+  reexecuteWithNativeQuicIfAvailable();
+  const program = createProgram(getCliBuildInfo());
   await program.parseAsync(process.argv);
   process.exit(0);
 }

@@ -27,8 +27,9 @@ export const createDirectoryActions = (args: {
   readonly client: SyncpeerBrowserClient;
   readonly sessionStore: SyncpeerSessionStore;
   readonly refreshActiveView: () => Promise<void>;
+  readonly syncStarredFiles: () => Promise<void>;
 }) => {
-  const { state, client, sessionStore, refreshActiveView } = args;
+  const { state, client, sessionStore, refreshActiveView, syncStarredFiles } = args;
 
 const openFolderRoot = async (folderId: string) => {
   if (folderIsLocked(state, folderId)) return;
@@ -156,6 +157,7 @@ const toggleFavorite = async (
       });
       if (kind === "file") {
         await refreshCachedStatuses(state, client, folderId, [path]);
+        await syncStarredFiles();
       }
     }
   } catch (error) {

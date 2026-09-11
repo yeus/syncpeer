@@ -167,7 +167,7 @@ const main = async (): Promise<void> => {
     {
       name: "Favorite synchronization policy diagnostics",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-favorite-sync-policies.ts"],
+      args: ["--import", "tsx/esm", "--test", "scripts/test-favorite-sync-policies.ts"],
     },
     {
       ...tsxScript("scripts/test-harness-diagnostics.ts"),

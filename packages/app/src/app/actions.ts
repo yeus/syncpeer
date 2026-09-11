@@ -45,6 +45,7 @@ export const createAppActions = (args: {
     client,
     sessionStore,
     refreshActiveView: connection.refreshActiveView,
+    syncStarredFiles: starred.syncStarredFiles,
   });
   const files = createFileActions({
     state,

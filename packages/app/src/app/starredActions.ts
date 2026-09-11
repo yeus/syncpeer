@@ -14,6 +14,7 @@ import {
   elapsedMsSince,
   splitPath,
 } from "./actionSupport.ts";
+import { updateCachedKey } from "./downloadPolicies.ts";
 import { pushSessionLog, type AppState } from "./state.ts";
 import type { TransferRuntime } from "./transferRuntime.ts";
 
@@ -198,6 +199,7 @@ const syncStarredFiles = async () => {
           lastSyncAtMs: Date.now(),
           lastDirection: "download",
         };
+        updateCachedKey(state, favorite.folderId, targetPath, true);
         downloaded += 1;
         continue;
       }
@@ -244,6 +246,7 @@ const syncStarredFiles = async () => {
           lastSyncAtMs: Date.now(),
           lastDirection: "download",
         };
+        updateCachedKey(state, favorite.folderId, targetPath, true);
         downloaded += 1;
         continue;
       }

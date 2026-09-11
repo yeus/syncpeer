@@ -6,6 +6,7 @@ dist/
 .tools/
 .flatpak-builder/
 .tmp/
+.code-analysis/reports/
 android.logs
 output.log
 output.*.log

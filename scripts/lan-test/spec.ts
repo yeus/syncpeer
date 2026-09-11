@@ -111,8 +111,6 @@ const connect = async (
 };
 
 const disconnect = async (): Promise<void> => {
-  const status = $("[data-testid='connection-status']");
-  if ((await status.getText()).trim() !== "Connected") return;
   await setAutomaticConnectionPaused(lanBrowser, true);
   await waitForDisconnected(lanBrowser, 30_000);
 };
@@ -396,10 +394,7 @@ describe("Syncpeer LAN integration", () => {
       }
       await setValue(`folder-password-${currentFixture.encryptedFolderId}`, currentFixture.encryptedPassword);
       await clickTestId(`unlock-folder-${currentFixture.encryptedFolderId}`);
-      await waitForText(lanBrowser, "unlocked", 90_000).catch(async (error) => {
-        console.log(`Safe session events: ${(await readSessionEventNames(lanBrowser)).join(", ")}`);
-        throw error;
-      });
+      await waitForText(lanBrowser, "unlocked", 90_000);
       await clickItemTitle(lanBrowser, currentFixture.encryptedFolderId);
       await waitForText(lanBrowser, "secret.txt", 90_000);
       await downloadByName("secret.txt");

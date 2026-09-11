@@ -69,6 +69,9 @@ export const createConnectionActions = (args: {
   let connectionSettingsGeneration = 0;
 
 const connect = async (targetDeviceId?: string) => {
+  connectionSettingsGeneration += 1;
+  if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
+  connectionSettingsTimer = null;
   if (connectInFlight) {
     await connectInFlight;
     return;
@@ -265,8 +268,10 @@ const disconnect = async () => {
   if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
   connectionSettingsTimer = null;
   state.ui.autoConnectPaused = true;
+  const obsoleteConnect = connectInFlight;
   try {
     await sessionStore.actions.disconnect();
+    if (obsoleteConnect) await obsoleteConnect;
   } catch (error) {
     reportActionError(state, "disconnect.failed", error);
   } finally {
@@ -279,6 +284,7 @@ const disconnect = async () => {
 
 const applyConnectionSettings = async (generation: number) => {
   if (generation !== connectionSettingsGeneration) return;
+  if (state.ui.autoConnectPaused) return;
   if (!hasAutoConnectTarget(state)) return;
   const obsoleteConnect = connectInFlight;
   if (
@@ -289,10 +295,10 @@ const applyConnectionSettings = async (generation: number) => {
   ) {
     await sessionStore.actions.disconnect();
     if (obsoleteConnect) await obsoleteConnect;
-    if (generation !== connectionSettingsGeneration) return;
+    if (generation !== connectionSettingsGeneration || state.ui.autoConnectPaused) return;
     resetRuntimeState(state);
   }
-  if (generation !== connectionSettingsGeneration) return;
+  if (generation !== connectionSettingsGeneration || state.ui.autoConnectPaused) return;
   state.ui.autoConnectPaused = false;
   await connect();
 };

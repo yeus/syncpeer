@@ -1,6 +1,6 @@
 {
   "name": "@syncpeer/cli",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "bin": {
     "syncpeer": "dist/main.js"
@@ -9,7 +9,7 @@
     "build": "node ../../scripts/build-cli.mjs"
   },
   "dependencies": {
-    "@syncpeer/core": "0.4.0",
+    "@syncpeer/core": "0.5.0",
     "commander": "^14.0.3"
   }
 }

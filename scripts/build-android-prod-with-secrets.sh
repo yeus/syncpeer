@@ -122,7 +122,7 @@ ensure_gradle_release_signing_config() {
   local gradle_file="$repo_root/packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts"
   [[ -f "$gradle_file" ]] || return 0
 
-  if rg -q "syncpeer-release-signing" "$gradle_file"; then
+  if grep -q "syncpeer-release-signing" "$gradle_file"; then
     return 0
   fi
 

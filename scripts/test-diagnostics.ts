@@ -65,6 +65,15 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-sensitive-identifiers.ts"],
     },
     {
+      name: "GitHub Actions log download unit tests",
+      command: process.execPath,
+      args: [
+        "--test",
+        "scripts/test-build-configuration.mjs",
+        "scripts/test-download-ci-logs.mjs",
+      ],
+    },
+    {
       name: "Incremental block reuse diagnostics",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-block-reuse.ts"],

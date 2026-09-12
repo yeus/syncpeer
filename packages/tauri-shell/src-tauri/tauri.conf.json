@@ -4,7 +4,7 @@
   "version": "0.5.0",
   "identifier": "dev.syncpeer.app",
   "build": {
-    "beforeBuildCommand": "npm install && npm run build -w @syncpeer/app",
+    "beforeBuildCommand": "npm --prefix ../.. run build:app",
     "beforeDevCommand": "npm run dev -w @syncpeer/app",
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../../app/dist"

@@ -606,7 +606,14 @@ export const createTauriAdapters = (
     },
     show: async id => { await invokeWithLogging("syncpeer_document_command", { request: { operation: "show", id } }); },
   });
-  return { hostAdapter, platformAdapter: documents.platformAdapter, connectDocumentFolder: documents.connectFolder };
+  return { hostAdapter, platformAdapter: documents.platformAdapter, connectDocumentFolder: documents.connectFolder,
+    syncDocumentFolders: documents.syncFolders,
+    folderCredentials: detectRuntimePlatform() === "android" ? {
+      load: async () => (await invokeWithLogging<{ result: Record<string, string> }>("syncpeer_document_command",
+        { request: { operation: "connectionPasswords" } })).result,
+      save: async (passwords: Record<string, string>) => { await invokeWithLogging("syncpeer_document_command",
+        { request: { operation: "saveConnectionPasswords", passwords } }); },
+    } : undefined };
 };
 
 export const reportUiError = (

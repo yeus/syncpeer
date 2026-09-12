@@ -5,6 +5,47 @@ import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFil
 import { deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 
+test("automatic folder storage starts empty and retains folder roots and downloaded files across restarts", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const options = { profileId: "fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => secret,
+      save: async (value: string) => { secret = value; }, remove: async () => { secret = null; },
+    } };
+  let documents = createDocumentFilesystem(options);
+  assert.equal((await documents.initialize(true)).vault.phase, "unlocked");
+  assert.deepEqual(await documents.list("syncpeer-root"), []);
+  await documents.rememberFolder({ id: "photos", label: "Photos" });
+  const [photos] = await documents.list("syncpeer-root");
+  assert.deepEqual(await documents.list(photos.id), []);
+  await documents.register({ id: "photos", label: "Photos", password: "synthetic-remote-password" });
+  const handle = await documents.beginDownload("photos", "sample.txt", 3, 1000);
+  await documents.write(handle, 0, Uint8Array.of(1, 2, 3));
+  await documents.finishDownload(handle);
+  await documents.rememberFolder({ id: "music", label: "Music" });
+  await documents.close();
+  documents = createDocumentFilesystem(options);
+  assert.equal((await documents.initialize(true)).vault.phase, "unlocked");
+  const folders = await documents.list("syncpeer-root");
+  assert.deepEqual(folders.map(folder => folder.name), ["Photos", "Music"]);
+  assert.equal(folders[0].id, photos.id);
+  assert.deepEqual(await documents.list(folders[1].id), []);
+  assert.deepEqual((await documents.list(photos.id)).map(file => file.name), ["sample.txt"]);
+  await documents.close();
+});
+
+test("automatic setup does not publish a vault when secure storage cannot retain its key", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => null, save: async () => {}, remove: async () => {},
+    } });
+  await assert.rejects(documents.initialize(true), /verification failed/);
+  assert.equal((await documents.status()).vault.phase, "uninitialized");
+  await documents.close();
+});
+
 test("registered encrypted documents reopen with remembered credentials, and lock revokes handles", async () => {
   const { roots, openStorage } = memoryDocumentStorage();
   let remembered: string | null = null;

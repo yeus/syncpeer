@@ -110,13 +110,13 @@ export function createFolderRegistry(dependencies: {
       for (const config of configs) entries.set(config.id, { config, state: { phase: "closed" } });
       initialized = true; notify();
     }),
-    add: (config: FolderRegistration) => enqueue(async () => {
+    add: (config: FolderRegistration, open = true) => enqueue(async () => {
       if (!initialized) throw new Error("Folder registry is not initialized.");
       const configs = validateRegistrations([...entries.values()].map(entry => entry.config).concat(config));
       const added = { ...configs.at(-1)! };
       await dependencies.save(configs);
       entries.set(added.id, { config: added, state: { phase: "closed" } }); notify();
-      await openEntry(added.id);
+      if (open) await openEntry(added.id);
     }),
     open: (id: string) => enqueue(() => openEntry(id)),
     attachDownloads: (id: string) => enqueue(async () => {

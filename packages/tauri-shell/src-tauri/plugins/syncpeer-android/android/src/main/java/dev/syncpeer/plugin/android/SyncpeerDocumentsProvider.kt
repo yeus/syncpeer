@@ -203,7 +203,7 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     ensureRuntime()
     if (Build.VERSION.SDK_INT < 26 || !bound) throw FileNotFoundException(summary())
     try { return ready.get(30, TimeUnit.SECONDS).command(input).get().opt("result").takeUnless { it == JSONObject.NULL } }
-    catch (_: Exception) { throw FileNotFoundException("Document operation failed. Check the vault in Syncpeer.") }
+    catch (_: Exception) { throw FileNotFoundException("Document operation failed. Check Folder settings in Syncpeer.") }
   }
 
   private fun addDocument(cursor: MatrixCursor, value: JSONObject) {

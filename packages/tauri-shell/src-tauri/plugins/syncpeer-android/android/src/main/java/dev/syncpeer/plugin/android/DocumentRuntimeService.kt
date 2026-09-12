@@ -52,11 +52,11 @@ class DocumentRuntimeService : Service() {
         val reply = JSONObject(value)
         val state = reply.optJSONObject("result")?.optJSONObject("vault")
         if (state != null) vaultSummary = when (state.getString("phase")) {
-          "unlocked" -> "Encrypted documents unlocked."
-          "locked" -> "Open Syncpeer to unlock encrypted documents."
-          else -> "Open Syncpeer to configure encrypted documents."
+          "unlocked" -> "Downloaded files available offline."
+          "locked" -> "Open Syncpeer to unlock folder storage."
+          else -> "Preparing folder storage."
         }
-        if (input.optString("operation") in listOf("register", "createVault", "unlock", "lock", "create", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
+        if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
         }
         reply

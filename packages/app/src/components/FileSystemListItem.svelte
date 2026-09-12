@@ -33,6 +33,7 @@
     passwordDraft: string;
     passwordSaved: string;
     locked: boolean;
+    canBrowseLocally?: boolean;
     isFavorite: boolean;
     hasCachedRoot: boolean;
     statsText: string;
@@ -145,7 +146,7 @@
   };
 
   const canClickMain = (value: FileSystemItem) => {
-    if (value.kind === "root-folder") return !value.locked;
+    if (value.kind === "root-folder") return !value.locked || value.canBrowseLocally;
     return true;
   };
 

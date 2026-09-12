@@ -176,6 +176,7 @@
         passwordDraft: app.passwords.drafts[folder.id] ?? "",
         passwordSaved: activeFolderPasswords[folder.id] ?? "",
         locked: isFolderLocked(folder.id),
+        canBrowseLocally: app.localFolders.some(local => local.id === folder.id),
         isFavorite: favoriteKeys.has(`folder:${folder.id}:`),
         hasCachedRoot: app.favorites.cachedFileKeys.has(`${folder.id}:`),
         statsText: folderStatsText(folder.stats),
@@ -400,7 +401,7 @@
         </div>
       {/if}
       <ul class={`list ${directoryViewMode === "grid" ? "list-grid" : ""}`}>
-        {#if isFolderLocked(app.session.currentFolderId)}
+        {#if isFolderLocked(app.session.currentFolderId) && !app.session.isLocalDirectory}
           <li class="empty">
             This receive-encrypted folder is locked. Use the unlock button in the folder list to browse or download files.
           </li>

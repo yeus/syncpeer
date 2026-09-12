@@ -57,6 +57,7 @@
     createInitialState,
   } from "./app/state.ts";
   import AboutPage from "./AboutPage.svelte";
+  import FolderSettingsPage from "./FolderSettingsPage.svelte";
   import { applyTheme } from "./app/theme.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
@@ -77,7 +78,7 @@
   let systemPrefersDark = $state(false);
   let contentElement = $state<HTMLElement | null>(null);
 
-  const { hostAdapter, platformAdapter, connectDocumentFolder } = createTauriAdapters({
+  const { hostAdapter, platformAdapter, connectDocumentFolder, syncDocumentFolders, folderCredentials } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
@@ -102,6 +103,10 @@
     client,
     sessionStore,
     transfers: transferRuntime,
+    savePasswords: folderCredentials ? async passwords => {
+      if (!app.passwords.secureStorage) throw new Error("Unlock folder storage before changing passwords.");
+      await folderCredentials.save(passwords);
+    } : undefined,
   });
   const actions = createNavigableAppActions({
     state: app,
@@ -117,8 +122,34 @@
   });
   const pimDependencies = { state: app, client, sessionStore };
 
+  async function loadFolderCredentials() {
+    if (!folderCredentials) return;
+    const saved = await folderCredentials.load();
+    for (const [id, password] of Object.entries(app.passwords.saved)) {
+      if (saved[id] !== undefined && saved[id] !== password) throw new Error("Conflicting saved folder passwords require review.");
+    }
+    const merged = { ...app.passwords.saved, ...saved };
+    await folderCredentials.save(merged);
+    app.passwords.saved = merged;
+    app.passwords.drafts = { ...merged };
+    app.passwords.secureStorage = true;
+    persistState(app);
+    const knownFolders = Object.values(app.offline.snapshots).flatMap(snapshot => snapshot.folders)
+      .map(folder => ({ ...folder, needsPassword: true }));
+    app.localFolders = (await syncDocumentFolders(knownFolders, {})).map(folder => ({ ...folder, readOnly: false }));
+    app.localFolders = (await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)))
+      .map(folder => ({ ...folder, readOnly: false }));
+  }
+
   const unsubscribe = sessionStore.subscribe((next) => {
     applySessionState(app, next);
+    void syncDocumentFolders(next.folders, activeFolderPasswords(app)).then(folders => {
+      app.localFolders = folders.map(folder => ({ id: folder.id, label: folder.label, readOnly: false }));
+    }).catch(async () => {
+      app.ui.recentError = "Local folder storage could not be prepared. Check folder access before downloading.";
+      try { app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false })); }
+      catch { /* Keep the last known roots if the service itself is unavailable. */ }
+    });
     actions.syncNavigationRoute();
     if (
       next.phase === "connected" &&
@@ -233,6 +264,7 @@
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
     void (async () => {
+      await loadFolderCredentials();
       await Promise.all([
         actions.hydrate(),
         actions.refreshCurrentDeviceId(),
@@ -241,7 +273,7 @@
       await actions.restoreNavigationRoute(false);
       await actions.onAppForeground();
       await actions.restoreNavigationRoute(true);
-    })();
+    })().catch(() => { app.ui.recentError = "Unlock folder storage in Folder settings to restore saved passwords."; });
 
     const handleOnline = () => {
       void actions.onNetworkOnline();
@@ -426,7 +458,6 @@
       {#if app.activeTab === "devices"}
         <DeviceTab
           {app}
-          onConnectDocumentFolder={connectDocumentFolder}
           advertisedDevices={currentAdvertisedDevices}
           isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
@@ -486,6 +517,9 @@
       {/if}
 
       {#if app.activeTab === "folders"}
+        {#if appInfo.platform === "android"}
+          <button onclick={actions.openFolderSettings}>Folder settings · New folder</button>
+        {/if}
         <FoldersTab
           {app}
           breadcrumbs={currentBreadcrumbs}
@@ -596,6 +630,11 @@
     onRunCategory={diagnosticsActions.runDiagnosticsCategory}
     onRunAll={diagnosticsActions.runAllDiagnostics}
   />
+{:else if app.currentPage === "folder-settings"}
+  <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onCreate={async label => {
+    await connectDocumentFolder({ id: crypto.randomUUID(), label });
+    app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false }));
+  }} />
 {:else}
   <AboutPage onBack={actions.closeAboutPage} />
 {/if}

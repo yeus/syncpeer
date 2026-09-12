@@ -184,6 +184,7 @@ export interface SyncpeerPlatformAdapter {
   }) => Promise<void>;
   getCachedStatuses?: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   listCachedFiles?: () => Promise<CachedFileRecord[]>;
+  listLocalDirectory?: (folderId: string, path: string) => Promise<FileEntry[] | null>;
   openCachedFile?: (folderId: string, path: string) => Promise<void>;
   openCachedFileDirectory?: (folderId: string, path: string) => Promise<void>;
   openCachedDirectory?: (folderId: string, path: string) => Promise<void>;
@@ -257,6 +258,7 @@ export interface SyncpeerBrowserClient {
   updateTransferNotification?: SyncpeerPlatformAdapter["updateTransferNotification"];
   getCachedStatuses: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   listCachedFiles: () => Promise<CachedFileRecord[]>;
+  listLocalDirectory: (folderId: string, path: string) => Promise<FileEntry[] | null>;
   openCachedFile: (folderId: string, path: string) => Promise<void>;
   openCachedFileDirectory: (folderId: string, path: string) => Promise<void>;
   openCachedDirectory: (folderId: string, path: string) => Promise<void>;
@@ -688,6 +690,7 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.getCachedStatuses
         ? platformAdapter.getCachedStatuses(folderId, paths)
         : throwMissingAdapter("getCachedStatuses"),
+    listLocalDirectory: async (folderId, path) => platformAdapter.listLocalDirectory?.(folderId, path) ?? null,
     listCachedFiles: async (): Promise<CachedFileRecord[]> =>
       platformAdapter.listCachedFiles
         ? platformAdapter.listCachedFiles()

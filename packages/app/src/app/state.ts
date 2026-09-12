@@ -116,7 +116,7 @@ export const persistState = (state: AppState) => {
       connection: toConnectionSettings(state.connection),
       savedDevices: state.devices.savedDevices,
       syncApprovedIntroducedFolderKeys: [...state.approvals.syncApprovedFolderKeys].sort(),
-      folderPasswords: state.passwords.saved,
+      folderPasswords: state.passwords.secureStorage ? undefined : state.passwords.saved,
       offlineFolderSnapshots: state.offline.snapshots,
       directoryPageSize: state.ui.directoryPageSize,
       directoryViewMode: state.ui.directoryViewMode,
@@ -132,13 +132,14 @@ export const createInitialState = (persisted = loadPersistedState()) => {
   const initialConnection = fromConnectionSettings(persisted?.connection ?? null);
   const savedDevices = normalizeSavedDevices(persisted?.savedDevices);
   return {
+    localFolders: [] as FolderInfo[],
     activeTab:
       persisted?.activeTab === "devices" ||
       persisted?.activeTab === "folders" ||
       persisted?.activeTab === "pim"
         ? persisted.activeTab
         : ("favorites" as const),
-    currentPage: "main" as "main" | "diagnostics" | "about",
+    currentPage: "main" as "main" | "diagnostics" | "about" | "folder-settings",
     connection: {
       host: initialConnection.host,
       port: initialConnection.port,
@@ -158,6 +159,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       remoteFs: null as RemoteFsLike | null,
       isConnected: false,
       isOfflineSnapshot: false,
+      isLocalDirectory: false,
       offlineLastSeenAtMs: 0,
       isConnecting: false,
       isRefreshing: false,
@@ -248,6 +250,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       pendingApprovalPromptDeviceId: "",
     },
     passwords: {
+      secureStorage: false,
       saved: normalizeFolderPasswords(persisted?.folderPasswords),
       drafts: { ...normalizeFolderPasswords(persisted?.folderPasswords) },
       visible: {} as Record<string, boolean>,
@@ -426,7 +429,10 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   const previousFolderId = state.session.currentFolderId;
   const previousPath = state.session.currentPath;
   const keepOfflineSnapshotView = shouldKeepOfflineSnapshotView(state, next);
-  const currentDirectory = keepOfflineSnapshotView ? state.session.directory : null;
+  const keepLocalDirectory = state.session.isLocalDirectory &&
+    (!next.remoteFs || !next.folders.some(folder => folder.id === previousFolderId && !folder.needsPassword));
+  const currentDirectory = keepOfflineSnapshotView || keepLocalDirectory ? state.session.directory : null;
+  if (!keepLocalDirectory) state.session.isLocalDirectory = false;
   state.session.remoteFs = next.remoteFs;
   state.session.isConnected =
     next.phase === "connected" || next.phase === "refreshing";
@@ -525,7 +531,7 @@ export const visibleBreadcrumbs = (state: AppState) =>
   );
 
 export const rootFolderEntries = (state: AppState) =>
-  state.session.folders
+  [...new Map([...state.localFolders, ...state.session.folders].map(folder => [folder.id, folder])).values()]
     .map((folder) => ({
       id: folder.id,
       name: folderDisplayName(folder),

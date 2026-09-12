@@ -83,6 +83,8 @@ const createBaseActions = (
     openAboutPage: () => {
       state.currentPage = "about";
     },
+    openFolderSettings: () => { state.currentPage = "folder-settings"; },
+    closeFolderSettings: () => { state.currentPage = "main"; },
     closeAboutPage: () => {
       state.currentPage = "main";
     },
@@ -196,6 +198,21 @@ test("Back reverses tab and folder actions in chronological order", async () => 
   await flush();
   assert.equal(state.activeTab, "favorites");
   assert.equal(state.session.currentFolderId, "");
+  stop();
+});
+
+test("folder settings have a URL and Back restores the previous folder without adding a tab", async () => {
+  const state = createInitialState(null);
+  const { actions, history, location } = createActions(state);
+  const stop = actions.startNavigation();
+  await actions.openFolderRoot("photos");
+  actions.openFolderSettings();
+  assert.equal(routeFromHash(location.hash)?.page, "folder-settings");
+  assert.equal(state.activeTab, "folders");
+  history.back();
+  await flush();
+  assert.equal(state.currentPage, "main");
+  assert.equal(state.session.currentFolderId, "photos");
   stop();
 });
 

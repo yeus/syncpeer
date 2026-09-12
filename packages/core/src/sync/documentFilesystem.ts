@@ -94,7 +94,9 @@ export function createDocumentFilesystem(options: {
     registry ??= createFolderRegistry({ ...configs, open: openFolder });
     await registry.initialize();
     if (vault.status().phase === "unlocked") {
-      for (const folder of registry.getState()) await registry.open(folder.id);
+      for (const folder of registry.getState()) {
+        if (await vault.folderPassword(folder.id)) await registry.open(folder.id);
+      }
     }
   };
   const status = async () => ({ vault: vault.status(), folders: await configs.load(), recoveryIssues: [...recoveryIssues.values()].flat() });
@@ -149,21 +151,32 @@ export function createDocumentFilesystem(options: {
       !Number.isSafeInteger(range.size) || range.size < 0 || !Number.isSafeInteger(range.offset + range.size))) throw new Error("Invalid document ranges.");
   };
   return {
-    initialize: () => run(async () => {
-      await options.profile.initializeReplica(); await vault.initialize(); await openRegistrations(); return status();
+    initialize: (automatic = false) => run(async () => {
+      await options.profile.initializeReplica(); await vault.initialize();
+      if (automatic && vault.status().phase === "uninitialized") await vault.createDeviceProtected();
+      await openRegistrations(); return status();
     }),
     status: () => run(status),
+    connectionPasswords: () => run(() => vault.connectionPasswords()),
+    saveConnectionPasswords: (passwords: Record<string, string>) => run(() => vault.saveConnectionPasswords(passwords)),
+    rememberFolder: (folder: { id: string; label: string }) => run(async () => {
+      if (!registry) throw new Error("Folder storage is unavailable.");
+      if (!registry.getState().some(value => value.id === folder.id)) {
+        await registry.add({ ...folder, storageId: await randomId() }, false);
+      }
+      return status();
+    }),
     createVault: (password: string) => run(async () => { await vault.create(password); await openRegistrations(); return status(); }),
     unlock: (password: string) => run(async () => { await vault.unlock(password); await openRegistrations(); return status(); }),
     lock: () => run(async () => { await vault.lock(); return status(); }),
-    setDefaultPassword: (password: string) => run(() => vault.setDefaultPassword(password)),
     register: (folder: { id: string; label: string; password?: string }) => run(async () => {
-      if (!registry || registry.getState().some(value => value.id === folder.id)) throw new Error("Folder is already registered or vault is unavailable.");
+      if (!registry) throw new Error("Folder storage is unavailable.");
       if (!folder.id.trim() || !folder.label.trim() || folder.id !== folder.id.trim() || folder.label !== folder.label.trim()) throw new Error("Invalid folder registration.");
       const existing = await vault.folderPassword(folder.id);
       if (existing === null) await vault.addFolder(folder.id, folder.password);
       else if (folder.password !== undefined && folder.password !== existing) throw new Error("Folder password changes require migration.");
-      await registry.add({ id: folder.id, label: folder.label, storageId: await randomId() });
+      if (registry.getState().some(value => value.id === folder.id)) await registry.open(folder.id);
+      else await registry.add({ id: folder.id, label: folder.label, storageId: await randomId() });
       return status();
     }),
     attachDownloads: (id: string) => run(async () => {
@@ -298,10 +311,15 @@ export function createDocumentFilesystem(options: {
         modifiedMs: Date.now(), expectedVersion: old.version ?? {} });
       return true;
     }),
-    stat: (id: string) => run(() => stat(id)),
+    stat: (id: string) => run(async () => {
+      const root = (await configs.load()).find(folder => id === JSON.stringify([folder.storageId, ""]));
+      return root ? entry(root, "", 0, true) : stat(id);
+    }),
     list: (id: string) => run(async () => {
+      if (id === "syncpeer-root") return (await configs.load()).map(folder => entry(folder, "", 0, true));
       if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-      if (id === "syncpeer-root") return registry!.getState().map(folder => entry(folder, "", 0, true));
+      const root = registry!.getState().find(folder => id === JSON.stringify([folder.storageId, ""]));
+      if (root && !registry!.getReplica(root.id)) return [];
       const { folder, path, replica } = resolve(id);
       if (!(await stat(id)).directory) throw new Error("Document is not a directory.");
       const prefix = path ? path + "/" : "";

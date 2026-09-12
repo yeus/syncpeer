@@ -28,6 +28,7 @@ export const createAppActions = (args: {
   readonly client: SyncpeerBrowserClient;
   readonly sessionStore: SyncpeerSessionStore;
   readonly transfers: TransferRuntime;
+  readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
 }) => {
   const { state, client, sessionStore, transfers } = args;
   const appInfo = getAppBuildInfo();
@@ -56,6 +57,7 @@ export const createAppActions = (args: {
     openCachedFile: directory.openCachedFile,
   });
   const devices = createDeviceActions({
+    savePasswords: args.savePasswords,
     state,
     client,
     sessionStore,

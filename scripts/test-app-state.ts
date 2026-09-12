@@ -8,7 +8,42 @@ import {
   applySessionState,
   createInitialState,
   downloadButtonLabel,
+  rootFolderEntries,
+  persistState,
 } from "../packages/app/src/app/state.ts";
+
+test("secure credentials are excluded from browser persistence", t => {
+  let written = "";
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: { setItem: (_key: string, value: string) => { written = value; } } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous); else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  state.passwords.saved = { photos: "synthetic-secret" };
+  state.passwords.secureStorage = true;
+  persistState(state);
+  assert.equal(JSON.parse(written).folderPasswords, undefined);
+  assert.ok(!written.includes("synthetic-secret"));
+});
+
+test("peer updates preserve the directory currently browsed from local storage", () => {
+  const state = createInitialState(null);
+  state.localFolders = [{ id: "photos", label: "Photos", readOnly: false }];
+  state.session.isLocalDirectory = true;
+  state.session.currentFolderId = "photos";
+  state.session.directory = { ...state.session.directory, folderId: "photos", path: "", status: "ready" };
+  applySessionState(state, { ...createInitialSessionState(), phase: "connected", folders: [{ id: "music", label: "Music", readOnly: false }] });
+  assert.equal(state.session.currentFolderId, "photos");
+});
+
+test("local folder roots remain visible when switching peers or disconnecting", () => {
+  const app = createInitialState(null);
+  app.localFolders = [{ id: "photos", label: "Photos", readOnly: false }];
+  applySessionState(app, { ...createInitialSessionState(), phase: "connected",
+    folders: [{ id: "music", label: "Music", readOnly: false }] });
+  assert.deepEqual(rootFolderEntries(app).map(folder => folder.name), ["Music", "Photos"]);
+  applySessionState(app, createInitialSessionState());
+  assert.deepEqual(rootFolderEntries(app).map(folder => folder.name), ["Photos"]);
+});
 
 test("keeps restored folders visible while reconnecting before live state arrives", () => {
   const app = createInitialState(null);

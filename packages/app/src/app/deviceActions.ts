@@ -24,7 +24,6 @@ import {
   clearDirectoryView,
   copyText,
   loadDirectorySideEffects,
-  migrateActiveLegacyFolderPasswords,
 } from "./actionSupport.ts";
 import { restoreOfflineSnapshot, setRemoteApprovalPending } from "./syncPolicies.ts";
 import { suggestedClientName } from "./suggestedNames.ts";
@@ -37,6 +36,7 @@ export const createDeviceActions = (args: {
   readonly refreshOverview: () => Promise<void>;
   readonly refreshActiveView: () => Promise<void>;
   readonly refreshCurrentDeviceId: () => Promise<void>;
+  readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
 }) => {
   const {
     state,
@@ -61,9 +61,7 @@ const setFolderPasswordInputVisible = (folderId: string, visible: boolean) => {
   };
 };
 
-const saveFolderPassword = async (folderId: string) => {
-  const password = (state.passwords.drafts[folderId] ?? "").trim();
-  migrateActiveLegacyFolderPasswords(state);
+const changeFolderPassword = async (folderId: string, password: string) => {
   const scopedKey = folderPasswordScopedKey(
     activeFolderPasswordScopeDeviceId(state),
     folderId,
@@ -74,13 +72,15 @@ const saveFolderPassword = async (folderId: string) => {
   if (password) {
     next[scopedKey || folderId] = password;
   }
-  state.passwords.saved = next;
-  setFolderPasswordInputVisible(folderId, false);
   try {
+    await args.savePasswords?.(next);
+    state.passwords.saved = next;
+    if (!password) state.passwords.drafts = { ...state.passwords.drafts, [folderId]: "" };
+    setFolderPasswordInputVisible(folderId, !password);
     await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
     if (state.session.isConnected) {
       await refreshOverview();
-      if (!folderIsLocked(state, folderId) && state.session.currentFolderId === folderId) {
+      if (password && !folderIsLocked(state, folderId) && state.session.currentFolderId === folderId) {
         await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
         applySessionState(state, sessionStore.getState());
         await loadDirectorySideEffects(state, client);
@@ -88,28 +88,6 @@ const saveFolderPassword = async (folderId: string) => {
     }
   } catch (error) {
     reportActionError(state, "folder_password.save.failed", error, { folderId });
-  }
-};
-
-const clearFolderPassword = async (folderId: string) => {
-  migrateActiveLegacyFolderPasswords(state);
-  const scopedKey = folderPasswordScopedKey(
-    activeFolderPasswordScopeDeviceId(state),
-    folderId,
-  );
-  const next = { ...state.passwords.saved };
-  delete next[folderId];
-  if (scopedKey) delete next[scopedKey];
-  state.passwords.saved = next;
-  state.passwords.drafts = { ...state.passwords.drafts, [folderId]: "" };
-  setFolderPasswordInputVisible(folderId, true);
-  try {
-    await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
-    if (state.session.isConnected) {
-      await refreshOverview();
-    }
-  } catch (error) {
-    reportActionError(state, "folder_password.clear.failed", error, { folderId });
   }
 };
 
@@ -326,8 +304,8 @@ const restoreIdentityRecovery = async () => {
   return {
     updateFolderPasswordDraft,
     setFolderPasswordInputVisible,
-    saveFolderPassword,
-    clearFolderPassword,
+    saveFolderPassword: (folderId: string) => changeFolderPassword(folderId, (state.passwords.drafts[folderId] ?? "").trim()),
+    clearFolderPassword: (folderId: string) => changeFolderPassword(folderId, ""),
     addSavedDevice,
     editSavedDeviceName,
     useSavedDevice,

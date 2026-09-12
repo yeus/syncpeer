@@ -4,13 +4,11 @@
   import Panel from "./Panel.svelte";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
-  import AndroidDocumentSettings from "./AndroidDocumentSettings.svelte";
   import { formatBuildTimeLocal, getAppBuildInfo } from "../lib/appInfo.ts";
   import { downloadTransportText, type AppState } from "../app/state.ts";
 
   interface Props {
     app: AppState;
-    onConnectDocumentFolder: (folder: { id: string; label: string; password?: string }) => Promise<void>;
     advertisedDevices: AdvertisedDeviceItem[];
     isSavedDeviceConnected: (deviceId: string) => boolean;
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
@@ -39,7 +37,6 @@
 
   let {
     app,
-    onConnectDocumentFolder,
     advertisedDevices,
     isSavedDeviceConnected,
     isSavedDeviceAwaitingRemoteApproval,
@@ -280,9 +277,6 @@
 
   {#if app.ui.isSettingsExpanded}
     <div class="settings-block">
-      {#if appInfo.platform === "android"}
-        <AndroidDocumentSettings folders={app.session.folders} onConnectFolder={onConnectDocumentFolder} />
-      {/if}
       <div class="appearance-settings" data-testid="appearance-settings">
         <h3>Appearance</h3>
         <div class="appearance-grid">

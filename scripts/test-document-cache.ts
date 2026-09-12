@@ -8,7 +8,92 @@ import { createServer } from "vite";
 import { createInitialSessionState } from "../packages/core/dist/ui/sessionPolicies.js";
 import type * as AppActions from "../packages/app/src/app/actions.ts";
 import type * as AppState from "../packages/app/src/app/state.ts";
+import type * as DeviceActions from "../packages/app/src/app/deviceActions.ts";
+import type * as DirectoryActions from "../packages/app/src/app/directoryActions.ts";
 import type { TransferRuntime } from "../packages/app/src/app/transferRuntime.ts";
+
+test("password actions publish changes only after secure storage succeeds", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createDeviceActions } = await server.ssrLoadModule("/packages/app/src/app/deviceActions.ts") as typeof DeviceActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.passwords.saved = { photos: "synthetic-old" };
+  state.passwords.drafts = { photos: "synthetic-new" };
+  let failSave = true, sessionUpdates = 0;
+  const actions = createDeviceActions({ state, client: {} as never,
+    sessionStore: { actions: { setFolderPasswords: async () => { sessionUpdates++; } } } as never,
+    refreshOverview: async () => {}, refreshActiveView: async () => {}, refreshCurrentDeviceId: async () => {},
+    savePasswords: async () => { if (failSave) throw new Error("Synthetic secure storage failure"); },
+  });
+  await actions.saveFolderPassword("photos");
+  assert.deepEqual(state.passwords.saved, { photos: "synthetic-old" });
+  assert.equal(sessionUpdates, 0);
+  failSave = false;
+  await actions.saveFolderPassword("photos");
+  assert.deepEqual(state.passwords.saved, { photos: "synthetic-new" });
+  assert.equal(sessionUpdates, 1);
+  failSave = true;
+  await actions.clearFolderPassword("photos");
+  assert.deepEqual(state.passwords.saved, { photos: "synthetic-new" });
+  assert.equal(sessionUpdates, 1);
+});
+
+test("local folders can be browsed offline and with a locked remote connection", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createDirectoryActions } = await server.ssrLoadModule("/packages/app/src/app/directoryActions.ts") as typeof DirectoryActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.localFolders = [{ id: "photos", label: "Photos", readOnly: false }];
+  let failRead = false;
+  const actions = createDirectoryActions({ state,
+    client: { listLocalDirectory: async () => { if (failRead) throw new Error("Synthetic locked storage"); return []; },
+      getCachedStatuses: async () => [] } as never,
+    sessionStore: { actions: { goToPath: async () => assert.fail("Local browsing must not contact a peer") } } as never,
+    refreshActiveView: async () => {}, syncStarredFiles: async () => {},
+  });
+  await actions.openFolderRoot("photos");
+  assert.equal(state.session.currentFolderId, "photos");
+  assert.deepEqual(state.session.entries, []);
+  state.session.isConnected = true;
+  state.session.folders = [{ id: "photos", label: "Photos", readOnly: true, encrypted: true, needsPassword: true }];
+  assert.equal(await actions.openLocation("photos", "", "fixture.open", {}), true);
+  failRead = true;
+  assert.equal(await actions.openLocation("photos", "", "fixture.open", {}), false);
+  assert.equal(state.ui.recentError, "Synthetic locked storage");
+});
+
+test("discovery retains empty roots across peers and only downloads enter the local directory", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => secret,
+      save: async value => { secret = value; }, remove: async () => { secret = null; },
+    } });
+  await documents.initialize(true);
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => await dispatchDocumentCommand(documents, input) as T,
+    legacy: { listCachedFiles: async () => [], cacheFile: async () => assert.fail("No plaintext fallback") },
+    openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  await cache.syncFolders([{ id: "photos", label: "Photos", readOnly: true, encrypted: true, needsPassword: true }], {});
+  assert.deepEqual(await cache.platformAdapter.listLocalDirectory!("photos", ""), []);
+  await assert.rejects(cache.platformAdapter.cacheFile!("photos", "image.bin", "image.bin", Uint8Array.of(1)), /not ready/);
+  await Promise.all([
+    cache.syncFolders([{ id: "photos", label: "Photos", readOnly: true, encrypted: true, needsPassword: false }],
+      { photos: "synthetic-remote-password" }),
+    cache.platformAdapter.cacheFile!("photos", "image.bin", "image.bin", Uint8Array.of(1)),
+  ]);
+  await assert.rejects(cache.connectFolder({ id: "photos", label: "Photos", password: "different-password" }), /migration/i);
+  await cache.syncFolders([{ id: "music", label: "Music", readOnly: false }], {});
+  const known = await cache.syncFolders([], {});
+  assert.deepEqual(known.map(folder => folder.label), ["Photos", "Music"]);
+  assert.deepEqual((await cache.platformAdapter.listLocalDirectory!("photos", ""))!.map(entry => entry.name), ["image.bin"]);
+  assert.deepEqual(await cache.platformAdapter.listLocalDirectory!("music", ""), []);
+  await documents.close();
+});
 
 test("opt-in cache migration preserves originals and routes downloads and picker edits through one owner", async t => {
   const { openStorage } = memoryDocumentStorage();

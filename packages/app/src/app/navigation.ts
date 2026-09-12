@@ -32,6 +32,8 @@ type NavigationActions = Pick<
   | "closeDiagnosticsPage"
   | "openAboutPage"
   | "closeAboutPage"
+  | "openFolderSettings"
+  | "closeFolderSettings"
   | "openFolderRoot"
   | "openDirectory"
   | "goToBreadcrumb"
@@ -39,7 +41,7 @@ type NavigationActions = Pick<
   | "openFavorite"
 >;
 
-const pages: AppRoute["page"][] = ["main", "diagnostics", "about"];
+const pages: AppRoute["page"][] = ["main", "diagnostics", "about", "folder-settings"];
 const tabs: AppRoute["tab"][] = ["favorites", "folders", "devices", "pim"];
 
 const isPage = (value: string): value is AppRoute["page"] =>
@@ -329,6 +331,8 @@ export const createNavigableAppActions = (args: {
     switchTab: recordAction(args.actions.switchTab),
     openDiagnosticsPage: recordAction(args.actions.openDiagnosticsPage),
     openAboutPage: recordAction(args.actions.openAboutPage),
+    openFolderSettings: recordAction(args.actions.openFolderSettings),
+    closeFolderSettings: () => routeOperations.goBackFromPage(args.actions.closeFolderSettings),
     openFolderRoot: recordAction(args.actions.openFolderRoot),
     openDirectory: recordAction(args.actions.openDirectory),
     goToBreadcrumb: recordAction(args.actions.goToBreadcrumb),

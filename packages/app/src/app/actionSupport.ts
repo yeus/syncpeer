@@ -33,6 +33,7 @@ export const sortByName = <T extends { name: string }>(items: T[]) =>
 
 export const clearDirectoryView = (state: AppState) => {
   state.session = clearDirectoryViewState(state.session);
+  state.session.isLocalDirectory = false;
 };
 
 export const resetRuntimeState = (state: AppState) => {

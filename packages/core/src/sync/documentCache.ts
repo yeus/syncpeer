@@ -4,9 +4,10 @@ import type { FileDownloadSink } from "../transfer/stream.js";
 import { sameDownloadMetadata } from "../transfer/stream.js";
 import type { FolderRegistration } from "./folderRegistry.js";
 import { assertReplicaPath } from "./replicaPaths.js";
+import type { FolderInfo } from "../core/model/remoteFs.js";
 
-/** Route opted-in cache folders to the service owner, never mirror two writable copies.
- * Migration is explicit, verified, and retains original storage as a backup.
+/** Route prepared folders to the service owner, never mirror two writable copies.
+ * Migration is verified and retains original storage as a backup.
  */
 export function createDocumentCache(options: {
   enabled: () => boolean;
@@ -85,12 +86,14 @@ export function createDocumentCache(options: {
     };
   };
   const createFileDownloadSink: NonNullable<SyncpeerPlatformAdapter["createFileDownloadSink"]> = async args => {
+    await folderQueue;
     const release = track(args.folderId);
     let destination: FileDownloadSink;
     try {
       const folder = await owner(args.folderId);
       if (folder) destination = sink(args.folderId, args.path, args.modifiedMs, args.expectedLocalHash);
       else {
+        if (options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
         if (!options.legacy.createFileDownloadSink) throw new Error("Download storage is unavailable.");
         destination = await options.legacy.createFileDownloadSink(args);
       }
@@ -118,6 +121,16 @@ export function createDocumentCache(options: {
     await options.show(documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
   };
   const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
+    listLocalDirectory: async (folderId, path) => {
+      const folder = (await registrations()).find(folder => folder.id === folderId);
+      if (!folder) return await options.legacy.listLocalDirectory?.(folderId, path) ?? null;
+      if (path) assertReplicaPath(path);
+      const entries = await request<Array<{ name: string; directory: boolean; size: number; modifiedMs: number }>>({
+        operation: "list", id: documentId(folder, path),
+      });
+      return entries.map(entry => ({ name: entry.name, path: path ? `${path}/${entry.name}` : entry.name,
+        type: entry.directory ? "directory" as const : "file" as const, size: entry.size, modifiedMs: entry.modifiedMs }));
+    },
     acknowledgeCachedSync: async (folderId, path, baseline) => {
       const folder = await owner(folderId);
       if (!folder) return false;
@@ -125,9 +138,11 @@ export function createDocumentCache(options: {
       return true;
     },
     cacheFile: async (folderId, path, name, bytes, modifiedMs) => {
+      await folderQueue;
       const release = track(folderId);
       try {
         if (!await owner(folderId)) {
+          if (options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
           if (!options.legacy.cacheFile) throw new Error("Cache is unavailable.");
           await options.legacy.cacheFile(folderId, path, name, bytes, modifiedMs); return;
         }
@@ -179,11 +194,9 @@ export function createDocumentCache(options: {
     migrating.add(folder.id);
     try {
       let registered = (await registrations()).find(value => value.id === folder.id);
+      await request({ operation: "register", ...folder });
       if (registered?.downloads) return;
-      if (!registered) {
-        await request({ operation: "register", ...folder });
-        registered = (await registrations()).find(value => value.id === folder.id)!;
-      }
+      registered = (await registrations()).find(value => value.id === folder.id)!;
       const files = (await options.legacy.listCachedFiles?.() ?? []).filter(file => file.folderId === folder.id);
       const existing = await request<CachedFileRecord[]>({ operation: "folderFiles", folderId: folder.id });
       for (const file of files) {
@@ -223,5 +236,27 @@ export function createDocumentCache(options: {
       await request({ operation: "attachDownloads", id: folder.id });
     } finally { migrating.delete(folder.id); }
   };
-  return { platformAdapter, connectFolder };
+  let folderQueue = Promise.resolve();
+  const observed = new Map<string, string>();
+  const syncFolders = (folders: FolderInfo[], passwords: Record<string, string>) => {
+    const task = folderQueue.then(async () => {
+      if (!options.enabled()) return [];
+      // Discovery must finish even if preparing one folder's contents later fails.
+      for (const folder of folders) {
+        await request({ operation: "rememberFolder", id: folder.id, label: folder.label || folder.id });
+      }
+      for (const folder of folders) {
+        const signature = JSON.stringify([folder.label, folder.encrypted, folder.needsPassword, passwords[folder.id]]);
+        if (observed.get(folder.id) === signature) continue;
+        if (!folder.needsPassword && (!folder.encrypted || passwords[folder.id])) {
+          await connectFolder({ id: folder.id, label: folder.label || folder.id, password: passwords[folder.id] });
+        }
+        observed.set(folder.id, signature);
+      }
+      return registrations();
+    });
+    folderQueue = task.then(() => {}, () => {});
+    return task;
+  };
+  return { platformAdapter, connectFolder, syncFolders };
 }

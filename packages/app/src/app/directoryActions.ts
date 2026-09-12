@@ -43,17 +43,32 @@ export const createDirectoryActions = (args: {
     details: unknown,
     missingOfflineMessage = "This folder has not been browsed on this device yet.",
   ): Promise<boolean> => {
-    if (folderIsLocked(state, folderId)) return false;
     const normalizedPath = normalizePath(path);
     state.ui.uploadMessage = "";
-    if (!state.session.isConnected || !state.session.remoteFs) {
-      if (!restoreOfflineDirectory(state, folderId, normalizedPath)) {
-        state.ui.recentError = missingOfflineMessage;
-        return false;
-      }
-      return true;
-    }
     try {
+      if (!state.session.isConnected || folderIsLocked(state, folderId) || !state.session.folders.some(folder => folder.id === folderId)) {
+        const local = await client.listLocalDirectory?.(folderId, normalizedPath);
+        if (local) {
+          state.session.isLocalDirectory = true;
+          state.session.directory = { ...state.session.directory, folderId, path: normalizedPath,
+            entries: local, status: "ready", error: null, loadedAtMs: Date.now() };
+          state.session.currentFolderId = folderId;
+          state.session.currentPath = normalizedPath;
+          state.session.entries = local;
+          state.session.directoryPage = 1;
+          await refreshCachedStatuses(state, client, folderId, local.map(entry => entry.path));
+          return true;
+        }
+      }
+      if (folderIsLocked(state, folderId)) return false;
+      if (!state.session.isConnected || !state.session.remoteFs) {
+        if (!restoreOfflineDirectory(state, folderId, normalizedPath)) {
+          state.ui.recentError = missingOfflineMessage;
+          return false;
+        }
+        return true;
+      }
+      state.session.isLocalDirectory = false;
       await sessionStore.actions.goToPath(
         folderId,
         normalizedPath,
@@ -70,7 +85,6 @@ export const createDirectoryActions = (args: {
   };
 
   const openFolderRoot = async (folderId: string) => {
-    if (folderIsLocked(state, folderId)) return;
     state.activeTab = "folders";
     await openLocation(folderId, "", "folder.open_root.failed", { folderId });
   };
@@ -100,6 +114,7 @@ export const createDirectoryActions = (args: {
 
   const goToRootView = async () => {
     state.ui.uploadMessage = "";
+    state.session.isLocalDirectory = false;
     if (!state.session.isConnected || !state.session.remoteFs) {
       clearDirectoryView(state);
       return;

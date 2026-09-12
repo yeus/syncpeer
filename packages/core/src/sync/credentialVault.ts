@@ -1,5 +1,6 @@
 import { deriveUntrustedFolderCrypto } from "../core/model/untrusted.js";
 import { readEncryptedRecord, writeEncryptedRecord } from "./encryptedRecord.js";
+import { FOLDER_PASSWORD_SCOPE_SEPARATOR, isScopedFolderPasswordKey } from "../ui/sessionPasswords.js";
 
 export interface CredentialVaultRecord {
   format: 1;
@@ -12,6 +13,7 @@ interface VaultData {
   format: 1;
   defaultPassword: string | null;
   folders: Record<string, string>;
+  connectionPasswords?: Record<string, string>;
 }
 
 export interface RememberedUnlockSecretStore {
@@ -42,7 +44,9 @@ const decodeData = (bytes: Uint8Array): VaultData => {
   if (!data || data.format !== 1 || !data.folders || typeof data.folders !== "object" || Array.isArray(data.folders) ||
     Object.keys(data.folders).length > 10000) throw new Error("Invalid credential vault contents.");
   if (data.defaultPassword !== null) password(data.defaultPassword);
-  for (const [id, value] of Object.entries(data.folders)) {
+  if (data.connectionPasswords !== undefined && (!data.connectionPasswords || typeof data.connectionPasswords !== "object" ||
+    Array.isArray(data.connectionPasswords) || Object.keys(data.connectionPasswords).length > 10000)) throw new Error("Invalid credential vault contents.");
+  for (const [id, value] of [...Object.entries(data.folders), ...Object.entries(data.connectionPasswords ?? {})]) {
     if (!id.length || id.length > 1024) throw new Error("Invalid vault folder identifier.");
     password(value);
   }
@@ -123,12 +127,39 @@ export function createCredentialVault(options: {
     if (record.manualLocked) { await revoke(); throw new Error("Credential vault is locked."); }
     return { record, data: await read(record, key) };
   };
-  const update = (transform: (data: VaultData) => VaultData) => run(async () => {
+  const rememberSecret = async (masterPassword: string, record: CredentialVaultRecord) => {
+    if (!options.rememberedSecret) return;
+    try {
+      await options.rememberedSecret.save(masterPassword);
+      await options.storage.save({ ...record, remember: true });
+      remembered = true;
+    } catch { issue = "Unlock secret could not be remembered; manual unlock remains available."; }
+  };
+  const update = (transform: (data: VaultData) => VaultData | Promise<VaultData>) => run(async () => {
     const { record, data } = await unlocked();
-    await save(transform(data), key!, record);
+    await save(await transform(data), key!, record);
   });
   return {
     status,
+    createDeviceProtected: () => run(async () => {
+      if (!options.rememberedSecret) throw new Error("Secure device storage is required.");
+      if (key || initialized || decodeRecord(await options.storage.load())) throw new Error("Credential vault already exists.");
+      if (!await options.rememberedSecret.isDeviceUnlocked()) throw new Error("Unlock the device first.");
+      const random = await options.randomBytes(32);
+      let derived: Awaited<ReturnType<typeof deriveUntrustedFolderCrypto>> | undefined;
+      try {
+        if (random.length !== 32) throw new Error("Invalid random secret length.");
+        const secret = [...random].map(byte => byte.toString(16).padStart(2, "0")).join("");
+        // Persist and verify recovery before publishing ciphertext encrypted with a generated secret.
+        await options.rememberedSecret.save(secret);
+        if (await options.rememberedSecret.load() !== secret) throw new Error("Secure device storage verification failed.");
+        derived = await deriveUntrustedFolderCrypto(vaultId, secret);
+        await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey, { manualLocked: false, remember: true });
+        key = derived.folderKey; initialized = true; remembered = true; issue = undefined;
+        return status();
+      } catch (error) { derived?.folderKey.fill(0); throw error; }
+      finally { random.fill(0); }
+    }),
     initialize: () => run(async () => {
       if (key) throw new Error("Credential vault is already unlocked.");
       const record = decodeRecord(await options.storage.load());
@@ -150,13 +181,7 @@ export function createCredentialVault(options: {
       try {
         const record = await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey, { manualLocked: false, remember: false });
         key = derived.folderKey; initialized = true;
-        if (remember && options.rememberedSecret) {
-          try {
-            await options.rememberedSecret.save(masterPassword);
-            await options.storage.save({ ...record, remember: true });
-            remembered = true;
-          } catch { issue = "Unlock secret could not be remembered; manual unlock remains available."; }
-        }
+        if (remember) await rememberSecret(masterPassword, record);
         return status();
       } catch (error) { derived.folderKey.fill(0); throw error; }
     }),
@@ -164,6 +189,7 @@ export function createCredentialVault(options: {
       const record = decodeRecord(await options.storage.load());
       if (!record) throw new Error("Credential vault is missing.");
       await unlock(masterPassword, record);
+      await rememberSecret(masterPassword, { ...record, manualLocked: false });
       return status();
     }),
     lock: () => run(async () => {
@@ -177,12 +203,28 @@ export function createCredentialVault(options: {
       const { data } = await unlocked();
       return Object.hasOwn(data.folders, folderId) ? data.folders[folderId] : null;
     }),
-    setDefaultPassword: (value: string | null) => update(data => ({ ...data, defaultPassword: value === null ? null : password(value) })),
-    addFolder: (folderId: string, value?: string) => update(data => {
+    connectionPasswords: () => run(async () => {
+      const { data } = await unlocked();
+      return { ...data.connectionPasswords };
+    }),
+    saveConnectionPasswords: (values: Record<string, string>) => update(data => {
+      for (const [id, value] of Object.entries(values)) {
+        const folderId = isScopedFolderPasswordKey(id) ? id.slice(id.indexOf(FOLDER_PASSWORD_SCOPE_SEPARATOR) + 1).trim() : id;
+        if (Object.hasOwn(data.folders, folderId) && data.folders[folderId] !== value) {
+          throw new Error("Folder password changes require migration; the saved password was not changed.");
+        }
+      }
+      return { ...data, connectionPasswords: { ...values } };
+    }),
+    addFolder: (folderId: string, value?: string) => update(async data => {
       if (Object.hasOwn(data.folders, folderId)) throw new Error("Folder credentials already exist; password changes require migration.");
-      const selected = value === undefined ? data.defaultPassword : password(value);
-      if (selected === null) throw new Error("A folder password or default is required.");
-      return { ...data, folders: { ...data.folders, [folderId]: selected } };
+      const selected = value === undefined ? null : password(value);
+      const generated = selected === null ? await options.randomBytes(32) : undefined;
+      try {
+        if (generated && generated.length !== 32) throw new Error("Invalid random password length.");
+        const secret = selected ?? [...generated!].map(byte => byte.toString(16).padStart(2, "0")).join("");
+        return { ...data, folders: { ...data.folders, [folderId]: secret } };
+      } finally { generated?.fill(0); }
     }),
     forgetRememberedSecret: () => run(async () => {
       const record = decodeRecord(await options.storage.load());

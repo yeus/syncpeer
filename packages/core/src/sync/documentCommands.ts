@@ -23,6 +23,12 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
   };
   switch (command.operation) {
     case "status": case "cacheRegistrations": return documents.status();
+    case "connectionPasswords": return documents.connectionPasswords();
+    case "saveConnectionPasswords": {
+      if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
+      return documents.saveConnectionPasswords(command.passwords as Record<string, string>);
+    }
+    case "rememberFolder": return documents.rememberFolder({ id: text("id"), label: text("label") });
     case "cachedFiles": return documents.cachedFiles();
     case "folderFiles": return documents.cachedFiles(text("folderId"));
     case "cachedStatuses": {
@@ -45,7 +51,6 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     case "createVault": return documents.createVault(text("password"));
     case "unlock": return documents.unlock(text("password"));
     case "lock": return documents.lock();
-    case "setDefaultPassword": return documents.setDefaultPassword(text("password"));
     case "register": return documents.register({ id: text("id"), label: text("label"),
       ...(command.password === undefined ? {} : { password: text("password") }) });
     case "stat": return documents.stat(text("id"));

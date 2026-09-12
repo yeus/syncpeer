@@ -79,5 +79,7 @@ const closeAboutPage = () => {
     closeDiagnosticsPage,
     openAboutPage,
     closeAboutPage,
+    openFolderSettings: () => { state.currentPage = "folder-settings"; },
+    closeFolderSettings: () => { state.currentPage = "main"; },
   };
 };

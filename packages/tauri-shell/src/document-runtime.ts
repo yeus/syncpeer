@@ -30,7 +30,7 @@ async function startDocuments(android: { getNamedPort: (name: string) => Promise
     randomBytes: async size => new Uint8Array(await request({ method: "random", size }) as number[]),
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
       remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true } });
-  await documents.initialize();
+  await documents.initialize(true);
   return { command: (input: unknown) => dispatchDocumentCommand(documents, input), close: documents.close };
 }
 

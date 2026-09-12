@@ -30,8 +30,7 @@ export async function runFilesystemConformance(request: (request: NativeFilesyst
     const vault = createCredentialVault(vaultOptions);
     const createdVault = await vault.create("synthetic-native-master");
     if (!createdVault.remembered) throw new Error("Native unlock secret was not remembered.");
-    await vault.setDefaultPassword("synthetic-folder-password");
-    await vault.addFolder("fixture-vault-folder");
+    await vault.addFolder("fixture-vault-folder", "synthetic-folder-password");
     await vault.lock();
     const restartedVault = createCredentialVault(vaultOptions);
     if ((await restartedVault.initialize()).phase !== "locked") throw new Error("Native remember bypassed manual lock.");

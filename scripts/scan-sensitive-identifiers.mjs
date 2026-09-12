@@ -191,7 +191,17 @@ const walkFiles = async (directory, output) => {
 
 const candidateFiles = async (root, includeIgnored) => {
   const candidates = includeIgnored ? null : listGitCandidates(root);
-  if (candidates) return candidates;
+  if (candidates) {
+    const existing = await Promise.all(candidates.map(async (filePath) => {
+      try {
+        return (await fs.stat(filePath)).isFile() ? filePath : null;
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    }));
+    return existing.filter(Boolean);
+  }
   const fallback = [];
   await walkFiles(root, fallback);
   return fallback;

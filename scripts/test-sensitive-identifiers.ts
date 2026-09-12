@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { scanText } from "./scan-sensitive-identifiers.mjs";
+import {
+  scanRepository,
+  scanText,
+} from "./scan-sensitive-identifiers.mjs";
 
 test("redacts and classifies sensitive identifier assignments", () => {
   const findings = scanText(
@@ -68,4 +75,25 @@ test("scans shell and URL credential forms", () => {
       { kind: "credential", severity: "error" },
     ],
   );
+});
+
+test("ignores tracked files deleted from the working tree", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "syncpeer-sensitive-scan-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const deletedPath = path.join(root, "deleted.txt");
+  await writeFile(deletedPath, "safe fixture\n", "utf8");
+  execFileSync("git", ["init", "--quiet"], { cwd: root });
+  execFileSync("git", ["add", "deleted.txt"], { cwd: root });
+  await rm(deletedPath);
+
+  const report = await scanRepository(root, {
+    includeIgnored: false,
+    strict: false,
+    json: false,
+    verbose: false,
+    help: false,
+  });
+
+  assert.equal(report.files, 0);
+  assert.deepEqual(report.findings, []);
 });

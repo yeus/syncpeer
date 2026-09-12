@@ -84,6 +84,8 @@ export const createAppActions = (args: {
   };
 };
 
+export type AppActions = ReturnType<typeof createAppActions>;
+
 export {
   cacheFileKeyExists,
   favoriteEntryKey,

@@ -313,21 +313,26 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
 
     goToRoot: async (): Promise<void> => {
       state.remoteFs?.setFocusedFolder(null);
-      setState((current) => ({
-        ...current,
-        directory: {
-          ...directoryToIdle(current).directory,
-          folderId: "",
-          path: "",
+      setState((current) => {
+        const requestSeq = current.directory.requestSeq + 1;
+        return {
+          ...current,
+          directoryLoadSeq: requestSeq,
+          directory: {
+            ...directoryToIdle(current).directory,
+            folderId: "",
+            path: "",
+            entries: [],
+            versionKey: "",
+            requestSeq,
+          },
+          currentFolderId: "",
+          currentPath: "",
           entries: [],
-          versionKey: "",
-        },
-        currentFolderId: "",
-        currentPath: "",
-        entries: [],
-        currentFolderVersionKey: "",
-        pending: { ...current.pending, loadingDirectory: false },
-      }));
+          currentFolderVersionKey: "",
+          pending: { ...current.pending, loadingDirectory: false },
+        };
+      });
     },
 
     openFolder: async (folderId: string, options?: ConnectOptions): Promise<void> => {
@@ -431,7 +436,9 @@ export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): Syncp
       } catch (error) {
         const message = resolveErrorMessage(error);
         setState((next) =>
-          next.requestEpoch === targetEpoch ? directoryToError(next, message) : next,
+          next.requestEpoch === targetEpoch && next.directory.requestSeq === requestSeq
+            ? directoryToError(next, message)
+            : next,
         );
         throw error;
       }

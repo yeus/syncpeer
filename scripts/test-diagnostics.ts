@@ -165,6 +165,16 @@ const main = async (): Promise<void> => {
       ],
     },
     {
+      name: "Application navigation history diagnostics",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test", "scripts/test-app-navigation.ts"],
+    },
+    {
+      name: "Session directory navigation diagnostics",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test", "scripts/test-session-store-navigation.ts"],
+    },
+    {
       name: "Favorite synchronization policy diagnostics",
       command: process.execPath,
       args: ["--import", "tsx/esm", "--test", "scripts/test-favorite-sync-policies.ts"],

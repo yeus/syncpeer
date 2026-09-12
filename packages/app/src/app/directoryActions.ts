@@ -11,14 +11,19 @@ import {
 } from "@syncpeer/core/browser";
 import { reportActionError } from "./actionErrors.ts";
 import {
+  applySessionState,
+  connectionDetails,
   directoryTotalPages,
   folderIsLocked,
-  applySessionState,
   type AppState,
 } from "./state.ts";
-import { sortByName, loadDirectorySideEffects, restoreAfterTransportFailure, clearDirectoryView } from "./actionSupport.ts";
+import {
+  clearDirectoryView,
+  loadDirectorySideEffects,
+  restoreAfterTransportFailure,
+  sortByName,
+} from "./actionSupport.ts";
 import { refreshCachedStatuses, refreshFolderRootCachedStatuses } from "./cacheStatusActions.ts";
-import { connectionDetails } from "./state.ts";
 import { restoreOfflineDirectory } from "./syncPolicies.ts";
 import { updateCachedKey } from "./downloadPolicies.ts";
 
@@ -31,100 +36,99 @@ export const createDirectoryActions = (args: {
 }) => {
   const { state, client, sessionStore, refreshActiveView, syncStarredFiles } = args;
 
-const openFolderRoot = async (folderId: string) => {
-  if (folderIsLocked(state, folderId)) return;
-  state.ui.uploadMessage = "";
-  state.activeTab = "folders";
-  if (!state.session.isConnected || !state.session.remoteFs) {
-    if (!restoreOfflineDirectory(state, folderId, "")) {
-      state.ui.recentError = "This folder has not been browsed on this device yet.";
+  const openLocation = async (
+    folderId: string,
+    path: string,
+    errorEvent: string,
+    details: unknown,
+    missingOfflineMessage = "This folder has not been browsed on this device yet.",
+  ): Promise<boolean> => {
+    if (folderIsLocked(state, folderId)) return false;
+    const normalizedPath = normalizePath(path);
+    state.ui.uploadMessage = "";
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      if (!restoreOfflineDirectory(state, folderId, normalizedPath)) {
+        state.ui.recentError = missingOfflineMessage;
+        return false;
+      }
+      return true;
     }
-    return;
-  }
-  try {
-    await sessionStore.actions.openFolder(folderId, connectionDetails(state));
-    applySessionState(state, sessionStore.getState());
-    await loadDirectorySideEffects(state, client);
-  } catch (error) {
-    reportActionError(state, "folder.open_root.failed", error, { folderId });
-    restoreAfterTransportFailure(state, error);
-  }
-};
+    try {
+      await sessionStore.actions.goToPath(
+        folderId,
+        normalizedPath,
+        connectionDetails(state),
+      );
+      applySessionState(state, sessionStore.getState());
+      await loadDirectorySideEffects(state, client);
+      return true;
+    } catch (error) {
+      reportActionError(state, errorEvent, error, details);
+      restoreAfterTransportFailure(state, error);
+      return false;
+    }
+  };
 
-const openDirectory = async (path: string) => {
-  if (!state.session.currentFolderId) return;
-  state.ui.uploadMessage = "";
-  const nextPath = resolveDirectoryPath(state.session.currentPath, path);
-  if (!state.session.isConnected || !state.session.remoteFs) {
-    if (!restoreOfflineDirectory(state, state.session.currentFolderId, nextPath)) {
-      state.ui.recentError = "This directory has not been browsed on this device yet.";
-    }
-    return;
-  }
-  try {
-    await sessionStore.actions.openPath(nextPath, connectionDetails(state));
-    applySessionState(state, sessionStore.getState());
-    await loadDirectorySideEffects(state, client);
-  } catch (error) {
-    reportActionError(state, "folder.open_path.failed", error, { path: nextPath });
-    restoreAfterTransportFailure(state, error);
-  }
-};
+  const openFolderRoot = async (folderId: string) => {
+    if (folderIsLocked(state, folderId)) return;
+    state.activeTab = "folders";
+    await openLocation(folderId, "", "folder.open_root.failed", { folderId });
+  };
 
-const goToBreadcrumb = async (segment: BreadcrumbSegment) => {
-  if (segment.ellipsis) return;
-  state.ui.uploadMessage = "";
-  if (!state.session.isConnected || !state.session.remoteFs) {
-    if (!restoreOfflineDirectory(state, segment.targetFolderId, segment.targetPath)) {
-      state.ui.recentError = "This directory has not been browsed on this device yet.";
-    }
-    return;
-  }
-  try {
-    await sessionStore.actions.goToPath(
+  const openDirectory = async (path: string) => {
+    if (!state.session.currentFolderId) return;
+    const nextPath = resolveDirectoryPath(state.session.currentPath, path);
+    await openLocation(
+      state.session.currentFolderId,
+      nextPath,
+      "folder.open_path.failed",
+      { path: nextPath },
+      "This directory has not been browsed on this device yet.",
+    );
+  };
+
+  const goToBreadcrumb = async (segment: BreadcrumbSegment) => {
+    if (segment.ellipsis) return;
+    await openLocation(
       segment.targetFolderId,
       segment.targetPath,
-      connectionDetails(state),
+      "folder.go_to_breadcrumb.failed",
+      segment,
+      "This directory has not been browsed on this device yet.",
     );
+  };
+
+  const goToRootView = async () => {
+    state.ui.uploadMessage = "";
+    if (!state.session.isConnected || !state.session.remoteFs) {
+      clearDirectoryView(state);
+      return;
+    }
+    await sessionStore.actions.goToRoot();
     applySessionState(state, sessionStore.getState());
-    await loadDirectorySideEffects(state, client);
-  } catch (error) {
-    reportActionError(state, "folder.go_to_breadcrumb.failed", error, segment);
-    restoreAfterTransportFailure(state, error);
-  }
-};
+    state.session.directoryPage = 1;
+    await refreshActiveView();
+  };
 
-const goToRootView = async () => {
-  state.ui.uploadMessage = "";
-  if (!state.session.isConnected || !state.session.remoteFs) {
-    clearDirectoryView(state);
-    return;
-  }
-  await sessionStore.actions.goToRoot();
-  applySessionState(state, sessionStore.getState());
-  state.session.directoryPage = 1;
-  await refreshActiveView();
-};
-
-const setDirectoryPage = (page: number) => {
+  const setDirectoryPage = (page: number) => {
   const maxPage = directoryTotalPages(state);
   const nextPage = Math.min(maxPage, Math.max(1, Math.floor(page)));
   state.session.directoryPage = nextPage;
 };
 
-const setDirectoryPageSize = (pageSize: number) => {
+  const setDirectoryPageSize = (pageSize: number) => {
   if (!Number.isFinite(pageSize)) return;
   const normalized = Math.min(2000, Math.max(10, Math.floor(pageSize)));
   state.ui.directoryPageSize = normalized;
   state.session.directoryPage = 1;
 };
 
-const setDirectorySortMode = (sortMode: FileEntrySortMode) => {
+  const setDirectorySortMode = (sortMode: FileEntrySortMode) => {
   state.ui.directorySortMode = sortMode;
   state.session.directoryPage = 1;
 };
 
-const setDirectoryNameFilter = (nameFilter: string) => {
+  const setDirectoryNameFilter = (nameFilter: string) => {
   state.ui.directoryNameFilter = nameFilter;
   state.session.directoryPage = 1;
 };
@@ -180,20 +184,14 @@ const removeFavorite = async (favorite: AppState["favorites"]["items"][number]) 
 const openFavorite = async (favorite: Pick<FavoriteRecord, "folderId" | "path" | "kind">) => {
   if (!state.session.isConnected) return;
   state.activeTab = "folders";
-  state.ui.uploadMessage = "";
-  try {
-    await sessionStore.actions.goToPath(
-      favorite.folderId,
-      favorite.kind === "folder"
-        ? favorite.path
-        : normalizePath(favorite.path.split("/").slice(0, -1).join("/")),
-      connectionDetails(state),
-    );
-    applySessionState(state, sessionStore.getState());
-    await loadDirectorySideEffects(state, client);
-  } catch (error) {
-    reportActionError(state, "favorite.open.failed", error, favorite);
-  }
+  await openLocation(
+    favorite.folderId,
+    favorite.kind === "folder"
+      ? favorite.path
+      : normalizePath(favorite.path.split("/").slice(0, -1).join("/")),
+    "favorite.open.failed",
+    favorite,
+  );
 };
 
 const openDownloadedFilesPanel = async () => {
@@ -278,6 +276,7 @@ const openCachedDirectory = (folderId: string, path: string) =>
 
 
   return {
+    openLocation,
     openFolderRoot,
     openDirectory,
     goToBreadcrumb,

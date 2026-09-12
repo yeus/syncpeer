@@ -20,6 +20,7 @@
     formatModified,
     rootFolderEntries,
   } from "./app/actions.ts";
+  import { createNavigableAppActions } from "./app/navigation.ts";
   import { createDiagnosticsActions } from "./app/diagnosticsActions.ts";
   import {
     importProviderPimFromSyncthingFolder,
@@ -96,11 +97,18 @@
     client,
     runtimeSurface: appInfo.runtimeSurface,
   });
-  const actions = createAppActions({
+  const baseActions = createAppActions({
     state: app,
     client,
     sessionStore,
     transfers: transferRuntime,
+  });
+  const actions = createNavigableAppActions({
+    state: app,
+    actions: baseActions,
+    history: window.history,
+    location: window.location,
+    events: window,
   });
   const diagnosticsActions = createDiagnosticsActions({
     state: app,
@@ -111,6 +119,14 @@
 
   const unsubscribe = sessionStore.subscribe((next) => {
     applySessionState(app, next);
+    actions.syncNavigationRoute();
+    if (
+      next.phase === "connected" &&
+      !next.pending.loadingDirectory &&
+      (next.directory.status === "ready" || !next.currentFolderId)
+    ) {
+      void actions.restoreNavigationRoute(true);
+    }
   });
 
   let activePasswords = $derived(activeFolderPasswords(app));
@@ -208,6 +224,7 @@
   });
 
   onMount(() => {
+    const stopNavigation = actions.startNavigation();
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const updateSystemTheme = () => {
       systemPrefersDark = colorScheme.matches;
@@ -221,7 +238,9 @@
         actions.refreshCurrentDeviceId(),
       ]);
       actions.restoreOfflineSnapshot(undefined, "startup");
+      await actions.restoreNavigationRoute(false);
       await actions.onAppForeground();
+      await actions.restoreNavigationRoute(true);
     })();
 
     const handleOnline = () => {
@@ -292,6 +311,7 @@
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("pageshow", handlePageShow);
       colorScheme.removeEventListener("change", updateSystemTheme);
+      stopNavigation();
     };
   });
 

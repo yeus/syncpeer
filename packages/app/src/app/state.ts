@@ -118,7 +118,8 @@ export const persistState = (state: AppState) => {
       savedDevices: state.devices.savedDevices,
       syncApprovedIntroducedFolderKeys: [...state.approvals.syncApprovedFolderKeys].sort(),
       folderPasswords: state.passwords.secureStorage ? undefined : state.passwords.saved,
-      offlineFolderSnapshots: state.offline.snapshots,
+      offlineFolderSnapshots: Object.fromEntries(Object.entries(state.offline.snapshots).map(([deviceId, snapshot]) =>
+        [deviceId, { ...snapshot, directories: undefined, activeDirectoryKey: undefined }])),
       directoryPageSize: state.ui.directoryPageSize,
       directoryViewMode: state.ui.directoryViewMode,
       directorySortMode: state.ui.directorySortMode,

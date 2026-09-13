@@ -167,6 +167,13 @@ export interface SyncpeerPlatformAdapter {
   removeFavorite?: (key: string) => Promise<FavoriteRecord[]>;
   loadProfileSettings?: () => Promise<SyncpeerProfileSettings>;
   saveProfileSettings?: (settings: SyncpeerProfileSettings) => Promise<void>;
+  loadDirectorySnapshot?: (folderId: string, sourceDeviceId: string, path: string) => Promise<{
+    entries: FileEntry[]; versionKey: string; loadedAtMs: number;
+  } | null>;
+  saveDirectorySnapshot?: (folderId: string, sourceDeviceId: string, path: string, snapshot: {
+    entries: FileEntry[]; versionKey: string; loadedAtMs: number;
+  }) => Promise<void>;
+  enforceCacheQuota?: () => Promise<{ quotaBytes: number; cachedBytes: number; protectedBytes: number; evicted: string[] }>;
   listDocumentVersions?: (folderId: string, path: string) => Promise<DocumentVersionRecord[]>;
   restoreDocumentVersion?: (folderId: string, path: string, versionId: string) => Promise<void>;
   cacheFile?: (
@@ -258,6 +265,9 @@ export interface SyncpeerBrowserClient {
   removeFavorite: (key: string) => Promise<FavoriteRecord[]>;
   loadProfileSettings: () => Promise<SyncpeerProfileSettings>;
   saveProfileSettings: (settings: SyncpeerProfileSettings) => Promise<void>;
+  loadDirectorySnapshot: NonNullable<SyncpeerPlatformAdapter["loadDirectorySnapshot"]>;
+  saveDirectorySnapshot: NonNullable<SyncpeerPlatformAdapter["saveDirectorySnapshot"]>;
+  enforceCacheQuota: NonNullable<SyncpeerPlatformAdapter["enforceCacheQuota"]>;
   listDocumentVersions: (folderId: string, path: string) => Promise<DocumentVersionRecord[]>;
   restoreDocumentVersion: (folderId: string, path: string, versionId: string) => Promise<void>;
   cacheFile: (
@@ -675,6 +685,15 @@ export const createSyncpeerBrowserClient = (
     saveProfileSettings: async settings => platformAdapter.saveProfileSettings
       ? platformAdapter.saveProfileSettings(settings)
       : throwMissingAdapter("saveProfileSettings"),
+    loadDirectorySnapshot: async (folderId, sourceDeviceId, path) => platformAdapter.loadDirectorySnapshot
+      ? platformAdapter.loadDirectorySnapshot(folderId, sourceDeviceId, path)
+      : null,
+    saveDirectorySnapshot: async (folderId, sourceDeviceId, path, snapshot) => {
+      await platformAdapter.saveDirectorySnapshot?.(folderId, sourceDeviceId, path, snapshot);
+    },
+    enforceCacheQuota: async () => platformAdapter.enforceCacheQuota
+      ? platformAdapter.enforceCacheQuota()
+      : ({ quotaBytes: 0, cachedBytes: 0, protectedBytes: 0, evicted: [] }),
     listDocumentVersions: async (folderId, path) => platformAdapter.listDocumentVersions
       ? platformAdapter.listDocumentVersions(folderId, path)
       : throwMissingAdapter("listDocumentVersions"),

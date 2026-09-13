@@ -211,4 +211,7 @@ export const loadDirectorySideEffects = async (
   );
   state.session.lastUpdatedAt = nowTime();
   saveOfflineDirectorySnapshot(state, activeSourceDeviceId(state));
+  await client.saveDirectorySnapshot(state.session.currentFolderId, activeSourceDeviceId(state),
+    state.session.currentPath, { entries: state.session.entries,
+      versionKey: state.session.currentFolderVersionKey, loadedAtMs: Date.now() });
 };

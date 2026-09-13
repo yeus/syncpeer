@@ -9,7 +9,7 @@ test("automatic folder storage starts empty and retains folder roots and downloa
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
   const options = { profileId: "fixture", deviceCounterId: "42", openStorage,
-    profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => secret,
       save: async (value: string) => { secret = value; }, remove: async () => { secret = null; },
     } };
@@ -38,11 +38,53 @@ test("automatic folder storage starts empty and retains folder roots and downloa
 test("automatic setup does not publish a vault when secure storage cannot retain its key", async () => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
-    profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => null, save: async () => {}, remove: async () => {},
     } });
   await assert.rejects(documents.initialize(true), /verification failed/);
   assert.equal((await documents.status()).vault.phase, "uninitialized");
+  await documents.close();
+});
+
+test("directory catalogs stay encrypted and cache eviction preserves favorites and local edits", async () => {
+  const { roots, openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const options = { profileId: "policy-fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 100,
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => secret,
+      save: async (value: string) => { secret = value; }, remove: async () => { secret = null; } } };
+  const documents = createDocumentFilesystem(options);
+  await documents.initialize(true);
+  await documents.register({ id: "folder", label: "Folder", password: "synthetic-password" });
+  await documents.attachDownloads("folder");
+  await documents.saveDirectorySnapshot("folder", "synthetic-device", "", {
+    entries: [{ name: "remote-only.txt", path: "remote-only.txt", type: "file", size: 9, modifiedMs: 1 }],
+    versionKey: "v1", loadedAtMs: 10,
+  });
+  assert.equal((await documents.loadDirectorySnapshot("folder", "synthetic-device", ""))?.entries[0].name,
+    "remote-only.txt");
+  for (const path of ["favorite.txt", "evictable.txt", "edited.txt"]) {
+    const handle = await documents.beginDownload("folder", path, 3, 1);
+    await documents.write(handle, 0, Uint8Array.of(1, 2, 3));
+    await documents.finishDownload(handle);
+  }
+  const settings = await documents.profileSettings();
+  settings.profile.cache.overrideBytes = 6;
+  settings.folders.folder = { exclusions: [], ignorePatterns: [], paused: false,
+    favorites: [{ key: "file:folder:favorite.txt", folderId: "folder", path: "favorite.txt",
+      name: "favorite.txt", kind: "file" }] };
+  await documents.saveProfileSettings(settings);
+  const [folder] = await documents.list("syncpeer-root");
+  const edited = (await documents.list(folder.id)).find(entry => entry.name === "edited.txt")!;
+  const writer = await documents.open(edited.id, "rw");
+  await documents.write(writer, 0, Uint8Array.of(9));
+  await documents.release(writer);
+  const result = await documents.enforceCacheQuota();
+  assert.deepEqual(result.evicted, ["folder:evictable.txt"]);
+  assert.deepEqual((await documents.cachedFiles()).map(file => file.path).sort(), ["edited.txt", "favorite.txt"]);
+  for (const root of roots.values()) for (const entry of root.files.values()) {
+    assert.equal(Buffer.from(entry.bytes).includes(Buffer.from("remote-only.txt")), false);
+  }
   await documents.close();
 });
 

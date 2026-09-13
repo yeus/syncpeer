@@ -39,7 +39,10 @@ export function createDocumentCache(options: {
     ? request<SyncpeerProfileSettings>({ operation: "profileSettings" })
     : options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
   const saveProfileSettings = async (settings: SyncpeerProfileSettings) => {
-    if (options.enabled()) await request({ operation: "saveProfileSettings", settings });
+    if (options.enabled()) {
+      await request({ operation: "saveProfileSettings", settings });
+      await request({ operation: "enforceCacheQuota" });
+    }
     else if (options.legacy.saveProfileSettings) await options.legacy.saveProfileSettings(settings);
     else throw new Error("Encrypted profile settings are unavailable.");
   };
@@ -189,7 +192,12 @@ export function createDocumentCache(options: {
       }
     } catch (error) { release(); throw error; }
     return { ...destination,
-      commit: async () => { await destination.commit(); release(); },
+      commit: async () => {
+        try {
+          await destination.commit();
+          if (options.enabled()) await request({ operation: "enforceCacheQuota" });
+        } finally { release(); }
+      },
       abort: async error => { try { await destination.abort(error); } finally { release(); } },
       ...(destination.suspend ? { suspend: async () => { try { await destination.suspend!(); } finally { release(); } } } : {}),
     };
@@ -213,6 +221,13 @@ export function createDocumentCache(options: {
   const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
     loadProfileSettings,
     saveProfileSettings,
+    loadDirectorySnapshot: (folderId, sourceDeviceId, path) => request({
+      operation: "loadDirectorySnapshot", folderId, sourceDeviceId, path,
+    }),
+    saveDirectorySnapshot: (folderId, sourceDeviceId, path, snapshot) => request({
+      operation: "saveDirectorySnapshot", folderId, sourceDeviceId, path, snapshot,
+    }),
+    enforceCacheQuota: () => request({ operation: "enforceCacheQuota" }),
     listDocumentVersions: async (folderId, path) => {
       const folder = await owner(folderId);
       if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
@@ -257,7 +272,8 @@ export function createDocumentCache(options: {
         }
         const target = sink(folderId, path, modifiedMs);
         try { await target.begin({ folderId, path, sizeBytes: bytes.length, encrypted: false });
-          await target.write(0, bytes); await target.commit(); }
+          await target.write(0, bytes); await target.commit();
+          await request({ operation: "enforceCacheQuota" }); }
         catch (error) { await target.abort(error); throw error; }
       } finally { release(); }
     },

@@ -994,6 +994,13 @@ async fn syncpeer_profile_storage_root(
     root.to_str().map(str::to_owned).ok_or_else(|| "Encrypted profile storage path is unavailable.".into())
 }
 
+#[tauri::command]
+async fn syncpeer_profile_available_bytes(app: tauri::AppHandle) -> Result<u64, String> {
+    let root = app_data_root(&app)?;
+    fs::create_dir_all(&root).map_err(|error| format!("Could not create app storage: {error}"))?;
+    fs2::available_space(root).map_err(|error| format!("Could not inspect available app storage: {error}"))
+}
+
 fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
     if !path.exists() {
         return Ok(T::default());
@@ -4263,6 +4270,7 @@ pub fn run() {
             syncpeer_upsert_favorite,
             syncpeer_remove_favorite,
             syncpeer_profile_storage_root,
+            syncpeer_profile_available_bytes,
             syncpeer_cache_file,
             syncpeer_cache_begin_file,
             syncpeer_cache_digest_ranges,

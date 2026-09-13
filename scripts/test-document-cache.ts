@@ -66,6 +66,28 @@ test("local folders can be browsed offline and with a locked remote connection",
   assert.equal(state.ui.recentError, "Synthetic locked storage");
 });
 
+test("offline browsing loads remote entries from the encrypted catalog", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createDirectoryActions } = await server.ssrLoadModule("/packages/app/src/app/directoryActions.ts") as typeof DirectoryActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.connection.remoteId = "ABCDEFG2";
+  state.session.folders = [{ id: "photos", label: "Photos", readOnly: true, needsPassword: false }];
+  const actions = createDirectoryActions({ state, client: {
+    listLocalDirectory: async () => null,
+    loadDirectorySnapshot: async (folderId: string, sourceDeviceId: string, path: string) => {
+      assert.deepEqual({ folderId, sourceDeviceId, path },
+        { folderId: "photos", sourceDeviceId: "ABCDEFG2", path: "album" });
+      return { entries: [{ name: "remote-only.jpg", path: "album/remote-only.jpg", type: "file", size: 4, modifiedMs: 1 }],
+        versionKey: "v1", loadedAtMs: 2 };
+    },
+  } as never, sessionStore: {} as never, refreshActiveView: async () => {}, syncStarredFiles: async () => {} });
+  assert.equal(await actions.openLocation("photos", "album", "fixture.open", {}), true);
+  assert.deepEqual(state.session.entries.map(entry => entry.name), ["remote-only.jpg"]);
+  assert.equal(state.session.isOfflineSnapshot, true);
+});
+
 test("unfavoriting an inherited child creates a device-local exclusion", async t => {
   const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
   t.after(() => server.close());
@@ -123,7 +145,7 @@ test("a favorite folder downloads its non-ignored descendants", async t => {
 test("discovery retains empty roots across peers and only downloads enter the local directory", async () => {
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
-  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
+  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage, availableBytes: async () => 1024 * 1024 * 1024,
     profile: await openStorage("profile"), randomBytes, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => secret,
       save: async value => { secret = value; }, remove: async () => { secret = null; },
@@ -166,7 +188,7 @@ test("discovery retains empty roots across peers and only downloads enter the lo
 
 test("cache migration verifies and removes plaintext originals", async t => {
   const { openStorage } = memoryDocumentStorage();
-  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
+  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage, availableBytes: async () => 1024 * 1024 * 1024,
     profile: await openStorage("profile"), randomBytes, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => null, save: async () => {}, remove: async () => {},
     } });
@@ -303,7 +325,7 @@ test("encrypted folders can be migrated back to verified plaintext storage", asy
   t.after(() => server.close());
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
-  const documents = createDocumentFilesystem({ profileId: "reverse-fixture", deviceCounterId: "42", openStorage,
+  const documents = createDocumentFilesystem({ profileId: "reverse-fixture", deviceCounterId: "42", openStorage, availableBytes: async () => 1024 * 1024 * 1024,
     profile: await openStorage("profile"), randomBytes, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => secret, save: async value => { secret = value; }, remove: async () => { secret = null; },
     } });
@@ -349,7 +371,7 @@ test("encrypted downloads resume verified ranges after a document runtime restar
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
   const openDocuments = async () => {
-    const documents = createDocumentFilesystem({ profileId: "resume-fixture", deviceCounterId: "42", openStorage,
+    const documents = createDocumentFilesystem({ profileId: "resume-fixture", deviceCounterId: "42", openStorage, availableBytes: async () => 1024 * 1024 * 1024,
       profile: await openStorage("profile"), randomBytes, rememberedSecret: {
         isDeviceUnlocked: async () => true, load: async () => secret,
         save: async value => { secret = value; }, remove: async () => { secret = null; },

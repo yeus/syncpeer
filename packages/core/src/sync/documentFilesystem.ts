@@ -19,7 +19,10 @@ import { cachedFileKey } from "../ui/helpers.js";
 import { loadDocumentBaseline, saveDocumentBaseline } from "./documentBaseline.js";
 import { classifyFavoritePath } from "../ui/favoriteSelection.js";
 import { defaultFolderSettings } from "./profileSettings.js";
+import { cacheQuotaBytes, planCacheEvictions } from "./profileSettings.js";
 import { planVersionRemovals } from "./folderSync.js";
+import { loadCacheAccess, loadDirectorySnapshot, saveCacheAccess,
+  saveDirectorySnapshot, type StoredDirectorySnapshot } from "./documentPrivateRecords.js";
 
 /** Single owner used by the UI and native file providers; host adapters only move bytes. */
 export function createDocumentFilesystem(options: {
@@ -29,6 +32,7 @@ export function createDocumentFilesystem(options: {
   openStorage: (id: string) => Promise<Awaited<ReturnType<typeof createNativeFilesystem>>>;
   rememberedSecret: RememberedUnlockSecretStore;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
+  availableBytes: () => Promise<number>;
 }) {
   const configs = createFolderRegistryStorage(options.profile);
   const storage = new Map<string, Awaited<ReturnType<typeof options.openStorage>>>();
@@ -198,6 +202,21 @@ export function createDocumentFilesystem(options: {
         modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
     }
   };
+  const digest = async (replica: LocalFolderReplica, path: string) => {
+    const source = await createReplicaFileSource(replica, path), hash = sha256.create();
+    for (let offset = 0; offset < source.size; offset += 131072) {
+      const data = await source.readRange(offset, Math.min(131072, source.size - offset));
+      try { hash.update(data); } finally { data.fill(0); }
+    }
+    return [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  };
+  const touch = async (folder: FolderRegistration, path: string) => {
+    if (!folder.downloads) return;
+    const bytes = storage.get(folder.storageId)!, key = folderKeys.get(folder.storageId)!;
+    const access = await loadCacheAccess(bytes, key);
+    access[path] = Date.now();
+    await saveCacheAccess(bytes, key, options.randomBytes, access);
+  };
   return {
     initialize: (automatic = false) => run(async () => {
       await options.profile.initializeReplica(); await vault.initialize();
@@ -210,6 +229,53 @@ export function createDocumentFilesystem(options: {
     profileSettings: () => run(() => vault.profileSettings()),
     saveProfileSettings: (settings: Parameters<typeof vault.saveProfileSettings>[0]) =>
       run(() => vault.saveProfileSettings(settings)),
+    loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) => run(async () => {
+      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
+      const folder = registry.getState().find(value => value.id === folderId);
+      if (!folder || !registry.getReplica(folderId)) return null;
+      assertReplicaPath(path || "root");
+      return loadDirectorySnapshot(storage.get(folder.storageId)!, folderKeys.get(folder.storageId)!, sourceDeviceId, path);
+    }),
+    saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string,
+      snapshot: StoredDirectorySnapshot) => run(async () => {
+      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
+      const folder = registry.getState().find(value => value.id === folderId);
+      if (!folder || !registry.getReplica(folderId)) throw new Error("Document folder is unavailable.");
+      assertReplicaPath(path || "root");
+      await saveDirectorySnapshot(storage.get(folder.storageId)!, { folderKey: folderKeys.get(folder.storageId)!,
+        randomBytes: options.randomBytes, sourceDeviceId, path, snapshot });
+    }),
+    enforceCacheQuota: () => run(async () => {
+      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
+      const settings = await vault.profileSettings();
+      const quotaBytes = cacheQuotaBytes(await options.availableBytes(), settings.profile.cache);
+      const candidates: Array<{ key: string; sizeBytes: number; lastAccessedMs: number; protected: boolean;
+        folder: FolderRegistration; path: string }> = [];
+      for (const folder of registry.getState().filter(value => value.downloads)) {
+        const replica = registry.getReplica(folder.id)!;
+        const bytes = storage.get(folder.storageId)!, key = folderKeys.get(folder.storageId)!;
+        const access = await loadCacheAccess(bytes, key);
+        const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
+        for (const info of await replica.scan()) {
+          if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0 || isInternalReplicaPath(info.name)) continue;
+          const baseline = await loadDocumentBaseline(bytes, key, info.name);
+          const selected = classifyFavoritePath({ folderId: folder.id, path: info.name, kind: "file" },
+            folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
+          const unchanged = baseline !== undefined && baseline.sizeBytes === Number(info.size ?? 0) &&
+            await digest(replica, info.name) === baseline.hash;
+          candidates.push({ key: cachedFileKey(folder.id, info.name), folder, path: info.name,
+            sizeBytes: Number(info.size ?? 0), lastAccessedMs: access[info.name] ??
+              Number(info.modified_s ?? 0) * 1000, protected: selected.status === "favorite" || !unchanged });
+        }
+      }
+      const evicted = planCacheEvictions(candidates, quotaBytes);
+      for (const key of evicted) {
+        const candidate = candidates.find(value => value.key === key)!;
+        await removePaths(registry.getReplica(candidate.folder.id)!, candidate.folder.id, [candidate.path]);
+      }
+      return { quotaBytes, cachedBytes: candidates.reduce((total, value) => total + value.sizeBytes, 0),
+        protectedBytes: candidates.filter(value => value.protected).reduce((total, value) => total + value.sizeBytes, 0), evicted };
+    }),
     rememberFolder: (folder: { id: string; label: string }) => run(async () => {
       if (!registry) throw new Error("Folder storage is unavailable.");
       if (!registry.getState().some(value => value.id === folder.id)) {
@@ -504,6 +570,7 @@ export function createDocumentFilesystem(options: {
         value.dirty = ["w", "wt", "rwt"].includes(mode);
         value.writer = await writable(id, value.dirty);
       }
+      if (mode === "r") await touch(file.folder, file.path);
       const idNumber = ++nextHandle; handles.set(idNumber, value); return idNumber;
     }),
     size: (id: number) => run(async () => { const value = handle(id); return value.writer ? value.writer.size() : value.reader!.size; }),

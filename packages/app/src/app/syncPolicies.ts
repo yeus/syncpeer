@@ -128,6 +128,22 @@ export const restoreOfflineDirectory = (
   return true;
 };
 
+export const applyOfflineDirectory = (
+  state: AppState,
+  folderId: string,
+  path: string,
+  directory: { entries: FileEntry[]; versionKey: string; loadedAtMs: number },
+) => {
+  state.session.directory = { ...state.session.directory, ...directory, folderId, path,
+    entries: [...directory.entries], status: "ready", error: null };
+  state.session.currentFolderId = folderId;
+  state.session.currentPath = path;
+  state.session.entries = [...directory.entries];
+  state.session.currentFolderVersionKey = directory.versionKey;
+  state.session.directoryPage = 1;
+  state.session.isOfflineSnapshot = true;
+};
+
 export const hasAutoConnectTarget = (state: AppState) => {
   const remoteTarget = normalizeDeviceId(state.connection.remoteId);
   if (remoteTarget) return true;

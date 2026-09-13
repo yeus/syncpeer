@@ -253,6 +253,7 @@ export const createTauriAdapters = (
       }
       const documents = createDocumentFilesystem({ profileId: "documents", deviceCounterId: counter.toString(),
         profile: await storage("profile"), openStorage: storage,
+        availableBytes: () => invokeWithLogging<number>("syncpeer_profile_available_bytes"),
         rememberedSecret: {
           load: () => invokeWithLogging<string | null>("syncpeer_vault_secret",
             { request: { profileId: "documents", operation: "load", secret: null } }),

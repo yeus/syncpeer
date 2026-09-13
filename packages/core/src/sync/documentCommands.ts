@@ -25,6 +25,16 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     case "status": case "cacheRegistrations": return documents.status();
     case "connectionPasswords": return documents.connectionPasswords();
     case "profileSettings": return documents.profileSettings();
+    case "loadDirectorySnapshot": return documents.loadDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
+      command.path === "" ? "" : text("path"));
+    case "saveDirectorySnapshot": {
+      if (!command.snapshot || typeof command.snapshot !== "object" || Array.isArray(command.snapshot)) {
+        throw new Error("Invalid directory snapshot.");
+      }
+      return documents.saveDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
+        command.path === "" ? "" : text("path"), command.snapshot as Parameters<typeof documents.saveDirectorySnapshot>[3]);
+    }
+    case "enforceCacheQuota": return documents.enforceCacheQuota();
     case "saveProfileSettings": {
       if (!command.settings || typeof command.settings !== "object" || Array.isArray(command.settings)) {
         throw new Error("Invalid profile settings.");

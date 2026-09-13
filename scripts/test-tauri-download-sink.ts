@@ -10,7 +10,7 @@ const installDocumentBridge = async () => {
   const native = globalThis as typeof globalThis & { __TAURI__?: unknown };
   const previous = native.__TAURI__;
   const { openStorage } = memoryDocumentStorage();
-  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
+  const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage, availableBytes: async () => 1024 * 1024 * 1024,
     profile: await openStorage("profile"), randomBytes, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => null, save: async () => {}, remove: async () => {},
     } });

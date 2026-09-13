@@ -28,6 +28,7 @@ async function startDocuments(android: { getNamedPort: (name: string) => Promise
   const documents = createDocumentFilesystem({ profileId: "documents", profile: await openStorage("profile"), openStorage,
     deviceCounterId: String(await request({ method: "counter" })),
     randomBytes: async size => new Uint8Array(await request({ method: "random", size }) as number[]),
+    availableBytes: async () => Number(await request({ method: "availableBytes" })),
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
       remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true } });
   await documents.initialize(true);

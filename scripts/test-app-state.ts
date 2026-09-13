@@ -25,6 +25,23 @@ test("secure credentials are excluded from browser persistence", t => {
   assert.ok(!written.includes("synthetic-secret"));
 });
 
+test("remote directory entries are excluded from browser persistence", t => {
+  let written = "";
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true,
+    value: { localStorage: { setItem: (_key: string, value: string) => { written = value; } } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  state.offline.snapshots.device = { deviceId: "device", remoteDevice: null, folders: [],
+    folderSyncStates: [], connectedVia: "fixture", transportKind: "", lastSeenAtMs: 1,
+    directories: { directory: { folderId: "folder", path: "", versionKey: "v1", loadedAtMs: 1,
+      entries: [{ name: "private-name.txt", path: "private-name.txt", type: "file", size: 1, modifiedMs: 1 }] } } };
+  persistState(state);
+  assert.equal(written.includes("private-name.txt"), false);
+  assert.equal(JSON.parse(written).offlineFolderSnapshots.device.directories, undefined);
+});
+
 test("peer updates preserve the directory currently browsed from local storage", () => {
   const state = createInitialState(null);
   state.localFolders = [{ id: "photos", label: "Photos", readOnly: false }];

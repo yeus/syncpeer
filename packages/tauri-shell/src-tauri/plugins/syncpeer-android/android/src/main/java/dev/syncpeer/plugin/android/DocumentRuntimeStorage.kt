@@ -1,6 +1,7 @@
 package dev.syncpeer.plugin.android
 
 import android.content.Context
+import android.os.StatFs
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -37,6 +38,7 @@ class DocumentRuntimeStorage(private val context: Context) : AutoCloseable {
         id
       }
     }
+    "availableBytes" -> StatFs(context.noBackupFilesDir.absolutePath).availableBytes
     else -> throw IllegalArgumentException("Unknown document storage method")
   }
 

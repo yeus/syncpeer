@@ -14,6 +14,7 @@ import {
 import { reportActionError } from "./actionErrors.ts";
 import {
   applySessionState,
+  activeSourceDeviceId,
   connectionDetails,
   directoryTotalPages,
   folderIsLocked,
@@ -26,7 +27,7 @@ import {
   sortByName,
 } from "./actionSupport.ts";
 import { refreshCachedStatuses, refreshFolderRootCachedStatuses } from "./cacheStatusActions.ts";
-import { restoreOfflineDirectory } from "./syncPolicies.ts";
+import { applyOfflineDirectory, restoreOfflineDirectory } from "./syncPolicies.ts";
 import { updateCachedKey } from "./downloadPolicies.ts";
 
 export const createDirectoryActions = (args: {
@@ -64,7 +65,9 @@ export const createDirectoryActions = (args: {
       }
       if (folderIsLocked(state, folderId)) return false;
       if (!state.session.isConnected || !state.session.remoteFs) {
-        if (!restoreOfflineDirectory(state, folderId, normalizedPath)) {
+        const encrypted = await client.loadDirectorySnapshot(folderId, activeSourceDeviceId(state), normalizedPath);
+        if (encrypted) applyOfflineDirectory(state, folderId, normalizedPath, encrypted);
+        else if (!restoreOfflineDirectory(state, folderId, normalizedPath)) {
           state.ui.recentError = missingOfflineMessage;
           return false;
         }

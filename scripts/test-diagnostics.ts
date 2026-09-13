@@ -104,7 +104,7 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-encrypted-filesystem.ts", "scripts/test-native-filesystem.ts", "scripts/test-replica-persistence.ts", "scripts/test-encrypted-replica.ts", "scripts/test-credential-vault.ts"],
     },
     {
-      name: "Tauri partial sink recovery",
+      name: "Tauri document sink recovery",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-tauri-download-sink.ts"],
     },
@@ -145,6 +145,11 @@ const main = async (): Promise<void> => {
     {
       ...tsxScript("scripts/test-transfer-runtime.ts"),
       name: "Application transfer runtime diagnostics",
+    },
+    {
+      name: "Favorite selection policy",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-favorite-selection.ts"],
     },
     {
       name: "Application theme and icon diagnostics",

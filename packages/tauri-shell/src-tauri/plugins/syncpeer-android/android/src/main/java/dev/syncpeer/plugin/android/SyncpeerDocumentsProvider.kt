@@ -52,8 +52,11 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     override fun onServiceDisconnected(name: ComponentName) {
       runtime = null
       ready.completeExceptionally(FileNotFoundException("Document runtime disconnected."))
-      runtimeSummary = "Document runtime stopped. Reopen Syncpeer to retry."
+      ready = CompletableFuture()
+      bound = false
+      runtimeSummary = "Document runtime is restarting."
       notifyRoots()
+      ensureRuntime()
     }
     override fun onNullBinding(name: ComponentName) = onServiceDisconnected(name)
     override fun onBindingDied(name: ComponentName) = onServiceDisconnected(name)
@@ -145,6 +148,17 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     return result.getString("id")
   }
 
+  override fun renameDocument(documentId: String, displayName: String): String {
+    val result = command(JSONObject().put("operation", "rename").put("id", documentId).put("name", displayName)) as JSONObject
+    return result.getString("id")
+  }
+
+  override fun deleteDocument(documentId: String) {
+    if (command(JSONObject().put("operation", "remove").put("id", documentId)) != true) {
+      throw FileNotFoundException("Document is unavailable.")
+    }
+  }
+
   /** Configuration is private to Syncpeer; a document URI grant never grants vault control. */
   override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
     if (method != "syncpeerDocumentCommand") return super.call(method, arg, extras)
@@ -212,7 +226,11 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       add(Document.COLUMN_DOCUMENT_ID, value.getString("id"))
       add(Document.COLUMN_DISPLAY_NAME, value.getString("name"))
       add(Document.COLUMN_MIME_TYPE, if (directory) Document.MIME_TYPE_DIR else "application/octet-stream")
-      add(Document.COLUMN_FLAGS, if (directory) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE)
+      add(Document.COLUMN_FLAGS, if (directory) {
+        Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_DELETE
+      } else {
+        Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+      })
       add(Document.COLUMN_SIZE, if (directory) null else value.getLong("size"))
       add(Document.COLUMN_LAST_MODIFIED, value.getLong("modifiedMs"))
       add(Document.COLUMN_SUMMARY, null)

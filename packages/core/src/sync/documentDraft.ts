@@ -3,6 +3,7 @@ import { encryptUntrustedFilename } from "../core/model/untrusted.js";
 import type { BepVersionVector } from "../core/protocol/bep.js";
 import { compareConcurrentVersionCounters } from "../core/protocol/versionVector.js";
 import { equalHash } from "../transfer/blockReuse.js";
+import { sameDownloadMetadata, type FileDownloadMetadata } from "../transfer/stream.js";
 import { loadEncryptedDiskMetadata, readEncryptedDiskRange } from "./encryptedFilesystem.js";
 import { readEncryptedRecord, writeEncryptedRecord } from "./encryptedRecord.js";
 import type { ReplicaByteStorage } from "./encryptedReplicaStorage.js";
@@ -14,7 +15,12 @@ type DraftStorage = ReplicaByteStorage & {
   listDirectory: (path: string) => Promise<ReplicaEntry[]>;
   copy: (source: string, target: string) => Promise<void>;
 };
-type DraftHead = { format: 1; path: string; baseSize: number; size: number; dirty: boolean; version: BepVersionVector | null; recover?: boolean };
+type DownloadDraft = FileDownloadMetadata & {
+  modifiedMs: number;
+  ranges: Array<{ offset: number; end: number }>;
+};
+type DraftHead = { format: 1; path: string; baseSize: number; size: number; dirty: boolean;
+  version: BepVersionVector | null; recover?: boolean; download?: DownloadDraft };
 type DraftOptions = {
   folderId: string; folderKey: Uint8Array; replica: LocalFolderReplica;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
@@ -32,6 +38,26 @@ async function writeRecord(bytes: DraftStorage, name: string, data: Uint8Array, 
   await bytes.flushChanges([name]);
 }
 
+const mergeRange = (ranges: readonly { offset: number; end: number }[], offset: number, end: number) =>
+  [...ranges, { offset, end }].sort((left, right) => left.offset - right.offset)
+    .reduce<Array<{ offset: number; end: number }>>((result, range) => {
+      const previous = result.at(-1);
+      if (previous && range.offset <= previous.end) previous.end = Math.max(previous.end, range.end);
+      else result.push({ ...range });
+      return result;
+    }, []);
+
+const validDownload = (download: DownloadDraft | undefined) => !download || (
+  typeof download.folderId === "string" && typeof download.path === "string" &&
+  typeof download.encrypted === "boolean" && Number.isSafeInteger(download.sizeBytes) && download.sizeBytes >= 0 &&
+  (download.sourceDeviceId === undefined || typeof download.sourceDeviceId === "string") &&
+  (download.contentId === undefined || typeof download.contentId === "string") &&
+  Number.isSafeInteger(download.modifiedMs) && download.modifiedMs >= 0 && Array.isArray(download.ranges) &&
+  download.ranges.every((range, index) => Number.isSafeInteger(range.offset) && range.offset >= 0 &&
+    Number.isSafeInteger(range.end) && range.end > range.offset && range.end <= download.sizeBytes &&
+    (index === 0 || download.ranges[index - 1]!.end < range.offset))
+);
+
 /** Ciphertext base snapshot plus atomic encrypted changed blocks. No eager plaintext copy.
  * Acknowledged writes survive process death; fsync/close publish one versioned file.
  * Only the document owner calls this object, with operations serialized by its queue.
@@ -39,7 +65,11 @@ async function writeRecord(bytes: DraftStorage, name: string, data: Uint8Array, 
 async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, options: DraftOptions) {
   assertReplicaPath(head.path);
   if (head.format !== 1 || isInternalReplicaPath(head.path) || typeof head.dirty !== "boolean" ||
-    ![head.baseSize, head.size].every(size => Number.isSafeInteger(size) && size >= 0)) throw new Error("Invalid document draft.");
+    ![head.baseSize, head.size].every(size => Number.isSafeInteger(size) && size >= 0) || !validDownload(head.download) ||
+    (head.download && (head.download.folderId !== options.folderId || head.download.path !== head.path ||
+      head.baseSize !== 0 || head.size > head.download.sizeBytes))) {
+    throw new Error("Invalid document draft.");
+  }
   if (head.version !== null) compareConcurrentVersionCounters(head.version, {});
   const chunks = new Set((await bytes.listDirectory(prefix)).flatMap(entry => {
     const match = /^chunk-(\d+)$/.exec(entry.path.slice(prefix.length + 1));
@@ -133,6 +163,7 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
   };
   return {
     path: head.path, size: async () => { ensureOpen(); return head.size; }, readRange, digest, flush, discard,
+    downloadRanges: () => head.download?.ranges.map(range => ({ ...range })) ?? [],
     write: async (offset: number, input: Uint8Array) => {
       ensureOpen();
       if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(offset + input.length) || input.length > 131072) throw new Error("Invalid document write.");
@@ -147,13 +178,18 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
         } finally { data.fill(0); }
         done += count;
       }
-      head = { ...head, size: Math.max(head.size, offset + input.length) }; await saveHead();
+      head = { ...head, size: Math.max(head.size, offset + input.length),
+        ...(head.download ? { download: { ...head.download,
+          ranges: mergeRange(head.download.ranges, offset, offset + input.length) } } : {}) };
+      await saveHead();
     },
     close: async () => { closed = true; metadata?.fileKey.fill(0); if (!head.dirty) await discard(); },
   };
 }
 
-export async function openDocumentDraft(bytes: DraftStorage, options: DraftOptions & { path: string; truncate: boolean; recover?: boolean }) {
+export async function openDocumentDraft(bytes: DraftStorage, options: DraftOptions & {
+  path: string; truncate: boolean; recover?: boolean; download?: Omit<DownloadDraft, "ranges">;
+}) {
   assertReplicaPath(options.path);
   if (isInternalReplicaPath(options.path)) throw new Error("Private document.");
   const current = (await options.replica.scan()).find(file => file.name === options.path);
@@ -164,10 +200,34 @@ export async function openDocumentDraft(bytes: DraftStorage, options: DraftOptio
   const baseSize = options.truncate || current?.deleted ? 0 : Number(current?.size ?? 0);
   if (baseSize) await bytes.copy(await encryptUntrustedFilename(options.folderKey, options.path), prefix + "/base");
   const head: DraftHead = { format: 1, path: options.path, baseSize, size: baseSize, dirty: options.truncate,
-    version: current?.version ?? null, recover: options.recover ?? true };
+    version: current?.version ?? null, recover: options.recover ?? true,
+    ...(options.download ? { download: { ...options.download, ranges: [] } } : {}) };
   const data = new TextEncoder().encode(JSON.stringify(head));
   try { await writeRecord(bytes, prefix + "/head", data, options); } finally { data.fill(0); }
   return useDraft(bytes, prefix, head, options);
+}
+
+export async function openDocumentDownloadDraft(bytes: DraftStorage, options: DraftOptions & {
+  path: string; download: Omit<DownloadDraft, "ranges">;
+}) {
+  for (const root of await bytes.listDirectory("")) {
+    if (root.type !== "directory" || !/^\.syncpeer-draft-[a-f0-9]{32}$/.test(root.path)) continue;
+    let data: Uint8Array | undefined;
+    try {
+      data = await readRecord(bytes, root.path + "/head", options.folderKey);
+      const head = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data)) as DraftHead;
+      if (head.recover !== false || head.path !== options.path || !validDownload(head.download)) continue;
+      const draft = await useDraft(bytes, root.path, head, options);
+      const { modifiedMs } = head.download!;
+      const metadata: FileDownloadMetadata = { folderId: head.download!.folderId, path: head.download!.path,
+        sizeBytes: head.download!.sizeBytes, encrypted: head.download!.encrypted,
+        ...(head.download!.sourceDeviceId ? { sourceDeviceId: head.download!.sourceDeviceId } : {}),
+        ...(head.download!.contentId ? { contentId: head.download!.contentId } : {}) };
+      if (modifiedMs === options.download.modifiedMs && sameDownloadMetadata(metadata, options.download)) return draft;
+      await draft.discard();
+    } finally { data?.fill(0); }
+  }
+  return openDocumentDraft(bytes, { ...options, truncate: true, recover: false, download: options.download });
 }
 
 export async function recoverDocumentDrafts(bytes: DraftStorage, options: DraftOptions): Promise<string[]> {
@@ -178,8 +238,13 @@ export async function recoverDocumentDrafts(bytes: DraftStorage, options: DraftO
       const data = await readRecord(bytes, root.path + "/head", options.folderKey);
       let head: DraftHead;
       try { head = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data)); } finally { data.fill(0); }
+      if (head.recover === false) {
+        if (head.download && validDownload(head.download)) continue;
+        const draft = await useDraft(bytes, root.path, head, options);
+        await draft.discard();
+        continue;
+      }
       const draft = await useDraft(bytes, root.path, head, options);
-      if (head.recover === false) { await draft.discard(); continue; }
       try { await draft.flush(true); } finally { await draft.close(); }
     } catch { issues.push("An encrypted edit needs recovery; its data has been retained."); }
   }

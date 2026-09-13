@@ -104,6 +104,13 @@ const createBaseActions = (
       state.session.currentPath = "";
     },
     openFavorite: async () => {},
+    openVersions: async (folderId, path, name) => {
+      state.currentPage = "versions";
+      state.versions.folderId = folderId;
+      state.versions.path = path;
+      state.versions.name = name;
+    },
+    closeVersions: () => { state.currentPage = "main"; },
   } as unknown as AppActions;
 };
 
@@ -148,6 +155,8 @@ test("serializes and validates the navigation route in the URL fragment", () => 
   assert.equal(routeFromHash(hash)?.tab, route.tab);
   assert.equal(routeFromHash("#v=1&page=unknown&tab=folders"), null);
   assert.equal(routeToHash({ ...route, path: "/nested/deeper/" }), hash);
+  const versionRoute: AppRoute = { ...route, page: "versions", path: "nested", versionPath: "nested/file.txt" };
+  assert.equal(routeFromHash(routeToHash(versionRoute))?.versionPath, "nested/file.txt");
 });
 
 test("records a route after synchronous session updates", async () => {

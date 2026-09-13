@@ -55,8 +55,14 @@ test("registered encrypted documents reopen with remembered credentials, and loc
       load: async () => remembered, remove: async () => { remembered = null; } } };
   let documents = createDocumentFilesystem(options);
   assert.equal((await documents.initialize()).vault.phase, "uninitialized");
-  await documents.createVault("synthetic-master");
+  await documents.createVault("synthetic-master", true);
   await documents.register({ id: "fixture-folder", label: "Fixture", password: "synthetic-folder-password" });
+  const profileSettings = await documents.profileSettings();
+  profileSettings.profile.versioning = "trash";
+  profileSettings.folders["fixture-folder"] = { favorites: [{ key: "folder:fixture-folder:",
+    folderId: "fixture-folder", path: "", name: "Fixture", kind: "folder" }], exclusions: [],
+    ignorePatterns: [], paused: false };
+  await documents.saveProfileSettings(profileSettings);
   const [folder] = await documents.list("syncpeer-root");
   const file = await documents.create(folder.id, "sample.txt", false);
   const writer = await documents.open(file.id, "rw");
@@ -83,6 +89,25 @@ test("registered encrypted documents reopen with remembered credentials, and loc
   await documents.release(append);
   const currentReader = await documents.open(file.id, "r");
   assert.deepEqual(await documents.read(currentReader, 0, 5), Uint8Array.of(5, 8, 9, 4, 10));
+  const versions = await documents.versions(file.id);
+  assert.ok(versions.length >= 2);
+  const archived = versions.at(-1)!;
+  await documents.restoreVersion(file.id, archived.id);
+  const restoredReader = await documents.open(file.id, "r");
+  const restoredBytes = await documents.read(restoredReader, 0, archived.sizeBytes);
+  assert.notDeepEqual(restoredBytes, Uint8Array.of(5, 8, 9, 4, 10));
+  await documents.release(restoredReader);
+  assert.ok((await documents.versions(file.id)).length > versions.length,
+    "Restore archives the current bytes and publishes restored data as a new version");
+  profileSettings.profile.versioning = "simple";
+  await documents.saveProfileSettings(profileSettings);
+  for (const byte of [11, 12]) {
+    const revision = await documents.open(file.id, "rwt");
+    await documents.write(revision, 0, Uint8Array.of(byte));
+    await documents.release(revision);
+  }
+  assert.equal((await documents.versions(file.id)).length, 1,
+    "Encrypted archives apply the same selected simple-version retention policy");
   await documents.lock();
   await assert.rejects(documents.read(reader, 0, 1));
   await documents.close();
@@ -103,6 +128,24 @@ test("registered encrypted documents reopen with remembered credentials, and loc
   await assert.rejects(documents.finishDownload(transfer), /incomplete/i);
   await documents.write(transfer, 0, Uint8Array.of(1, 2));
   await documents.finishDownload(transfer);
+  const renameSource = await documents.create(folder.id, "rename-source.txt", false);
+  const renameWriter = await documents.open(renameSource.id, "rwt");
+  await documents.write(renameWriter, 0, Uint8Array.of(4, 5, 6));
+  await documents.release(renameWriter);
+  const renamed = await documents.rename(renameSource.id, "renamed.txt");
+  const renamedReader = await documents.open(renamed.id, "r");
+  assert.deepEqual(await documents.read(renamedReader, 0, 3), Uint8Array.of(4, 5, 6));
+  await documents.release(renamedReader);
+  assert.equal(await documents.remove(renamed.id), true);
+  assert.equal((await documents.list(folder.id)).some(file => file.name === "renamed.txt"), false);
+  const removableDirectory = await documents.create(folder.id, "removable", true);
+  const removableFile = await documents.create(removableDirectory.id, "nested.txt", false);
+  const removableWriter = await documents.open(removableFile.id, "rwt");
+  await documents.write(removableWriter, 0, Uint8Array.of(7, 8, 9));
+  await documents.release(removableWriter);
+  assert.equal(await documents.remove(removableDirectory.id), true);
+  await assert.rejects(documents.stat(removableFile.id), /unavailable/i);
+  assert.equal((await documents.list(folder.id)).some(file => file.name === "removable"), false);
   await documents.attachDownloads("fixture-folder");
   const cached = await documents.cachedFiles();
   const downloaded = cached.find(file => file.path === "nested/download.txt")!;
@@ -138,7 +181,11 @@ test("registered encrypted documents reopen with remembered credentials, and loc
       assert.ok(encryptedName, "Archive retains the original encrypted path");
       const metadata = await loadEncryptedDiskMetadata({ size: entry.bytes.length,
         readRange: async (offset, size) => entry.bytes.slice(offset, offset + size) }, encryptedName, crypto.folderKey);
-      try { assert.ok(["sample.txt", "nested/download.txt"].includes(metadata.fileInfo.name)); archives++; } finally { metadata.fileKey.fill(0); }
+      try {
+        assert.ok(["sample.txt", "nested/download.txt", "rename-source.txt", "renamed.txt",
+          "removable/nested.txt"].includes(metadata.fileInfo.name));
+        archives++;
+      } finally { metadata.fileKey.fill(0); }
     }
     assert.ok(archives > 0);
   } finally { crypto.folderKey.fill(0); }

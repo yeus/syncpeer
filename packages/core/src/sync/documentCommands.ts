@@ -24,6 +24,13 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
   switch (command.operation) {
     case "status": case "cacheRegistrations": return documents.status();
     case "connectionPasswords": return documents.connectionPasswords();
+    case "profileSettings": return documents.profileSettings();
+    case "saveProfileSettings": {
+      if (!command.settings || typeof command.settings !== "object" || Array.isArray(command.settings)) {
+        throw new Error("Invalid profile settings.");
+      }
+      return documents.saveProfileSettings(command.settings as Parameters<typeof documents.saveProfileSettings>[0]);
+    }
     case "saveConnectionPasswords": {
       if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
       return documents.saveConnectionPasswords(command.passwords as Record<string, string>);
@@ -35,11 +42,22 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       if (!Array.isArray(command.paths) || command.paths.length > 4096 || command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");
       return documents.cachedStatuses(text("folderId"), command.paths);
     }
+    case "versions": return documents.versions(text("id"));
+    case "restoreVersion": return documents.restoreVersion(text("id"), text("versionId"));
     case "attachDownloads": return documents.attachDownloads(text("id"));
     case "detachDownloads": return documents.detachDownloads(text("id"));
     case "clearFolderContents": return documents.clearFolderContents(text("folderId"));
-    case "beginDownload": return documents.beginDownload(text("folderId"), text("path"), integer("size"), integer("modifiedMs"),
-      command.expectedLocalHash === undefined || command.expectedLocalHash === null ? command.expectedLocalHash : text("expectedLocalHash"));
+    case "beginDownload": {
+      if (typeof command.encrypted !== "boolean") throw new Error("Invalid download encryption metadata.");
+      return documents.beginDownload(text("folderId"), text("path"), integer("size"), integer("modifiedMs"),
+        command.expectedLocalHash === undefined || command.expectedLocalHash === null ? command.expectedLocalHash : text("expectedLocalHash"), {
+        encrypted: command.encrypted,
+        ...(command.sourceDeviceId === undefined ? {} : { sourceDeviceId: text("sourceDeviceId") }),
+        ...(command.contentId === undefined ? {} : { contentId: text("contentId") }),
+      });
+    }
+    case "downloadRanges": return documents.downloadRanges(integer("handle"));
+    case "suspendDownload": return documents.suspendDownload(integer("handle"));
     case "finishDownload": return documents.finishDownload(integer("handle"));
     case "digest": return documents.digest(integer("handle"));
     case "copyRanges": return documents.copyRanges(integer("handle"), ranges());
@@ -49,8 +67,12 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
         .map(range => ({ ...range, hash: Array.from(range.hash) }));
     }
     case "remove": return documents.remove(text("id"));
+    case "rename": return documents.rename(text("id"), text("name"));
     case "setSyncBaseline": return documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") });
-    case "createVault": return documents.createVault(text("password"));
+    case "createVault": {
+      if (command.remember !== undefined && typeof command.remember !== "boolean") throw new Error("Invalid remember setting.");
+      return documents.createVault(text("password"), command.remember === true);
+    }
     case "unlock": return documents.unlock(text("password"));
     case "unlockRemembered": return documents.unlockRemembered();
     case "changeMasterPassword": return documents.changeMasterPassword(text("password"));

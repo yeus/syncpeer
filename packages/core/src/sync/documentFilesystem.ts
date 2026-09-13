@@ -1,5 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import { deriveUntrustedFolderCrypto } from "../core/model/untrusted.js";
+import { deriveUntrustedFolderCrypto, encryptUntrustedFilename } from "../core/model/untrusted.js";
 import { createCredentialVault, type RememberedUnlockSecretStore } from "./credentialVault.js";
 import { createCredentialVaultStorage } from "./credentialVaultStorage.js";
 import { createFolderRegistry, type FolderRegistration } from "./folderRegistry.js";
@@ -8,13 +8,18 @@ import { createEncryptedReplicaStorage } from "./encryptedReplicaStorage.js";
 import { createFolderReplica } from "./replicaStorage.js";
 import { createReplicaController } from "./replicaControl.js";
 import { createReplicaFileSource } from "./replicaFileSource.js";
+import type { LocalFolderReplica } from "./replicaIndex.js";
 import { removeAbandonedEncryptedScratch } from "./encryptedScratch.js";
-import { openDocumentDraft, recoverDocumentDrafts } from "./documentDraft.js";
+import { openDocumentDraft, openDocumentDownloadDraft, recoverDocumentDrafts } from "./documentDraft.js";
+import { loadEncryptedDiskMetadata, readEncryptedDiskRange } from "./encryptedFilesystem.js";
 import type { createNativeFilesystem } from "./nativeFilesystem.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 import type { CachedFileRecord } from "../ui/browserClient.js";
 import { cachedFileKey } from "../ui/helpers.js";
 import { loadDocumentBaseline, saveDocumentBaseline } from "./documentBaseline.js";
+import { classifyFavoritePath } from "../ui/favoriteSelection.js";
+import { defaultFolderSettings } from "./profileSettings.js";
+import { planVersionRemovals } from "./folderSync.js";
 
 /** Single owner used by the UI and native file providers; host adapters only move bytes. */
 export function createDocumentFilesystem(options: {
@@ -58,6 +63,27 @@ export function createDocumentFilesystem(options: {
     storage: createCredentialVaultStorage(options.profile, options.profile), rememberedSecret: options.rememberedSecret,
     revokeAccess: revoke });
   const randomId = async () => [...await options.randomBytes(16)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const versionId = async () => `${Date.now()}-${await randomId()}`;
+  const versionTime = (path: string) => {
+    const match = /^\.stversions\/(\d{13})-[a-f0-9]{32}$/.exec(path);
+    return match ? Number(match[1]) : null;
+  };
+  const pruneVersions = async (bytes: Awaited<ReturnType<typeof options.openStorage>>, storedPath: string,
+    versioning: "trash" | "simple" | "staggered") => {
+    const roots = await bytes.listDirectory(".stversions");
+    const versions = (await Promise.all(roots.map(async root => {
+      const createdMs = root.type === "directory" ? versionTime(root.path) : null;
+      return createdMs === null || !await bytes.stat(`${root.path}/${storedPath}`)
+        ? null : { id: root.path, createdMs };
+    }))).filter((version): version is { id: string; createdMs: number } => version !== null);
+    for (const root of planVersionRemovals(versions, {
+      externalDeletion: "ignore", versioning,
+      ...(versioning === "staggered" ? { maxAgeMs: 365 * 86_400_000 } : {}),
+    }, Date.now())) {
+      await bytes.remove(`${root}/${storedPath}`, false);
+      if ((await bytes.listDirectory(root)).length === 0) await bytes.remove(root, true);
+    }
+  };
   const openFolder = async (folder: FolderRegistration) => {
     const password = await vault.folderPassword(folder.id);
     if (!password) throw new Error("Folder credentials are unavailable.");
@@ -69,12 +95,18 @@ export function createDocumentFilesystem(options: {
       await bytes.initializeReplica();
       await bytes.withLock(() => removeAbandonedEncryptedScratch(bytes));
       const encrypted = createEncryptedReplicaStorage(bytes, { folderKey: crypto.folderKey, randomBytes: options.randomBytes,
-        withLock: bytes.withLock, checkHealth: bytes.checkHealth, archive: async path => {
+        withLock: bytes.withLock, checkHealth: bytes.checkHealth, archive: async (path, originalPath) => {
+          const settings = await vault.profileSettings();
+          const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
+          const selection = classifyFavoritePath({ folderId: folder.id, path: originalPath, kind: "file" },
+            folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
+          if (selection.status !== "favorite" || settings.profile.versioning === "disabled") return;
           if (!await bytes.stat(".stversions")) await bytes.makeDirectory(".stversions");
-          const versionRoot = ".stversions/" + await randomId();
+          const versionRoot = ".stversions/" + await versionId();
           await bytes.makeDirectory(versionRoot);
           // The original ciphertext path is needed to decrypt archived metadata.
           await bytes.copy(path, versionRoot + "/" + path);
+          await pruneVersions(bytes, path, settings.profile.versioning);
         } });
       const replica = createReplicaController(createFolderReplica(encrypted, options.deviceCounterId, sha256));
       await replica.scan();
@@ -115,6 +147,19 @@ export function createDocumentFilesystem(options: {
   const entry = (folder: FolderRegistration, path: string, size: number, directory: boolean, modifiedMs = 0) => ({
     id: JSON.stringify([folder.storageId, path]), name: path ? path.split("/").at(-1)! : folder.label, size, directory, modifiedMs,
   });
+  const archivedSource = async (storageId: string, path: string, versionId: string) => {
+    if (!/^(?:\d{13}-)?[a-f0-9]{32}$/.test(versionId)) throw new Error("Invalid document version.");
+    const bytes = storage.get(storageId)!;
+    const key = folderKeys.get(storageId)!;
+    const encrypted = await encryptUntrustedFilename(key, path);
+    const archivePath = `.stversions/${versionId}/${encrypted}`;
+    const stat = await bytes.stat(archivePath);
+    if (!stat || stat.type !== "file") throw new Error("Document version is unavailable.");
+    const source = { size: stat.size, readRange: (offset: number, size: number) => bytes.readRange(archivePath, offset, size) };
+    const metadata = await loadEncryptedDiskMetadata(source, encrypted, key);
+    if (metadata.fileInfo.name !== path) { metadata.fileKey.fill(0); throw new Error("Document version does not match this path."); }
+    return { source, metadata };
+  };
   const stat = async (id: string) => {
     const { folder, path, replica } = resolve(id);
     if (!path) return entry(folder, "", 0, true);
@@ -137,18 +182,21 @@ export function createDocumentFilesystem(options: {
     if (value.download && offset + bytes.length > value.download.size) throw new Error("Download write exceeds expected size.");
     await value.writer.write(value.append ? await value.writer.size() : offset, bytes); value.dirty = true;
     if (value.download && bytes.length) {
-      const ranges = [...value.download.ranges, { offset, end: offset + bytes.length }].sort((a, b) => a.offset - b.offset);
-      value.download.ranges = ranges.reduce<typeof ranges>((result, range) => {
-        const previous = result.at(-1);
-        if (previous && range.offset <= previous.end) previous.end = Math.max(previous.end, range.end);
-        else result.push({ ...range });
-        return result;
-      }, []);
+      value.download.ranges = value.writer.downloadRanges();
     }
   };
   const checkRanges = (ranges: readonly { offset: number; size: number }[]) => {
     if (ranges.length > 256 || ranges.some(range => !Number.isSafeInteger(range.offset) || range.offset < 0 ||
       !Number.isSafeInteger(range.size) || range.size < 0 || !Number.isSafeInteger(range.offset + range.size))) throw new Error("Invalid document ranges.");
+  };
+  const removePaths = async (replica: LocalFolderReplica, folderId: string,
+    paths: readonly string[]) => {
+    for (const path of [...paths].sort((left, right) => right.length - left.length)) {
+      const current = (await replica.scan()).find(value => value.name === path && !value.deleted);
+      if (!current) continue;
+      await replica.edit!({ method: "delete", folderId, path,
+        modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
+    }
   };
   return {
     initialize: (automatic = false) => run(async () => {
@@ -159,6 +207,9 @@ export function createDocumentFilesystem(options: {
     status: () => run(status),
     connectionPasswords: () => run(() => vault.connectionPasswords()),
     saveConnectionPasswords: (passwords: Record<string, string>) => run(() => vault.saveConnectionPasswords(passwords)),
+    profileSettings: () => run(() => vault.profileSettings()),
+    saveProfileSettings: (settings: Parameters<typeof vault.saveProfileSettings>[0]) =>
+      run(() => vault.saveProfileSettings(settings)),
     rememberFolder: (folder: { id: string; label: string }) => run(async () => {
       if (!registry) throw new Error("Folder storage is unavailable.");
       if (!registry.getState().some(value => value.id === folder.id)) {
@@ -166,7 +217,9 @@ export function createDocumentFilesystem(options: {
       }
       return status();
     }),
-    createVault: (password: string) => run(async () => { await vault.create(password); await openRegistrations(); return status(); }),
+    createVault: (password: string, remember = false) => run(async () => {
+      await vault.create(password, remember); await openRegistrations(); return status();
+    }),
     unlock: (password: string) => run(async () => { await vault.unlock(password); await openRegistrations(); return status(); }),
     unlockRemembered: () => run(async () => { await vault.unlockRemembered(); await openRegistrations(); return status(); }),
     changeMasterPassword: (password: string) => run(async () => { await vault.changeMasterPassword(password); return status(); }),
@@ -196,15 +249,10 @@ export function createDocumentFilesystem(options: {
       if (!folder) throw new Error("Document folder is unavailable.");
       const replica = registry.getReplica(folderId);
       if (!replica) throw new Error("Document folder is not open.");
-      const files = (await replica.scan())
+      const paths = (await replica.scan())
         .filter(value => !value.deleted && !value.invalid && !isInternalReplicaPath(value.name))
-        .sort((left, right) => right.name.length - left.name.length);
-      for (const file of files) {
-        const current = (await replica.scan()).find(value => value.name === file.name && !value.deleted);
-        if (!current) continue;
-        await replica.edit!({ method: "delete", folderId, path: file.name,
-          modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
-      }
+        .map(value => value.name);
+      await removePaths(replica, folderId, paths);
       return status();
     }),
     cachedFiles: (folderId?: string) => run(async (): Promise<CachedFileRecord[]> => {
@@ -236,7 +284,45 @@ export function createDocumentFilesystem(options: {
           cachedAtMs: file ? Number(file.modified_s ?? 0) * 1000 : undefined };
       });
     }),
-    beginDownload: (folderId: string, path: string, size: number, modifiedMs: number, expectedLocalHash?: string | null) => run(async () => {
+    versions: (id: string) => run(async () => {
+      const { folder, path, bytes } = resolve(id);
+      if (!path) throw new Error("Choose a file to view its versions.");
+      const roots = await bytes.listDirectory(".stversions");
+      const versions: Array<{ id: string; modifiedMs: number; sizeBytes: number }> = [];
+      for (const root of roots) {
+        if (root.type !== "directory" || !/^(?:\d{13}-)?[a-f0-9]{32}$/.test(root.path.slice(".stversions/".length))) continue;
+        const versionId = root.path.slice(".stversions/".length);
+        try {
+          const archived = await archivedSource(folder.storageId, path, versionId);
+          try {
+            versions.push({ id: versionId,
+              modifiedMs: Number(archived.metadata.fileInfo.modified_s ?? 0) * 1000 +
+                Number(archived.metadata.fileInfo.modified_ns ?? 0) / 1000000,
+              sizeBytes: Number(archived.metadata.fileInfo.size ?? 0) });
+          } finally { archived.metadata.fileKey.fill(0); }
+        } catch (error) {
+          if (!(error instanceof Error && /unavailable/.test(error.message))) throw error;
+        }
+      }
+      return versions.sort((left, right) => right.modifiedMs - left.modifiedMs);
+    }),
+    restoreVersion: (id: string, versionId: string) => run(async () => {
+      const { folder, replica, path } = resolve(id);
+      if (!path) throw new Error("Choose a file to restore.");
+      const archived = await archivedSource(folder.storageId, path, versionId);
+      try {
+        const current = (await replica.scan()).find(file => file.name === path);
+        const restored = await replica.edit!({ method: "write", folderId: folder.id, path,
+          expectedVersion: current?.version ?? null, modifiedMs: Date.now(), source: {
+            size: Number(archived.metadata.fileInfo.size ?? 0),
+            readRange: (offset, size) => readEncryptedDiskRange(archived.source, archived.metadata, offset, size),
+          } });
+        return { modifiedMs: Number(restored.modified_s ?? 0) * 1000 + Number(restored.modified_ns ?? 0) / 1000000,
+          sizeBytes: Number(restored.size ?? 0) };
+      } finally { archived.metadata.fileKey.fill(0); }
+    }),
+    beginDownload: (folderId: string, path: string, size: number, modifiedMs: number, expectedLocalHash?: string | null,
+      metadata: { encrypted: boolean; sourceDeviceId?: string; contentId?: string } = { encrypted: false }) => run(async () => {
       if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
       if (handles.size >= 64) throw new Error("Too many open documents.");
       if (!Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(modifiedMs) || modifiedMs < 0) throw new Error("Invalid download metadata.");
@@ -267,15 +353,30 @@ export function createDocumentFilesystem(options: {
           expectedVersion: old?.version ?? null, modifiedMs });
         else if (old.type !== 1) throw new Error("Download parent is not a directory.");
       }
-      const writer = await openDocumentDraft(file.bytes, { folderId, path, truncate: true, recover: false,
-        replica: file.replica, folderKey: folderKeys.get(folder.storageId)!, randomBytes: options.randomBytes });
+      const writer = await openDocumentDownloadDraft(file.bytes, { folderId, path,
+        replica: file.replica, folderKey: folderKeys.get(folder.storageId)!, randomBytes: options.randomBytes,
+        download: { folderId, path, sizeBytes: size, modifiedMs, encrypted: metadata.encrypted,
+          ...(metadata.sourceDeviceId ? { sourceDeviceId: metadata.sourceDeviceId } : {}),
+          ...(metadata.contentId ? { contentId: metadata.contentId } : {}) } });
       const old = (await file.replica.scan()).find(info => info.name === path && !info.deleted);
       let reader: Awaited<ReturnType<typeof createReplicaFileSource>> | undefined;
       try { if (old) reader = await createReplicaFileSource(file.replica, path); }
       catch (error) { await writer.discard(); throw error; }
       const id = ++nextHandle;
-      handles.set(id, { documentId, writer, reader, dirty: true, download: { size, modifiedMs, ranges: [] } });
+      handles.set(id, { documentId, writer, reader, dirty: true,
+        download: { size, modifiedMs, ranges: writer.downloadRanges() } });
       return id;
+    }),
+    downloadRanges: (id: number) => run(async () => {
+      const value = handle(id);
+      if (!value.download) throw new Error("Not a download handle.");
+      return value.download.ranges.map(range => ({ offset: range.offset, size: range.end - range.offset }));
+    }),
+    suspendDownload: (id: number) => run(async () => {
+      const value = handle(id);
+      if (!value.download || !value.writer) throw new Error("Not a download handle.");
+      handles.delete(id);
+      await value.writer.close();
     }),
     finishDownload: (id: number) => run(async () => {
       const value = handle(id), download = value.download;
@@ -329,11 +430,44 @@ export function createDocumentFilesystem(options: {
     }),
     remove: (id: string) => run(async () => {
       const file = resolve(id);
-      const old = (await file.replica.scan()).find(info => info.name === file.path && !info.deleted);
+      const current = await file.replica.scan();
+      const old = current.find(info => info.name === file.path && !info.deleted);
       if (!old) return false;
-      await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: file.path,
-        modifiedMs: Date.now(), expectedVersion: old.version ?? {} });
+      const paths = old.type === 1
+        ? current.filter(info => !info.deleted && (info.name === file.path || info.name.startsWith(file.path + "/")))
+          .map(info => info.name)
+        : [file.path];
+      await removePaths(file.replica, file.folder.id, paths);
       return true;
+    }),
+    rename: (id: string, name: string) => run(async () => {
+      assertReplicaPath(name);
+      if (name.includes("/")) throw new Error("Expected one document name.");
+      const file = resolve(id), current = await file.replica.scan();
+      const old = current.find(info => info.name === file.path && !info.deleted);
+      if (!old) throw new Error("Document is unavailable.");
+      if (old.type === 1 && current.some(info => !info.deleted && info.name.startsWith(file.path + "/"))) {
+        throw new Error("Non-empty directories cannot be renamed safely.");
+      }
+      const parent = file.path.split("/").slice(0, -1).join("/"), target = parent ? `${parent}/${name}` : name;
+      if (target === file.path) return stat(id);
+      const previousTarget = current.find(info => info.name === target);
+      if (previousTarget && !previousTarget.deleted) throw new Error("A document with that name already exists.");
+      const modifiedMs = Date.now();
+      const created = old.type === 1
+        ? await file.replica.edit!({ method: "mkdir", folderId: file.folder.id, path: target,
+          modifiedMs, expectedVersion: previousTarget?.version ?? null })
+        : await file.replica.edit!({ method: "write", folderId: file.folder.id, path: target, modifiedMs,
+          expectedVersion: previousTarget?.version ?? null, source: await createReplicaFileSource(file.replica, file.path) });
+      try {
+        await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: file.path,
+          modifiedMs, expectedVersion: old.version ?? {} });
+      } catch (error) {
+        await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: target,
+          modifiedMs, expectedVersion: created.version ?? {} }).catch(() => {});
+        throw error;
+      }
+      return stat(JSON.stringify([file.folder.storageId, target]));
     }),
     stat: (id: string) => run(async () => {
       const root = (await configs.load()).find(folder => id === JSON.stringify([folder.storageId, ""]));

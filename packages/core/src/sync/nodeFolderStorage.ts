@@ -5,11 +5,12 @@ import { digestRanges } from "../transfer/nodeStorage.js";
 import type { ReplicaEntry } from "./replicaIndex.js";
 import { isInternalReplicaPath } from "./replicaPaths.js";
 import path from "node:path";
-import type {
-  FolderSyncBaseline,
-  FolderSyncPolicy,
-  FolderSyncStorage,
-  LocalSyncFile,
+import {
+  planVersionRemovals,
+  type FolderSyncBaseline,
+  type FolderSyncPolicy,
+  type FolderSyncStorage,
+  type LocalSyncFile,
 } from "./folderSync.js";
 
 export interface NodeFolderSyncStorageOptions {
@@ -135,15 +136,13 @@ const pruneVersions = async (root: string, relativePath: string, policy: FolderS
   const matches = entries
     .filter((entry) => entry.isFile() && entry.name.startsWith(`${name}.`) && /^\d{17}$/.test(entry.name.slice(name.length + 1)))
     .sort((left, right) => right.name.localeCompare(left.name));
-  const kept: number[] = [];
-  for (const entry of matches) {
+  const versions = matches.map(entry => {
     const stamp = entry.name.slice(name.length + 1);
-    const date = Date.UTC(+stamp.slice(0,4), +stamp.slice(4,6)-1, +stamp.slice(6,8), +stamp.slice(8,10), +stamp.slice(10,12), +stamp.slice(12,14), +stamp.slice(14));
-    const age = Math.max(0, nowMs - date);
-    const interval = age < 3600000 ? 30000 : age < 86400000 ? 3600000 : age < 2592000000 ? 86400000 : 604800000;
-    const limit = policy.maxVersions ?? (policy.versioning === "simple" ? 1 : Infinity);
-    if (kept.length < limit && (policy.versioning !== "staggered" || kept.length === 0 || kept.at(-1)! - date >= interval)) kept.push(date);
-    else await rm(path.join(archiveDirectory, entry.name));
+    return { id: entry.name, createdMs: Date.UTC(+stamp.slice(0,4), +stamp.slice(4,6)-1,
+      +stamp.slice(6,8), +stamp.slice(8,10), +stamp.slice(10,12), +stamp.slice(12,14), +stamp.slice(14)) };
+  });
+  for (const name of planVersionRemovals(versions, policy, nowMs)) {
+    await rm(path.join(archiveDirectory, name));
   }
 };
 

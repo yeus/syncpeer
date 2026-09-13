@@ -1,6 +1,7 @@
 import { deriveUntrustedFolderCrypto } from "../core/model/untrusted.js";
 import { readEncryptedRecord, writeEncryptedRecord } from "./encryptedRecord.js";
 import { FOLDER_PASSWORD_SCOPE_SEPARATOR, isScopedFolderPasswordKey } from "../ui/sessionPasswords.js";
+import { normalizeProfileSettings, type SyncpeerProfileSettings } from "./profileSettings.js";
 
 export interface CredentialVaultRecord {
   format: 1;
@@ -14,6 +15,7 @@ interface VaultData {
   defaultPassword: string | null;
   folders: Record<string, string>;
   connectionPasswords?: Record<string, string>;
+  settings?: SyncpeerProfileSettings;
 }
 
 export interface RememberedUnlockSecretStore {
@@ -50,6 +52,7 @@ const decodeData = (bytes: Uint8Array): VaultData => {
     if (!id.length || id.length > 1024) throw new Error("Invalid vault folder identifier.");
     password(value);
   }
+  normalizeProfileSettings(data.settings);
   return data;
 };
 
@@ -260,6 +263,12 @@ export function createCredentialVault(options: {
       }
       return { ...data, connectionPasswords: { ...values } };
     }),
+    profileSettings: () => run(async () => {
+      const { data } = await unlocked();
+      return normalizeProfileSettings(data.settings);
+    }),
+    saveProfileSettings: (settings: SyncpeerProfileSettings) => update(data =>
+      ({ ...data, settings: normalizeProfileSettings(settings) })),
     addFolder: (folderId: string, value?: string) => update(async data => {
       if (Object.hasOwn(data.folders, folderId)) throw new Error("Folder credentials already exist; password changes require migration.");
       const selected = value === undefined ? null : password(value);

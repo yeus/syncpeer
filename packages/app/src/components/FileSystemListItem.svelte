@@ -16,6 +16,7 @@
   import KeyRound from "lucide-svelte/icons/key-round";
   import Star from "lucide-svelte/icons/star";
   import Trash2 from "lucide-svelte/icons/trash-2";
+  import History from "lucide-svelte/icons/history";
   import Unlock from "lucide-svelte/icons/unlock";
   import X from "lucide-svelte/icons/x";
   import ListRow from "./ListRow.svelte";
@@ -50,6 +51,7 @@
     modifiedText: string;
     invalid: boolean;
     isFavorite: boolean;
+    ignoreReason?: string;
     isCached: boolean;
     thumbnailPath?: string | null;
     downloadLabel: string;
@@ -109,6 +111,7 @@
     onDownloadFile?: (folderId: string, path: string, name: string) => void;
     onCancelDownload?: (folderId?: string, path?: string) => void;
     onOpenOrDownloadFile?: (folderId: string, path: string, name: string) => void;
+    onOpenVersions?: (folderId: string, path: string, name: string) => void;
     onSetPasswordVisible?: (folderId: string, visible: boolean) => void;
     onUpdateFolderPasswordDraft?: (folderId: string, password: string) => void;
     onSaveFolderPassword?: (folderId: string) => void;
@@ -132,6 +135,7 @@
     onDownloadFile = () => {},
     onCancelDownload = () => {},
     onOpenOrDownloadFile = () => {},
+    onOpenVersions = () => {},
     onSetPasswordVisible = () => {},
     onUpdateFolderPasswordDraft = () => {},
     onSaveFolderPassword = () => {},
@@ -402,6 +406,11 @@
         {#if item.invalid}
           <div class="item-meta">Unavailable on remote (invalid)</div>
         {/if}
+        {#if item.ignoreReason}
+          <div class="item-meta" data-testid={`ignored-reason-${item.path}`}>
+            Ignored on this device: {item.ignoreReason}
+          </div>
+        {/if}
       {:else if item.kind === "favorite"}
         {#if item.isDownloadingActive && item.downloadProgressText}
           <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
@@ -499,6 +508,11 @@
       {/if}
       {#if item.invalid}
         <div class="item-meta">Unavailable on remote (invalid)</div>
+      {/if}
+      {#if item.ignoreReason}
+        <div class="item-meta" data-testid={`ignored-reason-${item.path}`}>
+          Ignored on this device: {item.ignoreReason}
+        </div>
       {/if}
     {:else if item.kind === "favorite"}
       {#if item.isDownloadingActive && item.downloadProgressText}
@@ -615,6 +629,12 @@
           <Star size={16} class="favorite-star-off" />
         {/if}
       </button>
+      {#if item.entryType === "file" && (item.isFavorite || item.isCached)}
+        <button class="row-action" onclick={() => onOpenVersions(item.folderId, item.path, item.name)}
+          aria-label="View versions" title="View versions">
+          <History size={16} />
+        </button>
+      {/if}
     {:else if item.kind === "favorite"}
       {#if item.isDownloadingActive}
         <button

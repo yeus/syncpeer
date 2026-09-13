@@ -1,5 +1,6 @@
 import {
   createSha256DownloadSink,
+  collectFavoriteFiles,
   DownloadInterruptedError,
   cachedFileKey,
   type FileDownloadSink,
@@ -41,8 +42,7 @@ const syncStarredFiles = async () => {
   ) {
     return;
   }
-  const starredFiles = state.favorites.items.filter((item) => item.kind === "file");
-  if (starredFiles.length === 0) return;
+  if (state.favorites.items.length === 0) return;
 
   state.sync.isSyncingStarredFiles = true;
   const startedAtMs = Date.now();
@@ -51,6 +51,25 @@ const syncStarredFiles = async () => {
 
   try {
     const remoteFs = state.session.remoteFs;
+    const folderIds = [...new Set(state.favorites.items.map(item => item.folderId))]
+      .filter(folderId => !state.favorites.pausedFolderIds.has(folderId));
+    const activeFolderIds = new Set(folderIds);
+    const nestedFiles = (await Promise.all(folderIds.map(async folderId =>
+      (await collectFavoriteFiles({
+        folderId,
+        favorites: state.favorites.items,
+        exclusions: state.favorites.exclusions,
+        patterns: state.favorites.ignorePatternsByFolder[folderId],
+        readDir: path => remoteFs.readDir(folderId, path),
+      })).map(file => ({ folderId, file }))))).flat();
+    const nestedByKey = new Map(nestedFiles.map(({ folderId, file }) =>
+      [`${folderId}:${normalizePath(file.path)}`, file]));
+    const starredFiles = [...new Map([
+      ...state.favorites.items.filter(item => item.kind === "file" && activeFolderIds.has(item.folderId)),
+      ...nestedFiles.map(({ folderId, file }) => ({ key: `file:${file.path}`, folderId,
+        path: file.path, name: file.name, kind: "file" as const })),
+    ].map(item => [`${item.folderId}:${item.path}`, item])).values()];
+    if (starredFiles.length === 0) return;
     const cachedFiles = await client.listCachedFiles();
     const cachedByKey = new Map(cachedFiles.map((item) => [item.key, item]));
     const dirCache = new Map<string, FileEntry[]>();
@@ -173,10 +192,10 @@ const syncStarredFiles = async () => {
       const { parent, name } = splitPath(targetPath);
       if (!name) continue;
       const dirKey = `${favorite.folderId}::${parent}`;
-      if (!dirCache.has(dirKey)) {
+      if (!nestedByKey.has(`${favorite.folderId}:${targetPath}`) && !dirCache.has(dirKey)) {
         dirCache.set(dirKey, await remoteFs.readDir(favorite.folderId, parent));
       }
-      const remoteEntry = dirCache
+      const remoteEntry = nestedByKey.get(`${favorite.folderId}:${targetPath}`) ?? dirCache
         .get(dirKey)
         ?.find((entry) => entry.type === "file" && normalizePath(entry.path) === targetPath);
       if (!remoteEntry) continue;

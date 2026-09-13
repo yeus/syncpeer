@@ -1,5 +1,7 @@
 import {
   favoriteKey,
+  classifyFavoritePath,
+  defaultFolderSettings,
   cachedFileKey,
   normalizePath,
   resolveDirectoryPath,
@@ -156,7 +158,26 @@ const toggleFavorite = async (
 ) => {
   const key = favoriteKey(folderId, path, kind);
   const exists = state.favorites.items.some((item) => item.key === key);
+  const selection = classifyFavoritePath({ folderId, path, kind }, state.favorites.items,
+    state.favorites.exclusions, state.favorites.ignorePatternsByFolder[folderId]);
   const previous = state.favorites.items;
+  const previousExclusions = state.favorites.exclusions;
+  if (!exists && selection.status === "favorite") {
+    const exclusion = { folderId, path: normalizePath(path), kind };
+    state.favorites.exclusions = [...previousExclusions.filter(item =>
+      item.folderId !== folderId || item.path !== exclusion.path || item.kind !== kind), exclusion];
+    try {
+      const settings = await client.loadProfileSettings();
+      const folder = settings.folders[folderId] ?? defaultFolderSettings();
+      settings.folders[folderId] = { ...folder, exclusions: state.favorites.exclusions
+        .filter(item => item.folderId === folderId) };
+      await client.saveProfileSettings(settings);
+    } catch (error) {
+      state.favorites.exclusions = previousExclusions;
+      reportActionError(state, "favorite.exclude.failed", error, { key });
+    }
+    return;
+  }
   state.favorites.items = exists
     ? previous.filter((item) => item.key !== key)
     : sortByName([
@@ -167,6 +188,8 @@ const toggleFavorite = async (
     if (exists) {
       await client.removeFavorite(key);
     } else {
+      state.favorites.exclusions = previousExclusions.filter(item =>
+        item.folderId !== folderId || item.path !== normalizePath(path) || item.kind !== kind);
       await client.upsertFavorite({
         key,
         folderId,
@@ -174,13 +197,12 @@ const toggleFavorite = async (
         name,
         kind,
       });
-      if (kind === "file") {
-        await refreshCachedStatuses(state, client, folderId, [path]);
-        await syncStarredFiles();
-      }
+      if (kind === "file") await refreshCachedStatuses(state, client, folderId, [path]);
+      await syncStarredFiles();
     }
   } catch (error) {
     state.favorites.items = previous;
+    state.favorites.exclusions = previousExclusions;
     reportActionError(state, exists ? "favorite.remove.failed" : "favorite.upsert.failed", error, { key });
   }
 };

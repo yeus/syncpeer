@@ -2,6 +2,17 @@ export { createSyncpeerCoreClient, UploadOutcomeUnknownError, withMetadataSessio
 export { createReplicaController } from "./sync/replicaControl.js";
 export type { ReplicaState } from "./sync/replicaControl.js";
 export {
+  DEFAULT_FAVORITE_IGNORE_PATTERNS,
+  classifyFavoritePath,
+  collectFavoriteFiles,
+} from "./ui/favoriteSelection.js";
+export type {
+  FavoriteExclusion,
+  FavoritePathState,
+} from "./ui/favoriteSelection.js";
+export { cacheQuotaBytes, defaultFolderSettings, defaultProfileSettings, normalizeProfileSettings, planCacheEvictions } from "./sync/profileSettings.js";
+export type { CacheCandidate, SyncpeerFolderSettings, SyncpeerProfileSettings } from "./sync/profileSettings.js";
+export {
   classifyRuntimeArchitecture,
   classifyRuntimePlatform,
   createAppBuildInfo,

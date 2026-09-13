@@ -56,6 +56,28 @@ test("new folders receive independent random passwords when no default or remote
   await vault.close();
 });
 
+test("profile settings are encrypted, validated, and default to staggered versioning", async () => {
+  let record: unknown = null;
+  const vault = createCredentialVault({ profileId: "settings-profile", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async value => { record = structuredClone(value); },
+      withLock: async operation => operation() }, revokeAccess: async () => {} });
+  await vault.create("synthetic-master");
+  const defaults = await vault.profileSettings();
+  assert.equal(defaults.profile.versioning, "staggered");
+  assert.equal(defaults.profile.cache.percent, 5);
+  const settings = structuredClone(defaults);
+  settings.folders.photos = { favorites: [{ key: "folder:photos:", folderId: "photos", path: "", name: "Photos", kind: "folder" }],
+    exclusions: [{ folderId: "photos", path: "node_modules", kind: "folder" }],
+    ignorePatterns: ["node_modules/"], paused: false };
+  await vault.saveProfileSettings(settings);
+  assert.equal(JSON.stringify(record).includes("node_modules"), false);
+  assert.deepEqual(await vault.profileSettings(), settings);
+  const invalid = structuredClone(settings);
+  invalid.profile.cache.percent = 101;
+  await assert.rejects(vault.saveProfileSettings(invalid), /cache settings/);
+  await vault.close();
+});
+
 test("rotates the local master password and allows an authorized remembered unlock", async () => {
   let record: unknown = null;
   let remembered: string | null = null;

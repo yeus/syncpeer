@@ -1,7 +1,6 @@
 <svelte:options runes={true} />
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
@@ -59,6 +58,7 @@
   } from "./app/state.ts";
   import AboutPage from "./AboutPage.svelte";
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
+  import VersionsPage from "./VersionsPage.svelte";
   import { applyTheme } from "./app/theme.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
@@ -79,7 +79,7 @@
   let systemPrefersDark = $state(false);
   let contentElement = $state<HTMLElement | null>(null);
 
-  const { hostAdapter, platformAdapter, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric } = createTauriAdapters({
+  const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
@@ -145,12 +145,12 @@
   async function unlockWithBiometric() {
     if (!biometric) throw new Error("Biometric unlock is unavailable.");
     if (!await biometric.authenticate()) throw new Error("Biometric authentication was not completed.");
-    await invoke("syncpeer_document_command", { request: { operation: "unlockRemembered" } });
+    await documentCommand({ operation: "unlockRemembered" });
     await loadFolderCredentials();
   }
 
   async function rotateMasterPassword(password: string) {
-    await invoke("syncpeer_document_command", { request: { operation: "changeMasterPassword", password } });
+    await documentCommand({ operation: "changeMasterPassword", password });
     await loadFolderCredentials();
   }
 
@@ -531,6 +531,7 @@
           onOpenCachedDirectory={actions.openCachedDirectory}
           onRemoveCachedFile={actions.removeCachedFile}
           onOpenOrDownloadFile={actions.openOrDownloadFile}
+          onOpenVersions={actions.openVersions}
           onDownloadFile={actions.downloadFile}
           onCancelDownload={transferRuntime.cancelDownload}
           onRemoveFavorite={actions.removeFavorite}
@@ -541,7 +542,7 @@
       {/if}
 
       {#if app.activeTab === "folders"}
-        {#if appInfo.platform === "android"}
+        {#if appInfo.runtimeSurface === "android-ui" || appInfo.runtimeSurface === "desktop-ui"}
           <button onclick={actions.openFolderSettings}>Folder settings · New folder</button>
         {/if}
         <FoldersTab
@@ -656,10 +657,26 @@
   />
 {:else if app.currentPage === "folder-settings"}
   <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
+    command={documentCommand}
+    onSettingsSaved={settings => {
+      app.favorites.exclusions = Object.values(settings.folders).flatMap(folder => folder.exclusions);
+      app.favorites.ignorePatternsByFolder = Object.fromEntries(Object.entries(settings.folders)
+        .map(([folderId, folder]) => [folderId, [...folder.ignorePatterns]]));
+      app.favorites.pausedFolderIds = new Set(Object.entries(settings.folders)
+        .filter(([, folder]) => folder.paused).map(([folderId]) => folderId));
+    }}
     onRotateMasterPassword={rotateMasterPassword} onMigrate={migrateDocumentFolder} biometric={biometric} onCreate={async label => {
-    await connectDocumentFolder({ id: crypto.randomUUID(), label });
+    const id = crypto.randomUUID();
+    await connectDocumentFolder({ id, label });
+    app.favorites.items = await client.upsertFavorite({ key: `folder:${id}:`, folderId: id,
+      path: "", name: label, kind: "folder" });
     app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false }));
+    await actions.starredSync();
   }} />
+{:else if app.currentPage === "versions"}
+  <VersionsPage name={app.versions.name} items={app.versions.items} loading={app.versions.loading}
+    restoringId={app.versions.restoringId} error={app.versions.error}
+    onBack={actions.closeVersions} onRestore={actions.restoreVersion} />
 {:else}
   <AboutPage onBack={actions.closeAboutPage} />
 {/if}

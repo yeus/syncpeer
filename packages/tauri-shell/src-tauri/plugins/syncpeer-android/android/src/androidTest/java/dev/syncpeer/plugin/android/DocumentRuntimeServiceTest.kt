@@ -65,13 +65,18 @@ class DocumentRuntimeServiceTest {
       val cached = command("cachedFiles") as JSONArray
       assertTrue((0 until cached.length()).any { cached.getJSONObject(it).getLong("sizeBytes") == expected.size.toLong() })
       val downloaded = (command("beginDownload", JSONObject().put("folderId", "fixture-folder")
-        .put("path", "downloaded.bin").put("size", 4).put("modifiedMs", 1000)) as Number).toInt()
+        .put("path", "downloaded.bin").put("size", 4).put("modifiedMs", 1000).put("encrypted", false)) as Number).toInt()
       command("write", JSONObject().put("handle", downloaded).put("offset", 0).put("bytes", JSONArray(listOf(1, 2, 3, 4))))
       command("finishDownload", JSONObject().put("handle", downloaded))
       val files = command("list", JSONObject().put("id", folder)) as JSONArray
       val downloadedId = (0 until files.length()).map { files.getJSONObject(it) }.first { it.getString("name") == "downloaded.bin" }.getString("id")
       val downloadUri = DocumentsContract.buildDocumentUri(authority, downloadedId)
       resolver.openInputStream(downloadUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
+      val renamedUri = DocumentsContract.renameDocument(resolver, downloadUri, "renamed.bin")!!
+      resolver.openInputStream(renamedUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
+      DocumentsContract.deleteDocument(resolver, renamedUri)
+      val afterDelete = command("list", JSONObject().put("id", folder)) as JSONArray
+      assertFalse((0 until afterDelete.length()).map { afterDelete.getJSONObject(it) }.any { it.getString("name") == "renamed.bin" })
       val openReader = resolver.openFileDescriptor(uri, "r")!!
       assertTrue(VaultSecretStore(context).execute("documents", "load", null) == "synthetic-master")
       command("lock")
@@ -240,6 +245,19 @@ class DocumentRuntimeServiceTest {
       runCatching { context.unbindService(first.first) }
       context.unbindService(second.first)
     }
+  }
+
+  @Test fun documentRuntimeRecoversAfterItsJavaScriptIsolateStops() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      assumeTrue(runtime.status().get(30, TimeUnit.SECONDS).phase == "locked")
+      assertEquals("locked", runtime.restartForTesting().get(30, TimeUnit.SECONDS).phase)
+      val result = runtime.command(JSONObject().put("operation", "status")).get(30, TimeUnit.SECONDS)
+      assertTrue(result.getJSONObject("result").getJSONObject("vault").getString("phase") in
+        listOf("uninitialized", "locked", "unlocked"))
+    } finally { context.unbindService(client.first) }
   }
 
   private fun checkProviderStatus(context: Context, expected: String) {

@@ -39,9 +39,16 @@ class DocumentRuntimeService : Service() {
   private var requestId = 0L
   @Volatile private var terminalStatus: DocumentRuntimeStatus? = null
   @Volatile private var vaultSummary: String? = null
+  @Volatile private var recovery: CompletableFuture<DocumentRuntimeStatus>? = null
+  @Volatile private var destroying = false
 
   inner class RuntimeBinder : Binder() {
-    fun status(): CompletableFuture<DocumentRuntimeStatus> = initialized.thenApply { terminalStatus ?: it.copy(summary = vaultSummary ?: it.summary) }
+    fun status(): CompletableFuture<DocumentRuntimeStatus> = initialized.thenCompose { initial ->
+      recovery?.thenApply { it.copy(summary = vaultSummary ?: it.summary) }
+        ?: CompletableFuture.completedFuture(terminalStatus ?: initial.copy(summary = vaultSummary ?: initial.summary))
+    }
+
+    internal fun restartForTesting(): CompletableFuture<DocumentRuntimeStatus> = startRecovery()
 
     fun command(input: JSONObject): CompletableFuture<JSONObject> {
       return evaluate("""
@@ -56,7 +63,7 @@ class DocumentRuntimeService : Service() {
           "locked" -> "Open Syncpeer to unlock folder storage."
           else -> "Preparing folder storage."
         }
-        if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
+        if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "rename", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
         }
         reply
@@ -71,7 +78,7 @@ class DocumentRuntimeService : Service() {
       val task = Runnable {
         try {
           if (result.isCancelled) return@Runnable
-          check(terminalStatus == null && initialized.get().phase == "locked") { "Document runtime unavailable." }
+          check(terminalStatus == null && isolate != null) { "Document runtime unavailable." }
           val engine = checkNotNull(isolate)
           if (!documentsStarted) {
             storage = DocumentRuntimeStorage(applicationContext)
@@ -95,9 +102,7 @@ class DocumentRuntimeService : Service() {
           result.complete(engine.evaluateJavaScriptAsync(script).get())
         } catch (error: Exception) {
           if (error is TimeoutException) {
-            markTerminated()
-            isolate?.close()
-            isolate = null
+            startRecovery()
           }
           result.completeExceptionally(error)
         } finally { data.fill(0) }
@@ -120,8 +125,9 @@ class DocumentRuntimeService : Service() {
         isolate = null
         sandbox?.close()
         sandbox = null
-        initialized.complete(DocumentRuntimeStatus("error", "Document runtime could not start. Restart Syncpeer to retry.",
+        initialized.complete(DocumentRuntimeStatus("error", "Document runtime is recovering.",
           failureType = (error.cause ?: error).javaClass.simpleName))
+        startRecovery()
       }
     }
   }
@@ -162,19 +168,57 @@ class DocumentRuntimeService : Service() {
     }
     val runtime = engine.createIsolate(startup)
     isolate = runtime
-    runtime.addOnTerminatedCallback({ it.run() }) { markTerminated() }
+    runtime.addOnTerminatedCallback({ it.run() }) { if (!destroying && isolate === runtime) startRecovery() }
     val code = assets.open("syncpeer-documents.js").bufferedReader().use { it.readText() }
     check(runtime.evaluateJavaScriptAsync(code).get(15, TimeUnit.SECONDS) == "ready")
   }
 
-  private fun markTerminated() {
-    terminalStatus = DocumentRuntimeStatus("error", "Document runtime stopped. Restart Syncpeer to retry.")
+  @Synchronized private fun startRecovery(): CompletableFuture<DocumentRuntimeStatus> {
+    recovery?.let { return it }
+    val task = CompletableFuture<DocumentRuntimeStatus>()
+    recovery = task
+    terminalStatus = DocumentRuntimeStatus("error", "Document runtime is restarting.")
+    val previous = isolate
+    isolate = null
+    runCatching { previous?.close() }
     contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
+    try {
+      worker.execute {
+        try {
+          documentsStarted = false
+          storagePort = null
+          storageWorker.submit { storage?.close(); storage = null }.get(15, TimeUnit.SECONDS)
+          val status = if (sandbox == null) initialize() else {
+            loadCore(checkNotNull(sandbox))
+            DocumentRuntimeStatus("locked", "Document access is not configured.")
+          }
+          terminalStatus = if (status.phase == "locked") null else status
+          vaultSummary = null
+          task.complete(status)
+        } catch (error: Exception) {
+          val failed = isolate
+          isolate = null
+          runCatching { failed?.close() }
+          val status = DocumentRuntimeStatus("error", "Document runtime could not recover. Reopen Syncpeer to retry.",
+            failureType = (error.cause ?: error).javaClass.simpleName)
+          terminalStatus = status
+          task.complete(status)
+        } finally {
+          recovery = null
+          contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
+        }
+      }
+    } catch (error: Exception) {
+      recovery = null
+      task.completeExceptionally(error)
+    }
+    return task
   }
 
   override fun onBind(intent: Intent): IBinder = binder
 
   override fun onDestroy() {
+    destroying = true
     // Serialize teardown after initialization; shutdown drains the already queued work.
     worker.execute {
       runCatching {

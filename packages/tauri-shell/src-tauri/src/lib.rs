@@ -64,6 +64,13 @@ struct RemoveFavoriteRequest {
     key: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileStorageRootRequest {
+    profile_id: String,
+    storage_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheFileRequest {
@@ -965,6 +972,26 @@ fn cache_partial_metadata_path(partial_root: &Path, transfer_id: &str) -> PathBu
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_root(app)?.join("settings.json"))
+}
+
+#[tauri::command]
+async fn syncpeer_profile_storage_root(
+    app: tauri::AppHandle,
+    request: ProfileStorageRootRequest,
+) -> Result<String, String> {
+    let valid_profile = !request.profile_id.is_empty() && request.profile_id.len() <= 128 &&
+        request.profile_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    let valid_storage = request.storage_id == "profile" ||
+        (request.storage_id.len() == 32 && request.storage_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !valid_profile || !valid_storage { return Err("Invalid encrypted profile storage identity.".into()); }
+    let root = app_data_root(&app)?.join("profiles").join(request.profile_id).join(request.storage_id);
+    fs::create_dir_all(&root).map_err(|_| "Encrypted profile storage could not be created.".to_string())?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .map_err(|_| "Encrypted profile storage permissions could not be secured.".to_string())?;
+    }
+    root.to_str().map(str::to_owned).ok_or_else(|| "Encrypted profile storage path is unavailable.".into())
 }
 
 fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
@@ -4235,6 +4262,7 @@ pub fn run() {
             syncpeer_list_favorites,
             syncpeer_upsert_favorite,
             syncpeer_remove_favorite,
+            syncpeer_profile_storage_root,
             syncpeer_cache_file,
             syncpeer_cache_begin_file,
             syncpeer_cache_digest_ranges,

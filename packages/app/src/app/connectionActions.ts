@@ -245,6 +245,12 @@ const hydrate = async () => {
     ...appInfo,
   });
   try {
+    const settings = await client.loadProfileSettings();
+    state.favorites.exclusions = Object.values(settings.folders).flatMap(folder => folder.exclusions);
+    state.favorites.ignorePatternsByFolder = Object.fromEntries(Object.entries(settings.folders)
+      .map(([folderId, folder]) => [folderId, [...folder.ignorePatterns]]));
+    state.favorites.pausedFolderIds = new Set(Object.entries(settings.folders)
+      .filter(([, folder]) => folder.paused).map(([folderId]) => folderId));
     state.favorites.items = await client.listFavorites();
     const fileFavorites = new Map<string, string[]>();
     for (const favorite of state.favorites.items) {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { classifyFavoritePath } from "@syncpeer/core/browser";
   import type {
     BreadcrumbSegment,
     CachedFileRecord,
@@ -40,6 +41,7 @@
     onOpenCachedFile: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory: (folderId: string, path: string) => void;
     onOpenOrDownloadFile: (folderId: string, path: string, name: string) => void;
+    onOpenVersions: (folderId: string, path: string, name: string) => void;
     onDownloadFile: (folderId: string, path: string, name: string) => void;
     onCancelDownload: (folderId?: string, path?: string) => void;
     onCancelTransfers: () => void;
@@ -85,6 +87,7 @@
     onOpenCachedFile,
     onOpenCachedFileDirectory,
     onOpenOrDownloadFile,
+    onOpenVersions,
     onDownloadFile,
     onCancelDownload,
     onCancelTransfers,
@@ -192,6 +195,12 @@
           app.session.currentFolderId,
           entry.path,
         );
+        const favoriteState = classifyFavoritePath({
+          folderId: app.session.currentFolderId,
+          path: entry.path,
+          kind: entry.type === "directory" ? "folder" : "file",
+        }, app.favorites.items, app.favorites.exclusions,
+        app.favorites.ignorePatternsByFolder[app.session.currentFolderId]);
         return {
           kind: "folder-entry",
           folderId: app.session.currentFolderId,
@@ -202,9 +211,12 @@
           sizeText: formatBytes(entry.size),
           modifiedText: formatModified(entry.modifiedMs),
           invalid: Boolean(entry.invalid),
-          isFavorite: favoriteKeys.has(
-            `${entry.type === "directory" ? "folder" : "file"}:${app.session.currentFolderId}:${entry.path}`,
-          ),
+          isFavorite: favoriteState.status === "favorite",
+          ignoreReason: favoriteState.status === "ignored"
+            ? favoriteState.reason === "pattern"
+              ? `matches pattern “${favoriteState.rule}”`
+              : `excluded path “${favoriteState.rule}”`
+            : undefined,
           isCached: app.favorites.cachedFileKeys.has(`${app.session.currentFolderId}:${entry.path}`),
           thumbnailPath: downloadedLocalPaths.get(`${app.session.currentFolderId}:${entry.path}`) ?? null,
           downloadLabel: downloadButtonLabel(app.session.currentFolderId, entry.path),
@@ -427,6 +439,7 @@
               onOpenCachedFile={onOpenCachedFile}
               onOpenCachedFileDirectory={onOpenCachedFileDirectory}
               onOpenOrDownloadFile={onOpenOrDownloadFile}
+              onOpenVersions={onOpenVersions}
               onDownloadFile={onDownloadFile}
               onCancelDownload={onCancelDownload}
               onToggleFavorite={onToggleFavorite}

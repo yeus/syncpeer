@@ -463,11 +463,32 @@ const handleUploadClick = () => {
   document.getElementById("folder-upload-input")?.click();
 };
 
+const openVersions = async (folderId: string, path: string, name: string) => {
+  state.versions = { folderId, path: normalizePath(path), name, items: [], loading: true,
+    restoringId: "", error: "" };
+  state.currentPage = "versions";
+  try { state.versions.items = await client.listDocumentVersions(folderId, path); }
+  catch (error) { state.versions.error = error instanceof Error ? error.message : String(error); }
+  finally { state.versions.loading = false; }
+};
+
+const restoreVersion = async (versionId: string) => {
+  if (!state.versions.folderId || !state.versions.path || state.versions.restoringId) return;
+  state.versions.restoringId = versionId; state.versions.error = "";
+  try {
+    await client.restoreDocumentVersion(state.versions.folderId, state.versions.path, versionId);
+    state.versions.items = await client.listDocumentVersions(state.versions.folderId, state.versions.path);
+  } catch (error) { state.versions.error = error instanceof Error ? error.message : String(error); }
+  finally { state.versions.restoringId = ""; }
+};
+
   return {
     downloadFile,
     openOrDownloadFile,
     uploadPreparedFile,
     handleUploadSelected,
     handleUploadClick,
+    openVersions,
+    restoreVersion,
   };
 };

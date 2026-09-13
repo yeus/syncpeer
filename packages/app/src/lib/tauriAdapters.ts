@@ -10,8 +10,9 @@ import type {
   SyncpeerTlsSocket,
   FileDownloadSink,
 } from "@syncpeer/core/browser";
-import { createDocumentCache, createNativeFilesystem } from "@syncpeer/core/filesystem";
-import { detectRuntimePlatform } from "./runtimeInfo.ts";
+import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
+  dispatchDocumentCommand } from "@syncpeer/core/filesystem";
+import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -96,6 +97,7 @@ export interface UiLogEntry {
 
 export interface CreateTauriAdaptersOptions {
   onLog?: (entry: UiLogEntry) => void;
+  runtimePlatform?: RuntimePlatform;
 }
 
 const emitLog = (
@@ -235,6 +237,44 @@ export const createTauriAdapters = (
       invoke = createLoggedInvoke(resolveInvoke(), options);
     }
     return invoke<T>(command, args);
+  };
+  const platform = options?.runtimePlatform ?? detectRuntimePlatform();
+  const desktopDocuments = (() => {
+    let owner: Promise<ReturnType<typeof createDocumentFilesystem>> | undefined;
+    return () => owner ??= (async () => {
+      const root = async (storageId: string) => invokeWithLogging<string>("syncpeer_profile_storage_root",
+        { request: { profileId: "documents", storageId } });
+      const storage = async (storageId: string) => createNativeFilesystem(
+        request => invokeWithLogging("syncpeer_replica_storage", { request }), await root(storageId));
+      const deviceId = await invokeWithLogging<string>("syncpeer_get_default_device_id");
+      let counter = 0xcbf29ce484222325n;
+      for (const byte of new TextEncoder().encode(deviceId)) {
+        counter = BigInt.asUintN(64, (counter ^ BigInt(byte)) * 0x100000001b3n);
+      }
+      const documents = createDocumentFilesystem({ profileId: "documents", deviceCounterId: counter.toString(),
+        profile: await storage("profile"), openStorage: storage,
+        rememberedSecret: {
+          load: () => invokeWithLogging<string | null>("syncpeer_vault_secret",
+            { request: { profileId: "documents", operation: "load", secret: null } }),
+          save: secret => invokeWithLogging("syncpeer_vault_secret",
+            { request: { profileId: "documents", operation: "save", secret } }),
+          remove: () => invokeWithLogging("syncpeer_vault_secret",
+            { request: { profileId: "documents", operation: "remove", secret: null } }),
+          isDeviceUnlocked: () => invokeWithLogging<boolean>("syncpeer_vault_secret",
+            { request: { profileId: "documents", operation: "isDeviceUnlocked", secret: null } }),
+        },
+        randomBytes: size => crypto.getRandomValues(new Uint8Array(size)),
+      });
+      await documents.initialize();
+      return documents;
+    })();
+  })();
+  const documentRequest = async <T>(request: Record<string, unknown>) => {
+    if (platform === "android") {
+      const response = await invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
+      return response.result;
+    }
+    return await dispatchDocumentCommand(await desktopDocuments(), request) as T;
   };
 
   const hostAdapter: SyncpeerHostAdapter = {
@@ -583,11 +623,9 @@ export const createTauriAdapters = (
     },
   };
 
-  const documents = createDocumentCache({ legacy: platformAdapter, enabled: () => detectRuntimePlatform() === "android",
-    request: async <T>(request: Record<string, unknown>) => {
-      const response = await invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
-      return response.result;
-    },
+  const documents = createDocumentCache({ legacy: platformAdapter,
+    enabled: () => detectRuntimeEnvironment() === "tauri",
+    request: documentRequest,
     openLegacySource: async file => {
       if (!file.localPath?.startsWith("/") || file.safRelativePath) {
         throw new Error("This folder uses external storage. Its existing plaintext files were left unchanged; import them through the file picker explicitly.");
@@ -606,16 +644,15 @@ export const createTauriAdapters = (
     },
     show: async id => { await invokeWithLogging("syncpeer_document_command", { request: { operation: "show", id } }); },
   });
-  return { hostAdapter, platformAdapter: documents.platformAdapter, connectDocumentFolder: documents.connectFolder,
+  return { hostAdapter, platformAdapter: documents.platformAdapter, documentCommand: documentRequest,
+    connectDocumentFolder: documents.connectFolder,
     disconnectDocumentFolder: documents.disconnectFolder,
     syncDocumentFolders: documents.syncFolders,
-    folderCredentials: detectRuntimePlatform() === "android" ? {
-      load: async () => (await invokeWithLogging<{ result: Record<string, string> }>("syncpeer_document_command",
-        { request: { operation: "connectionPasswords" } })).result,
-      save: async (passwords: Record<string, string>) => { await invokeWithLogging("syncpeer_document_command",
-        { request: { operation: "saveConnectionPasswords", passwords } }); },
+    folderCredentials: detectRuntimeEnvironment() === "tauri" ? {
+      load: () => documentRequest<Record<string, string>>({ operation: "connectionPasswords" }),
+      save: async (passwords: Record<string, string>) => { await documentRequest({ operation: "saveConnectionPasswords", passwords }); },
     } : undefined,
-    biometric: detectRuntimePlatform() === "android" ? {
+    biometric: platform === "android" ? {
       status: async () => invokeWithLogging<{ available: boolean; enabled: boolean }>("syncpeer_android_biometric_status", { request: { profileId: "documents" } }),
       setEnabled: async (enabled: boolean) => invokeWithLogging<{ available: boolean; enabled: boolean }>("syncpeer_android_biometric_set_enabled", { request: { profileId: "documents", enabled } }),
       authenticate: async () => invokeWithLogging<boolean>("syncpeer_android_biometric_authenticate", { request: { profileId: "documents" } }),

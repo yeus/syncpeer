@@ -10,6 +10,7 @@ export type AppRoute = {
   tab: AppState["activeTab"];
   folderId: string;
   path: string;
+  versionPath?: string;
 };
 
 type NavigationHistory = Pick<History, "pushState" | "replaceState" | "back"> & {
@@ -39,9 +40,11 @@ type NavigationActions = Pick<
   | "goToBreadcrumb"
   | "goToRootView"
   | "openFavorite"
+  | "openVersions"
+  | "closeVersions"
 >;
 
-const pages: AppRoute["page"][] = ["main", "diagnostics", "about", "folder-settings"];
+const pages: AppRoute["page"][] = ["main", "diagnostics", "about", "folder-settings", "versions"];
 const tabs: AppRoute["tab"][] = ["favorites", "folders", "devices", "pim"];
 
 const isPage = (value: string): value is AppRoute["page"] =>
@@ -55,13 +58,16 @@ export const routeFromState = (state: AppState): AppRoute => ({
   tab: state.activeTab,
   folderId: state.session.currentFolderId.trim(),
   path: normalizePath(state.session.currentPath),
+  ...(state.currentPage === "versions" && state.versions.path
+    ? { versionPath: normalizePath(state.versions.path) } : {}),
 });
 
 export const routeEquals = (left: AppRoute, right: AppRoute): boolean =>
   left.page === right.page &&
   left.tab === right.tab &&
   left.folderId === right.folderId &&
-  left.path === right.path;
+  left.path === right.path &&
+  normalizePath(left.versionPath ?? "") === normalizePath(right.versionPath ?? "");
 
 export const routeToHash = (route: AppRoute): string => {
   const params = new URLSearchParams({
@@ -71,6 +77,7 @@ export const routeToHash = (route: AppRoute): string => {
   });
   if (route.folderId) params.set("folder", route.folderId);
   if (route.path && route.folderId) params.set("path", normalizePath(route.path));
+  if (route.page === "versions" && route.versionPath) params.set("version", normalizePath(route.versionPath));
   return `#${params.toString()}`;
 };
 
@@ -86,6 +93,8 @@ export const routeFromHash = (hash: string): AppRoute | null => {
     tab,
     folderId,
     path: folderId ? normalizePath(params.get("path") ?? "") : "",
+    ...(page === "versions" && folderId && params.get("version")
+      ? { versionPath: normalizePath(params.get("version")!) } : {}),
   };
 };
 
@@ -112,6 +121,11 @@ const routeFromNavigationState = (value: unknown): AppRoute | null =>
 const applyPageAndTab = (state: AppState, route: AppRoute): void => {
   state.currentPage = route.page;
   state.activeTab = route.tab;
+  if (route.page === "versions" && route.versionPath) {
+    state.versions.folderId = route.folderId;
+    state.versions.path = route.versionPath;
+    state.versions.name = route.versionPath.split("/").at(-1) ?? route.versionPath;
+  }
 };
 
 type NavigationRuntime = {
@@ -243,6 +257,10 @@ const createRouteOperations = (
           "navigation.restore.failed",
           route,
         );
+        if (route.page === "versions" && route.versionPath) {
+          await runtime.actions.openVersions(route.folderId, route.versionPath,
+            route.versionPath.split("/").at(-1) ?? route.versionPath);
+        }
       }
     } finally {
       if (runtime.restoreToken === token) runtime.restoring = false;
@@ -338,6 +356,8 @@ export const createNavigableAppActions = (args: {
     goToBreadcrumb: recordAction(args.actions.goToBreadcrumb),
     goToRootView: recordAction(args.actions.goToRootView),
     openFavorite: recordAction(args.actions.openFavorite),
+    openVersions: recordAction(args.actions.openVersions),
+    closeVersions: () => routeOperations.goBackFromPage(args.actions.closeVersions),
     closeDiagnosticsPage: () => routeOperations.goBackFromPage(args.actions.closeDiagnosticsPage),
     closeAboutPage: () => routeOperations.goBackFromPage(args.actions.closeAboutPage),
   };

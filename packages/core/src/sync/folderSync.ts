@@ -8,12 +8,37 @@ export interface FolderSyncPolicy {
   externalDeletion: ExternalDeletionPolicy;
   versioning: FolderVersioningMode;
   maxVersions?: number;
+  maxAgeMs?: number;
 }
 
 export const defaultFolderSyncPolicy = (): FolderSyncPolicy => ({
   externalDeletion: "ignore",
   versioning: "staggered",
+  maxAgeMs: 365 * 24 * 60 * 60 * 1000,
 });
+
+export function planVersionRemovals(
+  versions: readonly { id: string; createdMs: number }[],
+  policy: FolderSyncPolicy,
+  nowMs: number,
+): string[] {
+  const retained: number[] = [];
+  const removals: string[] = [];
+  const maximumAgeMs = policy.maxAgeMs ??
+    (policy.versioning === "staggered" ? 365 * 86_400_000 : Infinity);
+  const limit = policy.maxVersions ?? (policy.versioning === "simple" ? 1 : Infinity);
+  for (const version of [...versions].sort((left, right) => right.createdMs - left.createdMs)) {
+    const age = Math.max(0, nowMs - version.createdMs);
+    const interval = age < 3_600_000 ? 30_000
+      : age < 86_400_000 ? 3_600_000
+        : age < 2_592_000_000 ? 86_400_000 : 604_800_000;
+    const spaced = policy.versioning !== "staggered" || retained.length === 0 ||
+      retained.at(-1)! - version.createdMs >= interval;
+    if (age <= maximumAgeMs && retained.length < limit && spaced) retained.push(version.createdMs);
+    else removals.push(version.id);
+  }
+  return removals;
+}
 
 export interface LocalSyncFile {
   path: string;

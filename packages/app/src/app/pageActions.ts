@@ -81,5 +81,6 @@ const closeAboutPage = () => {
     closeAboutPage,
     openFolderSettings: () => { state.currentPage = "folder-settings"; },
     closeFolderSettings: () => { state.currentPage = "main"; },
+    closeVersions: () => { state.currentPage = "main"; },
   };
 };

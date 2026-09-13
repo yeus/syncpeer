@@ -109,6 +109,18 @@ export {
 export { resolvePreferredSourceDeviceId } from "./ui/sessionPolicies.js";
 export { sortAndFilterFileEntries } from "./ui/fileEntries.js";
 export type { FileEntrySortMode } from "./ui/fileEntries.js";
+export {
+  DEFAULT_FAVORITE_IGNORE_PATTERNS,
+  classifyFavoritePath,
+  collectFavoriteFiles,
+} from "./ui/favoriteSelection.js";
+export type { DocumentVersionRecord } from "./ui/browserClient.js";
+export { cacheQuotaBytes, defaultFolderSettings, defaultProfileSettings, normalizeProfileSettings, planCacheEvictions } from "./sync/profileSettings.js";
+export type { CacheCandidate, SyncpeerFolderSettings, SyncpeerProfileSettings } from "./sync/profileSettings.js";
+export type {
+  FavoriteExclusion,
+  FavoritePathState,
+} from "./ui/favoriteSelection.js";
 export { downloadRemoteFile } from "./transfer/download.js";
 export {
   createDuplexChannel,

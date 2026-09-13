@@ -19,6 +19,7 @@ import {
   sortAndFilterFileEntries,
   toConnectionSettings,
   type CachedFileRecord,
+  type DocumentVersionRecord,
   type ConnectionScope,
   type FileEntry,
   type FileEntrySortMode,
@@ -139,7 +140,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       persisted?.activeTab === "pim"
         ? persisted.activeTab
         : ("favorites" as const),
-    currentPage: "main" as "main" | "diagnostics" | "about" | "folder-settings",
+    currentPage: "main" as "main" | "diagnostics" | "about" | "folder-settings" | "versions",
     connection: {
       host: initialConnection.host,
       port: initialConnection.port,
@@ -203,6 +204,9 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         name: string;
         kind: "folder" | "file";
       }>,
+      exclusions: [] as Array<{ folderId: string; path: string; kind: "folder" | "file" }>,
+      ignorePatternsByFolder: {} as Record<string, string[]>,
+      pausedFolderIds: new Set<string>(),
       downloadedFiles: [] as CachedFileRecord[],
       cachedFileKeys: new Set<string>(),
       showDownloadedFiles: false,
@@ -212,6 +216,15 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       isOpeningCachedFile: false,
       isRemovingCachedFile: false,
       isClearingCache: false,
+    },
+    versions: {
+      folderId: "",
+      path: "",
+      name: "",
+      items: [] as DocumentVersionRecord[],
+      loading: false,
+      restoringId: "",
+      error: "",
     },
     devices: {
       savedDevices: savedDevices as SavedDeviceLike[],

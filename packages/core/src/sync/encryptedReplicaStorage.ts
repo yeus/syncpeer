@@ -22,7 +22,7 @@ export function createEncryptedReplicaStorage(bytes: ReplicaByteStorage, options
   withLock: ReplicaStorage["withLock"];
   checkHealth: () => Promise<void>;
   /** Archive the supplied ciphertext path durably, without removing the source. */
-  archive: (storedPath: string) => Promise<void>;
+  archive: (storedPath: string, path: string) => Promise<void>;
 }): ReplicaStorage {
   const indexPath = ".syncpeer-replica-index";
   const storedPath = async (path: string) => {
@@ -93,7 +93,7 @@ export function createEncryptedReplicaStorage(bytes: ReplicaByteStorage, options
         createSink: (encrypted, size) => bytes.createSink(encrypted.name, size) });
       return { ...sink, commit: async () => { await options.checkHealth(); await sink.commit(); } };
     },
-    archive: async path => { await options.checkHealth(); await options.archive(await storedPath(path)); },
+    archive: async path => { await options.checkHealth(); await options.archive(await storedPath(path), path); },
     makeDirectory: async path => { await options.checkHealth(); await bytes.makeDirectory(await storedPath(path)); },
     remove: async (path, directory) => {
       await options.checkHealth();

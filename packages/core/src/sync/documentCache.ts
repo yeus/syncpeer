@@ -1,10 +1,11 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import type { CachedFileRecord, SyncpeerPlatformAdapter } from "../ui/browserClient.js";
+import type { CachedFileRecord, FavoriteRecord, SyncpeerPlatformAdapter } from "../ui/browserClient.js";
 import type { FileDownloadSink } from "../transfer/stream.js";
 import { sameDownloadMetadata } from "../transfer/stream.js";
 import type { FolderRegistration } from "./folderRegistry.js";
 import { assertReplicaPath } from "./replicaPaths.js";
 import type { FolderInfo } from "../core/model/remoteFs.js";
+import { defaultFolderSettings, defaultProfileSettings, type SyncpeerProfileSettings } from "./profileSettings.js";
 
 /** Route prepared folders to the service owner, never mirror two writable copies.
  * Migration changes ownership only after bytes and cleanup have been verified.
@@ -34,6 +35,43 @@ export function createDocumentCache(options: {
     return () => { if (!released) { released = true; active.set(folderId, active.get(folderId)! - 1); } };
   };
   const request = options.request;
+  const loadProfileSettings = async () => options.enabled()
+    ? request<SyncpeerProfileSettings>({ operation: "profileSettings" })
+    : options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
+  const saveProfileSettings = async (settings: SyncpeerProfileSettings) => {
+    if (options.enabled()) await request({ operation: "saveProfileSettings", settings });
+    else if (options.legacy.saveProfileSettings) await options.legacy.saveProfileSettings(settings);
+    else throw new Error("Encrypted profile settings are unavailable.");
+  };
+  const listFavorites = async () => Object.values((await loadProfileSettings()).folders)
+    .flatMap(folder => folder.favorites)
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const updateFavorites = async (transform: (favorites: FavoriteRecord[]) => FavoriteRecord[]) => {
+    const settings = await loadProfileSettings();
+    const favorites = transform(Object.values(settings.folders).flatMap(folder => folder.favorites));
+    const folderIds = new Set([...Object.keys(settings.folders), ...favorites.map(item => item.folderId)]);
+    settings.folders = Object.fromEntries([...folderIds].map(folderId => {
+      const current = settings.folders[folderId] ?? defaultFolderSettings();
+      return [folderId, { ...current, favorites: favorites.filter(item => item.folderId === folderId) }];
+    }));
+    await saveProfileSettings(settings);
+    return favorites.sort((left, right) => left.name.localeCompare(right.name));
+  };
+  let favoritesMigrated = false;
+  const listMigratedFavorites = async () => {
+    const secure = await listFavorites();
+    if (favoritesMigrated || secure.length || !options.legacy.listFavorites) {
+      favoritesMigrated = true; return secure;
+    }
+    const legacy = await options.legacy.listFavorites();
+    favoritesMigrated = true;
+    if (!legacy.length) return secure;
+    const migrated = await updateFavorites(() => legacy);
+    if (options.legacy.removeFavorite) {
+      for (const favorite of legacy) await options.legacy.removeFavorite(favorite.key);
+    }
+    return migrated;
+  };
   const legacyFiles = async (folderId: string) =>
     (await options.legacy.listCachedFiles?.() ?? []).filter(file => file.folderId === folderId);
   const removeLegacyFile = async (file: CachedFileRecord) => {
@@ -72,9 +110,21 @@ export function createDocumentCache(options: {
       readRange: async (offset: number, size: number) => new Uint8Array(await request<number[]>({ operation: "read", handle, offset, size })),
       close: () => request<void>({ operation: "release", handle }) };
   };
-  const sink = (folderId: string, path: string, modifiedMs = Date.now(), expectedLocalHash?: string | null): FileDownloadSink => {
+  const sink = (folderId: string, path: string, modifiedMs = 0, expectedLocalHash?: string | null): FileDownloadSink => {
     let handle: number | undefined;
     let metadata: Parameters<FileDownloadSink["begin"]>[0] | undefined;
+    let completedRanges: Array<{ offset: number; size: number }> = [];
+    const rememberRange = (offset: number, size: number) => {
+      const ranges = [...completedRanges.map(range => ({ offset: range.offset, end: range.offset + range.size })),
+        { offset, end: offset + size }].sort((left, right) => left.offset - right.offset);
+      completedRanges = ranges.reduce<Array<{ offset: number; size: number }>>((result, range) => {
+        const previous = result.at(-1);
+        if (previous && range.offset <= previous.offset + previous.size) {
+          previous.size = Math.max(previous.offset + previous.size, range.end) - previous.offset;
+        } else result.push({ offset: range.offset, size: range.end - range.offset });
+        return result;
+      }, []);
+    };
     const digestRanges = async (source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) => {
       const result: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
       for (let offset = 0; offset < ranges.length; offset += 256) {
@@ -98,15 +148,20 @@ export function createDocumentCache(options: {
           if (!metadata || !sameDownloadMetadata(metadata, value)) throw new Error("Download metadata changed.");
           return;
         }
-        handle = await request<number>({ operation: "beginDownload", folderId, path, size: value.sizeBytes, modifiedMs, expectedLocalHash });
+        handle = await request<number>({ operation: "beginDownload", folderId, path, size: value.sizeBytes, modifiedMs,
+          expectedLocalHash, encrypted: value.encrypted, sourceDeviceId: value.sourceDeviceId, contentId: value.contentId });
+        completedRanges = await request<Array<{ offset: number; size: number }>>({ operation: "downloadRanges", handle });
         metadata = value;
       },
       write: async (offset, bytes) => {
         if (handle === undefined) throw new Error("Download has not started.");
         for (let done = 0; done < bytes.length; done += 131072) {
-          await request({ operation: "write", handle, offset: offset + done, bytes: Array.from(bytes.subarray(done, done + 131072)) });
+          const chunk = bytes.subarray(done, done + 131072);
+          await request({ operation: "write", handle, offset: offset + done, bytes: Array.from(chunk) });
+          rememberRange(offset + done, chunk.length);
         }
       },
+      hasRange: (offset, size) => completedRanges.some(range => offset >= range.offset && offset + size <= range.offset + range.size),
       digestFile: () => request<string>({ operation: "digest", handle }),
       commit: async () => {
         if (handle === undefined) throw new Error("Download has not started.");
@@ -114,6 +169,9 @@ export function createDocumentCache(options: {
       },
       abort: async () => {
         if (handle !== undefined) { await request({ operation: "release", handle, abort: true }); handle = undefined; }
+      },
+      suspend: async () => {
+        if (handle !== undefined) { await request({ operation: "suspendDownload", handle }); handle = undefined; }
       },
     };
   };
@@ -153,6 +211,25 @@ export function createDocumentCache(options: {
     await options.show(documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
   };
   const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
+    loadProfileSettings,
+    saveProfileSettings,
+    listDocumentVersions: async (folderId, path) => {
+      const folder = await owner(folderId);
+      if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
+      return request({ operation: "versions", id: documentId(folder, path) });
+    },
+    restoreDocumentVersion: async (folderId, path, versionId) => {
+      const folder = await owner(folderId);
+      if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
+      await request({ operation: "restoreVersion", id: documentId(folder, path), versionId });
+    },
+    listFavorites: () => options.enabled() ? listMigratedFavorites() : options.legacy.listFavorites?.() ?? Promise.resolve([]),
+    upsertFavorite: favorite => options.enabled()
+      ? updateFavorites(favorites => [...favorites.filter(item => item.key !== favorite.key), favorite])
+      : options.legacy.upsertFavorite?.(favorite) ?? Promise.reject(new Error("Favorite storage is unavailable.")),
+    removeFavorite: key => options.enabled()
+      ? updateFavorites(favorites => favorites.filter(item => item.key !== key))
+      : options.legacy.removeFavorite?.(key) ?? Promise.reject(new Error("Favorite storage is unavailable.")),
     listLocalDirectory: async (folderId, path) => {
       const folder = (await registrations()).find(folder => folder.id === folderId);
       if (!folder) return await options.legacy.listLocalDirectory?.(folderId, path) ?? null;

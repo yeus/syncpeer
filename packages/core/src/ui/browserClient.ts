@@ -15,6 +15,7 @@ import type {
   RemoteDeviceInfo,
 } from "../core/model/remoteFs.js";
 import type { FileDownloadResult, FileDownloadSink } from "../transfer/stream.js";
+import type { SyncpeerProfileSettings } from "../sync/profileSettings.js";
 
 export interface ConnectOptions {
   host: string;
@@ -130,6 +131,12 @@ export interface CachedFileRecord {
   syncBaselineRequired?: boolean;
 }
 
+export interface DocumentVersionRecord {
+  id: string;
+  modifiedMs: number;
+  sizeBytes: number;
+}
+
 export interface AndroidContactRecord {
   contactId: string;
   displayName: string;
@@ -158,6 +165,10 @@ export interface SyncpeerPlatformAdapter {
   listFavorites?: () => Promise<FavoriteRecord[]>;
   upsertFavorite?: (favorite: FavoriteRecord) => Promise<FavoriteRecord[]>;
   removeFavorite?: (key: string) => Promise<FavoriteRecord[]>;
+  loadProfileSettings?: () => Promise<SyncpeerProfileSettings>;
+  saveProfileSettings?: (settings: SyncpeerProfileSettings) => Promise<void>;
+  listDocumentVersions?: (folderId: string, path: string) => Promise<DocumentVersionRecord[]>;
+  restoreDocumentVersion?: (folderId: string, path: string, versionId: string) => Promise<void>;
   cacheFile?: (
     folderId: string,
     path: string,
@@ -245,6 +256,10 @@ export interface SyncpeerBrowserClient {
   listFavorites: () => Promise<FavoriteRecord[]>;
   upsertFavorite: (favorite: FavoriteRecord) => Promise<FavoriteRecord[]>;
   removeFavorite: (key: string) => Promise<FavoriteRecord[]>;
+  loadProfileSettings: () => Promise<SyncpeerProfileSettings>;
+  saveProfileSettings: (settings: SyncpeerProfileSettings) => Promise<void>;
+  listDocumentVersions: (folderId: string, path: string) => Promise<DocumentVersionRecord[]>;
+  restoreDocumentVersion: (folderId: string, path: string, versionId: string) => Promise<void>;
   cacheFile: (
     folderId: string,
     path: string,
@@ -654,6 +669,18 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.removeFavorite
         ? platformAdapter.removeFavorite(key)
         : throwMissingAdapter("removeFavorite"),
+    loadProfileSettings: async () => platformAdapter.loadProfileSettings
+      ? platformAdapter.loadProfileSettings()
+      : throwMissingAdapter("loadProfileSettings"),
+    saveProfileSettings: async settings => platformAdapter.saveProfileSettings
+      ? platformAdapter.saveProfileSettings(settings)
+      : throwMissingAdapter("saveProfileSettings"),
+    listDocumentVersions: async (folderId, path) => platformAdapter.listDocumentVersions
+      ? platformAdapter.listDocumentVersions(folderId, path)
+      : throwMissingAdapter("listDocumentVersions"),
+    restoreDocumentVersion: async (folderId, path, versionId) => platformAdapter.restoreDocumentVersion
+      ? platformAdapter.restoreDocumentVersion(folderId, path, versionId)
+      : throwMissingAdapter("restoreDocumentVersion"),
     cacheFile: async (
       folderId: string,
       path: string,

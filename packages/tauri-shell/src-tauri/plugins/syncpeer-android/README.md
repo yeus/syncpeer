@@ -30,6 +30,17 @@ encrypted copy is not attached and the original remains available for retry.
 External-storage imports can require manual handling. Failed preparation never
 silently falls back to writing new Android downloads in plaintext.
 
+Acknowledged encrypted download ranges are journaled with the remote content
+identity. They can be reused after the service or app restarts, but are discarded
+when the remote identity changes. The document runtime also recreates its
+JavaScript isolate after termination without reusing open handles or stale keys.
+
+The Android picker exposes create, file rename, and delete where core can perform
+them safely. Deletion uses core's encrypted version archive. Android's
+DocumentsProvider API has no restore-version callback, so version browsing and
+restoration belong in Syncpeer's own folder UI rather than being advertised as a
+picker operation.
+
 Folder storage can be moved back to the legacy plaintext cache explicitly. The
 copy is verified before encrypted contents are removed, so failed reverse
 migrations retain encrypted ownership and can be retried. The app exposes this

@@ -11,6 +11,7 @@ import type * as AppActions from "../packages/app/src/app/actions.ts";
 import type * as AppState from "../packages/app/src/app/state.ts";
 import type * as DeviceActions from "../packages/app/src/app/deviceActions.ts";
 import type * as DirectoryActions from "../packages/app/src/app/directoryActions.ts";
+import type * as StarredActions from "../packages/app/src/app/starredActions.ts";
 import type { TransferRuntime } from "../packages/app/src/app/transferRuntime.ts";
 
 test("password actions publish changes only after secure storage succeeds", async t => {
@@ -65,6 +66,60 @@ test("local folders can be browsed offline and with a locked remote connection",
   assert.equal(state.ui.recentError, "Synthetic locked storage");
 });
 
+test("unfavoriting an inherited child creates a device-local exclusion", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createDirectoryActions } = await server.ssrLoadModule("/packages/app/src/app/directoryActions.ts") as typeof DirectoryActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.favorites.items = [{ key: "folder:photos:album", folderId: "photos", path: "album", name: "album", kind: "folder" }];
+  let saved: unknown;
+  const actions = createDirectoryActions({ state, client: {
+    loadProfileSettings: async () => ({ format: 1, profile: { versioning: "staggered", preserveLocalChanges: true,
+      cache: { percent: 5, minimumBytes: 1, maximumBytes: 2 }, allowMetered: false, autoMount: false }, folders: {}, devices: {} }),
+    saveProfileSettings: async value => { saved = structuredClone(value); },
+  } as never, sessionStore: {} as never, refreshActiveView: async () => {}, syncStarredFiles: async () => {} });
+  await actions.toggleFavorite("photos", "album/raw", "raw", "folder");
+  assert.deepEqual(state.favorites.exclusions, [{ folderId: "photos", path: "album/raw", kind: "folder" }]);
+  assert.deepEqual((saved as { folders: Record<string, { exclusions: unknown[] }> }).folders.photos.exclusions,
+    state.favorites.exclusions);
+});
+
+test("a favorite folder downloads its non-ignored descendants", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createStarredActions } = await server.ssrLoadModule("/packages/app/src/app/starredActions.ts") as typeof StarredActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.ui.isAppVisible = true; state.session.isConnected = true;
+  state.favorites.items = [{ key: "folder:code:", folderId: "code", path: "", name: "Code", kind: "folder" }];
+  const visited: string[] = [], downloaded: string[] = [];
+  state.session.remoteFs = {
+    readDir: async (_folderId: string, path: string) => {
+      visited.push(path);
+      if (!path) return [
+        { name: "src", path: "src", type: "directory", size: 0, modifiedMs: 1 },
+        { name: "node_modules", path: "node_modules", type: "directory", size: 0, modifiedMs: 1 },
+      ];
+      return path === "src" ? [{ name: "index.ts", path: "src/index.ts", type: "file", size: 2, modifiedMs: 2 }] : [];
+    },
+    readFileFully: async (_folderId: string, path: string) => { downloaded.push(path); return Uint8Array.of(1, 2); },
+  } as never;
+  const actions = createStarredActions({ state, client: { listCachedFiles: async () => [],
+    cacheFile: async () => {} } as never, transfers: {
+    begin: async () => {}, update: () => {}, finish: async () => {},
+  } as never });
+  await actions.syncStarredFiles();
+  assert.deepEqual(downloaded, ["src/index.ts"]);
+  assert.deepEqual(visited, ["", "src"]);
+  assert.equal(visited.includes("node_modules"), false);
+  state.favorites.pausedFolderIds.add("code");
+  downloaded.length = 0; visited.length = 0;
+  await actions.syncStarredFiles();
+  assert.deepEqual(downloaded, [], "Paused favorite folders do not transfer descendants");
+  assert.deepEqual(visited, [], "Paused favorite folders are not traversed");
+});
+
 test("discovery retains empty roots across peers and only downloads enter the local directory", async () => {
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
@@ -74,9 +129,13 @@ test("discovery retains empty roots across peers and only downloads enter the lo
       save: async value => { secret = value; }, remove: async () => { secret = null; },
     } });
   await documents.initialize(true);
+  const legacyFavorite = { key: "folder:photos:", folderId: "photos", path: "", name: "Photos", kind: "folder" as const };
+  let legacyFavorites = [legacyFavorite];
   const cache = createDocumentCache({ enabled: () => true,
     request: async <T>(input: Record<string, unknown>) => await dispatchDocumentCommand(documents, input) as T,
-    legacy: { listCachedFiles: async () => [], cacheFile: async () => assert.fail("No plaintext fallback") },
+    legacy: { listCachedFiles: async () => [], cacheFile: async () => assert.fail("No plaintext fallback"),
+      listFavorites: async () => legacyFavorites, removeFavorite: async key =>
+        legacyFavorites = legacyFavorites.filter(item => item.key !== key) },
     openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
   });
   await cache.syncFolders([{ id: "photos", label: "Photos", readOnly: true, encrypted: true, needsPassword: true }], {});
@@ -89,6 +148,15 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   ]);
   await assert.rejects(cache.connectFolder({ id: "photos", label: "Photos", password: "different-password" }), /migration/i);
   await cache.syncFolders([{ id: "music", label: "Music", readOnly: false }], {});
+  assert.deepEqual(await cache.platformAdapter.listFavorites!(), [legacyFavorite]);
+  assert.deepEqual(legacyFavorites, [], "Legacy plaintext favorite settings are removed after encrypted migration");
+  const favorite = legacyFavorite;
+  assert.deepEqual(await cache.platformAdapter.upsertFavorite!(favorite), [favorite]);
+  assert.deepEqual(await cache.platformAdapter.listFavorites!(), [favorite]);
+  const settings = await cache.platformAdapter.loadProfileSettings!();
+  assert.equal(settings.profile.versioning, "staggered");
+  assert.equal(settings.folders.photos?.ignorePatterns.includes("node_modules/"), true);
+  assert.deepEqual(await cache.platformAdapter.removeFavorite!(favorite.key), []);
   const known = await cache.syncFolders([], {});
   assert.deepEqual(known.map(folder => folder.label), ["Photos", "Music"]);
   assert.deepEqual((await cache.platformAdapter.listLocalDirectory!("photos", ""))!.map(entry => entry.name), ["image.bin"]);
@@ -103,6 +171,8 @@ test("cache migration verifies and removes plaintext originals", async t => {
       isDeviceUnlocked: async () => true, load: async () => null, save: async () => {}, remove: async () => {},
     } });
   await documents.initialize(); await documents.createVault("synthetic-master");
+  await assert.rejects(dispatchDocumentCommand(documents, { operation: "saveProfileSettings" }),
+    /settings/i, "Malformed commands cannot silently reset encrypted settings to defaults");
   const original = Uint8Array.of(1, 2, 3, 4);
   let legacyWrites = 0;
   let failVerification = true, failRemoval = false;
@@ -181,6 +251,8 @@ test("cache migration verifies and removes plaintext originals", async t => {
   const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
   const state = createInitialState(null), session = createInitialSessionState();
   const sample = (await cache.platformAdapter.listCachedFiles!()).find(file => file.path === "sample.bin")!;
+  assert.equal(sample.syncBaseline?.modifiedMs, 30,
+    "Completed downloads persist the exact remote version used for later conflict detection");
   const edit = async (byte: number) => {
     const handle = await documents.open(sample.localPath!.slice("syncpeer-document:".length), "rw");
     await documents.write(handle, 0, Uint8Array.of(byte)); await documents.release(handle);
@@ -270,5 +342,59 @@ test("encrypted folders can be migrated back to verified plaintext storage", asy
   await cache.disconnectFolder("reverse");
   assert.equal((await cache.platformAdapter.listCachedFiles!()).length, 1, "Plain migration retains the verified local file");
   assert.equal((await documents.status()).folders[0].downloads, undefined, "Encrypted ownership is detached only after verification");
+  await documents.close();
+});
+
+test("encrypted downloads resume verified ranges after a document runtime restart", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const openDocuments = async () => {
+    const documents = createDocumentFilesystem({ profileId: "resume-fixture", deviceCounterId: "42", openStorage,
+      profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+        isDeviceUnlocked: async () => true, load: async () => secret,
+        save: async value => { secret = value; }, remove: async () => { secret = null; },
+      } });
+    await documents.initialize(true);
+    return documents;
+  };
+  const openCache = (documents: Awaited<ReturnType<typeof openDocuments>>) => createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => await dispatchDocumentCommand(documents, input) as T,
+    legacy: { listCachedFiles: async () => [] },
+    openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  let documents = await openDocuments(), cache = openCache(documents);
+  await cache.connectFolder({ id: "resume", label: "Resume", password: "synthetic-password" });
+  const metadata = { sourceDeviceId: "synthetic-peer", folderId: "resume", path: "partial.bin",
+    sizeBytes: 6, encrypted: false, contentId: "blocks:synthetic-content" };
+  const first = await cache.platformAdapter.createFileDownloadSink!({ folderId: "resume", path: "partial.bin",
+    name: "partial.bin", modifiedMs: 1000 });
+  await first.begin(metadata);
+  await first.write(0, Uint8Array.of(1, 2, 3));
+  await first.suspend!();
+  await documents.close();
+
+  documents = await openDocuments(); cache = openCache(documents);
+  const resumed = await cache.platformAdapter.createFileDownloadSink!({ folderId: "resume", path: "partial.bin",
+    name: "partial.bin", modifiedMs: 1000 });
+  await resumed.begin(metadata);
+  assert.equal(resumed.hasRange!(0, 3), true, "Restarted encrypted storage exposes its durable completed range");
+  assert.equal((await resumed.digestPartialRanges!([{ offset: 0, size: 3 }])).length, 1);
+  await resumed.write(3, Uint8Array.of(4, 5, 6));
+  await resumed.commit();
+  const [stored] = await cache.platformAdapter.listCachedFiles!();
+  assert.deepEqual(await cache.platformAdapter.readBinaryFile!(stored.localPath!), Uint8Array.of(1, 2, 3, 4, 5, 6));
+
+  const stale = await cache.platformAdapter.createFileDownloadSink!({ folderId: "resume", path: "changed.bin",
+    name: "changed.bin", modifiedMs: 2000 });
+  await stale.begin({ ...metadata, path: "changed.bin", contentId: "blocks:old" });
+  await stale.write(0, Uint8Array.of(7, 8, 9));
+  await stale.suspend!();
+  await documents.close();
+  documents = await openDocuments(); cache = openCache(documents);
+  const changed = await cache.platformAdapter.createFileDownloadSink!({ folderId: "resume", path: "changed.bin",
+    name: "changed.bin", modifiedMs: 2000 });
+  await changed.begin({ ...metadata, path: "changed.bin", contentId: "blocks:new" });
+  assert.equal(changed.hasRange!(0, 3), false, "Changed remote content never reuses stale encrypted bytes");
+  await changed.abort(new Error("Synthetic cleanup"));
   await documents.close();
 });

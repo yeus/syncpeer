@@ -131,6 +131,33 @@ test("staggered versioning thins close revisions and retains an older revision",
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("staggered versioning removes history older than one year", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-staggered-age-"));
+  try {
+    await writeFile(path.join(root, "file"), "version");
+    const storage = await createNodeFolderSyncStorage(root);
+    const start = Date.UTC(2025, 0, 1);
+    await storage.archiveFile("file", "replace", defaultFolderSyncPolicy(), start);
+    await storage.archiveFile("file", "replace", defaultFolderSyncPolicy(), start + 366 * 86400000);
+    assert.equal((await storage.listVersions("file")).length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("version retention decisions are reusable across storage frontends", async () => {
+  const { planVersionRemovals } = await import("../packages/core/dist/sync/folderSync.js");
+  const now = Date.UTC(2026, 0, 1);
+  assert.deepEqual(planVersionRemovals([
+    { id: "newest", createdMs: now - 1_000 },
+    { id: "too-close", createdMs: now - 2_000 },
+    { id: "older", createdMs: now - 40_000 },
+    { id: "expired", createdMs: now - 366 * 86_400_000 },
+  ], defaultFolderSyncPolicy(), now), ["too-close", "expired"]);
+  assert.deepEqual(planVersionRemovals([
+    { id: "newest", createdMs: now - 1_000 },
+    { id: "older", createdMs: now - 40_000 },
+  ], { ...defaultFolderSyncPolicy(), versioning: "simple" }, now), ["older"]);
+});
+
 test("ambiguous publication is persisted and never blindly replayed", async () => {
   let publications = 0;
   let state: FolderSyncBaseline | null = null;

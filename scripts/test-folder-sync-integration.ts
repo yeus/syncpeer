@@ -8,6 +8,7 @@ import { createLanFixture, generateSyncthingIdentity } from "./lan-test/syncthin
 const root = await mkdtemp(path.join(tmpdir(), "syncpeer-folder-integration-"));
 let fixture: Awaited<ReturnType<typeof createLanFixture>> | undefined;
 try {
+  const cliEnvironment = { ...process.env, SYNCPEER_STATE_DIR: path.join(root, "state") };
   const identityRoot = path.join(root, "identity");
   const identity = generateSyncthingIdentity(identityRoot);
   fixture = await createLanFixture({ root: path.join(root, "server"), serverHost: "127.0.0.1", trustedDeviceId: identity.deviceId, mode: "direct", encryptedFolderType: "sendreceive" });
@@ -17,7 +18,8 @@ try {
   const options = ["packages/cli/dist/main.js", "--cert", path.join(identityRoot, "cert.pem"), "--key", path.join(identityRoot, "key.pem"),
     "--host", "127.0.0.1", "--port", String(fixture.fixture.directPort), "--remote-id", fixture.fixture.remoteDeviceId, "--discovery-mode", "direct"];
   const cli = async (connection: string[], ...args: string[]) => new Promise<void>((resolve, reject) => {
-    const child = spawn(process.execPath, [...connection, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [...connection, ...args], { stdio: ["ignore", "pipe", "pipe"],
+      env: cliEnvironment });
     let errors = "";
     child.stdout.resume();
     child.stderr.on("data", bytes => { errors += String(bytes); });
@@ -35,7 +37,8 @@ try {
   await cli(options, "delete-file", fixture.fixture.folderId, selected, "hello.txt");
   await assert.rejects(() => readFile(path.join(fixture.sharePath, "hello.txt")), { code: "ENOENT" });
   await assert.rejects(() => readFile(path.join(selected, "hello.txt")), { code: "ENOENT" });
-  const service = spawn(process.execPath, [...options, "sync-folder", fixture.fixture.folderId, selected], { stdio: ["ignore", "pipe", "pipe"] });
+  const service = spawn(process.execPath, [...options, "sync-folder", fixture.fixture.folderId, selected], {
+    stdio: ["ignore", "pipe", "pipe"], env: cliEnvironment });
   service.stderr.resume();
   const exited = new Promise<number | null>(resolve => service.once("exit", resolve));
   try {

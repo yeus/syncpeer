@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";
+
+useTemporaryMetadataRoot();
 import { sha256 } from "@noble/hashes/sha2.js";
 import { readReplicaBlock, scanReplicaIndex } from "../packages/core/dist/sync/replicaIndex.js";
 import { planReplicaMerge } from "../packages/core/dist/sync/replicaMerge.js";
 import { advanceVersionVector, mergeVersionVectors } from "../packages/core/dist/core/protocol/versionVector.js";
 import { receiveReplicaFiles } from "../packages/core/dist/sync/replicaReceive.js";
-import { createNodeFolderReplica, saveReplicaIndex } from "../packages/core/dist/sync/nodeReplica.js";
+import { createNodeFolderReplica } from "../packages/core/dist/sync/nodeReplica.js";
+import { saveSqliteReplicaIndex } from "../packages/core/dist/sync/nodeReplicaMetadata.js";
+import { createNodeMetadataStorage } from "../packages/core/dist/sync/nodeMetadataStorage.js";
 import { mkdtemp, mkdir, writeFile, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -172,7 +177,7 @@ test("missing replica marker blocks scans and reopening without silently recreat
   try {
     const replica = await createNodeFolderReplica(root, "1");
     await replica.scan();
-    await rm(path.join(root, ".syncpeer-folder-marker"), { force: true });
+    await rm(path.join(root, ".stfolder"), { recursive: true });
     await assert.rejects(replica.scan(), /marker/i);
     await assert.rejects(createNodeFolderReplica(root, "1"), /marker/i);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -314,7 +319,7 @@ test("pending replica metadata survives a real disk reopen", async () => {
     const [initial] = await replica.scan();
     const pending = { ...initial, blocks: [{ offset: 0, size: 1, hash: sha256(new Uint8Array([2])) }],
       version: { counters: [{ id: "1", value: "1" }, { id: "2", value: "1" }] } };
-    await saveReplicaIndex(path.join(root, ".syncpeer-replica.json"), {
+    saveSqliteReplicaIndex(await createNodeMetadataStorage(root), {
       format: 1, sequence: 1, files: { file: { revision: "old", info: initial } }, pending,
     });
     await writeFile(path.join(root, "file"), new Uint8Array([2]));

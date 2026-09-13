@@ -5,6 +5,9 @@ import { digestRanges } from "../transfer/nodeStorage.js";
 import type { ReplicaEntry } from "./replicaIndex.js";
 import { isInternalReplicaPath } from "./replicaPaths.js";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { createNodeMetadataStorage } from "./nodeMetadataStorage.js";
+import { initializeNodeMarker, readLegacyMetadata } from "./nodeReplicaMetadata.js";
 import {
   planVersionRemovals,
   type FolderSyncBaseline,
@@ -14,14 +17,34 @@ import {
 } from "./folderSync.js";
 
 export interface NodeFolderSyncStorageOptions {
+  stateRoot?: string;
+  /** Legacy JSON location, imported once into SQLite. */
   statePath?: string;
   versionRoot?: string;
   trashRoot?: string;
 }
 
 export interface NodeFolderSyncStorage extends FolderSyncStorage {
+  metadata: Awaited<ReturnType<typeof createNodeMetadataStorage>>;
+  checkHealth: () => Promise<void>;
   listVersions: (relativePath?: string) => Promise<Array<{ archivePath: string; path: string; modifiedMs: number }>>;
   restoreVersion: (archivePath: string, targetPath?: string) => Promise<void>;
+}
+
+function decodeBaselineRecords(records: { id: string; value: Uint8Array }[]): FolderSyncBaseline | null {
+  if (!records.length) return null;
+  if (!records.some(record => record.id === "header" && new TextDecoder().decode(record.value) === "1")) throw new Error("Folder baseline header missing or invalid.");
+  const files = Object.fromEntries(records.filter(record => record.id !== "header").map(record => {
+    if (!record.id.startsWith("file/")) throw new Error("Invalid folder baseline key.");
+    return [safePath(record.id.slice(5)), JSON.parse(new TextDecoder().decode(record.value))];
+  }));
+  return { format: 1, files };
+}
+
+function baselineRecords(state: FolderSyncBaseline) {
+  if (state?.format !== 1 || !state.files || typeof state.files !== "object" || Array.isArray(state.files)) throw new Error("Invalid folder baseline.");
+  return [{ id: "header", value: new TextEncoder().encode("1") }, ...Object.entries(state.files)
+    .map(([name, value]) => ({ id: `file/${safePath(name)}`, value: new TextEncoder().encode(JSON.stringify(value)) }))];
 }
 
 const normalizePath = (value: string): string => value.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
@@ -154,6 +177,8 @@ export const createNodeFolderSyncStorage = async (
   await assertNoSymlinks(path.parse(root).root, root);
   await mkdir(root, { recursive: true });
   const statePath = path.resolve(options.statePath ?? path.join(root, ".syncpeer-folder-state.json"));
+  const metadata = await createNodeMetadataStorage(root, options.stateRoot);
+  const checkHealth = await initializeNodeMarker(root, metadata);
   const versionRoot = path.resolve(options.versionRoot ?? path.join(root, ".stversions"));
   const trashRoot = path.resolve(options.trashRoot ?? path.join(root, ".syncpeer-trash"));
   const cache = new Map<string, { key: string; fingerprint: string; layout?: string; remoteFingerprint?: string }>();
@@ -218,6 +243,8 @@ export const createNodeFolderSyncStorage = async (
     await writeAtomically(path.join(root, relativeTarget), new Uint8Array(await readFile(absoluteArchive)));
   };
   return {
+    metadata,
+    checkHealth,
     listFiles: (remote = []) => listDirectory(root, "", path.basename(statePath), remote, cache),
     readFile: async (relativePath) => {
       const target = path.join(root, safePath(relativePath));
@@ -265,30 +292,41 @@ export const createNodeFolderSyncStorage = async (
       return target;
     },
     loadState: async () => {
-      try {
-        const parsed = JSON.parse(await readFile(statePath, "utf8")) as FolderSyncBaseline;
-        return parsed?.format === 1 && parsed.files && typeof parsed.files === "object" ? parsed : null;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-        throw error;
+      await checkHealth();
+      let records = metadata.entries("baseline");
+      const legacy = await readLegacyMetadata(statePath);
+      if (legacy) {
+        const parsed = JSON.parse(new TextDecoder().decode(legacy)) as FolderSyncBaseline;
+        const imported = baselineRecords(parsed);
+        if (records.length && !isDeepStrictEqual(decodeBaselineRecords(records), parsed)) throw new Error("Legacy folder baseline differs from SQLite.");
+        if (!records.length) { records = imported; metadata.replace("baseline", records); }
       }
+      if (legacy) await rm(statePath);
+      return decodeBaselineRecords(records);
     },
     saveState: async (state) => {
-      await writeAtomically(statePath, new TextEncoder().encode(JSON.stringify(state, null, 2) + "\n"));
+      await checkHealth();
+      metadata.replace("baseline", baselineRecords(state));
     },
     listVersions,
     restoreVersion,
     setSubscribed: async (subscribed) => {
-      const marker = path.join(root, ".syncpeer-unsubscribed");
-      if (subscribed) await rm(marker, { force: true });
-      else await writeAtomically(marker, new Uint8Array());
+      metadata.replace("subscription", [{ id: "active", value: new Uint8Array([Number(subscribed)]) }]);
+      await rm(path.join(root, ".syncpeer-unsubscribed"), { force: true });
     },
     isSubscribed: async () => {
-      try { await lstat(path.join(root, ".syncpeer-unsubscribed")); return false; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+      const stored = metadata.entries("subscription")[0];
+      if (stored) return stored.value[0] === 1;
+      const legacy = await readLegacyMetadata(path.join(root, ".syncpeer-unsubscribed"));
+      metadata.replace("subscription", [{ id: "active", value: new Uint8Array([Number(!legacy)]) }]);
+      if (legacy) await rm(path.join(root, ".syncpeer-unsubscribed"));
+      return !legacy;
     },
     withLock: async (operation) => {
-      const lockPath = path.join(root, ".syncpeer-folder-lock");
+      await checkHealth();
+      // An older process must not run alongside the migrated storage owner.
+      if (await readLegacyMetadata(path.join(root, ".syncpeer-folder-lock"))) throw new Error("Legacy folder lock exists; stop old Syncpeer processes before migration.");
+      const lockPath = path.join(metadata.directory, "operation.lock");
       const deadline = Date.now() + 120000;
       let lock;
       while (!lock) {
@@ -300,7 +338,7 @@ export const createNodeFolderSyncStorage = async (
             try { process.kill(pid, 0); }
             catch (error) {
               if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-                throw new Error("Folder lock belongs to a stopped process. Verify no sync is active before removing .syncpeer-folder-lock.", { cause: error });
+                throw new Error("Folder lock belongs to a stopped process. Verify no sync is active before removing the metadata operation.lock.", { cause: error });
               }
             }
           }

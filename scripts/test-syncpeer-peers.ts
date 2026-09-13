@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";
+
+useTemporaryMetadataRoot();
 import { execFileSync, spawn } from "node:child_process";
 import { X509Certificate } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from "node:fs/promises";

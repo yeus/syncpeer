@@ -1,14 +1,14 @@
-import { open, readFile, rename, mkdir, rmdir, utimes, lstat } from "node:fs/promises";
+import { open, mkdir, rmdir, utimes, lstat, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { encodeReplicaIndex, decodeReplicaIndex } from "./replicaPersistence.js";
 import { assertNoSymlinks, createNodeFolderSyncStorage, listNodeReplicaEntries, safePath } from "./nodeFolderStorage.js";
-import type { ReplicaIndex } from "./replicaIndex.js";
 import { createFolderReplica } from "./replicaStorage.js";
 import { createNodeFileDownloadSink } from "../transfer/nodeStorage.js";
 import { defaultFolderSyncPolicy } from "./folderSync.js";
 import { createReplicaController } from "./replicaControl.js";
+import { loadSqliteReplicaIndex, saveSqliteReplicaIndex, migrateReplicaMetadata } from "./nodeReplicaMetadata.js";
+import type { NodeFolderSyncStorageOptions } from "./nodeFolderStorage.js";
 
 const hashBytes = (bytes: Uint8Array) => new Uint8Array(createHash("sha256").update(bytes).digest());
 
@@ -32,73 +32,35 @@ const flushChanges = async (root: string, paths: readonly string[]) => {
   for (const directory of [...directories].sort((a, b) => b.length - a.length)) await syncEntry(directory);
 };
 
-const loadIndex = async (filename: string): Promise<ReplicaIndex | null> => {
-  let content: Uint8Array;
-  try { content = await readFile(filename); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
-  return decodeReplicaIndex(content);
-};
-
-export const saveReplicaIndex = async (filename: string, index: ReplicaIndex) => {
-  await writeReplicaBytes(filename, encodeReplicaIndex(index));
-};
-
-const writeReplicaBytes = async (filename: string, value: Uint8Array) => {
-  const temporary = `${filename}.tmp`;
-  const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
-  try { await file.writeFile(value); await file.sync(); }
-  finally { await file.close(); }
-  await rename(temporary, filename);
-  await syncEntry(path.dirname(filename));
-};
-
-const createRootGuard = async (root: string, indexPath: string) => {
+const createRootGuard = async (root: string, checkMarker: () => Promise<void>) => {
   await assertNoSymlinks(root, root);
   const original = await lstat(root);
   if (!original.isDirectory()) throw new Error("Replica root is not a directory.");
-  const marker = path.join(root, ".syncpeer-folder-marker");
-  try {
-    const info = await lstat(marker);
-    if (!info.isFile()) throw new Error("Invalid replica folder marker.");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const initialized = await lstat(indexPath).then(() => true, error => {
-      if (error.code === "ENOENT") return false;
-      throw error;
-    });
-    if (initialized) throw new Error("Replica folder marker missing; verify the selected storage before resuming.", { cause: error });
-    try {
-      const file = await open(marker, "wx", 0o600);
-      try { await file.sync(); } finally { await file.close(); }
-      await syncEntry(root);
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-  }
   return async () => {
     const current = await lstat(root);
     if (!current.isDirectory() || current.dev !== original.dev || current.ino !== original.ino) {
       throw new Error("Replica root changed; verify the selected storage before resuming.");
     }
     try {
-      if (!(await lstat(marker)).isFile()) throw new Error("Invalid replica folder marker.");
+      await checkMarker();
     } catch (error) {
       throw new Error("Replica folder marker unavailable; synchronization stopped to protect local data.", { cause: error });
     }
   };
 };
 
-export async function createNodeFolderReplica(rootPath: string, deviceCounterId: string) {
+export async function createNodeFolderReplica(rootPath: string, deviceCounterId: string, options: NodeFolderSyncStorageOptions = {}) {
   const root = path.resolve(rootPath);
-  const indexPath = path.join(root, ".syncpeer-replica.json");
-  const checkHealth = await createRootGuard(root, indexPath);
-  const storage = await createNodeFolderSyncStorage(root);
-  const settingsPath = path.join(root, ".syncpeer-replica-settings.json");
-  await assertNoSymlinks(root, settingsPath);
-  let paused = false;
-  try {
-    const settings = JSON.parse(await readFile(settingsPath, "utf8"));
-    if (settings.format !== 1 || typeof settings.paused !== "boolean") throw new Error("Invalid replica settings.");
-    paused = settings.paused;
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const storage = await createNodeFolderSyncStorage(root, options);
+  const checkHealth = await createRootGuard(root, storage.checkHealth);
+  await storage.withLock!(async () => {
+    await migrateReplicaMetadata(root, storage.metadata);
+    await storage.loadState!();
+    await rm(path.join(root, ".syncpeer-folder-marker"), { force: true });
+  });
+  const pausedRecord = storage.metadata.entries("replica-settings")[0];
+  if (pausedRecord && (pausedRecord.value.length !== 1 || pausedRecord.value[0] > 1)) throw new Error("Invalid replica settings.");
+  const paused = pausedRecord?.value[0] === 1;
   const readRange = async (relative: string, offset: number, size: number) => {
     await checkHealth();
     const filename = path.join(root, safePath(relative));
@@ -122,12 +84,11 @@ export async function createNodeFolderReplica(rootPath: string, deviceCounterId:
     },
     loadIndex: async () => {
       await checkHealth();
-      await assertNoSymlinks(root, indexPath);
-      return loadIndex(indexPath);
+      return loadSqliteReplicaIndex(storage.metadata);
     },
     listEntries: async () => { await checkHealth(); return listNodeReplicaEntries(root, "", ".syncpeer-state.json"); },
     readRange,
-    saveIndex: async index => { await checkHealth(); await saveReplicaIndex(indexPath, index); },
+    saveIndex: async index => { await checkHealth(); saveSqliteReplicaIndex(storage.metadata, index); },
     flushChanges: async paths => { await checkHealth(); await flushChanges(root, paths); },
     archive: async relative => {
       await checkHealth();
@@ -161,7 +122,6 @@ export async function createNodeFolderReplica(rootPath: string, deviceCounterId:
     },
   }, deviceCounterId, hashBytes), { paused, savePaused: value => storage.withLock!(async () => {
     await checkHealth();
-    await assertNoSymlinks(root, settingsPath);
-    await writeReplicaBytes(settingsPath, new TextEncoder().encode(JSON.stringify({ format: 1, paused: value })));
+    storage.metadata.replace("replica-settings", [{ id: "paused", value: new Uint8Array([Number(value)]) }]);
   }) });
 }

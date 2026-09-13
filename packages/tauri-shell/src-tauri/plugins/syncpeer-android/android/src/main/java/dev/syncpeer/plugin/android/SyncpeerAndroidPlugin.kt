@@ -34,6 +34,7 @@ import app.tauri.plugin.Plugin
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
+import java.util.concurrent.atomic.AtomicBoolean
 
 @InvokeArg
 class DocumentCommandArgs {
@@ -45,6 +46,12 @@ class VaultSecretArgs {
   var profileId: String = ""
   var operation: String = ""
   var secret: String? = null
+}
+
+@InvokeArg
+class BiometricAuthArgs {
+  var profileId: String = ""
+  var enabled: Boolean = false
 }
 
 @InvokeArg
@@ -193,6 +200,55 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (_: Exception) {
       invoke.reject("Protected credential operation failed; use manual unlock.")
     }
+  }
+
+  @Command
+  fun biometricStatus(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(VaultSecretArgs::class.java)
+      invoke.resolveObject(vaultSecrets.biometricStatus(args.profileId))
+    } catch (_: Exception) { invoke.reject("Biometric status is unavailable.") }
+  }
+
+  @Command
+  fun biometricSetEnabled(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(BiometricAuthArgs::class.java)
+      invoke.resolveObject(vaultSecrets.execute(args.profileId, "setBiometricEnabled", args.enabled.toString()) as Any)
+    } catch (_: Exception) { invoke.reject("Biometric setting could not be saved.") }
+  }
+
+  @Command
+  fun biometricAuthenticate(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(BiometricAuthArgs::class.java)
+      check(vaultSecrets.biometricStatus(args.profileId)["available"] == true) { "Biometric unlock is unavailable" }
+      if (android.os.Build.VERSION.SDK_INT < 28) throw IllegalStateException("Biometric unlock is unavailable")
+      val completed = AtomicBoolean(false)
+      val executor = androidx.core.content.ContextCompat.getMainExecutor(activity)
+      val callback = object : android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+        override fun onAuthenticationSucceeded(result: android.hardware.biometrics.BiometricPrompt.AuthenticationResult) {
+          if (completed.compareAndSet(false, true)) invoke.resolveObject(mapOf("authenticated" to true))
+        }
+        override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+          if (completed.compareAndSet(false, true)) invoke.reject("Biometric authentication was not completed.")
+        }
+      }
+      val builder = android.hardware.biometrics.BiometricPrompt.Builder(activity)
+        .setTitle("Unlock Syncpeer")
+        .setSubtitle("Confirm your identity to open Syncpeer")
+      if (android.os.Build.VERSION.SDK_INT >= 30) {
+        builder.setAllowedAuthenticators(
+          android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG or
+            android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL,
+        )
+      } else {
+        builder.setNegativeButton("Cancel", executor) { _, _ ->
+          if (completed.compareAndSet(false, true)) invoke.reject("Biometric authentication was not completed.")
+        }
+      }
+      builder.build().authenticate(android.os.CancellationSignal(), executor, callback)
+    } catch (error: Exception) { invoke.reject("Biometric authentication is unavailable.") }
   }
   private var multicastLock: WifiManager.MulticastLock? = null
   private var notificationCancellationPending = false

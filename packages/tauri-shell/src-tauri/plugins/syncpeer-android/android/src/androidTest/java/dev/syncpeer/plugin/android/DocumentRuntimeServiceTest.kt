@@ -31,6 +31,13 @@ class DocumentRuntimeServiceTest {
       fun command(operation: String, values: JSONObject = JSONObject()): Any? =
         runtime.command(values.put("operation", operation)).get(30, TimeUnit.SECONDS).opt("result")
       val status = command("status") as JSONObject
+      val initialPhase = status.getJSONObject("vault").getString("phase")
+      if (initialPhase == "unlocked") {
+        // Automatic setup must have persisted a device-protected secret before publishing the vault.
+        assertTrue(VaultSecretStore(context).isDeviceUnlocked())
+        assertFalse(VaultSecretStore(context).execute("documents", "load", null).toString().isEmpty())
+        command("changeMasterPassword", JSONObject().put("password", "synthetic-master"))
+      }
       when (status.getJSONObject("vault").getString("phase")) {
         "uninitialized" -> command("createVault", JSONObject().put("password", "synthetic-master"))
         "locked" -> command("unlock", JSONObject().put("password", "synthetic-master"))
@@ -86,6 +93,47 @@ class DocumentRuntimeServiceTest {
         // The runner kills the process before opening the next phase.
       }
     } finally { context.unbindService(client.first) }
+  }
+
+  @Test fun biometricPolicyIsScopedAndDoesNotExposeTheUnlockSecret() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val store = VaultSecretStore(context)
+    val disabled = store.execute("documents", "setBiometricEnabled", "false") as Map<*, *>
+    assertEquals(false, disabled["enabled"])
+    val status = store.biometricStatus("documents")
+    assertEquals(false, status["enabled"])
+    assertEquals(false, store.biometricStatus("other-profile")["enabled"])
+    assumeTrue("Synthetic secure-store test requires an unlocked device", store.isDeviceUnlocked())
+    store.execute("documents", "save", "synthetic-biometric-secret")
+    store.execute("documents", "remove", null)
+    assertNull(store.execute("documents", "load", null))
+    assertEquals(false, store.biometricStatus("documents")["enabled"])
+    if (status["available"] == true) {
+      val enabled = store.execute("documents", "setBiometricEnabled", "true") as Map<*, *>
+      assertEquals(true, enabled["enabled"])
+      assertEquals(false, enabled.containsKey("secret"))
+      store.execute("documents", "setBiometricEnabled", "false")
+    }
+  }
+
+  @Test fun rememberedSecretSurvivesRebootPhase() {
+    val phase = InstrumentationRegistry.getArguments().getString("vaultRebootPhase") ?: return
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val store = VaultSecretStore(context)
+    assumeTrue("Keystore reboot test requires an unlocked device", store.isDeviceUnlocked())
+    when (phase) {
+      "seed" -> {
+        store.execute("reboot-fixture", "remove", null)
+        store.execute("reboot-fixture", "save", "synthetic-reboot-secret")
+        assertEquals("synthetic-reboot-secret", store.execute("reboot-fixture", "load", null))
+      }
+      "load" -> try {
+        assertEquals("synthetic-reboot-secret", store.execute("reboot-fixture", "load", null))
+      } finally {
+        store.execute("reboot-fixture", "remove", null)
+      }
+      else -> fail("Unknown Keystore reboot phase: $phase")
+    }
   }
 
   @Test fun vaultReopensAfterProcessRestart() {

@@ -1,5 +1,6 @@
 package dev.syncpeer.plugin.android
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
 import android.os.UserManager
@@ -15,6 +16,7 @@ import javax.crypto.spec.GCMParameterSpec
 
 /** Platform wrapping only. Folder encryption and manual-lock policy remain in core. */
 class VaultSecretStore(private val context: Context) {
+  private val policy = context.getSharedPreferences("syncpeer-vault-policy", Context.MODE_PRIVATE)
   fun isDeviceUnlocked(): Boolean = Build.VERSION.SDK_INT >= 24 &&
     (context.getSystemService(Context.USER_SERVICE) as UserManager).isUserUnlocked
 
@@ -22,6 +24,13 @@ class VaultSecretStore(private val context: Context) {
   fun execute(profileId: String, operation: String, secret: String?): Any? {
     require(profileId.matches(Regex("[A-Za-z0-9_-]{1,128}"))) { "Invalid vault profile" }
     if (operation == "isDeviceUnlocked") return isDeviceUnlocked()
+    if (operation == "biometricStatus") return biometricStatus(profileId)
+    if (operation == "setBiometricEnabled") {
+      val enabled = secret?.toBooleanStrictOrNull() ?: throw IllegalArgumentException("Invalid biometric setting")
+      if (enabled) check(biometricAvailable()) { "Biometric unlock is unavailable" }
+      check(policy.edit().putBoolean(policyKey(profileId), enabled).commit()) { "Biometric setting could not be saved" }
+      return biometricStatus(profileId)
+    }
     check(isDeviceUnlocked()) { "Device credentials are unavailable before first unlock" }
     val alias = "syncpeer.vault.$profileId"
     val file = AtomicFile(File(context.noBackupFilesDir, "$alias.secret"))
@@ -60,11 +69,37 @@ class VaultSecretStore(private val context: Context) {
           try { String(plaintext, Charsets.UTF_8) } finally { plaintext.fill(0) }
         }
       }
-      "remove" -> { file.delete(); if (keys.containsAlias(alias)) keys.deleteEntry(alias); null }
+      "remove" -> {
+        file.delete()
+        if (keys.containsAlias(alias)) keys.deleteEntry(alias)
+        check(policy.edit().remove(policyKey(profileId)).commit()) { "Biometric setting could not be removed" }
+        null
+      }
       else -> throw IllegalArgumentException("Unknown credential operation")
     }
   }
 
+  fun biometricStatus(profileId: String): Map<String, Any> = mapOf(
+    "available" to biometricAvailable(),
+    "enabled" to policy.getBoolean(policyKey(profileId), false),
+  )
+
+  private fun policyKey(profileId: String) = "biometric.$profileId"
+
+  private fun biometricAvailable(): Boolean {
+    if (Build.VERSION.SDK_INT < 28) return false
+    if (Build.VERSION.SDK_INT < 29) return context.packageManager.hasSystemFeature("android.hardware.fingerprint")
+    val manager = context.getSystemService(Context.BIOMETRIC_SERVICE) as? android.hardware.biometrics.BiometricManager
+      ?: return false
+    if (Build.VERSION.SDK_INT < 30) {
+      @Suppress("DEPRECATION")
+      return manager.canAuthenticate() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
+    }
+    return manager.canAuthenticate(android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG) ==
+      android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
+  }
+
+  @SuppressLint("NewApi")
   private fun generateKey(alias: String): SecretKey {
     check(Build.VERSION.SDK_INT >= 23) { "Android Keystore is unavailable" }
     val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")

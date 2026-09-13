@@ -37,6 +37,7 @@ const targetLargeFileSize = Number(
   process.env.SYNCPEER_E2E_LARGE_FILE_SIZE || 30 * 1024 * 1024,
 );
 const targetLargeFileSha256 = process.env.SYNCPEER_E2E_LARGE_FILE_SHA256?.trim() || "";
+const rebootForDocumentRuntimeCheck = process.env.SYNCPEER_ANDROID_REBOOT_CHECK === "1";
 
 const runAdb = (args, timeout = 30_000) => {
   try {
@@ -62,6 +63,33 @@ const androidSdkVersion = () => Number(
 const wait = (milliseconds) => new Promise((resolve) => {
   setTimeout(resolve, milliseconds);
 });
+
+const waitForAndroidBoot = async () => {
+  runAdb(["wait-for-device"], 60_000);
+  const deadline = Date.now() + 120_000;
+  let state = "unknown";
+  while (Date.now() < deadline) {
+    try {
+      state = runAdb(["shell", "getprop", "sys.boot_completed"], 10_000).trim();
+      if (state === "1") return;
+    } catch {
+      // A reboot can briefly report an offline device while adbd restarts.
+    }
+    await wait(1_000);
+  }
+  throw new Error(`Android did not finish booting after reboot (sys.boot_completed=${state}).`);
+};
+
+const runDocumentInstrumentation = (method, argument, value) => {
+  runAdb(["shell", "am", "force-stop", "dev.syncpeer.plugin.android.test"]);
+  const result = runAdb(["shell", "am", "instrument", "-w", "-r", "-e", "class",
+    `dev.syncpeer.plugin.android.DocumentRuntimeServiceTest#${method}`,
+    "-e", argument, value,
+    "dev.syncpeer.plugin.android.test/androidx.test.runner.AndroidJUnitRunner"], 60_000);
+  if (!result.includes("OK (1 test)")) {
+    throw new Error(`Android instrumentation check failed (${method}:${value}).`);
+  }
+};
 
 const assertForeground = async () => {
   const deadline = Date.now() + 30_000;
@@ -1352,20 +1380,31 @@ const main = async () => {
     ":tauri-plugin-syncpeer-android:connectedDebugAndroidTest",
     "--no-daemon", "--console=plain",
   ], { stdio: "inherit", timeout: 240_000 });
-  if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1") {
+  if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1" || rebootForDocumentRuntimeCheck) {
     // Gradle removes its test package after the suite. Install a fresh synthetic
-    // fixture for the multi-process acceptance sequence, then remove it below.
+    // fixture for process/reboot acceptance sequences, then remove it below.
     const testApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/build/outputs/apk/androidTest/debug/tauri-plugin-syncpeer-android-debug-androidTest.apk";
     runAdb(["install", "-r", testApk], 60_000);
-    try { for (const phase of ["seed", "unlocked", "lock", "locked"]) {
-      runAdb(["shell", "am", "force-stop", "dev.syncpeer.plugin.android.test"]);
-      const result = runAdb(["shell", "am", "instrument", "-w", "-r", "-e", "class",
-        `dev.syncpeer.plugin.android.DocumentRuntimeServiceTest#${phase === "seed" ? "pickerUsesRegisteredEncryptedFilesAndKeystoreWithoutAnActivity" : "vaultReopensAfterProcessRestart"}`,
-        "-e", "documentsRestartPhase", phase,
-        "dev.syncpeer.plugin.android.test/androidx.test.runner.AndroidJUnitRunner"], 60_000);
-      if (!result.includes("OK (1 test)")) throw new Error(`Document runtime process-restart check failed (${phase}).`);
-    } } finally { runAdb(["uninstall", "dev.syncpeer.plugin.android.test"]); }
-    console.log("Android document vault process-restart and persistent-lock checks passed.");
+    try {
+      if (rebootForDocumentRuntimeCheck) {
+        runDocumentInstrumentation("rememberedSecretSurvivesRebootPhase", "vaultRebootPhase", "seed");
+        console.log("Rebooting Android to verify the device-protected unlock secret survives reboot.");
+        runAdb(["reboot"], 10_000);
+        await waitForAndroidBoot();
+        runDocumentInstrumentation("rememberedSecretSurvivesRebootPhase", "vaultRebootPhase", "load");
+        console.log("Android Keystore-backed unlock secret survived a real reboot.");
+      }
+      if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1") {
+        for (const phase of ["seed", "unlocked", "lock", "locked"]) {
+          runDocumentInstrumentation(
+            phase === "seed" ? "pickerUsesRegisteredEncryptedFilesAndKeystoreWithoutAnActivity" : "vaultReopensAfterProcessRestart",
+            "documentsRestartPhase",
+            phase,
+          );
+        }
+        console.log("Android document vault process-restart and persistent-lock checks passed.");
+      }
+    } finally { runAdb(["uninstall", "dev.syncpeer.plugin.android.test"]); }
   }
   await runAndroidDocumentsProviderChecks();
 

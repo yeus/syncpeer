@@ -193,6 +193,13 @@ struct AndroidTransferServiceRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AndroidBiometricRequest {
+    profile_id: String,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AndroidTransferNotificationRequest {
     title: String,
     body: String,
@@ -3460,6 +3467,64 @@ async fn syncpeer_android_start_transfer_service(
 }
 
 #[tauri::command]
+async fn syncpeer_android_biometric_status(
+    app: tauri::AppHandle,
+    request: AndroidBiometricRequest,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .biometric_status(&request.profile_id)
+            .map_err(|_| "Biometric status is unavailable.".to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Biometric unlock is Android-only.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_biometric_set_enabled(
+    app: tauri::AppHandle,
+    request: AndroidBiometricRequest,
+) -> Result<serde_json::Value, String> {
+    let enabled = request.enabled.ok_or_else(|| "Biometric setting is required.".to_string())?;
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .biometric_set_enabled(&request.profile_id, enabled)
+            .map_err(|_| "Biometric setting could not be saved.".to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, enabled);
+        Err("Biometric unlock is Android-only.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_biometric_authenticate(
+    app: tauri::AppHandle,
+    request: AndroidBiometricRequest,
+) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .biometric_authenticate(&request.profile_id)
+            .map_err(|_| "Biometric authentication was not completed.".to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Biometric unlock is Android-only.".to_string())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_stop_transfer_service(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
@@ -4180,6 +4245,9 @@ pub fn run() {
             syncpeer_cache_suspend,
             syncpeer_android_open_with_chooser,
             syncpeer_android_start_transfer_service,
+            syncpeer_android_biometric_status,
+            syncpeer_android_biometric_set_enabled,
+            syncpeer_android_biometric_authenticate,
             syncpeer_android_stop_transfer_service,
             syncpeer_android_update_transfer_notification,
             syncpeer_android_write_saf_file,

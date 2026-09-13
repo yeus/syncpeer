@@ -30,6 +30,16 @@ impl<R: Runtime> SyncpeerAndroid<R> {
   pub fn vault_secret(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("vaultSecret", request).map_err(Into::into)
   }
+  pub fn biometric_status(&self, profile_id: &str) -> crate::Result<serde_json::Value> {
+    self.0.run_mobile_plugin("biometricStatus", json!({"profileId": profile_id})).map_err(Into::into)
+  }
+  pub fn biometric_set_enabled(&self, profile_id: &str, enabled: bool) -> crate::Result<serde_json::Value> {
+    self.0.run_mobile_plugin("biometricSetEnabled", json!({"profileId": profile_id, "enabled": enabled})).map_err(Into::into)
+  }
+  pub fn biometric_authenticate(&self, profile_id: &str) -> crate::Result<bool> {
+    let value: serde_json::Value = self.0.run_mobile_plugin("biometricAuthenticate", json!({"profileId": profile_id})).map_err(Into::into)?;
+    Ok(value.get("authenticated").and_then(serde_json::Value::as_bool).unwrap_or(false))
+  }
   pub fn start_transfer_service(&self, label: &str) -> crate::Result<()> {
     self
       .0

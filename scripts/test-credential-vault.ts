@@ -56,6 +56,52 @@ test("new folders receive independent random passwords when no default or remote
   await vault.close();
 });
 
+test("rotates the local master password and allows an authorized remembered unlock", async () => {
+  let record: unknown = null;
+  let remembered: string | null = null;
+  const options = { profileId: "rotation-profile", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async value => { record = structuredClone(value); },
+      withLock: async operation => operation() },
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => remembered,
+      save: async value => { remembered = value; }, remove: async () => { remembered = null; } }, revokeAccess: async () => {} };
+  const vault = createCredentialVault(options);
+  await vault.createDeviceProtected();
+  await vault.changeMasterPassword("synthetic-user-master");
+  assert.equal(remembered, "synthetic-user-master");
+  await vault.lock();
+  await vault.unlockRemembered();
+  await vault.lock();
+  await assert.rejects(vault.unlock("wrong-password"));
+  await vault.unlock("synthetic-user-master");
+  await vault.close();
+});
+
+test("failed master-password rotation restores the old encrypted record and remembered secret", async () => {
+  let record: unknown = null;
+  let remembered: string | null = null;
+  let failNextSave = false;
+  const vault = createCredentialVault({ profileId: "rotation-rollback", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async value => {
+      if (failNextSave) { failNextSave = false; throw new Error("synthetic storage failure"); }
+      record = structuredClone(value);
+    }, withLock: async operation => operation() },
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => remembered,
+      save: async value => { remembered = value; }, remove: async () => { remembered = null; } },
+    revokeAccess: async () => {},
+  });
+  await vault.create("synthetic-old-master");
+  assert.equal(remembered, "synthetic-old-master");
+  failNextSave = true;
+  await assert.rejects(vault.changeMasterPassword("synthetic-new-master"), /storage failure/);
+  assert.equal(remembered, "synthetic-old-master");
+  await vault.lock();
+  await vault.unlockRemembered();
+  await vault.lock();
+  await assert.rejects(vault.unlock("synthetic-new-master"));
+  await vault.unlock("synthetic-old-master");
+  await vault.close();
+});
+
 test("vault corruption errors never expose decrypted credential contents", async () => {
   const crypto = await deriveUntrustedFolderCrypto("syncpeer-vault:synthetic-profile", "synthetic-master");
   let ciphertext = new Uint8Array();

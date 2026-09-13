@@ -168,6 +168,8 @@ export function createDocumentFilesystem(options: {
     }),
     createVault: (password: string) => run(async () => { await vault.create(password); await openRegistrations(); return status(); }),
     unlock: (password: string) => run(async () => { await vault.unlock(password); await openRegistrations(); return status(); }),
+    unlockRemembered: () => run(async () => { await vault.unlockRemembered(); await openRegistrations(); return status(); }),
+    changeMasterPassword: (password: string) => run(async () => { await vault.changeMasterPassword(password); return status(); }),
     lock: () => run(async () => { await vault.lock(); return status(); }),
     register: (folder: { id: string; label: string; password?: string }) => run(async () => {
       if (!registry) throw new Error("Folder storage is unavailable.");
@@ -182,6 +184,28 @@ export function createDocumentFilesystem(options: {
     attachDownloads: (id: string) => run(async () => {
       if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
       await registry.attachDownloads(id);
+    }),
+    detachDownloads: (id: string) => run(async () => {
+      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
+      await registry.detachDownloads(id);
+      return status();
+    }),
+    clearFolderContents: (folderId: string) => run(async () => {
+      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
+      const folder = registry.getState().find(value => value.id === folderId);
+      if (!folder) throw new Error("Document folder is unavailable.");
+      const replica = registry.getReplica(folderId);
+      if (!replica) throw new Error("Document folder is not open.");
+      const files = (await replica.scan())
+        .filter(value => !value.deleted && !value.invalid && !isInternalReplicaPath(value.name))
+        .sort((left, right) => right.name.length - left.name.length);
+      for (const file of files) {
+        const current = (await replica.scan()).find(value => value.name === file.name && !value.deleted);
+        if (!current) continue;
+        await replica.edit!({ method: "delete", folderId, path: file.name,
+          modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
+      }
+      return status();
     }),
     cachedFiles: (folderId?: string) => run(async (): Promise<CachedFileRecord[]> => {
       if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");

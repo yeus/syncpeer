@@ -125,6 +125,13 @@ export function createFolderRegistry(dependencies: {
       await dependencies.save([...entries.values()].map(value => value === entry ? config : value.config));
       entry.config = config; notify();
     }),
+    detachDownloads: (id: string) => enqueue(async () => {
+      const entry = requireEntry(id);
+      if (!entry.config.downloads) return;
+      const config = { id: entry.config.id, label: entry.config.label, storageId: entry.config.storageId };
+      await dependencies.save([...entries.values()].map(value => value === entry ? config : value.config));
+      entry.config = config; notify();
+    }),
     getReplica: (id: string): LocalFolderReplica | undefined => requireEntry(id).opened?.replica,
     pause: (id: string) => enqueue(async () => {
       const opened = requireEntry(id).opened;

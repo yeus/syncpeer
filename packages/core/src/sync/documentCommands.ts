@@ -36,6 +36,8 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return documents.cachedStatuses(text("folderId"), command.paths);
     }
     case "attachDownloads": return documents.attachDownloads(text("id"));
+    case "detachDownloads": return documents.detachDownloads(text("id"));
+    case "clearFolderContents": return documents.clearFolderContents(text("folderId"));
     case "beginDownload": return documents.beginDownload(text("folderId"), text("path"), integer("size"), integer("modifiedMs"),
       command.expectedLocalHash === undefined || command.expectedLocalHash === null ? command.expectedLocalHash : text("expectedLocalHash"));
     case "finishDownload": return documents.finishDownload(integer("handle"));
@@ -50,6 +52,8 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     case "setSyncBaseline": return documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") });
     case "createVault": return documents.createVault(text("password"));
     case "unlock": return documents.unlock(text("password"));
+    case "unlockRemembered": return documents.unlockRemembered();
+    case "changeMasterPassword": return documents.changeMasterPassword(text("password"));
     case "lock": return documents.lock();
     case "register": return documents.register({ id: text("id"), label: text("label"),
       ...(command.password === undefined ? {} : { password: text("password") }) });

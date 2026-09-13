@@ -7,7 +7,7 @@ import { assertReplicaPath } from "./replicaPaths.js";
 import type { FolderInfo } from "../core/model/remoteFs.js";
 
 /** Route prepared folders to the service owner, never mirror two writable copies.
- * Migration is verified and retains original storage as a backup.
+ * Migration changes ownership only after bytes and cleanup have been verified.
  */
 export function createDocumentCache(options: {
   enabled: () => boolean;
@@ -34,6 +34,38 @@ export function createDocumentCache(options: {
     return () => { if (!released) { released = true; active.set(folderId, active.get(folderId)! - 1); } };
   };
   const request = options.request;
+  const legacyFiles = async (folderId: string) =>
+    (await options.legacy.listCachedFiles?.() ?? []).filter(file => file.folderId === folderId);
+  const removeLegacyFile = async (file: CachedFileRecord) => {
+    if (!options.legacy.removeCachedFile) {
+      throw new Error("The old local copy cannot be removed safely; migration was not completed.");
+    }
+    if (!await options.legacy.removeCachedFile(file.folderId, file.path)) {
+      throw new Error("The old local copy could not be removed; migration was not completed.");
+    }
+    if ((await legacyFiles(file.folderId)).some(value => value.folderId === file.folderId && value.path === file.path)) {
+      throw new Error("The old local copy is still present; migration was not completed.");
+    }
+  };
+  const readSourceBytes = async (id: string) => {
+    const file = await source(id);
+    try {
+      const bytes = new Uint8Array(file.size);
+      for (let offset = 0; offset < file.size; offset += 131072) {
+        const chunk = await file.readRange(offset, Math.min(131072, file.size - offset));
+        try { bytes.set(chunk, offset); } finally { chunk.fill(0); }
+      }
+      return bytes;
+    } finally { await file.close(); }
+  };
+  const digestReader = async (reader: { size: number; readRange: (offset: number, size: number) => Promise<Uint8Array> }) => {
+    const hash = sha256.create();
+    for (let offset = 0; offset < reader.size; offset += 131072) {
+      const chunk = await reader.readRange(offset, Math.min(131072, reader.size - offset));
+      try { hash.update(chunk); } finally { chunk.fill(0); }
+    }
+    return [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  };
   const source = async (id: string) => {
     const handle = await request<number>({ operation: "open", id, mode: "r" });
     return { size: await request<number>({ operation: "size", handle }),
@@ -197,7 +229,7 @@ export function createDocumentCache(options: {
       await request({ operation: "register", ...folder });
       if (registered?.downloads) return;
       registered = (await registrations()).find(value => value.id === folder.id)!;
-      const files = (await options.legacy.listCachedFiles?.() ?? []).filter(file => file.folderId === folder.id);
+      const files = await legacyFiles(folder.id);
       const existing = await request<CachedFileRecord[]>({ operation: "folderFiles", folderId: folder.id });
       for (const file of files) {
         assertReplicaPath(file.path);
@@ -230,11 +262,49 @@ export function createDocumentCache(options: {
               sizeBytes: original.size, modifiedMs: file.modifiedMs ?? file.cachedAtMs });
             await target.abort(new Error("Already imported"));
           } else await target.commit();
+          await removeLegacyFile(file);
         } catch (error) { await target.abort(error); throw error; }
         finally { await original.close(); }
       }
       await request({ operation: "attachDownloads", id: folder.id });
     } finally { migrating.delete(folder.id); }
+  };
+  const disconnectFolder = async (folderId: string) => {
+    if (!options.enabled()) throw new Error("Document storage is unavailable.");
+    if (migrating.has(folderId) || active.get(folderId)) throw new Error("Wait for this folder’s transfers to finish before moving it.");
+    const registered = (await registrations()).find(value => value.id === folderId && value.downloads);
+    if (!registered) throw new Error("Encrypted folder storage is not attached.");
+    if (!options.legacy.cacheFile || !options.legacy.listCachedFiles || !options.legacy.removeCachedFile) {
+      throw new Error("Plain local storage is unavailable; migration was not completed.");
+    }
+    migrating.add(folderId);
+    try {
+      const encrypted = await request<CachedFileRecord[]>({ operation: "folderFiles", folderId });
+      const staged: Array<{ file: CachedFileRecord; bytes: Uint8Array; hash: string }> = [];
+      try {
+        for (const file of encrypted) {
+          if (!file.localPath?.startsWith("syncpeer-document:")) throw new Error("Encrypted document path is unavailable.");
+          const bytes = await readSourceBytes(file.localPath.slice("syncpeer-document:".length));
+          try {
+            const hash = await digestReader({ size: bytes.length, readRange: async (offset, size) => bytes.slice(offset, offset + size) });
+            await options.legacy.cacheFile(folderId, file.path, file.name, bytes, file.modifiedMs ?? file.cachedAtMs);
+            staged.push({ file, bytes, hash });
+          } finally { bytes.fill(0); }
+        }
+        for (const stagedFile of staged) {
+          const copy = (await legacyFiles(folderId)).find(value => value.path === stagedFile.file.path);
+          if (!copy) throw new Error("Plain local copy was not created; migration was not completed.");
+          const original = await options.openLegacySource(copy);
+          try {
+            if (original.size !== stagedFile.file.sizeBytes || await digestReader(original) !== stagedFile.hash) {
+              throw new Error("Plain local copy failed verification; encrypted data was retained.");
+            }
+          } finally { await original.close(); }
+        }
+        await request({ operation: "clearFolderContents", folderId });
+        await request({ operation: "detachDownloads", id: folderId });
+      } finally { staged.forEach(value => value.bytes.fill(0)); }
+    } finally { migrating.delete(folderId); }
   };
   let folderQueue = Promise.resolve();
   const observed = new Map<string, string>();
@@ -258,5 +328,5 @@ export function createDocumentCache(options: {
     folderQueue = task.then(() => {}, () => {});
     return task;
   };
-  return { platformAdapter, connectFolder, syncFolders };
+  return { platformAdapter, connectFolder, disconnectFolder, syncFolders };
 }

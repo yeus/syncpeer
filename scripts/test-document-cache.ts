@@ -6,6 +6,7 @@ import { createDocumentCache } from "../packages/core/dist/sync/documentCache.js
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 import { createServer } from "vite";
 import { createInitialSessionState } from "../packages/core/dist/ui/sessionPolicies.js";
+import type { CachedFileRecord } from "../packages/core/src/ui/browserClient.ts";
 import type * as AppActions from "../packages/app/src/app/actions.ts";
 import type * as AppState from "../packages/app/src/app/state.ts";
 import type * as DeviceActions from "../packages/app/src/app/deviceActions.ts";
@@ -95,7 +96,7 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   await documents.close();
 });
 
-test("opt-in cache migration preserves originals and routes downloads and picker edits through one owner", async t => {
+test("cache migration verifies and removes plaintext originals", async t => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
     profile: await openStorage("profile"), randomBytes, rememberedSecret: {
@@ -104,12 +105,18 @@ test("opt-in cache migration preserves originals and routes downloads and picker
   await documents.initialize(); await documents.createVault("synthetic-master");
   const original = Uint8Array.of(1, 2, 3, 4);
   let legacyWrites = 0;
-  let failVerification = true;
+  let failVerification = true, failRemoval = false;
   const records = [{ key: "fixture-folder:sample.bin", folderId: "fixture-folder", path: "sample.bin", name: "sample.bin",
     localPath: "/synthetic/sample.bin", sizeBytes: 4, cachedAtMs: 10, modifiedMs: 10 }];
   const cache = createDocumentCache({ enabled: () => true,
     request: async <T>(request: Record<string, unknown>) => await dispatchDocumentCommand(documents, request) as T,
     legacy: { listCachedFiles: async () => records, cacheFile: async () => { legacyWrites++; },
+      removeCachedFile: async (folderId, path) => {
+        if (failRemoval) return false;
+        const index = records.findIndex(value => value.folderId === folderId && value.path === path);
+        if (index < 0) return false;
+        records.splice(index, 1); return true;
+      },
       getCachedStatuses: async () => [{ path: "sample.bin", available: true, localPath: records[0].localPath }] },
     openLegacySource: async () => ({ size: 4, readRange: async (offset, size) => original.slice(offset, offset + size),
       verify: async () => { if (failVerification) throw new Error("Source changed during migration"); }, close: async () => {} }),
@@ -120,13 +127,26 @@ test("opt-in cache migration preserves originals and routes downloads and picker
   assert.equal((await documents.status()).folders[0].downloads, undefined, "Failed verification must not switch owners");
   failVerification = false;
   await cache.connectFolder({ id: "fixture-folder", label: "Fixture", password: "synthetic-folder-password" });
-  assert.equal(records.length, 1, "Migration never deletes originals");
+  assert.equal(records.length, 0, "Verified migration removes the old plaintext copy");
   assert.equal(legacyWrites, 0);
   let [cached] = await cache.platformAdapter.listCachedFiles!();
   const baseline = cached.syncBaseline;
   assert.ok(baseline?.hash, "Downloads retain an encrypted sync baseline across app restarts");
   assert.ok(cached.localPath?.startsWith("syncpeer-document:"));
   assert.deepEqual(await cache.platformAdapter.readBinaryFile!(cached.localPath!), original);
+  await documents.detachDownloads("fixture-folder");
+  records.push({ key: "fixture-folder:retry.bin", folderId: "fixture-folder", path: "retry.bin", name: "retry.bin",
+    localPath: "/synthetic/retry.bin", sizeBytes: 4, cachedAtMs: 11, modifiedMs: 11 });
+  failRemoval = true;
+  await assert.rejects(cache.connectFolder({ id: "fixture-folder", label: "Fixture", password: "synthetic-folder-password" }), /could not be removed/i);
+  assert.equal(records.length, 1, "A failed plaintext deletion keeps the old copy for retry");
+  assert.equal((await documents.status()).folders[0].downloads, undefined, "Failed cleanup must not attach encrypted downloads");
+  assert.equal((await documents.cachedFiles("fixture-folder")).some(file => file.path === "retry.bin"), true,
+    "Encrypted data remains available when cleanup fails");
+  failRemoval = false;
+  await cache.connectFolder({ id: "fixture-folder", label: "Fixture", password: "synthetic-folder-password" });
+  assert.equal(records.length, 0, "A retry removes the verified plaintext copy");
+  cached = (await cache.platformAdapter.listCachedFiles!()).find(file => file.path === "sample.bin")!;
   const picker = await documents.open(cached.localPath!.slice("syncpeer-document:".length), "rw");
   await documents.write(picker, 0, Uint8Array.of(9)); await documents.release(picker);
   assert.deepEqual((await cache.platformAdapter.listCachedFiles!())[0].syncBaseline, baseline, "Picker edits must not change the last remote baseline");
@@ -203,5 +223,52 @@ test("opt-in cache migration preserves originals and routes downloads and picker
   await documents.lock();
   await assert.rejects(cache.platformAdapter.cacheFile!("fixture-folder", "blocked.bin", "blocked.bin", original), /locked/i);
   assert.equal(legacyWrites, 0, "A locked vault must not silently fall back to plaintext");
+  await documents.close();
+});
+
+test("encrypted folders can be migrated back to verified plaintext storage", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const documents = createDocumentFilesystem({ profileId: "reverse-fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => secret, save: async value => { secret = value; }, remove: async () => { secret = null; },
+    } });
+  await documents.initialize(true);
+  const records: Array<CachedFileRecord> = [], localBytes = new Map<string, Uint8Array>();
+  let corruptPlaintext = false;
+  const legacy = {
+    listCachedFiles: async () => records,
+    cacheFile: async (folderId: string, path: string, name: string, bytes: Uint8Array) => {
+      const existing = records.find(value => value.folderId === folderId && value.path === path);
+      const value = { key: `${folderId}:${path}`, folderId, path, name, localPath: `/synthetic/${path}`,
+        sizeBytes: bytes.length, cachedAtMs: Date.now() };
+      localBytes.set(value.localPath, bytes.slice());
+      if (corruptPlaintext) localBytes.get(value.localPath)![0] ^= 1;
+      if (existing) Object.assign(existing, value); else records.push(value);
+    },
+    removeCachedFile: async () => false,
+  };
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => await dispatchDocumentCommand(documents, input) as T,
+    legacy,
+    openLegacySource: async file => ({ size: file.sizeBytes,
+      readRange: async (offset, size) => localBytes.get(file.localPath!)!.slice(offset, offset + size),
+      verify: async () => {}, close: async () => {} }),
+    show: async () => {},
+  });
+  await cache.connectFolder({ id: "reverse", label: "Reverse", password: "synthetic-password" });
+  await cache.platformAdapter.cacheFile!("reverse", "sample.bin", "sample.bin", Uint8Array.of(1, 2, 3));
+  const before = await cache.platformAdapter.listCachedFiles!();
+  assert.equal(before.length, 1);
+  corruptPlaintext = true;
+  await assert.rejects(cache.disconnectFolder("reverse"), /verification/i);
+  assert.equal((await documents.status()).folders[0].downloads, true, "Failed reverse verification keeps encrypted ownership");
+  assert.equal((await documents.cachedFiles("reverse")).length, 1, "Failed reverse verification retains encrypted data");
+  corruptPlaintext = false;
+  await cache.disconnectFolder("reverse");
+  assert.equal((await cache.platformAdapter.listCachedFiles!()).length, 1, "Plain migration retains the verified local file");
+  assert.equal((await documents.status()).folders[0].downloads, undefined, "Encrypted ownership is detached only after verification");
   await documents.close();
 });

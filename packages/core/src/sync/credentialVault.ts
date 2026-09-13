@@ -94,7 +94,7 @@ export function createCredentialVault(options: {
       readRange: async (offset, size) => ciphertext.slice(offset, offset + size) }, secret, ".syncpeer-vault");
     try { return decodeData(bytes); } finally { bytes.fill(0); }
   };
-  const save = async (data: VaultData, secret: Uint8Array, record: Pick<CredentialVaultRecord, "manualLocked" | "remember">) => {
+  const encrypt = async (data: VaultData, secret: Uint8Array, record: Pick<CredentialVaultRecord, "manualLocked" | "remember">) => {
     const bytes = new TextEncoder().encode(JSON.stringify(data));
     let ciphertext = new Uint8Array();
     try {
@@ -107,9 +107,13 @@ export function createCredentialVault(options: {
             abort: async () => { ciphertext.fill(0); } };
         } });
       const result: CredentialVaultRecord = { format: 1, ...record, ciphertext: Array.from(ciphertext) };
-      await options.storage.save(result);
       return result;
     } finally { bytes.fill(0); }
+  };
+  const save = async (data: VaultData, secret: Uint8Array, record: Pick<CredentialVaultRecord, "manualLocked" | "remember">) => {
+    const result = await encrypt(data, secret, record);
+    await options.storage.save(result);
+    return result;
   };
   const unlock = async (masterPassword: string, record: CredentialVaultRecord) => {
     const derived = await deriveUntrustedFolderCrypto(vaultId, password(masterPassword));
@@ -129,11 +133,16 @@ export function createCredentialVault(options: {
   };
   const rememberSecret = async (masterPassword: string, record: CredentialVaultRecord) => {
     if (!options.rememberedSecret) return;
+    let saved = false;
     try {
       await options.rememberedSecret.save(masterPassword);
+      saved = true;
       await options.storage.save({ ...record, remember: true });
       remembered = true;
-    } catch { issue = "Unlock secret could not be remembered; manual unlock remains available."; }
+    } catch {
+      if (saved) await options.rememberedSecret.remove().catch(() => {});
+      issue = "Unlock secret could not be remembered; manual unlock remains available.";
+    }
   };
   const update = (transform: (data: VaultData) => VaultData | Promise<VaultData>) => run(async () => {
     const { record, data } = await unlocked();
@@ -191,6 +200,41 @@ export function createCredentialVault(options: {
       await unlock(masterPassword, record);
       await rememberSecret(masterPassword, { ...record, manualLocked: false });
       return status();
+    }),
+    unlockRemembered: () => run(async () => {
+      const record = decodeRecord(await options.storage.load());
+      const masterPassword = await options.rememberedSecret?.load();
+      if (!record || !masterPassword) throw new Error("A remembered unlock secret is unavailable.");
+      await unlock(masterPassword, record);
+      return status();
+    }),
+    changeMasterPassword: (newPassword: string) => run(async () => {
+      const { record, data } = await unlocked();
+      const nextPassword = password(newPassword);
+      const oldKey = key!;
+      const oldRemembered = await options.rememberedSecret?.load();
+      const derived = await deriveUntrustedFolderCrypto(vaultId, nextPassword);
+      try {
+        const nextRecord = await encrypt(data, derived.folderKey, { manualLocked: false, remember: record.remember });
+        if (record.remember && options.rememberedSecret) await options.rememberedSecret.save(nextPassword);
+        await options.storage.save(nextRecord);
+        oldKey.fill(0);
+        key = derived.folderKey;
+        initialized = true;
+        remembered = record.remember;
+        issue = undefined;
+        return status();
+      } catch (error) {
+        derived.folderKey.fill(0);
+        try {
+          if (record.remember && options.rememberedSecret) {
+            if (oldRemembered === null || oldRemembered === undefined) await options.rememberedSecret.remove();
+            else await options.rememberedSecret.save(oldRemembered);
+          }
+          await options.storage.save(record);
+        } catch { issue = "Master password rotation needs recovery; the previous unlock may be required."; }
+        throw error;
+      }
     }),
     lock: () => run(async () => {
       try {

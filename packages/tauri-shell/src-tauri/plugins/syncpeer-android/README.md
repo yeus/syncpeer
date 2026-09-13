@@ -24,26 +24,38 @@ after a successful protected save. Changing an existing folder's encryption
 password is rejected until a migration can safely rewrite its contents.
 
 Downloads use the same storage owner as the DocumentsProvider. Existing private
-downloads are copied and verified before ownership switches; originals remain as
-backups. External-storage imports can require manual handling. Failed preparation
-never silently falls back to writing new Android downloads in plaintext.
+downloads are copied and verified before ownership switches; the old plaintext
+copy is removed only after verification. If cleanup or verification fails, the
+encrypted copy is not attached and the original remains available for retry.
+External-storage imports can require manual handling. Failed preparation never
+silently falls back to writing new Android downloads in plaintext.
+
+Folder storage can be moved back to the legacy plaintext cache explicitly. The
+copy is verified before encrypted contents are removed, so failed reverse
+migrations retain encrypted ownership and can be retried. The app exposes this
+as a per-folder operation rather than changing the default encrypted policy.
+
+The local master password can be changed while the vault is unlocked. Rotation
+rewrites the encrypted record and the remembered device-protected secret as one
+recoverable operation. Android biometric unlock is an optional app gate: it
+authenticates before the remembered secret is used, but it never stores or
+returns the folder password itself.
 
 The Folders view links to a separate settings/new-folder page with normal URL and
 Back navigation. Creating a local folder does not automatically share it remotely.
 
-### Remaining work and verification
+### Verification and limits
 
-- Reversible per-folder encryption changes, including restart-safe migration,
-  password rotation, and verified removal of original plaintext copies.
-- Optional user-selected master-password/recovery and biometric app-lock controls,
-  kept distinct from revoking file-provider access.
-- Android device tests covering reboot, secure-store failures, file-picker URI
-  grants, and upgrade from existing downloads. Core restart tests use synthetic
-  storage and do not prove hardware Keystore behavior.
-- Equivalent encrypted-folder integration on non-Android platforms; their current
-  cache behavior is unchanged.
+Core tests cover password rotation, interrupted migrations, verified plaintext
+deletion, reverse migration, and restart-safe encrypted storage. Android
+instrumentation tests cover the native secure-store policy, Keystore-backed
+remembered secret, file-picker access without an Activity, and process restarts.
+Set `SYNCPEER_ANDROID_REBOOT_CHECK=1` when running the Android E2E harness with
+an unlocked emulator/device to add a real reboot between those phases; this is
+optional because it needs an attached ADB device and cannot run in ordinary CI.
 
-Until migration cleanup exists, do not claim that all pre-existing local copies
-are encrypted. App-data deletion or loss of the Keystore key can also destroy
-access; there is no recovery/export workflow for automatically generated secrets
-in this change.
+The remembered secret is protected by Android Keystore and private no-backup
+storage. Deleting app data or losing the Keystore key can still destroy access;
+there is no export/recovery workflow for an automatically generated secret until
+the user sets a master password. Equivalent encrypted-folder integration on
+non-Android platforms remains unchanged.

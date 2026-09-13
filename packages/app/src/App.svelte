@@ -1,6 +1,7 @@
 <svelte:options runes={true} />
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
@@ -78,7 +79,7 @@
   let systemPrefersDark = $state(false);
   let contentElement = $state<HTMLElement | null>(null);
 
-  const { hostAdapter, platformAdapter, connectDocumentFolder, syncDocumentFolders, folderCredentials } = createTauriAdapters({
+  const { hostAdapter, platformAdapter, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
@@ -137,6 +138,27 @@
     const knownFolders = Object.values(app.offline.snapshots).flatMap(snapshot => snapshot.folders)
       .map(folder => ({ ...folder, needsPassword: true }));
     app.localFolders = (await syncDocumentFolders(knownFolders, {})).map(folder => ({ ...folder, readOnly: false }));
+    app.localFolders = (await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)))
+      .map(folder => ({ ...folder, readOnly: false }));
+  }
+
+  async function unlockWithBiometric() {
+    if (!biometric) throw new Error("Biometric unlock is unavailable.");
+    if (!await biometric.authenticate()) throw new Error("Biometric authentication was not completed.");
+    await invoke("syncpeer_document_command", { request: { operation: "unlockRemembered" } });
+    await loadFolderCredentials();
+  }
+
+  async function rotateMasterPassword(password: string) {
+    await invoke("syncpeer_document_command", { request: { operation: "changeMasterPassword", password } });
+    await loadFolderCredentials();
+  }
+
+  async function migrateDocumentFolder(folderId: string, target: "encrypted" | "plaintext") {
+    if (target === "encrypted") {
+      const folder = app.session.folders.find(value => value.id === folderId) ?? app.localFolders.find(value => value.id === folderId);
+      await connectDocumentFolder({ id: folderId, label: folder?.label ?? folderId, password: activeFolderPasswords(app)[folderId] });
+    } else await disconnectDocumentFolder(folderId);
     app.localFolders = (await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)))
       .map(folder => ({ ...folder, readOnly: false }));
   }
@@ -264,7 +286,9 @@
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
     void (async () => {
-      await loadFolderCredentials();
+      if (biometric && (await biometric.status()).enabled) {
+        await unlockWithBiometric();
+      } else await loadFolderCredentials();
       await Promise.all([
         actions.hydrate(),
         actions.refreshCurrentDeviceId(),
@@ -631,7 +655,8 @@
     onRunAll={diagnosticsActions.runAllDiagnostics}
   />
 {:else if app.currentPage === "folder-settings"}
-  <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onCreate={async label => {
+  <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
+    onRotateMasterPassword={rotateMasterPassword} onMigrate={migrateDocumentFolder} biometric={biometric} onCreate={async label => {
     await connectDocumentFolder({ id: crypto.randomUUID(), label });
     app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false }));
   }} />

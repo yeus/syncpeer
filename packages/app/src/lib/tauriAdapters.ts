@@ -607,12 +607,18 @@ export const createTauriAdapters = (
     show: async id => { await invokeWithLogging("syncpeer_document_command", { request: { operation: "show", id } }); },
   });
   return { hostAdapter, platformAdapter: documents.platformAdapter, connectDocumentFolder: documents.connectFolder,
+    disconnectDocumentFolder: documents.disconnectFolder,
     syncDocumentFolders: documents.syncFolders,
     folderCredentials: detectRuntimePlatform() === "android" ? {
       load: async () => (await invokeWithLogging<{ result: Record<string, string> }>("syncpeer_document_command",
         { request: { operation: "connectionPasswords" } })).result,
       save: async (passwords: Record<string, string>) => { await invokeWithLogging("syncpeer_document_command",
         { request: { operation: "saveConnectionPasswords", passwords } }); },
+    } : undefined,
+    biometric: detectRuntimePlatform() === "android" ? {
+      status: async () => invokeWithLogging<{ available: boolean; enabled: boolean }>("syncpeer_android_biometric_status", { request: { profileId: "documents" } }),
+      setEnabled: async (enabled: boolean) => invokeWithLogging<{ available: boolean; enabled: boolean }>("syncpeer_android_biometric_set_enabled", { request: { profileId: "documents", enabled } }),
+      authenticate: async () => invokeWithLogging<boolean>("syncpeer_android_biometric_authenticate", { request: { profileId: "documents" } }),
     } : undefined };
 };
 

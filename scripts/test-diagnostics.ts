@@ -86,7 +86,7 @@ const main = async (): Promise<void> => {
     {
       name: "Durable folder replica indexes",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-replica-index.ts"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-replica-index.ts", "scripts/test-sqlite-metadata.ts"],
     },
     {
       name: "Folder replica pause and status controls",
@@ -116,7 +116,7 @@ const main = async (): Promise<void> => {
     {
       name: "Native selected-folder storage",
       command: "cargo",
-      args: ["test", "--lib", "--manifest-path", "packages/tauri-shell/src-tauri/Cargo.toml", "replica_storage"],
+      args: ["test", "--lib", "--manifest-path", "packages/tauri-shell/src-tauri/Cargo.toml"],
     },
     {
       name: "Android document replacement unit tests",

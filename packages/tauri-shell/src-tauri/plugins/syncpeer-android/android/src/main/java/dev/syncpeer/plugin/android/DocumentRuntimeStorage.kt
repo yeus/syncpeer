@@ -9,7 +9,7 @@ import java.security.SecureRandom
 
 /** Application-private roots, random bytes, and Keystore wrapping; no file crypto. */
 class DocumentRuntimeStorage(private val context: Context) : AutoCloseable {
-  private val bytes = DocumentByteStorage()
+  private val bytes = DocumentByteStorage(File(context.noBackupFilesDir, "metadata").absolutePath)
   private val secrets = VaultSecretStore(context)
   private val random = SecureRandom()
 

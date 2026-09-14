@@ -4,10 +4,12 @@ import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 
 /** Byte-storage command contract; no keys or plaintext metadata cross this boundary. */
 export type NativeFilesystemRequest =
-  | { operation: "register"; rootPath: string }
+  | { operation: "register"; rootPath: string; metadataPrefixes: string[] }
   | { operation: "release"; rootId: number }
+  | { operation: "backupMetadata"; rootId: number }
   | { operation: "initializeReplica" | "checkHealth" | "acquire" | "unlock"; rootId: number }
   | { operation: "list"; rootId: number; path: string }
+  | { operation: "stat"; rootId: number; path: string }
   | { operation: "read"; rootId: number; path: string; offset: number; size: number }
   | { operation: "begin"; rootId: number; path: string; size: number }
   | { operation: "write"; writerId: number; offset: number; bytes: number[] }
@@ -41,7 +43,12 @@ export async function createNativeFilesystem(
   request: (request: NativeFilesystemRequest) => Promise<unknown>,
   rootPath: string,
 ) {
-  const rootId = handle(await request({ operation: "register", rootPath }));
+  // Core declares private metadata; native storage packs the opaque bytes into SQLite.
+  // File content, scratch data, and archived versions continue to use file storage.
+  const rootId = handle(await request({ operation: "register", rootPath, metadataPrefixes: [
+    ".syncpeer-vault-record", ".syncpeer-document-folders", ".syncpeer-replica-index",
+    ".syncpeer-ciphertext-index", ".syncpeer-baseline-", ".syncpeer-directory-catalog", ".syncpeer-cache-access",
+  ] }));
   const active = new Set<Promise<unknown>>();
   let closing = false;
   let closeTask: Promise<void> | undefined;
@@ -76,6 +83,11 @@ export async function createNativeFilesystem(
   };
   return {
     close,
+    backupMetadata: async () => {
+      const filename = await run({ operation: "backupMetadata", rootId });
+      if (typeof filename !== "string" || !filename) throw new Error("Invalid metadata backup response.");
+      return filename;
+    },
     listDirectory: async (path: string) => {
       if (path) assertReplicaPath(path);
       return listDirectory(path);
@@ -94,17 +106,11 @@ export async function createNativeFilesystem(
     },
     stat: async (path: string) => {
       assertReplicaPath(path);
-      let parent = "";
-      const segments = path.split("/");
-      for (let index = 0; index < segments.length; index++) {
-        const current = parent ? `${parent}/${segments[index]}` : segments[index];
-        const entry = (await listDirectory(parent)).find(entry => entry.path === current);
-        if (!entry) return null;
-        if (index === segments.length - 1) return entry;
-        if (entry.type !== "directory") return null;
-        parent = current;
-      }
-      return null;
+      const raw = await run({ operation: "stat", rootId, path });
+      if (raw === null) return null;
+      const entry = nativeEntry(raw, path.slice(0, Math.max(0, path.lastIndexOf("/"))));
+      if (entry.path !== path) throw new Error("Native stat returned a different path.");
+      return entry;
     },
     listEntries: async (): Promise<ReplicaEntry[]> => {
       const directories = [""];

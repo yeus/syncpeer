@@ -10,10 +10,22 @@ use jni::{
 pub extern "system" fn Java_dev_syncpeer_plugin_android_DocumentByteStorage_initialize(
     mut env: JNIEnv,
     object: JObject,
+    metadata_path: JString,
 ) {
     // The private Java field is owned by this adapter, initialized once, and all
     // access is serialized by the Kotlin instance. jni stores a Mutex<T> in it.
-    if unsafe { env.set_rust_field(&object, "nativeHandle", ReplicaRoots::default()) }.is_err() {
+    let result = (|| -> Result<(), String> {
+        let path: String = env
+            .get_string(&metadata_path)
+            .map_err(|e| e.to_string())?
+            .into();
+        if !std::path::Path::new(&path).is_absolute() {
+            return Err("Invalid metadata directory".into());
+        }
+        unsafe { env.set_rust_field(&object, "nativeHandle", ReplicaRoots::new(path.into())) }
+            .map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
         let _ = env.throw_new(
             "java/lang/IllegalStateException",
             "Document storage unavailable",

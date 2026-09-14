@@ -1,9 +1,11 @@
+use crate::metadata_sqlite::MetadataDatabase;
 use cap_std::fs::{Dir, File, Metadata, OpenOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 
 #[derive(Default)]
 pub struct ReplicaRoots {
@@ -12,6 +14,9 @@ pub struct ReplicaRoots {
     guards: HashMap<u64, ReplicaRootGuard>,
     locks: HashMap<u64, std::fs::File>,
     writers: HashMap<u64, ReplicaWriter>,
+    metadata_root: PathBuf,
+    metadata: HashMap<u64, MetadataDatabase>,
+    metadata_prefixes: HashMap<u64, Vec<String>>,
 }
 
 impl Drop for ReplicaRoots {
@@ -41,8 +46,8 @@ fn file_identity(metadata: &Metadata) -> io::Result<String> {
 }
 
 fn marker_identity(root: &Dir) -> io::Result<Option<String>> {
-    match root.symlink_metadata(".syncpeer-folder-marker") {
-        Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {
+    match root.symlink_metadata(".stfolder") {
+        Ok(metadata) if (metadata.is_file() || metadata.is_dir()) && !metadata.is_symlink() => {
             Ok(Some(file_identity(&metadata)?))
         }
         Ok(_) => Err(invalid("Invalid replica folder marker")),
@@ -70,16 +75,17 @@ struct ReplicaWriter {
     file: Option<File>,
     size: u64,
     written: Vec<(u64, u64)>,
+    metadata: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaEntry {
-    name: String,
-    kind: &'static str,
-    size: u64,
-    modified_ms: u64,
-    revision: String,
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) size: u64,
+    pub(crate) modified_ms: u64,
+    pub(crate) revision: String,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -138,6 +144,118 @@ fn revision(metadata: &Metadata) -> String {
 }
 
 impl ReplicaRoots {
+    pub fn new(metadata_root: PathBuf) -> Self {
+        let mut roots = Self::default();
+        roots.metadata_root = metadata_root;
+        roots
+    }
+
+    fn is_metadata(&self, id: u64, path: &str) -> bool {
+        !path.contains('/')
+            && self
+                .metadata_prefixes
+                .get(&id)
+                .is_some_and(|prefixes| prefixes.iter().any(|prefix| path.starts_with(prefix)))
+    }
+
+    fn metadata_revision(&self, id: u64, path: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .metadata
+            .get(&id)
+            .ok_or_else(|| invalid("Metadata unavailable"))?
+            .entry(path)?
+            .map(|entry| entry.revision))
+    }
+
+    pub fn register_metadata(&mut self, path: &Path, prefixes: Vec<String>) -> io::Result<u64> {
+        if prefixes.iter().any(|prefix| {
+            prefix.is_empty()
+                || prefix.contains('/')
+                || prefix.contains('\\')
+                || prefix.contains('\0')
+        }) {
+            return Err(invalid("Invalid metadata prefix"));
+        }
+        let id = self.register(path)?;
+        self.metadata_prefixes.insert(id, prefixes);
+        let migration = self.migrate_metadata(id);
+        if migration.is_err() {
+            let _ = self.release(id);
+        }
+        migration?;
+        Ok(id)
+    }
+
+    fn migrate_metadata(&mut self, id: u64) -> io::Result<()> {
+        self.acquire(id)?;
+        let result = (|| {
+            let root = self.root(id)?;
+            let db = self
+                .metadata
+                .get(&id)
+                .ok_or_else(|| invalid("Metadata unavailable"))?;
+            if root.try_exists(".syncpeer-folder-lock")? {
+                return Err(invalid(
+                    "Legacy Node folder lock exists; stop older writers before migration",
+                ));
+            }
+            let legacy_lock = if root.try_exists(".syncpeer-replica.lock")? {
+                check_relative(root, ".syncpeer-replica.lock")?;
+                let file = root
+                    .open_with(
+                        ".syncpeer-replica.lock",
+                        OpenOptions::new().read(true).write(true),
+                    )?
+                    .into_std();
+                fs2::FileExt::try_lock_exclusive(&file)?;
+                Some(file)
+            } else {
+                None
+            };
+            for entry in root.entries()? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| invalid("Invalid metadata filename"))?;
+                if !self.is_metadata(id, &name) {
+                    continue;
+                }
+                check_relative(root, &name)?;
+                let info = entry.metadata()?;
+                if !info.is_file() || info.len() > 64 * 1024 * 1024 {
+                    return Err(invalid("Invalid legacy metadata record"));
+                }
+                let original = revision(&info);
+                let bytes = root.read(&name)?;
+                if db.get("private", &name)?.is_none() {
+                    db.put("private", &name, &bytes, 0)?;
+                }
+                // An interrupted migration may leave a legacy file. Reject ambiguity instead of restoring stale state.
+                if db.get("private", &name)?.as_deref() != Some(bytes.as_slice())
+                    || current_revision(root, &name)?.as_deref() != Some(&original)
+                {
+                    return Err(invalid(
+                        "Legacy metadata differs from committed SQLite record",
+                    ));
+                }
+                root.remove_file(&name)?;
+                flush_parents(root, &name)?;
+            }
+            if root.try_exists(".syncpeer-folder-marker")? {
+                root.remove_file(".syncpeer-folder-marker")?;
+                flush_parents(root, ".syncpeer-folder-marker")?;
+            }
+            if legacy_lock.is_some() {
+                root.remove_file(".syncpeer-replica.lock")?;
+                flush_parents(root, ".syncpeer-replica.lock")?;
+            }
+            Ok(())
+        })();
+        self.unlock(id)?;
+        result
+    }
+
     pub fn register(&mut self, path: &Path) -> io::Result<u64> {
         if !path.is_absolute() || std::fs::symlink_metadata(path)?.is_symlink() {
             return Err(invalid(
@@ -145,6 +263,33 @@ impl ReplicaRoots {
             ));
         }
         let root = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+        if self.metadata_root.as_os_str().is_empty() {
+            return Err(invalid("Metadata root is not configured"));
+        }
+        let db = MetadataDatabase::open(
+            &self.metadata_root,
+            path,
+            &file_identity(&root.dir_metadata()?)?,
+        )?;
+        let expected = db.get("marker", "identity")?;
+        let mut marker = marker_identity(&root)?;
+        if marker.is_none() && expected.is_none() {
+            if let Ok(legacy) = root.symlink_metadata(".syncpeer-folder-marker") {
+                if !legacy.is_file() || legacy.is_symlink() {
+                    return Err(invalid("Invalid legacy marker"));
+                }
+                root.create_dir(".stfolder")?;
+                flush_parents(&root, ".stfolder")?;
+                marker = marker_identity(&root)?;
+            }
+        }
+        if let Some(expected) = expected {
+            if marker.as_ref().map(|value| value.as_bytes()) != Some(expected.as_slice()) {
+                return Err(invalid("Replica folder marker unavailable or replaced"));
+            }
+        } else if let Some(marker) = &marker {
+            db.put("marker", "identity", marker.as_bytes(), 0)?;
+        }
         self.next = self
             .next
             .checked_add(1)
@@ -154,10 +299,11 @@ impl ReplicaRoots {
             ReplicaRootGuard {
                 path: path.to_path_buf(),
                 identity: file_identity(&root.dir_metadata()?)?,
-                marker: marker_identity(&root)?,
+                marker,
             },
         );
         self.roots.insert(self.next, root);
+        self.metadata.insert(self.next, db);
         Ok(self.next)
     }
 
@@ -176,7 +322,13 @@ impl ReplicaRoots {
         }
         self.roots.remove(&id);
         self.guards.remove(&id);
-        self.locks.remove(&id);
+        if self.locks.remove(&id).is_some() {
+            if let Some(db) = self.metadata.get(&id) {
+                let _ = std::fs::remove_file(db.directory.join("operation.lock"));
+            }
+        }
+        self.metadata.remove(&id);
+        self.metadata_prefixes.remove(&id);
         cleanup_error.map_or(Ok(()), Err)
     }
 
@@ -205,17 +357,20 @@ impl ReplicaRoots {
         if self.locks.contains_key(&id) {
             return Err(invalid("Replica root already locked"));
         }
-        let root = self.root(id)?;
-        let path = ".syncpeer-replica.lock";
-        check_relative(root, path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
+        self.root(id)?;
+        let db = self
+            .metadata
+            .get(&id)
+            .ok_or_else(|| invalid("Metadata unavailable"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
-            use cap_std::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = root.open_with(path, &options)?.into_std();
+        let mut file = options.open(db.directory.join("operation.lock"))?;
+        write!(file, "{}", std::process::id())?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
             |error| {
@@ -238,6 +393,9 @@ impl ReplicaRoots {
     }
 
     fn unlock(&mut self, id: u64) -> io::Result<()> {
+        if !self.locks.contains_key(&id) {
+            return Ok(());
+        }
         if let Some(file) = self.locks.get(&id) {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock)?;
@@ -245,6 +403,9 @@ impl ReplicaRoots {
             file.unlock()?;
         }
         self.locks.remove(&id);
+        if let Some(db) = self.metadata.get(&id) {
+            std::fs::remove_file(db.directory.join("operation.lock"))?;
+        }
         Ok(())
     }
 
@@ -270,12 +431,14 @@ impl ReplicaRoots {
                     return Err(invalid("Replica initialization requires an empty folder"));
                 }
             }
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            root.open_with(".syncpeer-folder-marker", &options)?
-                .sync_all()?;
-            flush_parents(root, ".syncpeer-folder-marker")?;
+            root.create_dir(".stfolder")?;
+            root.open(".stfolder")?.sync_all()?;
+            flush_parents(root, ".stfolder")?;
             let marker = marker_identity(root)?;
+            self.metadata
+                .get(&id)
+                .ok_or_else(|| invalid("Metadata unavailable"))?
+                .put("marker", "identity", marker.as_ref().unwrap().as_bytes(), 0)?;
             self.guards.get_mut(&id).unwrap().marker = marker;
             Ok(())
         })();
@@ -289,6 +452,9 @@ impl ReplicaRoots {
         }
         let root = self.root(id)?;
         check_relative(root, path)?;
+        if self.is_metadata(id, path) {
+            return self.metadata.get(&id).unwrap().read(path, offset, size);
+        }
         let mut file = root.open(path)?;
         if !file.metadata()?.is_file() {
             return Err(invalid("Folder entry is not a regular file"));
@@ -333,7 +499,62 @@ impl ReplicaRoots {
             });
         }
         result.sort_by(|a, b| a.name.cmp(&b.name));
+        if path.is_empty() {
+            result.retain(|entry| !self.is_metadata(id, &entry.name));
+            result.extend(
+                self.metadata
+                    .get(&id)
+                    .ok_or_else(|| invalid("Metadata unavailable"))?
+                    .entries()?,
+            );
+            result.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         Ok(result)
+    }
+
+    fn stat(&self, id: u64, path: &str) -> io::Result<Option<ReplicaEntry>> {
+        let root = self.root(id)?;
+        check_relative(root, path)?;
+        if self.is_metadata(id, path) {
+            return self.metadata.get(&id).unwrap().entry(path);
+        }
+        let metadata = match root.symlink_metadata(path) {
+            Ok(value) => value,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.kind() == io::ErrorKind::NotADirectory =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.is_symlink() {
+            return Err(invalid("Symlink metadata is unsupported"));
+        }
+        let kind = if metadata.is_file() {
+            "file"
+        } else if metadata.is_dir() {
+            "directory"
+        } else {
+            return Err(invalid("Unsupported file kind"));
+        };
+        let modified_ms = metadata
+            .modified()?
+            .into_std()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| invalid("Unsupported modification time"))?
+            .as_millis() as u64;
+        Ok(Some(ReplicaEntry {
+            name: Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid("Invalid file name"))?
+                .into(),
+            kind,
+            size: if kind == "file" { metadata.len() } else { 0 },
+            modified_ms,
+            revision: revision(&metadata),
+        }))
     }
 }
 
@@ -415,7 +636,15 @@ impl ReplicaRoots {
             .checked_add(1)
             .ok_or_else(|| invalid("Folder handle limit reached"))?;
         let root = self.root(root_id)?;
-        let original = current_revision(root, path)?;
+        let metadata = self.is_metadata(root_id, path);
+        if metadata && size > 64 * 1024 * 1024 {
+            return Err(invalid("Metadata record too large"));
+        }
+        let original = if metadata {
+            self.metadata_revision(root_id, path)?
+        } else {
+            current_revision(root, path)?
+        };
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| invalid("Clock unavailable"))?
@@ -428,7 +657,16 @@ impl ReplicaRoots {
             use cap_std::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = root.open_with(&temporary, &options)?;
+        options.read(true);
+        let file = if metadata {
+            Dir::open_ambient_dir(
+                &self.metadata.get(&root_id).unwrap().directory,
+                cap_std::ambient_authority(),
+            )?
+            .open_with(&temporary, &options)?
+        } else {
+            root.open_with(&temporary, &options)?
+        };
         self.writers.insert(
             id,
             ReplicaWriter {
@@ -439,6 +677,7 @@ impl ReplicaRoots {
                 file: Some(file),
                 size,
                 written: Vec::new(),
+                metadata,
             },
         );
         self.next = id;
@@ -483,6 +722,44 @@ impl ReplicaRoots {
         }
         if covered != writer.size {
             return Err(invalid("Replacement is incomplete"));
+        }
+        if writer.metadata {
+            check_root_path(
+                self.guards
+                    .get(&writer.root_id)
+                    .ok_or_else(|| invalid("Folder guard unavailable"))?,
+            )?;
+            let db = self
+                .metadata
+                .get(&writer.root_id)
+                .ok_or_else(|| invalid("Metadata unavailable"))?;
+            let current = db.entry(&writer.path)?.map(|entry| entry.revision);
+            if current != writer.original || (exclusive && current.is_some()) {
+                return Err(invalid("Metadata changed during replacement"));
+            }
+            let file = writer
+                .file
+                .as_mut()
+                .ok_or_else(|| invalid("Writer closed"))?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| invalid("Clock unavailable"))?
+                .as_millis() as u64;
+            db.replace_record(
+                &writer.path,
+                &bytes,
+                modified_ms.unwrap_or(now),
+                writer.original.as_deref(),
+                exclusive,
+            )?;
+            let temporary = db.directory.join(&writer.temporary);
+            drop(writer.file.take());
+            std::fs::remove_file(temporary)?;
+            self.writers.remove(&id);
+            return Ok(());
         }
         let root = self
             .roots
@@ -544,6 +821,12 @@ impl ReplicaRoots {
         }
         let root = self.root(id)?;
         check_relative(root, path)?;
+        if self.is_metadata(id, path) {
+            if directory {
+                return Err(invalid("Metadata record is not a directory"));
+            }
+            return self.metadata.get(&id).unwrap().remove(path);
+        }
         if directory {
             root.remove_dir(path)?;
         } else {
@@ -555,6 +838,9 @@ impl ReplicaRoots {
     fn flush(&self, id: u64, paths: &[String]) -> io::Result<()> {
         let root = self.root(id)?;
         for path in paths {
+            if self.is_metadata(id, path) {
+                continue;
+            } // SQLite commit already durably flushed the record.
             check_relative(root, path)?;
             match root.open(path) {
                 Ok(file) => file.sync_all()?,
@@ -567,42 +853,28 @@ impl ReplicaRoots {
     }
 
     fn copy(&mut self, id: u64, source: &str, target: &str) -> io::Result<()> {
-        let root = self.root(id)?;
-        let before =
-            current_revision(root, source)?.ok_or_else(|| invalid("Copy source missing"))?;
-        if current_revision(root, target)?.is_some() {
+        let before = self
+            .stat(id, source)?
+            .ok_or_else(|| invalid("Copy source missing"))?;
+        if before.kind != "file" {
+            return Err(invalid("Copy source must be a regular file"));
+        }
+        if self.stat(id, target)?.is_some() {
             return Err(invalid("Archive already exists"));
         }
-        let mut input = root.open(source)?;
-        let metadata = input.metadata()?;
-        let modified_ms = metadata
-            .modified()?
-            .into_std()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| invalid("File time out of range"))?
-            .as_millis();
-        let writer = self.begin(id, target, metadata.len())?;
+        let writer = self.begin(id, target, before.size)?;
         let result = (|| {
-            let mut buffer = vec![0; 131072];
             let mut offset = 0;
-            loop {
-                let count = input.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                self.write(writer, offset, &buffer[..count])?;
+            while offset < before.size {
+                let count = (before.size - offset).min(131072) as usize;
+                let buffer = self.read(id, source, offset, count)?;
+                self.write(writer, offset, &buffer)?;
                 offset += count as u64;
             }
-            if current_revision(self.root(id)?, source)?.as_ref() != Some(&before)
-                || revision(&input.metadata()?) != before
-            {
+            if self.stat(id, source)?.map(|entry| entry.revision) != Some(before.revision) {
                 return Err(invalid("Copy source changed"));
             }
-            self.commit(
-                writer,
-                Some(u64::try_from(modified_ms).map_err(|_| invalid("File time out of range"))?),
-                true,
-            )
+            self.commit(writer, Some(before.modified_ms), true)
         })();
         if result.is_err() {
             self.abort(writer)?;
@@ -613,6 +885,18 @@ impl ReplicaRoots {
     fn abort(&mut self, id: u64) -> io::Result<()> {
         if let Some(mut writer) = self.writers.remove(&id) {
             drop(writer.file.take());
+            if writer.metadata {
+                let db = self
+                    .metadata
+                    .get(&writer.root_id)
+                    .ok_or_else(|| invalid("Metadata unavailable"))?;
+                match std::fs::remove_file(db.directory.join(&writer.temporary)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                return Ok(());
+            }
             // Cleanup uses the original capability even when the selected path changed.
             let root = self
                 .roots
@@ -637,6 +921,7 @@ impl ReplicaRoots {
 pub enum ReplicaStorageRequest {
     Register {
         root_path: String,
+        metadata_prefixes: Vec<String>,
     },
     Release {
         root_id: u64,
@@ -647,6 +932,9 @@ pub enum ReplicaStorageRequest {
     CheckHealth {
         root_id: u64,
     },
+    BackupMetadata {
+        root_id: u64,
+    },
     Acquire {
         root_id: u64,
     },
@@ -654,6 +942,10 @@ pub enum ReplicaStorageRequest {
         root_id: u64,
     },
     List {
+        root_id: u64,
+        path: String,
+    },
+    Stat {
         root_id: u64,
         path: String,
     },
@@ -705,8 +997,11 @@ pub fn dispatch(
     request: ReplicaStorageRequest,
 ) -> Result<serde_json::Value, String> {
     let result = match request {
-        ReplicaStorageRequest::Register { root_path } => serde_json::json!(roots
-            .register(Path::new(&root_path))
+        ReplicaStorageRequest::Register {
+            root_path,
+            metadata_prefixes,
+        } => serde_json::json!(roots
+            .register_metadata(Path::new(&root_path), metadata_prefixes)
             .map_err(|e| e.to_string())?),
         ReplicaStorageRequest::Release { root_id } => {
             roots.release(root_id).map_err(|e| e.to_string())?;
@@ -722,6 +1017,15 @@ pub fn dispatch(
             roots.check_health(root_id).map_err(|e| e.to_string())?;
             serde_json::Value::Null
         }
+        ReplicaStorageRequest::BackupMetadata { root_id } => {
+            roots.check_health(root_id).map_err(|e| e.to_string())?;
+            serde_json::json!(roots
+                .metadata
+                .get(&root_id)
+                .ok_or("Metadata unavailable")?
+                .create_backup()
+                .map_err(|e| e.to_string())?)
+        }
         ReplicaStorageRequest::Acquire { root_id } => {
             roots.acquire(root_id).map_err(|e| e.to_string())?;
             serde_json::Value::Null
@@ -732,6 +1036,9 @@ pub fn dispatch(
         }
         ReplicaStorageRequest::List { root_id, path } => {
             serde_json::json!(roots.list(root_id, &path).map_err(|e| e.to_string())?)
+        }
+        ReplicaStorageRequest::Stat { root_id, path } => {
+            serde_json::json!(roots.stat(root_id, &path).map_err(|e| e.to_string())?)
         }
         ReplicaStorageRequest::Read {
             root_id,
@@ -807,14 +1114,23 @@ pub fn dispatch(
 
 #[tauri::command]
 pub async fn syncpeer_replica_storage(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
     request: ReplicaStorageRequest,
 ) -> Result<serde_json::Value, String> {
     let state = Arc::clone(state.inner());
+    let metadata_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "App storage unavailable".to_string())?
+        .join("metadata");
     tauri::async_runtime::spawn_blocking(move || {
         let mut roots = state
             .lock()
             .map_err(|_| "Folder handle store unavailable".to_string())?;
+        if roots.metadata_root.as_os_str().is_empty() {
+            roots.metadata_root = metadata_root;
+        }
         dispatch(&mut roots, request)
     })
     .await
@@ -826,9 +1142,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copies_use_the_same_storage_for_private_records_and_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), [1, 2, 3]).unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let id = roots
+            .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
+            .unwrap();
+        roots.copy(id, "source", ".syncpeer-test-copy").unwrap();
+        roots
+            .copy(id, ".syncpeer-test-copy", "destination")
+            .unwrap();
+        assert_eq!(roots.read(id, "destination", 0, 3).unwrap(), [1, 2, 3]);
+        assert!(!temp.path().join(".syncpeer-test-copy").exists());
+        assert!(roots.copy(id, "source", ".syncpeer-test-copy").is_err());
+    }
+
+    #[test]
+    fn sqlite_private_records_migrate_and_failed_replacements_keep_old_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".syncpeer-folder-marker"), b"").unwrap();
+        std::fs::write(temp.path().join(".syncpeer-test-record"), [1, 2, 3]).unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let id = roots
+            .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
+            .unwrap();
+        roots.initialize_replica(id).unwrap();
+        assert!(!temp.path().join(".syncpeer-test-record").exists());
+        assert!(temp.path().join(".stfolder").exists());
+        assert_eq!(
+            roots.read(id, ".syncpeer-test-record", 0, 3).unwrap(),
+            [1, 2, 3]
+        );
+        let writer = roots.begin(id, ".syncpeer-test-record", 3).unwrap();
+        roots.write(writer, 0, &[4]).unwrap();
+        assert!(roots.commit(writer, None, false).is_err());
+        roots.abort(writer).unwrap();
+        assert_eq!(
+            roots.read(id, ".syncpeer-test-record", 0, 3).unwrap(),
+            [1, 2, 3]
+        );
+        roots.release(id).unwrap();
+        drop(roots);
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let id = roots
+            .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
+            .unwrap();
+        assert_eq!(
+            roots.read(id, ".syncpeer-test-record", 0, 3).unwrap(),
+            [1, 2, 3]
+        );
+        let writer = roots.begin(id, ".syncpeer-test-record", 3).unwrap();
+        roots.write(writer, 0, &[4, 5, 6]).unwrap();
+        roots.commit(writer, None, false).unwrap();
+        assert_eq!(
+            roots.read(id, ".syncpeer-test-record", 0, 3).unwrap(),
+            [4, 5, 6]
+        );
+    }
+
+    #[test]
     fn replica_locks_exclude_other_handles_and_release_on_close() {
         let temp = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let first = roots.register(temp.path()).unwrap();
         let second = roots.register(temp.path()).unwrap();
         roots.initialize_replica(first).unwrap();
@@ -847,12 +1226,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("root");
         std::fs::create_dir(&path).unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(&path).unwrap();
         assert!(roots.check_health(id).is_err());
         roots.initialize_replica(id).unwrap();
         roots.check_health(id).unwrap();
-        std::fs::remove_file(path.join(".syncpeer-folder-marker")).unwrap();
+        std::fs::remove_dir(path.join(".stfolder")).unwrap();
         assert!(roots.check_health(id).is_err());
         assert!(roots.initialize_replica(id).is_err());
         let writer = roots.begin(id, "file", 1).unwrap();
@@ -884,7 +1264,8 @@ mod tests {
     #[test]
     fn timestamps_archives_and_nonrecursive_removal_preserve_data() {
         let temp = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(temp.path()).unwrap();
         roots.make_directory(id, "nested").unwrap();
         let writer = roots.begin(id, "nested/file", 3).unwrap();
@@ -912,7 +1293,8 @@ mod tests {
     fn staged_writes_commit_atomically_and_cancellation_preserves_original() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file"), [1, 2, 3]).unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(temp.path()).unwrap();
         let writer = roots.begin(id, "file", 3).unwrap();
         roots.write(writer, 0, &[4, 5, 6]).unwrap();
@@ -932,7 +1314,8 @@ mod tests {
     fn intervening_edits_block_replacement_and_releasing_root_cleans_writers() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file"), [1]).unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(temp.path()).unwrap();
         let writer = roots.begin(id, "file", 1).unwrap();
         roots.write(writer, 0, &[2]).unwrap();
@@ -946,7 +1329,8 @@ mod tests {
     #[test]
     fn incomplete_replacements_are_rejected_and_nested_empty_files_work() {
         let temp = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(temp.path()).unwrap();
         let writer = roots.begin(id, "nested/file", 3).unwrap();
         roots.write(writer, 2, &[3]).unwrap();
@@ -969,7 +1353,8 @@ mod tests {
     fn selected_root_reads_are_bounded_and_handles_can_be_released() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file"), [1, 2, 3, 4]).unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(temp.path()).unwrap();
         assert_eq!(roots.read(id, "file", 1, 2).unwrap(), [2, 3]);
         assert!(roots.read(id, "file", 0, 131073).is_err());
@@ -993,7 +1378,8 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("private"), [9]).unwrap();
         std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
-        let mut roots = ReplicaRoots::default();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
         let id = roots.register(temp.path()).unwrap();
         assert_eq!(roots.list(id, "").unwrap()[0].kind, "symlink");
         assert!(roots.read(id, "link/private", 0, 1).is_err());

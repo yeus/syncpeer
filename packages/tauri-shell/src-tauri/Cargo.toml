@@ -33,6 +33,7 @@ prost = "0.13"
 quinn = "0.11"
 tokio = { version = "1", features = ["sync", "time"] }
 fs2 = "0.4"
+rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { version = "1", features = ["fs"] }

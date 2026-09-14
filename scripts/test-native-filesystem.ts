@@ -2,13 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createNativeFilesystem, type NativeFilesystemRequest } from "@syncpeer/core/filesystem";
 
-test("native stat returns absent when a parent directory does not exist", async () => {
+test("native stat uses one bounded lookup instead of enumerating parent directories", async () => {
   const fs = await createNativeFilesystem(async request => {
     if (request.operation === "register") return 1;
-    if (request.operation === "list") {
-      assert.equal(request.path, "", "Do not list inside an absent parent");
-      return [];
-    }
+    if (request.operation === "list") assert.fail("Stat must not enumerate a catalog");
+    if (request.operation === "stat") { assert.equal(request.path, "missing/child"); return null; }
     return null;
   }, "/synthetic-root");
   assert.equal(await fs.stat("missing/child"), null);
@@ -57,6 +55,8 @@ test("native filesystem adapter maps directory entries and bounded reads without
       ? [{ name: "nested", kind: "directory", size: 0, modifiedMs: 1, revision: "dir" }]
       : [{ name: "file", kind: "file", size: 3, modifiedMs: 2, revision: "file" }];
     if (request.operation === "read") return [1, 2, 3];
+    if (request.operation === "stat") return request.path === "nested/file"
+      ? { name: "file", kind: "file", size: 3, modifiedMs: 2, revision: "file" } : null;
     return null;
   }, "/synthetic-root");
   const entries = await fs.listEntries();

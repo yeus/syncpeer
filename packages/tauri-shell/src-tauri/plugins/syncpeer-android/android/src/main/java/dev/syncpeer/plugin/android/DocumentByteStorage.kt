@@ -5,10 +5,10 @@ import org.json.JSONObject
 
 /** Owns native handles; all actual byte-storage behavior lives in replica_storage.rs. */
 @Keep
-class DocumentByteStorage : AutoCloseable {
+class DocumentByteStorage(metadataPath: String) : AutoCloseable {
   @Keep private var nativeHandle: Long = 0
-  init { System.loadLibrary("tauri_shell_lib"); initialize() }
-  private external fun initialize()
+  init { System.loadLibrary("tauri_shell_lib"); initialize(metadataPath) }
+  private external fun initialize(metadataPath: String)
   private external fun request(json: String): String
   private external fun dispose()
   @Synchronized fun execute(request: JSONObject): Any? {

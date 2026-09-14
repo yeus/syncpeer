@@ -1,6 +1,7 @@
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 mod cache_ranges;
 mod replica_storage;
+mod metadata_sqlite;
 mod documents;
 #[cfg(target_os = "android")]
 mod document_storage;

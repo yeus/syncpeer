@@ -43,6 +43,7 @@ node dist/cli/main.js --help
 All contributor/development/build-target documentation lives in:
 
 - [DEVELOPMENT.md](./DEVELOPMENT.md)
+- [SQLite storage and migration](./SQLITE_STORAGE.md)
 
 ## For contributors
 

@@ -21,7 +21,7 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
     if (!stat) {
       const entries = await bytes.listEntries();
       if (await bytes.stat(".syncpeer-ciphertext-generations") || await bytes.stat(".syncpeer-replica-index") ||
-        entries.some(entry => ![".syncpeer-folder-marker", ".syncpeer-replica.lock"].includes(entry.path))) {
+        entries.some(entry => ![".stfolder", ".syncpeer-folder-marker", ".syncpeer-replica.lock"].includes(entry.path))) {
         throw new Error("Encrypted history is missing; explicit import or recovery is required.");
       }
       return createCiphertextIndex(identity);

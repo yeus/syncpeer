@@ -30,6 +30,16 @@ encrypted copy is not attached and the original remains available for retry.
 External-storage imports can require manual handling. Failed preparation never
 silently falls back to writing new Android downloads in plaintext.
 
+When the Activity is backgrounded after a connection, the WebView-owned peer
+session is closed before the service starts its own authenticated core session.
+The service is the only background session owner, runs as a low-noise `dataSync`
+foreground service, persists its bounded connection request through the
+Keystore-backed vault, and reconnects after network/power policy changes or an
+Android process restart. Returning to the Activity stops the service and waits
+for that session to close before the UI session resumes. This handoff keeps the
+favorite-only cache policy: a background connection does not turn registered
+or downloaded folders into whole-folder subscriptions.
+
 Acknowledged encrypted download ranges are journaled with the remote content
 identity. They can be reused after the service or app restarts, but are discarded
 when the remote identity changes. The document runtime also recreates its
@@ -47,7 +57,7 @@ migrations retain encrypted ownership and can be retried. The app exposes this
 as a per-folder operation rather than changing the default encrypted policy.
 
 The local master password can be changed while the vault is unlocked. Rotation
-rewrites the encrypted record and the remembered device-protected secret as one
+rewrites the encrypted record and the remembered Keystore-backed secret as one
 recoverable operation. Android biometric unlock is an optional app gate: it
 authenticates before the remembered secret is used, but it never stores or
 returns the folder password itself.
@@ -57,12 +67,47 @@ Back navigation. Creating a local folder does not automatically share it remotel
 
 ### Verification and limits
 
+The complete Android compatibility suite targets Android 10 (API 29), which is
+the oldest full-support target. The development shell includes a Play Store AVD
+named `syncpeer-api29`. The normal workflow provisions its WebView automatically
+from the current Google-signed WebView in the API 36 Play Store image, so no
+Play Store account or manual update is required:
+
+```sh
+npm run test:android
+```
+
+This builds the x86_64 test APK once, starts API 36 to run the focused
+transfer-service smoke test and capture its WebView pair, then starts API 29,
+installs that pair, and runs the Android 10 compatibility suite (including a
+real emulator reboot). Emulators are cleaned up when either phase fails. The
+suite records unsupported optional WebView capabilities instead of treating a
+known capability gap in the test image as an update failure; the deterministic
+capability policy is covered by JVM tests. The combined runner skips the
+separately managed remote-server workflow; the lower-level compatibility command
+can run that workflow when a server fixture is configured. No Play Store account
+or manual WebView update is required.
+
+For debugging one profile at a time, the lower-level commands remain available:
+
+```sh
+npm run android:emulator:compat
+npm run test:android:compat
+npm run android:emulator:modern
+npm run test:android:modern-smoke
+```
+
+The modern smoke check verifies Android 14+'s user-initiated transfer job
+boundary without duplicating the complete Android 10 suite.
+
 Core tests cover password rotation, interrupted migrations, verified plaintext
 deletion, reverse migration, and restart-safe encrypted storage. Android
 instrumentation tests cover the native secure-store policy, Keystore-backed
-remembered secret, file-picker access without an Activity, and process restarts.
-Set `SYNCPEER_ANDROID_REBOOT_CHECK=1` when running the Android E2E harness with
-an unlocked emulator/device to add a real reboot between those phases; this is
+remembered secret, encrypted background-session request persistence,
+file-picker access without an Activity, and process restarts. The Android E2E
+harness also checks the service handoff when a remote fixture is configured.
+Set `SYNCPEER_ANDROID_REBOOT_CHECK=1` with an unlocked emulator/device to add
+a real reboot between the Keystore and document-runtime phases; this remains
 optional because it needs an attached ADB device and cannot run in ordinary CI.
 
 The remembered secret is protected by Android Keystore and private no-backup

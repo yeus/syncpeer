@@ -218,6 +218,28 @@ npm run android:dev
 - `npm run icons:generate`
 - `npm run icons:ensure:android`
 
+Run the complete Android validation workflow with one command:
+
+```bash
+npm run test:android
+```
+
+It builds the x86_64 APK once, runs the focused modern transfer-service smoke
+test on Android 14+ (API 36), copies that image's Google-signed WebView pair to
+the API-29 emulator, then runs the Android 10 compatibility suite. The command
+starts and stops both emulators and cleans them up if a phase fails. Optional
+WebView capabilities that are absent from the image are reported as unsupported
+by the app and tested as such; the combined runner does not depend on a separate
+remote development server. No Play Store account or manual update is needed.
+Use these lower-level commands when debugging one profile manually:
+
+```bash
+npm run android:emulator:compat
+npm run test:android:compat
+npm run android:emulator:modern
+npm run test:android:modern-smoke
+```
+
 ## Diagnostics and E2E Test Suites
 
 The repository has two test umbrellas:

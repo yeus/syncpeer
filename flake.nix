@@ -19,6 +19,7 @@
 
         android = {
           platformVersion = "36";
+          compatibilityPlatformVersion = "29";
           buildToolsVersion = "35.0.0";
           ndkVersion = "26.3.11579264";
           cmakeVersion = "3.22.1";
@@ -28,9 +29,9 @@
         androidComposition = pkgs.androidenv.composeAndroidPackages {
           cmdLineToolsVersion = android.cmdLineToolsVersion;
           buildToolsVersions = [ android.buildToolsVersion ];
-          platformVersions = [ android.platformVersion ];
+          platformVersions = [ android.platformVersion android.compatibilityPlatformVersion ];
           includeSystemImages = true;
-          systemImageTypes = [ "google_apis" ];
+          systemImageTypes = [ "google_apis_playstore" ];
           abiVersions = [ "x86_64" ];
           includeEmulator = "if-supported";
           includeNDK = true;

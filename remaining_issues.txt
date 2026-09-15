@@ -1,0 +1,76 @@
+Remaining Syncpeer filesystem and two-way folder-sync work
+===========================================================
+
+This list was refreshed by comparing the encrypted-filesystem and standalone
+folder-sync designs with the current source and focused tests. The core
+encrypted storage, credential vault, folder registry, service-owned Android
+runtime, basic DocumentsProvider operations, causal sync/version handling, and
+external SQLite root metadata are implemented. The items below are the work
+that is still missing or lacks a real platform acceptance check.
+
+Desktop product wiring
+----------------------
+
+- Wire the durable folder registry into the Tauri UI: choose and validate a
+  local root, explicitly share/subscribe it, and show status, progress,
+  pause/resume, reconnect, and actionable errors.
+- Expose unsubscribe, delete-everywhere, archive/versioning, and cache-removal
+  controls as separate operations. Complete desktop profile onboarding and
+  logout/login cleanup (drain work, close handles, unmount, and discard keys).
+- Validate the real desktop Secret Service remembered-secret lifecycle; the
+  isolated keyring fixture only proves the adapter contract.
+
+Android folder workflows
+------------------------
+
+- Add explicit root onboarding and import/key-recovery for an existing
+  encrypted Syncthing folder. Keep a registered folder visible without
+  subscribing its whole contents to the favorite/download cache.
+- Define and wire background transfer policy for selected favorites or an
+  explicitly selected two-way folder; connecting must not download an entire
+  registered folder implicitly.
+- Exercise real DocumentsProvider plus peer-network flows after Activity and
+  process recreation. Current instrumentation covers service/storage behavior,
+  while the combined emulator runner does not yet run a real peer-network
+  workflow.
+- Add startup-timeout and repeated-failure regression coverage plus a
+  retry/backoff policy for runtime recovery. Isolate-termination recovery is
+  implemented and covered; every recovery path must fail closed and never reuse
+  stale keys.
+
+Linux FUSE frontend
+-------------------
+
+- Implement one standalone Linux FUSE mount backed by the existing core
+  namespace and encryption owner. Add the Tauri toggle, protected secret
+  handoff, readiness/error reporting, busy-unmount, exit, and logout behavior.
+- Reconcile Node and native root-lock protocols (or prohibit concurrent writable
+  app/mount access) and add host FUSE contract tests for rename, truncate,
+  random writes, concurrent handles, crash recovery, and reopen.
+
+Sync correctness and interoperability
+--------------------------------------
+
+- Add upstream Syncthing fixtures for wrong passwords, tampered metadata or
+  blocks, truncation, missing data, and large bounded reads.
+- Add mixed Syncthing/Syncpeer convergence tests, directory-conflict and
+  deletion stress tests, and physical crash/reopen checks.
+- Replace whole-file buffering in standalone folder-sync publication with a
+  bounded/streaming path and measure behavior on large files.
+- Define safe stale-lock recovery after an ungraceful process stop; never treat
+  a locked or replaced root as an empty folder.
+
+Catalog and platform acceptance
+-------------------------------
+
+- Replace remaining complete metadata-snapshot loads with bounded/paged SQLite
+  queries where possible, move blocking Node SQLite work off the main event
+  loop, and benchmark realistic large catalogs.
+- Validate native SQLite, external metadata, locks, markers, backups, recovery,
+  and Secret Service/key protection on Windows and macOS before claiming those
+  desktop targets are supported.
+- Validate the equivalent app-private paths on iOS before claiming iOS support.
+- Validate Android physical-device power-loss/reboot durability; emulator
+  reboot coverage is useful but is not a power-loss guarantee.
+- Add the deferred browser storage adapter (for example SQLite WASM) while
+  preserving the same core storage contract.

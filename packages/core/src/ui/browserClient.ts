@@ -157,6 +157,8 @@ export interface AndroidCalendarEventRecord {
 }
 
 export interface SyncpeerPlatformAdapter {
+  startBackgroundSession?: (options: Omit<ConnectOptions, "sharedFolders">) => Promise<void>;
+  stopBackgroundSession?: () => Promise<void>;
   acknowledgeCachedSync?: (folderId: string, path: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => Promise<boolean>;
   readTextFile?: (path: string) => Promise<string>;
   readBinaryFile?: (path: string) => Promise<Uint8Array>;
@@ -486,6 +488,7 @@ export const createSyncpeerBrowserClient = (
 
   let cachedDefaultIdentity: SyncpeerIdentityRecord | null = null;
   let activeConnectOptions: ConnectOptions | null = null;
+  let activeResolvedConnectOptions: ConnectOptions | null = null;
   let focusedFolderId: string | null = null;
 
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
@@ -552,6 +555,11 @@ export const createSyncpeerBrowserClient = (
       folderPasswords: normalized.folderPasswords,
       sharedFolders: normalized.sharedFolders,
     }, signal);
+    activeResolvedConnectOptions = {
+      ...normalized,
+      cert: certPem,
+      key: keyPem,
+    };
     logClient(options.onLog, "client.session.open.ready", {
       transportKind: session.transportKind,
       connectionScope: session.connectionScope,
@@ -659,12 +667,34 @@ export const createSyncpeerBrowserClient = (
     },
     disconnect: async (): Promise<void> => {
       activeConnectOptions = null;
+      activeResolvedConnectOptions = null;
       focusedFolderId = null;
+      await platformAdapter.stopBackgroundSession?.();
       await lifecycle.disconnect();
     },
     subscribeLifecycle: lifecycle.subscribe,
     setOnline: lifecycle.setOnline,
-    setForeground: lifecycle.setForeground,
+    setForeground: async (foreground) => {
+      if (foreground) {
+        // Stop the service before reopening the Activity-owned session.  The
+        // stop call waits for the service's core session to close, so two
+        // authenticated sessions never own the same peer at once.
+        await platformAdapter.stopBackgroundSession?.();
+        await lifecycle.setForeground(true);
+        return;
+      }
+
+      // Release the Activity-owned session before handing the options to the
+      // service.  Starting the service first would create a race in which both
+      // runtimes connect to the peer briefly.
+      await lifecycle.setForeground(false);
+      if (activeResolvedConnectOptions && platformAdapter.startBackgroundSession) {
+        const backgroundOptions = Object.fromEntries(
+          Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),
+        ) as Omit<ConnectOptions, "sharedFolders">;
+        await platformAdapter.startBackgroundSession(backgroundOptions);
+      }
+    },
     setTransferActive: lifecycle.setTransferActive,
     acknowledgeCachedSync: platformAdapter.acknowledgeCachedSync,
     listFavorites: async (): Promise<FavoriteRecord[]> =>

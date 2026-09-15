@@ -5,6 +5,8 @@ mod metadata_sqlite;
 mod documents;
 #[cfg(target_os = "android")]
 mod document_storage;
+#[cfg(target_os = "android")]
+mod android_network;
 mod vault_secret;
 use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -1280,8 +1282,8 @@ fn create_tls_session(
     Ok(Arc::new(TlsSession { commands }))
 }
 
-fn get_tls_session(
-    store: &tauri::State<SharedTlsStore>,
+fn get_tls_session_from_store(
+    store: &SharedTlsStore,
     session_id: u64,
 ) -> Result<Arc<TlsSession>, String> {
     let guard = store
@@ -1292,6 +1294,59 @@ fn get_tls_session(
         .get(&session_id)
         .cloned()
         .ok_or_else(|| format!("Unknown TLS session: {session_id}"))
+}
+
+fn read_tls_session(
+    store: &SharedTlsStore,
+    request: TlsReadRequest,
+) -> Result<TlsReadResponse, String> {
+    let session = get_tls_session_from_store(store, request.session_id)?;
+    let (response, result) = mpsc::channel();
+    session
+        .commands
+        .send(TlsCommand::Read {
+            max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
+            response,
+        })
+        .map_err(|_| "TLS worker stopped".to_string())?;
+    result.recv().map_err(|_| "TLS worker stopped".to_string())?
+}
+
+fn write_tls_session(
+    store: &SharedTlsStore,
+    request: TlsWriteRequest,
+) -> Result<(), String> {
+    let session = get_tls_session_from_store(store, request.session_id)?;
+    let (response, result) = mpsc::channel();
+    session
+        .commands
+        .send(TlsCommand::Write {
+            bytes: request.bytes,
+            response,
+        })
+        .map_err(|_| "TLS worker stopped".to_string())?;
+    result.recv().map_err(|_| "TLS worker stopped".to_string())?
+}
+
+fn close_tls_session(
+    store: &SharedTlsStore,
+    request: TlsCloseRequest,
+) -> Result<(), String> {
+    let removed = {
+        let mut guard = store
+            .lock()
+            .map_err(|_| "TLS session store lock poisoned".to_string())?;
+        guard.sessions.remove(&request.session_id)
+    };
+    if let Some(session) = removed {
+        let (response, result) = mpsc::channel();
+        session
+            .commands
+            .send(TlsCommand::Close { response })
+            .map_err(|_| "TLS worker stopped".to_string())?;
+        result.recv().map_err(|_| "TLS worker stopped".to_string())?;
+    }
+    Ok(())
 }
 
 fn load_identity_from_dir(cli_node_dir: &Path) -> Result<Option<CliNodeIdentityResponse>, String> {
@@ -2385,7 +2440,15 @@ async fn syncpeer_tls_open(
     request: TlsOpenRequest,
 ) -> Result<TlsOpenResponse, String> {
     let shared_store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || open_tls_session(shared_store, request))
+    .await
+    .map_err(|error| format!("TLS open task join error: {error}"))?
+}
+
+fn open_tls_session(
+    shared_store: SharedTlsStore,
+    request: TlsOpenRequest,
+) -> Result<TlsOpenResponse, String> {
         let address = format!("{}:{}", request.host, request.port);
         let tls_host = resolve_tls_hostname(&request.host);
         tauri_log(&format!(
@@ -2475,10 +2538,7 @@ async fn syncpeer_tls_open(
             peer_certificate_der,
             connected_via: None,
         })
-    })
-    .await
-    .map_err(|error| format!("TLS open task join error: {error}"))?
-}
+    }
 
 #[tauri::command]
 async fn syncpeer_relay_open(
@@ -2486,7 +2546,15 @@ async fn syncpeer_relay_open(
     request: RelayOpenRequest,
 ) -> Result<TlsOpenResponse, String> {
     let shared_store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || open_relay_session(shared_store, request))
+        .await
+        .map_err(|error| format!("Relay open task join error: {error}"))?
+}
+
+fn open_relay_session(
+    shared_store: SharedTlsStore,
+    request: RelayOpenRequest,
+) -> Result<TlsOpenResponse, String> {
         let relay_url = Url::parse(&request.relay_address).map_err(|error| {
             format!("Invalid relay address '{}': {error}", request.relay_address)
         })?;
@@ -2703,14 +2771,18 @@ async fn syncpeer_relay_open(
                 relay_session_endpoint
             )),
         })
-    })
-    .await
-    .map_err(|error| format!("Relay open task join error: {error}"))?
 }
 
 #[tauri::command]
 async fn syncpeer_quic_open(
     store: tauri::State<'_, SharedQuicStore>,
+    request: QuicOpenRequest,
+) -> Result<TlsOpenResponse, String> {
+    open_quic_session(store.inner().clone(), request).await
+}
+
+async fn open_quic_session(
+    store: SharedQuicStore,
     request: QuicOpenRequest,
 ) -> Result<TlsOpenResponse, String> {
     let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
@@ -2791,8 +2863,8 @@ async fn syncpeer_quic_open(
     })
 }
 
-fn get_quic_session(
-    store: &tauri::State<SharedQuicStore>,
+fn get_quic_session_from_store(
+    store: &SharedQuicStore,
     session_id: u64,
 ) -> Result<Arc<QuicSession>, String> {
     store.lock()
@@ -2803,12 +2875,11 @@ fn get_quic_session(
         .ok_or_else(|| format!("Unknown QUIC session: {session_id}"))
 }
 
-#[tauri::command]
-async fn syncpeer_quic_read(
-    store: tauri::State<'_, SharedQuicStore>,
+async fn read_quic_session(
+    store: &SharedQuicStore,
     request: TlsReadRequest,
 ) -> Result<TlsReadResponse, String> {
-    let session = get_quic_session(&store, request.session_id)?;
+    let session = get_quic_session_from_store(store, request.session_id)?;
     let mut receive = session.receive.lock().await;
     let chunk = receive.read_chunk(
         request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
@@ -2820,20 +2891,18 @@ async fn syncpeer_quic_read(
     })
 }
 
-#[tauri::command]
-async fn syncpeer_quic_write(
-    store: tauri::State<'_, SharedQuicStore>,
+async fn write_quic_session(
+    store: &SharedQuicStore,
     request: TlsWriteRequest,
 ) -> Result<(), String> {
-    let session = get_quic_session(&store, request.session_id)?;
+    let session = get_quic_session_from_store(store, request.session_id)?;
     let result = session.send.lock().await.write_all(&request.bytes).await
         .map_err(|error| format!("QUIC write failed: {error}"));
     result
 }
 
-#[tauri::command]
-async fn syncpeer_quic_close(
-    store: tauri::State<'_, SharedQuicStore>,
+fn close_quic_session(
+    store: &SharedQuicStore,
     request: TlsCloseRequest,
 ) -> Result<(), String> {
     let session = store.lock()
@@ -2847,24 +2916,36 @@ async fn syncpeer_quic_close(
 }
 
 #[tauri::command]
+async fn syncpeer_quic_read(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: TlsReadRequest,
+) -> Result<TlsReadResponse, String> {
+    read_quic_session(store.inner(), request).await
+}
+
+#[tauri::command]
+async fn syncpeer_quic_write(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: TlsWriteRequest,
+) -> Result<(), String> {
+    write_quic_session(store.inner(), request).await
+}
+
+#[tauri::command]
+async fn syncpeer_quic_close(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: TlsCloseRequest,
+) -> Result<(), String> {
+    close_quic_session(store.inner(), request)
+}
+
+#[tauri::command]
 async fn syncpeer_tls_read(
     store: tauri::State<'_, SharedTlsStore>,
     request: TlsReadRequest,
 ) -> Result<TlsReadResponse, String> {
-    let session = get_tls_session(&store, request.session_id)?;
-    let (response, result) = mpsc::channel();
-    session
-        .commands
-        .send(TlsCommand::Read {
-            max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
-            response,
-        })
-        .map_err(|_| "TLS worker stopped".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        result
-            .recv()
-            .map_err(|_| "TLS worker stopped".to_string())?
-    })
+    let shared_store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || read_tls_session(&shared_store, request))
     .await
     .map_err(|error| format!("TLS read task join error: {error}"))?
 }
@@ -2874,20 +2955,8 @@ async fn syncpeer_tls_write(
     store: tauri::State<'_, SharedTlsStore>,
     request: TlsWriteRequest,
 ) -> Result<(), String> {
-    let session = get_tls_session(&store, request.session_id)?;
-    let (response, result) = mpsc::channel();
-    session
-        .commands
-        .send(TlsCommand::Write {
-            bytes: request.bytes,
-            response,
-        })
-        .map_err(|_| "TLS worker stopped".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        result
-            .recv()
-            .map_err(|_| "TLS worker stopped".to_string())?
-    })
+    let shared_store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || write_tls_session(&shared_store, request))
     .await
     .map_err(|error| format!("TLS write task join error: {error}"))?
 }
@@ -2897,27 +2966,10 @@ async fn syncpeer_tls_close(
     store: tauri::State<'_, SharedTlsStore>,
     request: TlsCloseRequest,
 ) -> Result<(), String> {
-    let removed = {
-        let mut guard = store
-            .lock()
-            .map_err(|_| "TLS session store lock poisoned".to_string())?;
-        guard.sessions.remove(&request.session_id)
-    };
-    if let Some(session) = removed {
-        let (response, result) = mpsc::channel();
-        session
-            .commands
-            .send(TlsCommand::Close { response })
-            .map_err(|_| "TLS worker stopped".to_string())?;
-        tauri::async_runtime::spawn_blocking(move || {
-            result
-                .recv()
-                .map_err(|_| "TLS worker stopped".to_string())
-        })
+    let shared_store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || close_tls_session(&shared_store, request))
         .await
-        .map_err(|error| format!("TLS close task join error: {error}"))??;
-    }
-    Ok(())
+        .map_err(|error| format!("TLS close task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -3502,6 +3554,25 @@ async fn syncpeer_android_start_transfer_service(
 }
 
 #[tauri::command]
+async fn syncpeer_android_start_background_session(
+    app: tauri::AppHandle,
+    request: serde_json::Value,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .start_background_session(&request)
+            .map_err(|error| format!("Could not start background synchronization: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Ok(())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_biometric_status(
     app: tauri::AppHandle,
     request: AndroidBiometricRequest,
@@ -3567,6 +3638,22 @@ async fn syncpeer_android_stop_transfer_service(app: tauri::AppHandle) -> Result
             .syncpeer_android()
             .stop_transfer_service()
             .map_err(|error| format!("Could not stop transfer service: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_stop_background_session(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .stop_background_session()
+            .map_err(|error| format!("Could not stop background synchronization: {error}"));
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -4282,10 +4369,12 @@ pub fn run() {
             syncpeer_cache_suspend,
             syncpeer_android_open_with_chooser,
             syncpeer_android_start_transfer_service,
+            syncpeer_android_start_background_session,
             syncpeer_android_biometric_status,
             syncpeer_android_biometric_set_enabled,
             syncpeer_android_biometric_authenticate,
             syncpeer_android_stop_transfer_service,
+            syncpeer_android_stop_background_session,
             syncpeer_android_update_transfer_notification,
             syncpeer_android_write_saf_file,
             syncpeer_android_pick_saf_directory,

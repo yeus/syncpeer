@@ -59,6 +59,25 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .map_err(Into::into)
   }
 
+  pub fn start_background_session(&self, request: &serde_json::Value) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>(
+        "startBackgroundSession",
+        json!({"request": request.to_string()}),
+      )
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
+  pub fn stop_background_session(&self) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>("stopBackgroundSession", json!({}))
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
   pub fn update_transfer_notification(
     &self,
     title: &str,

@@ -16,6 +16,8 @@ import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.app.Activity
 import android.content.Context
+import android.content.ServiceConnection
+import android.os.IBinder
 import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.DocumentsContract
@@ -89,6 +91,11 @@ class TransferNotificationArgs {
   var progress: Int? = null
   var ongoing: Boolean = true
   var cancellable: Boolean = false
+}
+
+@InvokeArg
+class BackgroundSessionArgs {
+  var request: String = ""
 }
 
 @InvokeArg
@@ -290,6 +297,63 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolveObject(mapOf("stopped" to true))
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not stop transfer runtime.")
+    }
+  }
+
+  @Command
+  fun startBackgroundSession(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(BackgroundSessionArgs::class.java)
+      val request = JSONObject(args.request)
+      check(request.optString("operation") == "connect") { "Background session requires a connect request." }
+      check(args.request.length <= 4096) { "Background session request is too large." }
+      check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        "Background synchronization requires Android 8 or newer."
+      }
+      val intent = Intent(activity.applicationContext, DocumentRuntimeService::class.java)
+        .setAction(SyncpeerSessionConstants.ACTION_START)
+        .putExtra(SyncpeerSessionConstants.EXTRA_REQUEST, args.request)
+      ContextCompat.startForegroundService(activity.applicationContext, intent)
+      invoke.resolveObject(mapOf("started" to true))
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not start background synchronization.")
+    }
+  }
+
+  @Command
+  fun stopBackgroundSession(invoke: Invoke) {
+    try {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+        invoke.resolveObject(mapOf("stopped" to true))
+        return
+      }
+      val app = activity.applicationContext
+      val connection = object : ServiceConnection {
+        private var finished = false
+        private fun finish(error: String?) {
+          if (finished) return
+          finished = true
+          runCatching { app.unbindService(this) }
+          if (error == null) invoke.resolveObject(mapOf("stopped" to true)) else invoke.reject(error)
+        }
+        override fun onServiceConnected(name: ComponentName, service: IBinder) {
+          val owner = service as? DocumentRuntimeService.RuntimeBinder
+          if (owner == null) { finish("Background synchronization service is unavailable."); return }
+          owner.stopBackgroundSession().whenComplete { _, error ->
+            activity.runOnUiThread {
+              finish(error?.message ?: error?.cause?.message)
+            }
+          }
+        }
+        override fun onServiceDisconnected(name: ComponentName) {
+          finish(null)
+        }
+      }
+      if (!app.bindService(Intent(app, DocumentRuntimeService::class.java), connection, Context.BIND_AUTO_CREATE)) {
+        invoke.resolveObject(mapOf("stopped" to true))
+      }
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not stop background synchronization.")
     }
   }
 

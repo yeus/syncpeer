@@ -3,6 +3,13 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { build } from "vite";
 
+const cliArguments = process.argv.slice(2);
+const hasArgument = (name) => cliArguments.includes(name);
+const argumentValue = (name) => {
+  const index = cliArguments.indexOf(name);
+  return index < 0 ? undefined : cliArguments[index + 1];
+};
+
 const config = JSON.parse(
   fs.readFileSync("packages/tauri-shell/src-tauri/tauri.conf.json", "utf8"),
 );
@@ -10,6 +17,9 @@ const packageName = process.env.SYNCPEER_ANDROID_PACKAGE?.trim() || config.ident
 const transferServiceClass = process.env.SYNCPEER_ANDROID_TRANSFER_SERVICE?.trim()
   || "dev.syncpeer.plugin.android.SyncpeerTransferService";
 const transferServiceComponent = `${packageName}/${transferServiceClass}`;
+const sessionServiceClass = process.env.SYNCPEER_ANDROID_SESSION_SERVICE?.trim()
+  || "dev.syncpeer.plugin.android.DocumentRuntimeService";
+const sessionServiceComponent = `${packageName}/${sessionServiceClass}`;
 const transferJobServiceClass = process.env.SYNCPEER_ANDROID_TRANSFER_JOB_SERVICE?.trim()
   || "dev.syncpeer.plugin.android.SyncpeerTransferJobService";
 const transferJobServiceComponent = `${packageName}/${transferJobServiceClass}`;
@@ -37,7 +47,13 @@ const targetLargeFileSize = Number(
   process.env.SYNCPEER_E2E_LARGE_FILE_SIZE || 30 * 1024 * 1024,
 );
 const targetLargeFileSha256 = process.env.SYNCPEER_E2E_LARGE_FILE_SHA256?.trim() || "";
-const rebootForDocumentRuntimeCheck = process.env.SYNCPEER_ANDROID_REBOOT_CHECK === "1";
+const rebootForDocumentRuntimeCheck = process.env.SYNCPEER_ANDROID_REBOOT_CHECK === "1"
+  || hasArgument("--reboot");
+const requireDocumentRuntime = process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1"
+  || hasArgument("--require-document-runtime");
+const skipNetworkWorkflow = hasArgument("--skip-network");
+const modernSmoke = hasArgument("--modern-smoke");
+const expectedSdk = Number(argumentValue("--expect-sdk") || 0);
 
 const runAdb = (args, timeout = 30_000) => {
   try {
@@ -117,8 +133,39 @@ const transferServiceDump = () => runAdb([
   packageName,
 ]);
 
+const sessionServiceDump = () => runAdb([
+  "shell",
+  "dumpsys",
+  "activity",
+  "services",
+  packageName,
+]);
+
+const sessionForegroundActive = () => {
+  const record = sessionServiceDump().split("* ServiceRecord{")
+    .find((value) => value.includes(sessionServiceClass));
+  return record?.includes("isForeground=true") === true &&
+    record.includes("foregroundId=22068");
+};
+
+const waitForSessionService = async (expected, timeout = 30_000) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (sessionForegroundActive() === expected) return;
+    await wait(250);
+  }
+  throw new Error(
+    `Android session service did not become ${expected ? "foreground" : "inactive"}: ${sessionServiceComponent}`,
+  );
+};
+
 const transferJobServiceRunning = () =>
   transferServiceDump().includes(transferJobServiceClass);
+
+const transferForegroundServiceRunning = () =>
+  transferServiceDump().includes(transferServiceClass);
+
+const usesUserInitiatedTransferJob = () => androidSdkVersion() >= 34;
 
 const transferJobState = () => {
   try {
@@ -138,17 +185,24 @@ const transferJobState = () => {
 const transferJobRunning = () =>
   ["pending", "active", "ready", "waiting"].some((state) => transferJobState().includes(state));
 
-const waitForTransferJob = async (expected, timeout = 5_000) => {
+const transferOwnerState = () => usesUserInitiatedTransferJob()
+  ? transferJobState() || "unknown"
+  : transferForegroundServiceRunning() ? "foreground-service" : "stopped";
+
+const transferOwnerRunning = () => usesUserInitiatedTransferJob()
+  ? transferJobRunning()
+  : transferForegroundServiceRunning();
+
+const waitForTransferOwner = async (expected, timeout = 5_000) => {
   const deadline = Date.now() + timeout;
   let lastState = "unknown";
   while (Date.now() < deadline) {
-    lastState = transferJobState() || "unknown";
-    if (transferJobRunning() === expected) return lastState;
+    lastState = transferOwnerState();
+    if (transferOwnerRunning() === expected) return lastState;
     await wait(250);
   }
   throw new Error(
-    `UIDT job did not become ${expected ? "active or pending" : "stopped"}: ` +
-    `job=${transferJobId}, state=${lastState}`,
+    `Android transfer owner did not become ${expected ? "active" : "stopped"}: ${lastState}`,
   );
 };
 
@@ -313,6 +367,9 @@ const runAndroidDocumentsProviderChecks = async () => {
     throw new Error(`Syncpeer DocumentsProvider is not registered for ${documentsProviderAuthority}.`);
   }
   runAdb(["shell", "am", "force-stop", packageName]);
+  // DocumentsUI keeps its picker task alive across app restarts.  Start a
+  // fresh picker so its provider-root cache is rebuilt for this installation.
+  runAdb(["shell", "am", "force-stop", "com.android.documentsui"]);
   runAdb([
     "shell",
     "am",
@@ -324,18 +381,16 @@ const runAndroidDocumentsProviderChecks = async () => {
     "-t",
     "text/plain",
   ]);
-  await wait(1_000);
-  runAdb([
-    "shell",
-    "uiautomator",
-    "dump",
-    "/sdcard/syncpeer-documents-provider.xml",
-  ]);
-  const picker = runAdb(["shell", "cat", "/sdcard/syncpeer-documents-provider.xml"]);
-  if (!picker.includes("com.google.android.documentsui") || !picker.includes("Syncpeer")) {
-    throw new Error("Android document picker did not offer the Syncpeer provider.");
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    await wait(500);
+    const picker = await captureUiHierarchy("/sdcard/syncpeer-documents-provider.xml");
+    if (picker.includes("com.android.documentsui") && picker.includes("Syncpeer")) {
+      console.log(`Android DocumentsProvider registered and offered by DocumentsUI at ${documentsProviderAuthority}.`);
+      return;
+    }
   }
-  console.log(`Android DocumentsProvider registered and offered by DocumentsUI at ${documentsProviderAuthority}.`);
+  throw new Error("Android document picker did not offer the Syncpeer provider.");
 };
 
 const readUiDownloadState = async (cdp, name) => cdp.evaluate(`(() => {
@@ -454,9 +509,20 @@ const tauriInvoke = (cdp, command, args = undefined, timeout = 30_000) => cdp.ev
   }
 })()`, timeout);
 
-const notificationUiXml = () => {
-  runAdb(["shell", "uiautomator", "dump", "/sdcard/syncpeer-notifications.xml"]);
-  return runAdb(["shell", "cat", "/sdcard/syncpeer-notifications.xml"]);
+const captureUiHierarchy = async (path, timeout = 15_000) => {
+  const deadline = Date.now() + timeout;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      runAdb(["shell", "rm", "-f", path]);
+      runAdb(["shell", "uiautomator", "dump", path]);
+      return runAdb(["shell", "cat", path]);
+    } catch (error) {
+      lastError = error;
+      await wait(500);
+    }
+  }
+  throw lastError ?? new Error(`Android UI hierarchy was not written to ${path}.`);
 };
 
 const notificationBounds = (xml, text) => {
@@ -518,7 +584,7 @@ const waitForNotificationBounds = async (text, timeout = 15_000) => {
   runAdb(["shell", "cmd", "statusbar", "expand-notifications"]);
   let expanded = false;
   while (Date.now() < deadline) {
-    const xml = notificationUiXml();
+    const xml = await captureUiHierarchy("/sdcard/syncpeer-notifications.xml");
     const bounds = notificationBounds(xml, text);
     if (bounds) return bounds;
     if (!expanded) {
@@ -600,16 +666,18 @@ const waitForTransferNotificationText = async (texts, timeout = 15_000) => {
   let latest = { transferRecords: [] };
   while (Date.now() < deadline) {
     latest = appNotificationRecords();
-    if (
-      latest.transferRecords.length === 1 &&
-      texts.every((text) => latest.transferRecords[0].includes(text))
-    ) {
-      return latest.transferRecords[0];
+    const matching = latest.transferRecords.filter((record) =>
+      texts.every((text) => record.includes(text)),
+    );
+    if (matching.length > 0) {
+      // API 29 can briefly expose the foreground-service notification and its
+      // replacement as separate dump records while Android drains the queue.
+      return matching[matching.length - 1];
     }
     await wait(250);
   }
   throw new Error(
-    `Expected one transfer notification containing ${texts.join(", ")}; ` +
+    `Expected a transfer notification containing ${texts.join(", ")}; ` +
     `found ${latest.transferRecords.length}.`,
   );
 };
@@ -631,7 +699,7 @@ const runAndroidDownloadNotificationRegression = async () => {
     }
     await clearTransferNotifications(cdp);
     await startAndroidBlobDownload(cdp, false);
-    await waitForTransferJob(true, 15_000);
+    await waitForTransferOwner(true, 15_000);
     const notificationState = await waitForActiveTransferNotification(
       Math.min(downloadTimeoutMs, 60_000),
     );
@@ -697,7 +765,7 @@ const runUserInitiatedTransferLifecycle = async (cdp) => {
   await tauriInvoke(cdp, "syncpeer_android_start_transfer_service", {
     request: { label: "Android UIDT E2E transfer" },
   });
-  const scheduledState = await waitForTransferJob(true, 15_000);
+  const scheduledState = await waitForTransferOwner(true, 15_000);
   await tauriInvoke(cdp, "syncpeer_android_update_transfer_notification", {
     request: {
       title: "Syncpeer download",
@@ -720,17 +788,20 @@ const runUserInitiatedTransferLifecycle = async (cdp) => {
   await waitForTransferNotificationText(["Syncpeer transfers", "2 active"]);
   runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
   await wait(1_000);
-  const backgroundState = await waitForTransferJob(true, 15_000);
-  if (!transferJobServiceRunning()) {
+  const backgroundState = await waitForTransferOwner(true, 15_000);
+  if (usesUserInitiatedTransferJob() && !transferJobServiceRunning()) {
     throw new Error(`UIDT JobService is not running: ${transferJobServiceComponent}`);
+  }
+  if (!usesUserInitiatedTransferJob() && !transferForegroundServiceRunning()) {
+    throw new Error(`Foreground transfer service is not running: ${transferServiceComponent}`);
   }
   const notificationDump = runAdb(["shell", "dumpsys", "notification", "--noredact"]);
   if (!notificationDump.includes("syncpeer-transfers")) {
     throw new Error("UIDT transfer notification channel was not created.");
   }
   console.log(
-    `Android UIDT job stayed active in background; ` +
-    `service=${transferJobServiceComponent}, ` +
+    `Android transfer owner stayed active in background; ` +
+    `service=${usesUserInitiatedTransferJob() ? transferJobServiceComponent : transferServiceComponent}, ` +
     `states=${scheduledState}/${backgroundState}, notification channel present: true`,
   );
 
@@ -738,7 +809,7 @@ const runUserInitiatedTransferLifecycle = async (cdp) => {
   console.log("Android UIDT notification tap returned to the app.");
 
   await tauriInvoke(cdp, "syncpeer_android_stop_transfer_service");
-  await waitForTransferJob(false);
+  await waitForTransferOwner(false);
   await tauriInvoke(cdp, "syncpeer_android_update_transfer_notification", {
     request: {
       title: "Syncpeer transfers complete",
@@ -922,6 +993,38 @@ const openAndroidConnection = async (cdp) => {
   );
 };
 
+const runAndroidBackgroundSessionLifecycle = async (cdp) => {
+  // The visibility handoff must close the WebView-owned session before the
+  // service starts its own core session.  The service remains in the same app
+  // process, but its foreground notification and component are observable
+  // through Android's service manager while the Activity is backgrounded.
+  runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+  await waitForSessionService(true);
+  const notificationDump = runAdb(["shell", "dumpsys", "notification", "--noredact"]);
+  if (!notificationDump.includes("syncpeer-session-v1")) {
+    throw new Error("Android background session notification channel was not created.");
+  }
+
+  cdp.close();
+  runAdb(["shell", "monkey", "-p", packageName, "1"]);
+  await assertForeground();
+  await waitForSessionService(false);
+  const foregroundCdp = await connectCdp();
+  try {
+    await waitForUiCondition(
+      foregroundCdp,
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+      "foreground session after background-service handoff",
+      120_000,
+    );
+    console.log(`Android session ownership handoff passed: ${sessionServiceComponent}`);
+    return foregroundCdp;
+  } catch (error) {
+    foregroundCdp.close();
+    throw error;
+  }
+};
+
 const openAndroidFolder = async (cdp, clearCache = false) => {
   if (clearCache) {
     await clickUiTestId(cdp, "tab-devices");
@@ -1088,7 +1191,7 @@ const runAndroidBackgroundDownload = async (cdp) => {
   );
 };
 
-const transferRuntimeRunning = () => transferJobRunning();
+const transferRuntimeRunning = () => transferOwnerRunning();
 
 const waitForTransferRuntime = async (expected, timeout = 5_000) => {
   const deadline = Date.now() + timeout;
@@ -1130,12 +1233,12 @@ const runAndroidForceStopScenario = async () => {
     if (state !== "active") {
       throw new Error(`Force-stop test download was not active: ${state}`);
     }
-    await waitForTransferJob(true, 15_000);
+    await waitForTransferOwner(true, 15_000);
     runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
     await wait(500);
     runAdb(["shell", "am", "force-stop", packageName]);
     await waitForPackageStopped();
-    await waitForTransferJob(false, 10_000);
+    await waitForTransferOwner(false, 10_000);
   } finally {
     cdp.close();
     stopTransferService();
@@ -1172,7 +1275,7 @@ const runAndroidNetworkLossScenario = async () => {
     if (state !== "active") {
       throw new Error(`Network-loss test download was not active: ${state}`);
     }
-    await waitForTransferJob(true, 15_000);
+    await waitForTransferOwner(true, 15_000);
     runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
     await wait(500);
     setAirplaneMode(true);
@@ -1224,14 +1327,14 @@ const runAndroidDozeScenario = async () => {
     if (state !== "active") {
       throw new Error(`Doze test download was not active: ${state}`);
     }
-    await waitForTransferJob(true, 15_000);
+    await waitForTransferOwner(true, 15_000);
     runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
     await wait(500);
     setDeviceIdle(true);
     deviceIdle = true;
     await wait(5_000);
     processAliveDuringDoze = Boolean(packagePid());
-    const idleState = transferJobState() || "unknown";
+    const idleState = transferOwnerState();
     setDeviceIdle(false);
     deviceIdle = false;
     cdp.close();
@@ -1273,13 +1376,21 @@ const runAndroidDozeScenario = async () => {
 };
 
 const runOptionalAndroidNetworkWorkflow = async () => {
+  if (skipNetworkWorkflow) {
+    console.log("Android network UI workflow skipped by the self-contained emulator runner.");
+    return;
+  }
   if (!serverDeviceId) {
     console.log("Android network UI workflow skipped: set SYNCPEER_DEV_SERVER_DEVICE_ID or save server-device-id.");
     return;
   }
   let cdp = await connectCdp();
   try {
-    if (await openAndroidConnection(cdp)) await runAndroidBackgroundDownload(cdp);
+    if (await openAndroidConnection(cdp)) {
+      cdp = await runAndroidBackgroundSessionLifecycle(cdp);
+      await openAndroidConnection(cdp);
+      await runAndroidBackgroundDownload(cdp);
+    }
   } finally {
     cdp.close();
     stopTransferService();
@@ -1291,7 +1402,7 @@ const runOptionalAndroidNetworkWorkflow = async () => {
 };
 
 const runAndroidFilesystemChecks = async (cdp) => {
-  if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1") {
+  if (requireDocumentRuntime) {
     await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=tab-devices]")', "application navigation ready");
     await clickUiTestId(cdp, "tab-devices");
     if (!await cdp.evaluate('document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"')) {
@@ -1343,6 +1454,28 @@ const runAndroidFilesystemChecks = async (cdp) => {
   }
 };
 
+const runModernAndroidServiceSmoke = async () => {
+  if (!usesUserInitiatedTransferJob()) {
+    throw new Error("Modern Android smoke requires Android 14 (API 34) or newer.");
+  }
+  const cdp = await launchAndroidApp(true);
+  try {
+    await tauriInvoke(cdp, "syncpeer_android_start_transfer_service", {
+      request: { label: "Android modern service smoke" },
+    });
+    await waitForTransferOwner(true, 15_000);
+    if (!transferJobServiceRunning()) {
+      throw new Error(`UIDT JobService is not running: ${transferJobServiceComponent}`);
+    }
+    await tauriInvoke(cdp, "syncpeer_android_stop_transfer_service");
+    await waitForTransferOwner(false, 10_000);
+    console.log("Modern Android user-initiated transfer service smoke passed.");
+  } finally {
+    cdp.close();
+    stopTransferService();
+  }
+};
+
 const main = async () => {
   runAdb(["wait-for-device"], 60_000);
 
@@ -1358,11 +1491,16 @@ const main = async () => {
     );
   }
 
-  if (androidSdkVersion() < 34) {
-    console.log("Android E2E skipped: Android 14 (API 34) or newer is required.");
-    return;
+  const sdkVersion = androidSdkVersion();
+  if (expectedSdk && sdkVersion !== expectedSdk) {
+    throw new Error(`Expected Android API ${expectedSdk}, found API ${sdkVersion}.`);
   }
   grantNotificationPermission();
+
+  if (modernSmoke) {
+    await runModernAndroidServiceSmoke();
+    return;
+  }
 
   if (process.env.SYNCPEER_ANDROID_NETWORK_ONLY === "1") {
     runAdb(["shell", "am", "force-stop", packageName]);
@@ -1379,8 +1517,15 @@ const main = async () => {
     "-p", "packages/tauri-shell/src-tauri/gen/android",
     ":tauri-plugin-syncpeer-android:connectedDebugAndroidTest",
     "--no-daemon", "--console=plain",
-  ], { stdio: "inherit", timeout: 240_000 });
-  if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1" || rebootForDocumentRuntimeCheck) {
+  ], {
+    stdio: "inherit",
+    timeout: 240_000,
+    env: {
+      ...process.env,
+      ...(requireDocumentRuntime ? { SYNCPEER_REQUIRE_DOCUMENT_RUNTIME: "1" } : {}),
+    },
+  });
+  if (requireDocumentRuntime || rebootForDocumentRuntimeCheck) {
     // Gradle removes its test package after the suite. Install a fresh synthetic
     // fixture for process/reboot acceptance sequences, then remove it below.
     const testApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/build/outputs/apk/androidTest/debug/tauri-plugin-syncpeer-android-debug-androidTest.apk";
@@ -1394,7 +1539,7 @@ const main = async () => {
         runDocumentInstrumentation("rememberedSecretSurvivesRebootPhase", "vaultRebootPhase", "load");
         console.log("Android Keystore-backed unlock secret survived a real reboot.");
       }
-      if (process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME === "1") {
+      if (requireDocumentRuntime) {
         for (const phase of ["seed", "unlocked", "lock", "locked"]) {
           runDocumentInstrumentation(
             phase === "seed" ? "pickerUsesRegisteredEncryptedFilesAndKeystoreWithoutAnActivity" : "vaultReopensAfterProcessRestart",

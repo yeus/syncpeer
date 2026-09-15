@@ -8,6 +8,8 @@ import type {
   SyncpeerHostAdapter,
   SyncpeerPlatformAdapter,
   SyncpeerTlsSocket,
+  ConnectOptions,
+  SyncpeerProfileSettings,
   FileDownloadSink,
 } from "@syncpeer/core/browser";
 import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
@@ -455,6 +457,21 @@ export const createTauriAdapters = (
   };
 
   const platformAdapter: SyncpeerPlatformAdapter = {
+    startBackgroundSession: platform === "android" ? async (options: Omit<ConnectOptions, "sharedFolders">) => {
+      let allowMetered = false;
+      try {
+        const settings = await documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
+        allowMetered = settings.profile.allowMetered;
+      } catch {
+        // A locked vault keeps the safer default: background sessions wait for Wi-Fi.
+      }
+      await invokeWithLogging("syncpeer_android_start_background_session", {
+        request: { operation: "connect", options: { ...options, allowMetered } },
+      });
+    } : undefined,
+    stopBackgroundSession: platform === "android" ? async () => {
+      await invokeWithLogging("syncpeer_android_stop_background_session");
+    } : undefined,
     readTextFile: async (path: string): Promise<string> =>
       invokeWithLogging<string>("syncpeer_read_text_file", { request: { path } }),
     readBinaryFile: async (path: string): Promise<Uint8Array> => {

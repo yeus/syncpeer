@@ -274,7 +274,7 @@ export async function runFilesystemConformance(request: (request: NativeFilesyst
           throw new Error("Native encrypted archive cannot recover the deleted contents.");
         }
       } finally { archivedMetadata.fileKey.fill(0); }
-      await reopened.remove(".syncpeer-folder-marker", false);
+      await reopened.remove(".stfolder", true);
       try {
         await replica.scan();
         throw new Error("Replica scanned storage after its marker disappeared");

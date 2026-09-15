@@ -18,6 +18,7 @@ import org.junit.Assume.assumeTrue
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
+import java.io.File
 
 /** Starts the runtime from an application Context; no Activity or WebView is created. */
 @RunWith(AndroidJUnit4::class)
@@ -139,6 +140,28 @@ class DocumentRuntimeServiceTest {
       }
       else -> fail("Unknown Keystore reboot phase: $phase")
     }
+  }
+
+  @Test fun backgroundSessionRequestIsEncryptedAndCanBeReloadedByAnotherServiceInstance() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val store = BackgroundSessionStore(context)
+    assumeTrue("Background-session persistence requires an unlocked device", VaultSecretStore(context).isDeviceUnlocked())
+    val request = JSONObject()
+      .put("operation", "connect")
+      .put("options", JSONObject().put("host", "synthetic.invalid").put("port", 22000))
+      .toString()
+    val file = File(context.noBackupFilesDir, "syncpeer.vault.background-session.secret")
+    try {
+      store.clear()
+      store.save(request)
+      assertEquals(request, BackgroundSessionStore(context).load())
+      if (file.exists()) {
+        assertFalse("The persisted request must not be plaintext", String(file.readBytes(), Charsets.UTF_8).contains("synthetic.invalid"))
+      }
+    } finally {
+      store.clear()
+    }
+    assertNull(store.load())
   }
 
   @Test fun vaultReopensAfterProcessRestart() {

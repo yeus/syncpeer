@@ -322,11 +322,7 @@ impl ReplicaRoots {
         }
         self.roots.remove(&id);
         self.guards.remove(&id);
-        if self.locks.remove(&id).is_some() {
-            if let Some(db) = self.metadata.get(&id) {
-                let _ = std::fs::remove_file(db.directory.join("operation.lock"));
-            }
-        }
+        self.locks.remove(&id);
         self.metadata.remove(&id);
         self.metadata_prefixes.remove(&id);
         cleanup_error.map_or(Ok(()), Err)
@@ -363,7 +359,10 @@ impl ReplicaRoots {
             .get(&id)
             .ok_or_else(|| invalid("Metadata unavailable"))?;
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create_new(true);
+        // The file is persistent metadata. The OS lock, rather than file
+        // creation, owns exclusion so a crash cannot leave a permanently busy
+        // replica and unlock cannot race a newly opened lock file.
+        options.read(true).write(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -403,9 +402,6 @@ impl ReplicaRoots {
             file.unlock()?;
         }
         self.locks.remove(&id);
-        if let Some(db) = self.metadata.get(&id) {
-            std::fs::remove_file(db.directory.join("operation.lock"))?;
-        }
         Ok(())
     }
 
@@ -1214,7 +1210,9 @@ mod tests {
         roots.initialize_replica(second).unwrap();
         roots.acquire(first).unwrap();
         assert!(roots.acquire(first).is_err());
-        assert!(roots.acquire(second).is_err());
+        let competing = roots.acquire(second).unwrap_err();
+        assert_eq!(competing.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(competing.to_string(), "Replica root is busy");
         roots.release(first).unwrap();
         roots.acquire(second).unwrap();
         roots.unlock(second).unwrap();

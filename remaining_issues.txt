@@ -74,3 +74,43 @@ Catalog and platform acceptance
   reboot coverage is useful but is not a power-loss guarantee.
 - Add the deferred browser storage adapter (for example SQLite WASM) while
   preserving the same core storage contract.
+
+At-rest encryption hardening
+----------------------------
+
+- Encrypt the folder registry and keyless ciphertext-history index while
+  preserving locked operation; document any unavoidable structural leakage.
+- Move legacy `favorites.json`, `settings.json`, `cache-index.json`, partial
+  transfer metadata, and WebView state out of plaintext storage. Never retain a
+  folder-password fallback or inline private key in unencrypted localStorage.
+- Protect the default `cli-node/key.pem` with the platform credential store or a
+  documented encrypted identity container.
+- Make Android SAF output and the legacy download cache an explicit export
+  boundary, or encrypt those files before writing them outside the document
+  replica.
+
+Personal-space transition (not yet complete)
+--------------------------------------------
+
+- Synchronize the reserved encrypted settings folder only among explicitly
+  paired owned Syncpeer devices. The local wrapped root
+  key must remain device-specific; synchronize encrypted settings and transfer
+  the shared key through verified pairing instead. A separate core-only offline
+  backup format now exists, but still needs a safe user-facing export/import
+  workflow and recovery acceptance test.
+- Add verified owned-device pairing over LAN/relay, stable device slots,
+  revocation, replacement, and propagation of membership to other owned
+  devices. Keep external Syncthing shares and introducers separate.
+- Persist and apply versioned folder-share targets and device-scoped favorites
+  through the encrypted settings folder. The core merge and share-resolution
+  rules exist, but are not yet connected to BEP or the UI.
+- Add the explicit, confirmed local-only fresh start before dropping legacy
+  vault/settings formats. Never wipe external selected folders or remote peers.
+- Encrypt native and CLI metadata databases with managed SQLCipher keys;
+  protect native and CLI device-private identity keys; remove plaintext
+  WebView/legacy secret fallbacks only after the reset path is operational.
+- Add end-to-end recovery, compromise rekey, mixed-Syncthing interoperability,
+  Android service/reboot, and physical-device acceptance tests for the above.
+- Move the memory-hard bootstrap KDF off the UI thread. Noble's async scrypt
+  yields only to microtasks and does not let timers/rendering run; use a worker
+  or an owned native background executor before claiming responsive unlock.

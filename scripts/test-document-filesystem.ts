@@ -5,7 +5,7 @@ import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFil
 import { deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 
-test("automatic folder storage starts empty and retains folder roots and downloaded files across restarts", async () => {
+test("first-run folder storage requires a recoverable master password and retains files across restarts", async () => {
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
   const options = { profileId: "fixture", deviceCounterId: "42", openStorage,
@@ -14,7 +14,8 @@ test("automatic folder storage starts empty and retains folder roots and downloa
       save: async (value: string) => { secret = value; }, remove: async () => { secret = null; },
     } };
   let documents = createDocumentFilesystem(options);
-  assert.equal((await documents.initialize(true)).vault.phase, "unlocked");
+  assert.equal((await documents.initialize()).vault.phase, "uninitialized");
+  await documents.createVault("synthetic-master-password", true);
   assert.deepEqual(await documents.list("syncpeer-root"), []);
   await documents.rememberFolder({ id: "photos", label: "Photos" });
   const [photos] = await documents.list("syncpeer-root");
@@ -26,7 +27,7 @@ test("automatic folder storage starts empty and retains folder roots and downloa
   await documents.rememberFolder({ id: "music", label: "Music" });
   await documents.close();
   documents = createDocumentFilesystem(options);
-  assert.equal((await documents.initialize(true)).vault.phase, "unlocked");
+  assert.equal((await documents.initialize()).vault.phase, "unlocked");
   const folders = await documents.list("syncpeer-root");
   assert.deepEqual(folders.map(folder => folder.name), ["Photos", "Music"]);
   assert.equal(folders[0].id, photos.id);
@@ -35,13 +36,13 @@ test("automatic folder storage starts empty and retains folder roots and downloa
   await documents.close();
 });
 
-test("automatic setup does not publish a vault when secure storage cannot retain its key", async () => {
+test("automatic setup does not create an unrecoverable vault when secure storage is unavailable", async () => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage,
     profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => null, save: async () => {}, remove: async () => {},
     } });
-  await assert.rejects(documents.initialize(true), /verification failed/);
+  assert.equal((await documents.initialize()).vault.phase, "uninitialized");
   assert.equal((await documents.status()).vault.phase, "uninitialized");
   await documents.close();
 });
@@ -54,7 +55,8 @@ test("directory catalogs stay encrypted and cache eviction preserves favorites a
     rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => secret,
       save: async (value: string) => { secret = value; }, remove: async () => { secret = null; } } };
   const documents = createDocumentFilesystem(options);
-  await documents.initialize(true);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", true);
   await documents.register({ id: "folder", label: "Folder", password: "synthetic-password" });
   await documents.attachDownloads("folder");
   await documents.saveDirectorySnapshot("folder", "synthetic-device", "", {

@@ -19,6 +19,13 @@ keyed by namespace and ID; storage adapters do not interpret encrypted values.
 This does not change BEP or add a Taskyon protocol. Future Taskyon integration
 should adapt its records/blobs boundary, not share live database files over P2P.
 
+For the complete platform storage tree and the distinction between encrypted
+values, app-private files, and visible structural metadata, see
+[`LOCAL_STORAGE.md`](./LOCAL_STORAGE.md). “Opaque” means that the adapter does
+not interpret a value; it does not mean every record is cryptographically
+encrypted. Core's encrypted record formats are protected before they reach
+SQLite, while compatibility records and database structure may remain visible.
+
 ## What is stored
 
 The Node selected-folder adapter stores each replica entry and folder baseline

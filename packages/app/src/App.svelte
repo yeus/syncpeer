@@ -125,6 +125,8 @@
 
   async function loadFolderCredentials() {
     if (!folderCredentials) return;
+    const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
+    if (status.vault.phase !== "unlocked") return;
     const saved = await folderCredentials.load();
     for (const [id, password] of Object.entries(app.passwords.saved)) {
       if (saved[id] !== undefined && saved[id] !== password) throw new Error("Conflicting saved folder passwords require review.");
@@ -286,7 +288,8 @@
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
     void (async () => {
-      if (biometric && (await biometric.status()).enabled) {
+      if (biometric && (await biometric.status()).enabled &&
+        (await documentCommand<{ vault: { phase: string } }>({ operation: "status" })).vault.phase === "locked") {
         await unlockWithBiometric();
       } else await loadFolderCredentials();
       await Promise.all([
@@ -451,6 +454,15 @@
       </section>
     {/if}
     <main class="content" data-testid="app-content" bind:this={contentElement}>
+      {#if app.ui.showStabilityNotice}
+        <section class="panel" data-testid="stability-notice">
+          <p>Syncpeer is still experimental. Keep a verified copy of important files on another Syncthing peer or in a separate backup; do not rely on this app as your only copy.</p>
+          <button type="button" class="ghost" onclick={() => {
+            app.ui.showStabilityNotice = false;
+            persistState(app);
+          }}>I understand</button>
+        </section>
+      {/if}
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
           <p class="error">{app.ui.recentError}</p>

@@ -1,7 +1,7 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { deriveUntrustedFolderCrypto, encryptUntrustedFilename } from "../core/model/untrusted.js";
 import { createCredentialVault, type RememberedUnlockSecretStore } from "./credentialVault.js";
-import { createCredentialVaultStorage } from "./credentialVaultStorage.js";
+import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } from "./credentialVaultStorage.js";
 import { createFolderRegistry, type FolderRegistration } from "./folderRegistry.js";
 import { createFolderRegistryStorage } from "./folderRegistryStorage.js";
 import { createEncryptedReplicaStorage } from "./encryptedReplicaStorage.js";
@@ -65,6 +65,7 @@ export function createDocumentFilesystem(options: {
   };
   const vault = createCredentialVault({ profileId: options.profileId, randomBytes: options.randomBytes,
     storage: createCredentialVaultStorage(options.profile, options.profile), rememberedSecret: options.rememberedSecret,
+    bootstrapStorage: createPersonalSpaceBootstrapStorage(options.profile, options.profile),
     revokeAccess: revoke });
   const randomId = async () => [...await options.randomBytes(16)].map(byte => byte.toString(16).padStart(2, "0")).join("");
   const versionId = async () => `${Date.now()}-${await randomId()}`;
@@ -218,9 +219,8 @@ export function createDocumentFilesystem(options: {
     await saveCacheAccess(bytes, key, options.randomBytes, access);
   };
   return {
-    initialize: (automatic = false) => run(async () => {
+    initialize: () => run(async () => {
       await options.profile.initializeReplica(); await vault.initialize();
-      if (automatic && vault.status().phase === "uninitialized") await vault.createDeviceProtected();
       await openRegistrations(); return status();
     }),
     status: () => run(status),

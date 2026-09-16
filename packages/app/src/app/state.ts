@@ -78,6 +78,7 @@ export const loadPersistedState = () => {
     directorySortMode?: FileEntrySortMode;
     theme?: Partial<ThemePreferences>;
     expertView?: boolean;
+    stabilityNoticeAcknowledged?: boolean;
     pim?: {
       enabled?: boolean;
       contactsEnabled?: boolean;
@@ -125,6 +126,7 @@ export const persistState = (state: AppState) => {
       directorySortMode: state.ui.directorySortMode,
       theme: state.ui.theme,
       expertView: state.ui.expertView,
+      stabilityNoticeAcknowledged: !state.ui.showStabilityNotice,
       pim: state.pim,
     }),
   );
@@ -294,6 +296,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       directoryNameFilter: "",
       theme: normalizeThemePreferences(persisted?.theme),
       expertView: persisted?.expertView === true,
+      showStabilityNotice: persisted?.stabilityNoticeAcknowledged !== true,
     },
     sync: {
       isSyncingStarredFiles: false,

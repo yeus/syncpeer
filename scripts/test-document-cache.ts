@@ -150,7 +150,8 @@ test("discovery retains empty roots across peers and only downloads enter the lo
       isDeviceUnlocked: async () => true, load: async () => secret,
       save: async value => { secret = value; }, remove: async () => { secret = null; },
     } });
-  await documents.initialize(true);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", true);
   const legacyFavorite = { key: "folder:photos:", folderId: "photos", path: "", name: "Photos", kind: "folder" as const };
   let legacyFavorites = [legacyFavorite];
   const cache = createDocumentCache({ enabled: () => true,
@@ -329,7 +330,8 @@ test("encrypted folders can be migrated back to verified plaintext storage", asy
     profile: await openStorage("profile"), randomBytes, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => secret, save: async value => { secret = value; }, remove: async () => { secret = null; },
     } });
-  await documents.initialize(true);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", true);
   const records: Array<CachedFileRecord> = [], localBytes = new Map<string, Uint8Array>();
   let corruptPlaintext = false;
   const legacy = {
@@ -376,7 +378,10 @@ test("encrypted downloads resume verified ranges after a document runtime restar
         isDeviceUnlocked: async () => true, load: async () => secret,
         save: async value => { secret = value; }, remove: async () => { secret = null; },
       } });
-    await documents.initialize(true);
+    await documents.initialize();
+    if ((await documents.status()).vault.phase === "uninitialized") {
+      await documents.createVault("synthetic-master-password", true);
+    }
     return documents;
   };
   const openCache = (documents: Awaited<ReturnType<typeof openDocuments>>) => createDocumentCache({ enabled: () => true,

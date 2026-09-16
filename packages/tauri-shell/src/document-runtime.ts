@@ -103,7 +103,7 @@ async function startDocuments(android: AndroidRuntime) {
     availableBytes: async () => Number(await request({ method: "availableBytes" })),
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
       remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true } });
-  await documents.initialize(true);
+  await documents.initialize();
   return {
     command: (input: unknown) => dispatchDocumentCommand(documents, input),
     close: documents.close,

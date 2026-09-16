@@ -44,6 +44,7 @@ All contributor/development/build-target documentation lives in:
 
 - [DEVELOPMENT.md](./DEVELOPMENT.md)
 - [SQLite storage and migration](./SQLITE_STORAGE.md)
+- [Local storage and encryption map](./LOCAL_STORAGE.md)
 
 ## For contributors
 

@@ -12,6 +12,24 @@ import {
   persistState,
 } from "../packages/app/src/app/state.ts";
 
+test("stability warning appears on first run and stays dismissed", () => {
+  assert.equal(createInitialState(null).ui.showStabilityNotice, true);
+  assert.equal(createInitialState({ stabilityNoticeAcknowledged: true }).ui.showStabilityNotice, false);
+});
+
+test("stability warning dismissal is persisted without storing private state", t => {
+  let written = "";
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true,
+    value: { localStorage: { setItem: (_key: string, value: string) => { written = value; } } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  state.ui.showStabilityNotice = false;
+  persistState(state);
+  assert.equal(JSON.parse(written).stabilityNoticeAcknowledged, true);
+});
+
 test("secure credentials are excluded from browser persistence", t => {
   let written = "";
   const previous = Object.getOwnPropertyDescriptor(globalThis, "window");

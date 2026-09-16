@@ -133,9 +133,9 @@
     {/if}
   {:else if status?.vault.phase === "uninitialized"}
     <form onsubmit={event => { event.preventDefault(); void createProfile(); }}>
-      <label>Master password <input type="password" bind:value={masterPassword} autocomplete="new-password" required /></label>
+      <label>Master password (at least 16 characters) <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" required /></label>
       <label><input type="checkbox" bind:checked={rememberMaster} /> Remember with the operating system’s protected credential store</label>
-      <button type="button" onclick={generatePassword}>Generate recovery password</button>
+      <button type="button" onclick={generatePassword}>Generate local master password</button>
       {#if generatedPassword}
         <p><code>{generatedPassword}</code></p>
         <label><input type="checkbox" bind:checked={generatedSaved} /> I saved this recovery password</label>
@@ -149,8 +149,8 @@
     </form>
     <p>New folders receive a random password stored securely on this device. Creating a local folder does not automatically share it with another device.</p>
     <form onsubmit={event => { event.preventDefault(); void saveMasterPassword(); }}>
-      <label>Set local master password <input type="password" bind:value={masterPassword} autocomplete="new-password" required /></label>
-      <button disabled={busy || !masterPassword}>Save master password</button>
+      <label>Change personal-space master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" required /></label>
+      <button disabled={busy || !masterPassword}>Change master password</button>
     </form>
     {#if biometricState}
       <p>Biometric unlock is {biometricState.enabled ? "enabled" : "disabled"}.</p>

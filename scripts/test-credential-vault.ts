@@ -2,10 +2,115 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createCredentialVault } from "../packages/core/dist/sync/credentialVault.js";
-import { createCredentialVaultStorage } from "../packages/core/dist/sync/credentialVaultStorage.js";
+import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } from "../packages/core/dist/sync/credentialVaultStorage.js";
 import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { deriveUntrustedFolderCrypto } from "@syncpeer/core/filesystem";
 import { writeEncryptedRecord } from "../packages/core/dist/sync/encryptedRecord.js";
+
+test("new personal-space vault wraps one stable random key instead of re-encrypting settings on password change", async () => {
+  let record: unknown = null;
+  let bootstrap: unknown = null;
+  const options = { profileId: "personal-space-fixture", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async (value: unknown) => { record = structuredClone(value); },
+      withLock: async <T>(operation: () => Promise<T>) => operation() },
+    bootstrapStorage: { load: async () => structuredClone(bootstrap),
+      save: async (value: unknown) => { bootstrap = structuredClone(value); },
+      remove: async () => { bootstrap = null; } },
+    revokeAccess: async () => {} };
+  const vault = createCredentialVault(options);
+  await vault.create("old-synthetic-master", false);
+  await vault.addFolder("photos", "synthetic-folder-secret");
+  assert.equal((record as { format: number }).format, 2);
+  assert.equal(JSON.stringify(bootstrap).includes("personal-space-fixture"), false);
+  const originalCiphertext = (record as { ciphertext: number[] }).ciphertext;
+  const savedBootstrap = bootstrap;
+  bootstrap = null;
+  await vault.close();
+  await assert.rejects(createCredentialVault(options).unlock("old-synthetic-master"));
+  bootstrap = savedBootstrap;
+  const changing = createCredentialVault(options);
+  await changing.unlock("old-synthetic-master");
+  await changing.changeMasterPassword("new-synthetic-master");
+  assert.deepEqual((record as { ciphertext: number[] }).ciphertext, originalCiphertext);
+  await changing.close();
+  const reopened = createCredentialVault(options);
+  await assert.rejects(reopened.unlock("old-synthetic-master"));
+  await reopened.unlock("new-synthetic-master");
+  assert.equal(await reopened.folderPassword("photos"), "synthetic-folder-secret");
+  await reopened.close();
+});
+
+test("offline recovery backup restores settings with a new device password and no old device secret", async () => {
+  const makeStorage = () => {
+    let record: unknown = null, bootstrap: unknown = null;
+    return { profileId: "recovery-fixture", randomBytes,
+      storage: { load: async () => structuredClone(record), save: async (value: unknown) => { record = structuredClone(value); },
+        withLock: async <T>(operation: () => Promise<T>) => operation() },
+      bootstrapStorage: { load: async () => structuredClone(bootstrap),
+        save: async (value: unknown) => { bootstrap = structuredClone(value); },
+        remove: async () => { bootstrap = null; } },
+      revokeAccess: async () => {} };
+  };
+  const first = createCredentialVault(makeStorage());
+  await first.create("first-device-password", false);
+  await first.addFolder("photos", "synthetic-folder-secret");
+  const backup = await first.exportRecoveryBackup("separate-offline-recovery-password");
+  assert.equal(JSON.stringify(backup).includes("synthetic-folder-secret"), false);
+  await first.changeMasterPassword("rotated-first-device-password");
+  await first.close();
+  const second = createCredentialVault(makeStorage());
+  await assert.rejects(second.restoreRecoveryBackup(backup, "wrong-recovery-password", "second-device-password"));
+  assert.equal(second.status().phase, "uninitialized");
+  await second.restoreRecoveryBackup(backup, "separate-offline-recovery-password", "second-device-password");
+  assert.equal(await second.folderPassword("photos"), "synthetic-folder-secret");
+  await second.close();
+  const tampered = structuredClone(backup);
+  tampered.vault.ciphertext[0] ^= 1;
+  const third = createCredentialVault(makeStorage());
+  await assert.rejects(third.restoreRecoveryBackup(tampered, "separate-offline-recovery-password", "third-device-password"));
+  assert.equal(third.status().phase, "uninitialized");
+});
+
+test("personal-space password change rolls back when its recovery record cannot be saved", async () => {
+  let record: unknown = null, bootstrap: unknown = null, remembered: string | null = null;
+  let failNextBootstrapSave = false;
+  const options = { profileId: "personal-space-rollback", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async (value: unknown) => { record = structuredClone(value); },
+      withLock: async <T>(operation: () => Promise<T>) => operation() },
+    bootstrapStorage: { load: async () => structuredClone(bootstrap), save: async (value: unknown) => {
+      if (failNextBootstrapSave) { failNextBootstrapSave = false; throw new Error("synthetic bootstrap failure"); }
+      bootstrap = structuredClone(value);
+    }, remove: async () => { bootstrap = null; } },
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => remembered,
+      save: async (value: string) => { remembered = value; }, remove: async () => { remembered = null; } },
+    revokeAccess: async () => {} };
+  const vault = createCredentialVault(options);
+  await vault.create("old-synthetic-master", true);
+  failNextBootstrapSave = true;
+  await assert.rejects(vault.changeMasterPassword("new-synthetic-master"), /bootstrap failure/);
+  assert.equal(remembered, "old-synthetic-master");
+  await vault.close();
+  const reopened = createCredentialVault(options);
+  await assert.rejects(reopened.unlock("new-synthetic-master"));
+  await reopened.unlock("old-synthetic-master");
+  await reopened.close();
+});
+
+test("failed first vault publication never deletes a possibly committed recovery key", async () => {
+  let record: unknown = null, bootstrap: unknown = null;
+  const options = { profileId: "personal-space-uncertain-write", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async (value: unknown) => {
+      record = structuredClone(value);
+      throw new Error("synthetic flush failure after commit");
+    }, withLock: async <T>(operation: () => Promise<T>) => operation() },
+    bootstrapStorage: { load: async () => structuredClone(bootstrap),
+      save: async (value: unknown) => { bootstrap = structuredClone(value); },
+      remove: async () => { bootstrap = null; } },
+    revokeAccess: async () => {} };
+  await assert.rejects(createCredentialVault(options).create("synthetic-master-password", false), /flush failure/);
+  assert.equal((record as { format: number }).format, 2);
+  assert.notEqual(bootstrap, null);
+});
 
 test("successful manual unlock repairs remembered access after a temporary secure-store failure", async () => {
   let record: unknown = null;
@@ -160,6 +265,21 @@ test("vault record storage uses bounded atomic native byte writes and rejects ch
   } }, options);
   await assert.rejects(changing.load(), /changed/);
   await reopened.close();
+});
+
+test("personal-space recovery is a separate bounded record without readable IDs or passwords", async () => {
+  const { storage, files } = memoryReplicaStorage();
+  const options = { withLock: async <T>(operation: () => Promise<T>) => operation(), checkHealth: async () => {} };
+  const vault = createCredentialVault({ profileId: "synthetic-profile", randomBytes,
+    storage: createCredentialVaultStorage(storage, options),
+    bootstrapStorage: createPersonalSpaceBootstrapStorage(storage, options), revokeAccess: async () => {} });
+  await vault.create("synthetic-master-password", false);
+  assert.equal(files.has(".syncpeer-space"), true);
+  assert.equal(files.has(".syncpeer-vault-record"), true);
+  const visible = new TextDecoder().decode(files.get(".syncpeer-space")!.bytes);
+  assert.equal(visible.includes("synthetic-master-password"), false);
+  assert.equal(visible.includes("synthetic-profile"), false);
+  await vault.close();
 });
 
 test("vault encrypts independent folder credentials and persists manual lock", async () => {

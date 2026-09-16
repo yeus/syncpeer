@@ -101,7 +101,7 @@ const main = async (): Promise<void> => {
     {
       name: "Encrypted filesystem format",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-encrypted-filesystem.ts", "scripts/test-native-filesystem.ts", "scripts/test-replica-persistence.ts", "scripts/test-encrypted-replica.ts", "scripts/test-credential-vault.ts"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-encrypted-filesystem.ts", "scripts/test-native-filesystem.ts", "scripts/test-replica-persistence.ts", "scripts/test-encrypted-replica.ts", "scripts/test-credential-vault.ts", "scripts/test-personal-space.ts", "scripts/test-personal-space-sharing.ts", "scripts/test-personal-space-changes.ts"],
     },
     {
       name: "Tauri document sink recovery",

@@ -2,12 +2,21 @@ import { deriveUntrustedFolderCrypto } from "../core/model/untrusted.js";
 import { readEncryptedRecord, writeEncryptedRecord } from "./encryptedRecord.js";
 import { FOLDER_PASSWORD_SCOPE_SEPARATOR, isScopedFolderPasswordKey } from "../ui/sessionPasswords.js";
 import { normalizeProfileSettings, type SyncpeerProfileSettings } from "./profileSettings.js";
+import { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap,
+  personalVaultKey, wrapPersonalSpaceBootstrap, type PersonalSpace, type PersonalSpaceBootstrap } from "./personalSpaceBootstrap.js";
 
 export interface CredentialVaultRecord {
-  format: 1;
+  format: 1 | 2;
   manualLocked: boolean;
   remember: boolean;
   ciphertext: number[];
+}
+
+/** Portable encrypted snapshot; it contains no device identity or remembered unlock secret. */
+export interface PersonalSpaceRecoveryBackup {
+  format: 1;
+  bootstrap: PersonalSpaceBootstrap;
+  vault: CredentialVaultRecord;
 }
 
 interface VaultData {
@@ -33,7 +42,7 @@ const password = (value: unknown): string => {
 const decodeRecord = (value: unknown): CredentialVaultRecord | null => {
   if (value === null) return null;
   const record = value as CredentialVaultRecord;
-  if (!record || record.format !== 1 || typeof record.manualLocked !== "boolean" || typeof record.remember !== "boolean" ||
+  if (!record || (record.format !== 1 && record.format !== 2) || typeof record.manualLocked !== "boolean" || typeof record.remember !== "boolean" ||
     !Array.isArray(record.ciphertext) || !record.ciphertext.length || record.ciphertext.length > 2 * 1024 * 1024 ||
     record.ciphertext.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid credential vault record.");
   return record;
@@ -66,6 +75,11 @@ export function createCredentialVault(options: {
     save: (record: CredentialVaultRecord) => Promise<void>;
     withLock: <T>(operation: () => Promise<T>) => Promise<T>;
   };
+  bootstrapStorage?: {
+    load: () => Promise<unknown>;
+    save: (record: PersonalSpaceBootstrap) => Promise<void>;
+    remove: () => Promise<void>;
+  };
   rememberedSecret?: RememberedUnlockSecretStore;
   /** Revoke plaintext views/handles; locked ciphertext sync is a separate capability. */
   revokeAccess: () => Promise<void>;
@@ -73,6 +87,7 @@ export function createCredentialVault(options: {
   if (typeof options.profileId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(options.profileId)) throw new Error("Invalid vault profile.");
   const vaultId = `syncpeer-vault:${options.profileId}`;
   let key: Uint8Array | undefined;
+  let personalSpace: PersonalSpace | undefined;
   let initialized = false;
   let remembered = false;
   let issue: string | undefined;
@@ -89,7 +104,7 @@ export function createCredentialVault(options: {
   };
   const revoke = async () => {
     try { await options.revokeAccess(); }
-    finally { key?.fill(0); key = undefined; }
+    finally { key?.fill(0); personalSpace?.rootKey.fill(0); key = undefined; personalSpace = undefined; }
   };
   const read = async (record: CredentialVaultRecord, secret: Uint8Array) => {
     const ciphertext = new Uint8Array(record.ciphertext);
@@ -97,7 +112,8 @@ export function createCredentialVault(options: {
       readRange: async (offset, size) => ciphertext.slice(offset, offset + size) }, secret, ".syncpeer-vault");
     try { return decodeData(bytes); } finally { bytes.fill(0); }
   };
-  const encrypt = async (data: VaultData, secret: Uint8Array, record: Pick<CredentialVaultRecord, "manualLocked" | "remember">) => {
+  const encrypt = async (data: VaultData, secret: Uint8Array,
+    record: Pick<CredentialVaultRecord, "format" | "manualLocked" | "remember">) => {
     const bytes = new TextEncoder().encode(JSON.stringify(data));
     let ciphertext = new Uint8Array();
     try {
@@ -109,23 +125,29 @@ export function createCredentialVault(options: {
           return { write: async (offset, chunk) => { ciphertext.set(chunk, offset); }, commit: async () => {},
             abort: async () => { ciphertext.fill(0); } };
         } });
-      const result: CredentialVaultRecord = { format: 1, ...record, ciphertext: Array.from(ciphertext) };
+      const result: CredentialVaultRecord = { ...record, ciphertext: Array.from(ciphertext) };
       return result;
     } finally { bytes.fill(0); }
   };
-  const save = async (data: VaultData, secret: Uint8Array, record: Pick<CredentialVaultRecord, "manualLocked" | "remember">) => {
+  const save = async (data: VaultData, secret: Uint8Array,
+    record: Pick<CredentialVaultRecord, "format" | "manualLocked" | "remember">) => {
     const result = await encrypt(data, secret, record);
     await options.storage.save(result);
     return result;
   };
   const unlock = async (masterPassword: string, record: CredentialVaultRecord) => {
-    const derived = await deriveUntrustedFolderCrypto(vaultId, password(masterPassword));
+    if (record.format === 2 && !options.bootstrapStorage) throw new Error("Personal-space recovery storage is unavailable.");
+    const space = record.format === 2
+      ? openPersonalSpaceBootstrap(await options.bootstrapStorage!.load() as PersonalSpaceBootstrap, password(masterPassword))
+      : undefined;
+    const secret = space ? personalVaultKey(space)
+      : (await deriveUntrustedFolderCrypto(vaultId, password(masterPassword))).folderKey;
     try {
-      await read(record, derived.folderKey); // Wrong passwords/corruption never reset the vault.
+      await read(record, secret); // Wrong passwords/corruption never reset the vault.
       await options.storage.save({ ...record, manualLocked: false });
-      key?.fill(0); key = derived.folderKey;
+      key?.fill(0); personalSpace?.rootKey.fill(0); key = secret; personalSpace = space;
       initialized = true; remembered = record.remember; issue = undefined;
-    } catch (error) { derived.folderKey.fill(0); throw error; }
+    } catch (error) { secret.fill(0); space?.rootKey.fill(0); throw error; }
   };
   const unlocked = async () => {
     if (!key) throw new Error("Credential vault is locked.");
@@ -166,7 +188,8 @@ export function createCredentialVault(options: {
         await options.rememberedSecret.save(secret);
         if (await options.rememberedSecret.load() !== secret) throw new Error("Secure device storage verification failed.");
         derived = await deriveUntrustedFolderCrypto(vaultId, secret);
-        await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey, { manualLocked: false, remember: true });
+        await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey,
+          { format: 1, manualLocked: false, remember: true });
         key = derived.folderKey; initialized = true; remembered = true; issue = undefined;
         return status();
       } catch (error) { derived?.folderKey.fill(0); throw error; }
@@ -189,13 +212,61 @@ export function createCredentialVault(options: {
     create: (masterPassword: string, remember = true) => run(async () => {
       if (key || initialized) throw new Error("Credential vault already initialized; recover missing storage instead of replacing it.");
       if (decodeRecord(await options.storage.load())) throw new Error("Credential vault already exists.");
+      if (options.bootstrapStorage) {
+        if (await options.bootstrapStorage.load() !== null) throw new Error("Personal-space recovery record already exists.");
+        const { record: bootstrap, space } = await createPersonalSpaceBootstrap(password(masterPassword), options.randomBytes);
+        let secret: Uint8Array | undefined;
+        try {
+          await options.bootstrapStorage.save(bootstrap);
+          secret = personalVaultKey(space);
+          const record = await save({ format: 1, defaultPassword: null, folders: {} }, secret,
+            { format: 2, manualLocked: false, remember: false });
+          key = secret; personalSpace = space; initialized = true;
+          if (remember) await rememberSecret(masterPassword, record);
+          return status();
+        } catch (error) {
+          if (!initialized) {
+            secret?.fill(0);
+            space.rootKey.fill(0);
+            // A failed save may have committed the vault before its flush failed.
+            // Keep the wrapped root key so that record remains recoverable.
+          }
+          throw error;
+        }
+      }
       const derived = await deriveUntrustedFolderCrypto(vaultId, password(masterPassword));
       try {
-        const record = await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey, { manualLocked: false, remember: false });
+        const record = await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey,
+          { format: 1, manualLocked: false, remember: false });
         key = derived.folderKey; initialized = true;
         if (remember) await rememberSecret(masterPassword, record);
         return status();
       } catch (error) { derived.folderKey.fill(0); throw error; }
+    }),
+    exportRecoveryBackup: (recoveryPassword: string) => run(async (): Promise<PersonalSpaceRecoveryBackup> => {
+      const { record } = await unlocked();
+      if (record.format !== 2 || !personalSpace) throw new Error("Only personal-space profiles can be backed up.");
+      const bootstrap = await wrapPersonalSpaceBootstrap(personalSpace, recoveryPassword, options.randomBytes);
+      return { format: 1, bootstrap, vault: { ...record, manualLocked: false, remember: false } };
+    }),
+    restoreRecoveryBackup: (backup: PersonalSpaceRecoveryBackup, recoveryPassword: string,
+      localMasterPassword: string) => run(async () => {
+      if (!options.bootstrapStorage) throw new Error("Personal-space recovery storage is unavailable.");
+      if (key || initialized || decodeRecord(await options.storage.load()) ||
+        await options.bootstrapStorage.load() !== null) throw new Error("Local profile already exists; recovery cannot replace it.");
+      if (!backup || backup.format !== 1) throw new Error("Invalid personal-space recovery backup.");
+      const record = decodeRecord(backup.vault);
+      if (!record || record.format !== 2) throw new Error("Invalid personal-space recovery backup.");
+      const space = openPersonalSpaceBootstrap(backup.bootstrap, password(recoveryPassword));
+      const secret = personalVaultKey(space);
+      try {
+        await read(record, secret);
+        const localBootstrap = await wrapPersonalSpaceBootstrap(space, password(localMasterPassword), options.randomBytes);
+        await options.bootstrapStorage.save(localBootstrap);
+        await options.storage.save({ ...record, manualLocked: false, remember: false });
+        key = secret; personalSpace = space; initialized = true; remembered = false; issue = undefined;
+        return status();
+      } catch (error) { secret.fill(0); space.rootKey.fill(0); throw error; }
     }),
     unlock: (masterPassword: string) => run(async () => {
       const record = decodeRecord(await options.storage.load());
@@ -214,11 +285,33 @@ export function createCredentialVault(options: {
     changeMasterPassword: (newPassword: string) => run(async () => {
       const { record, data } = await unlocked();
       const nextPassword = password(newPassword);
+      if (record.format === 2) {
+        if (!options.bootstrapStorage || !personalSpace) throw new Error("Personal-space recovery storage is unavailable.");
+        const current = await options.bootstrapStorage.load() as PersonalSpaceBootstrap;
+        const oldPassword = await options.rememberedSecret?.load();
+        const next = await wrapPersonalSpaceBootstrap(personalSpace, nextPassword, options.randomBytes);
+        try {
+          if (record.remember && options.rememberedSecret) await options.rememberedSecret.save(nextPassword);
+          await options.bootstrapStorage.save(next);
+          issue = undefined;
+          return status();
+        } catch (error) {
+          if (record.remember && options.rememberedSecret) {
+            if (oldPassword) await options.rememberedSecret.save(oldPassword).catch(() => {});
+            else await options.rememberedSecret.remove().catch(() => {});
+          }
+          await options.bootstrapStorage.save(current).catch(() => {
+            issue = "Master password change needs recovery; try the previous password.";
+          });
+          throw error;
+        }
+      }
       const oldKey = key!;
       const oldRemembered = await options.rememberedSecret?.load();
       const derived = await deriveUntrustedFolderCrypto(vaultId, nextPassword);
       try {
-        const nextRecord = await encrypt(data, derived.folderKey, { manualLocked: false, remember: record.remember });
+        const nextRecord = await encrypt(data, derived.folderKey,
+          { format: 1, manualLocked: false, remember: record.remember });
         if (record.remember && options.rememberedSecret) await options.rememberedSecret.save(nextPassword);
         await options.storage.save(nextRecord);
         oldKey.fill(0);

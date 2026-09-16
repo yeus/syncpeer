@@ -17,8 +17,15 @@ export type { CiphertextIndex, CiphertextFolderIdentity } from "./sync/ciphertex
 export { createCiphertextReplica } from "./sync/ciphertextReplica.js";
 export { openCiphertextView } from "./sync/ciphertextView.js";
 export { createCredentialVault } from "./sync/credentialVault.js";
-export type { CredentialVaultRecord, RememberedUnlockSecretStore } from "./sync/credentialVault.js";
-export { createCredentialVaultStorage } from "./sync/credentialVaultStorage.js";
+export type { CredentialVaultRecord, PersonalSpaceRecoveryBackup, RememberedUnlockSecretStore } from "./sync/credentialVault.js";
+export { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } from "./sync/credentialVaultStorage.js";
+export { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap, rewrapPersonalSpaceBootstrap,
+  personalVaultKey, settingsFolderPassword, wrapPersonalSpaceBootstrap } from "./sync/personalSpaceBootstrap.js";
+export type { PersonalSpace, PersonalSpaceBootstrap } from "./sync/personalSpaceBootstrap.js";
+export { resolveFolderShareDevices, settingsFolderDevices } from "./sync/personalSpaceSharing.js";
+export type { FolderShareTarget, OwnedSpaceDevice } from "./sync/personalSpaceSharing.js";
+export { resolvePersonalSpaceChanges } from "./sync/personalSpaceChanges.js";
+export type { PersonalSpaceChange } from "./sync/personalSpaceChanges.js";
 export { createDocumentFilesystem } from "./sync/documentFilesystem.js";
 export { dispatchDocumentCommand } from "./sync/documentCommands.js";
 export { createDocumentCache } from "./sync/documentCache.js";

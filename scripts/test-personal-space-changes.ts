@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { resolvePersonalSpaceChanges } from "../packages/core/dist/sync/personalSpaceChanges.js";
+import { defaultProfileSettings, defaultFolderSettings, resolveDeviceProfileSettings } from
+  "../packages/core/dist/sync/profileSettings.js";
 
 test("changes to unrelated settings merge regardless of arrival order", () => {
   const changes = [
@@ -65,4 +67,23 @@ test("a hidden ancestry cycle is rejected even if another branch has a head", ()
     { id: "b", deviceId: "phone", path: ["profile", "name"], parents: ["a"], value: "B" },
     { id: "c", deviceId: "laptop", path: ["profile", "name"], parents: [], value: "C" },
   ]), /cyclic/i);
+});
+
+test("device settings override global values and favorites default to this device", () => {
+  const global = defaultProfileSettings();
+  global.profile.allowMetered = true;
+  global.profile.cache.minimumBytes = 0;
+  global.profile.cache.maximumBytes = 1000;
+  global.folders.photos = { ...defaultFolderSettings(), favorites: [
+    { folderId: "photos", key: "file:photos:remote", path: "remote", name: "Remote", kind: "file" },
+  ] };
+  const local = { profile: { allowMetered: false }, folders: { photos: { favorites: [
+    { folderId: "photos", key: "file:photos:local", path: "local", name: "Local", kind: "file" },
+  ] } } };
+  const effective = resolveDeviceProfileSettings(global, local);
+  assert.equal(effective.profile.allowMetered, false);
+  assert.equal(effective.profile.cache.maximumBytes, 1000);
+  assert.equal(effective.folders.photos.favorites[0].path, "local");
+  assert.deepEqual(resolveDeviceProfileSettings(global, {}).folders.photos.favorites, []);
+  assert.equal(resolveDeviceProfileSettings(global, { profile: {} }).profile.allowMetered, true);
 });

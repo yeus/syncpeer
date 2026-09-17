@@ -22,6 +22,14 @@ export interface SyncpeerProfileSettings {
   devices: Record<string, { allowMetered?: boolean }>;
 }
 
+/** Device-scoped values travel in the shared encrypted settings folder but apply only here. */
+export interface DeviceProfileOverrides {
+  profile?: Partial<Omit<SyncpeerProfileSettings["profile"], "cache">> & {
+    cache?: Partial<SyncpeerProfileSettings["profile"]["cache"]>;
+  };
+  folders?: Record<string, Partial<SyncpeerFolderSettings>>;
+}
+
 export const defaultProfileSettings = (): SyncpeerProfileSettings => ({
   format: 1,
   profile: {
@@ -103,6 +111,23 @@ export function normalizeProfileSettings(value: unknown): SyncpeerProfileSetting
   return { format: 1, profile: { versioning: profile.versioning as FolderVersioningMode,
     preserveLocalChanges: profile.preserveLocalChanges, cache: { ...cache }, allowMetered: profile.allowMetered,
     autoMount: profile.autoMount }, folders, devices };
+}
+
+/** Missing local keys inherit global settings; favorites and exclusions belong to each device. */
+export function resolveDeviceProfileSettings(global: SyncpeerProfileSettings,
+  local: DeviceProfileOverrides): SyncpeerProfileSettings {
+  const baseline = normalizeProfileSettings(global);
+  const folders = Object.fromEntries([...new Set([
+    ...Object.keys(baseline.folders), ...Object.keys(local.folders ?? {}),
+  ])].map(id => {
+    const shared = baseline.folders[id] ?? defaultFolderSettings();
+    const device = local.folders?.[id];
+    return [id, { ...shared, ...device,
+      favorites: device?.favorites ?? [], exclusions: device?.exclusions ?? [] }];
+  }));
+  return normalizeProfileSettings({ ...baseline,
+    profile: { ...baseline.profile, ...local.profile,
+      cache: { ...baseline.profile.cache, ...local.profile?.cache } }, folders });
 }
 
 export const cacheQuotaBytes = (availableBytes: number, settings: SyncpeerProfileSettings["profile"]["cache"]) => {

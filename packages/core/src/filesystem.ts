@@ -22,8 +22,11 @@ export { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } fro
 export { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap, rewrapPersonalSpaceBootstrap,
   personalVaultKey, settingsFolderPassword, wrapPersonalSpaceBootstrap } from "./sync/personalSpaceBootstrap.js";
 export type { PersonalSpace, PersonalSpaceBootstrap } from "./sync/personalSpaceBootstrap.js";
-export { resolveFolderShareDevices, settingsFolderDevices } from "./sync/personalSpaceSharing.js";
-export type { FolderShareTarget, OwnedSpaceDevice } from "./sync/personalSpaceSharing.js";
+export { resolveFolderShareDevices, settingsFolderDevices, signOwnedRosterUpdate, verifyOwnedRoster } from "./sync/personalSpaceSharing.js";
+export type { FolderShareTarget, OwnedSpaceDevice, OwnedRosterUpdate } from "./sync/personalSpaceSharing.js";
+export { createPairingInvitation, createPairingRequest, openPairingSession,
+  sealPairingTransfer, openPairingTransfer } from "./sync/personalSpacePairing.js";
+export type { PairingInvitation, PairingRequest, PairingTransfer } from "./sync/personalSpacePairing.js";
 export { resolvePersonalSpaceChanges } from "./sync/personalSpaceChanges.js";
 export type { PersonalSpaceChange } from "./sync/personalSpaceChanges.js";
 export { createDocumentFilesystem } from "./sync/documentFilesystem.js";

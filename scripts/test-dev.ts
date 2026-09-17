@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
-import { createLanFixture } from "./lan-test/syncthing.ts";
+import { createLanFixture, resetLanFixturePeers } from "./lan-test/syncthing.ts";
 import { buildLanApp, runLanWdio } from "./lan-test/tauri-runner.ts";
 import type { PendingSyncthingDevice } from "./lan-test/approval.ts";
 import {
@@ -159,6 +159,21 @@ const main = async (): Promise<number> => {
   const serverMode = process.argv.includes("--server");
   const clientMode = process.argv.includes("--client");
   const uiSmokeMode = process.argv.includes("--ui-smoke");
+  const resetOnly = process.argv.includes("--reset-only");
+  const resetPeers = resetOnly || process.argv.includes("--reset");
+  const serverRoot = (): string => path.resolve(
+    process.env.SYNCPEER_DEV_SERVER_ROOT ?? ".tmp/syncpeer-dev-server",
+  );
+  if (resetOnly) {
+    if (serverMode || clientMode) {
+      throw new Error("--reset-only cannot be combined with --server or --client.");
+    }
+    await resetLanFixturePeers(serverRoot());
+    return 0;
+  }
+  if (resetPeers && !serverMode) {
+    throw new Error("The --reset option requires --server.");
+  }
   if (serverMode === clientMode) {
     throw new Error("Choose exactly one of --server or --client.");
   }
@@ -166,10 +181,8 @@ const main = async (): Promise<number> => {
     throw new Error("The --ui-smoke option requires --client.");
   }
   if (serverMode) {
-    const serverRoot = path.resolve(
-      process.env.SYNCPEER_DEV_SERVER_ROOT ?? ".tmp/syncpeer-dev-server",
-    );
-    return runServer(serverRoot);
+    if (resetPeers) await resetLanFixturePeers(serverRoot());
+    return runServer(serverRoot());
   }
   const clientRoot = path.resolve(
     process.env.SYNCPEER_DEV_CLIENT_ROOT ?? ".tmp/syncpeer-dev-client",

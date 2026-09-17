@@ -326,6 +326,19 @@ require an inbound firewall rule or the test coordinator. Its identity,
 approved clients, fixture folders, and logs persist under
 `.tmp/syncpeer-dev-server/` across restarts.
 
+Approved clients live in `.tmp/syncpeer-dev-server/syncthing/config.xml`. To
+clear every accepted client while keeping the server device ID, stop the server
+and run:
+
+```bash
+npm run test:server:reset          # clear peers and exit
+npm run test:server -- --reset     # clear peers, then start the server
+```
+
+The reset refuses to run while the server is still reachable and preserves
+`cert.pem`/`key.pem`. Delete the whole `.tmp/syncpeer-dev-server/` directory to
+rotate the server device ID as well.
+
 On the development computer, run:
 
 ```bash

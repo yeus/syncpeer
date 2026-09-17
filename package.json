@@ -17,6 +17,7 @@
     "lint": "eslint eslint.config.mjs \"packages/**/*.{js,mjs,cjs,ts,svelte}\" \"scripts/**/*.{js,mjs,cjs,ts,svelte}\"",
     "download:syncthing": "node scripts/download-syncthing.mjs",
     "test:server": "npm run security:scan && node --experimental-strip-types scripts/test-dev.ts --server",
+    "test:server:reset": "node --experimental-strip-types scripts/test-dev.ts --reset-only",
     "test:client": "npm run security:scan && node --experimental-strip-types scripts/test-dev.ts --client",
     "test:lan:server": "npm run security:scan && node --experimental-strip-types scripts/test-lan.ts --server",
     "test:lan:client": "npm run security:scan && node --experimental-strip-types scripts/test-lan.ts --client",

@@ -76,6 +76,41 @@ export const generateSyncthingIdentity = (home: string): {
   };
 };
 
+const fixtureServerIsRunning = async (home: string): Promise<boolean> => {
+  const configPath = path.join(home, "config.xml");
+  if (!fs.existsSync(configPath)) return false;
+  const match = /<gui\b[\s\S]*?<address>127\.0\.0\.1:(\d+)<\/address>/.exec(
+    fs.readFileSync(configPath, "utf8"),
+  );
+  if (!match) return false;
+  return await new Promise<boolean>((resolve) => {
+    const socket = net.connect({ host: "127.0.0.1", port: Number(match[1]) }, () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", () => resolve(false));
+    socket.setTimeout(500, () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+};
+
+/** Removes accepted peers by deleting config.xml; the server identity stays intact. */
+export const resetLanFixturePeers = async (root: string, home?: string): Promise<void> => {
+  const homeDirectory = home ?? path.join(root, "syncthing");
+  const configPath = path.join(homeDirectory, "config.xml");
+  if (!fs.existsSync(configPath)) {
+    console.log("Reset accepted peers: no config.xml found at " + configPath + ".");
+    return;
+  }
+  if (await fixtureServerIsRunning(homeDirectory)) {
+    throw new Error("Refusing to reset peers while the test server is running. Stop it first.");
+  }
+  fs.rmSync(configPath);
+  console.log("Reset accepted peers: removed " + configPath + " (server identity preserved).");
+};
+
 export const readDeviceId = (home: string): string => {
   const certPem = fs.readFileSync(path.join(home, "cert.pem"), "utf8");
   const match = certPem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);

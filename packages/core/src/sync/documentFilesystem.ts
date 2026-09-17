@@ -24,586 +24,1006 @@ import { planVersionRemovals } from "./folderSync.js";
 import { loadCacheAccess, loadDirectorySnapshot, saveCacheAccess,
   saveDirectorySnapshot, type StoredDirectorySnapshot } from "./documentPrivateRecords.js";
 
-/** Single owner used by the UI and native file providers; host adapters only move bytes. */
-export function createDocumentFilesystem(options: {
+type NativeFs = Awaited<ReturnType<typeof createNativeFilesystem>>;
+type Vault = ReturnType<typeof createCredentialVault>;
+type FolderRegistry = ReturnType<typeof createFolderRegistry>;
+type ReplicaFileSource = Awaited<ReturnType<typeof createReplicaFileSource>>;
+type DocumentDraft = Awaited<ReturnType<typeof openDocumentDraft>>;
+
+interface DocumentFilesystemOptions {
   profileId: string;
   deviceCounterId: string;
-  profile: Awaited<ReturnType<typeof createNativeFilesystem>>;
-  openStorage: (id: string) => Promise<Awaited<ReturnType<typeof createNativeFilesystem>>>;
+  profile: NativeFs;
+  openStorage: (id: string) => Promise<NativeFs>;
   rememberedSecret: RememberedUnlockSecretStore;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
   availableBytes: () => Promise<number>;
-}) {
-  const configs = createFolderRegistryStorage(options.profile);
-  const storage = new Map<string, Awaited<ReturnType<typeof options.openStorage>>>();
-  const folderKeys = new Map<string, Uint8Array>();
-  const handles = new Map<number, { documentId: string; reader?: Awaited<ReturnType<typeof createReplicaFileSource>>;
-    writer?: Awaited<ReturnType<typeof openDocumentDraft>>; dirty: boolean; append?: boolean;
-    download?: { size: number; modifiedMs: number; ranges: Array<{ offset: number; end: number }> } }>();
-  const recoveryIssues = new Map<string, string[]>();
-  let registry: ReturnType<typeof createFolderRegistry> | undefined;
-  let nextHandle = 0, closed = false;
-  let queue = Promise.resolve();
-  let closeTask: Promise<void> | undefined;
-  const run = <T>(fn: () => Promise<T>) => {
-    const task = queue.then(() => { if (closed) throw new Error("Documents are closed."); return fn(); });
-    queue = task.then(() => {}, () => {});
-    return task;
-  };
-  const revoke = async () => {
-    const pending = [...handles.values()]; handles.clear();
-    const results = await Promise.allSettled(pending.map(handle => handle.writer?.close()));
-    const registryResult = await Promise.allSettled([registry?.close()]);
-    registry = undefined;
-    // A failed controller/storage close must never retain unlocked folder keys.
-    for (const key of folderKeys.values()) key.fill(0);
-    folderKeys.clear();
-    const storageResults = await Promise.allSettled([...storage.values()].map(bytes => bytes.close()));
-    storage.clear();
-    const errors = [...results, ...registryResult, ...storageResults].filter(result => result.status === "rejected");
-    if (errors.length) throw new Error("Some document handles could not be closed.");
-  };
-  const vault = createCredentialVault({ profileId: options.profileId, randomBytes: options.randomBytes,
-    storage: createCredentialVaultStorage(options.profile, options.profile), rememberedSecret: options.rememberedSecret,
-    bootstrapStorage: createPersonalSpaceBootstrapStorage(options.profile, options.profile),
-    revokeAccess: revoke });
-  const randomId = async () => [...await options.randomBytes(16)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-  const versionId = async () => `${Date.now()}-${await randomId()}`;
-  const versionTime = (path: string) => {
-    const match = /^\.stversions\/(\d{13})-[a-f0-9]{32}$/.exec(path);
-    return match ? Number(match[1]) : null;
-  };
-  const pruneVersions = async (bytes: Awaited<ReturnType<typeof options.openStorage>>, storedPath: string,
-    versioning: "trash" | "simple" | "staggered") => {
-    const roots = await bytes.listDirectory(".stversions");
-    const versions = (await Promise.all(roots.map(async root => {
-      const createdMs = root.type === "directory" ? versionTime(root.path) : null;
-      return createdMs === null || !await bytes.stat(`${root.path}/${storedPath}`)
-        ? null : { id: root.path, createdMs };
-    }))).filter((version): version is { id: string; createdMs: number } => version !== null);
-    for (const root of planVersionRemovals(versions, {
-      externalDeletion: "ignore", versioning,
-      ...(versioning === "staggered" ? { maxAgeMs: 365 * 86_400_000 } : {}),
-    }, Date.now())) {
-      await bytes.remove(`${root}/${storedPath}`, false);
-      if ((await bytes.listDirectory(root)).length === 0) await bytes.remove(root, true);
-    }
-  };
-  const openFolder = async (folder: FolderRegistration) => {
-    const password = await vault.folderPassword(folder.id);
-    if (!password) throw new Error("Folder credentials are unavailable.");
-    const crypto = await deriveUntrustedFolderCrypto(folder.id, password);
-    let bytes: Awaited<ReturnType<typeof options.openStorage>>;
-    try { bytes = await options.openStorage(folder.storageId); }
-    catch (error) { crypto.folderKey.fill(0); throw error; }
-    try {
-      await bytes.initializeReplica();
-      await bytes.withLock(() => removeAbandonedEncryptedScratch(bytes));
-      const encrypted = createEncryptedReplicaStorage(bytes, { folderKey: crypto.folderKey, randomBytes: options.randomBytes,
-        withLock: bytes.withLock, checkHealth: bytes.checkHealth, archive: async (path, originalPath) => {
-          const settings = await vault.profileSettings();
-          const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
-          const selection = classifyFavoritePath({ folderId: folder.id, path: originalPath, kind: "file" },
-            folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
-          if (selection.status !== "favorite" || settings.profile.versioning === "disabled") return;
-          if (!await bytes.stat(".stversions")) await bytes.makeDirectory(".stversions");
-          const versionRoot = ".stversions/" + await versionId();
-          await bytes.makeDirectory(versionRoot);
-          // The original ciphertext path is needed to decrypt archived metadata.
-          await bytes.copy(path, versionRoot + "/" + path);
-          await pruneVersions(bytes, path, settings.profile.versioning);
-        } });
-      const replica = createReplicaController(createFolderReplica(encrypted, options.deviceCounterId, sha256));
-      await replica.scan();
-      recoveryIssues.set(folder.storageId, await recoverDocumentDrafts(bytes, {
-        folderId: folder.id, folderKey: crypto.folderKey, replica, randomBytes: options.randomBytes,
-      }));
-      storage.set(folder.storageId, bytes);
-      folderKeys.set(folder.storageId, crypto.folderKey);
-      return { replica, close: async () => {
-        try { await bytes.close(); } finally {
-          crypto.folderKey.fill(0); folderKeys.delete(folder.storageId); storage.delete(folder.storageId);
-        }
-      } };
-    } catch (error) { crypto.folderKey.fill(0); await bytes.close(); throw error; }
-  };
-  const openRegistrations = async () => {
-    registry ??= createFolderRegistry({ ...configs, open: openFolder });
-    await registry.initialize();
-    if (vault.status().phase === "unlocked") {
-      for (const folder of registry.getState()) {
-        if (await vault.folderPassword(folder.id)) await registry.open(folder.id);
-      }
-    }
-  };
-  const status = async () => ({ vault: vault.status(), folders: await configs.load(), recoveryIssues: [...recoveryIssues.values()].flat() });
-  const resolve = (id: string) => {
-    if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-    const decoded: unknown = JSON.parse(id);
-    if (!Array.isArray(decoded) || decoded.length !== 2 || decoded.some(part => typeof part !== "string")) throw new Error("Invalid document ID.");
-    const [storageId, path] = decoded as [string, string];
-    if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
-    const folder = registry?.getState().find(folder => folder.storageId === storageId);
-    if (!folder) throw new Error("Document folder is unavailable.");
-    const replica = registry!.getReplica(folder.id);
-    if (!replica) throw new Error("Document folder is not open.");
-    return { folder, replica, path, bytes: storage.get(storageId)! };
-  };
-  const entry = (folder: FolderRegistration, path: string, size: number, directory: boolean, modifiedMs = 0) => ({
-    id: JSON.stringify([folder.storageId, path]), name: path ? path.split("/").at(-1)! : folder.label, size, directory, modifiedMs,
+}
+
+interface DocumentHandle {
+  documentId: string;
+  reader?: ReplicaFileSource;
+  writer?: DocumentDraft;
+  dirty: boolean;
+  append?: boolean;
+  download?: { size: number; modifiedMs: number; ranges: Array<{ offset: number; end: number }> };
+}
+
+interface DownloadMetadata {
+  encrypted: boolean;
+  sourceDeviceId?: string;
+  contentId?: string;
+}
+
+interface CacheCandidate {
+  key: string;
+  sizeBytes: number;
+  lastAccessedMs: number;
+  protected: boolean;
+  folder: FolderRegistration;
+  path: string;
+}
+
+interface DocumentRuntime {
+  readonly options: DocumentFilesystemOptions;
+  readonly configs: ReturnType<typeof createFolderRegistryStorage>;
+  readonly storage: Map<string, NativeFs>;
+  readonly folderKeys: Map<string, Uint8Array>;
+  readonly handles: Map<number, DocumentHandle>;
+  readonly recoveryIssues: Map<string, string[]>;
+  vault: Vault;
+  registry: FolderRegistry | undefined;
+  nextHandle: number;
+  closed: boolean;
+  queue: Promise<void>;
+  closeTask: Promise<void> | undefined;
+}
+
+const randomStorageId = async (runtime: DocumentRuntime): Promise<string> =>
+  [...await runtime.options.randomBytes(16)]
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+
+const createVersionId = async (runtime: DocumentRuntime): Promise<string> =>
+  `${Date.now()}-${await randomStorageId(runtime)}`;
+
+const versionTime = (path: string): number | null => {
+  const match = /^\.stversions\/(\d{13})-[a-f0-9]{32}$/.exec(path);
+  return match ? Number(match[1]) : null;
+};
+
+const toEntry = (
+  folder: FolderRegistration,
+  path: string,
+  size: number,
+  directory: boolean,
+  modifiedMs = 0,
+) => ({
+  id: JSON.stringify([folder.storageId, path]),
+  name: path ? path.split("/").at(-1)! : folder.label,
+  size,
+  directory,
+  modifiedMs,
+});
+
+const assertRanges = (ranges: readonly { offset: number; size: number }[]): void => {
+  if (ranges.length > 256 || ranges.some(range => !Number.isSafeInteger(range.offset) || range.offset < 0 ||
+    !Number.isSafeInteger(range.size) || range.size < 0 || !Number.isSafeInteger(range.offset + range.size))) {
+    throw new Error("Invalid document ranges.");
+  }
+};
+
+const hashReplicaFile = async (replica: LocalFolderReplica, path: string): Promise<string> => {
+  const source = await createReplicaFileSource(replica, path), hash = sha256.create();
+  for (let offset = 0; offset < source.size; offset += 131072) {
+    const data = await source.readRange(offset, Math.min(131072, source.size - offset));
+    try { hash.update(data); } finally { data.fill(0); }
+  }
+  return [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+};
+
+const removeReplicaPaths = async (
+  replica: LocalFolderReplica,
+  folderId: string,
+  paths: readonly string[],
+): Promise<void> => {
+  for (const path of [...paths].sort((left, right) => right.length - left.length)) {
+    const current = (await replica.scan()).find(value => value.name === path && !value.deleted);
+    if (!current) continue;
+    await replica.edit!({ method: "delete", folderId, path,
+      modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
+  }
+};
+
+const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>): Promise<T> => {
+  const task = runtime.queue.then(() => {
+    if (runtime.closed) throw new Error("Documents are closed.");
+    return fn();
   });
-  const archivedSource = async (storageId: string, path: string, versionId: string) => {
-    if (!/^(?:\d{13}-)?[a-f0-9]{32}$/.test(versionId)) throw new Error("Invalid document version.");
-    const bytes = storage.get(storageId)!;
-    const key = folderKeys.get(storageId)!;
-    const encrypted = await encryptUntrustedFilename(key, path);
-    const archivePath = `.stversions/${versionId}/${encrypted}`;
-    const stat = await bytes.stat(archivePath);
-    if (!stat || stat.type !== "file") throw new Error("Document version is unavailable.");
-    const source = { size: stat.size, readRange: (offset: number, size: number) => bytes.readRange(archivePath, offset, size) };
-    const metadata = await loadEncryptedDiskMetadata(source, encrypted, key);
-    if (metadata.fileInfo.name !== path) { metadata.fileKey.fill(0); throw new Error("Document version does not match this path."); }
-    return { source, metadata };
-  };
-  const stat = async (id: string) => {
-    const { folder, path, replica } = resolve(id);
-    if (!path) return entry(folder, "", 0, true);
-    const info = (await replica.scan()).find(file => file.name === path && !file.deleted && !file.invalid);
-    if (!info || ![0, 1].includes(Number(info.type ?? 0))) throw new Error("Document is unavailable.");
-    return entry(folder, path, Number(info.size ?? 0), info.type === 1, Number(info.modified_s ?? 0) * 1000);
-  };
-  const writable = async (id: string, truncate: boolean) => {
-    const { folder, replica, path, bytes } = resolve(id);
-    return openDocumentDraft(bytes, { folderId: folder.id, path, truncate, replica,
-      folderKey: folderKeys.get(folder.storageId)!, randomBytes: options.randomBytes });
-  };
-  const handle = (id: number) => {
-    const found = handles.get(id);
-    if (!found) throw new Error("Document handle is closed.");
-    return found;
-  };
-  const write = async (id: number, offset: number, bytes: Uint8Array) => {
-    const value = handle(id); if (!value.writer) throw new Error("Document is read only.");
-    if (value.download && offset + bytes.length > value.download.size) throw new Error("Download write exceeds expected size.");
-    await value.writer.write(value.append ? await value.writer.size() : offset, bytes); value.dirty = true;
-    if (value.download && bytes.length) {
-      value.download.ranges = value.writer.downloadRanges();
+  runtime.queue = task.then(() => {}, () => {});
+  return task;
+};
+
+const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
+  const pending = [...runtime.handles.values()]; runtime.handles.clear();
+  const results = await Promise.allSettled(pending.map(handle => handle.writer?.close()));
+  const registryResult = await Promise.allSettled([runtime.registry?.close()]);
+  runtime.registry = undefined;
+  // A failed controller/storage close must never retain unlocked folder keys.
+  for (const key of runtime.folderKeys.values()) key.fill(0);
+  runtime.folderKeys.clear();
+  const storageResults = await Promise.allSettled([...runtime.storage.values()].map(bytes => bytes.close()));
+  runtime.storage.clear();
+  const errors = [...results, ...registryResult, ...storageResults].filter(result => result.status === "rejected");
+  if (errors.length) throw new Error("Some document handles could not be closed.");
+};
+
+const openFolderStorage = async (
+  runtime: DocumentRuntime,
+  folder: FolderRegistration,
+  folderKey: Uint8Array,
+): Promise<NativeFs> => {
+  let bytes: NativeFs;
+  try { bytes = await runtime.options.openStorage(folder.storageId); }
+  catch (error) { folderKey.fill(0); throw error; }
+  try {
+    await bytes.initializeReplica();
+    await bytes.withLock(() => removeAbandonedEncryptedScratch(bytes));
+    return bytes;
+  } catch (error) { folderKey.fill(0); await bytes.close(); throw error; }
+};
+
+const pruneStoredVersions = async (
+  bytes: NativeFs,
+  storedPath: string,
+  versioning: "trash" | "simple" | "staggered",
+): Promise<void> => {
+  const roots = await bytes.listDirectory(".stversions");
+  const versions = (await Promise.all(roots.map(async root => {
+    const createdMs = root.type === "directory" ? versionTime(root.path) : null;
+    return createdMs === null || !await bytes.stat(`${root.path}/${storedPath}`)
+      ? null : { id: root.path, createdMs };
+  }))).filter((version): version is { id: string; createdMs: number } => version !== null);
+  for (const root of planVersionRemovals(versions, {
+    externalDeletion: "ignore", versioning,
+    ...(versioning === "staggered" ? { maxAgeMs: 365 * 86_400_000 } : {}),
+  }, Date.now())) {
+    await bytes.remove(`${root}/${storedPath}`, false);
+    if ((await bytes.listDirectory(root)).length === 0) await bytes.remove(root, true);
+  }
+};
+
+const createArchiveVersion = (
+  runtime: DocumentRuntime,
+  folder: FolderRegistration,
+  bytes: NativeFs,
+) => async (path: string, originalPath: string): Promise<void> => {
+  const settings = await runtime.vault.profileSettings();
+  const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
+  const selection = classifyFavoritePath({ folderId: folder.id, path: originalPath, kind: "file" },
+    folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
+  if (selection.status !== "favorite" || settings.profile.versioning === "disabled") return;
+  if (!await bytes.stat(".stversions")) await bytes.makeDirectory(".stversions");
+  const versionRoot = ".stversions/" + await createVersionId(runtime);
+  await bytes.makeDirectory(versionRoot);
+  // The original ciphertext path is needed to decrypt archived metadata.
+  await bytes.copy(path, versionRoot + "/" + path);
+  await pruneStoredVersions(bytes, path, settings.profile.versioning);
+};
+
+const makeFolderClose = (
+  runtime: DocumentRuntime,
+  folder: FolderRegistration,
+  bytes: NativeFs,
+  folderKey: Uint8Array,
+) => async (): Promise<void> => {
+  try { await bytes.close(); } finally {
+    folderKey.fill(0); runtime.folderKeys.delete(folder.storageId); runtime.storage.delete(folder.storageId);
+  }
+};
+
+const openFolderRuntime = async (
+  runtime: DocumentRuntime,
+  folder: FolderRegistration,
+) => {
+  const password = await runtime.vault.folderPassword(folder.id);
+  if (!password) throw new Error("Folder credentials are unavailable.");
+  const crypto = await deriveUntrustedFolderCrypto(folder.id, password);
+  const bytes = await openFolderStorage(runtime, folder, crypto.folderKey);
+  try {
+    const encrypted = createEncryptedReplicaStorage(bytes, {
+      folderKey: crypto.folderKey,
+      randomBytes: runtime.options.randomBytes,
+      withLock: bytes.withLock,
+      checkHealth: bytes.checkHealth,
+      archive: createArchiveVersion(runtime, folder, bytes),
+    });
+    const replica = createReplicaController(createFolderReplica(encrypted, runtime.options.deviceCounterId, sha256));
+    await replica.scan();
+    runtime.recoveryIssues.set(folder.storageId, await recoverDocumentDrafts(bytes, {
+      folderId: folder.id, folderKey: crypto.folderKey, replica, randomBytes: runtime.options.randomBytes,
+    }));
+    runtime.storage.set(folder.storageId, bytes);
+    runtime.folderKeys.set(folder.storageId, crypto.folderKey);
+    return { replica, close: makeFolderClose(runtime, folder, bytes, crypto.folderKey) };
+  } catch (error) { crypto.folderKey.fill(0); await bytes.close(); throw error; }
+};
+
+const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> => {
+  runtime.registry ??= createFolderRegistry({
+    ...runtime.configs,
+    open: (folder) => openFolderRuntime(runtime, folder),
+  });
+  await runtime.registry.initialize();
+  if (runtime.vault.status().phase === "unlocked") {
+    for (const folder of runtime.registry.getState()) {
+      if (await runtime.vault.folderPassword(folder.id)) await runtime.registry.open(folder.id);
     }
-  };
-  const checkRanges = (ranges: readonly { offset: number; size: number }[]) => {
-    if (ranges.length > 256 || ranges.some(range => !Number.isSafeInteger(range.offset) || range.offset < 0 ||
-      !Number.isSafeInteger(range.size) || range.size < 0 || !Number.isSafeInteger(range.offset + range.size))) throw new Error("Invalid document ranges.");
-  };
-  const removePaths = async (replica: LocalFolderReplica, folderId: string,
-    paths: readonly string[]) => {
-    for (const path of [...paths].sort((left, right) => right.length - left.length)) {
-      const current = (await replica.scan()).find(value => value.name === path && !value.deleted);
-      if (!current) continue;
-      await replica.edit!({ method: "delete", folderId, path,
-        modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
+  }
+};
+
+const documentStatus = async (runtime: DocumentRuntime) => ({
+  vault: runtime.vault.status(),
+  folders: await runtime.configs.load(),
+  recoveryIssues: [...runtime.recoveryIssues.values()].flat(),
+});
+
+const initializeFilesystem = async (runtime: DocumentRuntime) => {
+  await runtime.options.profile.initializeReplica();
+  await runtime.vault.initialize();
+  await openRegisteredFolders(runtime);
+  return documentStatus(runtime);
+};
+
+const closeFilesystem = (runtime: DocumentRuntime): Promise<void> => {
+  runtime.closed = true;
+  runtime.closeTask ??= runtime.queue.then(async () => {
+    await runtime.vault.close();
+    await runtime.options.profile.close();
+  });
+  return runtime.closeTask;
+};
+
+const resolveDocument = (runtime: DocumentRuntime, id: string) => {
+  if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
+  const decoded: unknown = JSON.parse(id);
+  if (!Array.isArray(decoded) || decoded.length !== 2 || decoded.some(part => typeof part !== "string")) {
+    throw new Error("Invalid document ID.");
+  }
+  const [storageId, path] = decoded as [string, string];
+  if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
+  const folder = runtime.registry?.getState().find(folder => folder.storageId === storageId);
+  if (!folder) throw new Error("Document folder is unavailable.");
+  const replica = runtime.registry!.getReplica(folder.id);
+  if (!replica) throw new Error("Document folder is not open.");
+  return { folder, replica, path, bytes: runtime.storage.get(storageId)! };
+};
+
+const documentStat = async (runtime: DocumentRuntime, id: string) => {
+  const { folder, path, replica } = resolveDocument(runtime, id);
+  if (!path) return toEntry(folder, "", 0, true);
+  const info = (await replica.scan()).find(file => file.name === path && !file.deleted && !file.invalid);
+  if (!info || ![0, 1].includes(Number(info.type ?? 0))) throw new Error("Document is unavailable.");
+  return toEntry(folder, path, Number(info.size ?? 0), info.type === 1, Number(info.modified_s ?? 0) * 1000);
+};
+
+const openWritableDraft = async (
+  runtime: DocumentRuntime,
+  id: string,
+  truncate: boolean,
+) => {
+  const { folder, replica, path, bytes } = resolveDocument(runtime, id);
+  return openDocumentDraft(bytes, { folderId: folder.id, path, truncate, replica,
+    folderKey: runtime.folderKeys.get(folder.storageId)!, randomBytes: runtime.options.randomBytes });
+};
+
+const requireHandle = (runtime: DocumentRuntime, id: number): DocumentHandle => {
+  const found = runtime.handles.get(id);
+  if (!found) throw new Error("Document handle is closed.");
+  return found;
+};
+
+const writeToHandle = async (
+  runtime: DocumentRuntime,
+  id: number,
+  offset: number,
+  bytes: Uint8Array,
+): Promise<void> => {
+  const value = requireHandle(runtime, id);
+  if (!value.writer) throw new Error("Document is read only.");
+  if (value.download && offset + bytes.length > value.download.size) {
+    throw new Error("Download write exceeds expected size.");
+  }
+  await value.writer.write(value.append ? await value.writer.size() : offset, bytes); value.dirty = true;
+  if (value.download && bytes.length) {
+    value.download.ranges = value.writer.downloadRanges();
+  }
+};
+
+const touchCachedFile = async (
+  runtime: DocumentRuntime,
+  folder: FolderRegistration,
+  path: string,
+): Promise<void> => {
+  if (!folder.downloads) return;
+  const bytes = runtime.storage.get(folder.storageId)!, key = runtime.folderKeys.get(folder.storageId)!;
+  const access = await loadCacheAccess(bytes, key);
+  access[path] = Date.now();
+  await saveCacheAccess(bytes, key, runtime.options.randomBytes, access);
+};
+
+const openArchivedSource = async (
+  runtime: DocumentRuntime,
+  storageId: string,
+  path: string,
+  versionId: string,
+) => {
+  if (!/^(?:\d{13}-)?[a-f0-9]{32}$/.test(versionId)) throw new Error("Invalid document version.");
+  const bytes = runtime.storage.get(storageId)!;
+  const key = runtime.folderKeys.get(storageId)!;
+  const encrypted = await encryptUntrustedFilename(key, path);
+  const archivePath = `.stversions/${versionId}/${encrypted}`;
+  const stat = await bytes.stat(archivePath);
+  if (!stat || stat.type !== "file") throw new Error("Document version is unavailable.");
+  const source = { size: stat.size, readRange: (offset: number, size: number) => bytes.readRange(archivePath, offset, size) };
+  const metadata = await loadEncryptedDiskMetadata(source, encrypted, key);
+  if (metadata.fileInfo.name !== path) { metadata.fileKey.fill(0); throw new Error("Document version does not match this path."); }
+  return { source, metadata };
+};
+
+const requireUnlockedRegistry = (runtime: DocumentRuntime): FolderRegistry => {
+  if (runtime.vault.status().phase !== "unlocked" || !runtime.registry) {
+    throw new Error("Document vault is locked.");
+  }
+  return runtime.registry;
+};
+
+const findVisibleFolder = (
+  runtime: DocumentRuntime,
+  folderId: string,
+): FolderRegistration | null => {
+  const registry = requireUnlockedRegistry(runtime);
+  const folder = registry.getState().find(value => value.id === folderId);
+  return folder && registry.getReplica(folderId) ? folder : null;
+};
+
+const requireOpenReplica = (runtime: DocumentRuntime, folderId: string): LocalFolderReplica => {
+  const registry = requireUnlockedRegistry(runtime);
+  const folder = registry.getState().find(value => value.id === folderId);
+  if (!folder) throw new Error("Document folder is unavailable.");
+  const replica = registry.getReplica(folderId);
+  if (!replica) throw new Error("Document folder is not open.");
+  return replica;
+};
+
+const rememberFolderAction = async (
+  runtime: DocumentRuntime,
+  folder: { id: string; label: string },
+) => {
+  if (!runtime.registry) throw new Error("Folder storage is unavailable.");
+  if (!runtime.registry.getState().some(value => value.id === folder.id)) {
+    await runtime.registry.add({ ...folder, storageId: await randomStorageId(runtime) }, false);
+  }
+  return documentStatus(runtime);
+};
+
+const registerFolderAction = async (
+  runtime: DocumentRuntime,
+  folder: { id: string; label: string; password?: string },
+) => {
+  if (!runtime.registry) throw new Error("Folder storage is unavailable.");
+  if (!folder.id.trim() || !folder.label.trim() || folder.id !== folder.id.trim() || folder.label !== folder.label.trim()) {
+    throw new Error("Invalid folder registration.");
+  }
+  const existing = await runtime.vault.folderPassword(folder.id);
+  if (existing === null) await runtime.vault.addFolder(folder.id, folder.password);
+  else if (folder.password !== undefined && folder.password !== existing) {
+    throw new Error("Folder password changes require migration.");
+  }
+  if (runtime.registry.getState().some(value => value.id === folder.id)) await runtime.registry.open(folder.id);
+  else await runtime.registry.add({ id: folder.id, label: folder.label, storageId: await randomStorageId(runtime) });
+  return documentStatus(runtime);
+};
+
+const unlockAfterVaultChange = async (
+  runtime: DocumentRuntime,
+  change: () => Promise<unknown>,
+) => {
+  await change();
+  await openRegisteredFolders(runtime);
+  return documentStatus(runtime);
+};
+
+const attachDownloadsAction = async (runtime: DocumentRuntime, id: string): Promise<void> => {
+  if (runtime.vault.status().phase !== "unlocked" || !runtime.registry) {
+    throw new Error("Document vault is locked.");
+  }
+  await runtime.registry.attachDownloads(id);
+};
+
+const detachDownloadsAction = async (runtime: DocumentRuntime, id: string) => {
+  if (runtime.vault.status().phase !== "unlocked" || !runtime.registry) {
+    throw new Error("Document vault is locked.");
+  }
+  await runtime.registry.detachDownloads(id);
+  return documentStatus(runtime);
+};
+
+const clearFolderContentsAction = async (runtime: DocumentRuntime, folderId: string) => {
+  const replica = requireOpenReplica(runtime, folderId);
+  const paths = (await replica.scan())
+    .filter(value => !value.deleted && !value.invalid && !isInternalReplicaPath(value.name))
+    .map(value => value.name);
+  await removeReplicaPaths(replica, folderId, paths);
+  return documentStatus(runtime);
+};
+
+const loadDirectorySnapshotAction = async (
+  runtime: DocumentRuntime,
+  folderId: string,
+  sourceDeviceId: string,
+  path: string,
+) => {
+  const folder = findVisibleFolder(runtime, folderId);
+  if (!folder) return null;
+  assertReplicaPath(path || "root");
+  return loadDirectorySnapshot(
+    runtime.storage.get(folder.storageId)!,
+    runtime.folderKeys.get(folder.storageId)!,
+    sourceDeviceId,
+    path,
+  );
+};
+
+const saveDirectorySnapshotAction = async (
+  runtime: DocumentRuntime,
+  folderId: string,
+  sourceDeviceId: string,
+  path: string,
+  snapshot: StoredDirectorySnapshot,
+) => {
+  const folder = findVisibleFolder(runtime, folderId);
+  if (!folder) throw new Error("Document folder is unavailable.");
+  assertReplicaPath(path || "root");
+  await saveDirectorySnapshot(runtime.storage.get(folder.storageId)!, {
+    folderKey: runtime.folderKeys.get(folder.storageId)!,
+    randomBytes: runtime.options.randomBytes, sourceDeviceId, path, snapshot,
+  });
+};
+
+const cachedFilesAction = async (
+  runtime: DocumentRuntime,
+  folderId?: string,
+): Promise<CachedFileRecord[]> => {
+  if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
+  const files: CachedFileRecord[] = [];
+  for (const folder of runtime.registry!.getState().filter(folder => folderId ? folder.id === folderId : folder.downloads)) {
+    for (const info of await runtime.registry!.getReplica(folder.id)!.scan()) {
+      if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0) continue;
+      const modifiedMs = Number(info.modified_s ?? 0) * 1000 + Number(info.modified_ns ?? 0) / 1000000;
+      files.push({ key: cachedFileKey(folder.id, info.name), folderId: folder.id, path: info.name,
+        name: info.name.split("/").at(-1)!, sizeBytes: Number(info.size ?? 0), modifiedMs, cachedAtMs: modifiedMs,
+        localPath: "syncpeer-document:" + JSON.stringify([folder.storageId, info.name]),
+        syncBaselineRequired: true,
+        syncBaseline: await loadDocumentBaseline(runtime.storage.get(folder.storageId)!, runtime.folderKeys.get(folder.storageId)!, info.name) });
     }
-  };
-  const digest = async (replica: LocalFolderReplica, path: string) => {
-    const source = await createReplicaFileSource(replica, path), hash = sha256.create();
-    for (let offset = 0; offset < source.size; offset += 131072) {
-      const data = await source.readRange(offset, Math.min(131072, source.size - offset));
+  }
+  return files;
+};
+
+const cachedStatusesAction = async (
+  runtime: DocumentRuntime,
+  folderId: string,
+  paths: string[],
+) => {
+  if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
+  const folder = runtime.registry!.getState().find(folder => folder.id === folderId && folder.downloads);
+  if (!folder) throw new Error("Downloads are not attached.");
+  const files = await runtime.registry!.getReplica(folderId)!.scan();
+  return paths.map(path => {
+    if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
+    const file = files.find(file => file.name === path && !file.deleted && !file.invalid);
+    const available = !path || !!file;
+    return { path, available, localPath: available ? "syncpeer-document:" + JSON.stringify([folder.storageId, path]) : undefined,
+      cachedAtMs: file ? Number(file.modified_s ?? 0) * 1000 : undefined };
+  });
+};
+
+const removeDocumentAction = async (runtime: DocumentRuntime, id: string) => {
+  const file = resolveDocument(runtime, id);
+  const current = await file.replica.scan();
+  const old = current.find(info => info.name === file.path && !info.deleted);
+  if (!old) return false;
+  const paths = old.type === 1
+    ? current.filter(info => !info.deleted && (info.name === file.path || info.name.startsWith(file.path + "/")))
+      .map(info => info.name)
+    : [file.path];
+  await removeReplicaPaths(file.replica, file.folder.id, paths);
+  return true;
+};
+
+const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: string) => {
+  assertReplicaPath(name);
+  if (name.includes("/")) throw new Error("Expected one document name.");
+  const file = resolveDocument(runtime, id), current = await file.replica.scan();
+  const old = current.find(info => info.name === file.path && !info.deleted);
+  if (!old) throw new Error("Document is unavailable.");
+  if (old.type === 1 && current.some(info => !info.deleted && info.name.startsWith(file.path + "/"))) {
+    throw new Error("Non-empty directories cannot be renamed safely.");
+  }
+  const parent = file.path.split("/").slice(0, -1).join("/"), target = parent ? `${parent}/${name}` : name;
+  if (target === file.path) return documentStat(runtime, id);
+  const previousTarget = current.find(info => info.name === target);
+  if (previousTarget && !previousTarget.deleted) throw new Error("A document with that name already exists.");
+  const modifiedMs = Date.now();
+  const created = old.type === 1
+    ? await file.replica.edit!({ method: "mkdir", folderId: file.folder.id, path: target,
+      modifiedMs, expectedVersion: previousTarget?.version ?? null })
+    : await file.replica.edit!({ method: "write", folderId: file.folder.id, path: target, modifiedMs,
+      expectedVersion: previousTarget?.version ?? null, source: await createReplicaFileSource(file.replica, file.path) });
+  try {
+    await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: file.path,
+      modifiedMs, expectedVersion: old.version ?? {} });
+  } catch (error) {
+    await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: target,
+      modifiedMs, expectedVersion: created.version ?? {} }).catch(() => {});
+    throw error;
+  }
+  return documentStat(runtime, JSON.stringify([file.folder.storageId, target]));
+};
+
+const statById = async (runtime: DocumentRuntime, id: string) => {
+  const root = (await runtime.configs.load()).find(folder => id === JSON.stringify([folder.storageId, ""]));
+  return root ? toEntry(root, "", 0, true) : documentStat(runtime, id);
+};
+
+const listEntriesAction = async (runtime: DocumentRuntime, id: string) => {
+  if (id === "syncpeer-root") return (await runtime.configs.load()).map(folder => toEntry(folder, "", 0, true));
+  if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
+  const root = runtime.registry!.getState().find(folder => id === JSON.stringify([folder.storageId, ""]));
+  if (root && !runtime.registry!.getReplica(root.id)) return [];
+  const { folder, path, replica } = resolveDocument(runtime, id);
+  if (!(await documentStat(runtime, id)).directory) throw new Error("Document is not a directory.");
+  const prefix = path ? path + "/" : "";
+  return (await replica.scan()).filter(file => !file.deleted && !file.invalid && [0, 1].includes(Number(file.type ?? 0)) &&
+    file.name.startsWith(prefix) && !file.name.slice(prefix.length).includes("/") && file.name !== path)
+    .map(file => toEntry(folder, file.name, Number(file.size ?? 0), file.type === 1, Number(file.modified_s ?? 0) * 1000));
+};
+
+const createEntryAction = async (
+  runtime: DocumentRuntime,
+  parentId: string,
+  name: string,
+  directory: boolean,
+) => {
+  assertReplicaPath(name); if (name.includes("/")) throw new Error("Expected one document name.");
+  const parent = resolveDocument(runtime, parentId), path = parent.path ? parent.path + "/" + name : name;
+  if (!(await documentStat(runtime, parentId)).directory) throw new Error("Parent is not a directory.");
+  await parent.replica.edit!({ folderId: parent.folder.id, path, modifiedMs: Date.now(), expectedVersion: null,
+    ...(directory ? { method: "mkdir" as const } : { method: "write" as const, source: { size: 0, readRange: async () => new Uint8Array() } }) });
+  return documentStat(runtime, JSON.stringify([parent.folder.storageId, path]));
+};
+
+const assertDownloadRequest = (
+  runtime: DocumentRuntime,
+  size: number,
+  modifiedMs: number,
+  path: string,
+): void => {
+  if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
+  if (runtime.handles.size >= 64) throw new Error("Too many open documents.");
+  if (!Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(modifiedMs) || modifiedMs < 0) {
+    throw new Error("Invalid download metadata.");
+  }
+  assertReplicaPath(path);
+};
+
+const assertExpectedLocalHash = async (
+  replica: LocalFolderReplica,
+  path: string,
+  expectedLocalHash: string | null,
+): Promise<void> => {
+  const current = (await replica.scan()).find(info => info.name === path && !info.deleted);
+  if (expectedLocalHash === null) {
+    if (current) throw new Error("Local document changed before download began.");
+    return;
+  }
+  if (!/^[a-f0-9]{64}$/.test(expectedLocalHash) || !current) {
+    throw new Error("Local document changed before download began.");
+  }
+  if (await hashReplicaFile(replica, path) !== expectedLocalHash) {
+    throw new Error("Local document changed before download began.");
+  }
+};
+
+const ensureDownloadParents = async (
+  replica: LocalFolderReplica,
+  folderId: string,
+  path: string,
+  modifiedMs: number,
+): Promise<void> => {
+  const parts = path.split("/");
+  for (let count = 1; count < parts.length; count++) {
+    const parent = parts.slice(0, count).join("/");
+    const old = (await replica.scan()).find(info => info.name === parent);
+    if (!old || old.deleted) await replica.edit!({ method: "mkdir", folderId, path: parent,
+      expectedVersion: old?.version ?? null, modifiedMs });
+    else if (old.type !== 1) throw new Error("Download parent is not a directory.");
+  }
+};
+
+const openExistingReader = async (
+  replica: LocalFolderReplica,
+  path: string,
+  writer: DocumentDraft,
+): Promise<ReplicaFileSource | undefined> => {
+  const old = (await replica.scan()).find(info => info.name === path && !info.deleted);
+  if (!old) return undefined;
+  try { return await createReplicaFileSource(replica, path); }
+  catch (error) { await writer.discard(); throw error; }
+};
+
+const beginDownloadAction = async (
+  runtime: DocumentRuntime,
+  folderId: string,
+  path: string,
+  size: number,
+  modifiedMs: number,
+  expectedLocalHash: string | null | undefined,
+  metadata: DownloadMetadata,
+): Promise<number> => {
+  assertDownloadRequest(runtime, size, modifiedMs, path);
+  const folder = runtime.registry?.getState().find(folder => folder.id === folderId);
+  if (!folder) throw new Error("Document folder is unavailable.");
+  const documentId = JSON.stringify([folder.storageId, path]);
+  const file = resolveDocument(runtime, documentId);
+  if (expectedLocalHash !== undefined) await assertExpectedLocalHash(file.replica, path, expectedLocalHash);
+  await ensureDownloadParents(file.replica, folderId, path, modifiedMs);
+  const writer = await openDocumentDownloadDraft(file.bytes, { folderId, path,
+    replica: file.replica, folderKey: runtime.folderKeys.get(folder.storageId)!, randomBytes: runtime.options.randomBytes,
+    download: { folderId, path, sizeBytes: size, modifiedMs, encrypted: metadata.encrypted,
+      ...(metadata.sourceDeviceId ? { sourceDeviceId: metadata.sourceDeviceId } : {}),
+      ...(metadata.contentId ? { contentId: metadata.contentId } : {}) } });
+  const reader = await openExistingReader(file.replica, path, writer);
+  const id = ++runtime.nextHandle;
+  runtime.handles.set(id, { documentId, writer, reader, dirty: true,
+    download: { size, modifiedMs, ranges: writer.downloadRanges() } });
+  return id;
+};
+
+const downloadRangesAction = async (runtime: DocumentRuntime, id: number) => {
+  const value = requireHandle(runtime, id);
+  if (!value.download) throw new Error("Not a download handle.");
+  return value.download.ranges.map(range => ({ offset: range.offset, size: range.end - range.offset }));
+};
+
+const suspendDownloadAction = async (runtime: DocumentRuntime, id: number): Promise<void> => {
+  const value = requireHandle(runtime, id);
+  if (!value.download || !value.writer) throw new Error("Not a download handle.");
+  runtime.handles.delete(id);
+  await value.writer.close();
+};
+
+const finishDownloadAction = async (runtime: DocumentRuntime, id: number): Promise<void> => {
+  const value = requireHandle(runtime, id), download = value.download;
+  if (!download || !value.writer) throw new Error("Not a download handle.");
+  if (await value.writer.size() !== download.size || (download.size &&
+    (download.ranges.length !== 1 || download.ranges[0].offset !== 0 || download.ranges[0].end !== download.size))) {
+    throw new Error("Download is incomplete.");
+  }
+  const hash = [...await value.writer.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  await value.writer.flush(false, download.modifiedMs);
+  const file = resolveDocument(runtime, value.documentId);
+  await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: runtime.folderKeys.get(file.folder.storageId)!,
+    randomBytes: runtime.options.randomBytes, baseline: { hash, sizeBytes: download.size, modifiedMs: download.modifiedMs } });
+  await value.writer.close(); runtime.handles.delete(id);
+};
+
+const setSyncBaselineAction = async (
+  runtime: DocumentRuntime,
+  id: string,
+  baseline: NonNullable<CachedFileRecord["syncBaseline"]>,
+): Promise<void> => {
+  const file = resolveDocument(runtime, id);
+  await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: runtime.folderKeys.get(file.folder.storageId)!,
+    randomBytes: runtime.options.randomBytes, baseline });
+};
+
+const digestHandleAction = async (runtime: DocumentRuntime, id: number): Promise<string> => {
+  const value = requireHandle(runtime, id);
+  if (!value.writer) throw new Error("Not a writable document.");
+  return [...await value.writer.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+};
+
+const digestRangesAction = async (
+  runtime: DocumentRuntime,
+  id: number,
+  source: "cached" | "partial",
+  ranges: readonly { offset: number; size: number }[],
+) => {
+  assertRanges(ranges);
+  const value = requireHandle(runtime, id), file = source === "cached" ? value.reader : value.writer;
+  if (!file) return [];
+  const size = typeof file.size === "number" ? file.size : await file.size();
+  const results: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
+  for (const range of ranges) {
+    if (range.offset + range.size > size) continue;
+    const hash = sha256.create();
+    for (let done = 0; done < range.size; done += 131072) {
+      const data = await file.readRange(range.offset + done, Math.min(131072, range.size - done));
       try { hash.update(data); } finally { data.fill(0); }
     }
-    return [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    results.push({ ...range, hash: hash.digest() });
+  }
+  return results;
+};
+
+const copyRangesAction = async (
+  runtime: DocumentRuntime,
+  id: number,
+  ranges: readonly { offset: number; size: number }[],
+): Promise<void> => {
+  assertRanges(ranges);
+  const value = requireHandle(runtime, id);
+  if (!value.download || !value.reader) throw new Error("Cached source is unavailable.");
+  for (const range of ranges) {
+    if (range.offset + range.size > value.reader.size) throw new Error("Cached range is unavailable.");
+    for (let done = 0; done < range.size; done += 131072) {
+      const data = await value.reader.readRange(range.offset + done, Math.min(131072, range.size - done));
+      try { await writeToHandle(runtime, id, range.offset + done, data); } finally { data.fill(0); }
+    }
+  }
+};
+
+const openHandleAction = async (runtime: DocumentRuntime, id: string, mode: string): Promise<number> => {
+  if (runtime.handles.size >= 64) throw new Error("Too many open documents.");
+  if (!["r", "w", "wt", "wa", "rw", "rwt"].includes(mode)) throw new Error("Unsupported document mode.");
+  const file = resolveDocument(runtime, id);
+  if ((await documentStat(runtime, id)).directory) throw new Error("Cannot open a directory.");
+  const value: DocumentHandle = { documentId: id, dirty: false, append: mode === "wa" };
+  if (mode === "r") value.reader = await createReplicaFileSource(file.replica, file.path);
+  else {
+    value.dirty = ["w", "wt", "rwt"].includes(mode);
+    value.writer = await openWritableDraft(runtime, id, value.dirty);
+  }
+  if (mode === "r") await touchCachedFile(runtime, file.folder, file.path);
+  const idNumber = ++runtime.nextHandle; runtime.handles.set(idNumber, value); return idNumber;
+};
+
+const flushHandleAction = async (runtime: DocumentRuntime, id: number): Promise<void> => {
+  const value = requireHandle(runtime, id); if (!value.writer || !value.dirty) return;
+  if (value.download) throw new Error("Use download completion to publish this handle.");
+  try {
+    await value.writer.flush(); value.dirty = false;
+  } catch (error) {
+    runtime.handles.delete(id);
+    await value.writer.close();
+    runtime.recoveryIssues.set(resolveDocument(runtime, value.documentId).folder.storageId,
+      ["An encrypted edit needs recovery. Lock and unlock the vault to recover it; its data has been retained."]);
+    throw error;
+  }
+};
+
+const releaseHandleAction = async (runtime: DocumentRuntime, id: number, abort = false): Promise<void> => {
+  const value = requireHandle(runtime, id); runtime.handles.delete(id);
+  if (abort || value.download) { await value.writer?.discard(); return; }
+  try { if (value.dirty) await value.writer!.flush(); }
+  catch (error) {
+    runtime.recoveryIssues.set(resolveDocument(runtime, value.documentId).folder.storageId,
+      ["An encrypted edit needs recovery. Lock and unlock the vault to recover it; its data has been retained."]);
+    throw error;
+  }
+  finally { await value.writer?.close(); }
+};
+
+const collectVersion = async (
+  runtime: DocumentRuntime,
+  storageId: string,
+  path: string,
+  versionId: string,
+  versions: Array<{ id: string; modifiedMs: number; sizeBytes: number }>,
+): Promise<void> => {
+  try {
+    const archived = await openArchivedSource(runtime, storageId, path, versionId);
+    try {
+      versions.push({ id: versionId,
+        modifiedMs: Number(archived.metadata.fileInfo.modified_s ?? 0) * 1000 +
+          Number(archived.metadata.fileInfo.modified_ns ?? 0) / 1000000,
+        sizeBytes: Number(archived.metadata.fileInfo.size ?? 0) });
+    } finally { archived.metadata.fileKey.fill(0); }
+  } catch (error) {
+    if (!(error instanceof Error && /unavailable/.test(error.message))) throw error;
+  }
+};
+
+const listVersionsAction = async (runtime: DocumentRuntime, id: string) => {
+  const { folder, path, bytes } = resolveDocument(runtime, id);
+  if (!path) throw new Error("Choose a file to view its versions.");
+  const roots = await bytes.listDirectory(".stversions");
+  const versions: Array<{ id: string; modifiedMs: number; sizeBytes: number }> = [];
+  for (const root of roots) {
+    if (root.type !== "directory" || !/^(?:\d{13}-)?[a-f0-9]{32}$/.test(root.path.slice(".stversions/".length))) continue;
+    await collectVersion(runtime, folder.storageId, path, root.path.slice(".stversions/".length), versions);
+  }
+  return versions.sort((left, right) => right.modifiedMs - left.modifiedMs);
+};
+
+const restoreVersionAction = async (runtime: DocumentRuntime, id: string, versionId: string) => {
+  const { folder, replica, path } = resolveDocument(runtime, id);
+  if (!path) throw new Error("Choose a file to restore.");
+  const archived = await openArchivedSource(runtime, folder.storageId, path, versionId);
+  try {
+    const current = (await replica.scan()).find(file => file.name === path);
+    const restored = await replica.edit!({ method: "write", folderId: folder.id, path,
+      expectedVersion: current?.version ?? null, modifiedMs: Date.now(), source: {
+        size: Number(archived.metadata.fileInfo.size ?? 0),
+        readRange: (offset, size) => readEncryptedDiskRange(archived.source, archived.metadata, offset, size),
+      } });
+    return { modifiedMs: Number(restored.modified_s ?? 0) * 1000 + Number(restored.modified_ns ?? 0) / 1000000,
+      sizeBytes: Number(restored.size ?? 0) };
+  } finally { archived.metadata.fileKey.fill(0); }
+};
+
+const collectCacheCandidates = async (
+  runtime: DocumentRuntime,
+  settings: Awaited<ReturnType<Vault["profileSettings"]>>,
+  folder: FolderRegistration,
+  candidates: CacheCandidate[],
+): Promise<void> => {
+  const replica = runtime.registry!.getReplica(folder.id)!;
+  const bytes = runtime.storage.get(folder.storageId)!, key = runtime.folderKeys.get(folder.storageId)!;
+  const access = await loadCacheAccess(bytes, key);
+  const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
+  for (const info of await replica.scan()) {
+    if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0 || isInternalReplicaPath(info.name)) continue;
+    const baseline = await loadDocumentBaseline(bytes, key, info.name);
+    const selected = classifyFavoritePath({ folderId: folder.id, path: info.name, kind: "file" },
+      folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
+    const unchanged = baseline !== undefined && baseline.sizeBytes === Number(info.size ?? 0) &&
+      await hashReplicaFile(replica, info.name) === baseline.hash;
+    candidates.push({ key: cachedFileKey(folder.id, info.name), folder, path: info.name,
+      sizeBytes: Number(info.size ?? 0), lastAccessedMs: access[info.name] ??
+        Number(info.modified_s ?? 0) * 1000, protected: selected.status === "favorite" || !unchanged });
+  }
+};
+
+const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
+  if (runtime.vault.status().phase !== "unlocked" || !runtime.registry) {
+    throw new Error("Document vault is locked.");
+  }
+  const settings = await runtime.vault.profileSettings();
+  const quotaBytes = cacheQuotaBytes(await runtime.options.availableBytes(), settings.profile.cache);
+  const candidates: CacheCandidate[] = [];
+  for (const folder of runtime.registry.getState().filter(value => value.downloads)) {
+    await collectCacheCandidates(runtime, settings, folder, candidates);
+  }
+  const evicted = planCacheEvictions(candidates, quotaBytes);
+  for (const key of evicted) {
+    const candidate = candidates.find(value => value.key === key)!;
+    await removeReplicaPaths(runtime.registry.getReplica(candidate.folder.id)!, candidate.folder.id, [candidate.path]);
+  }
+  return { quotaBytes, cachedBytes: candidates.reduce((total, value) => total + value.sizeBytes, 0),
+    protectedBytes: candidates.filter(value => value.protected).reduce((total, value) => total + value.sizeBytes, 0), evicted };
+};
+
+const createLifecycleActions = (runtime: DocumentRuntime) => ({
+  initialize: () => runQueued(runtime, () => initializeFilesystem(runtime)),
+  status: () => runQueued(runtime, () => documentStatus(runtime)),
+  close: () => closeFilesystem(runtime),
+});
+
+const createSettingsActions = (runtime: DocumentRuntime) => ({
+  connectionPasswords: () => runQueued(runtime, () => runtime.vault.connectionPasswords()),
+  saveConnectionPasswords: (passwords: Record<string, string>) =>
+    runQueued(runtime, () => runtime.vault.saveConnectionPasswords(passwords)),
+  profileSettings: () => runQueued(runtime, () => runtime.vault.profileSettings()),
+  saveProfileSettings: (settings: Parameters<Vault["saveProfileSettings"]>[0]) =>
+    runQueued(runtime, () => runtime.vault.saveProfileSettings(settings)),
+  rememberFolder: (folder: { id: string; label: string }) =>
+    runQueued(runtime, () => rememberFolderAction(runtime, folder)),
+  createVault: (password: string, remember = false) =>
+    runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.create(password, remember))),
+  unlock: (password: string) =>
+    runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.unlock(password))),
+  unlockRemembered: () =>
+    runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.unlockRemembered())),
+  changeMasterPassword: (password: string) =>
+    runQueued(runtime, async () => { await runtime.vault.changeMasterPassword(password); return documentStatus(runtime); }),
+  lock: () => runQueued(runtime, async () => { await runtime.vault.lock(); return documentStatus(runtime); }),
+});
+
+const createFolderActions = (runtime: DocumentRuntime) => ({
+  register: (folder: { id: string; label: string; password?: string }) =>
+    runQueued(runtime, () => registerFolderAction(runtime, folder)),
+  attachDownloads: (id: string) => runQueued(runtime, () => attachDownloadsAction(runtime, id)),
+  detachDownloads: (id: string) => runQueued(runtime, () => detachDownloadsAction(runtime, id)),
+  clearFolderContents: (folderId: string) => runQueued(runtime, () => clearFolderContentsAction(runtime, folderId)),
+  loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) =>
+    runQueued(runtime, () => loadDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path)),
+  saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string, snapshot: StoredDirectorySnapshot) =>
+    runQueued(runtime, () => saveDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path, snapshot)),
+});
+
+const createDirectoryActions = (runtime: DocumentRuntime) => ({
+  cachedFiles: (folderId?: string) => runQueued(runtime, () => cachedFilesAction(runtime, folderId)),
+  cachedStatuses: (folderId: string, paths: string[]) => runQueued(runtime, () => cachedStatusesAction(runtime, folderId, paths)),
+  remove: (id: string) => runQueued(runtime, () => removeDocumentAction(runtime, id)),
+  rename: (id: string, name: string) => runQueued(runtime, () => renameDocumentAction(runtime, id, name)),
+  stat: (id: string) => runQueued(runtime, () => statById(runtime, id)),
+  list: (id: string) => runQueued(runtime, () => listEntriesAction(runtime, id)),
+  create: (parentId: string, name: string, directory: boolean) =>
+    runQueued(runtime, () => createEntryAction(runtime, parentId, name, directory)),
+});
+
+const createHandleActions = (runtime: DocumentRuntime) => ({
+  beginDownload: (folderId: string, path: string, size: number, modifiedMs: number,
+    expectedLocalHash?: string | null, metadata: DownloadMetadata = { encrypted: false }) =>
+    runQueued(runtime, () => beginDownloadAction(runtime, folderId, path, size, modifiedMs, expectedLocalHash, metadata)),
+  downloadRanges: (id: number) => runQueued(runtime, () => downloadRangesAction(runtime, id)),
+  suspendDownload: (id: number) => runQueued(runtime, () => suspendDownloadAction(runtime, id)),
+  finishDownload: (id: number) => runQueued(runtime, () => finishDownloadAction(runtime, id)),
+  setSyncBaseline: (id: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) =>
+    runQueued(runtime, () => setSyncBaselineAction(runtime, id, baseline)),
+  digest: (id: number) => runQueued(runtime, () => digestHandleAction(runtime, id)),
+  digestRanges: (id: number, source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) =>
+    runQueued(runtime, () => digestRangesAction(runtime, id, source, ranges)),
+  copyRanges: (id: number, ranges: readonly { offset: number; size: number }[]) =>
+    runQueued(runtime, () => copyRangesAction(runtime, id, ranges)),
+  open: (id: string, mode: string) => runQueued(runtime, () => openHandleAction(runtime, id, mode)),
+  size: (id: number) => runQueued(runtime, async () => {
+    const value = requireHandle(runtime, id);
+    return value.writer ? value.writer.size() : value.reader!.size;
+  }),
+  read: (id: number, offset: number, size: number) => runQueued(runtime, async () => {
+    const value = requireHandle(runtime, id);
+    return (value.writer ?? value.reader!).readRange(offset, size);
+  }),
+  write: (id: number, offset: number, bytes: Uint8Array) => runQueued(runtime, () => writeToHandle(runtime, id, offset, bytes)),
+  flush: (id: number) => runQueued(runtime, () => flushHandleAction(runtime, id)),
+  release: (id: number, abort = false) => runQueued(runtime, () => releaseHandleAction(runtime, id, abort)),
+});
+
+const createVersionActions = (runtime: DocumentRuntime) => ({
+  versions: (id: string) => runQueued(runtime, () => listVersionsAction(runtime, id)),
+  restoreVersion: (id: string, versionId: string) => runQueued(runtime, () => restoreVersionAction(runtime, id, versionId)),
+});
+
+const createCacheActions = (runtime: DocumentRuntime) => ({
+  enforceCacheQuota: () => runQueued(runtime, () => enforceCacheQuotaAction(runtime)),
+});
+
+export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => {
+  const runtime: DocumentRuntime = {
+    options,
+    configs: createFolderRegistryStorage(options.profile),
+    storage: new Map(),
+    folderKeys: new Map(),
+    handles: new Map(),
+    recoveryIssues: new Map(),
+    vault: undefined as unknown as Vault,
+    registry: undefined,
+    nextHandle: 0,
+    closed: false,
+    queue: Promise.resolve(),
+    closeTask: undefined,
   };
-  const touch = async (folder: FolderRegistration, path: string) => {
-    if (!folder.downloads) return;
-    const bytes = storage.get(folder.storageId)!, key = folderKeys.get(folder.storageId)!;
-    const access = await loadCacheAccess(bytes, key);
-    access[path] = Date.now();
-    await saveCacheAccess(bytes, key, options.randomBytes, access);
-  };
+  runtime.vault = createCredentialVault({
+    profileId: options.profileId,
+    randomBytes: options.randomBytes,
+    storage: createCredentialVaultStorage(options.profile, options.profile),
+    rememberedSecret: options.rememberedSecret,
+    bootstrapStorage: createPersonalSpaceBootstrapStorage(options.profile, options.profile),
+    revokeAccess: () => revokeAccess(runtime),
+  });
   return {
-    initialize: () => run(async () => {
-      await options.profile.initializeReplica(); await vault.initialize();
-      await openRegistrations(); return status();
-    }),
-    status: () => run(status),
-    connectionPasswords: () => run(() => vault.connectionPasswords()),
-    saveConnectionPasswords: (passwords: Record<string, string>) => run(() => vault.saveConnectionPasswords(passwords)),
-    profileSettings: () => run(() => vault.profileSettings()),
-    saveProfileSettings: (settings: Parameters<typeof vault.saveProfileSettings>[0]) =>
-      run(() => vault.saveProfileSettings(settings)),
-    loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) => run(async () => {
-      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
-      const folder = registry.getState().find(value => value.id === folderId);
-      if (!folder || !registry.getReplica(folderId)) return null;
-      assertReplicaPath(path || "root");
-      return loadDirectorySnapshot(storage.get(folder.storageId)!, folderKeys.get(folder.storageId)!, sourceDeviceId, path);
-    }),
-    saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string,
-      snapshot: StoredDirectorySnapshot) => run(async () => {
-      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
-      const folder = registry.getState().find(value => value.id === folderId);
-      if (!folder || !registry.getReplica(folderId)) throw new Error("Document folder is unavailable.");
-      assertReplicaPath(path || "root");
-      await saveDirectorySnapshot(storage.get(folder.storageId)!, { folderKey: folderKeys.get(folder.storageId)!,
-        randomBytes: options.randomBytes, sourceDeviceId, path, snapshot });
-    }),
-    enforceCacheQuota: () => run(async () => {
-      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
-      const settings = await vault.profileSettings();
-      const quotaBytes = cacheQuotaBytes(await options.availableBytes(), settings.profile.cache);
-      const candidates: Array<{ key: string; sizeBytes: number; lastAccessedMs: number; protected: boolean;
-        folder: FolderRegistration; path: string }> = [];
-      for (const folder of registry.getState().filter(value => value.downloads)) {
-        const replica = registry.getReplica(folder.id)!;
-        const bytes = storage.get(folder.storageId)!, key = folderKeys.get(folder.storageId)!;
-        const access = await loadCacheAccess(bytes, key);
-        const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
-        for (const info of await replica.scan()) {
-          if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0 || isInternalReplicaPath(info.name)) continue;
-          const baseline = await loadDocumentBaseline(bytes, key, info.name);
-          const selected = classifyFavoritePath({ folderId: folder.id, path: info.name, kind: "file" },
-            folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
-          const unchanged = baseline !== undefined && baseline.sizeBytes === Number(info.size ?? 0) &&
-            await digest(replica, info.name) === baseline.hash;
-          candidates.push({ key: cachedFileKey(folder.id, info.name), folder, path: info.name,
-            sizeBytes: Number(info.size ?? 0), lastAccessedMs: access[info.name] ??
-              Number(info.modified_s ?? 0) * 1000, protected: selected.status === "favorite" || !unchanged });
-        }
-      }
-      const evicted = planCacheEvictions(candidates, quotaBytes);
-      for (const key of evicted) {
-        const candidate = candidates.find(value => value.key === key)!;
-        await removePaths(registry.getReplica(candidate.folder.id)!, candidate.folder.id, [candidate.path]);
-      }
-      return { quotaBytes, cachedBytes: candidates.reduce((total, value) => total + value.sizeBytes, 0),
-        protectedBytes: candidates.filter(value => value.protected).reduce((total, value) => total + value.sizeBytes, 0), evicted };
-    }),
-    rememberFolder: (folder: { id: string; label: string }) => run(async () => {
-      if (!registry) throw new Error("Folder storage is unavailable.");
-      if (!registry.getState().some(value => value.id === folder.id)) {
-        await registry.add({ ...folder, storageId: await randomId() }, false);
-      }
-      return status();
-    }),
-    createVault: (password: string, remember = false) => run(async () => {
-      await vault.create(password, remember); await openRegistrations(); return status();
-    }),
-    unlock: (password: string) => run(async () => { await vault.unlock(password); await openRegistrations(); return status(); }),
-    unlockRemembered: () => run(async () => { await vault.unlockRemembered(); await openRegistrations(); return status(); }),
-    changeMasterPassword: (password: string) => run(async () => { await vault.changeMasterPassword(password); return status(); }),
-    lock: () => run(async () => { await vault.lock(); return status(); }),
-    register: (folder: { id: string; label: string; password?: string }) => run(async () => {
-      if (!registry) throw new Error("Folder storage is unavailable.");
-      if (!folder.id.trim() || !folder.label.trim() || folder.id !== folder.id.trim() || folder.label !== folder.label.trim()) throw new Error("Invalid folder registration.");
-      const existing = await vault.folderPassword(folder.id);
-      if (existing === null) await vault.addFolder(folder.id, folder.password);
-      else if (folder.password !== undefined && folder.password !== existing) throw new Error("Folder password changes require migration.");
-      if (registry.getState().some(value => value.id === folder.id)) await registry.open(folder.id);
-      else await registry.add({ id: folder.id, label: folder.label, storageId: await randomId() });
-      return status();
-    }),
-    attachDownloads: (id: string) => run(async () => {
-      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
-      await registry.attachDownloads(id);
-    }),
-    detachDownloads: (id: string) => run(async () => {
-      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
-      await registry.detachDownloads(id);
-      return status();
-    }),
-    clearFolderContents: (folderId: string) => run(async () => {
-      if (vault.status().phase !== "unlocked" || !registry) throw new Error("Document vault is locked.");
-      const folder = registry.getState().find(value => value.id === folderId);
-      if (!folder) throw new Error("Document folder is unavailable.");
-      const replica = registry.getReplica(folderId);
-      if (!replica) throw new Error("Document folder is not open.");
-      const paths = (await replica.scan())
-        .filter(value => !value.deleted && !value.invalid && !isInternalReplicaPath(value.name))
-        .map(value => value.name);
-      await removePaths(replica, folderId, paths);
-      return status();
-    }),
-    cachedFiles: (folderId?: string) => run(async (): Promise<CachedFileRecord[]> => {
-      if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-      const files: CachedFileRecord[] = [];
-      for (const folder of registry!.getState().filter(folder => folderId ? folder.id === folderId : folder.downloads)) {
-        for (const info of await registry!.getReplica(folder.id)!.scan()) {
-          if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0) continue;
-          const modifiedMs = Number(info.modified_s ?? 0) * 1000 + Number(info.modified_ns ?? 0) / 1000000;
-          files.push({ key: cachedFileKey(folder.id, info.name), folderId: folder.id, path: info.name,
-            name: info.name.split("/").at(-1)!, sizeBytes: Number(info.size ?? 0), modifiedMs, cachedAtMs: modifiedMs,
-            localPath: "syncpeer-document:" + JSON.stringify([folder.storageId, info.name]),
-            syncBaselineRequired: true,
-            syncBaseline: await loadDocumentBaseline(storage.get(folder.storageId)!, folderKeys.get(folder.storageId)!, info.name) });
-        }
-      }
-      return files;
-    }),
-    cachedStatuses: (folderId: string, paths: string[]) => run(async () => {
-      if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-      const folder = registry!.getState().find(folder => folder.id === folderId && folder.downloads);
-      if (!folder) throw new Error("Downloads are not attached.");
-      const files = await registry!.getReplica(folderId)!.scan();
-      return paths.map(path => {
-        if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
-        const file = files.find(file => file.name === path && !file.deleted && !file.invalid);
-        const available = !path || !!file;
-        return { path, available, localPath: available ? "syncpeer-document:" + JSON.stringify([folder.storageId, path]) : undefined,
-          cachedAtMs: file ? Number(file.modified_s ?? 0) * 1000 : undefined };
-      });
-    }),
-    versions: (id: string) => run(async () => {
-      const { folder, path, bytes } = resolve(id);
-      if (!path) throw new Error("Choose a file to view its versions.");
-      const roots = await bytes.listDirectory(".stversions");
-      const versions: Array<{ id: string; modifiedMs: number; sizeBytes: number }> = [];
-      for (const root of roots) {
-        if (root.type !== "directory" || !/^(?:\d{13}-)?[a-f0-9]{32}$/.test(root.path.slice(".stversions/".length))) continue;
-        const versionId = root.path.slice(".stversions/".length);
-        try {
-          const archived = await archivedSource(folder.storageId, path, versionId);
-          try {
-            versions.push({ id: versionId,
-              modifiedMs: Number(archived.metadata.fileInfo.modified_s ?? 0) * 1000 +
-                Number(archived.metadata.fileInfo.modified_ns ?? 0) / 1000000,
-              sizeBytes: Number(archived.metadata.fileInfo.size ?? 0) });
-          } finally { archived.metadata.fileKey.fill(0); }
-        } catch (error) {
-          if (!(error instanceof Error && /unavailable/.test(error.message))) throw error;
-        }
-      }
-      return versions.sort((left, right) => right.modifiedMs - left.modifiedMs);
-    }),
-    restoreVersion: (id: string, versionId: string) => run(async () => {
-      const { folder, replica, path } = resolve(id);
-      if (!path) throw new Error("Choose a file to restore.");
-      const archived = await archivedSource(folder.storageId, path, versionId);
-      try {
-        const current = (await replica.scan()).find(file => file.name === path);
-        const restored = await replica.edit!({ method: "write", folderId: folder.id, path,
-          expectedVersion: current?.version ?? null, modifiedMs: Date.now(), source: {
-            size: Number(archived.metadata.fileInfo.size ?? 0),
-            readRange: (offset, size) => readEncryptedDiskRange(archived.source, archived.metadata, offset, size),
-          } });
-        return { modifiedMs: Number(restored.modified_s ?? 0) * 1000 + Number(restored.modified_ns ?? 0) / 1000000,
-          sizeBytes: Number(restored.size ?? 0) };
-      } finally { archived.metadata.fileKey.fill(0); }
-    }),
-    beginDownload: (folderId: string, path: string, size: number, modifiedMs: number, expectedLocalHash?: string | null,
-      metadata: { encrypted: boolean; sourceDeviceId?: string; contentId?: string } = { encrypted: false }) => run(async () => {
-      if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-      if (handles.size >= 64) throw new Error("Too many open documents.");
-      if (!Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(modifiedMs) || modifiedMs < 0) throw new Error("Invalid download metadata.");
-      assertReplicaPath(path);
-      const folder = registry?.getState().find(folder => folder.id === folderId);
-      if (!folder) throw new Error("Document folder is unavailable.");
-      const documentId = JSON.stringify([folder.storageId, path]);
-      const file = resolve(documentId);
-      if (expectedLocalHash !== undefined) {
-        const current = (await file.replica.scan()).find(info => info.name === path && !info.deleted);
-        if (expectedLocalHash === null) {
-          if (current) throw new Error("Local document changed before download began.");
-        } else {
-          if (!/^[a-f0-9]{64}$/.test(expectedLocalHash) || !current) throw new Error("Local document changed before download began.");
-          const source = await createReplicaFileSource(file.replica, path), hash = sha256.create();
-          for (let offset = 0; offset < source.size; offset += 131072) {
-            const data = await source.readRange(offset, Math.min(131072, source.size - offset));
-            try { hash.update(data); } finally { data.fill(0); }
-          }
-          if ([...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("") !== expectedLocalHash) throw new Error("Local document changed before download began.");
-        }
-      }
-      const parts = path.split("/");
-      for (let count = 1; count < parts.length; count++) {
-        const parent = parts.slice(0, count).join("/");
-        const old = (await file.replica.scan()).find(info => info.name === parent);
-        if (!old || old.deleted) await file.replica.edit!({ method: "mkdir", folderId, path: parent,
-          expectedVersion: old?.version ?? null, modifiedMs });
-        else if (old.type !== 1) throw new Error("Download parent is not a directory.");
-      }
-      const writer = await openDocumentDownloadDraft(file.bytes, { folderId, path,
-        replica: file.replica, folderKey: folderKeys.get(folder.storageId)!, randomBytes: options.randomBytes,
-        download: { folderId, path, sizeBytes: size, modifiedMs, encrypted: metadata.encrypted,
-          ...(metadata.sourceDeviceId ? { sourceDeviceId: metadata.sourceDeviceId } : {}),
-          ...(metadata.contentId ? { contentId: metadata.contentId } : {}) } });
-      const old = (await file.replica.scan()).find(info => info.name === path && !info.deleted);
-      let reader: Awaited<ReturnType<typeof createReplicaFileSource>> | undefined;
-      try { if (old) reader = await createReplicaFileSource(file.replica, path); }
-      catch (error) { await writer.discard(); throw error; }
-      const id = ++nextHandle;
-      handles.set(id, { documentId, writer, reader, dirty: true,
-        download: { size, modifiedMs, ranges: writer.downloadRanges() } });
-      return id;
-    }),
-    downloadRanges: (id: number) => run(async () => {
-      const value = handle(id);
-      if (!value.download) throw new Error("Not a download handle.");
-      return value.download.ranges.map(range => ({ offset: range.offset, size: range.end - range.offset }));
-    }),
-    suspendDownload: (id: number) => run(async () => {
-      const value = handle(id);
-      if (!value.download || !value.writer) throw new Error("Not a download handle.");
-      handles.delete(id);
-      await value.writer.close();
-    }),
-    finishDownload: (id: number) => run(async () => {
-      const value = handle(id), download = value.download;
-      if (!download || !value.writer) throw new Error("Not a download handle.");
-      if (await value.writer.size() !== download.size || (download.size &&
-        (download.ranges.length !== 1 || download.ranges[0].offset !== 0 || download.ranges[0].end !== download.size))) throw new Error("Download is incomplete.");
-      const hash = [...await value.writer.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
-      await value.writer.flush(false, download.modifiedMs);
-      const file = resolve(value.documentId);
-      await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: folderKeys.get(file.folder.storageId)!,
-        randomBytes: options.randomBytes, baseline: { hash, sizeBytes: download.size, modifiedMs: download.modifiedMs } });
-      await value.writer.close(); handles.delete(id);
-    }),
-    setSyncBaseline: (id: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => run(async () => {
-      const file = resolve(id);
-      await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: folderKeys.get(file.folder.storageId)!, randomBytes: options.randomBytes, baseline });
-    }),
-    digest: (id: number) => run(async () => {
-      const value = handle(id);
-      if (!value.writer) throw new Error("Not a writable document.");
-      return [...await value.writer.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
-    }),
-    digestRanges: (id: number, source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) => run(async () => {
-      checkRanges(ranges);
-      const value = handle(id), file = source === "cached" ? value.reader : value.writer;
-      if (!file) return [];
-      const size = typeof file.size === "number" ? file.size : await file.size();
-      const results: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
-      for (const range of ranges) {
-        if (range.offset + range.size > size) continue;
-        const hash = sha256.create();
-        for (let done = 0; done < range.size; done += 131072) {
-          const data = await file.readRange(range.offset + done, Math.min(131072, range.size - done));
-          try { hash.update(data); } finally { data.fill(0); }
-        }
-        results.push({ ...range, hash: hash.digest() });
-      }
-      return results;
-    }),
-    copyRanges: (id: number, ranges: readonly { offset: number; size: number }[]) => run(async () => {
-      checkRanges(ranges);
-      const value = handle(id);
-      if (!value.download || !value.reader) throw new Error("Cached source is unavailable.");
-      for (const range of ranges) {
-        if (range.offset + range.size > value.reader.size) throw new Error("Cached range is unavailable.");
-        for (let done = 0; done < range.size; done += 131072) {
-          const data = await value.reader.readRange(range.offset + done, Math.min(131072, range.size - done));
-          try { await write(id, range.offset + done, data); } finally { data.fill(0); }
-        }
-      }
-    }),
-    remove: (id: string) => run(async () => {
-      const file = resolve(id);
-      const current = await file.replica.scan();
-      const old = current.find(info => info.name === file.path && !info.deleted);
-      if (!old) return false;
-      const paths = old.type === 1
-        ? current.filter(info => !info.deleted && (info.name === file.path || info.name.startsWith(file.path + "/")))
-          .map(info => info.name)
-        : [file.path];
-      await removePaths(file.replica, file.folder.id, paths);
-      return true;
-    }),
-    rename: (id: string, name: string) => run(async () => {
-      assertReplicaPath(name);
-      if (name.includes("/")) throw new Error("Expected one document name.");
-      const file = resolve(id), current = await file.replica.scan();
-      const old = current.find(info => info.name === file.path && !info.deleted);
-      if (!old) throw new Error("Document is unavailable.");
-      if (old.type === 1 && current.some(info => !info.deleted && info.name.startsWith(file.path + "/"))) {
-        throw new Error("Non-empty directories cannot be renamed safely.");
-      }
-      const parent = file.path.split("/").slice(0, -1).join("/"), target = parent ? `${parent}/${name}` : name;
-      if (target === file.path) return stat(id);
-      const previousTarget = current.find(info => info.name === target);
-      if (previousTarget && !previousTarget.deleted) throw new Error("A document with that name already exists.");
-      const modifiedMs = Date.now();
-      const created = old.type === 1
-        ? await file.replica.edit!({ method: "mkdir", folderId: file.folder.id, path: target,
-          modifiedMs, expectedVersion: previousTarget?.version ?? null })
-        : await file.replica.edit!({ method: "write", folderId: file.folder.id, path: target, modifiedMs,
-          expectedVersion: previousTarget?.version ?? null, source: await createReplicaFileSource(file.replica, file.path) });
-      try {
-        await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: file.path,
-          modifiedMs, expectedVersion: old.version ?? {} });
-      } catch (error) {
-        await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: target,
-          modifiedMs, expectedVersion: created.version ?? {} }).catch(() => {});
-        throw error;
-      }
-      return stat(JSON.stringify([file.folder.storageId, target]));
-    }),
-    stat: (id: string) => run(async () => {
-      const root = (await configs.load()).find(folder => id === JSON.stringify([folder.storageId, ""]));
-      return root ? entry(root, "", 0, true) : stat(id);
-    }),
-    list: (id: string) => run(async () => {
-      if (id === "syncpeer-root") return (await configs.load()).map(folder => entry(folder, "", 0, true));
-      if (vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-      const root = registry!.getState().find(folder => id === JSON.stringify([folder.storageId, ""]));
-      if (root && !registry!.getReplica(root.id)) return [];
-      const { folder, path, replica } = resolve(id);
-      if (!(await stat(id)).directory) throw new Error("Document is not a directory.");
-      const prefix = path ? path + "/" : "";
-      return (await replica.scan()).filter(file => !file.deleted && !file.invalid && [0, 1].includes(Number(file.type ?? 0)) &&
-        file.name.startsWith(prefix) && !file.name.slice(prefix.length).includes("/") && file.name !== path)
-        .map(file => entry(folder, file.name, Number(file.size ?? 0), file.type === 1, Number(file.modified_s ?? 0) * 1000));
-    }),
-    create: (parentId: string, name: string, directory: boolean) => run(async () => {
-      assertReplicaPath(name); if (name.includes("/")) throw new Error("Expected one document name.");
-      const parent = resolve(parentId), path = parent.path ? parent.path + "/" + name : name;
-      if (!(await stat(parentId)).directory) throw new Error("Parent is not a directory.");
-      await parent.replica.edit!({ folderId: parent.folder.id, path, modifiedMs: Date.now(), expectedVersion: null,
-        ...(directory ? { method: "mkdir" as const } : { method: "write" as const, source: { size: 0, readRange: async () => new Uint8Array() } }) });
-      return stat(JSON.stringify([parent.folder.storageId, path]));
-    }),
-    open: (id: string, mode: string) => run(async () => {
-      if (handles.size >= 64) throw new Error("Too many open documents.");
-      if (!["r", "w", "wt", "wa", "rw", "rwt"].includes(mode)) throw new Error("Unsupported document mode.");
-      const file = resolve(id);
-      if ((await stat(id)).directory) throw new Error("Cannot open a directory.");
-      const value: ReturnType<typeof handle> = { documentId: id, dirty: false, append: mode === "wa" };
-      if (mode === "r") value.reader = await createReplicaFileSource(file.replica, file.path);
-      else {
-        value.dirty = ["w", "wt", "rwt"].includes(mode);
-        value.writer = await writable(id, value.dirty);
-      }
-      if (mode === "r") await touch(file.folder, file.path);
-      const idNumber = ++nextHandle; handles.set(idNumber, value); return idNumber;
-    }),
-    size: (id: number) => run(async () => { const value = handle(id); return value.writer ? value.writer.size() : value.reader!.size; }),
-    read: (id: number, offset: number, size: number) => run(() => {
-      const value = handle(id); return (value.writer ?? value.reader!).readRange(offset, size);
-    }),
-    write: (id: number, offset: number, bytes: Uint8Array) => run(() => write(id, offset, bytes)),
-    flush: (id: number) => run(async () => {
-      const value = handle(id); if (!value.writer || !value.dirty) return;
-      if (value.download) throw new Error("Use download completion to publish this handle.");
-      try {
-        await value.writer.flush(); value.dirty = false;
-      } catch (error) {
-        handles.delete(id);
-        await value.writer.close();
-        recoveryIssues.set(resolve(value.documentId).folder.storageId, ["An encrypted edit needs recovery. Lock and unlock the vault to recover it; its data has been retained."]);
-        throw error;
-      }
-    }),
-    release: (id: number, abort = false) => run(async () => {
-      const value = handle(id); handles.delete(id);
-      if (abort || value.download) { await value.writer?.discard(); return; }
-      try { if (value.dirty) await value.writer!.flush(); }
-      catch (error) {
-        recoveryIssues.set(resolve(value.documentId).folder.storageId, ["An encrypted edit needs recovery. Lock and unlock the vault to recover it; its data has been retained."]);
-        throw error;
-      }
-      finally { await value.writer?.close(); }
-    }),
-    close: () => {
-      closed = true;
-      closeTask ??= queue.then(async () => { await vault.close(); await options.profile.close(); });
-      return closeTask;
-    },
+    ...createLifecycleActions(runtime),
+    ...createSettingsActions(runtime),
+    ...createFolderActions(runtime),
+    ...createDirectoryActions(runtime),
+    ...createHandleActions(runtime),
+    ...createVersionActions(runtime),
+    ...createCacheActions(runtime),
   };
-}
+};
+
+export type DocumentFilesystem = ReturnType<typeof createDocumentFilesystem>;

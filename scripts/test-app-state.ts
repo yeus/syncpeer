@@ -43,6 +43,27 @@ test("secure credentials are excluded from browser persistence", t => {
   assert.ok(!written.includes("synthetic-secret"));
 });
 
+test("browser persistence never stores a private key or folder password without secure storage", t => {
+  let written = "";
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: {
+    setItem: (_key: string, value: string) => { written = value; },
+  } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  state.connection.key = "synthetic-private-key";
+  state.passwords.saved = { photos: "synthetic-folder-password" };
+  state.passwords.secureStorage = false;
+  persistState(state);
+  assert.ok(!written.includes("synthetic-private-key"));
+  assert.ok(!written.includes("synthetic-folder-password"));
+  const restored = createInitialState({ connection: { ...state.connection, key: "legacy-private-key" },
+    folderPasswords: { photos: "legacy-folder-password" } });
+  assert.equal(restored.connection.key, "");
+  assert.deepEqual(restored.passwords.saved, {});
+});
+
 test("remote directory entries are excluded from browser persistence", t => {
   let written = "";
   const previous = Object.getOwnPropertyDescriptor(globalThis, "window");

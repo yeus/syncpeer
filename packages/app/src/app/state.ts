@@ -10,7 +10,6 @@ import {
   formatRate,
   fromConnectionSettings,
   normalizeDeviceId,
-  normalizeFolderPasswords,
   normalizeSavedDevices,
   normalizeSyncApprovedIntroducedFolderKeys,
   resolvePreferredSourceDeviceId,
@@ -115,10 +114,9 @@ export const persistState = (state: AppState) => {
     JSON.stringify({
       activeTab: state.activeTab,
       selectedSavedDeviceId: state.devices.selectedSavedDeviceId,
-      connection: toConnectionSettings(state.connection),
+      connection: { ...toConnectionSettings(state.connection), key: "" },
       savedDevices: state.devices.savedDevices,
       syncApprovedIntroducedFolderKeys: [...state.approvals.syncApprovedFolderKeys].sort(),
-      folderPasswords: state.passwords.secureStorage ? undefined : state.passwords.saved,
       offlineFolderSnapshots: Object.fromEntries(Object.entries(state.offline.snapshots).map(([deviceId, snapshot]) =>
         [deviceId, { ...snapshot, directories: undefined, activeDirectoryKey: undefined }])),
       directoryPageSize: state.ui.directoryPageSize,
@@ -133,7 +131,8 @@ export const persistState = (state: AppState) => {
 };
 
 export const createInitialState = (persisted = loadPersistedState()) => {
-  const initialConnection = fromConnectionSettings(persisted?.connection ?? null);
+  const initialConnection = fromConnectionSettings(persisted?.connection
+    ? { ...persisted.connection, key: "" } as StoredConnectionSettingsLike : null);
   const savedDevices = normalizeSavedDevices(persisted?.savedDevices);
   return {
     localFolders: [] as FolderInfo[],
@@ -267,8 +266,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
     },
     passwords: {
       secureStorage: false,
-      saved: normalizeFolderPasswords(persisted?.folderPasswords),
-      drafts: { ...normalizeFolderPasswords(persisted?.folderPasswords) },
+      saved: {} as Record<string, string>,
+      drafts: {} as Record<string, string>,
       visible: {} as Record<string, boolean>,
     },
     offline: {

@@ -623,34 +623,26 @@ impl ServerCertVerifier for NoCertificateVerification {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -1350,33 +1342,51 @@ fn close_tls_session(
     Ok(())
 }
 
-fn load_identity_from_dir(cli_node_dir: &Path) -> Result<Option<CliNodeIdentityResponse>, String> {
-    let cert_path = cli_node_dir.join("cert.pem");
-    let key_path = cli_node_dir.join("key.pem");
-    if !cert_path.exists() || !key_path.exists() {
-        return Ok(None);
+fn check_legacy_identity(cli_node_dir: &Path) -> Result<(), String> {
+    if cli_node_dir.join("key.pem").exists() || cli_node_dir.join("cert.pem").exists() {
+        return Err("A plaintext device identity exists; use the confirmed local reset before continuing.".into());
     }
-    let cert_pem = fs::read_to_string(&cert_path)
-        .map_err(|error| format!("Could not read {}: {error}", cert_path.display()))?;
-    let key_pem = fs::read_to_string(&key_path)
-        .map_err(|error| format!("Could not read {}: {error}", key_path.display()))?;
-    if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(CliNodeIdentityResponse {
-        cert_path: cert_path.to_string_lossy().to_string(),
-        key_path: key_path.to_string_lossy().to_string(),
-        cert_pem,
-        key_pem,
-    }))
+    Ok(())
 }
 
-fn create_identity_in_dir(cli_node_dir: &Path) -> Result<CliNodeIdentityResponse, String> {
-    fs::create_dir_all(cli_node_dir)
-        .map_err(|error| format!("Could not create {}: {error}", cli_node_dir.display()))?;
-    let cert_path = cli_node_dir.join("cert.pem");
-    let key_path = cli_node_dir.join("key.pem");
+fn legacy_identity_directories(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
+        if !path.trim().is_empty() { directories.push(PathBuf::from(path.trim())); }
+    }
+    if let Ok(path) = app.path().app_config_dir() {
+        directories.push(path.join("syncpeer").join("cli-node"));
+    }
+    if let Ok(path) = app.path().app_data_dir() {
+        directories.push(path.join("syncpeer").join("cli-node"));
+    }
+    if let Ok(path) = app.path().config_dir() {
+        directories.push(path.join("syncpeer").join("cli-node"));
+    }
+    directories.dedup();
+    directories
+}
 
+fn require_no_legacy_identity(app: &tauri::AppHandle) -> Result<(), String> {
+    for directory in legacy_identity_directories(app) { check_legacy_identity(&directory)?; }
+    Ok(())
+}
+
+fn validate_identity_key_pair(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    let certificates = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Protected device certificate is invalid.".to_string())?;
+    let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|_| "Protected device key is invalid.".to_string())?
+        .ok_or_else(|| "Protected device key is missing.".to_string())?;
+    rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_client_auth_cert(certificates, private_key)
+        .map_err(|_| "Protected device certificate and key do not match.".to_string())?;
+    Ok(())
+}
+
+fn create_protected_identity(app: &tauri::AppHandle) -> Result<CliNodeIdentityResponse, String> {
     let cert = rcgen::generate_simple_self_signed(vec![
         "syncpeer.local".to_string(),
         "localhost".to_string(),
@@ -1387,37 +1397,32 @@ fn create_identity_in_dir(cli_node_dir: &Path) -> Result<CliNodeIdentityResponse
         .serialize_pem()
         .map_err(|error| format!("Could not serialize certificate PEM: {error}"))?;
     let key_pem = cert.serialize_private_key_pem();
+    validate_identity_key_pair(&cert_pem, &key_pem)?;
 
-    fs::write(&cert_path, &cert_pem)
-        .map_err(|error| format!("Could not write {}: {error}", cert_path.display()))?;
-    fs::write(&key_path, &key_pem)
-        .map_err(|error| format!("Could not write {}: {error}", key_path.display()))?;
-
+    let stored = serde_json::to_string(&IdentityRecoveryPayload { version: 1,
+        device_id: device_id_from_cert_pem(&cert_pem)?, cert_pem: cert_pem.clone(), key_pem: key_pem.clone() })
+        .map_err(|_| "Could not encode protected identity.".to_string())?;
+    vault_secret::identity_record(app, "save", Some(stored.clone()))?;
+    if vault_secret::identity_record(app, "load", None)?.as_deref() != Some(&stored) {
+        return Err("Protected device identity could not be verified.".into());
+    }
     Ok(CliNodeIdentityResponse {
-        cert_path: cert_path.to_string_lossy().to_string(),
-        key_path: key_path.to_string_lossy().to_string(),
+        cert_path: String::new(), key_path: String::new(),
         cert_pem,
         key_pem,
     })
 }
 
-fn resolve_default_identity_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
-        let configured = PathBuf::from(path.trim());
-        if !configured.as_os_str().is_empty() {
-            return Ok(configured);
-        }
+fn load_protected_identity(app: &tauri::AppHandle) -> Result<Option<CliNodeIdentityResponse>, String> {
+    let Some(stored) = vault_secret::identity_record(app, "load", None)? else { return Ok(None); };
+    let value: IdentityRecoveryPayload = serde_json::from_str(&stored)
+        .map_err(|_| "Protected device identity is invalid; local reset is required.".to_string())?;
+    if value.version != 1 || device_id_from_cert_pem(&value.cert_pem)? != value.device_id ||
+        validate_identity_key_pair(&value.cert_pem, &value.key_pem).is_err() {
+        return Err("Protected device identity is invalid; local reset is required.".into());
     }
-    if let Ok(path) = app.path().app_data_dir() {
-        return Ok(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().app_config_dir() {
-        return Ok(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().config_dir() {
-        return Ok(path.join("syncpeer").join("cli-node"));
-    }
-    Err("Could not resolve a writable identity directory".to_string())
+    Ok(Some(CliNodeIdentityResponse { cert_path: String::new(), key_path: String::new(),
+        cert_pem: value.cert_pem, key_pem: value.key_pem }))
 }
 
 fn normalize_device_id(value: &str) -> String {
@@ -2258,75 +2263,9 @@ async fn syncpeer_read_binary_file(request: ReadBinaryFileRequest) -> Result<Vec
 async fn syncpeer_read_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<CliNodeIdentityResponse, String> {
-    let mut existing_candidate_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
-        let configured = PathBuf::from(path.trim());
-        if !configured.as_os_str().is_empty() {
-            existing_candidate_dirs.push(configured);
-        }
-    }
-    if let Ok(path) = app.path().config_dir() {
-        existing_candidate_dirs.push(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().app_config_dir() {
-        existing_candidate_dirs.push(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().app_data_dir() {
-        existing_candidate_dirs.push(path.join("syncpeer").join("cli-node"));
-    }
-    existing_candidate_dirs.dedup();
-
-    for cli_node_dir in existing_candidate_dirs.iter() {
-        if let Some(identity) = load_identity_from_dir(cli_node_dir)? {
-            return Ok(identity);
-        }
-    }
-
-    let mut create_targets: Vec<PathBuf> = Vec::new();
-    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
-        let configured = PathBuf::from(path.trim());
-        if !configured.as_os_str().is_empty() {
-            create_targets.push(configured);
-        }
-    }
-    if let Ok(path) = app.path().app_data_dir() {
-        create_targets.push(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().app_config_dir() {
-        create_targets.push(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().config_dir() {
-        create_targets.push(path.join("syncpeer").join("cli-node"));
-    }
-    create_targets.dedup();
-
-    for cli_node_dir in create_targets.iter() {
-        match create_identity_in_dir(cli_node_dir) {
-            Ok(identity) => return Ok(identity),
-            Err(error) => {
-                tauri_log(&format!(
-                    "identity.auto_create.failed dir={} error={}",
-                    cli_node_dir.display(),
-                    error
-                ));
-            }
-        }
-    }
-
-    let searched = existing_candidate_dirs
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let attempted = create_targets
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    Err(format!(
-        "Missing cert/key and auto-create failed. Looked in: {searched}. Create attempts: {attempted}"
-    ))
+    require_no_legacy_identity(&app)?;
+    if let Some(identity) = load_protected_identity(&app)? { return Ok(identity); }
+    create_protected_identity(&app)
 }
 
 #[tauri::command]
@@ -2359,8 +2298,8 @@ async fn syncpeer_get_default_device_id(app: tauri::AppHandle) -> Result<String,
 async fn syncpeer_regenerate_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let identity_dir = resolve_default_identity_dir(&app)?;
-    let identity = create_identity_in_dir(&identity_dir)?;
+    require_no_legacy_identity(&app)?;
+    let identity = create_protected_identity(&app)?;
     device_id_from_cert_pem(&identity.cert_pem)
 }
 
@@ -2369,6 +2308,7 @@ async fn syncpeer_restore_identity_recovery(
     app: tauri::AppHandle,
     request: IdentityRecoveryRestoreRequest,
 ) -> Result<CliNodeIdentityResponse, String> {
+    require_no_legacy_identity(&app)?;
     let raw = request.recovery_secret.trim();
     if raw.is_empty() {
         return Err("Recovery secret is empty.".to_string());
@@ -2393,20 +2333,14 @@ async fn syncpeer_restore_identity_recovery(
             expected_device_id, computed_device_id
         ));
     }
+    validate_identity_key_pair(&payload.cert_pem, &payload.key_pem)?;
 
-    let identity_dir = resolve_default_identity_dir(&app)?;
-    fs::create_dir_all(&identity_dir)
-        .map_err(|error| format!("Could not create {}: {error}", identity_dir.display()))?;
-    let cert_path = identity_dir.join("cert.pem");
-    let key_path = identity_dir.join("key.pem");
-    fs::write(&cert_path, &payload.cert_pem)
-        .map_err(|error| format!("Could not write {}: {error}", cert_path.display()))?;
-    fs::write(&key_path, &payload.key_pem)
-        .map_err(|error| format!("Could not write {}: {error}", key_path.display()))?;
+    let stored = serde_json::to_string(&payload)
+        .map_err(|_| "Could not encode protected identity.".to_string())?;
+    vault_secret::identity_record(&app, "save", Some(stored))?;
 
     Ok(CliNodeIdentityResponse {
-        cert_path: cert_path.display().to_string(),
-        key_path: key_path.display().to_string(),
+        cert_path: String::new(), key_path: String::new(),
         cert_pem: payload.cert_pem,
         key_pem: payload.key_pem,
     })
@@ -4514,5 +4448,22 @@ mod tests {
         assert_eq!(tcp_connect_timeout(None), Duration::from_secs(10));
         assert_eq!(tcp_connect_timeout(Some(250)), Duration::from_millis(250));
         assert_eq!(tcp_connect_timeout(Some(0)), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn plaintext_identity_requires_explicit_local_reset() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("key.pem"), b"synthetic-private-key").unwrap();
+        assert!(check_legacy_identity(root.path()).is_err());
+    }
+
+    #[test]
+    fn restored_identity_rejects_a_key_from_another_certificate() {
+        let first = rcgen::generate_simple_self_signed(vec!["first.local".into()]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec!["second.local".into()]).unwrap();
+        assert!(validate_identity_key_pair(&first.serialize_pem().unwrap(),
+            &first.serialize_private_key_pem()).is_ok());
+        assert!(validate_identity_key_pair(&first.serialize_pem().unwrap(),
+            &second.serialize_private_key_pem()).is_err());
     }
 }

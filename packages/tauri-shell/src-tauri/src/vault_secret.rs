@@ -102,23 +102,40 @@ pub fn load_or_create_metadata_key(metadata_root: &std::path::Path) -> Result<[u
 
 #[cfg(target_os = "linux")]
 pub fn ensure_local_reset_credentials_available() -> Result<(), String> {
-    desktop_secret(VaultSecretRequest {
-        profile_id: "metadata".into(), operation: "load".into(), secret: None,
-    })?;
-    desktop_secret(VaultSecretRequest {
-        profile_id: "documents".into(), operation: "load".into(), secret: None,
-    })?;
+    for profile_id in ["metadata", "documents", "identity"] {
+        desktop_secret(VaultSecretRequest {
+            profile_id: profile_id.into(), operation: "load".into(), secret: None,
+        })?;
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 pub fn remove_local_reset_credentials() -> Result<(), String> {
-    for profile_id in ["metadata", "documents"] {
+    for profile_id in ["metadata", "documents", "identity"] {
         desktop_secret(VaultSecretRequest {
             profile_id: profile_id.into(), operation: "remove".into(), secret: None,
         })?;
     }
     Ok(())
+}
+
+pub fn identity_record(app: &tauri::AppHandle, operation: &str,
+    secret: Option<String>) -> Result<Option<String>, String> {
+    let request = VaultSecretRequest { profile_id: "identity".into(), operation: operation.into(), secret };
+    validate(&request)?;
+    #[cfg(target_os = "android")]
+    let result = {
+        use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
+        app.syncpeer_android().vault_secret(json!(request))
+            .map_err(|_| "Protected identity storage is unavailable.".to_string())?
+    };
+    #[cfg(target_os = "linux")]
+    let result = { let _ = app; desktop_secret(request)? };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let result: Value = { let _ = (app, request); return Err("Protected identity storage is unavailable.".into()); };
+    result.as_str().map(str::to_owned).map(Some).or_else(|| if result.is_null() { Some(None) } else { None })
+        .ok_or_else(|| "Protected identity record is invalid.".to_string())
 }
 
 #[tauri::command]

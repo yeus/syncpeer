@@ -416,7 +416,7 @@
             data-testid="connection-cert"
             type="text"
             bind:value={app.connection.cert}
-            placeholder="Auto uses persisted cli-node cert.pem"
+            placeholder="Auto uses this device's protected certificate"
           />
         </label>
 
@@ -426,7 +426,7 @@
             data-testid="connection-key"
             type="text"
             bind:value={app.connection.key}
-            placeholder="Auto uses persisted cli-node key.pem"
+            placeholder="Auto uses this device's protected key"
           />
         </label>
 

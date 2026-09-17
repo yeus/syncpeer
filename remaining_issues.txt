@@ -100,7 +100,9 @@ Personal-space transition (not yet complete)
   workflow and recovery acceptance test.
 - Add verified owned-device pairing over LAN/relay, stable device slots,
   revocation, replacement, and propagation of membership to other owned
-  devices. Keep external Syncthing shares and introducers separate.
+  devices. Keep external Syncthing shares and introducers separate. Signed
+  roster and pairing-session primitives exist, but transport, persistence,
+  user confirmation, and BEP membership propagation are not wired yet.
 - Persist and apply versioned folder-share targets and device-scoped favorites
   through the encrypted settings folder. The core merge and share-resolution
   rules exist, but are not yet connected to BEP or the UI.
@@ -110,8 +112,10 @@ Personal-space transition (not yet complete)
   selected folders or remote peers.
 - Native metadata now uses SQLCipher with protected per-install keys; verify
   Android physical-device behavior. Encrypt CLI metadata with a
-  managed key; protect native and CLI device-private identity keys; remove
-  plaintext WebView/legacy secret fallbacks after reset is validated.
+  managed key; protect the CLI device-private identity key; remove
+  remaining plaintext WebView/legacy secret fallbacks after reset is validated.
+  Native identity now uses protected storage, but must be verified on Android
+  and desktop with real credential stores and recovery flows.
 - Add end-to-end recovery, compromise rekey, mixed-Syncthing interoperability,
   Android service/reboot, and physical-device acceptance tests for the above.
 - Move the memory-hard bootstrap KDF off the UI thread. Noble's async scrypt

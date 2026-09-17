@@ -37,7 +37,7 @@ class VaultSecretStore(private val context: Context) {
     val keys = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     return when (operation) {
       "save" -> {
-        require(secret != null && secret.isNotEmpty() && secret.length <= 4096) { "Invalid unlock secret" }
+        require(secret != null && secret.isNotEmpty() && secret.length <= 16384) { "Invalid protected secret" }
         val key = if (keys.containsAlias(alias)) keys.getKey(alias, null) as SecretKey else generateKey(alias)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key)

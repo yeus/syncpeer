@@ -23,6 +23,7 @@
     resetError = "";
     const confirmation = window.prompt(
       "This deletes Syncpeer-managed data on this device, including downloaded files and its app-managed identity. " +
+      "On Linux it also deletes the older shared Syncpeer CLI identity if present. " +
       "Unsynced edits will be lost. External selected folders and other devices are not changed. " +
       "On Android, you must grant folder access again. Type RESET LOCAL DATA to continue.",
     );

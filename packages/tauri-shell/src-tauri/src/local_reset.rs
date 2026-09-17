@@ -38,6 +38,23 @@ fn clear_app_directory(path: &Path, identifier: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, target_os = "linux"))]
+fn clear_legacy_identity_directory(path: &Path) -> Result<(), String> {
+    if !path.is_absolute()
+        || path.file_name().is_none_or(|name| name != "cli-node")
+        || path.parent().and_then(Path::file_name).is_none_or(|name| name != "syncpeer")
+        || path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+        || [path, path.parent().unwrap()].iter().any(|candidate|
+            fs::symlink_metadata(candidate).is_ok_and(|entry| entry.file_type().is_symlink()))
+    {
+        return Err("Refusing to clear a path outside historical Syncpeer identity storage.".into());
+    }
+    if path.exists() {
+        fs::remove_dir_all(path).map_err(|_| "Historical Syncpeer identity could not be cleared.".to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn syncpeer_reset_local_data(
     app: tauri::AppHandle,
@@ -65,8 +82,13 @@ pub async fn syncpeer_reset_local_data(
         for path in &paths {
             app_owned_path(path, identifier)?;
         }
+        let historical_identity = app.path().config_dir()
+            .map_err(|_| "Historical Syncpeer identity path is unavailable.".to_string())?
+            .join("syncpeer").join("cli-node");
+        // Earlier desktop releases used this fallback outside the app-ID directory.
         crate::vault_secret::ensure_local_reset_credentials_available()?;
         let result = paths.iter().try_for_each(|path| clear_app_directory(path, identifier))
+            .and_then(|_| clear_legacy_identity_directory(&historical_identity))
             .and_then(|_| crate::vault_secret::remove_local_reset_credentials());
         let closing = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -115,5 +137,20 @@ mod tests {
             fs::read(selected.join("keep.txt")).unwrap(),
             b"synthetic-external-data"
         );
+    }
+
+    #[test]
+    fn reset_can_clear_only_the_historical_syncpeer_identity_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = root.path().join("syncpeer").join("cli-node");
+        let unrelated = root.path().join("other").join("cli-node");
+        fs::create_dir_all(&identity).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(identity.join("key.pem"), b"synthetic-key").unwrap();
+        fs::write(unrelated.join("key.pem"), b"keep").unwrap();
+        assert!(clear_legacy_identity_directory(&unrelated).is_err());
+        clear_legacy_identity_directory(&identity).unwrap();
+        assert!(!identity.exists());
+        assert_eq!(fs::read(unrelated.join("key.pem")).unwrap(), b"keep");
     }
 }

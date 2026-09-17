@@ -5,6 +5,7 @@
     formatBuildTimeLocal,
     getAppBuildInfo,
   } from "./lib/appInfo.ts";
+  import { invoke } from "@tauri-apps/api/core";
 
   interface Props {
     onBack: () => void;
@@ -16,6 +17,24 @@
   const buildTimeLocal = formatBuildTimeLocal(appInfo.buildTimeUtc);
   let copiedNotice = $state("");
   let copyError = $state("");
+  let resetError = $state("");
+
+  const resetLocalData = async (): Promise<void> => {
+    resetError = "";
+    const confirmation = window.prompt(
+      "This deletes Syncpeer-managed data on this device, including downloaded files and its app-managed identity. " +
+      "Unsynced edits will be lost. External selected folders and other devices are not changed. " +
+      "On Android, you must grant folder access again. Type RESET LOCAL DATA to continue.",
+    );
+    if (confirmation !== "RESET LOCAL DATA") return;
+    try {
+      await invoke("syncpeer_reset_local_data", { confirmation });
+      window.localStorage.clear();
+      window.location.reload();
+    } catch {
+      resetError = "Local reset failed or was incomplete. Restart Syncpeer before using it again.";
+    }
+  };
 
   const copyBuildInfo = async (): Promise<void> => {
     copiedNotice = "";
@@ -111,6 +130,17 @@
       <div class="error" data-testid="about-copy-error">{copyError}</div>
     {/if}
   </section>
+
+  {#if appInfo.runtimeEnvironment === "tauri"}
+    <section class="panel about-panel">
+      <h2 class="heading">Reset this device</h2>
+      <p class="hint">Deletes this device's Syncpeer app data and downloaded files, including unsynced edits. External selected folders and other devices are not changed. Android folder access must be granted again. Back up anything needed first.</p>
+      <div class="actions">
+        <button data-testid="about-reset-local" onclick={resetLocalData}>Reset local Syncpeer data</button>
+      </div>
+      {#if resetError}<div class="error" data-testid="about-reset-error">{resetError}</div>{/if}
+    </section>
+  {/if}
 </main>
 
 <style>

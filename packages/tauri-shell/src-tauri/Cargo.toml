@@ -25,6 +25,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pemfile = "2"
 rcgen = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 data-encoding = "2.6"
 url = "2.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
@@ -33,7 +34,8 @@ prost = "0.13"
 quinn = "0.11"
 tokio = { version = "1", features = ["sync", "time"] }
 fs2 = "0.4"
-rusqlite = { version = "0.38", features = ["bundled", "backup"] }
+getrandom = "0.2"
+rusqlite = { version = "0.38", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { version = "1", features = ["fs"] }

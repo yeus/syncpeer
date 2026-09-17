@@ -30,6 +30,10 @@ impl<R: Runtime> SyncpeerAndroid<R> {
   pub fn vault_secret(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("vaultSecret", request).map_err(Into::into)
   }
+  pub fn reset_local_data(&self) -> crate::Result<()> {
+    self.0.run_mobile_plugin::<serde_json::Value>("resetLocalData", json!({}))
+      .map(|_| ()).map_err(Into::into)
+  }
   pub fn biometric_status(&self, profile_id: &str) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("biometricStatus", json!({"profileId": profile_id})).map_err(Into::into)
   }

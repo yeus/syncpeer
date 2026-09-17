@@ -11,6 +11,7 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_DocumentByteStorage_init
     mut env: JNIEnv,
     object: JObject,
     metadata_path: JString,
+    metadata_key: JString,
 ) {
     // The private Java field is owned by this adapter, initialized once, and all
     // access is serialized by the Kotlin instance. jni stores a Mutex<T> in it.
@@ -22,8 +23,16 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_DocumentByteStorage_init
         if !std::path::Path::new(&path).is_absolute() {
             return Err("Invalid metadata directory".into());
         }
-        unsafe { env.set_rust_field(&object, "nativeHandle", ReplicaRoots::new(path.into())) }
-            .map_err(|e| e.to_string())
+        let encoded: String = env.get_string(&metadata_key).map_err(|e| e.to_string())?.into();
+        if encoded.len() != 64 { return Err("Invalid metadata key".into()); }
+        let mut key = [0u8; 32];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                .map_err(|_| "Invalid metadata key".to_string())?;
+        }
+        let roots = ReplicaRoots::new(path.into(), key);
+        key.fill(0);
+        unsafe { env.set_rust_field(&object, "nativeHandle", roots) }.map_err(|e| e.to_string())
     })();
     if result.is_err() {
         let _ = env.throw_new(

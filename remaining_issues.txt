@@ -104,11 +104,14 @@ Personal-space transition (not yet complete)
 - Persist and apply versioned folder-share targets and device-scoped favorites
   through the encrypted settings folder. The core merge and share-resolution
   rules exist, but are not yet connected to BEP or the UI.
-- Add the explicit, confirmed local-only fresh start before dropping legacy
-  vault/settings formats. Never wipe external selected folders or remote peers.
-- Encrypt native and CLI metadata databases with managed SQLCipher keys;
-  protect native and CLI device-private identity keys; remove plaintext
-  WebView/legacy secret fallbacks only after the reset path is operational.
+- Complete and device-test the explicit, confirmed local-only fresh start.
+  Native UI/backend wiring exists, but Android process-clear and desktop
+  credential/data cleanup still need acceptance tests. Never wipe external
+  selected folders or remote peers.
+- Native metadata now uses SQLCipher with protected per-install keys; verify
+  Android physical-device behavior. Encrypt CLI metadata with a
+  managed key; protect native and CLI device-private identity keys; remove
+  plaintext WebView/legacy secret fallbacks after reset is validated.
 - Add end-to-end recovery, compromise rekey, mixed-Syncthing interoperability,
   Android service/reboot, and physical-device acceptance tests for the above.
 - Move the memory-hard bootstrap KDF off the UI thread. Noble's async scrypt

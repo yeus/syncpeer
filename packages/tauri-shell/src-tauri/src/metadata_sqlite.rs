@@ -1,9 +1,12 @@
-//! Opaque private records shared by the desktop bridge and Android service JNI.
-//! Encryption remains in TypeScript. SQLite is the durable owner, never a cache fallback.
-use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest, Sha256};
+//! SQLCipher-backed private records shared by the desktop bridge and Android service JNI.
+//! Document payload encryption remains in TypeScript; the database also encrypts local metadata.
+use rusqlite::{backup::Backup, params, Connection, OptionalExtension};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+#[cfg(test)]
+use sha2::Digest;
 use std::{
-    fs, io,
+    fs, io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -11,10 +14,68 @@ use std::{
 pub struct MetadataDatabase {
     connection: Connection,
     pub directory: PathBuf,
+    key: [u8; 32],
 }
 
 fn error(value: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("Metadata database: {value}"))
+}
+
+fn key_connection(connection: &Connection, key: &[u8; 32]) -> io::Result<()> {
+    // Use the C API so the key never appears in SQL text, diagnostics, or a query trace.
+    let status = unsafe {
+        rusqlite::ffi::sqlite3_key(connection.handle(), key.as_ptr().cast(), key.len() as i32)
+    };
+    if status != rusqlite::ffi::SQLITE_OK {
+        return Err(error("could not unlock encrypted storage"));
+    }
+    Ok(())
+}
+
+fn check_metadata_key(base: &Path, key: &[u8; 32]) -> io::Result<()> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(error)?;
+    mac.update(b"syncpeer.metadata-root.v1");
+    let expected = mac.finalize().into_bytes();
+    if fs::symlink_metadata(base).is_ok_and(|entry| entry.file_type().is_symlink()) {
+        return Err(error("metadata root symlink is forbidden"));
+    }
+    fs::create_dir_all(base)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
+    }
+    let marker = base.join("key-check");
+    if fs::symlink_metadata(&marker).is_ok_and(|entry| entry.file_type().is_symlink()) {
+        return Err(error("metadata key check symlink is forbidden"));
+    }
+    if !marker.exists() {
+        let folders = base.join("folders");
+        if folders.is_dir() && fs::read_dir(folders)?.next().is_some() {
+            return Err(error("metadata key check is missing; restore or reset local storage"));
+        }
+        match fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+            Ok(mut file) => {
+                #[cfg(unix)] {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+                file.write_all(&expected)?;
+                file.sync_all()?;
+            }
+            Err(value) if value.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(value) => return Err(value),
+        }
+    }
+    if fs::read(&marker)? != expected.as_slice() {
+        return Err(error("metadata key does not match this installation"));
+    }
+    Ok(())
+}
+
+impl Drop for MetadataDatabase {
+    fn drop(&mut self) {
+        self.key.fill(0);
+    }
 }
 
 impl MetadataDatabase {
@@ -42,9 +103,12 @@ impl MetadataDatabase {
         self.connection.query_row("SELECT id, length(value), revision, modified_ms FROM records WHERE namespace = 'private' AND id = ? AND deleted = 0",
             [name], metadata_entry).optional().map_err(error)
     }
-    pub fn open(base: &Path, root: &Path, identity: &str) -> io::Result<Self> {
-        let key = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
-        let directory = base.join("folders").join(key);
+    pub fn open(base: &Path, root: &Path, identity: &str, key: &[u8; 32]) -> io::Result<Self> {
+        check_metadata_key(base, key)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(error)?;
+        mac.update(root.to_string_lossy().as_bytes());
+        let root_hash = format!("{:x}", mac.finalize().into_bytes());
+        let directory = base.join("folders").join(root_hash);
         if directory.starts_with(root) {
             return Err(error("must be outside selected folder"));
         }
@@ -70,6 +134,7 @@ impl MetadataDatabase {
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         }
         let mut connection = Connection::open(&database).map_err(error)?;
+        key_connection(&connection, key)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -134,6 +199,7 @@ impl MetadataDatabase {
         Ok(Self {
             connection,
             directory,
+            key: *key,
         })
     }
 
@@ -185,9 +251,24 @@ impl MetadataDatabase {
         if destination.exists() {
             return Err(error("backup destination already exists"));
         }
-        self.connection
-            .backup("main", destination, None)
-            .map_err(error)
+        let mut output = Connection::open(destination).map_err(error)?;
+        let result = (|| {
+            key_connection(&output, &self.key)?;
+            Backup::new(&self.connection, &mut output)
+                .map_err(error)?
+                .run_to_completion(128, Duration::from_millis(10), None)
+                .map_err(error)?;
+            let check: String = output.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(error)?;
+            if check != "ok" {
+                return Err(error("encrypted backup integrity validation failed"));
+            }
+            Ok(())
+        })();
+        drop(output);
+        if result.is_err() {
+            let _ = fs::remove_file(destination);
+        }
+        result
     }
 
     pub fn create_backup(&self) -> io::Result<PathBuf> {
@@ -225,12 +306,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_database_requires_key_and_encrypts_database_and_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("files");
+        let state = temp.path().join("state");
+        let key = [7u8; 32];
+        let marker = b"synthetic-private-record";
+        let db = MetadataDatabase::open(&state, &root, "fixture", &key).unwrap();
+        let plain_path_hash = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+        assert_ne!(db.directory.file_name().unwrap().to_string_lossy(), plain_path_hash);
+        db.put("private", "secret", marker, 0).unwrap();
+        let wal = db.directory.join("metadata.sqlite3-wal");
+        let wal_contents = fs::read(&wal).unwrap();
+        assert!(!wal_contents.windows(marker.len()).any(|window| window == marker));
+        let backup = temp.path().join("backup.sqlite3");
+        db.backup(&backup).unwrap();
+        let database = db.directory.join("metadata.sqlite3");
+        drop(db);
+        for path in [&database, &backup] {
+            let contents = fs::read(path).unwrap();
+            assert!(!contents.starts_with(b"SQLite format 3"));
+            assert!(!contents.windows(marker.len()).any(|window| window == marker));
+        }
+        let backup_connection = Connection::open(&backup).unwrap();
+        key_connection(&backup_connection, &key).unwrap();
+        let backed_up: Vec<u8> = backup_connection.query_row(
+            "SELECT value FROM records WHERE namespace = 'private' AND id = 'secret'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(backed_up, marker);
+        assert!(MetadataDatabase::open(&state, &root, "fixture", &[8u8; 32]).is_err());
+        assert_eq!(MetadataDatabase::open(&state, &root, "fixture", &key)
+            .unwrap().get("private", "secret").unwrap().unwrap(), marker);
+        fs::remove_file(state.join("key-check")).unwrap();
+        assert!(MetadataDatabase::open(&state, &root, "fixture", &key).is_err());
+    }
+
+    #[test]
     fn record_revisions_reject_stale_writers_even_after_delete_and_recreate() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("files");
         let state = temp.path().join("state");
-        let first = MetadataDatabase::open(&state, &root, "fixture").unwrap();
-        let second = MetadataDatabase::open(&state, &root, "fixture").unwrap();
+        let first = MetadataDatabase::open(&state, &root, "fixture", &[7u8; 32]).unwrap();
+        let second = MetadataDatabase::open(&state, &root, "fixture", &[7u8; 32]).unwrap();
         first
             .replace_record("record", &[1], 0, None, false)
             .unwrap();
@@ -251,7 +369,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("files");
         let state = temp.path().join("state");
-        let db = MetadataDatabase::open(&state, &root, "fixture-identity").unwrap();
+        let db = MetadataDatabase::open(&state, &root, "fixture-identity", &[7u8; 32]).unwrap();
         db.put("private", "opaque", &[0, 255, 1], 1).unwrap();
         assert_eq!(db.read("opaque", 1, 2).unwrap(), [255, 1]);
         assert!(db.read("opaque", 2, 2).is_err());
@@ -259,14 +377,14 @@ mod tests {
         db.backup(&backup).unwrap();
         assert!(db.backup(&backup).is_err());
         drop(db);
-        let db = MetadataDatabase::open(&state, &root, "fixture-identity").unwrap();
+        let db = MetadataDatabase::open(&state, &root, "fixture-identity", &[7u8; 32]).unwrap();
         assert_eq!(db.get("private", "opaque").unwrap().unwrap(), [0, 255, 1]);
-        assert!(MetadataDatabase::open(&state, &root, "replacement").is_err());
+        assert!(MetadataDatabase::open(&state, &root, "replacement", &[7u8; 32]).is_err());
         let filename = db.directory.join("metadata.sqlite3");
         drop(db);
         fs::write(&filename, b"corrupt").unwrap();
-        assert!(MetadataDatabase::open(&state, &root, "fixture-identity").is_err());
+        assert!(MetadataDatabase::open(&state, &root, "fixture-identity", &[7u8; 32]).is_err());
         fs::remove_file(filename).unwrap();
-        assert!(MetadataDatabase::open(&state, &root, "fixture-identity").is_err());
+        assert!(MetadataDatabase::open(&state, &root, "fixture-identity", &[7u8; 32]).is_err());
     }
 }

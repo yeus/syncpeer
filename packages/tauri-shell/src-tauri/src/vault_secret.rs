@@ -64,6 +64,63 @@ fn desktop_secret(request: VaultSecretRequest) -> Result<Value, String> {
     result.map_err(|_| "Protected credential operation failed; use manual unlock.".into())
 }
 
+#[cfg(target_os = "linux")]
+pub fn load_or_create_metadata_key(metadata_root: &std::path::Path) -> Result<[u8; 32], String> {
+    let request = |operation: &str, secret: Option<String>| VaultSecretRequest {
+        profile_id: "metadata".into(), operation: operation.into(), secret,
+    };
+    let stored = desktop_secret(request("load", None))?;
+    if let Some(encoded) = stored.as_str() {
+        let bytes = data_encoding::HEXLOWER.decode(encoded.as_bytes())
+            .map_err(|_| "Protected metadata key is invalid; recovery or local reset is required.".to_string())?;
+        return bytes.try_into().map_err(|_| "Protected metadata key is invalid; recovery or local reset is required.".to_string());
+    }
+    let folders = metadata_root.join("folders");
+    if metadata_root.join("key-check").exists() {
+        return Err("Existing metadata requires its protected key or a confirmed local reset.".into());
+    }
+    if folders.is_dir() {
+        for item in std::fs::read_dir(&folders).map_err(|_| "Metadata state could not be inspected.".to_string())? {
+            let item = item.map_err(|_| "Metadata state could not be inspected.".to_string())?;
+            if item.path().is_dir() && std::fs::read_dir(item.path())
+                .map_err(|_| "Metadata state could not be inspected.".to_string())?
+                .next().is_some() {
+                return Err("Existing metadata requires its protected key or a confirmed local reset.".into());
+            }
+        }
+    }
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|_| "Protected metadata key could not be generated.".to_string())?;
+    let encoded = data_encoding::HEXLOWER.encode(&key);
+    desktop_secret(request("save", Some(encoded.clone())))?;
+    if desktop_secret(request("load", None))?.as_str() != Some(encoded.as_str()) {
+        key.fill(0);
+        return Err("Protected metadata key verification failed.".into());
+    }
+    Ok(key)
+}
+
+#[cfg(target_os = "linux")]
+pub fn ensure_local_reset_credentials_available() -> Result<(), String> {
+    desktop_secret(VaultSecretRequest {
+        profile_id: "metadata".into(), operation: "load".into(), secret: None,
+    })?;
+    desktop_secret(VaultSecretRequest {
+        profile_id: "documents".into(), operation: "load".into(), secret: None,
+    })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn remove_local_reset_credentials() -> Result<(), String> {
+    for profile_id in ["metadata", "documents"] {
+        desktop_secret(VaultSecretRequest {
+            profile_id: profile_id.into(), operation: "remove".into(), secret: None,
+        })?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn syncpeer_vault_secret(
     app: tauri::AppHandle,

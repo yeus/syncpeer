@@ -15,6 +15,7 @@ import android.os.PersistableBundle
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Context
 import android.content.ServiceConnection
 import android.os.IBinder
@@ -159,6 +160,13 @@ class AndroidCalendarDeleteArgs {
 @TauriPlugin
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private val vaultSecrets by lazy { VaultSecretStore(activity.applicationContext) }
+
+  @Command
+  fun resetLocalData(invoke: Invoke) {
+    val manager = activity.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    if (!manager.clearApplicationUserData()) invoke.reject("Android could not clear Syncpeer local data.")
+    // A successful request clears the app's own private data and terminates its process.
+  }
 
   @Command
   fun documentCommand(invoke: Invoke) {

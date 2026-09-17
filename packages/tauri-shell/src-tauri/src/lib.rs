@@ -8,6 +8,7 @@ mod document_storage;
 #[cfg(target_os = "android")]
 mod android_network;
 mod vault_secret;
+mod local_reset;
 use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
@@ -4333,6 +4334,7 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
             vault_secret::syncpeer_vault_secret,
+            local_reset::syncpeer_reset_local_data,
             replica_storage::syncpeer_replica_storage,
             documents::syncpeer_document_command,
             syncpeer_read_text_file,

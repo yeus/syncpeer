@@ -15,6 +15,7 @@ pub struct ReplicaRoots {
     locks: HashMap<u64, std::fs::File>,
     writers: HashMap<u64, ReplicaWriter>,
     metadata_root: PathBuf,
+    metadata_key: Option<[u8; 32]>,
     metadata: HashMap<u64, MetadataDatabase>,
     metadata_prefixes: HashMap<u64, Vec<String>>,
 }
@@ -24,6 +25,7 @@ impl Drop for ReplicaRoots {
         for id in self.roots.keys().copied().collect::<Vec<_>>() {
             let _ = self.release(id);
         }
+        if let Some(key) = self.metadata_key.as_mut() { key.fill(0); }
     }
 }
 
@@ -144,9 +146,11 @@ fn revision(metadata: &Metadata) -> String {
 }
 
 impl ReplicaRoots {
-    pub fn new(metadata_root: PathBuf) -> Self {
+    #[cfg(any(test, target_os = "android"))]
+    pub fn new(metadata_root: PathBuf, metadata_key: [u8; 32]) -> Self {
         let mut roots = Self::default();
         roots.metadata_root = metadata_root;
+        roots.metadata_key = Some(metadata_key);
         roots
     }
 
@@ -270,6 +274,7 @@ impl ReplicaRoots {
             &self.metadata_root,
             path,
             &file_identity(&root.dir_metadata()?)?,
+            self.metadata_key.as_ref().ok_or_else(|| invalid("Protected metadata key is unavailable"))?,
         )?;
         let expected = db.get("marker", "identity")?;
         let mut marker = marker_identity(&root)?;
@@ -1127,6 +1132,12 @@ pub async fn syncpeer_replica_storage(
         if roots.metadata_root.as_os_str().is_empty() {
             roots.metadata_root = metadata_root;
         }
+        if roots.metadata_key.is_none() {
+            #[cfg(target_os = "linux")]
+            { roots.metadata_key = Some(crate::vault_secret::load_or_create_metadata_key(&roots.metadata_root)?); }
+            #[cfg(not(target_os = "linux"))]
+            { return Err("Protected metadata key is unavailable.".into()); }
+        }
         dispatch(&mut roots, request)
     })
     .await
@@ -1142,7 +1153,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("source"), [1, 2, 3]).unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots
             .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
             .unwrap();
@@ -1161,7 +1172,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(".syncpeer-folder-marker"), b"").unwrap();
         std::fs::write(temp.path().join(".syncpeer-test-record"), [1, 2, 3]).unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots
             .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
             .unwrap();
@@ -1182,7 +1193,7 @@ mod tests {
         );
         roots.release(id).unwrap();
         drop(roots);
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots
             .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
             .unwrap();
@@ -1203,7 +1214,7 @@ mod tests {
     fn replica_locks_exclude_other_handles_and_release_on_close() {
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let first = roots.register(temp.path()).unwrap();
         let second = roots.register(temp.path()).unwrap();
         roots.initialize_replica(first).unwrap();
@@ -1225,7 +1236,7 @@ mod tests {
         let path = temp.path().join("root");
         std::fs::create_dir(&path).unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(&path).unwrap();
         assert!(roots.check_health(id).is_err());
         roots.initialize_replica(id).unwrap();
@@ -1263,7 +1274,7 @@ mod tests {
     fn timestamps_archives_and_nonrecursive_removal_preserve_data() {
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(temp.path()).unwrap();
         roots.make_directory(id, "nested").unwrap();
         let writer = roots.begin(id, "nested/file", 3).unwrap();
@@ -1292,7 +1303,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file"), [1, 2, 3]).unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(temp.path()).unwrap();
         let writer = roots.begin(id, "file", 3).unwrap();
         roots.write(writer, 0, &[4, 5, 6]).unwrap();
@@ -1313,7 +1324,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file"), [1]).unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(temp.path()).unwrap();
         let writer = roots.begin(id, "file", 1).unwrap();
         roots.write(writer, 0, &[2]).unwrap();
@@ -1328,7 +1339,7 @@ mod tests {
     fn incomplete_replacements_are_rejected_and_nested_empty_files_work() {
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(temp.path()).unwrap();
         let writer = roots.begin(id, "nested/file", 3).unwrap();
         roots.write(writer, 2, &[3]).unwrap();
@@ -1352,7 +1363,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("file"), [1, 2, 3, 4]).unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(temp.path()).unwrap();
         assert_eq!(roots.read(id, "file", 1, 2).unwrap(), [2, 3]);
         assert!(roots.read(id, "file", 0, 131073).is_err());
@@ -1377,7 +1388,7 @@ mod tests {
         std::fs::write(outside.path().join("private"), [9]).unwrap();
         std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
         let state = tempfile::tempdir().unwrap();
-        let mut roots = ReplicaRoots::new(state.path().to_path_buf());
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots.register(temp.path()).unwrap();
         assert_eq!(roots.list(id, "").unwrap()[0].kind, "symlink");
         assert!(roots.read(id, "link/private", 0, 1).is_err());

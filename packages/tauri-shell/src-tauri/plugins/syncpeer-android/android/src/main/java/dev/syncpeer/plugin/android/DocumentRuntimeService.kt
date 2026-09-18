@@ -102,7 +102,7 @@ class DocumentRuntimeService : Service() {
         if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "rename", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
         }
-        if (input.optString("operation") in listOf("release", "remove", "rename", "saveProfileSettings")) requestFavoriteSync()
+        if (input.optString("operation") in listOf("release", "remove", "rename", "saveProfileSettings", "recordFavoriteResolution", "clearFavoriteSyncEntry")) requestFavoriteSync()
         reply
       }
     }

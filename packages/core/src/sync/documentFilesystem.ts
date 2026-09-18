@@ -18,7 +18,7 @@ import type { CachedFileRecord } from "../ui/browserClient.js";
 import { cachedFileKey } from "../ui/helpers.js";
 import { deleteDocumentBaseline, loadDocumentBaseline, saveDocumentBaseline } from "./documentBaseline.js";
 import { clearFavoriteRenames, loadFavoriteSyncState, recordFavoriteRename,
-  saveFavoriteSyncEntries, type FavoriteSyncEntry } from "./documentFavoriteState.js";
+  removeFavoriteSyncEntry, saveFavoriteSyncEntries, type FavoriteSyncEntry } from "./documentFavoriteState.js";
 import { classifyFavoritePath } from "../ui/favoriteSelection.js";
 import { defaultFolderSettings } from "./profileSettings.js";
 import { cacheQuotaBytes, planCacheEvictions } from "./profileSettings.js";
@@ -560,13 +560,47 @@ const recordRenamedFavorite = async (
   to: string,
 ): Promise<void> => {
   const settings = await runtime.vault.profileSettings();
-  const selected = settings.folders[folder.id]?.favorites.some(item =>
-    item.kind === "file" && item.path === from);
+  const selected = settings.folders[folder.id]?.favorites.some(item => item.path === from);
   if (!selected) return;
   const bytes = runtime.storage.get(folder.storageId), key = runtime.folderKeys.get(folder.storageId);
   if (!bytes || !key) throw new Error("Document folder is not open.");
   await recordFavoriteRename(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes },
     { from, to, atMs: Date.now() });
+};
+
+/** Copies every descendant to the new prefix, then tombstones the old paths.
+ * A partial copy is cleaned up before the error is surfaced.
+ */
+const renameDirectoryAction = async (
+  runtime: DocumentRuntime,
+  file: ReturnType<typeof resolveDocument>,
+  descendants: Awaited<ReturnType<LocalFolderReplica["scan"]>>,
+  target: string,
+  modifiedMs: number,
+): Promise<void> => {
+  const sourcePrefix = file.path + "/", created: string[] = [];
+  const fail = async (error: unknown): Promise<never> => {
+    await removeReplicaPaths(file.replica, file.folder.id, created).catch(() => {});
+    throw error;
+  };
+  try {
+    await file.replica.edit!({ method: "mkdir", folderId: file.folder.id, path: target, modifiedMs, expectedVersion: null });
+    created.push(target);
+    for (const info of [...descendants].sort((left, right) => left.name.length - right.name.length)) {
+      const next = target + "/" + info.name.slice(sourcePrefix.length);
+      if (info.type === 1) {
+        await file.replica.edit!({ method: "mkdir", folderId: file.folder.id, path: next, modifiedMs, expectedVersion: null });
+      } else {
+        await file.replica.edit!({ method: "write", folderId: file.folder.id, path: next, modifiedMs, expectedVersion: null,
+          source: await createReplicaFileSource(file.replica, info.name) });
+      }
+      created.push(next);
+    }
+  } catch (error) { await fail(error); }
+  try {
+    await removeReplicaPaths(file.replica, file.folder.id,
+      [...descendants].map(info => info.name).concat(file.path));
+  } catch (error) { await fail(error); }
 };
 
 const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: string) => {
@@ -575,19 +609,19 @@ const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: 
   const file = resolveDocument(runtime, id), current = await file.replica.scan();
   const old = current.find(info => info.name === file.path && !info.deleted);
   if (!old) throw new Error("Document is unavailable.");
-  if (old.type === 1 && current.some(info => !info.deleted && info.name.startsWith(file.path + "/"))) {
-    throw new Error("Non-empty directories cannot be renamed safely.");
-  }
   const parent = file.path.split("/").slice(0, -1).join("/"), target = parent ? `${parent}/${name}` : name;
   if (target === file.path) return documentStat(runtime, id);
   const previousTarget = current.find(info => info.name === target);
   if (previousTarget && !previousTarget.deleted) throw new Error("A document with that name already exists.");
   const modifiedMs = Date.now();
-  const created = old.type === 1
-    ? await file.replica.edit!({ method: "mkdir", folderId: file.folder.id, path: target,
-      modifiedMs, expectedVersion: previousTarget?.version ?? null })
-    : await file.replica.edit!({ method: "write", folderId: file.folder.id, path: target, modifiedMs,
-      expectedVersion: previousTarget?.version ?? null, source: await createReplicaFileSource(file.replica, file.path) });
+  if (old.type === 1) {
+    const descendants = current.filter(info => !info.deleted && info.name.startsWith(file.path + "/"));
+    await renameDirectoryAction(runtime, file, descendants, target, modifiedMs);
+    await recordRenamedFavorite(runtime, file.folder, file.path, target);
+    return documentStat(runtime, JSON.stringify([file.folder.storageId, target]));
+  }
+  const created = await file.replica.edit!({ method: "write", folderId: file.folder.id, path: target, modifiedMs,
+    expectedVersion: previousTarget?.version ?? null, source: await createReplicaFileSource(file.replica, file.path) });
   try {
     await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: file.path,
       modifiedMs, expectedVersion: old.version ?? {} });
@@ -596,7 +630,7 @@ const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: 
       modifiedMs, expectedVersion: created.version ?? {} }).catch(() => {});
     throw error;
   }
-  if (old.type !== 1) await recordRenamedFavorite(runtime, file.folder, file.path, target);
+  await recordRenamedFavorite(runtime, file.folder, file.path, target);
   return documentStat(runtime, JSON.stringify([file.folder.storageId, target]));
 };
 
@@ -992,6 +1026,18 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
     const { bytes, key } = favoriteStateTarget(runtime, folderId);
     await clearFavoriteRenames(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes }, paths);
   }),
+  clearFavoriteSyncEntry: (folderId: string, path: string) => runQueued(runtime, async () => {
+    const { bytes, key } = favoriteStateTarget(runtime, folderId);
+    await removeFavoriteSyncEntry(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes }, path);
+  }),
+  recordFavoriteResolution: (folderId: string, path: string, resolution: "keep-local" | "keep-remote") =>
+    runQueued(runtime, async () => {
+      const { bytes, key } = favoriteStateTarget(runtime, folderId);
+      const state = await loadFavoriteSyncState(bytes, key);
+      const entries = { ...state.entries, [path]: { phase: "conflict" as const, attempts: 0,
+        updatedAtMs: Date.now(), nextAttemptMs: 0, resolution } };
+      await saveFavoriteSyncEntries(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes }, entries);
+    }),
   loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) =>
     runQueued(runtime, () => loadDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path)),
   saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string, snapshot: StoredDirectorySnapshot) =>

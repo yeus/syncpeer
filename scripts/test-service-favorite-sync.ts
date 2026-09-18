@@ -14,15 +14,27 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
   failDeletes?: boolean;
 } = {}) {
   const requests = { uploads: [] as Array<{ path: string; bytes: Uint8Array }>, deletions: [] as string[] };
+  const children = (parent: string) => {
+    const prefix = parent ? parent + "/" : "";
+    const directories = new Set<string>(), entries: FileEntry[] = [];
+    for (const [path, file] of files) {
+      if (!path.startsWith(prefix)) continue;
+      const rest = path.slice(prefix.length);
+      if (!rest) continue;
+      const slash = rest.indexOf("/");
+      if (slash === -1) entries.push({ name: rest, path, type: "file", size: file.bytes.length, modifiedMs: file.modifiedMs });
+      else directories.add(rest.slice(0, slash));
+    }
+    return [...directories].map(name => ({ name, path: prefix + name, type: "directory" as const,
+      size: 0, modifiedMs: 0 })).concat(entries);
+  };
   const remote = {
     listFolders: async () => [{ id: "folder", label: "Folder", readOnly: false, stats: undefined }],
+    getRemoteDeviceInfo: () => ({ id: "synthetic-peer", deviceName: "Synthetic", clientName: "test", clientVersion: "0" }),
     getFolderSyncState: async (folderId: string) => ({ folderId, remoteIndexId: "1", remoteMaxSequence: "1",
       indexReceived: options.indexReceived ?? true }),
     waitForFolderIndex: async () => options.indexReceived ?? true,
-    readDir: async (_folderId: string, parent: string): Promise<FileEntry[]> =>
-      [...files.entries()].filter(([path]) => path.includes("/") ? path.slice(0, path.lastIndexOf("/")) === parent : parent === "")
-        .map(([path, file]) => ({ name: path.split("/").at(-1)!, path, type: "file" as const,
-          size: file.bytes.length, modifiedMs: file.modifiedMs })),
+    readDir: async (_folderId: string, parent: string): Promise<FileEntry[]> => children(parent),
     readFileToSink: async (_folderId: string, path: string, sink: {
       begin: (metadata: { folderId: string; path: string; sizeBytes: number; encrypted: boolean; contentId?: string }) => Promise<void>;
       write: (offset: number, bytes: Uint8Array) => Promise<void>;
@@ -35,10 +47,10 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
       await sink.commit();
       return { bytesWritten: file.bytes.length, totalBytes: file.bytes.length };
     },
-    writeFileFully: async (_folderId: string, path: string, bytes: Uint8Array) => {
+    writeFileFully: async (_folderId: string, path: string, bytes: Uint8Array, uploadOptions?: { modifiedMs?: number }) => {
       if (options.failUploads) throw new Error("Synthetic upload failure.");
       requests.uploads.push({ path, bytes: bytes.slice() });
-      files.set(path, { bytes: bytes.slice(), modifiedMs: Date.now() });
+      files.set(path, { bytes: bytes.slice(), modifiedMs: uploadOptions?.modifiedMs ?? Date.now() });
     },
     deleteFile: async (_folderId: string, path: string) => {
       if (options.failDeletes) throw new Error("Synthetic delete failure.");
@@ -48,7 +60,9 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
   return { remote, requests, files };
 }
 
-async function createFixture() {
+async function createFixture(favorites: Array<{ path: string; name: string; kind: "file" | "folder" }> = [
+  { path: "notes.txt", name: "notes.txt", kind: "file" },
+]) {
   const { openStorage } = memoryDocumentStorage();
   let remembered: string | null = null;
   const options = { profileId: "favorite-fixture", deviceCounterId: "42", openStorage,
@@ -61,9 +75,9 @@ async function createFixture() {
   await documents.register({ id: "folder", label: "Folder", password: "synthetic-folder-password" });
   await documents.attachDownloads("folder");
   const settings = await documents.profileSettings();
-  settings.folders.folder = { exclusions: [], ignorePatterns: [], paused: false, favorites: [
-    { key: "file:folder:notes.txt", folderId: "folder", path: "notes.txt", name: "notes.txt", kind: "file" },
-  ] };
+  settings.folders.folder = { exclusions: [], ignorePatterns: [], paused: false,
+    favorites: favorites.map(favorite => ({ key: `${favorite.kind}:folder:${favorite.path}`,
+      folderId: "folder", ...favorite })) };
   await documents.saveProfileSettings(settings);
   return { documents, options, openStorage, storageId: JSON.parse((await documents.list("syncpeer-root"))[0].id)[0] as string };
 }
@@ -196,7 +210,10 @@ test("publishes a renamed favorite and removes the old peer path", async () => {
 
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
 
-  assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "renamed" }]);
+  assert.deepEqual(results, [
+    { folderId: "folder", path: "notes.txt", result: "renamed" },
+    { folderId: "folder", path: "renamed.txt", result: "unchanged" },
+  ]);
   assert.equal(requests.uploads.length, 1);
   assert.equal(requests.uploads[0].path, "renamed.txt");
   assert.deepEqual(requests.uploads[0].bytes, content);
@@ -224,7 +241,10 @@ test("resumes a rename that was interrupted after publishing the new name", asyn
 
   const retry = fakeRemote(first.files, {});
   const recovered = await syncServiceFileFavorites(documents, retry.remote as unknown as RemoteFs, { nowMs: 20000 });
-  assert.deepEqual(recovered.results, [{ folderId: "folder", path: "notes.txt", result: "renamed" }]);
+  assert.deepEqual(recovered.results, [
+    { folderId: "folder", path: "notes.txt", result: "renamed" },
+    { folderId: "folder", path: "renamed.txt", result: "unchanged" },
+  ]);
   assert.deepEqual(retry.requests.deletions, ["notes.txt"]);
   assert.equal(retry.files.has("notes.txt"), false);
   assert.equal((await documents.profileSettings()).folders.folder.favorites[0].path, "renamed.txt");
@@ -275,5 +295,183 @@ test("waits for the folder index instead of deleting local favorites", async () 
   const reader = await documents.open(JSON.stringify([storageId, "notes.txt"]), "r");
   assert.equal((await documents.read(reader, 0, 9)).length, 9);
   await documents.release(reader);
+  await documents.close();
+});
+
+test("downloads only the selected descendants of a directory favorite", async () => {
+  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const keep = encoder.encode("keep"), nested = encoder.encode("nested");
+  const { remote } = fakeRemote(new Map([
+    ["docs/keep.txt", { bytes: keep, modifiedMs: 10 }],
+    ["docs/sub/nested.txt", { bytes: nested, modifiedMs: 11 }],
+    ["docs/skip.log", { bytes: encoder.encode("skip"), modifiedMs: 12 }],
+    ["other.txt", { bytes: encoder.encode("other"), modifiedMs: 13 }],
+  ]));
+  const settings = await documents.profileSettings();
+  settings.folders.folder.ignorePatterns = ["*.log"];
+  await documents.saveProfileSettings(settings);
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+
+  assert.deepEqual(results.map(result => [result.path, result.result]), [
+    ["docs/keep.txt", "downloaded"],
+    ["docs/sub/nested.txt", "downloaded"],
+  ]);
+  const reader = await documents.open(JSON.stringify([storageId, "docs/sub/nested.txt"]), "r");
+  assert.deepEqual(await documents.read(reader, 0, nested.length), nested);
+  await documents.release(reader);
+  await assert.rejects(documents.stat(JSON.stringify([storageId, "docs/skip.log"])), /unavailable/i);
+  await assert.rejects(documents.stat(JSON.stringify([storageId, "other.txt"])), /unavailable/i);
+  await documents.close();
+});
+
+test("uploads an offline edit inside a directory favorite", async () => {
+  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const original = encoder.encode("from peer"), edited = encoder.encode("edited offline");
+  const { remote, requests } = fakeRemote(new Map([["docs/keep.txt", { bytes: original, modifiedMs: 10 }]]));
+
+  await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  const id = JSON.stringify([storageId, "docs/keep.txt"]);
+  const writer = await documents.open(id, "rw");
+  await documents.write(writer, 0, edited);
+  await documents.release(writer);
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 2000 });
+
+  assert.deepEqual(results, [{ folderId: "folder", path: "docs/keep.txt", result: "uploaded" }]);
+  assert.deepEqual(requests.uploads, [{ path: "docs/keep.txt", bytes: edited }]);
+  await documents.close();
+});
+
+test("propagates a peer deletion inside a directory favorite and keeps local edits", async () => {
+  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const content = encoder.encode("from peer");
+  const { remote, files } = fakeRemote(new Map([
+    ["docs/gone.txt", { bytes: content, modifiedMs: 10 }],
+    ["docs/edited.txt", { bytes: content, modifiedMs: 10 }],
+  ]));
+  await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  files.delete("docs/gone.txt");
+  files.delete("docs/edited.txt");
+  const editedId = JSON.stringify([storageId, "docs/edited.txt"]);
+  const writer = await documents.open(editedId, "rw");
+  await documents.write(writer, 0, encoder.encode("local edit"));
+  await documents.release(writer);
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 2000 });
+
+  assert.deepEqual(results.map(result => [result.path, result.result]).sort(), [
+    ["docs/edited.txt", "conflict"],
+    ["docs/gone.txt", "deleted-local"],
+  ]);
+  await assert.rejects(documents.stat(JSON.stringify([storageId, "docs/gone.txt"])), /unavailable/i);
+  const reader = await documents.open(editedId, "r");
+  assert.deepEqual(await documents.read(reader, 0, 10), encoder.encode("local edit"));
+  await documents.release(reader);
+  await documents.close();
+});
+
+test("renames a directory favorite by publishing descendants and tombstoning old names", async () => {
+  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const first = encoder.encode("first"), second = encoder.encode("second");
+  const { remote, requests, files } = fakeRemote(new Map([
+    ["docs/a.txt", { bytes: first, modifiedMs: 10 }],
+    ["docs/sub/b.txt", { bytes: second, modifiedMs: 11 }],
+  ]));
+  await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  await documents.rename(JSON.stringify([storageId, "docs"]), "notes");
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 2000 });
+
+  assert.deepEqual(results.filter(result => result.result === "renamed").map(result => result.path).sort(),
+    ["docs/a.txt", "docs/sub/b.txt"]);
+  assert.deepEqual(requests.uploads.map(upload => upload.path).sort(), ["notes/a.txt", "notes/sub/b.txt"]);
+  assert.deepEqual(requests.deletions.sort(), ["docs/a.txt", "docs/sub/b.txt"]);
+  assert.equal(files.has("docs/a.txt"), false);
+  assert.equal(files.has("notes/a.txt"), true);
+  const favorites = (await documents.profileSettings()).folders.folder.favorites;
+  assert.deepEqual(favorites.map(favorite => favorite.path), ["notes"]);
+  assert.equal((await documents.favoriteSyncState("folder")).renames.length, 0);
+  await documents.close();
+});
+
+test("keeps a local-only file in a directory favorite instead of deleting it", async () => {
+  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const content = encoder.encode("from peer");
+  const { remote, requests } = fakeRemote(new Map([["docs/keep.txt", { bytes: content, modifiedMs: 10 }]]));
+  await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  const created = await documents.create(JSON.stringify([storageId, "docs"]), "offline.txt", false);
+  const writer = await documents.open(created.id, "rw");
+  await documents.write(writer, 0, encoder.encode("local"));
+  await documents.release(writer);
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 2000 });
+
+  assert.deepEqual(results, [
+    { folderId: "folder", path: "docs/keep.txt", result: "unchanged" },
+    { folderId: "folder", path: "docs/offline.txt", result: "uploaded" },
+  ]);
+  assert.deepEqual(requests.uploads, [{ path: "docs/offline.txt", bytes: encoder.encode("local") }]);
+  await documents.close();
+});
+
+test("saves an offline directory snapshot for each visited favorite directory", async () => {
+  const { documents } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { remote } = fakeRemote(new Map([
+    ["docs/keep.txt", { bytes: encoder.encode("keep"), modifiedMs: 10 }],
+    ["docs/sub/nested.txt", { bytes: encoder.encode("nested"), modifiedMs: 11 }],
+  ]));
+
+  await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+
+  const root = await documents.loadDirectorySnapshot("folder", "synthetic-peer", "docs");
+  assert.deepEqual(root?.entries.map(entry => entry.path).sort(), ["docs/keep.txt", "docs/sub"]);
+  const nested = await documents.loadDirectorySnapshot("folder", "synthetic-peer", "docs/sub");
+  assert.deepEqual(nested?.entries.map(entry => entry.path), ["docs/sub/nested.txt"]);
+  await documents.close();
+});
+
+test("applies a recorded keep-local resolution by publishing the local copy", async () => {
+  const { documents, storageId } = await createFixture();
+  const content = encoder.encode("from peer");
+  const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
+  await cacheRemoteFile(documents, "notes.txt", content, 10);
+  const id = JSON.stringify([storageId, "notes.txt"]);
+  const writer = await documents.open(id, "rw");
+  await documents.write(writer, 0, encoder.encode("local choice"));
+  await documents.release(writer);
+  files.set("notes.txt", { bytes: encoder.encode("peer choice"), modifiedMs: 20 });
+  const conflicted = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  assert.equal(conflicted.results[0].result, "conflict");
+  await documents.recordFavoriteResolution("folder", "notes.txt", "keep-local");
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+
+  assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "uploaded" }]);
+  assert.deepEqual(requests.uploads.at(-1), { path: "notes.txt", bytes: encoder.encode("local choice") });
+  assert.equal((await documents.favoriteSyncState("folder")).entries["notes.txt"]?.resolution, undefined);
+  await documents.close();
+});
+
+test("applies a recorded keep-remote resolution by replacing the local copy", async () => {
+  const { documents, storageId } = await createFixture();
+  const content = encoder.encode("from peer");
+  const { remote, files } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
+  await cacheRemoteFile(documents, "notes.txt", content, 10);
+  const id = JSON.stringify([storageId, "notes.txt"]);
+  const writer = await documents.open(id, "rw");
+  await documents.write(writer, 0, encoder.encode("local choice"));
+  await documents.release(writer);
+  files.set("notes.txt", { bytes: encoder.encode("peer choice"), modifiedMs: 20 });
+  await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  await documents.recordFavoriteResolution("folder", "notes.txt", "keep-remote");
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+
+  assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "downloaded" }]);
+  const reader = await documents.open(id, "r");
+  assert.deepEqual(await documents.read(reader, 0, 11), encoder.encode("peer choice"));
+  await documents.release(reader);
+  assert.equal((await documents.favoriteSyncState("folder")).entries["notes.txt"]?.resolution, undefined);
   await documents.close();
 });

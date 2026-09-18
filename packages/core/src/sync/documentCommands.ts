@@ -54,6 +54,26 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     }
     case "versions": return documents.versions(text("id"));
     case "restoreVersion": return documents.restoreVersion(text("id"), text("versionId"));
+    case "favoriteSyncState": return documents.favoriteSyncState(text("folderId"));
+    case "clearFavoriteSyncEntry": return documents.clearFavoriteSyncEntry(text("folderId"), text("path"));
+    case "recordFavoriteResolution": {
+      if (command.resolution !== "keep-local" && command.resolution !== "keep-remote") {
+        throw new Error("Invalid favorite conflict resolution.");
+      }
+      return documents.recordFavoriteResolution(text("folderId"), text("path"), command.resolution);
+    }
+    case "clearFavoriteRenames": {
+      if (!Array.isArray(command.paths) || command.paths.length > 4096 ||
+        command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");
+      return documents.clearFavoriteRenames(text("folderId"), command.paths);
+    }
+    case "saveFavoriteSyncEntries": {
+      if (!command.entries || typeof command.entries !== "object" || Array.isArray(command.entries)) {
+        throw new Error("Invalid favorite sync entries.");
+      }
+      return documents.saveFavoriteSyncEntries(text("folderId"),
+        command.entries as Parameters<typeof documents.saveFavoriteSyncEntries>[1]);
+    }
     case "attachDownloads": return documents.attachDownloads(text("id"));
     case "detachDownloads": return documents.detachDownloads(text("id"));
     case "clearFolderContents": return documents.clearFolderContents(text("folderId"));

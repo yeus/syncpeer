@@ -143,6 +143,21 @@ export interface DocumentVersionRecord {
   sizeBytes: number;
 }
 
+/** Service-owned favorite sync state, reported without filenames in logs. */
+export interface FavoriteSyncStateRecord {
+  path: string;
+  phase: "synced" | "downloading" | "uploading" | "deleting-remote" | "deleting-local" | "conflict" | "error";
+  message?: string;
+  attempts: number;
+  updatedAtMs: number;
+  nextAttemptMs: number;
+}
+
+export interface FavoriteSyncStateSnapshot {
+  folderId: string;
+  entries: FavoriteSyncStateRecord[];
+}
+
 export interface AndroidContactRecord {
   contactId: string;
   displayName: string;
@@ -185,6 +200,9 @@ export interface SyncpeerPlatformAdapter {
   enforceCacheQuota?: () => Promise<{ quotaBytes: number; cachedBytes: number; protectedBytes: number; evicted: string[] }>;
   listDocumentVersions?: (folderId: string, path: string) => Promise<DocumentVersionRecord[]>;
   restoreDocumentVersion?: (folderId: string, path: string, versionId: string) => Promise<void>;
+  listFavoriteSyncStates?: (folderIds: readonly string[]) => Promise<FavoriteSyncStateSnapshot[]>;
+  retryFavoriteSync?: (folderId: string, path: string) => Promise<void>;
+  resolveFavoriteConflict?: (folderId: string, path: string, resolution: "keep-local" | "keep-remote") => Promise<void>;
   cacheFile?: (
     folderId: string,
     path: string,
@@ -280,6 +298,9 @@ export interface SyncpeerBrowserClient {
   enforceCacheQuota: NonNullable<SyncpeerPlatformAdapter["enforceCacheQuota"]>;
   listDocumentVersions: (folderId: string, path: string) => Promise<DocumentVersionRecord[]>;
   restoreDocumentVersion: (folderId: string, path: string, versionId: string) => Promise<void>;
+  listFavoriteSyncStates: (folderIds: readonly string[]) => Promise<FavoriteSyncStateSnapshot[]>;
+  retryFavoriteSync: (folderId: string, path: string) => Promise<void>;
+  resolveFavoriteConflict: (folderId: string, path: string, resolution: "keep-local" | "keep-remote") => Promise<void>;
   cacheFile: (
     folderId: string,
     path: string,
@@ -740,6 +761,15 @@ export const createSyncpeerBrowserClient = (
     restoreDocumentVersion: async (folderId, path, versionId) => platformAdapter.restoreDocumentVersion
       ? platformAdapter.restoreDocumentVersion(folderId, path, versionId)
       : throwMissingAdapter("restoreDocumentVersion"),
+    listFavoriteSyncStates: async folderIds => platformAdapter.listFavoriteSyncStates
+      ? platformAdapter.listFavoriteSyncStates(folderIds)
+      : [],
+    retryFavoriteSync: async (folderId, path) => platformAdapter.retryFavoriteSync
+      ? platformAdapter.retryFavoriteSync(folderId, path)
+      : throwMissingAdapter("retryFavoriteSync"),
+    resolveFavoriteConflict: async (folderId, path, resolution) => platformAdapter.resolveFavoriteConflict
+      ? platformAdapter.resolveFavoriteConflict(folderId, path, resolution)
+      : throwMissingAdapter("resolveFavoriteConflict"),
     cacheFile: async (
       folderId: string,
       path: string,

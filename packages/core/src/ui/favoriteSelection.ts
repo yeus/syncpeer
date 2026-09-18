@@ -74,6 +74,8 @@ export async function collectFavoriteFiles(options: {
   exclusions: readonly FavoriteExclusion[];
   patterns?: readonly string[];
   readDir: (path: string) => Promise<FileEntry[]>;
+  /** Called with each visited favorite directory so callers can persist listings. */
+  onDirectory?: (path: string, entries: FileEntry[]) => Promise<void> | void;
 }): Promise<FileEntry[]> {
   const patterns = options.patterns ?? DEFAULT_FAVORITE_IGNORE_PATTERNS;
   const directFiles = options.favorites
@@ -94,7 +96,9 @@ export async function collectFavoriteFiles(options: {
     const directory = pending.shift()!;
     if (visited.has(directory)) continue;
     visited.add(directory);
-    for (const entry of await options.readDir(directory)) {
+    const entries = await options.readDir(directory);
+    await options.onDirectory?.(directory, entries);
+    for (const entry of entries) {
       const kind = entry.type === "directory" ? "folder" as const : "file" as const;
       const state = classifyFavoritePath({ folderId: options.folderId, path: entry.path, kind },
         options.favorites, options.exclusions, patterns);

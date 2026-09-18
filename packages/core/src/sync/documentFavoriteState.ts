@@ -15,6 +15,8 @@ export interface FavoriteSyncEntry {
   attempts: number;
   updatedAtMs: number;
   nextAttemptMs: number;
+  /** User intent recorded by the app; the service executes it on the next pass. */
+  resolution?: "keep-local" | "keep-remote";
 }
 
 export interface FavoriteRename {
@@ -49,12 +51,14 @@ const validateEntry = (value: unknown): FavoriteSyncEntry => {
   const entry = value as Partial<FavoriteSyncEntry>;
   if (!entry || typeof entry !== "object" || typeof entry.phase !== "string" || !phases.has(entry.phase) ||
     !Number.isSafeInteger(entry.attempts) || Number(entry.attempts) < 0 || Number(entry.attempts) > 10_000 ||
-    (entry.message !== undefined && (typeof entry.message !== "string" || entry.message.length > 512))) {
+    (entry.message !== undefined && (typeof entry.message !== "string" || entry.message.length > 512)) ||
+    (entry.resolution !== undefined && entry.resolution !== "keep-local" && entry.resolution !== "keep-remote")) {
     throw new Error("Invalid favorite sync state.");
   }
   return { phase: entry.phase as FavoriteSyncPhase, attempts: Number(entry.attempts),
     updatedAtMs: safeTime(entry.updatedAtMs), nextAttemptMs: safeTime(entry.nextAttemptMs),
-    ...(entry.message === undefined ? {} : { message: entry.message }) };
+    ...(entry.message === undefined ? {} : { message: entry.message }),
+    ...(entry.resolution === undefined ? {} : { resolution: entry.resolution }) };
 };
 
 const validateRename = (value: unknown): FavoriteRename => {
@@ -103,12 +107,32 @@ const writeState = async (bytes: ReplicaByteStorage, options: {
 export const loadFavoriteSyncState = (bytes: ReplicaByteStorage, folderKey: Uint8Array): Promise<FavoriteSyncState> =>
   readState(bytes, folderKey);
 
-/** Entries are service-owned; renames are document-owner-owned. Each writer keeps the other half. */
+/** Entries are service-owned; renames are document-owner-owned. Each writer keeps the other half.
+ * A resolution recorded by the app survives a service write until the service reports it as
+ * executed through `clearFavoriteSyncEntry`.
+ */
 export async function saveFavoriteSyncEntries(bytes: ReplicaByteStorage, options: {
   folderKey: Uint8Array; randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
 }, entries: Record<string, FavoriteSyncEntry>): Promise<void> {
   const current = await readState(bytes, options.folderKey);
-  await writeState(bytes, options, { entries: validateEntries(entries), renames: current.renames });
+  const merged = { ...entries };
+  for (const [path, stored] of Object.entries(current.entries)) {
+    if (!stored.resolution || merged[path]?.resolution) continue;
+    if (merged[path]) merged[path] = { ...merged[path], resolution: stored.resolution };
+  }
+  await writeState(bytes, options, { entries: validateEntries(merged), renames: current.renames });
+}
+
+/** Drops one entry, used by the service to consume an executed resolution and by
+ * the app to clear a backoff before an explicit retry.
+ */
+export async function removeFavoriteSyncEntry(bytes: ReplicaByteStorage, options: {
+  folderKey: Uint8Array; randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
+}, path: string): Promise<void> {
+  const current = await readState(bytes, options.folderKey);
+  const entries = { ...current.entries };
+  delete entries[safePath(path)];
+  await writeState(bytes, options, { entries, renames: current.renames });
 }
 
 export async function recordFavoriteRename(bytes: ReplicaByteStorage, options: {

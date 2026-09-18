@@ -8,8 +8,11 @@ import type { DocumentFilesystem } from "./documentFilesystem.js";
 import type { FolderRegistration } from "./folderRegistry.js";
 import { favoriteRetryDelayMs, type FavoriteRename,
   type FavoriteSyncEntry } from "./documentFavoriteState.js";
-import { planFavoriteRename, planFavoriteSync,
-  resolveFavoriteRenameTarget, type FavoriteRemoteVersion } from "./favoriteSyncPlan.js";
+import { applyFavoriteRename, planFavoriteCandidates, planFavoriteRename,
+  planFavoriteRenames, planFavoriteSync, type FavoriteCandidate,
+  type FavoriteRemoteVersion } from "./favoriteSyncPlan.js";
+import { collectFavoriteFiles, type FavoriteExclusion } from "../ui/favoriteSelection.js";
+import type { FileEntry } from "../core/model/remoteFs.js";
 
 const maxServiceUploadBytes = 32 * 1024 * 1024;
 type Baseline = NonNullable<CachedFileRecord["syncBaseline"]>;
@@ -164,69 +167,124 @@ const runDeleteLocal = async (context: FavoriteContext, path: string): Promise<F
   return { folderId: context.folderId, path, result: "deleted-local" };
 };
 
-const updateFavoritePath = async (context: FavoriteContext, from: string, to: string): Promise<void> => {
+const updateFavoritePaths = async (context: FavoriteContext, renames: readonly FavoriteRename[]): Promise<void> => {
   const settings = await context.documents.profileSettings();
   const folderSettings = settings.folders[context.folderId];
   if (!folderSettings) return;
-  const favorites = folderSettings.favorites.map(item => item.kind === "file" && item.path === from
-    ? { ...item, path: to, name: to.split("/").at(-1)!, key: favoriteKey(context.folderId, to, "file") }
-    : item);
+  const favorites = folderSettings.favorites.map(item => {
+    const resolved = applyFavoriteRename(renames, normalizePath(item.path));
+    if (!resolved) return item;
+    const name = resolved.target.split("/").at(-1)!;
+    return { ...item, path: resolved.target, name, key: favoriteKey(context.folderId, resolved.target, item.kind) };
+  });
   settings.folders = { ...settings.folders, [context.folderId]: { ...folderSettings, favorites } };
   await context.documents.saveProfileSettings(settings);
 };
 
-const runRename = async (context: FavoriteContext, from: string, chain: string[],
-  to: string, local: { size: number; hash: string }, baseline: Baseline | undefined): Promise<FavoriteSyncResult> => {
+/** Publishes one renamed path and tombstones its old peer name. A target whose
+ * published baseline already matches the peer copy resumes after an interruption.
+ */
+const renameFavorite = async (context: FavoriteContext, from: string, to: string): Promise<FavoriteSyncResult> => {
+  const local = context.cached.get(to);
+  if (!local) throw new Error("Renamed favorite is unavailable locally.");
+  const localHash = await hashLocal(context, to);
+  const baseline = await context.documents.syncBaseline(documentId(context.storageId, from));
   const remoteSource = await readRemoteVersion(context.remoteFs, context.folderId, from);
   const remoteTarget = await readRemoteVersion(context.remoteFs, context.folderId, to);
-  const resumeTarget = context.entries[to]?.phase === "uploading";
-  const action = planFavoriteRename({ local, remoteSource, remoteTarget, baseline, resumeTarget });
+  const targetBaseline = await context.documents.syncBaseline(documentId(context.storageId, to));
+  const published = !!targetBaseline && !!remoteTarget &&
+    remoteTarget.size === targetBaseline.sizeBytes && remoteTarget.modifiedMs === targetBaseline.modifiedMs;
+  const action = planFavoriteRename({ local: { size: local.sizeBytes, hash: localHash },
+    remoteSource, remoteTarget, baseline, resumeTarget: published });
   if (action.kind === "conflict") {
     const entry = await recordIssue(context, from, "conflict", action.message);
     return { folderId: context.folderId, path: from, result: "conflict", message: entry.message };
   }
   await setEntry(context, to, { phase: "uploading", attempts: 0, updatedAtMs: context.nowMs, nextAttemptMs: 0 });
-  await uploadFavorite(context, to, local);
+  if (!published) await uploadFavorite(context, to, { hash: localHash });
   if (action.removeRemote) {
     await context.remoteFs.deleteFile(context.folderId, from, { modifiedMs: context.nowMs, waitForRemote: true });
   }
   await context.documents.clearSyncBaseline(documentId(context.storageId, from)).catch(() => {});
-  await updateFavoritePath(context, from, to);
-  await context.documents.clearFavoriteRenames(context.folderId, chain);
-  context.renames = context.renames.filter(rename => !chain.includes(rename.from));
   delete context.entries[from];
   await markSynced(context, to);
   return { folderId: context.folderId, path: from, result: "renamed" };
 };
 
-const planAndRunFavorite = async (context: FavoriteContext, favorite: FavoriteRecord): Promise<FavoriteSyncResult> => {
-  const path = normalizePath(favorite.path), id = documentId(context.storageId, path);
-  const baseline = await context.documents.syncBaseline(id);
-  const cached = context.cached.get(path);
-  const local = cached ? { size: cached.sizeBytes, hash: await hashLocal(context, path) } : undefined;
-  const resolved = resolveFavoriteRenameTarget(context.renames, path);
-  if (resolved && !local) {
-    const target = context.cached.get(resolved.target);
-    if (target) {
-      const targetHash = await hashLocal(context, resolved.target);
-      return runRename(context, path, resolved.chain, resolved.target,
-        { size: target.sizeBytes, hash: targetHash }, baseline);
+const runRenames = async (context: FavoriteContext, results: FavoriteSyncResult[]): Promise<boolean> => {
+  const renames = [...context.renames];
+  const pairs = planFavoriteRenames([...context.cached.keys()], renames);
+  const paired = new Set(pairs.map(pair => pair.from));
+  let failed = false;
+  for (const pair of pairs) {
+    try { results.push(await renameFavorite(context, pair.from, pair.to)); }
+    catch (error) {
+      failed = true;
+      const message = error instanceof Error ? error.message : "Favorite rename failed.";
+      await recordIssue(context, pair.from, "error", message);
+      results.push({ folderId: context.folderId, path: pair.from, result: "error", message });
     }
-    await context.documents.clearFavoriteRenames(context.folderId, resolved.chain);
-    context.renames = context.renames.filter(rename => !resolved.chain.includes(rename.from));
   }
-  const completed = context.renames.find(rename => rename.to === path);
-  if (completed && local) {
-    await context.documents.clearFavoriteRenames(context.folderId, [completed.from, completed.to]);
-    context.renames = context.renames.filter(rename => rename.from !== completed.from);
+  if (failed) return false;
+  for (const rename of renames.filter(entry => !paired.has(entry.from))) {
+    const remote = await readRemoteVersion(context.remoteFs, context.folderId, rename.from);
+    const baseline = await context.documents.syncBaseline(documentId(context.storageId, rename.from));
+    const action = planFavoriteSync({ remote, baseline });
+    if (action.kind === "delete-remote") results.push(await runDeleteRemote(context, rename.from));
+    else if (action.kind === "conflict") await recordIssue(context, rename.from, "conflict", action.message);
   }
-  const remote = await readRemoteVersion(context.remoteFs, context.folderId, path);
-  const action = planFavoriteSync({ local, remote, baseline });
+  await updateFavoritePaths(context, renames);
+  await context.documents.clearFavoriteRenames(context.folderId, renames.flatMap(rename => [rename.from, rename.to]));
+  context.renames = [];
+  return true;
+};
+
+/** Executes a resolution the app recorded for a conflicted favorite.
+ * `keep-local` re-publishes the local copy; `keep-remote` replaces it.
+ * The stored resolution is consumed only after the operation succeeds.
+ */
+const runResolution = async (context: FavoriteContext, candidate: FavoriteCandidate,
+  resolution: "keep-local" | "keep-remote"): Promise<FavoriteSyncResult> => {
+  const path = candidate.path, local = candidate.local;
+  const consume = async () => {
+    await context.documents.clearFavoriteSyncEntry(context.folderId, path);
+    delete context.entries[path];
+  };
+  if (resolution === "keep-local") {
+    if (!local) throw new Error("The local copy is unavailable; the resolution was not applied.");
+    const hash = await hashLocal(context, path);
+    await setEntry(context, path, { phase: "uploading", attempts: 0, updatedAtMs: context.nowMs, nextAttemptMs: 0 });
+    await uploadFavorite(context, path, { hash });
+    await consume();
+    await markSynced(context, path);
+    return { folderId: context.folderId, path, result: "uploaded" };
+  }
+  if (!candidate.remote) throw new Error("The peer copy is unavailable; the resolution was not applied.");
+  const expected = local ? await hashLocal(context, path) : null;
+  await runDownload(context, path, candidate.remote, expected);
+  await consume();
+  await markSynced(context, path);
+  return { folderId: context.folderId, path, result: "downloaded" };
+};
+
+const planAndRunCandidate = async (context: FavoriteContext, candidate: FavoriteCandidate): Promise<FavoriteSyncResult> => {
+  const path = candidate.path, id = documentId(context.storageId, path);
+  const pending = context.entries[path];
+  if (pending?.resolution) {
+    if (pending.nextAttemptMs > context.nowMs) {
+      return { folderId: context.folderId, path, result: pending.phase === "conflict" ? "conflict" : "error",
+        ...(pending.message === undefined ? {} : { message: pending.message }) };
+    }
+    return runResolution(context, candidate, pending.resolution);
+  }
+  const baseline = candidate.local?.baseline ?? await context.documents.syncBaseline(id);
+  const local = candidate.local ? { size: candidate.local.sizeBytes, hash: await hashLocal(context, path) } : undefined;
+  const action = planFavoriteSync({ local, remote: candidate.remote, baseline });
   switch (action.kind) {
     case "unchanged":
       if (context.entries[path]?.phase !== "synced") await markSynced(context, path);
       return { folderId: context.folderId, path, result: "unchanged" };
-    case "download": return runDownload(context, path, remote!, action.expectedLocalHash);
+    case "download": return runDownload(context, path, candidate.remote!, action.expectedLocalHash);
     case "upload": return runUpload(context, path, local!);
     case "delete-remote": return runDeleteRemote(context, path);
     case "delete-local": return runDeleteLocal(context, path);
@@ -237,15 +295,15 @@ const planAndRunFavorite = async (context: FavoriteContext, favorite: FavoriteRe
   }
 };
 
-const runFavorite = async (context: FavoriteContext, favorite: FavoriteRecord): Promise<FavoriteSyncResult> => {
-  const path = normalizePath(favorite.path);
+const runCandidate = async (context: FavoriteContext, candidate: FavoriteCandidate): Promise<FavoriteSyncResult> => {
+  const path = candidate.path;
   const pending = context.entries[path];
-  if (pending && pending.nextAttemptMs > context.nowMs) {
+  if (!pending?.resolution && pending && pending.nextAttemptMs > context.nowMs) {
     return { folderId: context.folderId, path, result: pending.phase === "conflict" ? "conflict" : "error",
       ...(pending.message === undefined ? {} : { message: pending.message }) };
   }
   try {
-    return await planAndRunFavorite(context, favorite);
+    return await planAndRunCandidate(context, candidate);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Favorite sync failed.";
     await recordIssue(context, path, "error", message);
@@ -253,15 +311,11 @@ const runFavorite = async (context: FavoriteContext, favorite: FavoriteRecord): 
   }
 };
 
-const pruneEntries = (entries: Record<string, FavoriteSyncEntry>, favorites: readonly FavoriteRecord[],
-  renames: readonly FavoriteRename[]): Record<string, FavoriteSyncEntry> => {
-  const retained = new Set<string>();
-  for (const favorite of favorites) {
-    const path = normalizePath(favorite.path);
-    retained.add(path);
-    const resolved = resolveFavoriteRenameTarget(renames, path);
-    if (resolved) retained.add(resolved.target);
-  }
+const pruneEntries = (entries: Record<string, FavoriteSyncEntry>, candidates: readonly FavoriteCandidate[],
+  favorites: readonly FavoriteRecord[], renames: readonly FavoriteRename[]): Record<string, FavoriteSyncEntry> => {
+  const retained = new Set(candidates.map(candidate => candidate.path));
+  for (const favorite of favorites) retained.add(normalizePath(favorite.path));
+  for (const rename of renames) { retained.add(rename.from); retained.add(rename.to); }
   return Object.fromEntries(Object.entries(entries).filter(([path]) => retained.has(path)));
 };
 
@@ -269,14 +323,27 @@ const favoriteFolderResults = (folderId: string, favorites: readonly FavoriteRec
   result: FavoriteSyncResult["result"], message: string): FavoriteSyncResult[] =>
   favorites.map(favorite => ({ folderId, path: normalizePath(favorite.path), result, message }));
 
+const collectRemoteFavorites = async (args: {
+  remoteFs: RemoteFs;
+  folderId: string;
+  favorites: readonly FavoriteRecord[];
+  exclusions: readonly FavoriteExclusion[];
+  patterns: readonly string[];
+  onDirectory?: (path: string, entries: FileEntry[]) => Promise<void> | void;
+}) => collectFavoriteFiles({ folderId: args.folderId, favorites: args.favorites, exclusions: args.exclusions,
+  patterns: args.patterns, readDir: path => args.remoteFs.readDir(args.folderId, path),
+  ...(args.onDirectory ? { onDirectory: args.onDirectory } : {}) });
+
 const syncFolderFavorites = async (args: {
   documents: DocumentFilesystem;
   remoteFs: RemoteFs;
   folder: FolderRegistration;
   favorites: FavoriteRecord[];
+  exclusions: FavoriteExclusion[];
+  patterns: string[];
   nowMs: number;
 }): Promise<FavoriteSyncResult[]> => {
-  const { documents, remoteFs, folder, favorites, nowMs } = args;
+  const { documents, remoteFs, folder, favorites, exclusions, patterns, nowMs } = args;
   let indexState = await remoteFs.getFolderSyncState(folder.id);
   if (indexState?.indexReceived !== true) {
     await remoteFs.waitForFolderIndex(folder.id, 6000, 120);
@@ -297,8 +364,37 @@ const syncFolderFavorites = async (args: {
     cached: new Map(cached.map(file => [file.path, file])), entries: state.entries, renames: state.renames,
     nowMs, persist: async () => { await documents.saveFavoriteSyncEntries(folder.id, context.entries); } };
   const results: FavoriteSyncResult[] = [];
-  for (const favorite of favorites) results.push(await runFavorite(context, favorite));
-  const retained = pruneEntries(context.entries, favorites, context.renames);
+  const hadRenames = context.renames.length > 0;
+  if (!await runRenames(context, results)) return results;
+  if (hadRenames) {
+    cached = await documents.cachedFiles(folder.id);
+    context.cached = new Map(cached.map(file => [file.path, file]));
+  }
+  const current = (await documents.profileSettings()).folders[folder.id];
+  const activeFavorites = current?.favorites ?? favorites;
+  const activeExclusions = current?.exclusions ?? exclusions;
+  const activePatterns = current?.ignorePatterns ?? patterns;
+  const sourceDeviceId = remoteFs.getRemoteDeviceInfo()?.id;
+  const onDirectory = sourceDeviceId ? async (path: string, entries: FileEntry[]) => {
+    await documents.saveDirectorySnapshot(folder.id, sourceDeviceId, path,
+      { entries, versionKey: "", loadedAtMs: nowMs });
+  } : undefined;
+  let remote: FileEntry[];
+  try {
+    remote = await collectRemoteFavorites({ remoteFs, folderId: folder.id, favorites: activeFavorites,
+      exclusions: activeExclusions, patterns: activePatterns, ...(onDirectory ? { onDirectory } : {}) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Folder contents are unavailable.";
+    return results.concat(favoriteFolderResults(folder.id, activeFavorites, "unavailable", message));
+  }
+  const baselines = new Map<string, NonNullable<CachedFileRecord["syncBaseline"]>>();
+  for (const file of cached) if (file.syncBaseline) baselines.set(file.path, file.syncBaseline);
+  const candidates = planFavoriteCandidates({ folderId: folder.id, favorites: activeFavorites,
+    exclusions: activeExclusions, patterns: activePatterns,
+    remote, local: cached.map(file => ({ path: file.path, sizeBytes: file.sizeBytes, modifiedMs: file.modifiedMs ?? file.cachedAtMs })),
+    baselines });
+  for (const candidate of candidates) results.push(await runCandidate(context, candidate));
+  const retained = pruneEntries(context.entries, candidates, activeFavorites, context.renames);
   if (Object.keys(retained).length !== Object.keys(context.entries).length) {
     context.entries = retained;
     await context.persist();
@@ -320,7 +416,7 @@ export async function syncServiceFileFavorites(
   const results: FavoriteSyncResult[] = [];
   for (const [folderId, folderSettings] of Object.entries(settings.folders)) {
     const folder = registered.get(folderId);
-    const favorites = folderSettings.favorites.filter(item => item.kind === "file");
+    const favorites = folderSettings.favorites;
     if (!folder || folderSettings.paused || favorites.length === 0) continue;
     const info = folderInfos.get(folderId);
     if (!info || info.needsPassword || info.passwordError || info.stopReason) {
@@ -328,7 +424,8 @@ export async function syncServiceFileFavorites(
         "Folder metadata is unavailable for synchronization."));
       continue;
     }
-    results.push(...await syncFolderFavorites({ documents, remoteFs, folder, favorites, nowMs }));
+    results.push(...await syncFolderFavorites({ documents, remoteFs, folder, favorites,
+      exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs }));
   }
   return { results };
 }

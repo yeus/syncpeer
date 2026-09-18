@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import type { CachedFileRecord, FavoriteRecord, SyncpeerPlatformAdapter } from "../ui/browserClient.js";
+import type { CachedFileRecord, FavoriteRecord, FavoriteSyncStateRecord,
+  SyncpeerPlatformAdapter } from "../ui/browserClient.js";
 import type { FileDownloadSink } from "../transfer/stream.js";
 import { sameDownloadMetadata } from "../transfer/stream.js";
 import type { FolderRegistration } from "./folderRegistry.js";
@@ -237,6 +238,25 @@ export function createDocumentCache(options: {
       const folder = await owner(folderId);
       if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
       await request({ operation: "restoreVersion", id: documentId(folder, path), versionId });
+    },
+    listFavoriteSyncStates: async folderIds => {
+      const states = [];
+      for (const folderId of folderIds) {
+        if (!await owner(folderId)) continue;
+        const state = await request<{ entries: Record<string, Omit<FavoriteSyncStateRecord, "path">> }>(
+          { operation: "favoriteSyncState", folderId });
+        states.push({ folderId,
+          entries: Object.entries(state.entries).map(([path, entry]) => ({ path, ...entry })) });
+      }
+      return states;
+    },
+    retryFavoriteSync: async (folderId, path) => {
+      if (!await owner(folderId)) throw new Error("Encrypted folder storage is not ready.");
+      await request({ operation: "clearFavoriteSyncEntry", folderId, path });
+    },
+    resolveFavoriteConflict: async (folderId, path, resolution) => {
+      if (!await owner(folderId)) throw new Error("Encrypted folder storage is not ready.");
+      await request({ operation: "recordFavoriteResolution", folderId, path, resolution });
     },
     listFavorites: () => options.enabled() ? listMigratedFavorites() : options.legacy.listFavorites?.() ?? Promise.resolve([]),
     upsertFavorite: favorite => options.enabled()

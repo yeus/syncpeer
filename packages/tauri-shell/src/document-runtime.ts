@@ -9,6 +9,7 @@ import { createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDi
 import { createSyncpeerCoreClient, type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
 import { createConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
+import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
 
@@ -109,6 +110,8 @@ async function startDocuments(android: AndroidRuntime) {
     close: documents.close,
     connectionPasswords: documents.connectionPasswords,
     rememberFolder: documents.rememberFolder,
+    syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1]) =>
+      syncServiceFileFavorites(documents, remoteFs),
   };
 }
 
@@ -168,6 +171,11 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         return { phase: lifecycle.getState().phase };
       }
       if (request.operation === "disconnect") { activeOptions = null; await lifecycle.disconnect(); return { phase: "idle" }; }
+      if (request.operation === "syncFavorites") {
+        const session = lifecycle.getSession();
+        if (!session) return { phase: "waiting" };
+        return documents.syncFavorites(session.remoteFs);
+      }
       if (request.operation === "status") return { ...lifecycle.getState(), active: !!lifecycle.getSession(), hasOptions: !!activeOptions };
       throw new Error(`Unknown session operation: ${String(request.operation)}`);
     },

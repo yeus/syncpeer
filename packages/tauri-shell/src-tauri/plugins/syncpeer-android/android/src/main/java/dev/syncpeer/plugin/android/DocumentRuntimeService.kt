@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import androidx.core.app.ServiceCompat
 
 data class DocumentRuntimeStatus(
@@ -58,6 +59,14 @@ class DocumentRuntimeService : Service() {
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
   private var powerReceiver: BroadcastReceiver? = null
   private val initialized = CompletableFuture<DocumentRuntimeStatus>()
+  private val favoriteSyncPending = AtomicBoolean(false)
+  private val favoriteSyncRunnable = object : Runnable {
+    override fun run() {
+      if (sessionPhase != "connected") return
+      requestFavoriteSync()
+      mainHandler.postDelayed(this, FAVORITE_SYNC_INTERVAL_MS)
+    }
+  }
   private val binder = RuntimeBinder()
   private var sandbox: JavaScriptSandbox? = null
   private var isolate: JavaScriptIsolate? = null
@@ -93,6 +102,7 @@ class DocumentRuntimeService : Service() {
         if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "rename", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
         }
+        if (input.optString("operation") == "release") requestFavoriteSync()
         reply
       }
     }
@@ -351,12 +361,42 @@ class DocumentRuntimeService : Service() {
         sessionError = null
         SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", "Peer session connected; selected sync is ready.")
         result.complete(reply)
+        startFavoriteSyncSchedule()
+        requestFavoriteSync()
       }
     }
   }
 
+  private fun requestFavoriteSync() {
+    if (sessionPhase != "connected" || !favoriteSyncPending.compareAndSet(false, true)) return
+    evaluateRuntime("""
+      const value = await globalThis.syncpeerSession.command({operation: "syncFavorites"});
+      return JSON.stringify({result: value});
+    """.trimIndent(), "{}".toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
+      favoriteSyncPending.set(false)
+      val failures = if (error == null) runCatching {
+        JSONObject(value).getJSONObject("result").getJSONArray("results")
+          .let { results -> (0 until results.length()).count { index ->
+            results.getJSONObject(index).getString("result") !in listOf("downloaded", "uploaded", "unchanged")
+          } }
+      }.getOrDefault(1) else 1
+      if (failures > 0) SyncpeerSessionNotifications.update(this,
+        "Syncpeer background synchronization", "Selected files need attention in Syncpeer.")
+    }
+  }
+
+  private fun startFavoriteSyncSchedule() {
+    mainHandler.removeCallbacks(favoriteSyncRunnable)
+    mainHandler.post(favoriteSyncRunnable)
+  }
+
+  private fun stopFavoriteSyncSchedule() {
+    mainHandler.removeCallbacks(favoriteSyncRunnable)
+  }
+
   private fun stopSession(persist: Boolean): CompletableFuture<JSONObject> {
     val generation = nextSessionGeneration()
+    stopFavoriteSyncSchedule()
     sessionRequest = null
     sessionStarted = false
     sessionPhase = "stopping"
@@ -559,6 +599,7 @@ class DocumentRuntimeService : Service() {
 
   override fun onDestroy() {
     destroying = true
+    stopFavoriteSyncSchedule()
     unregisterBackgroundSignals()
     // Serialize teardown after initialization; shutdown drains the already queued work.
     worker.execute {
@@ -579,5 +620,9 @@ class DocumentRuntimeService : Service() {
     }
     worker.shutdown()
     super.onDestroy()
+  }
+
+  private companion object {
+    const val FAVORITE_SYNC_INTERVAL_MS = 15_000L
   }
 }

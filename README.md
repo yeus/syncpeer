@@ -43,8 +43,14 @@ node dist/cli/main.js --help
 All contributor/development/build-target documentation lives in:
 
 - [DEVELOPMENT.md](./DEVELOPMENT.md)
-- [SQLite storage and migration](./SQLITE_STORAGE.md)
-- [Local storage and encryption map](./LOCAL_STORAGE.md)
+- [FEATURES.csv](./FEATURES.csv) - the app definition: every feature and
+  requirement with its status, Syncthing-compatibility layer, implementation
+  and verifying test
+
+The planning documents that previously lived in this repository (roadmap,
+remaining issues, local-storage map, SQLite storage notes and the incremental
+block-reuse design) have been folded into `FEATURES.csv` and removed. Their
+texts remain available in Git history.
 
 ## For contributors
 

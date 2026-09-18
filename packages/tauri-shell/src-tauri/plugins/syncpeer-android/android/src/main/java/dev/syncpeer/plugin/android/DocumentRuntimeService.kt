@@ -102,7 +102,7 @@ class DocumentRuntimeService : Service() {
         if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "rename", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
         }
-        if (input.optString("operation") == "release") requestFavoriteSync()
+        if (input.optString("operation") in listOf("release", "remove", "rename", "saveProfileSettings")) requestFavoriteSync()
         reply
       }
     }
@@ -377,7 +377,7 @@ class DocumentRuntimeService : Service() {
       val failures = if (error == null) runCatching {
         JSONObject(value).getJSONObject("result").getJSONArray("results")
           .let { results -> (0 until results.length()).count { index ->
-            results.getJSONObject(index).getString("result") !in listOf("downloaded", "uploaded", "unchanged")
+            results.getJSONObject(index).getString("result") in listOf("conflict", "error", "unavailable")
           } }
       }.getOrDefault(1) else 1
       if (failures > 0) SyncpeerSessionNotifications.update(this,

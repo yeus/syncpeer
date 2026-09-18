@@ -22,6 +22,14 @@ export async function loadDocumentBaseline(bytes: ReplicaByteStorage, folderKey:
   finally { data.fill(0); }
 }
 
+export async function deleteDocumentBaseline(bytes: ReplicaByteStorage, path: string, key: Uint8Array): Promise<void> {
+  const name = await nameFor(path, key), entry = await bytes.stat(name);
+  if (!entry) return;
+  if (entry.type !== "file") throw new Error("Invalid document sync baseline.");
+  await bytes.remove(name, false);
+  await bytes.flushChanges([name]);
+}
+
 export async function saveDocumentBaseline(bytes: ReplicaByteStorage, options: {
   path: string; folderKey: Uint8Array; randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
   baseline: NonNullable<CachedFileRecord["syncBaseline"]>;

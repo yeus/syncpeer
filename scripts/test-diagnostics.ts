@@ -194,6 +194,11 @@ const main = async (): Promise<void> => {
       args: ["--import", "tsx/esm", "--test", "scripts/test-favorite-sync-policies.ts"],
     },
     {
+      name: "Favorite synchronization decision diagnostics",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test", "scripts/test-favorite-sync-plan.ts"],
+    },
+    {
       name: "Service-owned favorite synchronization diagnostics",
       command: process.execPath,
       args: ["--import", "tsx/esm", "--test", "scripts/test-service-favorite-sync.ts"],

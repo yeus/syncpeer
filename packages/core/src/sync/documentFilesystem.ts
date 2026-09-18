@@ -16,7 +16,9 @@ import type { createNativeFilesystem } from "./nativeFilesystem.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 import type { CachedFileRecord } from "../ui/browserClient.js";
 import { cachedFileKey } from "../ui/helpers.js";
-import { loadDocumentBaseline, saveDocumentBaseline } from "./documentBaseline.js";
+import { deleteDocumentBaseline, loadDocumentBaseline, saveDocumentBaseline } from "./documentBaseline.js";
+import { clearFavoriteRenames, loadFavoriteSyncState, recordFavoriteRename,
+  saveFavoriteSyncEntries, type FavoriteSyncEntry } from "./documentFavoriteState.js";
 import { classifyFavoritePath } from "../ui/favoriteSelection.js";
 import { defaultFolderSettings } from "./profileSettings.js";
 import { cacheQuotaBytes, planCacheEvictions } from "./profileSettings.js";
@@ -396,6 +398,15 @@ const requireOpenReplica = (runtime: DocumentRuntime, folderId: string): LocalFo
   return replica;
 };
 
+const favoriteStateTarget = (runtime: DocumentRuntime, folderId: string) => {
+  const registry = requireUnlockedRegistry(runtime);
+  const folder = registry.getState().find(value => value.id === folderId);
+  const bytes = folder ? runtime.storage.get(folder.storageId) : undefined;
+  const key = folder ? runtime.folderKeys.get(folder.storageId) : undefined;
+  if (!folder || !bytes || !key || !registry.getReplica(folderId)) throw new Error("Document folder is not open.");
+  return { bytes, key };
+};
+
 const rememberFolderAction = async (
   runtime: DocumentRuntime,
   folder: { id: string; label: string },
@@ -542,6 +553,22 @@ const removeDocumentAction = async (runtime: DocumentRuntime, id: string) => {
   return true;
 };
 
+const recordRenamedFavorite = async (
+  runtime: DocumentRuntime,
+  folder: { id: string; storageId: string },
+  from: string,
+  to: string,
+): Promise<void> => {
+  const settings = await runtime.vault.profileSettings();
+  const selected = settings.folders[folder.id]?.favorites.some(item =>
+    item.kind === "file" && item.path === from);
+  if (!selected) return;
+  const bytes = runtime.storage.get(folder.storageId), key = runtime.folderKeys.get(folder.storageId);
+  if (!bytes || !key) throw new Error("Document folder is not open.");
+  await recordFavoriteRename(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes },
+    { from, to, atMs: Date.now() });
+};
+
 const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: string) => {
   assertReplicaPath(name);
   if (name.includes("/")) throw new Error("Expected one document name.");
@@ -569,6 +596,7 @@ const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: 
       modifiedMs, expectedVersion: created.version ?? {} }).catch(() => {});
     throw error;
   }
+  if (old.type !== 1) await recordRenamedFavorite(runtime, file.folder, file.path, target);
   return documentStat(runtime, JSON.stringify([file.folder.storageId, target]));
 };
 
@@ -727,6 +755,19 @@ const setSyncBaselineAction = async (
   const file = resolveDocument(runtime, id);
   await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: runtime.folderKeys.get(file.folder.storageId)!,
     randomBytes: runtime.options.randomBytes, baseline });
+};
+
+const clearSyncBaselineAction = async (runtime: DocumentRuntime, id: string): Promise<void> => {
+  const file = resolveDocument(runtime, id);
+  await deleteDocumentBaseline(file.bytes, file.path, runtime.folderKeys.get(file.folder.storageId)!);
+};
+
+const loadSyncBaselineAction = async (
+  runtime: DocumentRuntime,
+  id: string,
+): Promise<NonNullable<CachedFileRecord["syncBaseline"]> | undefined> => {
+  const file = resolveDocument(runtime, id);
+  return loadDocumentBaseline(file.bytes, runtime.folderKeys.get(file.folder.storageId)!, file.path);
 };
 
 const digestHandleAction = async (runtime: DocumentRuntime, id: number): Promise<string> => {
@@ -938,6 +979,19 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
   attachDownloads: (id: string) => runQueued(runtime, () => attachDownloadsAction(runtime, id)),
   detachDownloads: (id: string) => runQueued(runtime, () => detachDownloadsAction(runtime, id)),
   clearFolderContents: (folderId: string) => runQueued(runtime, () => clearFolderContentsAction(runtime, folderId)),
+  favoriteSyncState: (folderId: string) => runQueued(runtime, async () => {
+    const { bytes, key } = favoriteStateTarget(runtime, folderId);
+    return loadFavoriteSyncState(bytes, key);
+  }),
+  saveFavoriteSyncEntries: (folderId: string, entries: Record<string, FavoriteSyncEntry>) =>
+    runQueued(runtime, async () => {
+      const { bytes, key } = favoriteStateTarget(runtime, folderId);
+      await saveFavoriteSyncEntries(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes }, entries);
+    }),
+  clearFavoriteRenames: (folderId: string, paths: string[]) => runQueued(runtime, async () => {
+    const { bytes, key } = favoriteStateTarget(runtime, folderId);
+    await clearFavoriteRenames(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes }, paths);
+  }),
   loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) =>
     runQueued(runtime, () => loadDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path)),
   saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string, snapshot: StoredDirectorySnapshot) =>
@@ -964,6 +1018,8 @@ const createHandleActions = (runtime: DocumentRuntime) => ({
   finishDownload: (id: number) => runQueued(runtime, () => finishDownloadAction(runtime, id)),
   setSyncBaseline: (id: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) =>
     runQueued(runtime, () => setSyncBaselineAction(runtime, id, baseline)),
+  clearSyncBaseline: (id: string) => runQueued(runtime, () => clearSyncBaselineAction(runtime, id)),
+  syncBaseline: (id: string) => runQueued(runtime, () => loadSyncBaselineAction(runtime, id)),
   digest: (id: number) => runQueued(runtime, () => digestHandleAction(runtime, id)),
   digestRanges: (id: number, source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) =>
     runQueued(runtime, () => digestRangesAction(runtime, id, source, ranges)),

@@ -48,6 +48,7 @@ export async function createNativeFilesystem(
   const rootId = handle(await request({ operation: "register", rootPath, metadataPrefixes: [
     ".syncpeer-vault-record", ".syncpeer-document-folders", ".syncpeer-replica-index",
     ".syncpeer-ciphertext-index", ".syncpeer-baseline-", ".syncpeer-directory-catalog", ".syncpeer-cache-access",
+    ".syncpeer-favorite-sync",
   ] }));
   const active = new Set<Promise<unknown>>();
   let closing = false;

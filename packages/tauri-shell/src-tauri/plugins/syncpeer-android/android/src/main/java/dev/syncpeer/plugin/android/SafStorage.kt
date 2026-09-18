@@ -28,6 +28,19 @@ internal fun <T> finishDocumentReplacement(
   }
 }
 
+internal fun digestSafFile(open: () -> InputStream): ByteArray {
+  val digest = MessageDigest.getInstance("SHA-256")
+  open().use { input ->
+    val buffer = ByteArray(64 * 1024)
+    while (true) {
+      val count = input.read(buffer)
+      if (count < 0) break
+      digest.update(buffer, 0, count)
+    }
+  }
+  return digest.digest()
+}
+
 internal fun digestAvailableSafRanges(
   open: () -> InputStream, ranges: List<Pair<Long, Long>>,
 ): List<Triple<Long, Long, ByteArray>> {

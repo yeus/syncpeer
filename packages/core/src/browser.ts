@@ -169,6 +169,7 @@ export type {
   LocalSyncFile,
 } from "./sync/folderSync.js";
 export type {
+  CachedFileDigest,
   CachedFileRecord,
   CachedFileStatus,
   ConnectOptions,

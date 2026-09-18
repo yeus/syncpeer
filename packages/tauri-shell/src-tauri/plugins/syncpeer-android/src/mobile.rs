@@ -220,6 +220,40 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .map_err(Into::into)
   }
 
+  pub fn read_saf_file(
+    &self,
+    tree_uri: &str,
+    relative_path: &str,
+  ) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin(
+        "readSafFile",
+        json!({
+          "treeUri": tree_uri,
+          "relativePath": relative_path
+        }),
+      )
+      .map_err(Into::into)
+  }
+
+  pub fn digest_saf_file(
+    &self,
+    tree_uri: &str,
+    relative_path: &str,
+  ) -> crate::Result<serde_json::Value> {
+    self
+      .0
+      .run_mobile_plugin(
+        "digestSafFile",
+        json!({
+          "treeUri": tree_uri,
+          "relativePath": relative_path
+        }),
+      )
+      .map_err(Into::into)
+  }
+
   pub fn digest_saf_ranges(
     &self,
     tree_uri: &str,

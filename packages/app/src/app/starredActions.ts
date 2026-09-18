@@ -72,8 +72,27 @@ const syncStarredFiles = async () => {
     if (starredFiles.length === 0) return;
     const cachedFiles = await client.listCachedFiles();
     const cachedByKey = new Map(cachedFiles.map((item) => [item.key, item]));
+    const digestTargets = [...new Map(starredFiles.map((file) => {
+      const key = cachedFileKey(file.folderId, normalizePath(file.path));
+      return [key, { folderId: file.folderId, path: normalizePath(file.path) }];
+    })).values()].filter((file) => cachedByKey.has(cachedFileKey(file.folderId, file.path)));
+    const nativeDigestByKey = new Map<string, string | null>();
+    if (client.digestCachedFiles && digestTargets.length > 0) {
+      for (const digest of await client.digestCachedFiles(digestTargets)) {
+        nativeDigestByKey.set(cachedFileKey(digest.folderId, digest.path), digest.hash ?? null);
+      }
+    }
     const dirCache = new Map<string, FileEntry[]>();
     const syncController = new AbortController();
+    const readCachedBytes = async (cached: typeof cachedFiles[number], folderId: string, path: string) => {
+      try {
+        if (cached.localPath) return await client.readBinaryFile(cached.localPath);
+        if (client.readCachedFile) return await client.readCachedFile(folderId, path);
+      } catch {
+        // A disappeared cache entry is handled as unavailable below.
+      }
+      return null;
+    };
 
     const downloadStarredFile = async (
       folderId: string,
@@ -234,12 +253,21 @@ const syncStarredFiles = async () => {
       if (cached.syncBaselineRequired && !previous) {
         throw new Error("This local document has no verified remote baseline. Upload or download it explicitly before enabling automatic updates.");
       }
+      const nativeLocalHash = nativeDigestByKey.get(key);
       let localBytes: Uint8Array | null = null;
-      if (cached.localPath) {
-        try { localBytes = await client.readBinaryFile(cached.localPath); }
-        catch { localBytes = null; }
+      let localHash: string;
+      if (nativeLocalHash !== undefined) {
+        localHash = nativeLocalHash ?? previous?.lastLocalHash ?? "";
+        if (previous && localHash !== previous.lastLocalHash) {
+          localBytes = await readCachedBytes(cached, favorite.folderId, targetPath);
+          if (!localBytes) {
+            throw new Error(`Changed cached file could not be read: ${targetPath}`);
+          }
+        }
+      } else {
+        localBytes = await readCachedBytes(cached, favorite.folderId, targetPath);
+        localHash = localBytes ? await digestBytesHex(localBytes) : previous?.lastLocalHash ?? "";
       }
-      const localHash = localBytes ? await digestBytesHex(localBytes) : previous?.lastLocalHash ?? "";
       const localChanged = Boolean(localBytes && previous) && localHash !== previous!.lastLocalHash;
       const remoteChanged = remoteFavoriteNeedsDownload(
         { sizeBytes: remoteEntry.size, modifiedMs: remoteModifiedMs },

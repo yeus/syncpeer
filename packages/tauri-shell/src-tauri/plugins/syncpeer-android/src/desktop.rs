@@ -50,6 +50,14 @@ impl<R: Runtime> SyncpeerAndroid<R> {
     Err(crate::Error::UnsupportedPlatform("saf_path_exists".into()))
   }
 
+  pub fn read_saf_file(
+    &self,
+    _tree_uri: &str,
+    _relative_path: &str,
+  ) -> crate::Result<serde_json::Value> {
+    Err(crate::Error::UnsupportedPlatform("read_saf_file".into()))
+  }
+
   pub fn delete_saf_path(&self, _tree_uri: &str, _relative_path: &str) -> crate::Result<bool> {
     Err(crate::Error::UnsupportedPlatform("delete_saf_path".into()))
   }

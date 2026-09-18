@@ -629,6 +629,36 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
+  fun readSafFile(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(SafPathArgs::class.java)
+      val target = findSafDocument(args.treeUri, args.relativePath)
+        ?: throw IllegalStateException("SAF file does not exist: ${args.relativePath}")
+      val bytes = activity.contentResolver.openInputStream(target.uri)?.use { it.readBytes() }
+        ?: throw IllegalStateException("Could not open SAF file.")
+      invoke.resolveObject(bytes.map { it.toInt() and 0xff })
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not read SAF file.")
+    }
+  }
+
+  @Command
+  fun digestSafFile(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(SafPathArgs::class.java)
+      val target = findSafDocument(args.treeUri, args.relativePath)
+        ?: throw IllegalStateException("SAF file does not exist: ${args.relativePath}")
+      val hash = dev.syncpeer.plugin.android.digestSafFile {
+        activity.contentResolver.openInputStream(target.uri)
+          ?: throw IllegalStateException("Could not open SAF source stream.")
+      }
+      invoke.resolveObject(hash.map { it.toInt() and 0xff })
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not hash SAF file.")
+    }
+  }
+
+  @Command
   fun digestSafRanges(invoke: Invoke) {
     try {
       val args = invoke.parseArgs(SafRangesArgs::class.java)

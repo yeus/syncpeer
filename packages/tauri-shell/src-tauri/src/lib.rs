@@ -181,6 +181,28 @@ struct CachedFileStatus {
     cached_at_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedFileDigestRequest {
+    folder_id: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedFileDigest {
+    folder_id: String,
+    path: String,
+    hash: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedFileReadRequest {
+    folder_id: String,
+    path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenCachedFileRequest {
@@ -4050,6 +4072,123 @@ async fn syncpeer_list_cached_files(
     Ok(index.files)
 }
 
+#[cfg(target_os = "android")]
+fn digest_android_cached_file(
+    app: &tauri::AppHandle,
+    record: &CachedFileRecord,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(tree_uri) = configured_android_saf_tree_uri(app)? else { return Ok(None); };
+    let Some(relative_path) = record.saf_relative_path.as_deref() else { return Ok(None); };
+    let value = app
+        .syncpeer_android()
+        .digest_saf_file(&tree_uri, relative_path)
+        .map_err(|error| format!("Could not digest SAF cached file {}: {error}", record.path))?;
+    serde_json::from_value::<Vec<u8>>(value)
+        .map(Some)
+        .map_err(|error| format!("Invalid SAF digest response for {}: {error}", record.path))
+}
+
+fn digest_local_cached_file(record: &CachedFileRecord) -> Result<Option<Vec<u8>>, String> {
+    let Some(local_path) = record.local_path.as_deref() else { return Ok(None); };
+    let path = PathBuf::from(local_path);
+    if !path.exists() { return Ok(None); }
+    let mut file = fs::File::open(&path)
+        .map_err(|error| format!("Could not open cached file {}: {error}", path.display()))?;
+    let size = file.metadata()
+        .map_err(|error| format!("Could not stat cached file {}: {error}", path.display()))?
+        .len();
+    digest_range(&mut file, &CacheRange { offset: 0, size })
+        .map(Some)
+        .map_err(|error| format!("Could not digest cached file {}: {error}", path.display()))
+}
+
+fn digest_cached_files(
+    app: &tauri::AppHandle,
+    requests: Vec<CachedFileDigestRequest>,
+) -> Result<Vec<CachedFileDigest>, String> {
+    let index = read_json_or_default::<CacheIndex>(&cache_index_path(app)?)?;
+    requests.into_iter().map(|request| {
+        let folder_id = request.folder_id.trim().to_string();
+        let path = normalize_path(&request.path);
+        let key = cache_key(&folder_id, &path);
+        let record = index.files.iter().find(|entry| entry.key == key);
+        let hash = match record {
+            Some(record) => {
+                let local_hash = digest_local_cached_file(record)?;
+                if local_hash.is_some() { local_hash }
+                else {
+                    #[cfg(target_os = "android")]
+                    { digest_android_cached_file(app, record)? }
+                    #[cfg(not(target_os = "android"))]
+                    { None }
+                }
+            }
+            None => None,
+        };
+        Ok(CachedFileDigest { folder_id, path, hash })
+    }).collect()
+}
+
+#[tauri::command]
+async fn syncpeer_digest_cached_files(
+    app: tauri::AppHandle,
+    requests: Vec<CachedFileDigestRequest>,
+) -> Result<Vec<CachedFileDigest>, String> {
+    tauri::async_runtime::spawn_blocking(move || digest_cached_files(&app, requests))
+        .await
+        .map_err(|error| format!("Cached file digest task join error: {error}"))?
+}
+
+#[cfg(target_os = "android")]
+fn read_android_cached_file(
+    app: &tauri::AppHandle,
+    record: &CachedFileRecord,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(tree_uri) = configured_android_saf_tree_uri(app)? else { return Ok(None); };
+    let Some(relative_path) = record.saf_relative_path.as_deref() else { return Ok(None); };
+    let value = app
+        .syncpeer_android()
+        .read_saf_file(&tree_uri, relative_path)
+        .map_err(|error| format!("Could not read SAF cached file {}: {error}", record.path))?;
+    serde_json::from_value::<Vec<u8>>(value)
+        .map(Some)
+        .map_err(|error| format!("Invalid SAF file response for {}: {error}", record.path))
+}
+
+fn read_cached_file(
+    app: &tauri::AppHandle,
+    request: CachedFileReadRequest,
+) -> Result<Vec<u8>, String> {
+    let folder_id = request.folder_id.trim();
+    let path = normalize_path(&request.path);
+    let key = cache_key(folder_id, &path);
+    let index = read_json_or_default::<CacheIndex>(&cache_index_path(app)?)?;
+    let record = index.files.iter().find(|entry| entry.key == key)
+        .ok_or_else(|| format!("Cached file is unavailable: {path}"))?;
+    if let Some(local_path) = record.local_path.as_deref() {
+        let path = PathBuf::from(local_path);
+        if path.exists() {
+            return fs::read(&path)
+                .map_err(|error| format!("Could not read cached file {}: {error}", path.display()));
+        }
+    }
+    #[cfg(target_os = "android")]
+    if let Some(bytes) = read_android_cached_file(app, record)? {
+        return Ok(bytes);
+    }
+    Err(format!("Cached file is unavailable: {path}"))
+}
+
+#[tauri::command]
+async fn syncpeer_read_cached_file(
+    app: tauri::AppHandle,
+    request: CachedFileReadRequest,
+) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || read_cached_file(&app, request))
+        .await
+        .map_err(|error| format!("Cached file read task join error: {error}"))?
+}
+
 #[tauri::command]
 async fn syncpeer_open_cached_file(
     app: tauri::AppHandle,
@@ -4273,6 +4412,7 @@ pub fn run() {
             documents::syncpeer_document_command,
             syncpeer_read_text_file,
             syncpeer_read_binary_file,
+            syncpeer_read_cached_file,
             syncpeer_read_default_cli_identity,
             syncpeer_export_identity_recovery,
             syncpeer_get_default_device_id,
@@ -4325,6 +4465,7 @@ pub fn run() {
             syncpeer_get_android_saf_tree_uri,
             syncpeer_set_android_saf_tree_uri,
             syncpeer_list_cached_files,
+            syncpeer_digest_cached_files,
             syncpeer_get_cached_statuses,
             syncpeer_open_cached_file,
             syncpeer_open_cached_file_directory,

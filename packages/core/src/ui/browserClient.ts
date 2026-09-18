@@ -116,6 +116,12 @@ export interface CachedFileStatus {
   cachedAtMs?: number;
 }
 
+export interface CachedFileDigest {
+  folderId: string;
+  path: string;
+  hash?: string;
+}
+
 export interface CachedFileRecord {
   key: string;
   folderId: string;
@@ -162,6 +168,7 @@ export interface SyncpeerPlatformAdapter {
   acknowledgeCachedSync?: (folderId: string, path: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => Promise<boolean>;
   readTextFile?: (path: string) => Promise<string>;
   readBinaryFile?: (path: string) => Promise<Uint8Array>;
+  readCachedFile?: (folderId: string, path: string) => Promise<Uint8Array>;
   pickUploadFile?: () => Promise<string | null | undefined>;
   readDefaultIdentity?: () => Promise<SyncpeerIdentityRecord>;
   listFavorites?: () => Promise<FavoriteRecord[]>;
@@ -203,6 +210,7 @@ export interface SyncpeerPlatformAdapter {
     cancellable: boolean;
   }) => Promise<void>;
   getCachedStatuses?: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
+  digestCachedFiles?: (files: readonly { folderId: string; path: string }[]) => Promise<CachedFileDigest[]>;
   listCachedFiles?: () => Promise<CachedFileRecord[]>;
   listLocalDirectory?: (folderId: string, path: string) => Promise<FileEntry[] | null>;
   openCachedFile?: (folderId: string, path: string) => Promise<void>;
@@ -284,6 +292,7 @@ export interface SyncpeerBrowserClient {
   stopTransfer?: () => Promise<void>;
   updateTransferNotification?: SyncpeerPlatformAdapter["updateTransferNotification"];
   getCachedStatuses: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
+  digestCachedFiles?: (files: readonly { folderId: string; path: string }[]) => Promise<CachedFileDigest[]>;
   listCachedFiles: () => Promise<CachedFileRecord[]>;
   listLocalDirectory: (folderId: string, path: string) => Promise<FileEntry[] | null>;
   openCachedFile: (folderId: string, path: string) => Promise<void>;
@@ -324,6 +333,7 @@ export interface SyncpeerBrowserClient {
   getDefaultDeviceId: () => Promise<string>;
   regenerateDefaultIdentity: () => Promise<string>;
   readBinaryFile: (path: string) => Promise<Uint8Array>;
+  readCachedFile?: (folderId: string, path: string) => Promise<Uint8Array>;
   pickUploadFile: () => Promise<string | null | undefined>;
 }
 
@@ -766,6 +776,9 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.getCachedStatuses
         ? platformAdapter.getCachedStatuses(folderId, paths)
         : throwMissingAdapter("getCachedStatuses"),
+    digestCachedFiles: platformAdapter.digestCachedFiles
+      ? (files) => platformAdapter.digestCachedFiles!(files)
+      : undefined,
     listLocalDirectory: async (folderId, path) => platformAdapter.listLocalDirectory?.(folderId, path) ?? null,
     listCachedFiles: async (): Promise<CachedFileRecord[]> =>
       platformAdapter.listCachedFiles
@@ -858,6 +871,9 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.readBinaryFile
         ? platformAdapter.readBinaryFile(path)
         : throwMissingAdapter("readBinaryFile"),
+    readCachedFile: platformAdapter.readCachedFile
+      ? (folderId, path) => platformAdapter.readCachedFile!(folderId, path)
+      : undefined,
     pickUploadFile: async (): Promise<string | null | undefined> =>
       platformAdapter.pickUploadFile
         ? platformAdapter.pickUploadFile()

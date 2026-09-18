@@ -1,4 +1,5 @@
 import type {
+  CachedFileDigest,
   CachedFileRecord,
   CachedFileStatus,
   FavoriteRecord,
@@ -480,6 +481,12 @@ export const createTauriAdapters = (
       });
       return new Uint8Array(bytes);
     },
+    readCachedFile: async (folderId: string, path: string): Promise<Uint8Array> => {
+      const bytes = await invokeWithLogging<number[]>("syncpeer_read_cached_file", {
+        request: { folderId, path },
+      });
+      return new Uint8Array(bytes);
+    },
     readDefaultIdentity: async (): Promise<CliNodeIdentityResponse> =>
       invokeWithLogging<CliNodeIdentityResponse>("syncpeer_read_default_cli_identity"),
     listFavorites: async (): Promise<FavoriteRecord[]> =>
@@ -592,6 +599,20 @@ export const createTauriAdapters = (
     },
     getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
       invokeWithLogging<CachedFileStatus[]>("syncpeer_get_cached_statuses", { request: { folderId, paths } }),
+    digestCachedFiles: async (
+      files: readonly { folderId: string; path: string }[],
+    ): Promise<CachedFileDigest[]> => {
+      const response = await invokeWithLogging<Array<{
+        folderId: string;
+        path: string;
+        hash: number[] | null;
+      }>>("syncpeer_digest_cached_files", { requests: files });
+      return response.map(({ folderId, path, hash }) => ({
+        folderId,
+        path,
+        hash: hash === null ? undefined : Array.from(hash, byte => byte.toString(16).padStart(2, "0")).join(""),
+      }));
+    },
     listCachedFiles: async (): Promise<CachedFileRecord[]> =>
       invokeWithLogging<CachedFileRecord[]>("syncpeer_list_cached_files"),
     openCachedFile: async (folderId: string, path: string): Promise<void> =>

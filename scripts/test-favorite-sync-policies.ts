@@ -104,3 +104,72 @@ test("marking an uncached file favorite immediately downloads it", async () => {
   assert.equal(state.favorites.items.length, 1);
   assert.equal(state.favorites.cachedFileKeys.has("fixture-folder:favorite.txt"), true);
 });
+
+test("uses native cached digests without reading unchanged local content into the UI", async () => {
+  const state = createInitialState(null);
+  state.ui.isAppVisible = true;
+  state.session.isConnected = true;
+  state.favorites.items = [{ key: "file:favorite.txt", folderId: "fixture-folder", path: "favorite.txt", name: "favorite.txt", kind: "file" }];
+  state.sync.starredFileSyncState["fixture-folder:favorite.txt"] = {
+    lastLocalHash: "same-hash",
+    lastRemoteModifiedMs: 10,
+    lastRemoteSizeBytes: 4,
+    lastSyncAtMs: 10,
+    lastDirection: "baseline",
+  };
+  state.session.remoteFs = {
+    readDir: async () => [{ name: "favorite.txt", path: "favorite.txt", type: "file", size: 4, modifiedMs: 10 }],
+  } as unknown as NonNullable<typeof state.session.remoteFs>;
+  const client = {
+    listCachedFiles: async () => [{
+      key: "fixture-folder:favorite.txt", folderId: "fixture-folder", path: "favorite.txt", name: "favorite.txt",
+      sizeBytes: 4, cachedAtMs: 10,
+    }],
+    digestCachedFiles: async () => [{ folderId: "fixture-folder", path: "favorite.txt", hash: "same-hash" }],
+    readBinaryFile: async () => { throw new Error("unchanged content should stay native"); },
+  } as unknown as Parameters<typeof createStarredActions>[0]["client"];
+  const starred = createStarredActions({
+    state,
+    client,
+    transfers: { begin: async () => undefined, update: () => undefined, finish: async () => undefined } as unknown as Parameters<typeof createStarredActions>[0]["transfers"],
+  });
+
+  await starred.syncStarredFiles();
+  assert.equal(state.sync.starredFileSyncState["fixture-folder:favorite.txt"].lastLocalHash, "same-hash");
+});
+
+test("reads changed SAF-backed favorites through the native cache boundary before upload", async () => {
+  const state = createInitialState(null);
+  state.ui.isAppVisible = true;
+  state.session.isConnected = true;
+  state.favorites.items = [{ key: "file:favorite.txt", folderId: "fixture-folder", path: "favorite.txt", name: "favorite.txt", kind: "file" }];
+  state.sync.starredFileSyncState["fixture-folder:favorite.txt"] = {
+    lastLocalHash: "old-hash",
+    lastRemoteModifiedMs: 10,
+    lastRemoteSizeBytes: 4,
+    lastSyncAtMs: 10,
+    lastDirection: "baseline",
+  };
+  const events: string[] = [];
+  state.session.remoteFs = {
+    readDir: async () => [{ name: "favorite.txt", path: "favorite.txt", type: "file", size: 4, modifiedMs: 10 }],
+    writeFileFully: async () => { events.push("upload"); },
+  } as unknown as NonNullable<typeof state.session.remoteFs>;
+  const client = {
+    listCachedFiles: async () => [{
+      key: "fixture-folder:favorite.txt", folderId: "fixture-folder", path: "favorite.txt", name: "favorite.txt",
+      sizeBytes: 4, cachedAtMs: 10,
+    }],
+    digestCachedFiles: async () => [{ folderId: "fixture-folder", path: "favorite.txt", hash: "new-hash" }],
+    readCachedFile: async () => { events.push("read"); return new Uint8Array([1, 2, 3, 4]); },
+    cacheFile: async () => { events.push("acknowledge"); },
+  } as unknown as Parameters<typeof createStarredActions>[0]["client"];
+  const starred = createStarredActions({
+    state,
+    client,
+    transfers: { begin: async () => undefined, update: () => undefined, finish: async () => undefined } as unknown as Parameters<typeof createStarredActions>[0]["transfers"],
+  });
+
+  await starred.syncStarredFiles();
+  assert.deepEqual(events, ["read", "upload", "acknowledge"]);
+});

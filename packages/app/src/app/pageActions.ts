@@ -5,14 +5,12 @@ import { pushSessionLog, type AppState } from "./state.ts";
 export const createPageActions = (args: {
   readonly state: AppState;
   readonly sessionStore: SyncpeerSessionStore;
-  readonly refreshActiveView: () => Promise<void>;
   readonly discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<void>;
   readonly connect: () => Promise<void>;
 }) => {
   const {
     state,
     sessionStore,
-    refreshActiveView,
     discoverLocalDevices,
     connect,
   } = args;
@@ -23,7 +21,10 @@ const switchTab = (tab: AppState["activeTab"], event?: MouseEvent) => {
   if (state.activeTab === tab) return;
   state.activeTab = tab;
   pushSessionLog(state, "info", "ui.tab.switch", `Switched tab to ${tab}`);
-  void refreshActiveView();
+  // Tab switching is pure navigation. Data refresh is driven by the periodic
+  // refresh timer and by explicit user actions; the favorites reconciliation
+  // scan (remote directory walks plus local hashing) is far too expensive to
+  // run on every navigation.
 };
 
 const setAutoConnectPaused = (paused: boolean) => {

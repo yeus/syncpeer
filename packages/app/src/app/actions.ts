@@ -68,7 +68,6 @@ export const createAppActions = (args: {
   const page = createPageActions({
     state,
     sessionStore,
-    refreshActiveView: connection.refreshActiveView,
     discoverLocalDevices: connection.discoverLocalDevices,
     connect: connection.connect,
   });

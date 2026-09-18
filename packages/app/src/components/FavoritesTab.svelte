@@ -17,6 +17,11 @@
     onDownloadFile: (folderId: string, path: string, name: string) => void;
     onCancelDownload: (folderId?: string, path?: string) => void;
     onRemoveFavorite: (favorite: FavoriteRecord) => void;
+    onRetryFavorite: (favorite: { folderId: string; path: string }) => void;
+    onResolveFavoriteConflict: (
+      favorite: { folderId: string; path: string },
+      resolution: "keep-local" | "keep-remote",
+    ) => void;
     onClearAllCache: () => void;
     formatBytes: (value: number) => string;
     formatModified: (value: number) => string;
@@ -34,6 +39,8 @@
     onDownloadFile,
     onCancelDownload,
     onRemoveFavorite,
+    onRetryFavorite,
+    onResolveFavoriteConflict,
     onClearAllCache,
     formatBytes,
     formatModified,
@@ -56,6 +63,12 @@
     cachedLocalPathByKey(app.favorites.downloadedFiles),
   );
 
+  const formatRetryDelay = (remainingMs: number) => {
+    const seconds = Math.ceil(remainingMs / 1000);
+    if (seconds < 60) return `in ${seconds}s`;
+    return `in ${Math.ceil(seconds / 60)}m`;
+  };
+
   let favoriteRows = $derived.by(() =>
     app.favorites.items.map(
       (favorite): FavoriteItem => {
@@ -64,6 +77,8 @@
           favorite.folderId,
           favorite.path,
         );
+        const syncState = app.sync.favoriteSyncStates[`${favorite.folderId}:${favorite.path}`];
+        const retryInMs = syncState ? syncState.nextAttemptMs - Date.now() : 0;
         return {
           kind: "favorite",
           key: favorite.key,
@@ -78,6 +93,9 @@
           isDownloadingActive: Boolean(activeDownload),
           downloadProgressText: activeDownload?.text ?? "",
           downloadProgressPercent: activeDownload?.progressPercent ?? 0,
+          syncPhase: syncState?.phase,
+          syncMessage: syncState?.message,
+          syncRetryText: retryInMs > 0 ? formatRetryDelay(retryInMs) : "",
         };
       },
     ),
@@ -132,6 +150,10 @@
           onDownloadFile={onDownloadFile}
           onCancelDownload={onCancelDownload}
           onRemoveFavorite={onRemoveFavorite}
+          onRetryFavorite={onRetryFavorite}
+          onResolveFavoriteConflict={onResolveFavoriteConflict}
+          isRetryingFavorite={app.sync.isRetryingFavorite}
+          isResolvingFavorite={app.sync.isResolvingFavorite}
         />
       {/each}
     {/if}

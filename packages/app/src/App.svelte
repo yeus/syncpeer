@@ -547,6 +547,8 @@
           onDownloadFile={actions.downloadFile}
           onCancelDownload={transferRuntime.cancelDownload}
           onRemoveFavorite={actions.removeFavorite}
+          onRetryFavorite={actions.retryFavorite}
+          onResolveFavoriteConflict={actions.resolveFavoriteConflict}
           onClearAllCache={actions.clearAllCache}
           {formatBytes}
           {formatModified}

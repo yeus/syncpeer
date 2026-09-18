@@ -309,6 +309,18 @@ export const createInitialState = (persisted = loadPersistedState()) => {
           lastDirection: "upload" | "download" | "baseline";
         }
       >,
+      /** Service-owned state, keyed by `${folderId}:${path}`. */
+      favoriteSyncStates: {} as Record<string, {
+        phase: "synced" | "downloading" | "uploading" | "deleting-remote" | "deleting-local" | "conflict" | "error";
+        message?: string;
+        attempts: number;
+        updatedAtMs: number;
+        nextAttemptMs: number;
+        resolution?: "keep-local" | "keep-remote";
+      }>,
+      isLoadingFavoriteSyncStates: false,
+      isRetryingFavorite: false,
+      isResolvingFavorite: false,
     },
     pim: {
       enabled: persisted?.pim?.enabled ?? false,

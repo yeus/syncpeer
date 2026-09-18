@@ -60,9 +60,10 @@ export const createConnectionActions = (args: {
   readonly sessionStore: SyncpeerSessionStore;
   readonly transfers: TransferRuntime;
   readonly syncStarredFiles: () => Promise<void>;
+  readonly loadFavoriteSyncStates: () => Promise<void>;
   readonly appInfo: AppBuildInfo;
 }) => {
-  const { state, client, sessionStore, transfers, syncStarredFiles, appInfo } = args;
+  const { state, client, sessionStore, transfers, syncStarredFiles, loadFavoriteSyncStates, appInfo } = args;
   const { transferInProgress } = transfers;
   let connectInFlight: Promise<void> | null = null;
   let connectionSettingsTimer: ReturnType<typeof setTimeout> | null = null;
@@ -238,6 +239,7 @@ const refreshActiveView = async () => {
   if (transferInProgress()) return;
   await refreshOverview();
   await syncStarredFiles();
+  await loadFavoriteSyncStates();
 };
 
 const hydrate = async () => {
@@ -252,6 +254,7 @@ const hydrate = async () => {
     state.favorites.pausedFolderIds = new Set(Object.entries(settings.folders)
       .filter(([, folder]) => folder.paused).map(([folderId]) => folderId));
     state.favorites.items = await client.listFavorites();
+    await loadFavoriteSyncStates();
     const fileFavorites = new Map<string, string[]>();
     for (const favorite of state.favorites.items) {
       if (favorite.kind !== "file") continue;

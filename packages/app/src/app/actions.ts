@@ -39,6 +39,7 @@ export const createAppActions = (args: {
     sessionStore,
     transfers,
     syncStarredFiles: starred.syncStarredFiles,
+    loadFavoriteSyncStates: starred.loadFavoriteSyncStates,
     appInfo,
   });
   const directory = createDirectoryActions({
@@ -79,6 +80,9 @@ export const createAppActions = (args: {
     ...devices,
     ...page,
     starredSync: starred.syncStarredFiles,
+    loadFavoriteSyncStates: starred.loadFavoriteSyncStates,
+    retryFavorite: starred.retryFavorite,
+    resolveFavoriteConflict: starred.resolveFavoriteConflict,
     persist: () => persistState(state),
     restoreOfflineSnapshot: (deviceId?: string, reason?: string) =>
       restoreOfflineSnapshot(state, clearDirectoryView, deviceId, reason),

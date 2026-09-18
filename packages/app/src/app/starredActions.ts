@@ -3,6 +3,7 @@ import {
   collectFavoriteFiles,
   DownloadInterruptedError,
   cachedFileKey,
+  type FavoriteRecord,
   type FileDownloadSink,
   type FileEntry,
   normalizePath,
@@ -365,5 +366,56 @@ const syncStarredFiles = async () => {
 };
 
 
-  return { syncStarredFiles };
+const loadFavoriteSyncStates = async () => {
+  if (!client.listFavoriteSyncStates) return;
+  const folderIds = [...new Set(state.favorites.items.map(item => item.folderId))];
+  if (folderIds.length === 0) {
+    state.sync.favoriteSyncStates = {};
+    return;
+  }
+  state.sync.isLoadingFavoriteSyncStates = true;
+  try {
+    const states = await client.listFavoriteSyncStates(folderIds);
+    state.sync.favoriteSyncStates = Object.fromEntries(states.flatMap(snapshot =>
+      snapshot.entries.map(entry => [`${snapshot.folderId}:${entry.path}`, entry])));
+  } catch (error) {
+    reportActionError(state, "favorite.sync_state.failed", error);
+  } finally {
+    state.sync.isLoadingFavoriteSyncStates = false;
+  }
+};
+
+const retryFavorite = async (favorite: Pick<FavoriteRecord, "folderId" | "path">) => {
+  if (!client.retryFavoriteSync) return;
+  state.sync.isRetryingFavorite = true;
+  try {
+    await client.retryFavoriteSync(favorite.folderId, normalizePath(favorite.path));
+    delete state.sync.favoriteSyncStates[`${favorite.folderId}:${normalizePath(favorite.path)}`];
+    await syncStarredFiles();
+    await loadFavoriteSyncStates();
+  } catch (error) {
+    reportActionError(state, "favorite.retry.failed", error, { key: `${favorite.folderId}:${favorite.path}` });
+  } finally {
+    state.sync.isRetryingFavorite = false;
+  }
+};
+
+const resolveFavoriteConflict = async (
+  favorite: Pick<FavoriteRecord, "folderId" | "path">,
+  resolution: "keep-local" | "keep-remote",
+) => {
+  if (!client.resolveFavoriteConflict) return;
+  state.sync.isResolvingFavorite = true;
+  try {
+    await client.resolveFavoriteConflict(favorite.folderId, normalizePath(favorite.path), resolution);
+    await syncStarredFiles();
+    await loadFavoriteSyncStates();
+  } catch (error) {
+    reportActionError(state, "favorite.conflict.failed", error, { key: `${favorite.folderId}:${favorite.path}` });
+  } finally {
+    state.sync.isResolvingFavorite = false;
+  }
+};
+
+  return { syncStarredFiles, loadFavoriteSyncStates, retryFavorite, resolveFavoriteConflict };
 };

@@ -17,7 +17,9 @@
   import Star from "lucide-svelte/icons/star";
   import Trash2 from "lucide-svelte/icons/trash-2";
   import History from "lucide-svelte/icons/history";
+  import RefreshCw from "lucide-svelte/icons/refresh-cw";
   import Unlock from "lucide-svelte/icons/unlock";
+  import Upload from "lucide-svelte/icons/upload";
   import X from "lucide-svelte/icons/x";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
@@ -74,6 +76,9 @@
     isDownloadingActive: boolean;
     downloadProgressText: string;
     downloadProgressPercent: number;
+    syncPhase?: "synced" | "downloading" | "uploading" | "deleting-remote" | "deleting-local" | "conflict" | "error";
+    syncMessage?: string;
+    syncRetryText?: string;
   }
 
   export interface CachedFileItem {
@@ -104,6 +109,10 @@
     onOpenFavorite?: (favorite: { folderId: string; path: string; kind: "folder" | "file" }) => void;
     onToggleFavorite?: (folderId: string, path: string, name: string, kind: "folder" | "file") => void;
     onRemoveFavorite?: (favorite: { key: string; folderId: string; path: string; name: string; kind: "folder" | "file" }) => void;
+    onRetryFavorite?: (favorite: { folderId: string; path: string }) => void;
+    onResolveFavoriteConflict?: (favorite: { folderId: string; path: string }, resolution: "keep-local" | "keep-remote") => void;
+    isRetryingFavorite?: boolean;
+    isResolvingFavorite?: boolean;
     onOpenCachedDirectory?: (folderId: string, path: string) => void;
     onOpenCachedFile?: (folderId: string, path: string) => void;
     onOpenCachedFileDirectory?: (folderId: string, path: string) => void;
@@ -129,6 +138,10 @@
     onOpenFavorite = () => {},
     onToggleFavorite = () => {},
     onRemoveFavorite = () => {},
+    onRetryFavorite = () => {},
+    onResolveFavoriteConflict = () => {},
+    isRetryingFavorite = false,
+    isResolvingFavorite = false,
     onOpenCachedDirectory = () => {},
     onOpenCachedFile = () => {},
     onRemoveCachedFile = () => {},
@@ -417,6 +430,18 @@
         {:else}
           <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
         {/if}
+        {#if item.syncPhase && item.syncPhase !== "synced"}
+          <div class="item-meta" data-testid={`favorite-sync-${item.path}`}>
+            {#if item.syncPhase === "conflict"}Conflict
+            {:else if item.syncPhase === "error"}Sync error
+            {:else if item.syncPhase === "downloading"}Downloading
+            {:else if item.syncPhase === "uploading"}Uploading
+            {:else if item.syncPhase === "deleting-remote"}Deleting on peer
+            {:else}Removing locally{/if}
+            {#if item.syncMessage}: {item.syncMessage}{/if}
+            {#if item.syncRetryText} · retry {item.syncRetryText}{/if}
+          </div>
+        {/if}
       {:else}
         <div class="item-meta">{item.folderId}:{item.path}</div>
         <div class="item-meta">{item.sizeText} | Cached {item.cachedAtText}</div>
@@ -519,6 +544,18 @@
         <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
       {:else}
         <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
+      {/if}
+      {#if item.syncPhase && item.syncPhase !== "synced"}
+        <div class="item-meta" data-testid={`favorite-sync-${item.path}`}>
+          {#if item.syncPhase === "conflict"}Conflict
+          {:else if item.syncPhase === "error"}Sync error
+          {:else if item.syncPhase === "downloading"}Downloading
+          {:else if item.syncPhase === "uploading"}Uploading
+          {:else if item.syncPhase === "deleting-remote"}Deleting on peer
+          {:else}Removing locally{/if}
+          {#if item.syncMessage}: {item.syncMessage}{/if}
+          {#if item.syncRetryText} · retry {item.syncRetryText}{/if}
+        </div>
       {/if}
     {:else}
       <div class="item-meta">{item.folderId}:{item.path}</div>
@@ -652,6 +689,42 @@
           disabled={item.isDownloadingActive || !item.connected}
           title={item.downloadLabel}
           aria-label={item.downloadLabel}
+        >
+          <Download size={16} />
+        </button>
+      {/if}
+      {#if item.syncPhase === "conflict" || item.syncPhase === "error"}
+        <button
+          class="row-action"
+          data-testid={`retry-favorite-${item.path}`}
+          onclick={() => onRetryFavorite({ folderId: item.folderId, path: item.path })}
+          disabled={isRetryingFavorite}
+          aria-label="Retry favorite sync"
+          title="Retry favorite sync"
+        >
+          <RefreshCw size={16} />
+        </button>
+      {/if}
+      {#if item.syncPhase === "conflict"}
+        <button
+          class="row-action"
+          data-testid={`keep-local-favorite-${item.path}`}
+          onclick={() =>
+            onResolveFavoriteConflict({ folderId: item.folderId, path: item.path }, "keep-local")}
+          disabled={isResolvingFavorite}
+          aria-label="Keep the local copy"
+          title="Keep the local copy and publish it"
+        >
+          <Upload size={16} />
+        </button>
+        <button
+          class="row-action"
+          data-testid={`keep-remote-favorite-${item.path}`}
+          onclick={() =>
+            onResolveFavoriteConflict({ folderId: item.folderId, path: item.path }, "keep-remote")}
+          disabled={isResolvingFavorite}
+          aria-label="Keep the peer copy"
+          title="Replace the local copy with the peer copy"
         >
           <Download size={16} />
         </button>

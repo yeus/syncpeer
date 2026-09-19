@@ -12,11 +12,12 @@ hand-written declaration files to the absolute minimum for unavoidable external
 or tooling shims; do not duplicate the public API in `.d.ts` files. This rule
 takes priority over satisfying a lint rule by adding manual declarations.
 
-## Feature requirements catalog
+## System definition catalog
 
-- Treat `FEATURES.csv` as Syncpeer's canonical feature requirements catalog, not
-  as optional release notes or secondary documentation.
-- Every software change must update the relevant row or rows in `FEATURES.csv`
+- Treat `SYSTEM_DEFINITION.csv` as Syncpeer's canonical system definition for agents and the
+  human-readable overview of product behavior, architecture, implementation evidence, validation,
+  milestones, and known limitations. It is not optional release notes or secondary documentation.
+- Every software change must update the relevant row or rows in `SYSTEM_DEFINITION.csv`
   in the same change. Keep the requirement description, status, surface,
   compatibility, implementation paths, verification evidence, milestone,
   source, and notes synchronized with the resulting behavior.

@@ -43,13 +43,13 @@ node dist/cli/main.js --help
 All contributor/development/build-target documentation lives in:
 
 - [DEVELOPMENT.md](./DEVELOPMENT.md)
-- [FEATURES.csv](./FEATURES.csv) - the app definition: every feature and
-  requirement with its status, Syncthing-compatibility layer, implementation
-  and verifying test
+- [SYSTEM_DEFINITION.csv](./SYSTEM_DEFINITION.csv) - the canonical system definition and agent
+  guardrail: product behavior, architecture, requirements, status, Syncthing-compatibility layer,
+  implementation evidence, validation, milestones and known limitations
 
 The planning documents that previously lived in this repository (roadmap,
 remaining issues, local-storage map, SQLite storage notes and the incremental
-block-reuse design) have been folded into `FEATURES.csv` and removed. Their
+block-reuse design) have been folded into `SYSTEM_DEFINITION.csv` and removed. Their
 texts remain available in Git history.
 
 ## For contributors

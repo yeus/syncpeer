@@ -113,6 +113,7 @@
     </label>
   </form>
 
+  <p>Choosing an Android directory enables plaintext export. Files written there can be read by other apps with access and are outside the encrypted Syncpeer replica.</p>
   <div class="actions">
     <button
       type="button"
@@ -120,7 +121,7 @@
       onclick={onPickAndroidPimDirectory}
       disabled={!app.pim.enabled}
     >
-      Pick Android PIM Directory
+      Choose plaintext export directory
     </button>
     <button
       type="button"

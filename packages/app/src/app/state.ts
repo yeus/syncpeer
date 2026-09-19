@@ -55,41 +55,33 @@ const parseJson = <T,>(raw: string | null) => {
   }
 };
 
-export const loadPersistedState = () => {
+/** Display preferences restored before unlock; legacy private fields await encrypted migration. */
+export interface PersistedAppState {
+  activeTab?: "favorites" | "folders" | "devices" | "pim";
+  selectedSavedDeviceId?: string;
+  connection?: StoredConnectionSettingsLike;
+  savedDevices?: SavedDeviceLike[];
+  directoryPageSize?: number;
+  directoryViewMode?: "list" | "grid";
+  directorySortMode?: FileEntrySortMode;
+  theme?: Partial<ThemePreferences>;
+  expertView?: boolean;
+  stabilityNoticeAcknowledged?: boolean;
+}
+
+export const loadPersistedState = (): PersistedAppState | null => {
   if (typeof window === "undefined") return null;
-  return parseJson<{
-    activeTab?: "favorites" | "folders" | "devices" | "pim";
-    selectedSavedDeviceId?: string;
-    connection?: StoredConnectionSettingsLike;
-    savedDevices?: Array<{
-      id: string;
-      name: string;
-      createdAtMs: number;
-      isIntroducer: boolean;
-      customName?: boolean;
-    }>;
-    syncApprovedIntroducedFolderKeys?: string[];
-    acceptedIntroducedFolderKeys?: string[];
-    folderPasswords?: Record<string, string>;
-    offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
-    directoryPageSize?: number;
-    directoryViewMode?: "list" | "grid";
-    directorySortMode?: FileEntrySortMode;
-    theme?: Partial<ThemePreferences>;
-    expertView?: boolean;
-    stabilityNoticeAcknowledged?: boolean;
-    pim?: {
-      enabled?: boolean;
-      contactsEnabled?: boolean;
-      calendarEnabled?: boolean;
-      syncFolderMode?: "choose" | "create";
-      syncFolderPath?: string;
-      standardsMode?: "one_entry_per_file";
-      autoMergeSilent?: boolean;
-      androidContactsIntegration?: boolean;
-      androidCalendarIntegration?: boolean;
-    };
-  }>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
+  const persisted = parseJson<PersistedAppState>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
+  if (!persisted) return null;
+  return {
+    activeTab: persisted.activeTab,
+    directoryPageSize: persisted.directoryPageSize,
+    directoryViewMode: persisted.directoryViewMode,
+    directorySortMode: persisted.directorySortMode,
+    theme: persisted.theme,
+    expertView: persisted.expertView,
+    stabilityNoticeAcknowledged: persisted.stabilityNoticeAcknowledged,
+  };
 };
 
 const normalizeDirectoryPageSize = (value: unknown) => {
@@ -107,27 +99,115 @@ const normalizeDirectoryViewMode = (value: unknown): "list" | "grid" =>
 const normalizeDirectorySortMode = (value: unknown): FileEntrySortMode =>
   value === "modified" || value === "size" || value === "type" ? value : "name";
 
-export const persistState = (state: AppState) => {
+export const persistState = (state: AppState, migrated = false) => {
   if (typeof window === "undefined") return;
+  // Retain the exact legacy record until its encrypted replacement is read back.
+  const legacy = window.localStorage.getItem?.(APP_STATE_STORAGE_KEY);
+  if (!migrated && legacy && readLegacySensitiveState()) return;
   window.localStorage.setItem(
     APP_STATE_STORAGE_KEY,
     JSON.stringify({
       activeTab: state.activeTab,
-      selectedSavedDeviceId: state.devices.selectedSavedDeviceId,
-      connection: { ...toConnectionSettings(state.connection), key: "" },
-      savedDevices: state.devices.savedDevices,
-      syncApprovedIntroducedFolderKeys: [...state.approvals.syncApprovedFolderKeys].sort(),
-      offlineFolderSnapshots: Object.fromEntries(Object.entries(state.offline.snapshots).map(([deviceId, snapshot]) =>
-        [deviceId, { ...snapshot, directories: undefined, activeDirectoryKey: undefined }])),
       directoryPageSize: state.ui.directoryPageSize,
       directoryViewMode: state.ui.directoryViewMode,
       directorySortMode: state.ui.directorySortMode,
       theme: state.ui.theme,
       expertView: state.ui.expertView,
       stabilityNoticeAcknowledged: !state.ui.showStabilityNotice,
-      pim: state.pim,
     }),
   );
+};
+
+export interface PersistedPimState {
+  enabled: boolean;
+  contactsEnabled: boolean;
+  calendarEnabled: boolean;
+  syncFolderMode: "choose" | "create";
+  syncFolderPath: string;
+  standardsMode: "one_entry_per_file";
+  autoMergeSilent: boolean;
+  androidContactsIntegration: boolean;
+  androidCalendarIntegration: boolean;
+}
+
+export interface SensitiveAppState {
+  connection?: StoredConnectionSettingsLike;
+  savedDevices?: SavedDeviceLike[];
+  selectedSavedDeviceId?: string;
+  approvals: string[];
+  offlineFolderSnapshots: Record<string, OfflineFolderSnapshot>;
+  pim: PersistedPimState;
+}
+
+const normalizePersistedPim = (value: Partial<PersistedPimState> | undefined): PersistedPimState => ({
+  enabled: value?.enabled ?? false,
+  contactsEnabled: value?.contactsEnabled ?? true,
+  calendarEnabled: value?.calendarEnabled ?? true,
+  syncFolderMode: value?.syncFolderMode === "create" ? "create" : "choose",
+  syncFolderPath: String(value?.syncFolderPath ?? "").trim(),
+  standardsMode: "one_entry_per_file",
+  autoMergeSilent: value?.autoMergeSilent ?? true,
+  androidContactsIntegration: value?.androidContactsIntegration ?? true,
+  androidCalendarIntegration: value?.androidCalendarIntegration ?? true,
+});
+
+/** Encrypted subset of the app state; loaded and saved after vault unlock. */
+export const sensitiveAppState = (state: AppState): SensitiveAppState => ({
+  connection: { ...toConnectionSettings(state.connection), key: "" },
+  savedDevices: state.devices.savedDevices,
+  selectedSavedDeviceId: state.devices.selectedSavedDeviceId,
+  approvals: [...state.approvals.syncApprovedFolderKeys].sort(),
+  offlineFolderSnapshots: Object.fromEntries(Object.entries(state.offline.snapshots).map(([deviceId, snapshot]) =>
+    [deviceId, { ...snapshot, directories: undefined, activeDirectoryKey: undefined }])),
+  pim: state.pim,
+});
+
+export const applySensitiveAppState = (state: AppState, value: unknown) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<SensitiveAppState>;
+  if (!Array.isArray(record.approvals) || typeof record.offlineFolderSnapshots !== "object" ||
+    record.offlineFolderSnapshots === null || Array.isArray(record.offlineFolderSnapshots)) return false;
+  if (record.connection) Object.assign(state.connection, fromConnectionSettings({ ...record.connection, key: "" }));
+  if (record.savedDevices) state.devices.savedDevices = normalizeSavedDevices(record.savedDevices);
+  state.devices.selectedSavedDeviceId = record.selectedSavedDeviceId ?? "";
+  state.approvals.syncApprovedFolderKeys = normalizeSyncApprovedIntroducedFolderKeys(
+    record.approvals.filter((key): key is string => typeof key === "string"));
+  state.offline.snapshots = record.offlineFolderSnapshots;
+  state.pim = normalizePersistedPim(record.pim);
+  return true;
+};
+
+/** Legacy plaintext subset still present in browser storage before migration. */
+export const readLegacySensitiveState = (): SensitiveAppState | null => {
+  if (typeof window === "undefined") return null;
+  const legacy = parseJson<{
+    connection?: StoredConnectionSettingsLike;
+    savedDevices?: SavedDeviceLike[];
+    selectedSavedDeviceId?: string;
+    acceptedIntroducedFolderKeys?: string[];
+    syncApprovedIntroducedFolderKeys?: string[];
+    offlineFolderSnapshots?: Record<string, OfflineFolderSnapshot>;
+    pim?: Partial<PersistedPimState>;
+    folderPasswords?: Record<string, string>;
+  }>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
+  if (!legacy) return null;
+  const approvals = normalizeSyncApprovedIntroducedFolderKeys(
+    legacy.syncApprovedIntroducedFolderKeys ?? legacy.acceptedIntroducedFolderKeys);
+  const snapshots = legacy.offlineFolderSnapshots ?? {};
+  if (!approvals.size && !Object.keys(snapshots).length && legacy.pim === undefined && !Object.keys(legacy.folderPasswords ?? {}).length && !legacy.connection && !legacy.savedDevices) return null;
+  return { connection: legacy.connection ? { ...legacy.connection, key: "" } : undefined,
+    savedDevices: legacy.savedDevices, selectedSavedDeviceId: legacy.selectedSavedDeviceId,
+    approvals: [...approvals].sort(), offlineFolderSnapshots: snapshots,
+    pim: normalizePersistedPim(legacy.pim) };
+};
+
+export const readLegacyFolderPasswords = (): Record<string, string> => {
+  if (typeof window === "undefined") return {};
+  const legacy = parseJson<{ folderPasswords?: Record<string, string> }>(window.localStorage.getItem(APP_STATE_STORAGE_KEY));
+  const passwords = legacy?.folderPasswords ?? {};
+  if (typeof passwords !== "object" || Array.isArray(passwords) ||
+    Object.values(passwords).some(value => typeof value !== "string")) throw new Error("Invalid legacy folder credentials.");
+  return passwords;
 };
 
 export const createInitialState = (persisted = loadPersistedState()) => {
@@ -257,10 +337,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       localDiscoveryNotice: "",
     },
     approvals: {
-      syncApprovedFolderKeys: normalizeSyncApprovedIntroducedFolderKeys(
-        persisted?.syncApprovedIntroducedFolderKeys ??
-          persisted?.acceptedIntroducedFolderKeys,
-      ),
+      syncApprovedFolderKeys: normalizeSyncApprovedIntroducedFolderKeys(undefined),
       remoteApprovalPendingIds: new Set<string>(),
       pendingApprovalPromptDeviceId: "",
     },
@@ -271,7 +348,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       visible: {} as Record<string, boolean>,
     },
     offline: {
-      snapshots: persisted?.offlineFolderSnapshots ?? {},
+      snapshots: {} as Record<string, OfflineFolderSnapshot>,
     },
     ui: {
       isSettingsExpanded: false,
@@ -322,17 +399,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       isRetryingFavorite: false,
       isResolvingFavorite: false,
     },
-    pim: {
-      enabled: persisted?.pim?.enabled ?? false,
-      contactsEnabled: persisted?.pim?.contactsEnabled ?? true,
-      calendarEnabled: persisted?.pim?.calendarEnabled ?? true,
-      syncFolderMode: persisted?.pim?.syncFolderMode === "create" ? "create" : "choose",
-      syncFolderPath: String(persisted?.pim?.syncFolderPath ?? "").trim(),
-      standardsMode: "one_entry_per_file" as const,
-      autoMergeSilent: persisted?.pim?.autoMergeSilent ?? true,
-      androidContactsIntegration: persisted?.pim?.androidContactsIntegration ?? true,
-      androidCalendarIntegration: persisted?.pim?.androidCalendarIntegration ?? true,
-    },
+    pim: normalizePersistedPim(undefined),
     logs: {
       nextId: 1,
       items: [] as Array<{

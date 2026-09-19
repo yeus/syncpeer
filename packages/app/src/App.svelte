@@ -5,6 +5,7 @@
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
     cachedFileKey,
+    folderPasswordScopedKey,
   } from "@syncpeer/core/browser";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
   import AppHeader from "./components/AppHeader.svelte";
@@ -31,6 +32,7 @@
   import { createTransferRuntime } from "./app/transferRuntime.ts";
   import {
     activeFolderPasswords,
+    connectionDetails,
     advertisedDevices,
     applySessionState,
     activeDownloadProgressPercent as downloadProgressPercent,
@@ -55,6 +57,10 @@
     pushSessionLog,
     visibleBreadcrumbs,
     createInitialState,
+    applySensitiveAppState,
+    readLegacySensitiveState,
+    readLegacyFolderPasswords,
+    sensitiveAppState,
   } from "./app/state.ts";
   import AboutPage from "./AboutPage.svelte";
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
@@ -123,20 +129,66 @@
   });
   const pimDependencies = { state: app, client, sessionStore };
 
+  let uiStateLoaded = false;
+  let uiStateSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function loadEncryptedUiState() {
+    if (uiStateLoaded || !folderCredentials) return;
+    const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
+    if (status.vault.phase !== "unlocked") return;
+    const stored = await documentCommand<unknown>({ operation: "uiState" });
+    if (stored !== null && applySensitiveAppState(app, stored)) {
+      uiStateLoaded = true;
+      return;
+    }
+    if (stored !== null) throw new Error("Invalid encrypted UI state; existing data was retained.");
+    const legacy = readLegacySensitiveState();
+    if (!legacy) {
+      uiStateLoaded = true;
+      return;
+    }
+    await documentCommand({ operation: "saveUiState", state: legacy });
+    const verified = await documentCommand<unknown>({ operation: "uiState" });
+    if (JSON.stringify(verified) !== JSON.stringify(JSON.parse(JSON.stringify(legacy)))) {
+      throw new Error("Encrypted UI state migration could not be verified.");
+    }
+    applySensitiveAppState(app, legacy);
+    uiStateLoaded = true;
+    // Plaintext cleanup follows credential migration in loadFolderCredentials.
+  }
+
+  const persistSensitiveState = () => {
+    if (!uiStateLoaded) return;
+    // Read the payload while the effect tracks state so later edits schedule a save.
+    const payload = sensitiveAppState(app);
+    if (uiStateSaveTimer) clearTimeout(uiStateSaveTimer);
+    uiStateSaveTimer = setTimeout(() => {
+      uiStateSaveTimer = undefined;
+      void documentCommand({ operation: "saveUiState", state: payload })
+        .catch(() => { uiStateLoaded = false; });
+    }, 500);
+  };
+
   async function loadFolderCredentials() {
     if (!folderCredentials) return;
     const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
     if (status.vault.phase !== "unlocked") return;
+    await loadEncryptedUiState();
     const saved = await folderCredentials.load();
-    for (const [id, password] of Object.entries(app.passwords.saved)) {
+    const pending = { ...readLegacyFolderPasswords(), ...app.passwords.saved };
+    for (const [id, password] of Object.entries(pending)) {
       if (saved[id] !== undefined && saved[id] !== password) throw new Error("Conflicting saved folder passwords require review.");
     }
-    const merged = { ...app.passwords.saved, ...saved };
+    const merged = { ...pending, ...saved };
     await folderCredentials.save(merged);
+    const verifiedPasswords = await folderCredentials.load();
+    if (Object.entries(merged).some(([id, value]) => verifiedPasswords[id] !== value)) {
+      throw new Error("Encrypted credentials could not be verified; legacy data was retained.");
+    }
     app.passwords.saved = merged;
     app.passwords.drafts = { ...merged };
     app.passwords.secureStorage = true;
-    persistState(app);
+    persistState(app, true);
     const knownFolders = Object.values(app.offline.snapshots).flatMap(snapshot => snapshot.folders)
       .map(folder => ({ ...folder, needsPassword: true }));
     app.localFolders = (await syncDocumentFolders(knownFolders, {})).map(folder => ({ ...folder, readOnly: false }));
@@ -154,6 +206,27 @@
   async function rotateMasterPassword(password: string) {
     await documentCommand({ operation: "changeMasterPassword", password });
     await loadFolderCredentials();
+  }
+
+  async function importPeerFolder(peerId: string, folderId: string, password: string) {
+    if (!app.session.isConnected || app.session.remoteDevice?.id !== peerId || !folderCredentials) {
+      throw new Error("Reconnect to the approved peer first.");
+    }
+    const passwords = activeFolderPasswords(app);
+    const recovered = password || passwords[folderId];
+    if (!recovered) throw new Error("A folder password is required.");
+    const overview = await client.connectAndGetOverview({ ...connectionDetails(app),
+      folderPasswords: { ...passwords, [folderId]: recovered } });
+    const folder = overview.folders.find(value => value.id === folderId);
+    if (app.session.remoteDevice?.id !== peerId || !folder?.encrypted || folder.needsPassword) {
+      throw new Error("The approved encrypted folder could not be unlocked.");
+    }
+    await connectDocumentFolder({ id: folder.id, label: folder.label || folder.id, password: recovered });
+    const saved = { ...await folderCredentials.load(), [folderPasswordScopedKey(peerId, folderId)]: recovered };
+    await folderCredentials.save(saved);
+    await loadFolderCredentials();
+    await sessionStore.actions.setFolderPasswords(activeFolderPasswords(app));
+    await sessionStore.actions.refreshOverview(connectionDetails(app));
   }
 
   async function migrateDocumentFolder(folderId: string, target: "encrypted" | "plaintext") {
@@ -213,6 +286,10 @@
       clearInterval(localDiscoveryTimer);
       localDiscoveryTimer = null;
     }
+    if (uiStateSaveTimer) {
+      clearTimeout(uiStateSaveTimer);
+      uiStateSaveTimer = undefined;
+    }
     unsubscribe();
     actions.dispose();
     transferRuntime.dispose();
@@ -223,6 +300,7 @@
 
   $effect(() => {
     persistState(app);
+    persistSensitiveState();
   });
 
   $effect(() => {
@@ -671,7 +749,8 @@
   />
 {:else if app.currentPage === "folder-settings"}
   <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
-    command={documentCommand}
+    command={documentCommand} onImport={importPeerFolder}
+    peerId={app.session.isConnected ? app.session.remoteDevice?.id ?? "" : ""} peerFolders={app.session.folders}
     onSettingsSaved={settings => {
       app.favorites.exclusions = Object.values(settings.folders).flatMap(folder => folder.exclusions);
       app.favorites.ignorePatternsByFolder = Object.fromEntries(Object.entries(settings.folders)

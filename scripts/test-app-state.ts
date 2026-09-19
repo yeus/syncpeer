@@ -6,10 +6,13 @@ import {
   activeDownloadProgressPercent,
   activeDownloadSummary,
   applySessionState,
+  applySensitiveAppState,
   createInitialState,
   downloadButtonLabel,
+  readLegacySensitiveState,
   rootFolderEntries,
   persistState,
+  sensitiveAppState,
 } from "../packages/app/src/app/state.ts";
 
 test("stability warning appears on first run and stays dismissed", () => {
@@ -58,13 +61,12 @@ test("browser persistence never stores a private key or folder password without 
   persistState(state);
   assert.ok(!written.includes("synthetic-private-key"));
   assert.ok(!written.includes("synthetic-folder-password"));
-  const restored = createInitialState({ connection: { ...state.connection, key: "legacy-private-key" },
-    folderPasswords: { photos: "legacy-folder-password" } });
+  const restored = createInitialState({ connection: { ...state.connection, key: "legacy-private-key" } });
   assert.equal(restored.connection.key, "");
   assert.deepEqual(restored.passwords.saved, {});
 });
 
-test("remote directory entries are excluded from browser persistence", t => {
+test("sensitive UI state is excluded from browser persistence", t => {
   let written = "";
   const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", { configurable: true,
@@ -72,13 +74,57 @@ test("remote directory entries are excluded from browser persistence", t => {
   t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
     else Reflect.deleteProperty(globalThis, "window"); });
   const state = createInitialState(null);
-  state.offline.snapshots.device = { deviceId: "device", remoteDevice: null, folders: [],
+  state.approvals.syncApprovedFolderKeys = new Set(["device:folder"]);
+  state.offline.snapshots.device = { deviceId: "device", remoteDevice: null, folders: [{ id: "folder", label: "Private folder", readOnly: false }],
     folderSyncStates: [], connectedVia: "fixture", transportKind: "", lastSeenAtMs: 1,
     directories: { directory: { folderId: "folder", path: "", versionKey: "v1", loadedAtMs: 1,
       entries: [{ name: "private-name.txt", path: "private-name.txt", type: "file", size: 1, modifiedMs: 1 }] } } };
+  state.pim.syncFolderPath = "private/pim";
   persistState(state);
+  const persisted = JSON.parse(written);
   assert.equal(written.includes("private-name.txt"), false);
-  assert.equal(JSON.parse(written).offlineFolderSnapshots.device.directories, undefined);
+  assert.equal(written.includes("Private folder"), false);
+  assert.equal(persisted.offlineFolderSnapshots, undefined);
+  assert.equal(persisted.syncApprovedIntroducedFolderKeys, undefined);
+  assert.equal(persisted.pim, undefined);
+});
+
+test("sensitive UI state round-trips through the encrypted payload", () => {
+  const state = createInitialState(null);
+  state.approvals.syncApprovedFolderKeys = new Set(["device:folder"]);
+  state.offline.snapshots.device = { deviceId: "device", remoteDevice: null, folders: [],
+    folderSyncStates: [], connectedVia: "fixture", transportKind: "", lastSeenAtMs: 1 };
+  state.pim.enabled = true;
+  state.pim.syncFolderPath = "private/pim";
+  const payload = sensitiveAppState(state);
+  assert.deepEqual(payload.approvals, ["device:folder"]);
+  assert.equal(payload.offlineFolderSnapshots.device.lastSeenAtMs, 1);
+  assert.equal(payload.pim.syncFolderPath, "private/pim");
+
+  const restored = createInitialState(null);
+  assert.equal(applySensitiveAppState(restored, JSON.parse(JSON.stringify(payload))), true);
+  assert.deepEqual([...restored.approvals.syncApprovedFolderKeys], ["device:folder"]);
+  assert.equal(restored.offline.snapshots.device.lastSeenAtMs, 1);
+  assert.equal(restored.pim.enabled, true);
+  assert.equal(restored.pim.syncFolderPath, "private/pim");
+  assert.equal(applySensitiveAppState(restored, "invalid"), false);
+});
+
+test("legacy plaintext UI state is discoverable for one-time migration", (t) => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: { getItem: () => JSON.stringify({
+    syncApprovedIntroducedFolderKeys: ["device:folder"],
+    offlineFolderSnapshots: { device: { deviceId: "device", folders: [], folderSyncStates: [],
+      connectedVia: "", transportKind: "", lastSeenAtMs: 3, remoteDevice: null } },
+    pim: { enabled: true, syncFolderPath: "private/pim" },
+    theme: "dark",
+  }) } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const legacy = readLegacySensitiveState();
+  assert.deepEqual(legacy?.approvals, ["device:folder"]);
+  assert.equal(legacy?.offlineFolderSnapshots.device.lastSeenAtMs, 3);
+  assert.equal(legacy?.pim.enabled, true);
 });
 
 test("peer updates preserve the directory currently browsed from local storage", () => {
@@ -220,4 +266,22 @@ test("tracks active manual downloads independently", () => {
     activeDownloadSummary(Object.values(app.favorites.activeDownloads)),
     "2 downloads: 50%",
   );
+});
+
+test("startup persistence retains legacy sensitive state until verified migration", t => {
+  let raw = JSON.stringify({ pim: { enabled: true, syncFolderPath: "synthetic/private" },
+    folderPasswords: { folder: "synthetic-password" }, syncApprovedIntroducedFolderKeys: ["device:folder"] });
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: {
+    getItem: () => raw, setItem: (_key: string, value: string) => { raw = value; },
+  } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  persistState(state);
+  assert.equal(readLegacySensitiveState()?.pim.syncFolderPath, "synthetic/private");
+  assert.equal(JSON.parse(raw).folderPasswords.folder, "synthetic-password");
+  persistState(state, true);
+  assert.equal(JSON.parse(raw).pim, undefined);
+  assert.equal(JSON.parse(raw).folderPasswords, undefined);
 });

@@ -89,7 +89,7 @@ export const pickAndroidPimDirectory = async (args: PimActionDependencies) => {
     await client.setAndroidSafTreeUri(treeUri);
     state.pim.syncFolderMode = "choose";
     state.pim.syncFolderPath = treeUri;
-    state.devices.identityNotice = "Android PIM directory selected.";
+    state.devices.identityNotice = "Plaintext export directory selected. Exported files are outside the encrypted replica.";
   } catch (error) {
     reportActionError(state, "pim.android.pick_directory.failed", error);
   }

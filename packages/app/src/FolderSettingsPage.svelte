@@ -2,8 +2,11 @@
   import { onMount } from "svelte";
   import { defaultFolderSettings, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import type { createDocumentFilesystem } from "@syncpeer/core/filesystem";
-  let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved, biometric, command }: {
+  let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved, onImport, peerId, peerFolders, biometric, command }: {
     onBack: () => void;
+    onImport: (peerId: string, folderId: string, password: string) => Promise<void>;
+    peerId: string;
+    peerFolders: Array<{ id: string; label: string; encrypted?: boolean }>;
     onCreate: (label: string) => Promise<void>;
     onUnlock: () => Promise<void>;
     onUnlockBiometric: () => Promise<void>;
@@ -23,6 +26,33 @@
   let settings = $state<SyncpeerProfileSettings | null>(null);
   let patternDrafts = $state<Record<string, string>>({});
   let rememberMaster = $state(false), generatedPassword = $state(""), generatedSaved = $state(false);
+  let importFolderId = $state(""), importPassword = $state(""), importApproved = $state(false);
+  let recoveryPassword = $state(""), backupText = $state(""), backupFile = $state<File | null>(null);
+
+  async function transferBackup(restore: boolean) {
+    busy = true; error = "";
+    try {
+      if (restore) {
+        if (backupFile && backupFile.size > 12 * 1024 * 1024) throw new Error("Backup is too large.");
+        const encoded = backupFile ? await backupFile.text() : backupText;
+        if (encoded.length > 12 * 1024 * 1024) throw new Error("Backup is too large.");
+        await command({ operation: "restoreRecoveryBackup", backup: JSON.parse(encoded),
+          recoveryPassword, password: masterPassword });
+        backupText = ""; backupFile = null; masterPassword = "";
+        await onUnlock(); await refresh();
+      } else {
+        backupText = JSON.stringify(await command({ operation: "exportRecoveryBackup", password: recoveryPassword }));
+      }
+    } catch { error = "Backup operation failed. Check the backup and passwords. Existing data was retained."; }
+    finally { recoveryPassword = ""; busy = false; }
+  }
+  async function importFolder() {
+    if (!importApproved || !peerId || !importFolderId) return;
+    busy = true; error = "";
+    try { await onImport(peerId, importFolderId, importPassword); importPassword = ""; importApproved = false; await refresh(); }
+    catch { error = "Folder import failed. Check the connected peer, folder identity and password. Existing data was retained."; }
+    finally { busy = false; }
+  }
   async function refresh() {
     status = await command<NonNullable<typeof status>>({ operation: "status" });
     if (status.vault.phase === "unlocked") {
@@ -135,6 +165,7 @@
     <form onsubmit={event => { event.preventDefault(); void createProfile(); }}>
       <label>Master password (at least 16 characters) <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" required /></label>
       <label><input type="checkbox" bind:checked={rememberMaster} /> Remember with the operating system’s protected credential store</label>
+      <p>Remembering allows background access after restarting the app or rebooting, once the device is unlocked. Without it, enter your master password each time. Explicitly locking always requires the master password again.</p>
       <button type="button" onclick={generatePassword}>Generate local master password</button>
       {#if generatedPassword}
         <p><code>{generatedPassword}</code></p>
@@ -143,6 +174,22 @@
       <button disabled={busy || !masterPassword || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
     </form>
   {:else if status?.vault.phase === "unlocked"}
+    <section>
+      <h2>Register or recover an encrypted peer folder</h2>
+      <p>Connect to the peer first. Registration keeps the root browsable; only favorites download automatically. Recover a saved folder password from your personal-space backup, or enter and approve it here.</p>
+      <p>Connected peer: <code>{peerId || "None"}</code></p>
+      <form onsubmit={event => { event.preventDefault(); void importFolder(); }}>
+        <label>Encrypted folder <select bind:value={importFolderId} onchange={() => { importApproved = false; }}>
+          <option value="">Choose a folder</option>
+          {#each peerFolders.filter(folder => folder.encrypted) as folder (folder.id)}
+            <option value={folder.id}>{folder.label} · {folder.id}</option>
+          {/each}
+        </select></label>
+        <label>Folder password (blank uses recovered credentials) <input type="password" bind:value={importPassword} autocomplete="off" /></label>
+        <label><input type="checkbox" bind:checked={importApproved} /> I verified this peer and folder ID with the folder owner</label>
+        <button disabled={busy || !peerId || !importFolderId || !importApproved}>Approve and register folder</button>
+      </form>
+    </section>
     <form onsubmit={event => { event.preventDefault(); void submit(false); }}>
       <label>New folder name <input bind:value={label} required /></label>
       <button disabled={busy || !label.trim()}>Create folder</button>
@@ -184,6 +231,26 @@
         </label>
       </section>
     {/if}
+  {/if}
+  {#if status?.vault.phase === "unlocked" || status?.vault.phase === "uninitialized"}
+    <section>
+      <h2>Personal-space backup</h2>
+      <p>This password-encrypted backup contains folder credentials and settings. It contains neither downloaded documents nor device identity keys. Keep its recovery password separately; cross-device pairing and shared settings are outside the 0.6 release promise.</p>
+      <label>Backup recovery password <input type="password" bind:value={recoveryPassword} autocomplete="off" /></label>
+      {#if status.vault.phase === "unlocked"}
+        <button disabled={busy || !recoveryPassword} onclick={() => void transferBackup(false)}>Export encrypted backup</button>
+        {#if backupText}
+          <label>Encrypted backup — copy and save this text <textarea readonly rows="6" value={backupText} onclick={event => event.currentTarget.select()}></textarea></label>
+          <a download="syncpeer-space-backup.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(backupText)}`}>Save backup file</a>
+        {/if}
+      {:else}
+        <label>Backup file <input type="file" accept="application/json,.json" onchange={event => { backupFile = event.currentTarget.files?.[0] ?? null; }} /></label>
+        <label>Or paste encrypted backup <textarea rows="6" bind:value={backupText}></textarea></label>
+        <label>New device master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" /></label>
+        <p>Recovery starts with remembering disabled. Your existing peer connections require approval on this device.</p>
+        <button disabled={busy || !recoveryPassword || masterPassword.length < 16 || (!backupFile && !backupText)} onclick={() => void transferBackup(true)}>Import backup into this new profile</button>
+      {/if}
+    </section>
   {/if}
   <ul>{#each status?.folders ?? [] as folder (folder.id)}
     <li>

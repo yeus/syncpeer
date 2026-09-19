@@ -24,6 +24,34 @@ export interface FileDownloadSink extends CachedRangeStorage {
   resumeStorage?: CachedRangeStorage;
 }
 
+/** Random-access plaintext source for bounded uploads. Core reads at most one
+ * block at a time while hashing and serving; the owner keeps the source
+ * readable until the publication is acknowledged, and closes it afterwards.
+ */
+export interface FileUploadSource {
+  readonly size: number;
+  readonly read: (offset: number, size: number) => Promise<Uint8Array>;
+  readonly close?: () => Promise<void>;
+}
+
+/** In-memory upload source; reads copy from the original byte array. */
+export const memoryUploadSource = (bytes: Uint8Array): FileUploadSource => ({
+  size: bytes.length,
+  read: async (offset, size) => bytes.slice(offset, offset + size),
+});
+
+/** Materializes a source in bounded chunks; only for recovery verification. */
+export const readSourceFully = async (source: FileUploadSource): Promise<Uint8Array> => {
+  const bytes = new Uint8Array(source.size);
+  for (let offset = 0; offset < source.size; offset += 131072) {
+    const length = Math.min(131072, source.size - offset);
+    const chunk = await source.read(offset, length);
+    if (chunk.length !== length) throw new Error("Upload source returned an unexpected length.");
+    bytes.set(chunk, offset);
+  }
+  return bytes;
+};
+
 export interface DownloadCheckpoint {
   metadata: FileDownloadMetadata | null;
   completedRanges: Array<{ offset: number; size: number }>;

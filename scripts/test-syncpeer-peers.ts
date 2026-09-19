@@ -303,6 +303,22 @@ test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { 
     await waitForFile(incoming, "from-b.txt");
     assert.deepEqual(await outgoing.remoteFs.readFileFully("fixture-folder", "from-a.txt"), fromA);
     assert.deepEqual(await incoming.remoteFs.readFileFully("fixture-folder", "from-b.txt"), fromB);
+    {
+      const streamed = new Uint8Array(300 * 1024).map((_, index) => (index * 7) % 251);
+      const streamReads: number[] = [];
+      await incoming.remoteFs.writeFileStream("fixture-folder", "streamed.bin", {
+        size: streamed.length,
+        read: async (offset, size) => { streamReads.push(size); return streamed.slice(offset, offset + size); },
+      }, publication);
+      const streamDeadline = Date.now() + 3000;
+      while (true) {
+        const actual = await readFile(path.join(root, "share-b", "streamed.bin")).catch(() => null);
+        if (actual) { assert.deepEqual(new Uint8Array(actual), streamed); break; }
+        assert.ok(Date.now() < streamDeadline, "Streamed upload did not synchronize");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.ok(streamReads.every(size => size <= 131072), "Upload source reads stay block-bounded");
+    }
     if (mode === "encrypted") {
       assert.ok(repeatCluster);
       captureIndex = true;

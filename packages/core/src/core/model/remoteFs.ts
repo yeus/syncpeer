@@ -7,6 +7,7 @@ import type {
   FileDownloadMetadata,
   FileDownloadResult,
   FileDownloadSink,
+  FileUploadSource,
 } from "../../transfer/stream.js";
 
 export interface FolderInfo {
@@ -100,6 +101,8 @@ export interface FileUploadOptions {
   waitForRemote?: boolean;
   modifiedMs?: number;
   signal?: AbortSignal;
+  /** Fail before advertising when the streamed plaintext hash differs. */
+  expectedHash?: string;
   onProgress?: (progress: {
     processedBytes: number;
     totalBytes: number;
@@ -298,6 +301,12 @@ export class RemoteFs {
     bytes: Uint8Array,
     options?: FileUploadOptions,
   ) => Promise<void>;
+  private publishFileStream?: (
+    folderId: string,
+    path: string,
+    source: FileUploadSource,
+    options?: FileUploadOptions,
+  ) => Promise<void>;
   private publishDeletion?: (
     folderId: string,
     path: string,
@@ -338,6 +347,12 @@ export class RemoteFs {
       path: string,
       options?: FileDeleteOptions,
     ) => Promise<void>,
+    publishFileStream?: (
+      folderId: string,
+      path: string,
+      source: FileUploadSource,
+      options?: FileUploadOptions,
+    ) => Promise<void>,
   ) {
     this.folders = folders;
     this.requestBlock = requestBlock;
@@ -345,6 +360,7 @@ export class RemoteFs {
     this.remoteDevice = remoteDevice;
     this.closeConnection = closeConnection;
     this.publishFile = publishFile;
+    this.publishFileStream = publishFileStream;
     this.publishDeletion = publishDeletion;
     this.requestFolderIndexUpdate = requestFolderIndexUpdate;
     this.setFocusedFolderId = setFocusedFolderId;
@@ -826,6 +842,25 @@ export class RemoteFs {
       throw new Error("Upload path must not be empty.");
     }
     await this.publishFile(folderId, normalizedPath, bytes, options);
+  }
+
+  /** Publishes a random-access source through the bounded streaming path. The
+   * caller keeps the source readable until the publication is acknowledged.
+   */
+  async writeFileStream(
+    folderId: string,
+    path: string,
+    source: FileUploadSource,
+    options?: FileUploadOptions,
+  ): Promise<void> {
+    if (!this.publishFileStream) {
+      throw new Error("Streaming upload is not supported by this session transport.");
+    }
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath) {
+      throw new Error("Upload path must not be empty.");
+    }
+    await this.publishFileStream(folderId, normalizedPath, source, options);
   }
 
   async deleteFile(

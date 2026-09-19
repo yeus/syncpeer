@@ -14,7 +14,7 @@ import type {
   FolderSyncState,
   RemoteDeviceInfo,
 } from "../core/model/remoteFs.js";
-import type { FileDownloadResult, FileDownloadSink } from "../transfer/stream.js";
+import type { FileDownloadResult, FileDownloadSink, FileUploadSource } from "../transfer/stream.js";
 import type { SyncpeerProfileSettings } from "../sync/profileSettings.js";
 
 export interface ConnectOptions {
@@ -64,6 +64,12 @@ export interface RemoteFsLike {
     folderId: string,
     path: string,
     bytes: Uint8Array,
+    options?: FileUploadOptions,
+  ) => Promise<void>;
+  writeFileStream: (
+    folderId: string,
+    path: string,
+    source: FileUploadSource,
     options?: FileUploadOptions,
   ) => Promise<void>;
   deleteFile?: (

@@ -20,8 +20,11 @@ import {
   type BepRequest,
   type BepResponse,
 } from "./core/protocol/bep.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type { createCiphertextReplica } from "./sync/ciphertextReplica.js";
 import { createCiphertextIndex, selectCiphertextPublication } from "./sync/ciphertextIndex.js";
+import { memoryUploadSource, type FileUploadSource } from "./transfer/stream.js";
 import {
   isTransportFailure,
   RemoteFs,
@@ -42,7 +45,6 @@ import {
   type PendingIndexFrame,
 } from "./core/protocol/indexQueue.js";
 import {
-  encryptUntrustedBlockHash,
   encryptUntrustedBlock,
   encryptUntrustedFilename,
   deriveUntrustedFileKey,
@@ -307,16 +309,20 @@ interface UploadedBlock {
   offset: number;
   size: number;
   hash: Uint8Array;
-  encryptedData?: Uint8Array;
 }
 
 interface UploadedFileRecord {
   path: string;
-  bytes: Uint8Array;
+  size: number;
+  /** Advertised block layout; encrypted folders use the ciphertext layout. */
   blocks: UploadedBlock[];
+  /** Plaintext block layout used to verify source reads before serving. */
+  plaintextBlocks: UploadedBlock[];
+  source: FileUploadSource;
   modifiedMs: number;
   sequence: number;
   encryptedName?: string;
+  fileKey?: Uint8Array;
 }
 
 interface PendingRequestMeta {
@@ -1747,14 +1753,15 @@ class BepSession {
     const storedRecord: UploadedFileRecord = {
       ...record,
       path: normalizedPath,
-      bytes: new Uint8Array(record.bytes),
       blocks: record.blocks.map((block) => ({
         offset: block.offset,
         size: block.size,
         hash: new Uint8Array(block.hash),
-        encryptedData: block.encryptedData
-          ? new Uint8Array(block.encryptedData)
-          : undefined,
+      })),
+      plaintextBlocks: record.plaintextBlocks.map((block) => ({
+        offset: block.offset,
+        size: block.size,
+        hash: new Uint8Array(block.hash),
       })),
     };
     this.uploadedFilesByFolder.get(folderId)?.set(normalizedPath, storedRecord);
@@ -1820,49 +1827,15 @@ class BepSession {
         if (offset < 0 || size < 0) {
           code = 2;
         } else {
-          const chunks: Uint8Array[] = [];
-          let remaining = size;
-          let cursor = offset;
-          for (const block of record.blocks) {
-            const encryptedData = block.encryptedData;
-            if (!encryptedData) continue;
-            const blockStart = block.offset;
-            const blockEnd = block.offset + block.size;
-            if (cursor >= blockEnd) continue;
-            if (cursor < blockStart && chunks.length === 0) {
-              // Requested an offset that is between known block boundaries.
-              code = 2;
-              break;
-            }
-            const startInBlock = Math.max(0, cursor - blockStart);
-            const available = block.size - startInBlock;
-            if (available <= 0) continue;
-            const sliceSize = Math.min(remaining, available);
-            chunks.push(encryptedData.slice(startInBlock, startInBlock + sliceSize));
-            cursor += sliceSize;
-            remaining -= sliceSize;
-            if (remaining <= 0) break;
-          }
-          if (code === 0) {
-            if (chunks.length === 0) {
-              code = 2;
-            } else {
-              const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-              const merged = new Uint8Array(total);
-              let cursorOut = 0;
-              for (const chunk of chunks) {
-                merged.set(chunk, cursorOut);
-                cursorOut += chunk.length;
-              }
-              data = merged;
-            }
-          }
+          data = await this.readEncryptedUploadRange(record, offset, size);
         }
-      } else if (offset > record.bytes.length) {
+      } else if (record.encryptedName) {
+        code = 2;
+      } else if (offset > record.size) {
         code = 2;
       } else {
-        const end = Math.min(record.bytes.length, offset + size);
-        data = record.bytes.slice(offset, end);
+        data = await this.readPlaintextUploadRange(record, offset, size,
+          req.hash instanceof Uint8Array ? req.hash : undefined);
       }
     } catch (error) {
       code = 1;
@@ -1902,10 +1875,83 @@ class BepSession {
     }
   }
 
+  /** Re-reads and verifies one plaintext block so a changed source fails closed. */
+  private async readPlaintextUploadRange(record: UploadedFileRecord, offset: number, size: number,
+    expectedHash?: Uint8Array): Promise<Uint8Array> {
+    const length = Math.min(size, record.size - offset);
+    const bytes = await record.source.read(offset, length);
+    if (bytes.length !== length) throw new Error("Upload source returned an unexpected length.");
+    const block = record.blocks.find(candidate => candidate.offset === offset && candidate.size === length);
+    if (block && expectedHash && !bytesEqual(expectedHash, block.hash)) {
+      throw new Error("Requested block does not match this upload.");
+    }
+    if (block && !bytesEqual(toUint8Array(await this.adapter.sha256(bytes)), block.hash)) {
+      throw new Error("Upload source changed after publication.");
+    }
+    return bytes;
+  }
+
+  /** Re-encrypts advertised blocks from the verified plaintext source, so peers
+   * receive ciphertext that decrypts to the published block hashes. Requests
+   * must cover whole advertised blocks, which is what BEP peers send.
+   */
+  private async readEncryptedUploadRange(record: UploadedFileRecord, offset: number, size: number): Promise<Uint8Array> {
+    if (!record.fileKey || record.blocks.length !== record.plaintextBlocks.length) {
+      throw new Error("Uploaded encrypted file is unavailable.");
+    }
+    const end = offset + size;
+    const chunks: Uint8Array[] = [];
+    for (let index = 0; index < record.blocks.length; index += 1) {
+      const block = record.blocks[index];
+      const blockEnd = block.offset + block.size;
+      if (blockEnd <= offset) continue;
+      if (block.offset >= end) break;
+      if (block.offset < offset || blockEnd > end) {
+        throw new Error("Encrypted upload requests must align with advertised blocks.");
+      }
+      chunks.push(await this.encryptUploadBlock(record, index));
+    }
+    if (chunks.length === 0) throw new Error("Encrypted upload block is unavailable.");
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const merged = new Uint8Array(total);
+    let cursor = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, cursor);
+      cursor += chunk.length;
+    }
+    return merged;
+  }
+
+  private async encryptUploadBlock(record: UploadedFileRecord, index: number): Promise<Uint8Array> {
+    const plaintext = record.plaintextBlocks[index];
+    const bytes = await record.source.read(plaintext.offset, plaintext.size);
+    try {
+      if (bytes.length !== plaintext.size) throw new Error("Upload source returned an unexpected length.");
+      if (!bytesEqual(toUint8Array(await this.adapter.sha256(bytes)), plaintext.hash)) {
+        throw new Error("Upload source changed after publication.");
+      }
+      return await encryptUntrustedBlock(record.fileKey!, bytes, size => this.adapter.randomBytes(size));
+    } finally { bytes.fill(0); }
+  }
+
   async publishFile(
     folderId: string,
     path: string,
     bytes: Uint8Array,
+    options?: FileUploadOptions,
+  ): Promise<void> {
+    // Own the bytes so later caller mutations cannot change what peers receive.
+    await this.publishFileFromSource(folderId, path, memoryUploadSource(new Uint8Array(bytes)), options);
+  }
+
+  /** Publishes a random-access source through a bounded path: blocks are hashed
+   * one at a time, and peers are served by re-reading the source instead of
+   * retaining the file in memory.
+   */
+  async publishFileFromSource(
+    folderId: string,
+    path: string,
+    source: FileUploadSource,
     options?: FileUploadOptions,
   ): Promise<void> {
     const folder = this.folders.get(folderId);
@@ -1924,6 +1970,12 @@ class BepSession {
     }
     assertReplicaPath(normalizedPath);
     if (isInternalReplicaPath(normalizedPath)) throw new Error("Internal files cannot be published.");
+    if (!Number.isSafeInteger(source.size) || source.size < 0) {
+      throw new Error("Upload source size must be a non-negative safe integer.");
+    }
+    if (folder.encrypted && (!folder.folderCrypto || folder.needsPassword)) {
+      throw new Error(`Folder ${folderId} requires a valid encryption password before upload.`);
+    }
     const throwIfCancelled = () => {
       if (!options?.signal?.aborted) return;
       const error = new Error("Upload cancelled.");
@@ -1941,70 +1993,42 @@ class BepSession {
       folderId,
       path: normalizedPath,
       encrypted: folder.encrypted,
-      sizeBytes: bytes.length,
+      sizeBytes: source.size,
       blockSize,
+      streamed: true,
     });
-    const notifyProgress = (
-      processedBytes: number,
-      phase: "preparing" | "publishing",
-    ) => {
+    const notifyProgress = (processedBytes: number, phase: "preparing" | "publishing") => {
       options?.onProgress?.({
-        processedBytes: Math.min(bytes.length, Math.max(0, processedBytes)),
-        totalBytes: bytes.length,
+        processedBytes: Math.min(source.size, Math.max(0, processedBytes)),
+        totalBytes: source.size,
         elapsedMs: Math.max(1, Date.now() - uploadStartedAtMs),
         phase,
       });
     };
-    const blocks: UploadedBlock[] = [];
-    let encryptedName: string | undefined;
+    const digest = options?.expectedHash ? sha256.create() : undefined;
+    const plaintextBlocks: UploadedBlock[] = [];
+    for (let offset = 0; offset < source.size; offset += blockSize) {
+      throwIfCancelled();
+      const length = Math.min(blockSize, source.size - offset);
+      const chunk = await source.read(offset, length);
+      try {
+        if (chunk.length !== length) throw new Error("Upload source returned an unexpected length.");
+        digest?.update(chunk);
+        plaintextBlocks.push({ offset, size: chunk.length, hash: toUint8Array(await this.adapter.sha256(chunk)) });
+      } finally { chunk.fill(0); }
+      notifyProgress(offset + length, "preparing");
+    }
+    if (digest && bytesToHex(digest.digest()) !== options!.expectedHash) {
+      throw new Error("Upload source changed after publication started; retry later.");
+    }
+    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
+    const sequence = this.nextFolderSequence(folderId);
+    const baseVersion = advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId);
     if (!folder.encrypted) {
-      for (let offset = 0; offset < bytes.length; offset += blockSize) {
-        throwIfCancelled();
-        const end = Math.min(bytes.length, offset + blockSize);
-        const chunk = bytes.slice(offset, end);
-        const hash = await this.adapter.sha256(chunk);
-        blocks.push({
-          offset,
-          size: chunk.length,
-          hash: toUint8Array(hash),
-        });
-        notifyProgress(end, "preparing");
-      }
-    } else {
-      if (!folder.folderCrypto || folder.needsPassword) {
-        throw new Error(`Folder ${folderId} requires a valid encryption password before upload.`);
-      }
-      const fileKey = deriveUntrustedFileKey(folder.folderCrypto.folderKey, normalizedPath);
-      encryptedName = await encryptUntrustedFilename(
-        folder.folderCrypto.folderKey,
-        normalizedPath,
-      );
-      let encryptedOffset = 0;
-      const originalBlocks: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
-      for (let offset = 0; offset < bytes.length; offset += blockSize) {
-        throwIfCancelled();
-        const end = Math.min(bytes.length, offset + blockSize);
-        const chunk = bytes.slice(offset, end);
-        const hashPlain = toUint8Array(await this.adapter.sha256(chunk));
-        const encryptedData = await encryptUntrustedBlock(fileKey, chunk, size => this.adapter.randomBytes(size));
-        const encryptedHash = encryptUntrustedBlockHash(fileKey, hashPlain, offset);
-        originalBlocks.push({ offset, size: chunk.length, hash: hashPlain });
-        blocks.push({
-          offset: encryptedOffset,
-          size: encryptedData.length,
-          hash: encryptedHash,
-          encryptedData,
-        });
-        encryptedOffset += encryptedData.length;
-        notifyProgress(end, "preparing");
-      }
-      const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
-      const sequence = this.nextFolderSequence(folderId);
-      const baseVersion = advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId);
-      const originalFileInfo = {
+      const fileInfo = {
         name: normalizedPath,
         type: 0,
-        size: bytes.length,
+        size: source.size,
         permissions: 0o644,
         modified_s: Math.floor(modifiedMs / 1000),
         modified_ns: (modifiedMs % 1000) * 1_000_000,
@@ -2015,85 +2039,62 @@ class BepSession {
         version: baseVersion,
         sequence,
         block_size: blockSize,
-        blocks: originalBlocks.map((block) => ({
-          offset: block.offset,
-          size: block.size,
-          hash: block.hash,
-        })),
+        blocks: plaintextBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
       };
-      const advertisedFileInfo = await encryptUntrustedFileInfo(
-        folder.folderCrypto.folderKey,
-        originalFileInfo,
-        toUint8Array(await this.adapter.randomBytes(24)),
-      );
-      const fakeBlocks = advertisedFileInfo.blocks ?? [];
+      throwIfCancelled();
+      folder.files.set(normalizedPath, { indexFile: fileInfo });
       this.log("upload.prepared", {
         folderId,
         path: normalizedPath,
-        encrypted: true,
-        sizeBytes: bytes.length,
-        blockCount: blocks.length,
+        encrypted: false,
+        sizeBytes: source.size,
+        blockCount: plaintextBlocks.length,
         elapsedMs: Date.now() - uploadStartedAtMs,
-        avgRateBps: uploadRateBps(bytes.length),
+        avgRateBps: uploadRateBps(source.size),
       });
-      throwIfCancelled();
-      folder.files.set(normalizedPath, {
-        indexFile: originalFileInfo,
-        request: {
-          encryptedName,
-          fileKey,
-          encryptedBlocks: fakeBlocks.map((block) => ({
-            offset: block.offset,
-            size: block.size,
-            hash: block.hash,
-          })),
-        },
-      });
-      this.storeUploadedFile(folderId, {
-        path: normalizedPath,
-        bytes,
-        blocks,
-        modifiedMs,
-        sequence,
-        encryptedName,
-      });
+      this.storeUploadedFile(folderId, { path: normalizedPath, size: source.size, blocks: plaintextBlocks,
+        plaintextBlocks, source, modifiedMs, sequence });
       const frame = encodeMessageFrame(
         MessageTypeValues.INDEX_UPDATE,
         IndexUpdate,
         {
           folder: folderId,
-          files: [advertisedFileInfo],
+          files: [fileInfo],
         },
         0,
       );
-      await this.publishAndWait(frame, folderId, normalizedPath, originalFileInfo, options);
-      notifyProgress(bytes.length, "publishing");
+      await this.publishAndWait(frame, folderId, normalizedPath, fileInfo, options);
+      notifyProgress(source.size, "publishing");
       this.log("upload.index_update.sent", {
         folderId,
         path: normalizedPath,
-        encrypted: true,
-        encryptedName,
-        sizeBytes: bytes.length,
-        blockCount: blocks.length,
+        encrypted: false,
+        sizeBytes: source.size,
+        blockCount: plaintextBlocks.length,
         sequence,
       });
       this.log("upload.complete", {
         folderId,
         path: normalizedPath,
-        encrypted: true,
-        sizeBytes: bytes.length,
-        blockCount: blocks.length,
+        encrypted: false,
+        sizeBytes: source.size,
+        blockCount: plaintextBlocks.length,
         elapsedMs: Date.now() - uploadStartedAtMs,
-        avgRateBps: uploadRateBps(bytes.length),
+        avgRateBps: uploadRateBps(source.size),
       });
       return;
     }
-    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
-    const sequence = this.nextFolderSequence(folderId);
-    const fileInfo = {
+    const folderCrypto = folder.folderCrypto;
+    if (!folderCrypto) throw new Error(`Folder ${folderId} requires a valid encryption password before upload.`);
+    const fileKey = deriveUntrustedFileKey(folderCrypto.folderKey, normalizedPath);
+    const encryptedName = await encryptUntrustedFilename(
+      folderCrypto.folderKey,
+      normalizedPath,
+    );
+    const originalFileInfo = {
       name: normalizedPath,
       type: 0,
-      size: bytes.length,
+      size: source.size,
       permissions: 0o644,
       modified_s: Math.floor(modifiedMs / 1000),
       modified_ns: (modifiedMs % 1000) * 1_000_000,
@@ -2101,63 +2102,71 @@ class BepSession {
       deleted: false,
       invalid: false,
       no_permissions: false,
-      version: advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId),
+      version: baseVersion,
       sequence,
       block_size: blockSize,
-      blocks: blocks.map((block) => ({
-        offset: block.offset,
-        size: block.size,
-        hash: block.hash,
-      })),
+      blocks: plaintextBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
     };
+    const advertisedFileInfo = await encryptUntrustedFileInfo(
+      folderCrypto.folderKey,
+      originalFileInfo,
+      toUint8Array(await this.adapter.randomBytes(24)),
+    );
+    const advertisedBlocks: UploadedBlock[] = (advertisedFileInfo.blocks ?? []).map(block => ({
+      offset: Number(block.offset),
+      size: Number(block.size),
+      hash: toUint8Array(block.hash),
+    }));
     throwIfCancelled();
-    folder.files.set(normalizedPath, { indexFile: fileInfo });
     this.log("upload.prepared", {
       folderId,
       path: normalizedPath,
-      encrypted: false,
-      sizeBytes: bytes.length,
-      blockCount: blocks.length,
+      encrypted: true,
+      sizeBytes: source.size,
+      blockCount: plaintextBlocks.length,
       elapsedMs: Date.now() - uploadStartedAtMs,
-      avgRateBps: uploadRateBps(bytes.length),
+      avgRateBps: uploadRateBps(source.size),
     });
-    this.storeUploadedFile(folderId, {
-      path: normalizedPath,
-      bytes,
-      blocks,
-      modifiedMs,
-      sequence,
+    folder.files.set(normalizedPath, {
+      indexFile: originalFileInfo,
+      request: {
+        encryptedName,
+        fileKey,
+        encryptedBlocks: advertisedBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
+      },
     });
+    this.storeUploadedFile(folderId, { path: normalizedPath, size: source.size, blocks: advertisedBlocks,
+      plaintextBlocks, source, modifiedMs, sequence, encryptedName, fileKey });
     const frame = encodeMessageFrame(
       MessageTypeValues.INDEX_UPDATE,
       IndexUpdate,
       {
         folder: folderId,
-        files: [fileInfo],
+        files: [advertisedFileInfo],
       },
       0,
     );
-    await this.publishAndWait(frame, folderId, normalizedPath, fileInfo, options);
-    notifyProgress(bytes.length, "publishing");
+    await this.publishAndWait(frame, folderId, normalizedPath, originalFileInfo, options);
+    notifyProgress(source.size, "publishing");
     this.log("upload.index_update.sent", {
       folderId,
       path: normalizedPath,
-      encrypted: false,
-      sizeBytes: bytes.length,
-      blockCount: blocks.length,
+      encrypted: true,
+      encryptedName,
+      sizeBytes: source.size,
+      blockCount: plaintextBlocks.length,
       sequence,
     });
     this.log("upload.complete", {
       folderId,
       path: normalizedPath,
-      encrypted: false,
-      sizeBytes: bytes.length,
-      blockCount: blocks.length,
+      encrypted: true,
+      sizeBytes: source.size,
+      blockCount: plaintextBlocks.length,
       elapsedMs: Date.now() - uploadStartedAtMs,
-      avgRateBps: uploadRateBps(bytes.length),
+      avgRateBps: uploadRateBps(source.size),
     });
   }
-
   private acknowledgePublication(folderId: string, path: string, file: BepFileInfo): void {
     const pending = this.awaitingPublications.get(`${folderId}\0${path}`);
     if (!pending) return;
@@ -2376,6 +2385,8 @@ class BepSession {
       (bytes) => this.adapter.sha256(bytes),
       (folderId, path, options) =>
         this.publishDeletion(folderId, path, options),
+      (folderId, path, source, options) =>
+        this.publishFileFromSource(folderId, path, source, options),
     );
   }
 

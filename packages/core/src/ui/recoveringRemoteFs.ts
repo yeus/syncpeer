@@ -5,7 +5,8 @@ import {
   type SyncpeerSessionHandle,
 } from "../client.js";
 import { isTransportFailure } from "../core/model/remoteFs.js";
-import { createCheckpointedDownloadSink, DownloadInterruptedError, type FileDownloadSink } from "../transfer/stream.js";
+import { createCheckpointedDownloadSink, DownloadInterruptedError, readSourceFully,
+  type FileDownloadSink, type FileUploadSource } from "../transfer/stream.js";
 import type { ConnectOptions, RemoteFsLike } from "./browserClient.js";
 
 export const createRecoveringRemoteFs = (deps: {
@@ -83,6 +84,31 @@ export const createRecoveringRemoteFs = (deps: {
     }
   };
 
+  const uploadStream = async (
+    folderId: string,
+    path: string,
+    source: FileUploadSource,
+    options?: Parameters<RemoteFsLike["writeFileStream"]>[3],
+  ): Promise<void> => {
+    const connectOptions = deps.getOptions();
+    if (!connectOptions) throw new Error("No active connection. Connect first.");
+    const session = await deps.ensureSession(connectOptions);
+    try {
+      await session.remoteFs.writeFileStream(folderId, path, source, options);
+    } catch (error) {
+      if (!isTransportFailure(error) || !session.isClosed()) throw error;
+      try {
+        const replacement = await deps.ensureSession(connectOptions);
+        replacement.remoteFs.setFocusedFolder(folderId);
+        await replacement.remoteFs.requestFolderIndex(folderId);
+        if (await replacement.remoteFs.matchesFileContent(folderId, path, await readSourceFully(source))) return;
+      } catch {
+        // Verification did not prove success, so publication must not be replayed.
+      }
+      throw new UploadOutcomeUnknownError(undefined, { cause: error });
+    }
+  };
+
   const deleteRemote = async (
     folderId: string,
     path: string,
@@ -131,6 +157,7 @@ export const createRecoveringRemoteFs = (deps: {
         signal,
       ), signal) as ReturnType<NonNullable<RemoteFsLike["readFileToSink"]>>,
     writeFileFully: upload,
+    writeFileStream: uploadStream,
     deleteFile: deleteRemote,
   };
 };

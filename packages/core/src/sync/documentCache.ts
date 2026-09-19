@@ -22,11 +22,19 @@ export function createDocumentCache(options: {
   show: (id: string) => Promise<void>;
 }) {
   const active = new Map<string, number>(), migrating = new Set<string>();
-  const registrations = async () => options.enabled()
-    ? (await options.request<{ folders: FolderRegistration[] }>({ operation: "cacheRegistrations" })).folders : [];
+  type CacheStatus = { vault: { phase: string }; folders: FolderRegistration[] };
+  const cacheStatus = () => options.request<CacheStatus>({ operation: "cacheRegistrations" });
+  const registrations = async () => options.enabled() ? (await cacheStatus()).folders : [];
   const owner = async (folderId: string) => {
     if (migrating.has(folderId)) throw new Error("This folder is being moved to encrypted document storage. Retry when migration finishes.");
-    return (await registrations()).find(folder => folder.id === folderId && folder.downloads);
+    if (!options.enabled()) return undefined;
+    const status = await cacheStatus();
+    // An uninitialized vault still needs to expose existing legacy files; lock never does.
+    if (status.vault.phase === "uninitialized") return undefined;
+    if (status.vault.phase !== "unlocked") {
+      throw new Error("Encrypted folder storage is locked. Unlock the vault before downloading.");
+    }
+    return status.folders.find(folder => folder.id === folderId && folder.downloads);
   };
   const documentId = (folder: FolderRegistration, path: string) => JSON.stringify([folder.storageId, path]);
   const track = (folderId: string) => {

@@ -57,7 +57,8 @@ test("the Tauri document bridge forwards complete download identity", async () =
   let beginRequest: Record<string, unknown> | null = null;
   native.__TAURI__ = { core: { invoke: async (command: string, args: { request: Record<string, unknown> }) => {
     if (command !== "syncpeer_document_command") throw new Error(`Unexpected native command ${command}`);
-    if (args.request.operation === "cacheRegistrations") return { result: { folders: [{ id: "folder", label: "Folder", storageId: "0123456789abcdef0123456789abcdef", downloads: true }] } };
+    if (args.request.operation === "cacheRegistrations") return { result: { vault: { phase: "unlocked" },
+      folders: [{ id: "folder", label: "Folder", storageId: "0123456789abcdef0123456789abcdef", downloads: true }] } };
     if (args.request.operation === "beginDownload") { beginRequest = args.request; return { result: 1 }; }
     if (args.request.operation === "downloadRanges") return { result: [] };
     if (args.request.operation === "release") return { result: undefined };

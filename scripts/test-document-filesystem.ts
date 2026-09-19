@@ -76,6 +76,35 @@ test("an injected password KDF port serves vault creation and unlock", async () 
   ]);
 });
 
+test("fresh encrypted profiles never store document names or content in plaintext", async () => {
+  const { roots, openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const options = { profileId: "fresh-fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => secret,
+      save: async (value: string) => { secret = value; }, remove: async () => { secret = null; },
+    } };
+  const documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false);
+  await documents.register({ id: "fresh-folder", label: "Private folder label", password: "synthetic-folder-password" });
+  await documents.attachDownloads("fresh-folder");
+  const name = "private-fresh-install-marker.txt";
+  const content = new TextEncoder().encode("fresh install plaintext marker");
+  const handle = await documents.beginDownload("fresh-folder", name, content.length, 1);
+  await documents.write(handle, 0, content);
+  await documents.finishDownload(handle);
+  await documents.close();
+  for (const [storageId, fixture] of roots) {
+    for (const [path, file] of fixture.files) {
+      assert.equal(path.includes("private-fresh-install-marker"), false, `Plaintext name leaked in ${storageId}:${path}`);
+      const text = new TextDecoder().decode(file.bytes);
+      assert.equal(text.includes("fresh install plaintext marker"), false, `Plaintext content leaked in ${storageId}:${path}`);
+      assert.equal(text.includes("Private folder label"), false, `Plaintext label leaked in ${storageId}:${path}`);
+    }
+  }
+});
+
 test("directory catalogs stay encrypted and cache eviction preserves favorites and local edits", async () => {
   const { roots, openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
@@ -262,4 +291,61 @@ test("registered encrypted documents reopen with remembered credentials, and loc
     }
     assert.ok(archives > 0);
   } finally { crypto.folderKey.fill(0); }
+});
+
+test("legacy folder registrations migrate only after encrypted read-back and stay hidden while locked", async () => {
+  const { roots, openStorage } = memoryDocumentStorage();
+  const profile = await openStorage("profile");
+  const options = { profileId: "migration-fixture", deviceCounterId: "42", openStorage, profile, randomBytes,
+    availableBytes: async () => 1024 * 1024 * 1024,
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
+      save: async () => {}, remove: async () => {} } };
+  const documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false);
+  await documents.close();
+  const legacy = [{ id: "legacy-folder", label: "Private legacy label", storageId: "legacy-root" }];
+  const data = new TextEncoder().encode(JSON.stringify(legacy));
+  const sink = await profile.createSink(".syncpeer-document-folders", data.length);
+  await sink.write(0, data); await sink.commit();
+  const reopened = createDocumentFilesystem(options);
+  assert.deepEqual((await reopened.initialize()).folders, []);
+  assert.ok(roots.get("profile")!.files.has(".syncpeer-document-folders"));
+  assert.deepEqual((await reopened.unlock("synthetic-master-password")).folders, legacy);
+  assert.equal(roots.get("profile")!.files.has(".syncpeer-document-folders"), false);
+  await reopened.lock();
+  assert.deepEqual((await reopened.status()).folders, []);
+  await reopened.close();
+});
+
+test("backup commands restore portable credentials without device-local roots or documents", async () => {
+  const { dispatchDocumentCommand } = await import("../packages/core/dist/sync/documentCommands.js");
+  const makeDocuments = async () => {
+    const { openStorage } = memoryDocumentStorage();
+    return createDocumentFilesystem({ profileId: "backup-fixture", deviceCounterId: "42", openStorage,
+      profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024,
+      rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
+        save: async () => {}, remove: async () => {} } });
+  };
+  const source = await makeDocuments();
+  await source.initialize();
+  await source.createVault("synthetic-master-password", false);
+  await source.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
+  await source.saveConnectionPasswords({ photos: "synthetic-folder-password" });
+  await source.saveUiState({ deviceLocal: "synthetic-private-device" });
+  const backup = await dispatchDocumentCommand(source, { operation: "exportRecoveryBackup", password: "synthetic-backup-password" });
+  const target = await makeDocuments();
+  await target.initialize();
+  await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
+    recoveryPassword: "wrong-password", password: "new-synthetic-master" }));
+  await dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
+    recoveryPassword: "synthetic-backup-password", password: "new-synthetic-master" });
+  assert.deepEqual((await target.status()).folders, []);
+  assert.equal(await target.uiState(), null);
+  assert.deepEqual(await target.connectionPasswords(), { photos: "synthetic-folder-password" });
+  await target.register({ id: "photos", label: "Recovered photos", password: "synthetic-folder-password" });
+  assert.deepEqual(await target.cachedFiles(), []);
+  await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
+    recoveryPassword: "synthetic-backup-password", password: "new-synthetic-master" }), /already exists/);
+  await source.close(); await target.close();
 });

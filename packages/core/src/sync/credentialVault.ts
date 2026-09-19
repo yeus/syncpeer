@@ -1,3 +1,4 @@
+import { validateRegistrations, type FolderRegistration } from "./folderRegistry.js";
 import { deriveUntrustedFolderCrypto } from "../core/model/untrusted.js";
 import { scryptPasswordKdf, type PasswordKdf } from "../core/model/passwordKdf.js";
 import { readEncryptedRecord, writeEncryptedRecord } from "./encryptedRecord.js";
@@ -26,6 +27,9 @@ interface VaultData {
   folders: Record<string, string>;
   connectionPasswords?: Record<string, string>;
   settings?: SyncpeerProfileSettings;
+  /** Device-local WebView state migrated out of plaintext browser storage. */
+  uiState?: unknown;
+  registrations?: FolderRegistration[];
 }
 
 export interface RememberedUnlockSecretStore {
@@ -63,6 +67,7 @@ const decodeData = (bytes: Uint8Array): VaultData => {
     password(value);
   }
   normalizeProfileSettings(data.settings);
+  if (data.registrations !== undefined) validateRegistrations(data.registrations);
   return data;
 };
 
@@ -161,16 +166,14 @@ export function createCredentialVault(options: {
     if (record.manualLocked) { await revoke(); throw new Error("Credential vault is locked."); }
     return { record, data: await read(record, key) };
   };
-  const rememberSecret = async (masterPassword: string, record: CredentialVaultRecord) => {
+  /** Remembering intent lives in the vault record; a failed store write stays retryable. */
+  const rememberSecret = async (masterPassword: string) => {
     if (!options.rememberedSecret) return;
-    let saved = false;
     try {
       await options.rememberedSecret.save(masterPassword);
-      saved = true;
-      await options.storage.save({ ...record, remember: true });
       remembered = true;
     } catch {
-      if (saved) await options.rememberedSecret.remove().catch(() => {});
+      remembered = false;
       issue = "Unlock secret could not be remembered; manual unlock remains available.";
     }
   };
@@ -224,10 +227,10 @@ export function createCredentialVault(options: {
         try {
           await options.bootstrapStorage.save(bootstrap);
           secret = personalVaultKey(space);
-          const record = await save({ format: 1, defaultPassword: null, folders: {} }, secret,
-            { format: 2, manualLocked: false, remember: false });
+          await save({ format: 1, defaultPassword: null, folders: {} }, secret,
+            { format: 2, manualLocked: false, remember });
           key = secret; personalSpace = space; initialized = true;
-          if (remember) await rememberSecret(masterPassword, record);
+          if (remember) await rememberSecret(masterPassword);
           return status();
         } catch (error) {
           if (!initialized) {
@@ -241,18 +244,20 @@ export function createCredentialVault(options: {
       }
       const derived = await deriveUntrustedFolderCrypto(vaultId, password(masterPassword), kdf);
       try {
-        const record = await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey,
-          { format: 1, manualLocked: false, remember: false });
+        await save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey,
+          { format: 1, manualLocked: false, remember });
         key = derived.folderKey; initialized = true;
-        if (remember) await rememberSecret(masterPassword, record);
+        if (remember) await rememberSecret(masterPassword);
         return status();
       } catch (error) { derived.folderKey.fill(0); throw error; }
     }),
     exportRecoveryBackup: (recoveryPassword: string) => run(async (): Promise<PersonalSpaceRecoveryBackup> => {
-      const { record } = await unlocked();
+      const { record, data } = await unlocked();
       if (record.format !== 2 || !personalSpace) throw new Error("Only personal-space profiles can be backed up.");
       const bootstrap = await wrapPersonalSpaceBootstrap(personalSpace, recoveryPassword, options.randomBytes, kdf);
-      return { format: 1, bootstrap, vault: { ...record, manualLocked: false, remember: false } };
+      const vault = await encrypt({ ...data, registrations: undefined, uiState: undefined }, key!,
+        { format: 2, manualLocked: false, remember: false });
+      return { format: 1, bootstrap, vault };
     }),
     restoreRecoveryBackup: (backup: PersonalSpaceRecoveryBackup, recoveryPassword: string,
       localMasterPassword: string) => run(async () => {
@@ -277,11 +282,15 @@ export function createCredentialVault(options: {
       const record = decodeRecord(await options.storage.load());
       if (!record) throw new Error("Credential vault is missing.");
       await unlock(masterPassword, record);
-      await rememberSecret(masterPassword, { ...record, manualLocked: false });
+      if (record.remember) await rememberSecret(masterPassword);
       return status();
     }),
     unlockRemembered: () => run(async () => {
       const record = decodeRecord(await options.storage.load());
+      if (record?.manualLocked) throw new Error("Enter the master password after explicit lock.");
+      if (!record?.remember || !await options.rememberedSecret?.isDeviceUnlocked()) {
+        throw new Error("A remembered unlock secret is unavailable.");
+      }
       const masterPassword = await options.rememberedSecret?.load();
       if (!record || !masterPassword) throw new Error("A remembered unlock secret is unavailable.");
       await unlock(masterPassword, record);
@@ -365,6 +374,14 @@ export function createCredentialVault(options: {
       const { data } = await unlocked();
       return normalizeProfileSettings(data.settings);
     }),
+    registrations: () => run(async () => (await unlocked()).data.registrations ?? null),
+    saveRegistrations: (folders: FolderRegistration[]) => update(data =>
+      ({ ...data, registrations: validateRegistrations(folders) })),
+    uiState: () => run(async () => {
+      const { data } = await unlocked();
+      return data.uiState ?? null;
+    }),
+    saveUiState: (value: unknown) => update(data => ({ ...data, uiState: value === null ? undefined : value })),
     saveProfileSettings: (settings: SyncpeerProfileSettings) => update(data =>
       ({ ...data, settings: normalizeProfileSettings(settings) })),
     addFolder: (folderId: string, value?: string) => update(async data => {

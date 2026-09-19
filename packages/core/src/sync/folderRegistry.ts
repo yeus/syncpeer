@@ -20,7 +20,7 @@ export interface OpenedFolder {
   close: () => Promise<void>;
 }
 
-const validateRegistrations = (values: FolderRegistration[]) => {
+export const validateRegistrations = (values: FolderRegistration[]) => {
   if (!Array.isArray(values)) throw new Error("Invalid folder registrations.");
   const ids = new Set<string>(), roots = new Set<string>();
   return values.map(value => {

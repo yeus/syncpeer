@@ -71,7 +71,7 @@ interface CacheCandidate {
 
 interface DocumentRuntime {
   readonly options: DocumentFilesystemOptions;
-  readonly configs: ReturnType<typeof createFolderRegistryStorage>;
+  configs: ReturnType<typeof createFolderRegistryStorage>;
   readonly storage: Map<string, NativeFs>;
   readonly folderKeys: Map<string, Uint8Array>;
   readonly handles: Map<number, DocumentHandle>;
@@ -255,6 +255,7 @@ const openFolderRuntime = async (
 };
 
 const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> => {
+  if (runtime.vault.status().phase !== "unlocked") return;
   runtime.registry ??= createFolderRegistry({
     ...runtime.configs,
     open: (folder) => openFolderRuntime(runtime, folder),
@@ -269,7 +270,7 @@ const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> =>
 
 const documentStatus = async (runtime: DocumentRuntime) => ({
   vault: runtime.vault.status(),
-  folders: await runtime.configs.load(),
+  folders: runtime.vault.status().phase === "unlocked" ? await runtime.configs.load() : [],
   recoveryIssues: [...runtime.recoveryIssues.values()].flat(),
 });
 
@@ -997,6 +998,11 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   profileSettings: () => runQueued(runtime, () => runtime.vault.profileSettings()),
   saveProfileSettings: (settings: Parameters<Vault["saveProfileSettings"]>[0]) =>
     runQueued(runtime, () => runtime.vault.saveProfileSettings(settings)),
+  exportRecoveryBackup: (password: string) => runQueued(runtime, () => runtime.vault.exportRecoveryBackup(password)),
+  restoreRecoveryBackup: (backup: Parameters<Vault["restoreRecoveryBackup"]>[0], recoveryPassword: string, password: string) =>
+    runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.restoreRecoveryBackup(backup, recoveryPassword, password))),
+  uiState: () => runQueued(runtime, () => runtime.vault.uiState()),
+  saveUiState: (value: unknown) => runQueued(runtime, () => runtime.vault.saveUiState(value)),
   rememberFolder: (folder: { id: string; label: string }) =>
     runQueued(runtime, () => rememberFolderAction(runtime, folder)),
   createVault: (password: string, remember = false) =>
@@ -1100,7 +1106,7 @@ const createCacheActions = (runtime: DocumentRuntime) => ({
 export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => {
   const runtime: DocumentRuntime = {
     options,
-    configs: createFolderRegistryStorage(options.profile),
+    configs: undefined as unknown as ReturnType<typeof createFolderRegistryStorage>,
     storage: new Map(),
     folderKeys: new Map(),
     handles: new Map(),
@@ -1121,6 +1127,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     ...(options.kdf ? { kdf: options.kdf } : {}),
     revokeAccess: () => revokeAccess(runtime),
   });
+  runtime.configs = createFolderRegistryStorage(options.profile, runtime.vault);
   return {
     ...createLifecycleActions(runtime),
     ...createSettingsActions(runtime),

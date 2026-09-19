@@ -45,6 +45,23 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
       return documents.saveConnectionPasswords(command.passwords as Record<string, string>);
     }
+    case "exportRecoveryBackup": return documents.exportRecoveryBackup(text("password"));
+    case "restoreRecoveryBackup": {
+      if (!command.backup || typeof command.backup !== "object" || Array.isArray(command.backup)) {
+        throw new Error("Invalid personal-space recovery backup.");
+      }
+      return documents.restoreRecoveryBackup(command.backup as Parameters<typeof documents.restoreRecoveryBackup>[0],
+        text("recoveryPassword"), text("password"));
+    }
+    case "uiState": return documents.uiState();
+    case "saveUiState": {
+      const state = command.state ?? null;
+      if (state !== null) {
+        const encoded = JSON.stringify(state);
+        if (typeof encoded !== "string" || encoded.length > 512 * 1024) throw new Error("Invalid UI state record.");
+      }
+      return documents.saveUiState(state);
+    }
     case "rememberFolder": return documents.rememberFolder({ id: text("id"), label: text("label") });
     case "cachedFiles": return documents.cachedFiles();
     case "folderFiles": return documents.cachedFiles(text("folderId"));

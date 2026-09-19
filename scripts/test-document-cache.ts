@@ -187,6 +187,25 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   await documents.close();
 });
 
+test("an uninitialized vault keeps existing plaintext cache browsable", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "uninitialized-cache", deviceCounterId: "42", openStorage,
+    availableBytes: async () => 1024 * 1024 * 1024, profile: await openStorage("profile"), randomBytes,
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
+      save: async () => {}, remove: async () => {} } });
+  await documents.initialize();
+  let opened = 0;
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => await dispatchDocumentCommand(documents, input) as T,
+    legacy: { openCachedFile: async (folderId, path) => {
+      assert.deepEqual({ folderId, path }, { folderId: "legacy-folder", path: "legacy.txt" }); opened++;
+    } }, openLegacySource: async () => { throw new Error("No legacy source"); },
+    show: async () => { assert.fail("An uninitialized vault must use the legacy cache"); } });
+  await cache.platformAdapter.openCachedFile!("legacy-folder", "legacy.txt");
+  assert.equal(opened, 1);
+  await documents.close();
+});
+
 test("cache migration verifies and removes plaintext originals", async t => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "fixture", deviceCounterId: "42", openStorage, availableBytes: async () => 1024 * 1024 * 1024,

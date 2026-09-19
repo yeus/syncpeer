@@ -384,10 +384,6 @@ const logClient = (
   details?: unknown,
 ) => {
   emitLog(onLog, "info", event, details);
-  if (details !== undefined) {
-    console.log(`[syncpeer-core-ui] ${event}`, details);
-    return;
-  }
   console.log(`[syncpeer-core-ui] ${event}`);
 };
 
@@ -495,13 +491,12 @@ export const reportClientError = async (
   error: unknown,
   context?: unknown,
 ): Promise<void> => {
-  const message = error instanceof Error ? error.message : String(error);
-  const normalizedContext =
-    context && typeof context === "object" ? (context as Record<string, unknown>) : {};
-  console.error(`[syncpeer-core-ui] ${event}`, { message, ...normalizedContext });
+  void error;
+  void context;
+  console.error(`[syncpeer-core-ui] ${event}`);
   if (!platformAdapter?.logError) return;
   try {
-    await platformAdapter.logError(event, { message, ...normalizedContext });
+    await platformAdapter.logError(event, { category: "operation-failed" });
   } catch {
     // Ignore logging forwarding failures.
   }

@@ -25,6 +25,7 @@ import {
   type AppState,
 } from "./state.ts";
 import { localDiscoveryUnavailableNotice } from "./connectionNotices.ts";
+import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
 import {
   applyAutoApprovals,
   normalizeCandidateAddresses,
@@ -442,10 +443,10 @@ const copySessionLogs = async () => {
     .slice()
     .reverse()
     .map((item) => {
-      const base = `${new Date(item.timestampMs).toISOString()} [${item.level.toUpperCase()}] ${item.event}: ${item.message}`;
+      const base = `${new Date(item.timestampMs).toISOString()} [${item.level.toUpperCase()}] ${item.event}`;
       return item.details === undefined
         ? base
-        : `${base}\n${JSON.stringify(item.details, null, 2)}`;
+        : `${base}\n${JSON.stringify(sanitizeDiagnosticArtifact(item.details), null, 2)}`;
     })
     .join("\n\n");
   const metadata = [

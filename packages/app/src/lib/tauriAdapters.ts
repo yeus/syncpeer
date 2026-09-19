@@ -17,6 +17,7 @@ import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
   dispatchDocumentCommand } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
 import { createWorkerPasswordKdf } from "./passwordKdf.ts";
+import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -110,11 +111,12 @@ const emitLog = (
   event: string,
   details?: unknown,
 ) => {
+  const safeEvent = /^[a-zA-Z0-9._-]{1,128}$/.test(event) ? event : "invalid";
   options?.onLog?.({
     timestampMs: Date.now(),
     level,
-    event,
-    details,
+    event: safeEvent,
+    details: details === undefined ? undefined : sanitizeDiagnosticArtifact(details),
   });
 };
 
@@ -124,11 +126,13 @@ const logUi = (
   details?: unknown,
 ) => {
   emitLog(options, "info", event, details);
-  if (details !== undefined) {
-    console.log(`[syncpeer-ui] ${event}`, details);
+  const safeEvent = /^[a-zA-Z0-9._-]{1,128}$/.test(event) ? event : "invalid";
+  const safeDetails = details === undefined ? undefined : sanitizeDiagnosticArtifact(details);
+  if (safeDetails !== undefined) {
+    console.log(`[syncpeer-ui] ${safeEvent}`, safeDetails);
     return;
   }
-  console.log(`[syncpeer-ui] ${event}`);
+  console.log(`[syncpeer-ui] ${safeEvent}`);
 };
 
 const resolveInvoke = (): InvokeFn => {
@@ -153,7 +157,11 @@ const tryForwardUiErrorToCli = async (
   details: Record<string, unknown>,
 ): Promise<void> => {
   try {
-    await invoke<void>("syncpeer_log_ui_error", { event, details });
+    const safeEvent = /^[a-zA-Z0-9._-]{1,128}$/.test(event) ? event : "invalid";
+    await invoke<void>("syncpeer_log_ui_error", {
+      event: safeEvent,
+      details: sanitizeDiagnosticArtifact(details),
+    });
   } catch {
     // Ignore forwarding failures to avoid masking the original UI error.
   }
@@ -180,10 +188,9 @@ const createLoggedInvoke = (
       }
       return result;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`[syncpeer-ui] tauri.invoke.error ${command}`, error);
-      emitLog(options, "error", "tauri.invoke.error", { command, message });
-      void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command, message });
+      console.error("[syncpeer-ui] tauri.invoke.error", { command });
+      emitLog(options, "error", "tauri.invoke.error", { command });
+      void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command });
       throw error;
     }
   };
@@ -706,13 +713,15 @@ export const reportUiError = (
   error: unknown,
   context?: unknown,
 ) => {
-  const message = error instanceof Error ? error.message : String(error);
+  void error;
   const normalizedContext =
     context && typeof context === "object" ? (context as Record<string, unknown>) : {};
-  console.error(`[syncpeer-ui] ${event}`, { message, ...normalizedContext });
+  const safeEvent = /^[a-zA-Z0-9._-]{1,128}$/.test(event) ? event : "invalid";
+  const safeContext = sanitizeDiagnosticArtifact(normalizedContext) as Record<string, unknown>;
+  console.error(`[syncpeer-ui] ${safeEvent}`, safeContext);
   try {
     const invoke = resolveInvoke();
-    void tryForwardUiErrorToCli(invoke, event, { message, ...normalizedContext });
+    void tryForwardUiErrorToCli(invoke, safeEvent, safeContext);
   } catch {
     // App might be running outside Tauri.
   }

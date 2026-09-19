@@ -907,13 +907,7 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
     discoveryFetch: nodeDiscoveryFetch,
     discoverLocalCandidates: discoverNodeLocalCandidates,
     log: enableLogs
-      ? (event, details) => {
-          if (details === undefined) {
-            console.error(`[syncpeer-core] ${event}`);
-            return;
-          }
-          console.error(`[syncpeer-core] ${event}`, details);
-        }
+      ? (event) => { console.error(`[syncpeer-core] ${event}`); }
       : undefined,
   };
 }

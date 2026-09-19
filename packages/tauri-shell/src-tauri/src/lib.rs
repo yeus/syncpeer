@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::{Ipv6Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
@@ -40,7 +40,6 @@ use x509_parser::prelude::parse_x509_certificate;
 #[serde(rename_all = "camelCase")]
 struct UiErrorLogRequest {
     event: String,
-    details: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,6 +673,15 @@ fn tauri_log(message: &str) {
     eprintln!("[syncpeer-tauri] {message}");
 }
 
+fn diagnostic_event(value: &str) -> &str {
+    if value.len() <= 128 && value.contains('.') && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase) &&
+        value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')) {
+        value
+    } else {
+        "invalid"
+    }
+}
+
 fn mask_pem_summary(label: &str, pem: &str) -> String {
     format!("{}Chars={}", label, pem.chars().count())
 }
@@ -1107,6 +1115,26 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T,
         .map_err(|error| format!("Could not parse {}: {error}", path.display()))
 }
 
+fn create_json_temporary(path: &Path) -> Result<(PathBuf, fs::File), String> {
+    let parent = path.parent().ok_or_else(|| "JSON path has no parent.".to_string())?;
+    let name = path.file_name().ok_or_else(|| "JSON path has no file name.".to_string())?;
+    for attempt in 0..100 {
+        let candidate = parent.join(format!(".{}.{}.{}.tmp", name.to_string_lossy(), std::process::id(), attempt));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not create temporary JSON: {error}")),
+        }
+    }
+    Err("Could not allocate temporary JSON storage.".to_string())
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1114,11 +1142,18 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     }
     let content = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("Could not encode JSON: {error}"))?;
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, content)
-        .map_err(|error| format!("Could not write {}: {error}", temp_path.display()))?;
-    fs::rename(&temp_path, path)
-        .map_err(|error| format!("Could not rename {}: {error}", path.display()))
+    let (temp_path, mut file) = create_json_temporary(path)?;
+    let result = file.write_all(&content).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Could not write temporary JSON: {error}"));
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Could not replace JSON: {error}"));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "android")]
@@ -2487,9 +2522,7 @@ fn open_tls_session(
         let address = format!("{}:{}", request.host, request.port);
         let tls_host = resolve_tls_hostname(&request.host);
         tauri_log(&format!(
-            "tls.open.start address={} tlsHost={} {} {}",
-            address,
-            tls_host,
+            "tls.open.start {} {}",
             mask_pem_summary("cert", &request.cert_pem),
             mask_pem_summary("key", &request.key_pem)
         ));
@@ -2502,8 +2535,7 @@ fn open_tls_session(
             return Err("Client certificate PEM did not contain any certificate".to_string());
         }
         tauri_log(&format!(
-            "tls.open.cert_parsed address={} certChainLen={}",
-            address,
+            "tls.open.cert_parsed certChainLen={}",
             cert_chain.len()
         ));
 
@@ -2511,7 +2543,7 @@ fn open_tls_session(
         let private_key = rustls_pemfile::private_key(&mut key_reader)
             .map_err(|error| format!("Invalid client private key PEM: {error}"))?
             .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
-        tauri_log(&format!("tls.open.key_parsed address={}", address));
+        tauri_log("tls.open.key_parsed");
 
         let config = ClientConfig::builder()
             .dangerous()
@@ -2520,26 +2552,26 @@ fn open_tls_session(
             .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
         let config = Arc::new(config);
 
-        tauri_log(&format!("tls.open.tcp_connect.start address={}", address));
+        tauri_log("tls.open.tcp_connect.start");
         let tcp = connect_tcp_with_timeout(&address, request.timeout_ms)?;
         tcp.set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
         tcp.set_write_timeout(Some(Duration::from_secs(10)))
             .map_err(|error| format!("Could not set TLS write timeout: {error}"))?;
-        tauri_log(&format!("tls.open.tcp_connect.done address={}", address));
+        tauri_log("tls.open.tcp_connect.done");
 
         let server_name = ServerName::try_from(tls_host.clone())
             .map_err(|error| format!("Invalid TLS host '{}': {error}", tls_host))?;
         let connection = ClientConnection::new(config, server_name)
             .map_err(|error| format!("Could not create TLS client: {error}"))?;
         let mut stream = StreamOwned::new(connection, tcp);
-        tauri_log(&format!("tls.open.handshake.start address={}", address));
+        tauri_log("tls.open.handshake.start");
         {
             let (conn, sock) = (&mut stream.conn, &mut stream.sock);
             conn.complete_io(sock)
                 .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
         }
-        tauri_log(&format!("tls.open.handshake.done address={}", address));
+        tauri_log("tls.open.handshake.done");
         let peer_certificate_der = stream
             .conn
             .peer_certificates()
@@ -2547,14 +2579,7 @@ fn open_tls_session(
             .map(|cert| cert.as_ref().to_vec())
             .ok_or_else(|| "Peer certificate missing".to_string())?;
         verify_hostname_against_cert(&peer_certificate_der, &tls_host)?;
-        let peer_device_id =
-            canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
-        tauri_log(&format!(
-            "tls.open.peer_cert address={} peerCertBytes={} peerDeviceId={}",
-            address,
-            peer_certificate_der.len(),
-            peer_device_id
-        ));
+        tauri_log(&format!("tls.open.peer_cert peerCertBytes={}", peer_certificate_der.len()));
 
         let mut guard = shared_store
             .lock()
@@ -2564,10 +2589,7 @@ fn open_tls_session(
         guard
             .sessions
             .insert(next_id, create_tls_session(stream)?);
-        tauri_log(&format!(
-            "tls.open.ready address={} sessionId={}",
-            address, next_id
-        ));
+        tauri_log(&format!("tls.open.ready sessionId={}", next_id));
         Ok(TlsOpenResponse {
             session_id: next_id,
             peer_certificate_der,
@@ -2609,10 +2631,7 @@ fn open_relay_session(
             .find(|(key, _)| key == "id")
             .map(|(_, value)| value.to_string());
 
-        tauri_log(&format!(
-            "relay.open.start relay={} expectedDeviceId={}",
-            request.relay_address, request.expected_device_id
-        ));
+        tauri_log("relay.open.start");
 
         let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
         let cert_chain = rustls_pemfile::certs(&mut cert_reader)
@@ -2715,11 +2734,7 @@ fn open_relay_session(
             session_port
         };
         let relay_session_endpoint = format!("{session_host}:{session_port}");
-        tauri_log(&format!(
-            "relay.open.session endpoint={} keyLen={}",
-            relay_session_endpoint,
-            session_key.len()
-        ));
+        tauri_log(&format!("relay.open.session keyLen={}", session_key.len()));
 
         let session_tcp = connect_tcp_with_timeout(
             &relay_session_endpoint,
@@ -2780,12 +2795,7 @@ fn open_relay_session(
             .and_then(|certs| certs.first())
             .map(|cert| cert.as_ref().to_vec())
             .ok_or_else(|| "Relay BEP peer certificate missing".to_string())?;
-        let peer_device_id =
-            canonical_device_id(&compute_device_id_from_der(&peer_certificate_der));
-        tauri_log(&format!(
-            "relay.open.peer_cert endpoint={} peerDeviceId={}",
-            relay_session_endpoint, peer_device_id
-        ));
+        tauri_log(&format!("relay.open.peer_cert peerCertBytes={}", peer_certificate_der.len()));
 
         let mut guard = shared_store
             .lock()
@@ -3009,10 +3019,7 @@ async fn syncpeer_tls_close(
 
 #[tauri::command]
 async fn syncpeer_log_ui_error(entry: UiErrorLogRequest) -> Result<(), String> {
-    tauri_log(&format!(
-        "ui.error event={} details={}",
-        entry.event, entry.details
-    ));
+    tauri_log(&format!("ui.error event={}", diagnostic_event(&entry.event)));
     Ok(())
 }
 
@@ -4650,6 +4657,26 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("key.pem"), b"synthetic-private-key").unwrap();
         assert!(check_legacy_identity(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_replacement_does_not_inherit_stale_temporary_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        let stale = path.with_extension("tmp");
+        fs::write(&stale, b"synthetic stale metadata").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o666)).unwrap();
+        write_json(&path, &serde_json::json!({ "safe": true })).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn diagnostic_events_reject_embedded_private_details() {
+        assert_eq!(diagnostic_event("tauri.invoke.error"), "tauri.invoke.error");
+        assert_eq!(diagnostic_event("failure at /private/fixture"), "invalid");
+        assert_eq!(diagnostic_event("192.0.2.44"), "invalid");
     }
 
     #[test]

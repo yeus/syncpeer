@@ -4,7 +4,8 @@ import {
   folderRootEmptyNotice,
   localDiscoveryUnavailableNotice,
 } from "../packages/app/src/app/connectionNotices.ts";
-import { createTauriAdapters } from "../packages/app/src/lib/tauriAdapters.ts";
+import { createTauriAdapters, reportUiError } from "../packages/app/src/lib/tauriAdapters.ts";
+import { reportClientError } from "@syncpeer/core/browser";
 
 test("explains an empty folder list on a healthy connection", () => {
   assert.equal(
@@ -74,5 +75,57 @@ test("serializes overlapping native local discovery calls", async () => {
     assert.equal(discoveryCalls, 2);
   } finally {
     scope.__TAURI__ = previousTauri;
+  }
+});
+
+test("native error logging keeps raw errors in the caller but not diagnostics", async () => {
+  const privateMessage = "synthetic failure at /private/fixture from 192.0.2.44 DEVICE-SENTINEL";
+  const forwarded: Array<{ command: string; args?: Record<string, unknown> }> = [];
+  const entries: unknown[] = [];
+  const consoleErrors: unknown[][] = [];
+  const scope = globalThis as typeof globalThis & {
+    __TAURI__?: { core?: { invoke?: <T>(command: string, args?: Record<string, unknown>) => Promise<T> } };
+  };
+  const previousTauri = scope.__TAURI__;
+  const previousConsoleError = console.error;
+  scope.__TAURI__ = { core: { invoke: async <T>(command: string, args?: Record<string, unknown>) => {
+    if (command === "syncpeer_log_ui_error") {
+      forwarded.push({ command, args });
+      return undefined as T;
+    }
+    throw new Error(privateMessage);
+  } } };
+  console.error = (...args: unknown[]) => { consoleErrors.push(args); };
+  try {
+    const adapter = createTauriAdapters({ runtimePlatform: "linux", onLog: entry => entries.push(entry) });
+    await assert.rejects(adapter.platformAdapter.getDefaultDeviceId(), new RegExp(privateMessage));
+    reportUiError("ui.synthetic", new Error(privateMessage), { path: "/private/fixture", count: 1 });
+    await Promise.resolve();
+    const published = JSON.stringify({ forwarded, entries, consoleErrors: consoleErrors.map(args =>
+      args.map(value => value instanceof Error ? value.message : value)) });
+    assert.equal(published.includes(privateMessage), false);
+    assert.equal(published.includes("/private/fixture"), false);
+    assert.equal(consoleErrors.flat().some(value => value instanceof Error), false);
+    assert.equal(forwarded.length, 2);
+  } finally {
+    scope.__TAURI__ = previousTauri;
+    console.error = previousConsoleError;
+  }
+});
+
+test("core client error reporting omits arbitrary error and context text", async () => {
+  const privateMessage = "synthetic failure at /private/core from 192.0.2.45";
+  const forwarded: unknown[] = [];
+  const consoleErrors: unknown[][] = [];
+  const previousConsoleError = console.error;
+  console.error = (...args: unknown[]) => { consoleErrors.push(args); };
+  try {
+    await reportClientError({ logError: async (...args) => { forwarded.push(args); } },
+      "client.synthetic", new Error(privateMessage), { path: "/private/core" });
+    const published = JSON.stringify({ forwarded, consoleErrors });
+    assert.equal(published.includes(privateMessage), false);
+    assert.equal(published.includes("/private/core"), false);
+  } finally {
+    console.error = previousConsoleError;
   }
 });

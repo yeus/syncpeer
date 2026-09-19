@@ -1,6 +1,6 @@
 import { open, mkdir, rename, rm, mkdtemp, readdir, readFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { sameDownloadMetadata, type FileDownloadSink, type FileDownloadMetadata } from "./stream.js";
 import type { DownloadRange } from "./blockReuse.js";
 
@@ -61,11 +61,19 @@ const openResumeSource = async (directory: string, prefix: string, current: stri
 };
 
 const saveDownloadMetadata = async (staging: string, metadata: FileDownloadMetadata, suspended: boolean) => {
-  const temporary = path.join(staging, "metadata.tmp");
-  const record = await open(temporary, "w", 0o600);
-  try { await record.writeFile(JSON.stringify({ ...metadata, ownerPid: process.pid, suspended })); await record.sync(); }
-  finally { await record.close(); }
-  await rename(temporary, path.join(staging, "metadata.json"));
+  const temporary = path.join(staging, `metadata-${randomUUID()}.tmp`);
+  try {
+    const record = await open(temporary, "wx", 0o600);
+    try {
+      await record.writeFile(JSON.stringify({ ...metadata, ownerPid: process.pid, suspended }));
+      await record.sync();
+    } finally {
+      await record.close();
+    }
+    await rename(temporary, path.join(staging, "metadata.json"));
+  } finally {
+    await rm(temporary, { force: true });
+  }
 };
 
 /** Native filesystem mechanics only; block selection and comparison stay in core. */

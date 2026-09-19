@@ -987,26 +987,29 @@ async function runUploadCommand(
   command: Command,
 ): Promise<void> {
   await withSession(command, async (remoteFs) => {
-    const payload = fs.readFileSync(localPath);
     const fileName = path.basename(localPath);
     const targetPath = normalizeRelativePath(remotePath ?? fileName);
     if (!targetPath) throw new Error("remotePath must not be empty");
-    await remoteFs.writeFileFully(
-      folderId,
-      targetPath,
-      new Uint8Array(payload),
-      {
-        modifiedMs: fs.statSync(localPath).mtimeMs,
-      },
-    );
-    console.log(`Uploaded ${payload.length} bytes to ${folderId}/${targetPath}`);
-    const serveMs = Number.isFinite(uploadOpts.serveMs)
-      ? Math.max(0, Number(uploadOpts.serveMs))
-      : 0;
-    if (serveMs > 0) {
-      console.log(`Serving upload blocks for ${serveMs} ms...`);
-      await sleepMs(serveMs);
-    }
+    const handle = await fs.promises.open(localPath, "r");
+    try {
+      const metadata = await handle.stat();
+      await remoteFs.writeFileStream(folderId, targetPath, {
+        size: metadata.size,
+        read: async (offset, size) => {
+          const buffer = new Uint8Array(size);
+          const { bytesRead } = await handle.read(buffer, 0, size, offset);
+          return buffer.subarray(0, bytesRead);
+        },
+      }, { modifiedMs: metadata.mtimeMs });
+      console.log(`Uploaded ${metadata.size} bytes to ${folderId}/${targetPath}`);
+      const serveMs = Number.isFinite(uploadOpts.serveMs)
+        ? Math.max(0, Number(uploadOpts.serveMs))
+        : 0;
+      if (serveMs > 0) {
+        console.log(`Serving upload blocks for ${serveMs} ms...`);
+        await sleepMs(serveMs);
+      }
+    } finally { await handle.close(); }
   });
 }
 

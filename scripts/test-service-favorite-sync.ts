@@ -13,7 +13,8 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
   failUploads?: boolean;
   failDeletes?: boolean;
 } = {}) {
-  const requests = { uploads: [] as Array<{ path: string; bytes: Uint8Array }>, deletions: [] as string[] };
+  const requests = { uploads: [] as Array<{ path: string; bytes: Uint8Array }>, deletions: [] as string[],
+    uploadReads: [] as number[] };
   const children = (parent: string) => {
     const prefix = parent ? parent + "/" : "";
     const directories = new Set<string>(), entries: FileEntry[] = [];
@@ -50,6 +51,18 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
     writeFileFully: async (_folderId: string, path: string, bytes: Uint8Array, uploadOptions?: { modifiedMs?: number }) => {
       if (options.failUploads) throw new Error("Synthetic upload failure.");
       requests.uploads.push({ path, bytes: bytes.slice() });
+      files.set(path, { bytes: bytes.slice(), modifiedMs: uploadOptions?.modifiedMs ?? Date.now() });
+    },
+    writeFileStream: async (_folderId: string, path: string, source: { size: number; read: (offset: number, size: number) => Promise<Uint8Array> },
+      uploadOptions?: { modifiedMs?: number }) => {
+      if (options.failUploads) throw new Error("Synthetic upload failure.");
+      const bytes = new Uint8Array(source.size);
+      for (let offset = 0; offset < source.size; offset += 131072) {
+        const chunk = await source.read(offset, Math.min(131072, source.size - offset));
+        requests.uploadReads.push(chunk.length);
+        bytes.set(chunk, offset);
+      }
+      requests.uploads.push({ path, bytes });
       files.set(path, { bytes: bytes.slice(), modifiedMs: uploadOptions?.modifiedMs ?? Date.now() });
     },
     deleteFile: async (_folderId: string, path: string) => {
@@ -126,6 +139,30 @@ test("uploads an offline favorite edit and advances the baseline", async () => {
   const baseline = await documents.syncBaseline(id);
   assert.equal(baseline?.sizeBytes, edited.length);
   assert.equal(baseline?.modifiedMs, 1000);
+  await documents.close();
+});
+
+test("streams a favorite larger than the retired service buffer cap", { timeout: 120000 }, async () => {
+  const { documents, storageId } = await createFixture();
+  const content = encoder.encode("from peer");
+  const size = 33 * 1024 * 1024 + 7;
+  const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
+  await cacheRemoteFile(documents, "notes.txt", content, 10);
+  const id = JSON.stringify([storageId, "notes.txt"]);
+  const writer = await documents.open(id, "rw");
+  const edited = new Uint8Array(size).fill(4);
+  for (let offset = 0; offset < size; offset += 131072) {
+    await documents.write(writer, offset, edited.subarray(offset, Math.min(size, offset + 131072)));
+  }
+  await documents.release(writer);
+
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+
+  assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "uploaded" }]);
+  assert.equal(requests.uploads.length, 1);
+  assert.equal(requests.uploads[0].bytes.length, size);
+  assert.ok(requests.uploadReads.every(read => read <= 131072), "Upload reads stay block-bounded");
+  assert.equal((await documents.syncBaseline(id))?.sizeBytes, size);
   await documents.close();
 });
 

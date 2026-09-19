@@ -3,7 +3,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { RemoteFs } from "../core/model/remoteFs.js";
 import type { CachedFileRecord, FavoriteRecord } from "../ui/browserClient.js";
 import { favoriteKey, normalizePath } from "../ui/helpers.js";
-import type { FileDownloadSink } from "../transfer/stream.js";
+import type { FileDownloadSink, FileUploadSource } from "../transfer/stream.js";
 import type { DocumentFilesystem } from "./documentFilesystem.js";
 import type { FolderRegistration } from "./folderRegistry.js";
 import { favoriteRetryDelayMs, type FavoriteRename,
@@ -14,7 +14,6 @@ import { applyFavoriteRename, planFavoriteCandidates, planFavoriteRename,
 import { collectFavoriteFiles, type FavoriteExclusion } from "../ui/favoriteSelection.js";
 import type { FileEntry } from "../core/model/remoteFs.js";
 
-const maxServiceUploadBytes = 32 * 1024 * 1024;
 type Baseline = NonNullable<CachedFileRecord["syncBaseline"]>;
 
 export interface FavoriteSyncResult {
@@ -37,18 +36,32 @@ interface FavoriteContext {
   persist: () => Promise<void>;
 }
 
-async function readDocument(documents: DocumentFilesystem, id: string, collect: boolean) {
+/** Hashes one document without materializing it. */
+async function hashDocument(documents: DocumentFilesystem, id: string): Promise<string> {
   const handle = await documents.open(id, "r");
   try {
     const size = await documents.size(handle), hash = sha256.create();
-    if (collect && size > maxServiceUploadBytes) throw new Error("Favorite upload exceeds the service limit; local edit was preserved.");
-    const bytes = collect ? new Uint8Array(size) : undefined;
     for (let offset = 0; offset < size; offset += 131072) {
       const chunk = await documents.read(handle, offset, Math.min(131072, size - offset));
-      try { hash.update(chunk); bytes?.set(chunk, offset); } finally { chunk.fill(0); }
+      try { hash.update(chunk); } finally { chunk.fill(0); }
     }
-    return { hash: bytesToHex(hash.digest()), bytes };
+    return bytesToHex(hash.digest());
   } finally { await documents.release(handle); }
+}
+
+/** Random-access source over an open document handle; the caller closes it. */
+async function documentUploadSource(documents: DocumentFilesystem, id: string): Promise<FileUploadSource> {
+  const handle = await documents.open(id, "r");
+  let released = false;
+  return {
+    size: await documents.size(handle),
+    read: (offset, size) => documents.read(handle, offset, size),
+    close: async () => {
+      if (released) return;
+      released = true;
+      await documents.release(handle);
+    },
+  };
 }
 
 function documentDownloadSink(documents: DocumentFilesystem, folderId: string, path: string,
@@ -104,7 +117,7 @@ const markSynced = (context: FavoriteContext, path: string): Promise<void> =>
   setEntry(context, path, { phase: "synced", attempts: 0, updatedAtMs: context.nowMs, nextAttemptMs: 0 });
 
 const hashLocal = async (context: FavoriteContext, path: string): Promise<string> =>
-  (await readDocument(context.documents, documentId(context.storageId, path), false)).hash;
+  hashDocument(context.documents, documentId(context.storageId, path));
 
 const downloadFavorite = async (context: FavoriteContext, path: string,
   remote: FavoriteRemoteVersion, expectedLocalHash: string | null): Promise<void> => {
@@ -118,15 +131,15 @@ const downloadFavorite = async (context: FavoriteContext, path: string,
 const uploadFavorite = async (context: FavoriteContext, path: string,
   local: { hash: string }): Promise<Baseline> => {
   const id = documentId(context.storageId, path);
-  const current = await readDocument(context.documents, id, true);
+  const source = await documentUploadSource(context.documents, id);
+  const modifiedMs = context.nowMs;
   try {
-    if (current.hash !== local.hash) throw new Error("Favorite changed during upload preparation; retry later.");
-    const modifiedMs = context.nowMs;
-    await context.remoteFs.writeFileFully(context.folderId, path, current.bytes!, { modifiedMs, waitForRemote: true });
-    const baseline = { hash: current.hash, sizeBytes: current.bytes!.length, modifiedMs };
+    await context.remoteFs.writeFileStream(context.folderId, path, source,
+      { modifiedMs, waitForRemote: true, expectedHash: local.hash });
+    const baseline = { hash: local.hash, sizeBytes: source.size, modifiedMs };
     await context.documents.setSyncBaseline(id, baseline);
     return baseline;
-  } finally { current.bytes?.fill(0); }
+  } finally { await source.close?.(); }
 };
 
 const clearFavoriteRecords = async (context: FavoriteContext, path: string): Promise<void> => {

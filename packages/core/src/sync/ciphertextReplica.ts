@@ -1,5 +1,5 @@
 import type { BepFileInfo } from "../core/protocol/bep.js";
-import { createCiphertextIndex, prepareCiphertextUpdate, completeCiphertextUpdate, loadCiphertextIndex,
+import { createCiphertextIndex, prepareCiphertextUpdate, completeCiphertextUpdate, loadCiphertextIndexStorage,
   saveCiphertextIndex, type CiphertextIndex, type CiphertextFolderIdentity } from "./ciphertextIndex.js";
 import { loadCiphertextDiskMetadata, readCiphertextBlock, receiveCiphertextFile } from "./ciphertextFilesystem.js";
 import type { ReplicaByteStorage } from "./encryptedReplicaStorage.js";
@@ -24,14 +24,14 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
         entries.some(entry => ![".stfolder", ".syncpeer-folder-marker", ".syncpeer-replica.lock"].includes(entry.path))) {
         throw new Error("Encrypted history is missing; explicit import or recovery is required.");
       }
-      return createCiphertextIndex(identity);
+      return { index: createCiphertextIndex(identity), needsMigration: false };
     }
     if (stat.type !== "file") throw new Error("Invalid encrypted history storage.");
-    const index = await loadCiphertextIndex({ size: stat.size,
+    const loaded = await loadCiphertextIndexStorage({ size: stat.size,
       readRange: (offset, size) => bytes.readRange(indexPath, offset, size) }, identity);
     const after = await bytes.stat(indexPath);
     if (!after || after.revision !== stat.revision || after.size !== stat.size) throw new Error("Encrypted history changed during read.");
-    return index;
+    return loaded;
   };
   const save = async (index: CiphertextIndex) => {
     await options.checkHealth();
@@ -41,6 +41,12 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
     });
     await bytes.flushChanges([indexPath]);
   };
+  const loadCurrent = async () => {
+    const loaded = await load();
+    if (loaded.needsMigration) await save(loaded.index);
+    return loaded.index;
+  };
+  const loadIndex = async () => (await load()).index;
   const generation = async (id: string, info: BepFileInfo) => {
     const path = generationPath(id);
     const stat = await bytes.stat(path);
@@ -54,7 +60,7 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
   const receive = async (remote: CiphertextFolderIdentity, info: BepFileInfo,
     requestBlock: Parameters<typeof receiveCiphertextFile>[0]["requestBlock"], signal?: AbortSignal) => {
     signal?.throwIfAborted();
-    const previous = await load();
+    const previous = await loadCurrent();
     const prepared = prepareCiphertextUpdate({ ...previous, pending: undefined }, remote, info);
     if (previous.pending && prepared.pending?.id !== previous.pending.id) throw new Error("Encrypted update is pending recovery.");
     if (!prepared.pending) return previous;
@@ -79,7 +85,7 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
   };
   // No receive lock while serving: two peers can each be receiving from the other.
   const readBlock = async (id: string, offset: number, size: number, token: Uint8Array, signal?: AbortSignal) => {
-      const index = await load();
+      const index = await loadIndex();
       const entry = Object.hasOwn(index.versions, id) ? index.versions[id] : undefined;
       if (!entry || entry.info.deleted || entry.info.invalid || Number(entry.info.type ?? 0) !== 0) {
         throw new Error("Encrypted generation is not published.");
@@ -95,9 +101,9 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
       return data;
   };
   return {
-    snapshot: () => options.withLock(load),
+    snapshot: () => options.withLock(loadCurrent),
     openGeneration: async (id: string) => {
-      const index = await load();
+      const index = await loadIndex();
       const entry = Object.hasOwn(index.versions, id) ? index.versions[id] : undefined;
       if (!entry || entry.info.deleted || entry.info.invalid || Number(entry.info.type ?? 0) !== 0) {
         throw new Error("Encrypted generation is not published.");
@@ -120,7 +126,7 @@ export function createCiphertextReplica(bytes: ReplicaByteStorage, options: {
       options.withLock(() => receive(remote, info, request, signal)),
     readBlock,
     readNamedBlock: async (name: string, offset: number, size: number, token: Uint8Array, signal?: AbortSignal) => {
-      const index = await load();
+      const index = await loadIndex();
       const match = Object.entries(index.versions).find(([, entry]) => entry.info.name === name && !entry.info.deleted &&
         !entry.info.invalid && entry.info.blocks?.some(block => Number(block.offset) === offset && block.size === size &&
           equalBytes(block.hash, token)));

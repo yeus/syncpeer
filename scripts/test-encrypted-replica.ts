@@ -4,11 +4,47 @@ import { randomBytes } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createEncryptedReplicaStorage, createFolderReplica, deriveUntrustedFolderCrypto } from "@syncpeer/core/filesystem";
 import { createCiphertextReplica } from "../packages/core/dist/sync/ciphertextReplica.js";
+import { createCiphertextIndex, encodeCiphertextIndex } from "../packages/core/dist/sync/ciphertextIndex.js";
 import { encryptUntrustedFileInfo } from "../packages/core/dist/core/model/untrustedMetadata.js";
 import { encryptUntrustedBytes, deriveUntrustedFileKey } from "../packages/core/dist/core/model/untrusted.js";
 
 import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { openCiphertextView } from "../packages/core/dist/sync/ciphertextView.js";
+
+const legacyCiphertextIndex = (bytes: Uint8Array, identity: { folderId: string; passwordToken: Uint8Array }) => {
+  const stored = JSON.parse(new TextDecoder().decode(bytes));
+  const legacy = { ...stored, format: 1, identity: {
+    folderId: identity.folderId, passwordToken: Array.from(identity.passwordToken),
+  } };
+  delete legacy.identityCommitment;
+  return new TextEncoder().encode(JSON.stringify(legacy));
+};
+
+test("locked replica atomically migrates legacy raw identity metadata", async () => {
+  const { files, storage } = memoryReplicaStorage();
+  const crypto = await deriveUntrustedFolderCrypto("fixture-folder", "synthetic-password");
+  const identity = { folderId: crypto.folderId, passwordToken: crypto.passwordToken };
+  const legacy = legacyCiphertextIndex(encodeCiphertextIndex(createCiphertextIndex(identity)), identity);
+  files.set(".syncpeer-ciphertext-index", { bytes: legacy, revision: "legacy-revision", type: "file" });
+  const options = { identity, withLock: async <T>(operation: () => Promise<T>) => operation(), checkHealth: async () => {} };
+  const replica = createCiphertextReplica(storage, options);
+  assert.equal((await replica.snapshot()).sequence, 0);
+  const migrated = files.get(".syncpeer-ciphertext-index")!.bytes;
+  const stored = JSON.parse(new TextDecoder().decode(migrated));
+  assert.equal(stored.format, 2);
+  assert.equal(Object.hasOwn(stored, "identity"), false);
+  assert.equal(new TextDecoder().decode(migrated).includes(identity.folderId), false);
+
+  files.set(".syncpeer-ciphertext-index", { bytes: legacy, revision: "legacy-revision-2", type: "file" });
+  const interrupted = createCiphertextReplica({ ...storage, createSink: async (path, size) => {
+    const sink = await storage.createSink(path, size);
+    return { ...sink, commit: async () => { throw new Error("migration interrupted"); } };
+  } }, options);
+  await assert.rejects(interrupted.snapshot(), /migration interrupted/);
+  assert.deepEqual(files.get(".syncpeer-ciphertext-index")!.bytes, legacy,
+    "Failed migration must retain the legacy journal for retry");
+  crypto.folderKey.fill(0);
+});
 
 test("unlock reconciles authenticated histories without rewriting ciphertext and close revokes reads", async () => {
   const { storage, files } = memoryReplicaStorage();

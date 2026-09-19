@@ -48,6 +48,15 @@ const requireIdentity = (actual: CiphertextFolderIdentity, expected: CiphertextF
   }
 };
 
+const identityCommitment = (identity: CiphertextFolderIdentity) => {
+  validateIdentity(identity);
+  return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([
+    "syncpeer.ciphertext-index.identity.v2",
+    identity.folderId,
+    Array.from(identity.passwordToken),
+  ]))));
+};
+
 const descriptorBytes = (info: BepFileInfo) => {
   validateCiphertextMetadata(info);
   const counters = mergeVersionVectors(info.version ?? {}, {}).counters ?? [];
@@ -92,14 +101,14 @@ export function completeCiphertextUpdate(index: CiphertextIndex, id: string, rev
 
 /** Opaque metadata only. Store inside private app storage; this is not a public diagnostic. */
 export function encodeCiphertextIndex(index: CiphertextIndex): Uint8Array {
-  const bytes = new TextEncoder().encode(JSON.stringify({ format: 1, identity: {
-    folderId: index.identity.folderId, passwordToken: Array.from(index.identity.passwordToken),
-  }, sequence: index.sequence, versions: Object.entries(index.versions).map(([id, value]) => ({
+  const bytes = new TextEncoder().encode(JSON.stringify({ format: 2,
+    identityCommitment: identityCommitment(index.identity),
+    sequence: index.sequence, versions: Object.entries(index.versions).map(([id, value]) => ({
     id, revision: value.revision, sequence: Number(value.info.sequence), info: Array.from(descriptorBytes(value.info)),
   })), ...(index.pending ? { pending: { id: index.pending.id, info: Array.from(descriptorBytes(index.pending.info)) } } : {}) }));
   if (bytes.length > 64 * 1024 * 1024) throw new Error("Encrypted index capacity exceeded; unlock and reconcile history.");
   // Keep writer validation identical to restart validation.
-  decodeCiphertextIndex(bytes, index.identity);
+  decodeCiphertextIndexStorage(bytes, index.identity);
   return bytes;
 }
 
@@ -117,13 +126,22 @@ const storedDescriptor = (value: { id?: unknown; info?: unknown }) => {
   return { id: value.id, info };
 };
 
-export function decodeCiphertextIndex(bytes: Uint8Array, expected: CiphertextFolderIdentity): CiphertextIndex {
+export function decodeCiphertextIndexStorage(bytes: Uint8Array, expected: CiphertextFolderIdentity) {
   if (bytes.length > 64 * 1024 * 1024) throw new Error("Encrypted index capacity exceeded.");
+  validateIdentity(expected);
   const stored = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  if (!stored || stored.format !== 1 || !Number.isSafeInteger(stored.sequence) || stored.sequence < 0 ||
-    !stored.identity || !Array.isArray(stored.versions)) throw new Error("Invalid encrypted index.");
-  const index = createCiphertextIndex({ folderId: stored.identity.folderId, passwordToken: storedBytes(stored.identity.passwordToken) });
-  requireIdentity(index.identity, expected);
+  if (!stored || ![1, 2].includes(stored.format) || !Number.isSafeInteger(stored.sequence) || stored.sequence < 0 ||
+    !Array.isArray(stored.versions)) throw new Error("Invalid encrypted index.");
+  if (stored.format === 1) {
+    if (!stored.identity) throw new Error("Invalid encrypted index.");
+    requireIdentity({ folderId: stored.identity.folderId,
+      passwordToken: storedBytes(stored.identity.passwordToken) }, expected);
+  } else if (stored.identity !== undefined || typeof stored.identityCommitment !== "string" ||
+    !/^[0-9a-f]{64}$/.test(stored.identityCommitment) ||
+    stored.identityCommitment !== identityCommitment(expected)) {
+    throw new Error("Encrypted folder identity mismatch.");
+  }
+  const index = createCiphertextIndex(expected);
   index.sequence = stored.sequence;
   const sequences = new Set<number>();
   for (const value of stored.versions) {
@@ -140,14 +158,23 @@ export function decodeCiphertextIndex(bytes: Uint8Array, expected: CiphertextFol
     index.pending = storedDescriptor(stored.pending);
     if (Object.hasOwn(index.versions, index.pending.id)) throw new Error("Encrypted pending generation is already committed.");
   }
-  return index;
+  return { index, needsMigration: stored.format === 1 };
+}
+
+export function decodeCiphertextIndex(bytes: Uint8Array, expected: CiphertextFolderIdentity): CiphertextIndex {
+  return decodeCiphertextIndexStorage(bytes, expected).index;
 }
 
 export async function loadCiphertextIndex(source: EncryptedFileSource, expected: CiphertextFolderIdentity, signal?: AbortSignal) {
+  return (await loadCiphertextIndexStorage(source, expected, signal)).index;
+}
+
+export async function loadCiphertextIndexStorage(source: EncryptedFileSource,
+  expected: CiphertextFolderIdentity, signal?: AbortSignal) {
   if (!Number.isSafeInteger(source.size) || source.size < 0 || source.size > 64 * 1024 * 1024) {
     throw new Error("Invalid or oversized encrypted index.");
   }
-  return decodeCiphertextIndex(await readExactEncryptedRange(source, 0, source.size, signal), expected);
+  return decodeCiphertextIndexStorage(await readExactEncryptedRange(source, 0, source.size, signal), expected);
 }
 
 /** Host supplies staging and durable atomic commit; it must hold the root lock. */

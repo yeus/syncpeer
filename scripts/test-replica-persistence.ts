@@ -21,7 +21,13 @@ test("locked index pins folder identity and journals opaque history across resta
   assert.equal(pending.sequence, 0);
   assert.equal(Object.keys(pending.versions).length, 0, "uncommitted data is not advertised");
   const encoded = encodeCiphertextIndex(pending);
-  assert.equal(new TextDecoder().decode(encoded).includes(original.name), false);
+  const serialized = new TextDecoder().decode(encoded);
+  const stored = JSON.parse(serialized);
+  assert.equal(stored.format, 2);
+  assert.equal(Object.hasOwn(stored, "identity"), false);
+  assert.match(stored.identityCommitment, /^[0-9a-f]{64}$/);
+  assert.equal(serialized.includes(original.name), false);
+  assert.equal(serialized.includes(identity.folderId), false);
   const reopened = decodeCiphertextIndex(encoded, identity);
   const committed = completeCiphertextUpdate(reopened, reopened.pending!.id, "revision-one");
   assert.equal(committed.sequence, 1);
@@ -29,6 +35,13 @@ test("locked index pins folder identity and journals opaque history across resta
   assert.equal(Object.values(committed.versions)[0].verification, "pending-unlock");
   assert.deepEqual(prepareCiphertextUpdate(committed, identity, encrypted), committed);
   assert.throws(() => decodeCiphertextIndex(encoded, { ...identity, folderId: "other-fixture" }), /identity/);
+  const legacy = { ...stored, format: 1, identity: {
+    folderId: identity.folderId, passwordToken: Array.from(identity.passwordToken),
+  } };
+  delete legacy.identityCommitment;
+  const legacyBytes = new TextEncoder().encode(JSON.stringify(legacy));
+  assert.deepEqual(decodeCiphertextIndex(legacyBytes, identity), reopened);
+  assert.throws(() => decodeCiphertextIndex(legacyBytes, { ...identity, folderId: "other-fixture" }), /identity/);
   assert.throws(() => prepareCiphertextUpdate(initial, { ...identity, passwordToken: new Uint8Array(32) }, encrypted), /identity/);
   assert.throws(() => completeCiphertextUpdate(reopened, "wrong-transaction", "revision"), /transaction/);
 });
@@ -70,6 +83,7 @@ test("locked index rejects corrupt transactions and does not confuse remote sequ
   const stored = JSON.parse(new TextDecoder().decode(encodeCiphertextIndex(committed)));
   const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
   for (const invalid of [
+    { ...stored, identity: { folderId: identity.folderId, passwordToken: [] } },
     { ...stored, versions: [stored.versions[0], stored.versions[0]] },
     { ...stored, sequence: 0 },
     { ...stored, versions: [{ ...stored.versions[0], sequence: -1 }] },

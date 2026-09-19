@@ -2,6 +2,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 mod cache_ranges;
 mod replica_storage;
 mod metadata_sqlite;
+mod native_cache_metadata;
 mod documents;
 #[cfg(target_os = "android")]
 mod document_storage;
@@ -10,6 +11,7 @@ mod android_network;
 mod vault_secret;
 mod local_reset;
 use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
+use native_cache_metadata::NativeCacheMetadata;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use prost::Message;
@@ -118,7 +120,7 @@ struct CacheTransferRequest {
     transfer_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CachePartialMetadata {
     transfer_id: String,
@@ -146,7 +148,7 @@ struct CacheRangesRequest {
 #[serde(rename_all = "lowercase")]
 enum CacheRangeSource { Cached, Partial }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CachedFileRecord {
     key: String,
@@ -160,7 +162,7 @@ struct CachedFileRecord {
     modified_ms: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CacheIndex {
     files: Vec<CachedFileRecord>,
 }
@@ -574,7 +576,7 @@ struct CacheWriter {
     expected_size: u64,
     modified_ms: Option<f64>,
     temp_path: PathBuf,
-    metadata_path: PathBuf,
+    metadata_id: String,
     file: Arc<Mutex<fs::File>>,
     cached_source: Option<Arc<Mutex<fs::File>>>,
     cached_saf_source: Option<(String, String)>,
@@ -984,8 +986,84 @@ fn cache_partial_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app_cache_files_root(app)?.join(".partial"))
 }
 
-fn cache_partial_metadata_path(partial_root: &Path, transfer_id: &str) -> PathBuf {
-    partial_root.join(format!("{transfer_id}.json"))
+const CACHE_INDEX_METADATA_ID: &str = "index";
+const CACHE_PARTIAL_METADATA_PREFIX: &str = "partial/";
+
+fn native_cache_metadata(app: &tauri::AppHandle) -> Result<NativeCacheMetadata, String> {
+    let metadata_root = app_data_root(app)?.join("native-cache-metadata");
+    #[cfg(target_os = "linux")]
+    let mut key = vault_secret::load_or_create_protected_key(
+        "native-cache-metadata",
+        &metadata_root,
+    )?;
+    #[cfg(target_os = "android")]
+    let mut key = vault_secret::load_or_create_protected_key(
+        app,
+        "native-cache-metadata",
+        &metadata_root,
+    )?;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    return Err("Protected native cache metadata is unavailable on this platform.".into());
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let result = NativeCacheMetadata::open(&metadata_root, &app_cache_files_root(app)?, &key);
+        key.fill(0);
+        result
+    }
+}
+
+fn read_cache_index(app: &tauri::AppHandle) -> Result<CacheIndex, String> {
+    Ok(native_cache_metadata(app)?
+        .load_or_migrate(CACHE_INDEX_METADATA_ID, &cache_index_path(app)?)?
+        .unwrap_or_default())
+}
+
+fn write_cache_index(app: &tauri::AppHandle, index: &CacheIndex) -> Result<(), String> {
+    native_cache_metadata(app)?.save(CACHE_INDEX_METADATA_ID, index)
+}
+
+fn partial_metadata_id(transfer_id: &str) -> Result<String, String> {
+    if transfer_id.is_empty() || transfer_id.len() > 128 ||
+        !transfer_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+        return Err("Invalid cache transfer identity.".into());
+    }
+    Ok(format!("{CACHE_PARTIAL_METADATA_PREFIX}{transfer_id}"))
+}
+
+fn read_partial_metadata(app: &tauri::AppHandle, partial_root: &Path) -> Result<Vec<CachePartialMetadata>, String> {
+    let store = native_cache_metadata(app)?;
+    if partial_root.exists() {
+        for entry in fs::read_dir(partial_root).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") { continue; }
+            let transfer_id = path.file_stem().and_then(|value| value.to_str())
+                .ok_or_else(|| "Invalid legacy partial metadata filename.".to_string())?;
+            let decoded = serde_json::from_slice::<CachePartialMetadata>(&fs::read(&path)
+                .map_err(|error| format!("Could not read {}: {error}", path.display()))?)
+                .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+            if decoded.transfer_id != transfer_id {
+                return Err("Legacy partial metadata identity mismatch.".into());
+            }
+            store.load_or_migrate::<CachePartialMetadata>(&partial_metadata_id(transfer_id)?, &path)?
+                .ok_or_else(|| "Legacy partial metadata disappeared during migration.".to_string())?;
+        }
+    }
+    store.list::<CachePartialMetadata>(CACHE_PARTIAL_METADATA_PREFIX)?
+        .into_iter()
+        .map(|(name, metadata)| {
+            let expected = partial_metadata_id(&metadata.transfer_id)?;
+            if name != expected { return Err("Encrypted partial metadata identity mismatch.".into()); }
+            Ok(metadata)
+        })
+        .collect()
+}
+
+fn remove_partial_metadata(app: &tauri::AppHandle) -> Result<(), String> {
+    let store = native_cache_metadata(app)?;
+    for name in store.names(CACHE_PARTIAL_METADATA_PREFIX)? {
+        store.remove(&name)?;
+    }
+    Ok(())
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -3032,8 +3110,7 @@ async fn syncpeer_cache_file(
         local_path = Some(local_abs_path.to_string_lossy().to_string());
     }
 
-    let index_path = cache_index_path(&app)?;
-    let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let mut index = read_cache_index(&app)?;
     index.files.retain(|entry| entry.key != key);
     let record = CachedFileRecord {
         key,
@@ -3047,7 +3124,7 @@ async fn syncpeer_cache_file(
         modified_ms: request.modified_ms,
     };
     index.files.push(record.clone());
-    write_json(&index_path, &index)?;
+    write_cache_index(&app, &index)?;
 
     Ok(record)
 }
@@ -3089,7 +3166,7 @@ async fn syncpeer_cache_begin_file(
         .keys()
         .cloned()
         .collect::<HashSet<_>>();
-    let cached_index = read_json_or_default::<CacheIndex>(&cache_index_path(&app)?)?;
+    let cached_index = read_cache_index(&app)?;
     let cached_record = cached_index.files.iter()
         .find(|entry| entry.key == cache_key(&request.folder_id, &normalized_path));
     let cached_path = cached_record.and_then(|entry| entry.local_path.as_ref());
@@ -3111,14 +3188,7 @@ async fn syncpeer_cache_begin_file(
     })?;
     let requested_name = cache_display_name(&normalized_path, &request.name);
     let mut resume: Option<CachePartialMetadata> = None;
-    for entry in fs::read_dir(&partial_root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else { continue };
-        let Ok(metadata) = serde_json::from_str::<CachePartialMetadata>(&raw) else { continue };
+    for metadata in read_partial_metadata(&app, &partial_root)? {
         if active_ids.contains(&metadata.transfer_id)
             || !partial_matches_download(&metadata, &request, &normalized_path, &requested_name)
         {
@@ -3130,13 +3200,13 @@ async fn syncpeer_cache_begin_file(
             resume = Some(metadata);
         }
     }
-    let (transfer_id, temp_path, metadata_path, file) = if let Some(metadata) = resume {
+    let (transfer_id, temp_path, metadata_id, file) = if let Some(metadata) = resume {
         let transfer_id = metadata.transfer_id.clone();
         let temp_path = partial_root.join(format!("{transfer_id}.part"));
-        let metadata_path = cache_partial_metadata_path(&partial_root, &transfer_id);
+        let metadata_id = partial_metadata_id(&transfer_id)?;
         let file = fs::OpenOptions::new().read(true).write(true).open(&temp_path)
             .map_err(|error| format!("Could not resume partial cached file {}: {error}", temp_path.display()))?;
-        (transfer_id, temp_path, metadata_path, file)
+        (transfer_id, temp_path, metadata_id, file)
     } else {
         let transfer_id = {
             let mut guard = store
@@ -3146,10 +3216,10 @@ async fn syncpeer_cache_begin_file(
             format!("{}-{}", now_ms(), guard.next_id)
         };
         let temp_path = partial_root.join(format!("{transfer_id}.part"));
-        let metadata_path = cache_partial_metadata_path(&partial_root, &transfer_id);
+        let metadata_id = partial_metadata_id(&transfer_id)?;
         let file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&temp_path)
             .map_err(|error| format!("Could not create partial cached file {}: {error}", temp_path.display()))?;
-        (transfer_id, temp_path, metadata_path, file)
+        (transfer_id, temp_path, metadata_id, file)
     };
     let metadata = CachePartialMetadata {
         transfer_id: transfer_id.clone(),
@@ -3163,7 +3233,7 @@ async fn syncpeer_cache_begin_file(
         encrypted: request.encrypted,
         created_at_ms: now_ms(),
     };
-    write_json(&metadata_path, &metadata)?;
+    native_cache_metadata(&app)?.save(&metadata_id, &metadata)?;
 
     let writer = CacheWriter {
         folder_id: request.folder_id.trim().to_string(),
@@ -3172,7 +3242,7 @@ async fn syncpeer_cache_begin_file(
         expected_size: request.size_bytes,
         modified_ms: request.modified_ms,
         temp_path,
-        metadata_path,
+        metadata_id,
         file: Arc::new(Mutex::new(file)),
         cached_source,
         cached_saf_source,
@@ -3393,8 +3463,7 @@ async fn syncpeer_cache_commit(
         (Some(local_abs_path.to_string_lossy().to_string()), None)
     };
 
-    let index_path = cache_index_path(&app)?;
-    let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let mut index = read_cache_index(&app)?;
     index.files.retain(|entry| entry.key != key);
     let record = CachedFileRecord {
         key,
@@ -3408,22 +3477,19 @@ async fn syncpeer_cache_commit(
         modified_ms: writer.modified_ms,
     };
     index.files.push(record.clone());
-    write_json(&index_path, &index)?;
+    write_cache_index(&app, &index)?;
 
     let mut guard = store
         .lock()
         .map_err(|_| "Cache writer store lock poisoned".to_string())?;
     guard.writers.remove(&request.transfer_id);
-    if writer.metadata_path.exists() {
-        fs::remove_file(&writer.metadata_path).map_err(|error| {
-            format!("Could not remove partial metadata {}: {error}", writer.metadata_path.display())
-        })?;
-    }
+    native_cache_metadata(&app)?.remove(&writer.metadata_id)?;
     Ok(record)
 }
 
 #[tauri::command]
 async fn syncpeer_cache_abort(
+    app: tauri::AppHandle,
     store: tauri::State<'_, SharedCacheWriterStore>,
     request: CacheTransferRequest,
 ) -> Result<(), String> {
@@ -3439,11 +3505,7 @@ async fn syncpeer_cache_abort(
                 format!("Could not remove partial cached file: {error}")
             })?;
         }
-        if writer.metadata_path.exists() {
-            fs::remove_file(&writer.metadata_path).map_err(|error| {
-                format!("Could not remove partial metadata: {error}")
-            })?;
-        }
+        native_cache_metadata(&app)?.remove(&writer.metadata_id)?;
     }
     Ok(())
 }
@@ -3894,8 +3956,7 @@ async fn syncpeer_set_android_saf_tree_uri(
     #[cfg(target_os = "android")]
     if let Some(new_tree_uri) = request.tree_uri.as_deref() {
         if settings.android_saf_tree_uri.as_deref() != Some(new_tree_uri) {
-            let index_path = cache_index_path(&app)?;
-            let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
+            let mut index = read_cache_index(&app)?;
             let mut touched = false;
             for record in &mut index.files {
                 let normalized_path = normalize_path(&record.path);
@@ -3923,12 +3984,13 @@ async fn syncpeer_set_android_saf_tree_uri(
                 }
             }
             if touched {
-                write_json(&index_path, &index)?;
+                write_cache_index(&app, &index)?;
             }
             let files_root = app_cache_files_root(&app)?;
             if files_root.exists() {
                 let _ = fs::remove_dir_all(&files_root);
             }
+            remove_partial_metadata(&app)?;
         }
     }
     settings.android_saf_tree_uri = request.tree_uri;
@@ -3945,8 +4007,7 @@ async fn syncpeer_get_cached_statuses(
     if folder_id.is_empty() {
         return Err("folderId is required.".to_string());
     }
-    let index_path = cache_index_path(&app)?;
-    let index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let index = read_cache_index(&app)?;
     let folder_records = index
         .files
         .iter()
@@ -4062,8 +4123,7 @@ async fn syncpeer_get_cached_statuses(
 async fn syncpeer_list_cached_files(
     app: tauri::AppHandle,
 ) -> Result<Vec<CachedFileRecord>, String> {
-    let path = cache_index_path(&app)?;
-    let mut index = read_json_or_default::<CacheIndex>(&path)?;
+    let mut index = read_cache_index(&app)?;
     index.files.sort_by(|a, b| {
         b.cached_at_ms
             .cmp(&a.cached_at_ms)
@@ -4106,7 +4166,7 @@ fn digest_cached_files(
     app: &tauri::AppHandle,
     requests: Vec<CachedFileDigestRequest>,
 ) -> Result<Vec<CachedFileDigest>, String> {
-    let index = read_json_or_default::<CacheIndex>(&cache_index_path(app)?)?;
+    let index = read_cache_index(app)?;
     requests.into_iter().map(|request| {
         let folder_id = request.folder_id.trim().to_string();
         let path = normalize_path(&request.path);
@@ -4162,7 +4222,7 @@ fn read_cached_file(
     let folder_id = request.folder_id.trim();
     let path = normalize_path(&request.path);
     let key = cache_key(folder_id, &path);
-    let index = read_json_or_default::<CacheIndex>(&cache_index_path(app)?)?;
+    let index = read_cache_index(app)?;
     let record = index.files.iter().find(|entry| entry.key == key)
         .ok_or_else(|| format!("Cached file is unavailable: {path}"))?;
     if let Some(local_path) = record.local_path.as_deref() {
@@ -4201,8 +4261,7 @@ async fn syncpeer_open_cached_file(
     if normalized_path.is_empty() {
         return Err("path is required.".to_string());
     }
-    let index_path = cache_index_path(&app)?;
-    let index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let index = read_cache_index(&app)?;
     let key = cache_key(&request.folder_id, &normalized_path);
     let record = index
         .files
@@ -4232,8 +4291,7 @@ async fn syncpeer_open_cached_file_directory(
     if normalized_path.is_empty() {
         return Err("path is required.".to_string());
     }
-    let index_path = cache_index_path(&app)?;
-    let index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let index = read_cache_index(&app)?;
     let key = cache_key(&request.folder_id, &normalized_path);
     let record = index
         .files
@@ -4301,15 +4359,14 @@ async fn syncpeer_remove_cached_file(
         return Err("path is required.".to_string());
     }
 
-    let index_path = cache_index_path(&app)?;
-    let mut index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let mut index = read_cache_index(&app)?;
     let key = cache_key(&request.folder_id, &normalized_path);
     let Some(record_index) = index.files.iter().position(|entry| entry.key == key) else {
         return Ok(false);
     };
 
     let record = index.files.remove(record_index);
-    write_json(&index_path, &index)?;
+    write_cache_index(&app, &index)?;
 
     if let Some(local_path) = record.local_path.as_deref() {
         let local_path = PathBuf::from(local_path);
@@ -4332,8 +4389,7 @@ async fn syncpeer_remove_cached_file(
 
 #[tauri::command]
 async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
-    let index_path = cache_index_path(&app)?;
-    let index = read_json_or_default::<CacheIndex>(&index_path)?;
+    let index = read_cache_index(&app)?;
 
     for record in &index.files {
         if let Some(local_path) = &record.local_path {
@@ -4358,10 +4414,8 @@ async fn syncpeer_clear_cache(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
 
-    if index_path.exists() {
-        fs::remove_file(&index_path)
-            .map_err(|error| format!("Could not remove {}: {error}", index_path.display()))?;
-    }
+    native_cache_metadata(&app)?.remove(CACHE_INDEX_METADATA_ID)?;
+    remove_partial_metadata(&app)?;
 
     Ok(())
 }

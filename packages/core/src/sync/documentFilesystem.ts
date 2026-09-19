@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { deriveUntrustedFolderCrypto, encryptUntrustedFilename } from "../core/model/untrusted.js";
+import type { PasswordKdf } from "../core/model/passwordKdf.js";
 import { createCredentialVault, type RememberedUnlockSecretStore } from "./credentialVault.js";
 import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } from "./credentialVaultStorage.js";
 import { createFolderRegistry, type FolderRegistration } from "./folderRegistry.js";
@@ -40,6 +41,8 @@ interface DocumentFilesystemOptions {
   rememberedSecret: RememberedUnlockSecretStore;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
   availableBytes: () => Promise<number>;
+  /** Defaults to the in-process scrypt derivation; platforms may inject a worker. */
+  kdf?: PasswordKdf;
 }
 
 interface DocumentHandle {
@@ -230,7 +233,7 @@ const openFolderRuntime = async (
 ) => {
   const password = await runtime.vault.folderPassword(folder.id);
   if (!password) throw new Error("Folder credentials are unavailable.");
-  const crypto = await deriveUntrustedFolderCrypto(folder.id, password);
+  const crypto = await deriveUntrustedFolderCrypto(folder.id, password, runtime.options.kdf);
   const bytes = await openFolderStorage(runtime, folder, crypto.folderKey);
   try {
     const encrypted = createEncryptedReplicaStorage(bytes, {
@@ -1115,6 +1118,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     storage: createCredentialVaultStorage(options.profile, options.profile),
     rememberedSecret: options.rememberedSecret,
     bootstrapStorage: createPersonalSpaceBootstrapStorage(options.profile, options.profile),
+    ...(options.kdf ? { kdf: options.kdf } : {}),
     revokeAccess: () => revokeAccess(runtime),
   });
   return {

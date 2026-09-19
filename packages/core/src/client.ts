@@ -25,6 +25,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { createCiphertextReplica } from "./sync/ciphertextReplica.js";
 import { createCiphertextIndex, selectCiphertextPublication } from "./sync/ciphertextIndex.js";
 import { memoryUploadSource, type FileUploadSource } from "./transfer/stream.js";
+import { scryptPasswordKdf, type PasswordKdf } from "./core/model/passwordKdf.js";
 import {
   isTransportFailure,
   RemoteFs,
@@ -125,6 +126,8 @@ export interface SyncpeerHostAdapter {
   ) => Promise<SyncpeerRelayConnectResult>;
   sha256: (data: Uint8Array) => Promise<Uint8Array> | Uint8Array;
   randomBytes: (length: number) => Promise<Uint8Array> | Uint8Array;
+  /** Defaults to the in-process scrypt derivation; platforms may inject a worker. */
+  kdf?: PasswordKdf;
   discoveryFetch: (
     input: string | URL,
     init?: SyncpeerDiscoveryFetchInit,
@@ -869,6 +872,7 @@ class BepSession {
   private sentIndexBootstrapFolderIds = new Set<string>();
   private socket: SyncpeerTlsSocket;
   private adapter: SyncpeerHostAdapter;
+  private kdf: PasswordKdf;
   private localDeviceId: Uint8Array;
   private localDeviceName: string;
   private remoteDeviceId?: Uint8Array;
@@ -894,6 +898,7 @@ class BepSession {
   ) {
     this.socket = socket;
     this.adapter = adapter;
+    this.kdf = adapter.kdf ?? scryptPasswordKdf;
     this.localDeviceId = localDeviceId;
     this.localDeviceName = localDeviceName;
     this.remoteDeviceId = remoteDeviceId;
@@ -996,6 +1001,7 @@ class BepSession {
         ? await deriveUntrustedFolderCrypto(
             folderId,
             sharedFolder.encryption.password,
+            this.kdf,
           )
         : undefined;
       this.sharedFolders.set(folderId, { ...sharedFolder, folderCrypto });
@@ -1436,7 +1442,7 @@ class BepSession {
           needsPassword = true;
         } else {
           try {
-            const derived = await deriveUntrustedFolderCrypto(folderId, password);
+            const derived = await deriveUntrustedFolderCrypto(folderId, password, this.kdf);
             const tokenValid = await verifyUntrustedPasswordToken(
               derived,
               announcedToken,

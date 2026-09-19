@@ -1,8 +1,8 @@
 import { aessiv } from "@noble/ciphers/aes.js";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
-import { scrypt } from "@noble/hashes/scrypt.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import { scryptPasswordKdf, type PasswordKdf } from "./passwordKdf.js";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -111,15 +111,13 @@ export function untrustedPasswordToken(folderId: string, folderKey: Uint8Array):
 export async function deriveUntrustedFolderCrypto(
   folderId: string,
   password: string,
+  kdf: PasswordKdf = scryptPasswordKdf,
 ): Promise<UntrustedFolderCrypto> {
   const passwordBytes = textEncoder.encode(password);
   const salt = textEncoder.encode(`${PASSWORD_TOKEN_PREFIX}${folderId}`);
-  const folderKey = scrypt(passwordBytes, salt, {
-    N: 32768,
-    r: 8,
-    p: 1,
-    dkLen: 32,
-  });
+  let folderKey: Uint8Array;
+  try { folderKey = await kdf(passwordBytes, salt); }
+  finally { passwordBytes.fill(0); }
   const passwordToken = untrustedPasswordToken(folderId, folderKey);
   return {
     folderId,

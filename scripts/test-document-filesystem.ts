@@ -3,6 +3,7 @@ import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
 import { deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
+import { scryptPasswordKdf, type PasswordKdf } from "../packages/core/dist/kdf.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 
 test("first-run folder storage requires a recoverable master password and retains files across restarts", async () => {
@@ -45,6 +46,34 @@ test("automatic setup does not create an unrecoverable vault when secure storage
   assert.equal((await documents.initialize()).vault.phase, "uninitialized");
   assert.equal((await documents.status()).vault.phase, "uninitialized");
   await documents.close();
+});
+
+test("an injected password KDF port serves vault creation and unlock", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const calls: Array<{ password: string; saltLength: number }> = [];
+  const kdf: PasswordKdf = async (passwordBytes, salt) => {
+    calls.push({ password: new TextDecoder().decode(passwordBytes), saltLength: salt.length });
+    return scryptPasswordKdf(passwordBytes, salt);
+  };
+  const options = { profileId: "kdf-fixture", deviceCounterId: "42", openStorage, kdf,
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => secret,
+      save: async (value: string) => { secret = value; }, remove: async () => { secret = null; },
+    } };
+  const documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false);
+  await documents.close();
+  assert.deepEqual(calls, [{ password: "synthetic-master-password", saltLength: 16 }]);
+  const reopened = createDocumentFilesystem(options);
+  assert.equal((await reopened.initialize()).vault.phase, "locked");
+  await reopened.unlock("synthetic-master-password");
+  await reopened.close();
+  assert.deepEqual(calls, [
+    { password: "synthetic-master-password", saltLength: 16 },
+    { password: "synthetic-master-password", saltLength: 16 },
+  ]);
 });
 
 test("directory catalogs stay encrypted and cache eviction preserves favorites and local edits", async () => {

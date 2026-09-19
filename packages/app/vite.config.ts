@@ -57,6 +57,10 @@ export default defineConfig(({ mode }) => ({
         find: /^@syncpeer\/core$/,
         replacement: fileURLToPath(new URL("../core/src/index.ts", import.meta.url)),
       },
+      {
+        find: /^@syncpeer\/core\/kdf$/,
+        replacement: fileURLToPath(new URL("../core/src/kdf.ts", import.meta.url)),
+      },
     ],
   },
   build: {

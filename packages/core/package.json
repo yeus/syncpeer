@@ -22,6 +22,10 @@
       "import": "./dist/node.js",
       "types": "./dist/node.d.ts"
     },
+    "./kdf": {
+      "import": "./dist/kdf.js",
+      "types": "./dist/kdf.d.ts"
+    },
     "./browser": {
       "import": "./dist/browser.js",
       "types": "./dist/browser.d.ts"

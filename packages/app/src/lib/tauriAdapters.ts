@@ -16,6 +16,7 @@ import type {
 import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
   dispatchDocumentCommand } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
+import { createWorkerPasswordKdf } from "./passwordKdf.ts";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
@@ -268,6 +269,7 @@ export const createTauriAdapters = (
             { request: { profileId: "documents", operation: "isDeviceUnlocked", secret: null } }),
         },
         randomBytes: size => crypto.getRandomValues(new Uint8Array(size)),
+        kdf: createWorkerPasswordKdf(),
       });
       await documents.initialize();
       return documents;
@@ -282,6 +284,7 @@ export const createTauriAdapters = (
   };
 
   const hostAdapter: SyncpeerHostAdapter = {
+    kdf: createWorkerPasswordKdf(),
     connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal }) => {
       const opened = await invokeWithLogging<TlsOpenResponse>("syncpeer_tls_open", {
         request: {

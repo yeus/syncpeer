@@ -1,7 +1,7 @@
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
-import { scrypt } from "@noble/hashes/scrypt.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import { scryptPasswordKdf, type PasswordKdf } from "../core/model/passwordKdf.js";
 
 export interface PersonalSpaceBootstrap {
   format: 1;
@@ -34,7 +34,8 @@ const validId = (value: unknown): value is string => typeof value === "string" &
 const idBytes = (value: string) => Uint8Array.from(value.match(/../g)!.map(part => Number.parseInt(part, 16)));
 
 const seal = async (space: PersonalSpace, masterPassword: string,
-  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>): Promise<PersonalSpaceBootstrap> => {
+  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>,
+  kdf: PasswordKdf): Promise<PersonalSpaceBootstrap> => {
   if (typeof masterPassword !== "string" || masterPassword.length < 16) {
     throw new Error("Personal-space master password must have at least 16 characters.");
   }
@@ -44,7 +45,7 @@ const seal = async (space: PersonalSpace, masterPassword: string,
   const nonce = await random(randomBytes, 24);
   const passwordBytes = new TextEncoder().encode(masterPassword);
   let key: Uint8Array;
-  try { key = scrypt(passwordBytes, salt, { N: 32768, r: 8, p: 1, dkLen: 32 }); }
+  try { key = await kdf(passwordBytes, salt); }
   finally { passwordBytes.fill(0); }
   const plaintext = new Uint8Array(64);
   plaintext.set(idBytes(space.id), 0);
@@ -59,14 +60,15 @@ const seal = async (space: PersonalSpace, masterPassword: string,
 };
 
 export async function createPersonalSpaceBootstrap(masterPassword: string,
-  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>) {
+  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>, kdf: PasswordKdf = scryptPasswordKdf) {
   const space = { id: hex(await random(randomBytes, 16)), settingsFolderId: hex(await random(randomBytes, 16)),
     rootKey: await random(randomBytes, 32) };
-  try { return { record: await seal(space, masterPassword, randomBytes), space }; }
+  try { return { record: await seal(space, masterPassword, randomBytes, kdf), space }; }
   catch (error) { space.rootKey.fill(0); throw error; }
 }
 
-export function openPersonalSpaceBootstrap(record: PersonalSpaceBootstrap, masterPassword: string): PersonalSpace {
+export async function openPersonalSpaceBootstrap(record: PersonalSpaceBootstrap, masterPassword: string,
+  kdf: PasswordKdf = scryptPasswordKdf): Promise<PersonalSpace> {
   if (!record || record.format !== 1 || record.kdf !== "scrypt-N32768-r8-p1" ||
     typeof masterPassword !== "string" || !masterPassword || masterPassword.length > 4096 ||
     !Array.isArray(record.ciphertext) || record.ciphertext.length < 16 || record.ciphertext.length > 4096) {
@@ -79,7 +81,7 @@ export function openPersonalSpaceBootstrap(record: PersonalSpaceBootstrap, maste
   const ciphertext = Uint8Array.from(record.ciphertext);
   const passwordBytes = new TextEncoder().encode(masterPassword);
   let key: Uint8Array;
-  try { key = scrypt(passwordBytes, salt, { N: 32768, r: 8, p: 1, dkLen: 32 }); }
+  try { key = await kdf(passwordBytes, salt); }
   finally { passwordBytes.fill(0); }
   let plaintext: Uint8Array = new Uint8Array();
   try {
@@ -92,16 +94,17 @@ export function openPersonalSpaceBootstrap(record: PersonalSpaceBootstrap, maste
 }
 
 export async function rewrapPersonalSpaceBootstrap(record: PersonalSpaceBootstrap, oldPassword: string,
-  newPassword: string, randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>) {
-  const space = openPersonalSpaceBootstrap(record, oldPassword);
-  try { return await seal(space, newPassword, randomBytes); }
+  newPassword: string, randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>,
+  kdf: PasswordKdf = scryptPasswordKdf) {
+  const space = await openPersonalSpaceBootstrap(record, oldPassword, kdf);
+  try { return await seal(space, newPassword, randomBytes, kdf); }
   finally { space.rootKey.fill(0); }
 }
 
 /** Rewrap an already-unlocked space without retaining or re-entering the old password. */
 export function wrapPersonalSpaceBootstrap(space: PersonalSpace, newPassword: string,
-  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>) {
-  return seal(space, newPassword, randomBytes);
+  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>, kdf: PasswordKdf = scryptPasswordKdf) {
+  return seal(space, newPassword, randomBytes, kdf);
 }
 
 const deriveSpaceKey = (space: PersonalSpace, purpose: string): Uint8Array => {

@@ -34,7 +34,7 @@ import {
   coalescePendingIndexFrame,
   type PendingIndexFrame,
 } from "../packages/core/src/core/protocol/indexQueue.ts";
-import { deriveUntrustedFolderCrypto } from "../packages/core/src/core/model/untrusted.ts";
+import { deriveUntrustedFolderCrypto } from "../packages/core/dist/core/model/untrusted.js";
 import { resolvePackagedAppVersion } from "../packages/app/buildInfo.ts";
 import {
   classifyRuntimeEnvironment,

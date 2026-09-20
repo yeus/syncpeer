@@ -1134,9 +1134,23 @@ pub async fn syncpeer_replica_storage(
         }
         if roots.metadata_key.is_none() {
             #[cfg(target_os = "linux")]
-            { roots.metadata_key = Some(crate::vault_secret::load_or_create_metadata_key(&roots.metadata_root)?); }
-            #[cfg(not(target_os = "linux"))]
-            { return Err("Protected metadata key is unavailable.".into()); }
+            {
+                roots.metadata_key = Some(crate::vault_secret::load_or_create_metadata_key(
+                    &roots.metadata_root,
+                )?);
+            }
+            #[cfg(target_os = "android")]
+            {
+                roots.metadata_key = Some(crate::vault_secret::load_or_create_protected_key(
+                    &app,
+                    "metadata",
+                    &roots.metadata_root,
+                )?);
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                return Err("Protected metadata key is unavailable.".into());
+            }
         }
         dispatch(&mut roots, request)
     })

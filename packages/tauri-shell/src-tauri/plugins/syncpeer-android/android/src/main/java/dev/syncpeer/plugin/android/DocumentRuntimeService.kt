@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -15,12 +16,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.javascriptengine.JavaScriptSandbox
-import androidx.javascriptengine.JavaScriptIsolate
-import androidx.javascriptengine.IsolateStartupParameters
-import androidx.javascriptengine.Message
-import androidx.javascriptengine.MessagePort
 import org.json.JSONObject
 import android.provider.DocumentsContract
 import java.util.concurrent.CompletableFuture
@@ -43,11 +41,11 @@ class DocumentRuntimeService : Service() {
   private val mainHandler = Handler(Looper.getMainLooper())
   private val worker = Executors.newSingleThreadExecutor()
   private val storageWorker = Executors.newSingleThreadExecutor()
-  private val networkWorker = Executors.newSingleThreadExecutor()
+  // A BEP session keeps one blocking read active while writes and closes must
+  // continue independently through the same native transport.
+  private val networkWorker = Executors.newFixedThreadPool(4)
   private var storage: DocumentRuntimeStorage? = null
-  private var storagePort: MessagePort? = null
   private var network: SessionNetworkTransport? = null
-  private var networkPort: MessagePort? = null
   private var documentsStarted = false
   @Volatile private var sessionStarted = false
   @Volatile private var sessionRequest: String? = null
@@ -68,12 +66,17 @@ class DocumentRuntimeService : Service() {
     }
   }
   private val binder = RuntimeBinder()
-  private var sandbox: JavaScriptSandbox? = null
-  private var isolate: JavaScriptIsolate? = null
-  private var requestId = 0L
+  private var runtimeHost: DocumentRuntimeHost? = null
+  private var runtimeGeneration = 0L
   @Volatile private var terminalStatus: DocumentRuntimeStatus? = null
   @Volatile private var vaultSummary: String? = null
   @Volatile private var recovery: CompletableFuture<DocumentRuntimeStatus>? = null
+  private var recoveryFailureCount = 0
+  private var pendingRecoveryRetry: Runnable? = null
+  private var recoveryWillRetry = false
+  private var injectedRecoveryFailures = 0
+  private var injectedRecoveryAttempts = 0
+  private var forceWebViewForTesting = false
   @Volatile private var destroying = false
 
   inner class RuntimeBinder : Binder() {
@@ -83,6 +86,42 @@ class DocumentRuntimeService : Service() {
     }
 
     internal fun restartForTesting(): CompletableFuture<DocumentRuntimeStatus> = startRecovery()
+
+    internal fun injectRecoveryFailuresForTesting(count: Int) {
+      check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        "Runtime failure injection requires a debuggable build."
+      }
+      require(count in 0..6) { "Invalid injected runtime failure count." }
+      synchronized(this@DocumentRuntimeService) {
+        injectedRecoveryFailures = count
+        injectedRecoveryAttempts = 0
+      }
+    }
+
+    internal fun injectedRecoveryAttemptsForTesting(): Int =
+      synchronized(this@DocumentRuntimeService) { injectedRecoveryAttempts }
+
+    internal fun resetRecoveryBudgetForTesting(): CompletableFuture<DocumentRuntimeStatus> {
+      check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        "Runtime recovery reset requires a debuggable build."
+      }
+      synchronized(this@DocumentRuntimeService) {
+        injectedRecoveryFailures = 0
+        recoveryFailureCount = 0
+        cancelPendingRecoveryRetry()
+      }
+      return startRecovery()
+    }
+
+    internal fun runtimeKindForTesting(): DocumentRuntimeKind? = runtimeHost?.kind
+
+    internal fun forceWebViewForTesting(): CompletableFuture<DocumentRuntimeStatus> {
+      check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        "Runtime selection override requires a debuggable build."
+      }
+      forceWebViewForTesting = true
+      return startRecovery()
+    }
 
     internal fun backgroundSessionStatus(): JSONObject = sessionStatus()
 
@@ -125,41 +164,15 @@ class DocumentRuntimeService : Service() {
 
   private fun evaluateRuntime(code: String, input: ByteArray): CompletableFuture<String> {
     require(input.size <= 1024 * 1024) { "Document runtime input is too large." }
-    val data = input.copyOf()
+    val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
     val result = CompletableFuture<String>()
     val task = Runnable {
       try {
         if (result.isCancelled) return@Runnable
-        check(terminalStatus == null && isolate != null) { "Document runtime unavailable." }
-        val engine = checkNotNull(isolate)
-        if (!documentsStarted) {
-          storage = DocumentRuntimeStorage(applicationContext)
-          storagePort = engine.createMessageChannel("storage", storageWorker) { message ->
-            val request = JSONObject(message.string)
-            val reply = JSONObject().put("id", request.getLong("id"))
-            try { reply.put("result", storage!!.execute(request) ?: JSONObject.NULL) }
-            catch (_: Exception) { reply.put("error", "Document storage operation failed.") }
-            storagePort?.postMessage(Message.createStringMessage(reply.toString()))
-          }
-          network = SessionNetworkTransport()
-          networkPort = engine.createMessageChannel("network", networkWorker) { message ->
-            val request = JSONObject(message.string)
-            val reply = JSONObject().put("id", request.getLong("id"))
-            try { reply.put("result", network!!.execute(request) ?: JSONObject.NULL) }
-            catch (error: Exception) { reply.put("error", error.message ?: "Network operation failed.") }
-            networkPort?.postMessage(Message.createStringMessage(reply.toString()))
-          }
-          documentsStarted = true
-        }
-        val name = "request-${++requestId}"
-        engine.provideNamedData(name, data)
-        // The interpolated name is generated here; code is a trusted call site.
-        val script = "android.consumeNamedDataAsArrayBuffer('$name').then(bytes => {" +
-          "const parsed = JSON.parse(new TextDecoder().decode(bytes)); new Uint8Array(bytes).fill(0);" +
-          "return (async input => { $code\n})(parsed); })"
+        check(terminalStatus == null && runtimeHost != null) { "Document runtime unavailable." }
         // Trusted core publication is bounded by file size, not a fixed startup deadline.
-        // Killing the isolate after 15 seconds made large-file fsync impossible.
-        result.complete(engine.evaluateJavaScriptAsync(script).get())
+        // Killing the runtime after 15 seconds made large-file fsync impossible.
+        result.complete(checkNotNull(runtimeHost).evaluate(code, data).get())
       } catch (error: Exception) {
         if (error is TimeoutException) startRecovery()
         result.completeExceptionally(error)
@@ -217,7 +230,7 @@ class DocumentRuntimeService : Service() {
     val request = sessionRequest
     if (request == null) return
     val generation = nextSessionGeneration()
-    val wasStarted = sessionStarted && documentsStarted && isolate != null
+    val wasStarted = sessionStarted && documentsStarted && runtimeHost != null
     sessionStarted = false
     sessionPhase = "waiting"
     sessionError = reason
@@ -316,12 +329,21 @@ class DocumentRuntimeService : Service() {
             result.complete(sessionStatus())
             return@execute
           }
-          initialized.whenComplete { _, initializationError ->
+          initialized.whenComplete { initialStatus, initializationError ->
             if (generation != sessionGeneration || sessionRequest != request) return@whenComplete
             if (initializationError != null) {
               sessionPhase = "error"
               sessionError = initializationError.message ?: "Document runtime unavailable."
               result.completeExceptionally(initializationError)
+            } else if (!documentRuntimeCanStartSession(
+                terminalStatus ?: initialStatus,
+                isolateAvailable = runtimeHost != null,
+              )) {
+              val retrying = recoveryIsPending()
+              sessionPhase = if (retrying) "waiting" else "error"
+              sessionError = (terminalStatus ?: initialStatus).summary
+              if (retrying) result.complete(sessionStatus())
+              else result.completeExceptionally(IllegalStateException(sessionError))
             } else {
               evaluateSession(request, generation, result)
             }
@@ -405,7 +427,7 @@ class DocumentRuntimeService : Service() {
     try {
       worker.execute {
         if (persist) runCatching { backgroundSessions.clear() }
-        if (!documentsStarted || isolate == null) {
+        if (!documentsStarted || runtimeHost == null) {
           finishSessionStop(result)
           return@execute
         }
@@ -483,33 +505,25 @@ class DocumentRuntimeService : Service() {
     registerBackgroundSignals()
     worker.execute {
       try {
-        initialized.complete(initialize())
+        val status = initialize()
+        terminalStatus = if (status.phase == "locked") null else status
+        initialized.complete(status)
       } catch (error: Exception) {
-        isolate?.close()
-        isolate = null
-        sandbox?.close()
-        sandbox = null
-        initialized.complete(DocumentRuntimeStatus("error", "Document runtime is recovering.",
-          failureType = (error.cause ?: error).javaClass.simpleName))
-        startRecovery()
+        closeRuntimeHost()
+        initialized.complete(recordRecoveryFailure(error))
       }
     }
   }
 
   private fun initialize(): DocumentRuntimeStatus {
-    documentRuntimeCompatibility(
-      JavaScriptSandbox.isSupported(),
-      emptyList(),
-    ) { false }?.let { return it }
-    val opening = JavaScriptSandbox.createConnectedInstanceAsync(applicationContext)
-    val engine = try {
-      opening.get(15, TimeUnit.SECONDS)
-    } catch (error: Exception) {
-      // Do not leak an engine that finishes connecting after the timeout.
-      opening.addListener({ runCatching { opening.get().close() } }, { it.run() })
-      throw error
+    storage = DocumentRuntimeStorage(applicationContext)
+    network = SessionNetworkTransport()
+    val generation = synchronized(this) { runtimeGeneration += 1; runtimeGeneration }
+    val terminated = {
+      if (!destroying && synchronized(this) { generation == runtimeGeneration }) startRecovery()
+      Unit
     }
-    sandbox = engine
+    val code = assets.open("syncpeer-documents.js").bufferedReader().use { it.readText() }
     val requiredFeatures = listOf(
       JavaScriptSandbox.JS_FEATURE_PROMISE_RETURN,
       JavaScriptSandbox.JS_FEATURE_MESSAGE_PORTS,
@@ -517,72 +531,168 @@ class DocumentRuntimeService : Service() {
       JavaScriptSandbox.JS_FEATURE_ISOLATE_TERMINATION,
       JavaScriptSandbox.JS_FEATURE_ISOLATE_MAX_HEAP_SIZE,
     )
-    val incompatible = documentRuntimeCompatibility(
-      true,
-      requiredFeatures,
-      engine::isFeatureSupported,
-    )
-    if (incompatible != null) {
-      engine.close()
-      sandbox = null
-      return incompatible
+    runtimeHost = if (forceWebViewForTesting || !JavaScriptSandbox.isSupported()) {
+      createWebViewHost(terminated)
+    } else {
+      val opening = JavaScriptSandbox.createConnectedInstanceAsync(applicationContext)
+      val sandbox = try {
+        opening.get(15, TimeUnit.SECONDS)
+      } catch (error: Exception) {
+        // Do not leak an engine that finishes connecting after the timeout.
+        opening.addListener({ runCatching { opening.get().close() } }, { it.run() })
+        throw error
+      }
+      when (selectDocumentRuntime(true, requiredFeatures, sandbox::isFeatureSupported)) {
+        DocumentRuntimeKind.SANDBOX -> SandboxDocumentRuntimeHost.create(
+          sandbox, code, storageWorker, networkWorker,
+          ::executeStorageRequest, ::executeNetworkRequest, terminated,
+        )
+        DocumentRuntimeKind.WEB_VIEW -> {
+          sandbox.close()
+          createWebViewHost(terminated)
+        }
+      }
     }
-    loadCore(engine)
+    documentsStarted = true
     return DocumentRuntimeStatus("locked", "Document access is not configured.")
   }
 
-  private fun loadCore(engine: JavaScriptSandbox) {
-    val startup = IsolateStartupParameters().apply {
-      setMaxHeapSizeBytes(128L * 1024 * 1024)
-      setMaxEvaluationReturnSizeBytes(1024 * 1024)
+  private fun createWebViewHost(terminated: () -> Unit): DocumentRuntimeHost {
+    val opening = WebViewDocumentRuntimeHost.create(
+      applicationContext, mainHandler, storageWorker, networkWorker,
+      ::executeStorageRequest, ::executeNetworkRequest, terminated,
+    )
+    return try {
+      opening.get(15, TimeUnit.SECONDS)
+    } catch (error: Exception) {
+      if (!opening.completeExceptionally(error)) opening.getNow(null)?.close()
+      throw error
     }
-    val runtime = engine.createIsolate(startup)
-    isolate = runtime
-    runtime.addOnTerminatedCallback({ it.run() }) { if (!destroying && isolate === runtime) startRecovery() }
-    val code = assets.open("syncpeer-documents.js").bufferedReader().use { it.readText() }
-    check(runtime.evaluateJavaScriptAsync(code).get(15, TimeUnit.SECONDS) == "ready")
+  }
+
+  private fun executeStorageRequest(raw: String): String {
+    val request = JSONObject(raw)
+    val reply = JSONObject().put("id", request.getLong("id"))
+    try { reply.put("result", checkNotNull(storage).execute(request) ?: JSONObject.NULL) }
+    catch (_: Exception) { reply.put("error", "Document storage operation failed.") }
+    return reply.toString()
+  }
+
+  private fun executeNetworkRequest(raw: String): String {
+    val request = JSONObject(raw)
+    val reply = JSONObject().put("id", request.getLong("id"))
+    if (request.optString("operation") == "diagnostic") {
+      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        Log.w("SyncpeerRuntime", "${request.optString("event")}: ${request.optString("message")}")
+      }
+      return reply.put("result", JSONObject.NULL).toString()
+    }
+    try { reply.put("result", checkNotNull(network).execute(request) ?: JSONObject.NULL) }
+    catch (error: Exception) { reply.put("error", error.message ?: "Network operation failed.") }
+    return reply.toString()
+  }
+
+  @Synchronized private fun closeRuntimeHost() {
+    runtimeGeneration += 1
+    val previous = runtimeHost
+    runtimeHost = null
+    documentsStarted = false
+    runCatching { previous?.close() }
+  }
+
+  @Synchronized private fun recoveryIsPending(): Boolean = recoveryWillRetry
+
+  @Synchronized private fun failRecoveryIfInjected() {
+    if (injectedRecoveryFailures == 0) return
+    injectedRecoveryFailures -= 1
+    injectedRecoveryAttempts += 1
+    throw TimeoutException("Synthetic document runtime startup timeout.")
+  }
+
+  @Synchronized private fun cancelPendingRecoveryRetry() {
+    pendingRecoveryRetry?.let { mainHandler.removeCallbacks(it) }
+    pendingRecoveryRetry = null
+    recoveryWillRetry = false
+  }
+
+  @Synchronized private fun recordRecoveryFailure(error: Exception): DocumentRuntimeStatus {
+    recoveryFailureCount += 1
+    val decision = documentRuntimeRecoveryDecision(recoveryFailureCount, error)
+    val status = if (decision.retryDelayMs == null || destroying) {
+      DocumentRuntimeStatus(
+        "error",
+        "Document runtime could not recover. Reopen Syncpeer to retry.",
+        failureType = decision.failureType,
+      )
+    } else {
+      DocumentRuntimeStatus(
+        "error",
+        "Document runtime is retrying (${recoveryFailureCount} of 5).",
+        failureType = decision.failureType,
+      )
+    }
+    terminalStatus = status
+    recoveryWillRetry = decision.retryDelayMs != null && !destroying
+    sessionStarted = false
+    if (sessionRequest != null) {
+      sessionPhase = if (decision.retryDelayMs == null || destroying) "error" else "waiting"
+      sessionError = status.summary
+    }
+    if (decision.retryDelayMs != null && !destroying) {
+      lateinit var retry: Runnable
+      retry = Runnable {
+        synchronized(this@DocumentRuntimeService) {
+          if (destroying || pendingRecoveryRetry !== retry) return@Runnable
+          pendingRecoveryRetry = null
+        }
+        startRecovery()
+      }
+      pendingRecoveryRetry = retry
+      mainHandler.postDelayed(retry, decision.retryDelayMs)
+    }
+    contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
+    return status
   }
 
   @Synchronized private fun startRecovery(): CompletableFuture<DocumentRuntimeStatus> {
     recovery?.let { return it }
+    pendingRecoveryRetry?.let {
+      return CompletableFuture.completedFuture(checkNotNull(terminalStatus))
+    }
     val task = CompletableFuture<DocumentRuntimeStatus>()
     recovery = task
+    recoveryWillRetry = true
     terminalStatus = DocumentRuntimeStatus("error", "Document runtime is restarting.")
     nextSessionGeneration()
     sessionStarted = false
-    sessionPhase = if (sessionRequest == null) "idle" else "starting"
-    sessionError = null
-    val previous = isolate
-    isolate = null
-    runCatching { previous?.close() }
+    sessionPhase = if (sessionRequest == null) "idle" else "waiting"
+    sessionError = if (sessionRequest == null) null else terminalStatus?.summary
+    closeRuntimeHost()
     contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
     try {
       worker.execute {
         try {
-          documentsStarted = false
-          storagePort = null
-          networkPort = null
+          failRecoveryIfInjected()
           storageWorker.submit { storage?.close(); storage = null }.get(15, TimeUnit.SECONDS)
           networkWorker.submit { network?.close(); network = null }.get(15, TimeUnit.SECONDS)
-          val status = if (sandbox == null) initialize() else {
-            loadCore(checkNotNull(sandbox))
-            DocumentRuntimeStatus("locked", "Document access is not configured.")
+          val status = initialize()
+          synchronized(this@DocumentRuntimeService) {
+            terminalStatus = if (status.phase == "locked") null else status
+            recoveryFailureCount = 0
+            cancelPendingRecoveryRetry()
           }
-          terminalStatus = if (status.phase == "locked") null else status
           vaultSummary = null
           task.complete(status)
           if (status.phase == "locked") sessionRequest?.let { request ->
             sessionPhase = "starting"
             evaluateSession(request, sessionGeneration, CompletableFuture())
+          } else if (sessionRequest != null) {
+            sessionPhase = "error"
+            sessionError = status.summary
           }
         } catch (error: Exception) {
-          val failed = isolate
-          isolate = null
-          runCatching { failed?.close() }
-          val status = DocumentRuntimeStatus("error", "Document runtime could not recover. Reopen Syncpeer to retry.",
-            failureType = (error.cause ?: error).javaClass.simpleName)
-          terminalStatus = status
-          task.complete(status)
+          closeRuntimeHost()
+          task.complete(recordRecoveryFailure(error))
         } finally {
           recovery = null
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
@@ -590,7 +700,7 @@ class DocumentRuntimeService : Service() {
       }
     } catch (error: Exception) {
       recovery = null
-      task.completeExceptionally(error)
+      task.complete(recordRecoveryFailure(error))
     }
     return task
   }
@@ -599,22 +709,18 @@ class DocumentRuntimeService : Service() {
 
   override fun onDestroy() {
     destroying = true
+    cancelPendingRecoveryRetry()
     stopFavoriteSyncSchedule()
     unregisterBackgroundSignals()
     // Serialize teardown after initialization; shutdown drains the already queued work.
     worker.execute {
       runCatching {
-        isolate?.evaluateJavaScriptAsync("(async () => { await globalThis.syncpeerDocuments?.close(); return 'closed'; })()")
+        runtimeHost?.evaluate("await globalThis.syncpeerDocuments?.close(); return 'closed';", ByteArray(0))
           ?.get(15, TimeUnit.SECONDS)
       }
-      isolate?.close()
-      isolate = null
-      sandbox?.close()
-      sandbox = null
+      closeRuntimeHost()
       storageWorker.execute { storage?.close(); storage = null }
       networkWorker.execute { network?.close(); network = null }
-      storagePort = null
-      networkPort = null
       networkWorker.shutdown()
       storageWorker.shutdown()
     }

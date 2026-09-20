@@ -1,6 +1,8 @@
 // JavaScriptEngine has no browser text codecs; install the standard UTF-8 shim
 // before loading core. Encryption and authenticated file layout stay in core.
 import "./document-runtime-polyfills.js";
+import { installAndroidTimers } from "./document-runtime-polyfills.js";
+import { createPortRequest } from "./document-runtime-port.js";
 import { createDocumentFilesystem } from "../../core/src/sync/documentFilesystem.js";
 import { dispatchDocumentCommand } from "../../core/src/sync/documentCommands.js";
 import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js";
@@ -9,28 +11,13 @@ import { createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDi
 import { createSyncpeerCoreClient, type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
 import { createConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
+import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
 
-const createPortRequest = async (port: MessagePort) => {
-  let next = 0;
-  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
-  port.onmessage = event => {
-    const reply = JSON.parse(event.data);
-    const task = pending.get(reply.id);
-    if (!task) return;
-    pending.delete(reply.id);
-    if (reply.error) task.reject(new Error(reply.error)); else task.resolve(reply.result);
-  };
-  return (input: object): Promise<unknown> => new Promise((resolve, reject) => {
-    const id = ++next; pending.set(id, { resolve, reject });
-    port.postMessage(JSON.stringify({ id, ...input }));
-  });
-};
-
 const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<SyncpeerHostAdapter> => {
-  const request = await createPortRequest(await android.getNamedPort("network"));
+  const request = createPortRequest(await android.getNamedPort("network"));
   const socket = (sessionId: number, peerCertificateDer: Uint8Array, transport: "tls" | "quic" = "tls"): SyncpeerTlsSocket => ({
     peerCertificateDer: async () => peerCertificateDer,
     read: async (maxBytes?: number) => {
@@ -42,6 +29,11 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
     close: async () => { await request({ operation: transport === "quic" ? "quicClose" : "tlsClose", sessionId }); },
   });
   return {
+    log: (event, details) => {
+      if (!["core.upload.request.failed", "core.replica.receive.failed"].includes(event)) return;
+      void request({ operation: "diagnostic", event,
+        message: typeof details?.message === "string" ? details.message : "Unknown runtime failure." });
+    },
     connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal }) => {
       const value = await request({ operation: "tlsOpen", host, port, certPem, keyPem, caPem: caPem ?? null, timeoutMs: timeoutMs ?? null }) as { sessionId: number; peerCertificateDer: number[] };
       const result = socket(Number(value.sessionId), new Uint8Array(value.peerCertificateDer));
@@ -81,20 +73,9 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
 };
 
 async function startDocuments(android: AndroidRuntime) {
+  await installAndroidTimers(android);
   const port = await android.getNamedPort("storage");
-  let next = 0;
-  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
-  port.onmessage = event => {
-    const reply = JSON.parse(event.data);
-    const task = pending.get(reply.id);
-    if (!task) return;
-    pending.delete(reply.id);
-    if (reply.error) task.reject(new Error(reply.error)); else task.resolve(reply.result);
-  };
-  const request = (input: object): Promise<unknown> => new Promise((resolve, reject) => {
-    const id = ++next; pending.set(id, { resolve, reject });
-    port.postMessage(JSON.stringify({ id, ...input }));
-  });
+  const request = createPortRequest(port);
   const native = (input: object) => request({ method: "storage", input });
   const openStorage = async (id: string) => createNativeFilesystem(native, String(await request({ method: "root", idValue: id })));
   const secret = (operation: string, value?: string) => request({ method: "secret", operation, secret: value });
@@ -109,9 +90,10 @@ async function startDocuments(android: AndroidRuntime) {
     command: (input: unknown) => dispatchDocumentCommand(documents, input),
     close: documents.close,
     connectionPasswords: documents.connectionPasswords,
+    sessionSharedFolders: documents.sessionSharedFolders,
     rememberFolder: documents.rememberFolder,
-    syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1]) =>
-      syncServiceFileFavorites(documents, remoteFs),
+    syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1], excludeFolderIds: readonly string[]) =>
+      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds }),
   };
 }
 
@@ -119,6 +101,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
   const adapter = await createAndroidSessionAdapter(android);
   const core = createSyncpeerCoreClient(adapter);
   let activeOptions: ConnectOptions | null = null;
+  let sharedFolderIds: string[] = [];
   const lifecycle = createConnectionLifecycle<ConnectOptions>({
     open: async (options, signal) => {
       let passwords: Record<string, string> = {};
@@ -130,6 +113,11 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         // unlock it later before requesting a favorite download.
       }
       if (!options.cert || !options.key) throw new Error("Background session is missing the resolved identity.");
+      const folderPasswords = {
+        ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
+        ...options.folderPasswords,
+      };
+      const sharedFolders = await documents.sessionSharedFolders(folderPasswords);
       const coreOptions: SyncpeerConnectOptions = {
         host: options.host,
         port: options.port,
@@ -143,9 +131,12 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         enableRelayFallback: options.enableRelayFallback,
         relayOnly: options.relayOnly,
         quicOnly: options.quicOnly,
-        folderPasswords: { ...passwords, ...options.folderPasswords },
+        folderPasswords,
+        sharedFolders,
       };
-      return core.openSession(coreOptions, signal);
+      const session = await core.openSession(coreOptions, signal);
+      sharedFolderIds = sharedFolders.map(folder => folder.id);
+      return session;
     },
     keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName }),
   });
@@ -162,29 +153,70 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         const options = request.options as ConnectOptions;
         activeOptions = options;
         const session = await lifecycle.connect(options);
-        // Keep the directory-service roots visible without subscribing the
-        // cache to a whole remote folder.  Actual bytes still arrive only via
-        // an explicit favorite download or a future explicit folder-sync mode.
+        // Remember newly advertised roots. Folders already attached to the
+        // DocumentsProvider are supplied above as explicit full replicas;
+        // unattached folders remain metadata-only until selected.
         for (const folder of await session.remoteFs.listFolders()) {
           await documents.rememberFolder({ id: folder.id, label: folder.label || folder.id });
         }
         return { phase: lifecycle.getState().phase };
       }
-      if (request.operation === "disconnect") { activeOptions = null; await lifecycle.disconnect(); return { phase: "idle" }; }
+      if (request.operation === "disconnect") {
+        activeOptions = null;
+        sharedFolderIds = [];
+        await lifecycle.disconnect();
+        return { phase: "idle" };
+      }
       if (request.operation === "syncFavorites") {
         const session = lifecycle.getSession();
         if (!session) return { phase: "waiting" };
-        return documents.syncFavorites(session.remoteFs);
+        return documents.syncFavorites(session.remoteFs, sharedFolderIds);
       }
       if (request.operation === "status") return { ...lifecycle.getState(), active: !!lifecycle.getSession(), hasOptions: !!activeOptions };
       throw new Error(`Unknown session operation: ${String(request.operation)}`);
     },
-    close: async () => { activeOptions = null; await lifecycle.disconnect(); },
+    close: async () => { activeOptions = null; sharedFolderIds = []; await lifecycle.disconnect(); },
   };
 }
 
 Object.defineProperty(globalThis, "syncpeerDocumentsCore", {
-  value: { deriveUntrustedFolderCrypto, createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDiskRange, startDocuments, startSession },
+  value: { deriveUntrustedFolderCrypto, createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDiskRange,
+    installAndroidTimers, startDocuments, startSession },
   writable: false,
   configurable: false,
 });
+
+const installWebViewRuntimeHost = () => {
+  if (typeof window === "undefined") return;
+  window.addEventListener("message", event => {
+    if (event.data !== "syncpeer-runtime" || event.ports.length !== 3) return;
+    const [commands, storage, network] = event.ports;
+    const ports = new Map([["storage", storage], ["network", network]]);
+    const android: AndroidRuntime = {
+      getNamedPort: async name => {
+        const port = ports.get(name);
+        if (!port) throw new Error(`Unknown Android runtime port: ${name}`);
+        return port;
+      },
+    };
+    commands.onmessage = async message => {
+      const request = JSON.parse(message.data) as { id: number; code: string; input: string };
+      try {
+        const run = Object.getPrototypeOf(async function () {}).constructor(
+          "android", "input", request.code,
+        ) as (android: AndroidRuntime, input: unknown) => Promise<unknown>;
+        const result = await run(android, JSON.parse(request.input));
+        commands.postMessage(JSON.stringify({ id: request.id, result: String(result) }));
+      } catch (error) {
+        commands.postMessage(JSON.stringify({ id: request.id,
+          error: error instanceof Error ? error.message : "Document runtime command failed." }));
+      }
+    };
+    commands.start();
+    storage.start();
+    network.start();
+    commands.postMessage(JSON.stringify({ ready: true }));
+  }, { once: true });
+};
+
+installWebViewRuntimeHost();

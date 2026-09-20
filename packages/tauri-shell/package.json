@@ -33,6 +33,7 @@
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@ungap/structured-clone": "^1.4.0",
-    "abort-controller": "^3.0.0"
+    "abort-controller": "^3.0.0",
+    "base64-js": "^1.5.1"
   }
 }

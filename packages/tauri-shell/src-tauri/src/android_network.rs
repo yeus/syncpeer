@@ -175,10 +175,10 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
         env.set_rust_field(
             &object,
             "nativeHandle",
-            AndroidNetwork {
+            Arc::new(AndroidNetwork {
                 tls_store: Arc::new(Mutex::new(TlsSessionStore::default())),
                 quic_store: Arc::new(Mutex::new(QuicSessionStore::default())),
-            },
+            }),
         )
     };
     if result.is_err() {
@@ -205,9 +205,12 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
         }
         let request: serde_json::Value = serde_json::from_str(&json)
             .map_err(|error| format!("Invalid network request: {error}"))?;
-        let network =
-            unsafe { env.get_rust_field::<_, _, AndroidNetwork>(&object, "nativeHandle") }
-                .map_err(|error| error.to_string())?;
+        let network = {
+            let network =
+                unsafe { env.get_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") }
+                    .map_err(|error| error.to_string())?;
+            Arc::clone(&network)
+        };
         execute(&network, &request)
     })();
     let response = match result {
@@ -231,5 +234,5 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
     mut env: JNIEnv,
     object: JObject,
 ) {
-    let _ = unsafe { env.take_rust_field::<_, _, AndroidNetwork>(&object, "nativeHandle") };
+    let _ = unsafe { env.take_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") };
 }

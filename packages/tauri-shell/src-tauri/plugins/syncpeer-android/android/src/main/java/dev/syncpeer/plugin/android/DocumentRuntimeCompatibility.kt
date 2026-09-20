@@ -1,20 +1,11 @@
 package dev.syncpeer.plugin.android
 
-internal fun documentRuntimeCompatibility(
+internal enum class DocumentRuntimeKind { SANDBOX, WEB_VIEW }
+
+internal fun selectDocumentRuntime(
   sandboxSupported: Boolean,
   requiredFeatures: List<String>,
   featureSupported: (String) -> Boolean,
-): DocumentRuntimeStatus? {
-  if (!sandboxSupported) {
-    return DocumentRuntimeStatus(
-      "unsupported",
-      "Document access needs a supported Android System WebView.",
-    )
-  }
-  val missing = requiredFeatures.filterNot(featureSupported)
-  return if (missing.isEmpty()) null else DocumentRuntimeStatus(
-    "unsupported",
-    "This Android System WebView lacks required document-access capabilities.",
-    missing,
-  )
-}
+): DocumentRuntimeKind = if (
+  sandboxSupported && requiredFeatures.all(featureSupported)
+) DocumentRuntimeKind.SANDBOX else DocumentRuntimeKind.WEB_VIEW

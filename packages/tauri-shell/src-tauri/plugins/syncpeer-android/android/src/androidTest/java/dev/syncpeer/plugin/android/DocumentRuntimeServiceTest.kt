@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.database.ContentObserver
 import android.os.IBinder
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -20,7 +21,7 @@ import org.json.JSONObject
 import java.security.MessageDigest
 import java.io.File
 
-/** Starts the runtime from an application Context; no Activity or WebView is created. */
+/** Starts the runtime from an application Context; no Activity or visible interface is created. */
 @RunWith(AndroidJUnit4::class)
 class DocumentRuntimeServiceTest {
   @Test fun pickerUsesRegisteredEncryptedFilesAndKeystoreWithoutAnActivity() {
@@ -40,7 +41,7 @@ class DocumentRuntimeServiceTest {
         command("changeMasterPassword", JSONObject().put("password", "synthetic-master"))
       }
       when (status.getJSONObject("vault").getString("phase")) {
-        "uninitialized" -> command("createVault", JSONObject().put("password", "synthetic-master"))
+        "uninitialized" -> command("createVault", JSONObject().put("password", "synthetic-master").put("remember", true))
         "locked" -> command("unlock", JSONObject().put("password", "synthetic-master"))
       }
       if ((command("status") as JSONObject).getJSONArray("folders").length() == 0) {
@@ -65,6 +66,11 @@ class DocumentRuntimeServiceTest {
       command("attachDownloads", JSONObject().put("id", "fixture-folder"))
       val cached = command("cachedFiles") as JSONArray
       assertTrue((0 until cached.length()).any { cached.getJSONObject(it).getLong("sizeBytes") == expected.size.toLong() })
+      val statuses = command("cachedStatuses", JSONObject().put("folderId", "fixture-folder")
+        .put("paths", JSONArray(listOf("sample.bin")))) as JSONArray
+      assertEquals(1, statuses.length())
+      assertTrue((command("favoriteSyncState", JSONObject().put("folderId", "fixture-folder")) as JSONObject)
+        .has("entries"))
       val downloaded = (command("beginDownload", JSONObject().put("folderId", "fixture-folder")
         .put("path", "downloaded.bin").put("size", 4).put("modifiedMs", 1000).put("encrypted", false)) as Number).toInt()
       command("write", JSONObject().put("handle", downloaded).put("offset", 0).put("bytes", JSONArray(listOf(1, 2, 3, 4))))
@@ -276,11 +282,57 @@ class DocumentRuntimeServiceTest {
     try {
       val runtime = client.second.get(15, TimeUnit.SECONDS)
       assumeTrue(runtime.status().get(30, TimeUnit.SECONDS).phase == "locked")
-      assertEquals("locked", runtime.restartForTesting().get(30, TimeUnit.SECONDS).phase)
+      val recovery = runtime.restartForTesting()
+      assertSame(recovery, runtime.restartForTesting())
+      assertEquals("locked", recovery.get(30, TimeUnit.SECONDS).phase)
       val result = runtime.command(JSONObject().put("operation", "status")).get(30, TimeUnit.SECONDS)
       assertTrue(result.getJSONObject("result").getJSONObject("vault").getString("phase") in
         listOf("uninitialized", "locked", "unlocked"))
     } finally { context.unbindService(client.first) }
+  }
+
+  @Test fun headlessWebViewFallbackRunsTheSharedCoreWithoutAnActivity() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      assumeTrue(runtime.status().get(30, TimeUnit.SECONDS).phase == "locked")
+      assertEquals("locked", runtime.forceWebViewForTesting().get(30, TimeUnit.SECONDS).phase)
+      assertEquals(DocumentRuntimeKind.WEB_VIEW, runtime.runtimeKindForTesting())
+      assertTrue(runtime.evaluate(
+        "return structuredClone.toString();", "{}".toByteArray(),
+      ).get(30, TimeUnit.SECONDS).contains("[native code]"))
+      val result = runtime.command(JSONObject().put("operation", "status")).get(30, TimeUnit.SECONDS)
+      assertTrue(result.getJSONObject("result").has("vault"))
+    } finally { context.unbindService(client.first) }
+  }
+
+  @Test fun repeatedRuntimeStartupFailuresExhaustTheirRetryBudget() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      assumeTrue(runtime.status().get(30, TimeUnit.SECONDS).phase == "locked")
+      runtime.injectRecoveryFailuresForTesting(6)
+      val started = SystemClock.elapsedRealtime()
+      assertEquals("error", runtime.restartForTesting().get(10, TimeUnit.SECONDS).phase)
+      val deadline = started + 50_000
+      var status = runtime.status().get(5, TimeUnit.SECONDS)
+      while (runtime.injectedRecoveryAttemptsForTesting() < 6 && SystemClock.elapsedRealtime() < deadline) {
+        Thread.sleep(250)
+        status = runtime.status().get(5, TimeUnit.SECONDS)
+      }
+      assertEquals("error", status.phase)
+      assertTrue(status.summary.contains("could not recover"))
+      assertEquals(6, runtime.injectedRecoveryAttemptsForTesting())
+      assertTrue(SystemClock.elapsedRealtime() - started >= 30_000)
+      Thread.sleep(1_500)
+      assertEquals(6, runtime.injectedRecoveryAttemptsForTesting())
+      // Restore this shared test process after proving that automatic retries stop.
+      assertEquals("locked", runtime.resetRecoveryBudgetForTesting().get(30, TimeUnit.SECONDS).phase)
+    } finally {
+      context.unbindService(client.first)
+    }
   }
 
   private fun checkProviderStatus(context: Context, expected: String) {

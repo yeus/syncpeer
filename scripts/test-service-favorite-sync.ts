@@ -105,6 +105,22 @@ async function cacheRemoteFile(documents: Awaited<ReturnType<typeof createFixtur
 const favoriteState = async (documents: Awaited<ReturnType<typeof createFixture>>["documents"]) =>
   (await documents.favoriteSyncState("folder")).entries["notes.txt"];
 
+test("skips favorite sync for a folder owned by live replica sync", async () => {
+  const { documents } = await createFixture();
+  const { remote } = fakeRemote(new Map([["notes.txt", {
+    bytes: encoder.encode("from peer"), modifiedMs: 10,
+  }]]));
+  remote.readDir = async () => { throw new Error("Excluded folder was read."); };
+
+  const result = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, {
+    nowMs: 1000,
+    excludeFolderIds: ["folder"],
+  });
+
+  assert.deepEqual(result, { results: [] });
+  await documents.close();
+});
+
 test("downloads a newly selected favorite and persists its baseline", async () => {
   const { documents, storageId } = await createFixture();
   const content = encoder.encode("from peer");

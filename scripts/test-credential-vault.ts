@@ -6,6 +6,19 @@ import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } fro
 import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { deriveUntrustedFolderCrypto } from "@syncpeer/core/filesystem";
 import { writeEncryptedRecord } from "../packages/core/dist/sync/encryptedRecord.js";
+import { resolveFolderPasswordsForDevice } from "../packages/core/dist/ui/sessionPasswords.js";
+
+test("headless sessions resolve peer-scoped folder passwords after restart", () => {
+  const deviceId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  assert.deepEqual(resolveFolderPasswordsForDevice({
+    [`${deviceId}:photos`]: "peer-password",
+    notes: "legacy-password",
+    "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:photos": "other-password",
+  }, deviceId), {
+    photos: "peer-password",
+    notes: "legacy-password",
+  });
+});
 
 test("new personal-space vault wraps one stable random key instead of re-encrypting settings on password change", async () => {
   let record: unknown = null;

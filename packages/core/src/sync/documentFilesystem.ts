@@ -1022,6 +1022,22 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
   attachDownloads: (id: string) => runQueued(runtime, () => attachDownloadsAction(runtime, id)),
   detachDownloads: (id: string) => runQueued(runtime, () => detachDownloadsAction(runtime, id)),
   clearFolderContents: (folderId: string) => runQueued(runtime, () => clearFolderContentsAction(runtime, folderId)),
+  sessionSharedFolders: (passwords: Record<string, string>) => runQueued(runtime, async () => {
+    const registry = requireUnlockedRegistry(runtime);
+    return registry.getState().filter(folder => folder.downloads).map(folder => {
+      const replica = registry.getReplica(folder.id);
+      if (!replica) throw new Error("Document folder is not open.");
+      const password = passwords[folder.id]?.trim();
+      return {
+        id: folder.id,
+        label: folder.label,
+        replica,
+        encryption: password
+          ? { mode: "encrypted" as const, password }
+          : { mode: "plaintext" as const },
+      };
+    });
+  }),
   favoriteSyncState: (folderId: string) => runQueued(runtime, async () => {
     const { bytes, key } = favoriteStateTarget(runtime, folderId);
     return loadFavoriteSyncState(bytes, key);

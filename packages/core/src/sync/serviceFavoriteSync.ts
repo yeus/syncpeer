@@ -418,13 +418,16 @@ const syncFolderFavorites = async (args: {
 export async function syncServiceFileFavorites(
   documents: DocumentFilesystem,
   remoteFs: RemoteFs,
-  options: { nowMs?: number } = {},
+  options: { nowMs?: number; excludeFolderIds?: readonly string[] } = {},
 ): Promise<{ skipped?: "locked"; results: FavoriteSyncResult[] }> {
   const nowMs = options.nowMs ?? Date.now();
   const status = await documents.status();
   if (status.vault.phase !== "unlocked") return { skipped: "locked", results: [] };
   const settings = await documents.profileSettings();
-  const registered = new Map(status.folders.filter(folder => folder.downloads).map(folder => [folder.id, folder]));
+  const excluded = new Set(options.excludeFolderIds ?? []);
+  const registered = new Map(status.folders
+    .filter(folder => folder.downloads && !excluded.has(folder.id))
+    .map(folder => [folder.id, folder]));
   const folderInfos = new Map((await remoteFs.listFolders()).map(folder => [folder.id, folder]));
   const results: FavoriteSyncResult[] = [];
   for (const [folderId, folderSettings] of Object.entries(settings.folders)) {

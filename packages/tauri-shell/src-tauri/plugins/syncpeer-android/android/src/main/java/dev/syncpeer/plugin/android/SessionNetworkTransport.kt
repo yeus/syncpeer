@@ -9,7 +9,7 @@ import org.json.JSONObject
  */
 @Keep
 class SessionNetworkTransport : AutoCloseable {
-  @Keep private var nativeHandle: Long = 0
+  @Keep @Volatile private var nativeHandle: Long = 0
 
   init {
     System.loadLibrary("tauri_shell_lib")
@@ -20,7 +20,6 @@ class SessionNetworkTransport : AutoCloseable {
   private external fun request(json: String): String
   private external fun dispose()
 
-  @Synchronized
   fun execute(input: JSONObject): Any? {
     check(nativeHandle != 0L) { "Network transport is closed" }
     val reply = JSONObject(request(input.toString()))

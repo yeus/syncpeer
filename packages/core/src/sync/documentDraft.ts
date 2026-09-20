@@ -171,7 +171,13 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
       if (!head.dirty) { head = { ...head, dirty: true }; await saveHead(); }
       for (let done = 0; done < input.length;) {
         const position = offset + done, index = Math.floor(position / 131072), start = position % 131072;
-        const count = Math.min(input.length - done, 131072 - start), data = await chunk(index);
+        const count = Math.min(input.length - done, 131072 - start);
+        const downloadBlockSize = head.download
+          ? Math.min(131072, head.download.sizeBytes - index * 131072)
+          : 0;
+        const data = head.download && start === 0 && count === downloadBlockSize
+          ? new Uint8Array(131072)
+          : await chunk(index);
         try {
           data.set(input.subarray(done, done + count), start);
           await writeRecord(bytes, `${prefix}/chunk-${index}`, data, options); chunks.add(index);

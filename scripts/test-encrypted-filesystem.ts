@@ -10,7 +10,7 @@ import path from "node:path";
 import { binaryPath, ensureSyncthingTools, createLanFixture } from "./lan-test/syncthing.ts";
 import { createNodeFileDownloadSink } from "../packages/core/dist/transfer/nodeStorage.js";
 import { FileInfo } from "../packages/core/dist/core/protocol/bep.js";
-import { deriveUntrustedFolderCrypto, deriveUntrustedFileKey, encryptUntrustedFilename, encryptUntrustedBytes, encryptUntrustedBlockHash } from "../packages/core/dist/core/model/untrusted.js";
+import { decryptUntrustedBlockHash, deriveUntrustedFolderCrypto, deriveUntrustedFileKey, encryptUntrustedFilename, encryptUntrustedBytes, encryptUntrustedBlockHash } from "../packages/core/dist/core/model/untrusted.js";
 import { loadEncryptedDiskMetadata, readEncryptedDiskRange, writeEncryptedDiskFile, readEncryptedNamespace, createEncryptedDownloadSink } from "@syncpeer/core/filesystem";
 import { encryptUntrustedFileInfo, decryptUntrustedFileInfo } from "../packages/core/dist/core/model/untrustedMetadata.js";
 import { RemoteFs } from "../packages/core/dist/core/model/remoteFs.js";
@@ -361,13 +361,28 @@ test("encrypted block tokens bind the plaintext offset as Syncthing's eight-byte
     const additional = new Uint8Array(8);
     new DataView(additional.buffer).setBigUint64(0, BigInt(offset), false);
     const token = encryptUntrustedBlockHash(key, hash, offset);
-    assert.deepEqual(aessiv(key, additional).decrypt(token), hash);
+    assert.deepEqual(aessiv(key, additional, new Uint8Array()).decrypt(token), hash);
     assert.deepEqual(encryptUntrustedBlockHash(key, hash, offset), token);
   }
   assert.notDeepEqual(encryptUntrustedBlockHash(key, hash, 0), encryptUntrustedBlockHash(key, hash, 131072));
   for (const offset of [-1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => encryptUntrustedBlockHash(key, hash, offset), /offset/i);
   }
+});
+
+test("encrypted block tokens validate current and legacy Syncthing requests", () => {
+  const key = new Uint8Array(32).fill(7);
+  const hash = sha256(new Uint8Array([4, 5, 6]));
+  const offset = 131072;
+  assert.deepEqual(
+    decryptUntrustedBlockHash(key, encryptUntrustedBlockHash(key, hash, offset), offset),
+    hash,
+  );
+  assert.deepEqual(decryptUntrustedBlockHash(key, aessiv(key).encrypt(hash), offset), hash);
+  assert.throws(
+    () => decryptUntrustedBlockHash(key, encryptUntrustedBlockHash(key, hash, offset), 0),
+    /token/i,
+  );
 });
 
 const fixture = async (chunks = [new Uint8Array([1, 2, 3])], name = "nested/file") => {

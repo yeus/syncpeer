@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { createEncryptedReplicaStorage, createFolderReplica, deriveUntrustedFolderCrypto } from "../packages/core/dist/filesystem.js";
-import { openDocumentDraft, recoverDocumentDrafts } from "../packages/core/dist/sync/documentDraft.js";
+import { openDocumentDownloadDraft, openDocumentDraft, recoverDocumentDrafts } from "../packages/core/dist/sync/documentDraft.js";
 
 test("large document writes are linear, durable before publication, and recover after interruption", async () => {
   const fixture = memoryReplicaStorage();
@@ -47,5 +47,32 @@ test("large document writes are linear, durable before publication, and recover 
   const unchanged = await openDocumentDraft(bytes, { ...options, truncate: false });
   assert.deepEqual(await unchanged.readRange(0, 3), Uint8Array.of(71, 5, 6));
   await unchanged.close();
+  folderKey.fill(0);
+});
+
+test("a resumed download replaces a damaged full journal block", async () => {
+  const fixture = memoryReplicaStorage();
+  const bytes = { ...fixture.storage, copy: async (source: string, target: string) => {
+    const data = fixture.files.get(source)!.bytes.slice();
+    const sink = await fixture.storage.createSink(target, data.length);
+    await sink.write(0, data); await sink.commit();
+  } };
+  const { folderKey } = await deriveUntrustedFolderCrypto("fixture-folder", "synthetic-password");
+  const replica = createFolderReplica(createEncryptedReplicaStorage(bytes, { folderKey, randomBytes,
+    withLock: async fn => fn(), checkHealth: async () => {}, archive: async () => {} }), "42", sha256);
+  const options = { folderId: "fixture-folder", path: "download.bin", folderKey, randomBytes, replica,
+    download: { folderId: "fixture-folder", path: "download.bin", sizeBytes: 131072,
+      modifiedMs: 1, encrypted: true } };
+  const interrupted = await openDocumentDownloadDraft(bytes, options);
+  await interrupted.write(0, new Uint8Array(131072).fill(1));
+  await interrupted.close();
+  const encryptedChunk = [...fixture.files].find(([path]) =>
+    path.startsWith(".syncpeer-draft-") && path.endsWith("/chunk-0"))!;
+  encryptedChunk[1].bytes[0] ^= 1;
+  const resumed = await openDocumentDownloadDraft(bytes, options);
+  const replacement = new Uint8Array(131072).fill(2);
+  await resumed.write(0, replacement);
+  assert.deepEqual(await resumed.readRange(0, replacement.length), replacement);
+  await resumed.close();
   folderKey.fill(0);
 });

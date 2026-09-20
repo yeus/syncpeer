@@ -157,6 +157,8 @@ export interface BepRequest {
   offset?: number;
   size?: number;
   hash?: Uint8Array;
+  from_temporary?: boolean;
+  block_no?: number;
 }
 
 export interface BepClose {

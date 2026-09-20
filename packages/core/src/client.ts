@@ -46,6 +46,7 @@ import {
   type PendingIndexFrame,
 } from "./core/protocol/indexQueue.js";
 import {
+  decryptUntrustedBlockHash,
   encryptUntrustedBlock,
   encryptUntrustedFilename,
   deriveUntrustedFileKey,
@@ -1789,11 +1790,22 @@ class BepSession {
   private async readEncryptedReplicaRequest(folderId: string, req: BepRequest, replica: LocalFolderReplica, crypto: UntrustedFolderCrypto): Promise<Uint8Array> {
     const file = this.advertisedReplicaFiles.get(folderId)?.get(String(req.name));
     if (!file || file.original.deleted || Number(file.original.type ?? 0) !== 0) throw new Error("Encrypted replica file is not advertised.");
-    const index = file.advertised.blocks?.findIndex(block => Number(block.offset) === Number(req.offset) && block.size === Number(req.size)) ?? -1;
+    const index = file.advertised.blocks?.findIndex(block =>
+      Number(block.offset) === Number(req.offset) && Number(block.size) === Number(req.size)) ?? -1;
+    if (index < 0) throw new Error("Encrypted replica block range is not advertised.");
     const original = file.original.blocks?.[index];
     const advertised = file.advertised.blocks?.[index];
-    if (!original || !advertised || (req.hash?.length && !bytesEqual(req.hash, advertised.hash))) {
-      throw new Error("Encrypted replica block is not advertised.");
+    if (!original || !advertised) throw new Error("Encrypted replica block metadata is incomplete.");
+    if (req.hash?.length) {
+      const key = deriveUntrustedFileKey(crypto.folderKey, file.original.name);
+      try {
+        const requestedHash = decryptUntrustedBlockHash(key, req.hash, Number(original.offset));
+        if (!bytesEqual(requestedHash, original.hash)) {
+          throw new Error("Encrypted replica block token does not identify the advertised plaintext block.");
+        }
+      } finally {
+        key.fill(0);
+      }
     }
     const bytes = await replica.readBlock(file.original.name, Number(original.offset), original.size, original.hash);
     const key = deriveUntrustedFileKey(crypto.folderKey, file.original.name);

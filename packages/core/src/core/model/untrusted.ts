@@ -183,7 +183,30 @@ export function encryptUntrustedBlockHash(
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid encrypted block offset.");
   const additional = new Uint8Array(8);
   new DataView(additional.buffer).setBigUint64(0, BigInt(offset), false);
-  return aessiv(fileKey, additional).encrypt(hash);
+  return aessiv(fileKey, additional, EMPTY_AAD).encrypt(hash);
+}
+
+/** Opens the authenticated block token used by Syncthing requests.
+ * Older peers omitted the offset AAD, so accept that form only after the
+ * current format fails authentication.
+ */
+export function decryptUntrustedBlockHash(
+  fileKey: Uint8Array,
+  token: Uint8Array,
+  offset: number,
+): Uint8Array {
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid encrypted block offset.");
+  const additional = new Uint8Array(8);
+  new DataView(additional.buffer).setBigUint64(0, BigInt(offset), false);
+  try {
+    return aessiv(fileKey, additional, EMPTY_AAD).decrypt(token);
+  } catch {
+    try {
+      return aessiv(fileKey).decrypt(token);
+    } catch {
+      throw new Error("Encrypted block token authentication failed.");
+    }
+  }
 }
 
 export function encryptUntrustedBytes(

@@ -423,6 +423,7 @@ export const createLanFixture = async (args: {
   home?: string;
   mode: "direct" | "relay" | "quic";
   encryptedFolderType?: "sendonly" | "sendreceive";
+  includeBlob?: boolean;
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
   const root = args.root;
@@ -451,8 +452,9 @@ export const createLanFixture = async (args: {
   fs.writeFileSync(path.join(sharePath, "nested", "file.txt"), "nested LAN file\n");
   const blob = Buffer.alloc(LAN_FIXTURE_BLOB_SIZE);
   for (let index = 0; index < blob.length; index += 1) blob[index] = index % 251;
-  fs.writeFileSync(path.join(sharePath, "blob.bin"), blob);
+  if (args.includeBlob !== false) fs.writeFileSync(path.join(sharePath, "blob.bin"), blob);
   fs.writeFileSync(path.join(encryptedSharePath, "secret.txt"), "encrypted LAN secret\n");
+  if (args.includeBlob !== false) fs.writeFileSync(path.join(encryptedSharePath, "blob.bin"), blob);
   const encryptedExpected = {
     path: "secret.txt",
     ...hashFile(path.join(encryptedSharePath, "secret.txt")),
@@ -484,7 +486,7 @@ export const createLanFixture = async (args: {
   const syncGuiUrl = "http://127.0.0.1:" + guiPort;
   const request = <T>(call: SyncthingApiCall): Promise<T> =>
     apiRequest<T>(syncGuiUrl, apiKey, call);
-  const expectedFiles = ["hello.txt", "nested/file.txt", "blob.bin"].map((relativePath) => ({
+  const expectedFiles = ["hello.txt", "nested/file.txt", ...(args.includeBlob === false ? [] : ["blob.bin"])].map((relativePath) => ({
     path: relativePath,
     ...hashFile(path.join(sharePath, relativePath)),
   }));

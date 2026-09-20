@@ -16,5 +16,6 @@ logs/
 syncpeer-android-*-arm64-v8a.apk
 packages/tauri-shell/src-tauri/target/
 packages/tauri-shell/src-tauri/gen/*
+packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/
 packages/tauri-shell/src-tauri/icons/*
 !packages/tauri-shell/src-tauri/icons/.gitkeep

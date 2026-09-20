@@ -37,13 +37,25 @@ foreground service, persists its bounded connection request through the
 Keystore-backed vault, and reconnects after network/power policy changes or an
 Android process restart. Returning to the Activity stops the service and waits
 for that session to close before the UI session resumes. This handoff keeps the
-favorite-only cache policy: a background connection does not turn registered
-or downloaded folders into whole-folder subscriptions.
+ownership explicit: folders attached to the DocumentsProvider use their full
+encrypted replica, while unattached folders still download only explicit
+favorites. Peer-scoped saved passwords are resolved before an attached encrypted
+folder is advertised after restart.
 
 Acknowledged encrypted download ranges are journaled with the remote content
 identity. They can be reused after the service or app restarts, but are discarded
 when the remote identity changes. The document runtime also recreates its
 JavaScript isolate after termination without reusing open handles or stale keys.
+Startup and recovery failures retry after 1, 2, 4, 8 and 16 seconds, then fail
+closed until Android recreates the service.
+
+The service prefers AndroidX `JavaScriptSandbox` when it provides promise
+results, message ports, array buffers, termination callbacks, and heap limits.
+If that complete feature set is unavailable, the service runs the same packaged
+document-runtime JavaScript in a hidden WebView. Both hosts remain headless,
+live in the service process, and use the same private storage, network, and timer
+ports; the fallback does not add an Activity, browser UI, or second sync logic
+implementation.
 
 The Android picker exposes create, file rename, and delete where core can perform
 them safely. Deletion uses core's encrypted version archive. Android's
@@ -80,13 +92,18 @@ npm run test:android
 This builds the x86_64 test APK once, starts API 36 to run the focused
 transfer-service smoke test and capture its WebView pair, then starts API 29,
 installs that pair, and runs the Android 10 compatibility suite (including a
-real emulator reboot). Emulators are cleaned up when either phase fails. The
-suite records unsupported optional WebView capabilities instead of treating a
-known capability gap in the test image as an update failure; the deterministic
-capability policy is covered by JVM tests. The combined runner skips the
-separately managed remote-server workflow; the lower-level compatibility command
-can run that workflow when a server fixture is configured. No Play Store account
-or manual WebView update is required.
+real emulator reboot). It then starts a real host Syncthing peer and a separate,
+non-launcher synthetic editor APK. That APK receives a normal persisted SAF grant and performs
+create, write, rename, read and delete operations through the DocumentsProvider.
+The peer gate checks host convergence in both directions, interrupts a measured
+in-progress 4 MiB/32-block replica transfer by sending SIGKILL to the emulator,
+cold-starts it and verifies the entire recovered document through the editor APK,
+then repeats the cold restart with a durable provider edit held offline. The
+ordinary transfer suite separately covers 128 MiB. This real-peer gate passed on
+the managed API 29 emulator on 2026-09-20. The runner uninstalls only the Syncpeer
+app, instrumentation package and synthetic editor from each managed emulator;
+do not use these AVDs for persistent manual test data. Emulators are cleaned up
+when a phase fails. No Play Store account or manual WebView update is required.
 
 For debugging one profile at a time, the lower-level commands remain available:
 

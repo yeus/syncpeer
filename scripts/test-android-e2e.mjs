@@ -33,9 +33,11 @@ const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim()
 const discoveryServer = process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || "";
 // Global mode is relay-only in E2E builds; local TCP fixtures opt into automatic.
 const discoveryMode = process.env.SYNCPEER_ANDROID_DISCOVERY_MODE?.trim() || "global";
-if (!["automatic", "global"].includes(discoveryMode)) {
-  throw new Error("SYNCPEER_ANDROID_DISCOVERY_MODE must be automatic or global.");
+if (!["automatic", "global", "direct"].includes(discoveryMode)) {
+  throw new Error("SYNCPEER_ANDROID_DISCOVERY_MODE must be automatic, global, or direct.");
 }
+const directHost = process.env.SYNCPEER_ANDROID_DIRECT_HOST?.trim() || "10.0.2.2";
+const directPort = process.env.SYNCPEER_ANDROID_DIRECT_PORT?.trim() || "22000";
 const connectionTimeoutMs = Number(process.env.SYNCPEER_LAN_TIMEOUT_MS || 120_000);
 const downloadTimeoutMs = Number(process.env.SYNCPEER_ANDROID_DOWNLOAD_TIMEOUT_MS || 240_000);
 const targetFolderId = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-lan";
@@ -54,6 +56,11 @@ const requireDocumentRuntime = process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME ===
 const skipNetworkWorkflow = hasArgument("--skip-network");
 const modernSmoke = hasArgument("--modern-smoke");
 const expectedSdk = Number(argumentValue("--expect-sdk") || 0);
+const editorPackage = "dev.syncpeer.synthetic.editor";
+const editorAuthority = `${editorPackage}.commands`;
+const peerHostFolder = process.env.SYNCPEER_PEER_HOST_FOLDER?.trim() || "";
+const peerGuiUrl = process.env.SYNCPEER_PEER_GUI_URL?.trim() || "";
+const peerApiKey = process.env.SYNCPEER_PEER_API_KEY?.trim() || "";
 
 const runAdb = (args, timeout = 30_000) => {
   try {
@@ -241,7 +248,8 @@ const waitForCdpPage = async (port = 9222) => {
   while (Date.now() < deadline) {
     try {
       const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-      const page = pages.find((candidate) => candidate.type === "page");
+      const page = pages.find((candidate) =>
+        candidate.type === "page" && candidate.url !== "https://syncpeer.invalid/runtime.html");
       if (page?.webSocketDebuggerUrl) return page;
     } catch {
       // The WebView debug socket appears shortly after the process starts.
@@ -413,6 +421,24 @@ const waitForUiDownloadState = async (cdp, name, timeout = 60_000) => {
   throw new Error(`Timed out waiting for Android UI download state: ${name}`);
 };
 
+const waitForLargeDownloadState = async (cdp, name, previous, timeout = 30_000) => {
+  const deadline = Date.now() + timeout;
+  let changed = previous !== "done" && previous !== "failed";
+  while (Date.now() < deadline) {
+    const state = await readUiDownloadState(cdp, name);
+    if (state === "active" || transferRuntimeRunning()) return "active";
+    if (state === "failed" && (previous !== "failed" || changed)) {
+      const detail = await cdp.evaluate(`(document.body?.innerText || "").split("\\n")
+        .find((line) => line.includes(${JSON.stringify(`Download failed: ${name}`)})) || ""`);
+      throw new Error(`Android UI download failed: ${name}${detail ? ` (${detail})` : ""}`);
+    }
+    if (state !== previous) changed = true;
+    if (state === "done" && changed) return "done";
+    await wait(250);
+  }
+  throw new Error(`Timed out waiting for Android UI download state transition: ${name}`);
+};
+
 const waitForUiDownloadDone = async (cdp, name, timeout = 90_000) => {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -525,17 +551,280 @@ const captureUiHierarchy = async (path, timeout = 15_000) => {
   throw lastError ?? new Error(`Android UI hierarchy was not written to ${path}.`);
 };
 
-const notificationBounds = (xml, text) => {
+const hierarchyTextBounds = (xml, text) => {
+  const escaped = text.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+  return notificationBounds(xml, escaped, true);
+};
+
+const hierarchyResourceBounds = (xml, resourceId) => {
+  const nodes = xml.match(/<node\b[^>]*>/g) ?? [];
+  const node = nodes.find((candidate) => candidate.includes(`resource-id="${resourceId}"`));
+  return node ? nodeBounds(node) : null;
+};
+
+const tapDocumentUiText = async (text, timeout = 30_000) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const xml = await captureUiHierarchy("/sdcard/syncpeer-editor-picker.xml");
+    const bounds = hierarchyTextBounds(xml, text);
+    if (bounds) {
+      runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
+      return;
+    }
+    await wait(500);
+  }
+  throw new Error(`Android document picker did not show ${JSON.stringify(text)}.`);
+};
+
+const tapDocumentUiResource = async (resourceId, timeout = 30_000) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const xml = await captureUiHierarchy("/sdcard/syncpeer-editor-picker.xml");
+    const bounds = hierarchyResourceBounds(xml, resourceId);
+    if (bounds) {
+      runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
+      return;
+    }
+    await wait(500);
+  }
+  throw new Error(`Android document picker did not show resource ${JSON.stringify(resourceId)}.`);
+};
+
+const grantEditorFolder = async () => {
+  runAdb(["shell", "am", "force-stop", editorPackage]);
+  runAdb(["shell", "am", "start", "-n", `${editorPackage}/.GrantActivity`]);
+  await tapDocumentUiText(targetFolderTitle);
+  await tapDocumentUiResource("android:id/button1");
+  try {
+    await waitForEditorGrant(1_500);
+    return;
+  } catch {
+    // API 29 presents a second confirmation dialog; other versions may grant
+    // the selected tree immediately.
+  }
+  await tapDocumentUiText("Allow", 30_000);
+};
+
+const editorCommand = (method, name = "", extras = {}) => {
+  const args = ["shell", "content", "call", "--uri", `content://${editorAuthority}`,
+    "--method", method];
+  if (name) args.push("--arg", name);
+  for (const [key, value] of Object.entries(extras)) {
+    args.push("--extra", `${key}:s:${value}`);
+  }
+  const output = runAdb(args).trim();
+  const result = output.match(/result=([^}]*)/)?.[1];
+  if (result === undefined) throw new Error(`Synthetic editor ${method} returned ${output}.`);
+  return result;
+};
+
+const waitForEditorGrant = async (timeout = 10_000) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      if (editorCommand("status")) return;
+    } catch {
+      // The editor process may still be receiving the picker result.
+    }
+    await wait(250);
+  }
+  throw new Error("Synthetic editor did not persist its SAF grant.");
+};
+
+const waitForHostFile = async (name, expected, timeout = 120_000) => {
+  const target = `${peerHostFolder}/${name}`;
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(target) && fs.readFileSync(target, "utf8") === expected) return;
+    await wait(250);
+  }
+  throw new Error(`Host Syncthing folder did not converge ${name}.`);
+};
+
+const waitForHostDeletion = async (name, timeout = 120_000) => {
+  const target = `${peerHostFolder}/${name}`;
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (!fs.existsSync(target)) return;
+    await wait(250);
+  }
+  throw new Error(`Host Syncthing folder did not delete ${name}.`);
+};
+
+const scanPeerFolder = async () => {
+  if (!peerGuiUrl || !peerApiKey) return;
+  const response = await fetch(
+    `${peerGuiUrl}/rest/db/scan?folder=${encodeURIComponent(targetFolderId)}`,
+    { method: "POST", headers: { "X-API-Key": peerApiKey } },
+  );
+  if (!response.ok) throw new Error(`Host Syncthing scan failed: ${response.status}.`);
+};
+
+const ensurePeerDocumentVault = async (cdp) => {
+  const command = async (request) => {
+    const response = await tauriInvoke(cdp, "syncpeer_document_command", { request }, 60_000);
+    return response.result;
+  };
+  const status = await command({ operation: "status" });
+  if (status.vault.phase === "uninitialized") {
+    await command({
+      operation: "createVault",
+      password: "synthetic-android-vault",
+      remember: true,
+    });
+  } else if (status.vault.phase === "locked") {
+    try {
+      await command({ operation: "unlockRemembered" });
+    } catch {
+      await command({ operation: "unlock", password: "synthetic-android-vault" });
+    }
+  }
+  if (targetFolderPassword) {
+    await command({
+      operation: "saveConnectionPasswords",
+      passwords: { [targetFolderId]: targetFolderPassword },
+    });
+  }
+};
+
+const runPeerCrossAppWorkflow = async () => {
+  if (!peerHostFolder) throw new Error("SYNCPEER_PEER_HOST_FOLDER is required.");
+  let cdp = await launchAndroidApp(true);
+  try {
+    await ensurePeerDocumentVault(cdp);
+    cdp.close();
+    cdp = await launchAndroidApp(true);
+    if (!await openAndroidConnection(cdp)) throw new Error("Peer workflow did not connect.");
+    await openAndroidFolder(cdp, false);
+    await startAndroidFileDownload(cdp, targetFileName);
+    await disconnectAndroidSession(cdp);
+    await waitForSessionService(false, 30_000);
+    await grantEditorFolder();
+    await waitForEditorGrant();
+    if (!await openAndroidConnection(cdp)) throw new Error("Peer workflow did not reconnect after the editor grant.");
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 30_000);
+    await waitForSessionNotificationText(
+      "Peer session connected; selected sync is ready.",
+      120_000,
+    );
+  } finally {
+    cdp.close();
+  }
+  editorCommand("create", "editor-created.txt");
+  editorCommand("write", "editor-created.txt", { content: "created-by-editor" });
+  if (editorCommand("read", "editor-created.txt") !== "created-by-editor") {
+    throw new Error("Synthetic editor write was not readable through the DocumentsProvider.");
+  }
+  await waitForHostFile("editor-created.txt", "created-by-editor");
+  editorCommand("write", "editor-created.txt", { content: "modified-by-editor" });
+  await waitForHostFile("editor-created.txt", "modified-by-editor");
+  editorCommand("rename", "editor-created.txt", { target: "editor-renamed.txt" });
+  await waitForHostFile("editor-renamed.txt", "modified-by-editor");
+  await waitForHostDeletion("editor-created.txt");
+
+  fs.writeFileSync(`${peerHostFolder}/host-created.txt`, "created-by-host", "utf8");
+  await scanPeerFolder();
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      if (editorCommand("read", "host-created.txt") === "created-by-host") break;
+    } catch {
+      // The provider sees the host mutation after the live session applies it.
+    }
+    await wait(250);
+  }
+  if (editorCommand("read", "host-created.txt") !== "created-by-host") {
+    throw new Error("Synthetic editor did not observe the host-created file.");
+  }
+  editorCommand("delete", "editor-renamed.txt");
+  await waitForHostDeletion("editor-renamed.txt");
+  console.log("Separate synthetic editor APK CRUD converged through Syncpeer to host Syncthing and back.");
+};
+
+const preparePeerTransferPowerCut = async () => {
+  await waitForSessionService(true, 30_000);
+  await waitForSessionNotificationText("Peer session connected; selected sync is ready.", 120_000);
+  await wait(1_000);
+  console.log("Android headless replica received the large-file index and is ready for abrupt emulator termination.");
+};
+
+const verifyPeerTransferPowerCut = async () => {
+  const cdp = await launchAndroidApp();
+  try {
+    await waitForEditorGrant();
+    if (!await openAndroidConnection(cdp)) throw new Error("Power-cut recovery did not reconnect.");
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 30_000);
+    await waitForSessionNotificationText(
+      "Peer session connected; selected sync is ready.",
+      120_000,
+    );
+    cdp.close();
+    const deadline = Date.now() + downloadTimeoutMs;
+    let summary = "";
+    let lastError = "";
+    while (Date.now() < deadline) {
+      try {
+        summary = editorCommand("digest", targetLargeFileName);
+        if (summary === `${targetLargeFileSize}:${fixtureBlobHash()}`) break;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        // The provider exposes only committed files, never an interrupted draft.
+      }
+      await wait(500);
+    }
+    if (summary !== `${targetLargeFileSize}:${fixtureBlobHash()}`) {
+      throw new Error(`abrupt emulator termination recovery produced an invalid document: ${summary || "missing"}` +
+        `${lastError ? ` (${lastError})` : ""}`);
+    }
+    console.log("Headless replica recovered after abrupt emulator termination without a corrupt committed file.");
+  } finally {
+    try { cdp.close(); } catch { /* The backgrounded WebView may already be detached. */ }
+  }
+};
+
+const preparePeerEditPowerCut = async () => {
+  editorCommand("create", "power-edit.txt");
+  editorCommand("write", "power-edit.txt", { content: "durable-before-power-cut" });
+  if (editorCommand("read", "power-edit.txt") !== "durable-before-power-cut") {
+    throw new Error("Synthetic editor write was not durable before the power cut.");
+  }
+  console.log("Durable provider edit is ready for abrupt emulator termination.");
+};
+
+const verifyPeerEditPowerCut = async () => {
+  const cdp = await launchAndroidApp();
+  try {
+    if (!await openAndroidConnection(cdp)) throw new Error("Power-cut edit recovery did not reconnect.");
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 30_000);
+    await waitForSessionNotificationText(
+      "Peer session connected; selected sync is ready.",
+      120_000,
+    );
+    cdp.close();
+    await waitForHostFile("power-edit.txt", "durable-before-power-cut");
+    console.log("Provider edit survived abrupt emulator termination and converged to host Syncthing.");
+  } finally {
+    try { cdp.close(); } catch { /* The backgrounded WebView may already be detached. */ }
+  }
+};
+
+const nodeBounds = (node) => {
+  const bounds = node.match(/\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+  return bounds ? {
+    x: Math.floor((Number(bounds[1]) + Number(bounds[3])) / 2),
+    y: Math.floor((Number(bounds[2]) + Number(bounds[4])) / 2),
+  } : null;
+};
+
+const notificationBounds = (xml, text, ignoreCase = false) => {
   const nodes = xml.match(/<node\b[^>]*>/g) ?? [];
   for (const node of nodes) {
     const textValue = node.match(/\btext="([^"]*)"/)?.[1];
-    if (textValue !== text) continue;
-    const bounds = node.match(/\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
-    if (!bounds) continue;
-    return {
-      x: Math.floor((Number(bounds[1]) + Number(bounds[3])) / 2),
-      y: Math.floor((Number(bounds[2]) + Number(bounds[4])) / 2),
-    };
+    if (ignoreCase ? textValue?.toLocaleLowerCase() !== text.toLocaleLowerCase() : textValue !== text) continue;
+    return nodeBounds(node);
   }
   return null;
 };
@@ -621,10 +910,24 @@ const appNotificationRecords = () => {
   return {
     dump,
     records,
+    sessionRecords: records.filter((record) =>
+      /\bid=22068\b/.test(record) || record.includes("channel=syncpeer-session-v1")),
     transferRecords: records.filter((record) =>
       /\bid=(11001|11002|22067)\b/.test(record) || record.includes("channel=syncpeer-transfers"),
     ),
   };
+};
+
+const waitForSessionNotificationText = async (text, timeout = 30_000) => {
+  const deadline = Date.now() + timeout;
+  let count = 0;
+  while (Date.now() < deadline) {
+    const records = appNotificationRecords().sessionRecords;
+    count = records.length;
+    if (records.some((record) => record.includes(text))) return;
+    await wait(250);
+  }
+  throw new Error(`Expected the connected background-session notification; found ${count}.`);
 };
 
 const clearTransferNotifications = async (cdp) => {
@@ -949,6 +1252,25 @@ const openAndroidConnection = async (cdp) => {
     await clickUiTestId(cdp, "connection-settings-toggle");
     await waitForUiText(cdp, "Remote Device ID", 10_000);
   }
+  const peerSaved = await cdp.evaluate(
+    `Array.from(document.querySelectorAll('[data-testid="connection-saved-device"] option'))` +
+    `.some(option => option.value === ${JSON.stringify(serverDeviceId)})`,
+  );
+  if (!peerSaved) {
+    const added = await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find(element => element.textContent?.trim() === "Add Device");
+      const panel = button?.closest("section");
+      const input = panel?.querySelector('input[type="text"]');
+      if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, ${JSON.stringify(serverDeviceId)});
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      button.click();
+      return true;
+    })()`);
+    if (!added) throw new Error("Android UI could not save the managed Syncthing peer.");
+  }
   const initiallyConnected = await cdp.evaluate(
     'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
   );
@@ -963,11 +1285,15 @@ const openAndroidConnection = async (cdp) => {
   }
   await setUiValue(cdp, "connection-saved-device", "");
   await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
-  await setUiValue(cdp, "connection-remote-id", serverDeviceId);
   await setUiValue(cdp, "connection-timeout", String(connectionTimeoutMs));
+  if (discoveryMode === "direct") {
+    await setUiValue(cdp, "connection-host", directHost);
+    await setUiValue(cdp, "connection-port", directPort);
+  }
   if (discoveryServer) {
     await setUiValue(cdp, "connection-discovery-server", discoveryServer);
   }
+  await setUiValue(cdp, "connection-remote-id", serverDeviceId);
   await waitForUiCondition(
     cdp,
     `document.querySelector("[data-testid=connection-remote-id]")?.value === ${JSON.stringify(serverDeviceId)}`,
@@ -1025,7 +1351,7 @@ const runAndroidBackgroundSessionLifecycle = async (cdp) => {
   }
 };
 
-const openAndroidFolder = async (cdp, clearCache = false) => {
+const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true) => {
   if (clearCache) {
     await clickUiTestId(cdp, "tab-devices");
     const settingsExpanded = await cdp.evaluate(
@@ -1073,7 +1399,7 @@ const openAndroidFolder = async (cdp, clearCache = false) => {
     );
   }
   await waitForUiText(cdp, targetFolderTitle, 90_000);
-  if (targetFolderPassword) {
+  if (targetFolderPassword && attachDocuments) {
     const passwordInput = `folder-password-${targetFolderId}`;
     const editButton = `edit-folder-password-${targetFolderId}`;
     const inputVisible = await cdp.evaluate(
@@ -1094,6 +1420,22 @@ const openAndroidFolder = async (cdp, clearCache = false) => {
     if (inputVisible || editVisible) {
       await setUiValue(cdp, passwordInput, targetFolderPassword);
       await clickUiTestId(cdp, `unlock-folder-${targetFolderId}`);
+      await waitForUiCondition(
+        cdp,
+        `(async () => {
+          try {
+            const invoke = globalThis.__TAURI__?.core?.invoke ?? globalThis.__TAURI_INTERNALS__?.invoke;
+            const response = await invoke("syncpeer_document_command", {
+              request: { operation: "status" },
+            });
+            return response?.result?.folders?.some(
+              (folder) => folder.id === ${JSON.stringify(targetFolderId)} && folder.downloads === true,
+            ) === true;
+          } catch { return false; }
+        })()`,
+        "encrypted document folder attachment",
+        60_000,
+      );
     }
   }
   if (!await clickUiItem(cdp, targetFolderTitle)) {
@@ -1101,17 +1443,29 @@ const openAndroidFolder = async (cdp, clearCache = false) => {
   }
 };
 
+const waitForAndroidFileRow = async (cdp, name, timeout = 90_000) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await cdp.evaluate(`document.body?.innerText?.includes(${JSON.stringify(name)}) === true`)) return;
+    const atRoot = await cdp.evaluate(
+      'document.querySelector(".crumb-current")?.textContent?.trim() === "All Syncthing Folders"',
+    );
+    if (atRoot) await clickUiItem(cdp, targetFolderTitle);
+    await wait(250);
+  }
+  throw new Error(`Timed out waiting for Android folder file: ${name}`);
+};
+
 const startAndroidFileDownload = async (cdp, name) => {
-  await waitForUiText(cdp, name, 90_000);
+  await waitForAndroidFileRow(cdp, name);
   await waitForUiDownloadButton(cdp, name);
+  const previous = await readUiDownloadState(cdp, name);
   if (!await clickUiDownload(cdp, name)) {
     throw new Error(`Android UI could not start the ${name} download.`);
   }
-  const state = await waitForUiDownloadState(
-    cdp,
-    name,
-    name === targetLargeFileName ? 30_000 : 90_000,
-  );
+  const state = name === targetLargeFileName
+    ? await waitForLargeDownloadState(cdp, name, previous)
+    : await waitForUiDownloadState(cdp, name, 90_000);
   if (name !== targetLargeFileName) {
     await waitForUiDownloadDone(cdp, name);
     return "done";
@@ -1119,8 +1473,8 @@ const startAndroidFileDownload = async (cdp, name) => {
   return state;
 };
 
-const startAndroidBlobDownload = async (cdp, verifyHello = true) => {
-  await openAndroidFolder(cdp, true);
+const startAndroidBlobDownload = async (cdp, verifyHello = true, clearCache = true, attachDocuments = true) => {
+  await openAndroidFolder(cdp, clearCache, attachDocuments);
   if (verifyHello) {
     const helloState = await startAndroidFileDownload(cdp, targetFileName);
     if (helloState !== "done") {
@@ -1496,6 +1850,58 @@ const main = async () => {
     throw new Error(`Expected Android API ${expectedSdk}, found API ${sdkVersion}.`);
   }
   grantNotificationPermission();
+
+  const deviceIdPath = argumentValue("--write-device-id");
+  if (deviceIdPath) {
+    const cdp = await launchAndroidApp(true);
+    try {
+      const deviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+      fs.writeFileSync(deviceIdPath, `${deviceId}\n`, { mode: 0o600 });
+    } finally {
+      cdp.close();
+    }
+    return;
+  }
+
+  const runtimeProbePath = argumentValue("--probe-document-runtime");
+  if (runtimeProbePath) {
+    const cdp = await launchAndroidApp(true);
+    let supported = false;
+    try {
+      await tauriInvoke(cdp, "syncpeer_document_command", {
+        request: { operation: "status" },
+      }, 60_000);
+      supported = true;
+    } catch {
+      // The managed image may expose JavaScriptSandbox without every feature
+      // required by the service-owned storage/network bridge.
+    } finally {
+      cdp.close();
+    }
+    fs.writeFileSync(runtimeProbePath, supported ? "supported\n" : "unsupported\n", { mode: 0o600 });
+    return;
+  }
+
+  if (hasArgument("--peer-cross-app")) {
+    await runPeerCrossAppWorkflow();
+    return;
+  }
+  if (hasArgument("--prepare-transfer-power-cut")) {
+    await preparePeerTransferPowerCut();
+    return;
+  }
+  if (hasArgument("--verify-transfer-power-cut")) {
+    await verifyPeerTransferPowerCut();
+    return;
+  }
+  if (hasArgument("--prepare-edit-power-cut")) {
+    await preparePeerEditPowerCut();
+    return;
+  }
+  if (hasArgument("--verify-edit-power-cut")) {
+    await verifyPeerEditPowerCut();
+    return;
+  }
 
   if (modernSmoke) {
     await runModernAndroidServiceSmoke();

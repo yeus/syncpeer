@@ -61,6 +61,44 @@ test("the combined Android workflow owns both emulator profiles", () => {
   assert.match(runner, /modern/);
   assert.match(runner, /test-android-e2e\.mjs/);
   assert.match(runner, /--skip-network/);
+  assert.match(runner, /uninstallIfPresent\("dev\.syncpeer\.app"\)/);
+  assert.match(runner, /uninstallIfPresent\("dev\.syncpeer\.plugin\.android\.test"\)/);
+  assert.match(runner, /dev\.syncpeer\.synthetic\.editor/);
+  assert.match(runner, /editorProject, "assembleDebug"/);
+});
+
+test("the synthetic document editor is a separate test-only APK", () => {
+  const editorSettings = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/settings.gradle.kts",
+    "utf8",
+  );
+  const manifest = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/src/main/AndroidManifest.xml",
+    "utf8",
+  );
+  const editorBuild = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build.gradle.kts",
+    "utf8",
+  );
+  const editorProvider = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/src/main/java/dev/syncpeer/synthetic/editor/EditorCommandProvider.kt",
+    "utf8",
+  );
+  const editorTheme = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/src/main/res/values/styles.xml",
+    "utf8",
+  );
+  assert.match(editorSettings, /rootProject\.name = "syncpeer-document-editor"/);
+  assert.match(editorBuild, /applicationId = "dev\.syncpeer\.synthetic\.editor"/);
+  assert.doesNotMatch(manifest, /android\.intent\.category\.LAUNCHER/);
+  assert.match(manifest, /android:theme="@style\/SyntheticEditorGrantTheme"/);
+  assert.match(editorTheme, /Theme\.Translucent\.NoTitleBar/);
+  assert.doesNotMatch(manifest, /Theme\.NoDisplay/);
+  assert.doesNotMatch(editorProvider, /readNBytes/);
+  assert.doesNotMatch(
+    fs.readFileSync("packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts", "utf8"),
+    /syncpeer-document-editor/,
+  );
 });
 
 test("the combined Android workflow provisions WebView without Play Store interaction", () => {
@@ -68,6 +106,25 @@ test("the combined Android workflow provisions WebView without Play Store intera
   assert.match(runner, /captureWebViewFixture/);
   assert.match(runner, /installWebViewFixture/);
   assert.match(runner, /set-webview-implementation/);
+});
+
+test("the Android runtime bridge permits concurrent network reads and writes", () => {
+  const service = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt",
+    "utf8",
+  );
+  const transport = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/SessionNetworkTransport.kt",
+    "utf8",
+  );
+  const nativeBridge = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/src/android_network.rs",
+    "utf8",
+  );
+  assert.match(service, /networkWorker = Executors\.newFixedThreadPool\([2-9]\)/);
+  assert.doesNotMatch(transport, /@Synchronized\s+fun execute/);
+  assert.match(nativeBridge, /set_rust_field\([\s\S]*Arc::new\(AndroidNetwork/);
+  assert.match(nativeBridge, /Arc::clone\(&network\)/);
 });
 
 test("modern Android uses only a focused service smoke test", () => {

@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 
 import {
@@ -10,13 +11,20 @@ import {
   profile,
 } from "./android-emulator.mjs";
 
-const run = (executable, args) => execFileSync(executable, args, {
+const editorPackage = "dev.syncpeer.synthetic.editor";
+const editorApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/" +
+  "editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk";
+const androidProject = "packages/tauri-shell/src-tauri/gen/android";
+const editorProject = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app";
+
+export const run = (executable, args, options = {}) => execFileSync(executable, args, {
   stdio: "inherit",
+  ...options,
 });
 
 const pull = (remote, local) => run("adb", ["pull", remote, local]);
 
-const adb = (args, options = {}) => execFileSync("adb", args, {
+export const adb = (args, options = {}) => execFileSync("adb", args, {
   encoding: "utf8",
   stdio: ["ignore", "pipe", "pipe"],
   ...options,
@@ -41,7 +49,16 @@ const assertNoDevices = () => {
   }
 };
 
-const waitForBoot = async (child, avdName) => {
+export const uninstallIfPresent = (packageName) => {
+  try {
+    if (!adb(["shell", "pm", "path", packageName], { timeout: 10_000 }).trim()) return;
+  } catch {
+    return;
+  }
+  run("adb", ["uninstall", packageName]);
+};
+
+export const waitForBoot = async (child, avdName) => {
   const deadline = Date.now() + 180_000;
   let state = "not started";
   let launchError;
@@ -77,7 +94,7 @@ const waitForExit = async (child, timeout = 15_000) => {
   if (child.exitCode === null) child.kill("SIGTERM");
 };
 
-const stopEmulator = async (child) => {
+export const stopEmulator = async (child) => {
   try {
     adb(["emu", "kill"], { timeout: 10_000 });
   } catch {
@@ -126,15 +143,19 @@ const installWebViewFixture = (fixture) => {
   }
 };
 
-const runProfile = async (profileName, testArguments, prepareDevice) => {
+const runProfile = async (profileName, testArguments, prepareDevice, installEditor = false) => {
   assertNoDevices();
   const selected = profile(profileName);
   create(selected);
   const child = spawn("emulator", emulatorArguments(selected), { stdio: "ignore" });
   try {
     await waitForBoot(child, selected.avdName);
+    uninstallIfPresent(editorPackage);
+    uninstallIfPresent("dev.syncpeer.plugin.android.test");
+    uninstallIfPresent("dev.syncpeer.app");
     await prepareDevice?.();
     run("npm", ["run", "android:install:e2e"]);
+    if (installEditor) run("adb", ["install", "-r", editorApk]);
     run(process.execPath, ["scripts/test-android-e2e.mjs", ...testArguments]);
   } finally {
     await stopEmulator(child);
@@ -145,6 +166,10 @@ const main = async () => {
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-webview-"));
   try {
     run("npm", ["run", "build:android:e2e"]);
+    run(path.join(androidProject, "gradlew"), [
+      "-p", editorProject, "assembleDebug", "--no-daemon", "--console=plain",
+    ]);
+    if (!fs.existsSync(editorApk)) throw new Error(`Synthetic editor APK was not built: ${editorApk}`);
     let webViewFixture;
     await runProfile("modern", ["--modern-smoke"], () => {
       webViewFixture = captureWebViewFixture(fixtureDirectory);
@@ -154,14 +179,20 @@ const main = async () => {
     ], () => {
       if (!webViewFixture) throw new Error("Modern WebView fixture was not captured.");
       installWebViewFixture(webViewFixture);
-    });
+    }, true);
+    run(process.execPath, [
+      "--experimental-strip-types",
+      "scripts/test-android-peer.ts",
+    ]);
     console.log("Combined Android compatibility and modern smoke tests passed.");
   } finally {
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 };
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

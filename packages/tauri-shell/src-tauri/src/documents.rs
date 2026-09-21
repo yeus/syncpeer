@@ -9,10 +9,10 @@ pub async fn syncpeer_document_command(
         tauri::async_runtime::spawn_blocking(move || {
             app.syncpeer_android()
                 .document_command(request)
-                .map_err(|_| {
-                    "Document operation failed. Check the vault and Android System WebView."
-                        .to_string()
-                })
+                .map_err(|error| crate::preserve_private_storage_failure(
+                    error,
+                    "Document operation failed. Check the vault and Android System WebView.",
+                ))
         })
         .await
         .map_err(|_| "Document worker failed.".to_string())?

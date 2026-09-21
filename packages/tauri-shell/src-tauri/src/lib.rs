@@ -966,12 +966,84 @@ fn verify_hostname_against_cert(cert_der: &[u8], host: &str) -> Result<(), Strin
     ))
 }
 
+const APP_STORAGE_FORMAT_FILE: &str = ".syncpeer-storage-format.json";
+const APP_STORAGE_FORMAT_VERSION: u64 = 1;
+const PRIVATE_STORAGE_UNRECOGNIZED: &str = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED";
+
+fn private_storage_unrecognized(detail: &str) -> String {
+    format!("{PRIVATE_STORAGE_UNRECOGNIZED}: {detail}")
+}
+
+fn preserve_private_storage_failure(error: impl std::fmt::Display, fallback: &str) -> String {
+    let message = error.to_string();
+    message
+        .find(PRIVATE_STORAGE_UNRECOGNIZED)
+        .map(|index| message[index..].to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn app_storage_marker_is_current(path: &Path) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(describe_storage_failure("Private storage marker could not be inspected", error)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(private_storage_unrecognized("the storage format marker is not a regular file"));
+    }
+    let marker: serde_json::Value = serde_json::from_slice(&fs::read(path)
+        .map_err(|error| describe_storage_failure("Private storage marker could not be read", error))?)
+        .map_err(|_| private_storage_unrecognized("the storage format marker is invalid"))?;
+    Ok(marker.get("owner").and_then(serde_json::Value::as_str) == Some("syncpeer") &&
+        marker.get("version").and_then(serde_json::Value::as_u64) == Some(APP_STORAGE_FORMAT_VERSION))
+}
+
+fn secure_app_data_root(root: &Path) -> Result<(), String> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| describe_storage_failure("Private storage permissions could not be secured", error))?;
+    }
+    Ok(())
+}
+
+fn prepare_app_data_root(root: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() =>
+            return Err(private_storage_unrecognized("the private storage root is not a regular directory")),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir_all(root)
+            .map_err(|error| describe_storage_failure("Private storage could not be created", error))?,
+        Err(error) => return Err(describe_storage_failure("Private storage could not be inspected", error)),
+    }
+    let marker = root.join(APP_STORAGE_FORMAT_FILE);
+    if app_storage_marker_is_current(&marker)? { return secure_app_data_root(root); }
+    if marker.exists() || fs::read_dir(root)
+        .map_err(|error| describe_storage_failure("Private storage could not be inspected", error))?
+        .next().transpose()
+        .map_err(|error| describe_storage_failure("Private storage could not be inspected", error))?
+        .is_some() {
+        return Err(private_storage_unrecognized("existing data has no supported storage format marker"));
+    }
+    write_json(&marker, &serde_json::json!({
+        "owner": "syncpeer",
+        "version": APP_STORAGE_FORMAT_VERSION,
+    }))?;
+    secure_app_data_root(root)
+}
+
 fn app_data_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let root = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("Could not resolve app data dir: {error}"))?;
-    Ok(root.join("syncpeer"))
+    let root = root.join("syncpeer");
+    prepare_app_data_root(&root)?;
+    Ok(root)
+}
+
+fn describe_storage_failure(operation: &str, error: impl std::fmt::Display) -> String {
+    format!("{operation}: {error}")
 }
 
 fn app_cache_files_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -1089,11 +1161,15 @@ async fn syncpeer_profile_storage_root(
         (request.storage_id.len() == 32 && request.storage_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if !valid_profile || !valid_storage { return Err("Invalid encrypted profile storage identity.".into()); }
     let root = app_data_root(&app)?.join("profiles").join(request.profile_id).join(request.storage_id);
-    fs::create_dir_all(&root).map_err(|_| "Encrypted profile storage could not be created.".to_string())?;
+    fs::create_dir_all(&root).map_err(|error| describe_storage_failure(
+        "Encrypted profile storage could not be created", error,
+    ))?;
     #[cfg(unix)] {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-            .map_err(|_| "Encrypted profile storage permissions could not be secured.".to_string())?;
+            .map_err(|error| describe_storage_failure(
+                "Encrypted profile storage permissions could not be secured", error,
+            ))?;
     }
     root.to_str().map(str::to_owned).ok_or_else(|| "Encrypted profile storage path is unavailable.".into())
 }
@@ -1474,36 +1550,6 @@ fn close_tls_session(
             .map_err(|_| "TLS worker stopped".to_string())?;
         result.recv().map_err(|_| "TLS worker stopped".to_string())?;
     }
-    Ok(())
-}
-
-fn check_legacy_identity(cli_node_dir: &Path) -> Result<(), String> {
-    if cli_node_dir.join("key.pem").exists() || cli_node_dir.join("cert.pem").exists() {
-        return Err("A plaintext device identity exists; use the confirmed local reset before continuing.".into());
-    }
-    Ok(())
-}
-
-fn legacy_identity_directories(app: &tauri::AppHandle) -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Ok(path) = std::env::var("SYNCPEER_DEFAULT_IDENTITY_DIR") {
-        if !path.trim().is_empty() { directories.push(PathBuf::from(path.trim())); }
-    }
-    if let Ok(path) = app.path().app_config_dir() {
-        directories.push(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().app_data_dir() {
-        directories.push(path.join("syncpeer").join("cli-node"));
-    }
-    if let Ok(path) = app.path().config_dir() {
-        directories.push(path.join("syncpeer").join("cli-node"));
-    }
-    directories.dedup();
-    directories
-}
-
-fn require_no_legacy_identity(app: &tauri::AppHandle) -> Result<(), String> {
-    for directory in legacy_identity_directories(app) { check_legacy_identity(&directory)?; }
     Ok(())
 }
 
@@ -2398,7 +2444,7 @@ async fn syncpeer_read_binary_file(request: ReadBinaryFileRequest) -> Result<Vec
 async fn syncpeer_read_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<CliNodeIdentityResponse, String> {
-    require_no_legacy_identity(&app)?;
+    let _ = app_data_root(&app)?;
     if let Some(identity) = load_protected_identity(&app)? { return Ok(identity); }
     create_protected_identity(&app)
 }
@@ -2433,7 +2479,7 @@ async fn syncpeer_get_default_device_id(app: tauri::AppHandle) -> Result<String,
 async fn syncpeer_regenerate_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    require_no_legacy_identity(&app)?;
+    let _ = app_data_root(&app)?;
     let identity = create_protected_identity(&app)?;
     device_id_from_cert_pem(&identity.cert_pem)
 }
@@ -2443,7 +2489,7 @@ async fn syncpeer_restore_identity_recovery(
     app: tauri::AppHandle,
     request: IdentityRecoveryRestoreRequest,
 ) -> Result<CliNodeIdentityResponse, String> {
-    require_no_legacy_identity(&app)?;
+    let _ = app_data_root(&app)?;
     let raw = request.recovery_secret.trim();
     if raw.is_empty() {
         return Err("Recovery secret is empty.".to_string());
@@ -4564,6 +4610,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_storage_error_preserves_native_reason() {
+        let error = describe_storage_failure(
+            "Encrypted profile storage could not be created",
+            std::io::Error::other("permission denied"),
+        );
+        assert_eq!(error, "Encrypted profile storage could not be created: permission denied");
+    }
+
+    #[test]
+    fn private_storage_marks_an_empty_root_and_accepts_it_again() {
+        let root = tempfile::tempdir().unwrap();
+        prepare_app_data_root(root.path()).unwrap();
+        prepare_app_data_root(root.path()).unwrap();
+        assert!(root.path().join(APP_STORAGE_FORMAT_FILE).is_file());
+    }
+
+    #[test]
+    fn private_storage_rejects_and_preserves_unrecognized_data() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("unknown-state");
+        fs::write(&existing, b"synthetic local state").unwrap();
+        let error = prepare_app_data_root(root.path()).unwrap_err();
+        assert!(error.starts_with(PRIVATE_STORAGE_UNRECOGNIZED));
+        assert_eq!(fs::read(existing).unwrap(), b"synthetic local state");
+    }
+
+    #[test]
+    fn private_storage_rejects_an_unknown_format_version() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(APP_STORAGE_FORMAT_FILE),
+            r#"{"owner":"syncpeer","version":999}"#,
+        ).unwrap();
+        let error = prepare_app_data_root(root.path()).unwrap_err();
+        assert!(error.starts_with(PRIVATE_STORAGE_UNRECOGNIZED));
+    }
+
+    #[test]
+    fn private_storage_failure_survives_native_bridge_context() {
+        assert_eq!(
+            preserve_private_storage_failure(
+                "plugin error: SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED: unsupported marker",
+                "fallback",
+            ),
+            "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED: unsupported marker",
+        );
+        assert_eq!(
+            preserve_private_storage_failure("other plugin error", "fallback"),
+            "fallback",
+        );
+    }
+
+    #[test]
     fn partial_recovery_requires_the_same_source_and_encryption_identity() {
         let request = CacheBeginFileRequest {
             folder_id: "fixture-folder".into(), path: "file".into(), name: "file".into(),
@@ -4651,13 +4750,6 @@ mod tests {
         assert_eq!(tcp_connect_timeout(None), Duration::from_secs(10));
         assert_eq!(tcp_connect_timeout(Some(250)), Duration::from_millis(250));
         assert_eq!(tcp_connect_timeout(Some(0)), Duration::from_millis(1));
-    }
-
-    #[test]
-    fn plaintext_identity_requires_explicit_local_reset() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("key.pem"), b"synthetic-private-key").unwrap();
-        assert!(check_legacy_identity(root.path()).is_err());
     }
 
     #[cfg(unix)]

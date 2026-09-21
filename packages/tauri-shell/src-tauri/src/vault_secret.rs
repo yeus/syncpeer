@@ -122,7 +122,10 @@ pub fn load_or_create_protected_key(app: &tauri::AppHandle, profile_id: &str,
         profile_id: profile_id.into(), operation: operation.into(), secret,
     };
     let execute = |request: VaultSecretRequest| app.syncpeer_android().vault_secret(json!(request))
-        .map_err(|_| "Protected metadata key operation failed.".to_string());
+        .map_err(|error| crate::preserve_private_storage_failure(
+            error,
+            "Protected metadata key operation failed.",
+        ));
     let stored = execute(request("load", None))?;
     if let Some(encoded) = stored.as_str() {
         let bytes = data_encoding::HEXLOWER.decode(encoded.as_bytes())
@@ -171,7 +174,10 @@ pub fn identity_record(app: &tauri::AppHandle, operation: &str,
     let result = {
         use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
         app.syncpeer_android().vault_secret(json!(request))
-            .map_err(|_| "Protected identity storage is unavailable.".to_string())?
+            .map_err(|error| crate::preserve_private_storage_failure(
+                error,
+                "Protected identity storage is unavailable.",
+            ))?
     };
     #[cfg(target_os = "linux")]
     let result = { let _ = app; desktop_secret(request)? };
@@ -195,7 +201,10 @@ pub async fn syncpeer_vault_secret(
         {
             use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
             app.syncpeer_android().vault_secret(json!(request))
-                .map_err(|_| "Protected credential operation failed; use manual unlock.".into())
+                .map_err(|error| crate::preserve_private_storage_failure(
+                    error,
+                    "Protected credential operation failed; use manual unlock.",
+                ))
         }
         #[cfg(target_os = "linux")]
         { let _ = app; desktop_secret(request) }

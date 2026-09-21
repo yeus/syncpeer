@@ -9,7 +9,8 @@ import java.security.SecureRandom
 
 /** Application-private roots, random bytes, and Keystore wrapping; no file crypto. */
 class DocumentRuntimeStorage(private val context: Context) : AutoCloseable {
-  private val metadataRoot = File(context.noBackupFilesDir, "metadata")
+  private val privateRoot = preparePrivateStorageRoot(context.noBackupFilesDir)
+  private val metadataRoot = File(privateRoot, "metadata")
   private val secrets = VaultSecretStore(context)
   private val random = SecureRandom()
   private val bytes = DocumentByteStorage(metadataRoot.absolutePath, metadataKey())
@@ -52,7 +53,7 @@ class DocumentRuntimeStorage(private val context: Context) : AutoCloseable {
     "root" -> {
       val id = request.getString("idValue")
       require(id == "profile" || id.matches(Regex("[a-f0-9]{32}")))
-      val root = File(context.noBackupFilesDir, "documents/$id")
+      val root = File(privateRoot, "documents/$id")
       check(root.isDirectory || root.mkdirs())
       root.canonicalPath
     }
@@ -64,7 +65,7 @@ class DocumentRuntimeStorage(private val context: Context) : AutoCloseable {
         id
       }
     }
-    "availableBytes" -> StatFs(context.noBackupFilesDir.absolutePath).availableBytes
+    "availableBytes" -> StatFs(privateRoot.absolutePath).availableBytes
     else -> throw IllegalArgumentException("Unknown document storage method")
   }
 

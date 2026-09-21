@@ -618,7 +618,14 @@ class DocumentRuntimeService : Service() {
   @Synchronized private fun recordRecoveryFailure(error: Exception): DocumentRuntimeStatus {
     recoveryFailureCount += 1
     val decision = documentRuntimeRecoveryDecision(recoveryFailureCount, error)
-    val status = if (decision.retryDelayMs == null || destroying) {
+    val privateStorageFailure = privateStorageFailureMessage(error)
+    val status = if (privateStorageFailure != null) {
+      DocumentRuntimeStatus(
+        "error",
+        privateStorageFailure,
+        failureType = decision.failureType,
+      )
+    } else if (decision.retryDelayMs == null || destroying) {
       DocumentRuntimeStatus(
         "error",
         "Document runtime could not recover. Reopen Syncpeer to retry.",

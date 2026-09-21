@@ -6,6 +6,7 @@
     getAppBuildInfo,
   } from "./lib/appInfo.ts";
   import { invoke } from "@tauri-apps/api/core";
+  import { requestLocalDataReset } from "./app/localReset.ts";
 
   interface Props {
     onBack: () => void;
@@ -21,17 +22,13 @@
 
   const resetLocalData = async (): Promise<void> => {
     resetError = "";
-    const confirmation = window.prompt(
-      "This deletes Syncpeer-managed data on this device, including downloaded files and its app-managed identity. " +
-      "On Linux it also deletes the older shared Syncpeer CLI identity if present. " +
-      "Unsynced edits will be lost. External selected folders and other devices are not changed. " +
-      "On Android, you must grant folder access again. Type RESET LOCAL DATA to continue.",
-    );
-    if (confirmation !== "RESET LOCAL DATA") return;
     try {
-      await invoke("syncpeer_reset_local_data", { confirmation });
-      window.localStorage.clear();
-      window.location.reload();
+      await requestLocalDataReset({
+        invoke: (command, args) => invoke(command, args),
+        prompt: message => window.prompt(message),
+        clearLocalState: () => window.localStorage.clear(),
+        reload: () => window.location.reload(),
+      });
     } catch {
       resetError = "Local reset failed or was incomplete. Restart Syncpeer before using it again.";
     }

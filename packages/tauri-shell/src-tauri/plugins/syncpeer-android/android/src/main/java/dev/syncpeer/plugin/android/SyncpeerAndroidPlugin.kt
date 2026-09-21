@@ -179,8 +179,9 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       try {
         val uri = Uri.parse("content://${activity.packageName}.documents")
         val request = JSONObject(args.request)
+        val privateRoot = preparePrivateStorageRoot(activity.noBackupFilesDir)
         // A never-configured vault must not require JavaScriptEngine just to use the legacy cache.
-        if (request.optString("operation") == "cacheRegistrations" && !File(activity.noBackupFilesDir, "documents/profile").exists()) {
+        if (request.optString("operation") == "cacheRegistrations" && !File(privateRoot, "documents/profile").exists()) {
           invoke.resolve(app.tauri.plugin.JSObject("{\"result\":{\"folders\":[]}}")); return@Thread
         }
         if (Build.VERSION.SDK_INT < 26) {
@@ -202,7 +203,10 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
           return@Thread
         }
         invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(result?.getString("result"))))
-      } catch (_: Exception) { invoke.reject("Document operation failed. Check the vault password and Android System WebView.") }
+      } catch (error: Exception) {
+        invoke.reject(privateStorageFailureMessage(error)
+          ?: "Document operation failed. Check the vault password and Android System WebView.")
+      }
     }.start()
   }
 
@@ -212,8 +216,9 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       val args = invoke.parseArgs(VaultSecretArgs::class.java)
       val result = vaultSecrets.execute(args.profileId, args.operation, args.secret)
       if (result == null) invoke.resolve() else invoke.resolveObject(result)
-    } catch (_: Exception) {
-      invoke.reject("Protected credential operation failed; use manual unlock.")
+    } catch (error: Exception) {
+      invoke.reject(privateStorageFailureMessage(error)
+        ?: "Protected credential operation failed; use manual unlock.")
     }
   }
 

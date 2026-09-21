@@ -12,6 +12,9 @@ internal fun documentRuntimeRecoveryDecision(
   error: Throwable,
 ): DocumentRuntimeRecoveryDecision {
   require(failedAttemptCount > 0) { "The failed runtime attempt count must be positive." }
+  if (privateStorageFailureMessage(error) != null) {
+    return DocumentRuntimeRecoveryDecision(null, "PrivateStorageUnrecognized")
+  }
   return DocumentRuntimeRecoveryDecision(
     retryDelayMs = documentRuntimeRetryDelaysMs.getOrNull(failedAttemptCount - 1),
     failureType = (error.cause ?: error).javaClass.simpleName,

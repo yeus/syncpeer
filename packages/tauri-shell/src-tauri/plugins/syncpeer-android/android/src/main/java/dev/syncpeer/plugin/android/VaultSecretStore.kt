@@ -16,6 +16,7 @@ import javax.crypto.spec.GCMParameterSpec
 
 /** Platform wrapping only. Folder encryption and manual-lock policy remain in core. */
 class VaultSecretStore(private val context: Context) {
+  private val privateRoot = preparePrivateStorageRoot(context.noBackupFilesDir)
   private val policy = context.getSharedPreferences("syncpeer-vault-policy", Context.MODE_PRIVATE)
   fun isDeviceUnlocked(): Boolean = Build.VERSION.SDK_INT >= 24 &&
     (context.getSystemService(Context.USER_SERVICE) as UserManager).isUserUnlocked
@@ -33,7 +34,7 @@ class VaultSecretStore(private val context: Context) {
     }
     check(isDeviceUnlocked()) { "Device credentials are unavailable before first unlock" }
     val alias = "syncpeer.vault.$profileId"
-    val file = AtomicFile(File(context.noBackupFilesDir, "$alias.secret"))
+    val file = AtomicFile(File(privateRoot, "$alias.secret"))
     val keys = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     return when (operation) {
       "save" -> {

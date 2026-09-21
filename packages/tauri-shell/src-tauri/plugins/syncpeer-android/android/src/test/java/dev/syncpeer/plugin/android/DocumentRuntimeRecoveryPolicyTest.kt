@@ -23,6 +23,15 @@ class DocumentRuntimeRecoveryPolicyTest {
     assertNull(documentRuntimeRecoveryDecision(6, IllegalStateException()).retryDelayMs)
   }
 
+  @Test fun unrecognizedPrivateStorageWaitsForAnExplicitReset() {
+    val decision = documentRuntimeRecoveryDecision(
+      1,
+      IllegalStateException("$PRIVATE_STORAGE_UNRECOGNIZED: unsupported format marker"),
+    )
+    assertNull(decision.retryDelayMs)
+    assertEquals("PrivateStorageUnrecognized", decision.failureType)
+  }
+
   @Test fun sessionsStartOnlyWhenAHealthyRuntimeIsReady() {
     val ready = DocumentRuntimeStatus("locked", "ready")
     val retrying = DocumentRuntimeStatus("error", "retrying")

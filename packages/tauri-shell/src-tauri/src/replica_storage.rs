@@ -1123,7 +1123,7 @@ pub async fn syncpeer_replica_storage(
     let metadata_root = app
         .path()
         .app_data_dir()
-        .map_err(|_| "App storage unavailable".to_string())?
+        .map_err(|error| format!("App storage unavailable: {error}"))?
         .join("metadata");
     tauri::async_runtime::spawn_blocking(move || {
         let mut roots = state

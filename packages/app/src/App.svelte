@@ -1,6 +1,7 @@
 <svelte:options runes={true} />
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
@@ -66,6 +67,8 @@
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
   import VersionsPage from "./VersionsPage.svelte";
   import { applyTheme } from "./app/theme.ts";
+  import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
+  import { requestLocalDataReset } from "./app/localReset.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
   import Star from "lucide-svelte/icons/star";
@@ -84,6 +87,26 @@
   let app = $state(createInitialState());
   let systemPrefersDark = $state(false);
   let contentElement = $state<HTMLElement | null>(null);
+  let privateStorageRecoveryMessage = $state<string | null>(null);
+  let privateStorageResetPending = $state(false);
+  let privateStorageResetError = $state("");
+
+  async function resetPrivateStorage() {
+    privateStorageResetPending = true;
+    privateStorageResetError = "";
+    try {
+      await requestLocalDataReset({
+        invoke: (command, args) => invoke(command, args),
+        prompt: message => window.prompt(message),
+        clearLocalState: () => window.localStorage.clear(),
+        reload: () => window.location.reload(),
+      });
+    } catch {
+      privateStorageResetError = "Syncpeer could not reset its private local data. Nothing outside the app was changed.";
+    } finally {
+      privateStorageResetPending = false;
+    }
+  }
 
   const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
@@ -242,8 +265,11 @@
     applySessionState(app, next);
     void syncDocumentFolders(next.folders, activeFolderPasswords(app)).then(folders => {
       app.localFolders = folders.map(folder => ({ id: folder.id, label: folder.label, readOnly: false }));
-    }).catch(async () => {
-      app.ui.recentError = "Local folder storage could not be prepared. Check folder access before downloading.";
+      privateStorageRecoveryMessage = null;
+    }).catch(async error => {
+      const issue = documentStoragePreparationIssue(next.folders.length, error);
+      app.ui.recentError = issue.message;
+      privateStorageRecoveryMessage = issue.canResetPrivateStorage ? issue.message : null;
       try { app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false })); }
       catch { /* Keep the last known roots if the service itself is unavailable. */ }
     });
@@ -544,6 +570,17 @@
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
           <p class="error">{app.ui.recentError}</p>
+          {#if privateStorageRecoveryMessage === app.ui.recentError}
+            <div class="actions">
+              <button
+                type="button"
+                data-testid="reset-unrecognized-private-storage"
+                disabled={privateStorageResetPending}
+                onclick={resetPrivateStorage}
+              >{privateStorageResetPending ? "Resetting…" : "Reset Syncpeer local data"}</button>
+            </div>
+            {#if privateStorageResetError}<p class="error">{privateStorageResetError}</p>{/if}
+          {/if}
         </section>
       {/if}
 

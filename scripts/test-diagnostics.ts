@@ -167,6 +167,16 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-connection-notices.ts"],
     },
     {
+      name: "Application local storage recovery diagnostics",
+      command: process.execPath,
+      args: [
+        "--experimental-strip-types",
+        "--test",
+        "scripts/test-app-storage-errors.ts",
+        "scripts/test-app-local-reset.ts",
+      ],
+    },
+    {
       name: "Application state merge diagnostics",
       command: process.execPath,
       args: [

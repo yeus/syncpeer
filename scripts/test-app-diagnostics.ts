@@ -21,6 +21,7 @@ const createFixture = () =>
       runtimeSurface: "web-ui",
       platform: "linux",
       architecture: "x64",
+      osVersion: "synthetic-os-version",
     }),
   });
 

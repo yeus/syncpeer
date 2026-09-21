@@ -269,6 +269,7 @@ const appBuildInfo = createAppBuildInfo({
   runtimeSurface: "android-ui",
   platform: "android",
   architecture: "arm64",
+  osVersion: "15",
 });
 assert.deepEqual(appBuildInfo, {
   appName: "Syncpeer",
@@ -281,8 +282,10 @@ assert.deepEqual(appBuildInfo, {
   runtimeSurface: "android-ui",
   platform: "android",
   architecture: "arm64",
+  osVersion: "15",
 });
 assert.match(formatAppBuildInfo(appBuildInfo), /runtime_surface: android-ui/);
+assert.match(formatAppBuildInfo(appBuildInfo), /os_version: 15/);
 assert.doesNotMatch(formatAppBuildInfo(appBuildInfo), /device|folder|127\.0\.0\.1/i);
 
 const runtimeGlobal = globalThis as { __TAURI_INTERNALS__?: unknown };

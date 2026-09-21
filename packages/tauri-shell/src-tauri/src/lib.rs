@@ -4461,6 +4461,7 @@ pub fn run() {
         .plugin(tauri_plugin_syncpeer_android::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_os::init())
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .manage(Arc::new(Mutex::new(QuicSessionStore::default())))
         .manage(Arc::new(Mutex::new(CacheWriterStore::default())))

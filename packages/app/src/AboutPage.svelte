@@ -103,6 +103,10 @@
         <dd data-testid="about-architecture">{appInfo.architecture}</dd>
       </div>
       <div>
+        <dt>OS version</dt>
+        <dd data-testid="about-os-version">{appInfo.osVersion}</dd>
+      </div>
+      <div>
         <dt>Build mode</dt>
         <dd data-testid="about-build-mode">{appInfo.buildMode}</dd>
       </div>

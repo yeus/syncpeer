@@ -26,6 +26,7 @@ export interface AppBuildInfo {
   runtimeSurface: AppRuntimeSurface;
   platform: AppRuntimePlatform;
   architecture: AppRuntimeArchitecture;
+  osVersion: string;
 }
 
 const textOrUnknown = (value: unknown): string => {
@@ -44,6 +45,7 @@ export const createAppBuildInfo = (input: {
   runtimeSurface: AppRuntimeSurface;
   platform: AppRuntimePlatform;
   architecture: AppRuntimeArchitecture;
+  osVersion: unknown;
 }): AppBuildInfo => ({
   appName: "Syncpeer",
   appVersion: textOrUnknown(input.appVersion),
@@ -55,6 +57,7 @@ export const createAppBuildInfo = (input: {
   runtimeSurface: input.runtimeSurface,
   platform: input.platform,
   architecture: input.architecture,
+  osVersion: textOrUnknown(input.osVersion),
 });
 
 export const classifyRuntimePlatform = (text: string): AppRuntimePlatform => {
@@ -96,4 +99,5 @@ export const formatAppBuildInfo = (info: AppBuildInfo): string => [
   `runtime_surface: ${info.runtimeSurface}`,
   `platform: ${info.platform}`,
   `architecture: ${info.architecture}`,
+  `os_version: ${info.osVersion}`,
 ].join("\n");

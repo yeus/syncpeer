@@ -33,6 +33,7 @@ const main = (): void => {
   assert.match(about.output, /build_time_utc: \S+/);
   assert.match(about.output, /runtime_surface: cli/);
   assert.match(about.output, /runtime_environment: node/);
+  assert.match(about.output, /os_version: \S+/);
   assert.doesNotMatch(about.output, /device|folder|127\.0\.0\.1/i);
 
   const version = runCli(["--version"]);

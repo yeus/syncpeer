@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "notification:default",
+    "os:default",
     "core:webview:allow-internal-toggle-devtools",
     {
       "identifier": "opener:allow-open-path",

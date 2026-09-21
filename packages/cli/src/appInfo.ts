@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import packageJson from "../package.json" with { type: "json" };
 import {
   classifyRuntimeArchitecture,
@@ -70,6 +71,7 @@ export const getCliBuildInfo = (): AppBuildInfo => {
     runtimeSurface: "cli",
     platform: classifyRuntimePlatform(process.platform),
     architecture: classifyRuntimeArchitecture(process.arch),
+    osVersion: `${os.version()} (kernel ${os.release()})`,
   });
 };
 

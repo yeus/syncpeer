@@ -187,7 +187,11 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   await documents.close();
 });
 
-test("an uninitialized vault keeps existing plaintext cache browsable", async () => {
+test("fresh-install startup uses default settings while keeping existing plaintext cache browsable", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "uninitialized-cache", deviceCounterId: "42", openStorage,
     availableBytes: async () => 1024 * 1024 * 1024, profile: await openStorage("profile"), randomBytes,
@@ -201,8 +205,25 @@ test("an uninitialized vault keeps existing plaintext cache browsable", async ()
       assert.deepEqual({ folderId, path }, { folderId: "legacy-folder", path: "legacy.txt" }); opened++;
     } }, openLegacySource: async () => { throw new Error("No legacy source"); },
     show: async () => { assert.fail("An uninitialized vault must use the legacy cache"); } });
+  const settings = await cache.platformAdapter.loadProfileSettings!();
+  assert.equal(settings.profile.versioning, "staggered");
+  assert.deepEqual(settings.folders, {});
+  assert.deepEqual(await cache.platformAdapter.listFavorites!(), []);
+  const state = createInitialState(null);
+  const actions = createAppActions({ state,
+    client: cache.platformAdapter as Parameters<typeof createAppActions>[0]["client"],
+    sessionStore: {} as Parameters<typeof createAppActions>[0]["sessionStore"],
+    transfers: { begin: () => {}, update: () => {}, finish: () => {} } as unknown as TransferRuntime,
+  });
+  await actions.hydrate();
+  assert.equal(state.ui.recentError, null);
+  assert.deepEqual(state.favorites.items, []);
   await cache.platformAdapter.openCachedFile!("legacy-folder", "legacy.txt");
   assert.equal(opened, 1);
+  await documents.createVault("synthetic-master");
+  await documents.lock();
+  await assert.rejects(cache.platformAdapter.loadProfileSettings!(), /locked/i,
+    "An existing locked vault must not expose encrypted settings as defaults");
   await documents.close();
 });
 

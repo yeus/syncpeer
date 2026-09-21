@@ -44,9 +44,13 @@ export function createDocumentCache(options: {
     return () => { if (!released) { released = true; active.set(folderId, active.get(folderId)! - 1); } };
   };
   const request = options.request;
-  const loadProfileSettings = async () => options.enabled()
-    ? request<SyncpeerProfileSettings>({ operation: "profileSettings" })
-    : options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
+  const loadProfileSettings = async () => {
+    if (!options.enabled()) return options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
+    const status = await cacheStatus();
+    return status.vault.phase === "uninitialized"
+      ? defaultProfileSettings()
+      : request<SyncpeerProfileSettings>({ operation: "profileSettings" });
+  };
   const saveProfileSettings = async (settings: SyncpeerProfileSettings) => {
     if (options.enabled()) {
       await request({ operation: "saveProfileSettings", settings });

@@ -7,7 +7,7 @@ internal const val PRIVATE_STORAGE_FORMAT_FILE = ".syncpeer-storage-format.json"
 internal const val PRIVATE_STORAGE_UNRECOGNIZED = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED"
 private const val privateStorageFormatVersion = 1
 private val currentMarker = Regex(
-  """\s*\{\s*"owner"\s*:\s*"syncpeer"\s*,\s*"version"\s*:\s*$privateStorageFormatVersion\s*}\s*""",
+  """\s*\{\s*"owner"\s*:\s*"syncpeer"\s*,\s*"version"\s*:\s*$privateStorageFormatVersion\s*\}\s*""",
 )
 
 private fun unrecognizedPrivateStorage(detail: String): Nothing =

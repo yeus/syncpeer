@@ -45,6 +45,7 @@
     "test:android": "node scripts/test-android.mjs",
     "test:android:compat": "npm run build:android:e2e && npm run android:install:e2e && node scripts/test-android-e2e.mjs --expect-sdk 29 --reboot",
     "test:android:modern-smoke": "npm run build:android:e2e && npm run android:install:e2e && node scripts/test-android-e2e.mjs --modern-smoke",
+    "test:android:syncpeer-peers": "node --experimental-strip-types scripts/test-android-syncpeer-peers.ts",
     "android:install:diagnose": "scripts/diagnose-android-install.sh dist/syncpeer-android-release-arm64-v8a.apk dev.syncpeer.app",
     "android:dev": "npm run android:dev -w @syncpeer/tauri-shell",
     "icons:generate": "npm run icons:generate -w @syncpeer/tauri-shell",

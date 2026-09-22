@@ -1,4 +1,5 @@
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 mod cache_ranges;
 mod replica_storage;
 mod metadata_sqlite;
@@ -13,7 +14,8 @@ mod local_reset;
 use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
 use native_cache_metadata::NativeCacheMetadata;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, DistinguishedName, ServerConfig,
+    ServerConnection, SignatureScheme, StreamOwned};
 use prost::Message;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,9 +24,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::net::{Ipv6Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
@@ -374,6 +376,8 @@ struct TlsOpenRequest {
     key_pem: String,
     ca_pem: Option<String>,
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    alpn_protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +468,47 @@ struct TlsWriteRequest {
 #[serde(rename_all = "camelCase")]
 struct TlsCloseRequest {
     session_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsListenRequest {
+    host: String,
+    port: u16,
+    cert_pem: String,
+    key_pem: String,
+    alpn_protocols: Vec<String>,
+    handshake_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsListenResponse {
+    listener_id: u64,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsAcceptRequest {
+    listener_id: u64,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsAcceptResponse {
+    session_id: u64,
+    peer_certificate_der: Vec<u8>,
+    remote_address: String,
+    remote_port: u16,
+    alpn: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TlsListenerCloseRequest {
+    listener_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,6 +646,19 @@ struct TlsSessionStore {
 
 type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
 
+struct TlsListenerState {
+    stop: Arc<AtomicBool>,
+    accepted: Mutex<mpsc::Receiver<Result<TlsAcceptResponse, String>>>,
+}
+
+#[derive(Default)]
+struct TlsListenerStore {
+    next_id: u64,
+    listeners: HashMap<u64, Arc<TlsListenerState>>,
+}
+
+type SharedTlsListenerStore = Arc<Mutex<TlsListenerStore>>;
+
 struct QuicSession {
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
@@ -642,6 +700,53 @@ impl ServerCertVerifier for NoCertificateVerification {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[derive(Debug, Default)]
+struct AnyPresentedClientCertificate {
+    hints: Vec<DistinguishedName>,
+}
+
+impl ClientCertVerifier for AnyPresentedClientCertificate {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        if end_entity.is_empty() {
+            return Err(rustls::Error::General("Client certificate is required".to_string()));
+        }
+        Ok(ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -1348,8 +1453,26 @@ fn tls_write_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
+trait TlsIo: Read + Write + Send {
+    fn prepare_nonblocking(&self) -> std::io::Result<()>;
+    fn shutdown_transport(&self);
+}
+
+impl<C: Send> TlsIo for StreamOwned<C, TcpStream>
+where
+    StreamOwned<C, TcpStream>: Read + Write,
+{
+    fn prepare_nonblocking(&self) -> std::io::Result<()> {
+        self.sock.set_nonblocking(true)
+    }
+
+    fn shutdown_transport(&self) {
+        let _ = self.sock.shutdown(Shutdown::Both);
+    }
+}
+
 fn write_tls_bytes(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    stream: &mut dyn TlsIo,
     bytes: &[u8],
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + tls_write_timeout();
@@ -1382,10 +1505,10 @@ fn write_tls_bytes(
 }
 
 fn run_tls_session(
-    mut stream: StreamOwned<ClientConnection, TcpStream>,
+    mut stream: Box<dyn TlsIo>,
     commands: mpsc::Receiver<TlsCommand>,
 ) {
-    if stream.get_ref().set_nonblocking(true).is_err() {
+    if stream.prepare_nonblocking().is_err() {
         return;
     }
     let mut pending_read: Option<(
@@ -1396,7 +1519,7 @@ fn run_tls_session(
         if pending_read.is_none() {
             match commands.recv_timeout(Duration::from_millis(10)) {
                 Ok(command) => {
-                    if handle_tls_command(command, &mut stream, &mut pending_read) {
+                    if handle_tls_command(command, stream.as_mut(), &mut pending_read) {
                         return;
                     }
                 }
@@ -1405,7 +1528,7 @@ fn run_tls_session(
             }
         } else {
             while let Ok(command) = commands.try_recv() {
-                if handle_tls_command(command, &mut stream, &mut pending_read) {
+                if handle_tls_command(command, stream.as_mut(), &mut pending_read) {
                     return;
                 }
             }
@@ -1444,7 +1567,7 @@ fn run_tls_session(
 
 fn handle_tls_command(
     command: TlsCommand,
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    stream: &mut dyn TlsIo,
     pending_read: &mut Option<(
         Vec<u8>,
         mpsc::Sender<Result<TlsReadResponse, String>>,
@@ -1468,20 +1591,18 @@ fn handle_tls_command(
             if let Some((_, read_response)) = pending_read.take() {
                 let _ = read_response.send(Err("Connection closed".to_string()));
             }
-            let _ = stream.get_mut().shutdown(Shutdown::Both);
+            stream.shutdown_transport();
             let _ = response.send(());
             true
         }
     }
 }
 
-fn create_tls_session(
-    stream: StreamOwned<ClientConnection, TcpStream>,
-) -> Result<Arc<TlsSession>, String> {
+fn create_tls_session<S: TlsIo + 'static>(stream: S) -> Result<Arc<TlsSession>, String> {
     let (commands, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("syncpeer-tls".to_string())
-        .spawn(move || run_tls_session(stream, receiver))
+        .spawn(move || run_tls_session(Box::new(stream), receiver))
         .map_err(|error| format!("Could not start TLS worker: {error}"))?;
     Ok(Arc::new(TlsSession { commands }))
 }
@@ -1549,6 +1670,161 @@ fn close_tls_session(
             .send(TlsCommand::Close { response })
             .map_err(|_| "TLS worker stopped".to_string())?;
         result.recv().map_err(|_| "TLS worker stopped".to_string())?;
+    }
+    Ok(())
+}
+
+fn store_tls_session<S: TlsIo + 'static>(store: &SharedTlsStore, stream: S) -> Result<u64, String> {
+    let session = create_tls_session(stream)?;
+    let mut guard = store
+        .lock()
+        .map_err(|_| "TLS session store lock poisoned".to_string())?;
+    let next_id = guard.next_id.saturating_add(1).max(1);
+    guard.next_id = next_id;
+    guard.sessions.insert(next_id, session);
+    Ok(next_id)
+}
+
+fn local_announce_packet(cert_der: &[u8], port: u16, instance_id: i64) -> Vec<u8> {
+    let announce = LocalDiscoveryAnnounce {
+        id: Sha256::digest(cert_der).to_vec(),
+        addresses: vec![format!("tcp://0.0.0.0:{port}")],
+        instance_id,
+    };
+    let mut packet = LOCAL_DISCOVERY_MAGIC.to_be_bytes().to_vec();
+    announce.encode(&mut packet).expect("encoding into a byte vector cannot fail");
+    packet
+}
+
+fn start_local_announce_worker(cert_der: Vec<u8>, port: u16,
+    stop: Arc<AtomicBool>) -> Result<(), String> {
+    thread::Builder::new().name("syncpeer-local-announce".to_string()).spawn(move || {
+        let packet = local_announce_packet(&cert_der, port,
+            now_ms().try_into().unwrap_or(i64::MAX));
+        let udp4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok();
+        if let Some(socket) = &udp4 { let _ = socket.set_broadcast(true); }
+        let udp6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok();
+        while !stop.load(Ordering::Acquire) {
+            if let Some(socket) = &udp4 {
+                let _ = socket.send_to(&packet, (Ipv4Addr::BROADCAST, LOCAL_DISCOVERY_PORT));
+            }
+            if let Some(socket) = &udp6 {
+                let _ = socket.send_to(&packet,
+                    (Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), LOCAL_DISCOVERY_PORT));
+            }
+            for _ in 0..100 {
+                if stop.load(Ordering::Acquire) { return; }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }).map_err(|error| format!("Could not start local discovery announcer: {error}"))?;
+    Ok(())
+}
+
+fn open_tls_listener(
+    session_store: SharedTlsStore,
+    listener_store: SharedTlsListenerStore,
+    request: TlsListenRequest,
+) -> Result<TlsListenResponse, String> {
+    if request.alpn_protocols.is_empty() || request.alpn_protocols.len() > 8 ||
+        request.alpn_protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
+        return Err("TLS listener requires valid ALPN protocols.".to_string());
+    }
+    let cert_chain = rustls_pemfile::certs(&mut request.cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid listener certificate PEM: {error}"))?;
+    if cert_chain.is_empty() {
+        return Err("Listener certificate PEM did not contain a certificate.".to_string());
+    }
+    let announce_certificate = cert_chain[0].as_ref().to_vec();
+    let private_key = rustls_pemfile::private_key(&mut request.key_pem.as_bytes())
+        .map_err(|error| format!("Invalid listener private key PEM: {error}"))?
+        .ok_or_else(|| "Listener key PEM did not contain a private key.".to_string())?;
+    let mut config = ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|error| format!("Invalid listener cert/key pair: {error}"))?;
+    config.alpn_protocols = request.alpn_protocols.iter().map(|value| value.as_bytes().to_vec()).collect();
+    let listener = TcpListener::bind((request.host.as_str(), request.port))
+        .map_err(|error| format!("Syncpeer could not listen on {}:{}: {error}", request.host, request.port))?;
+    let port = listener.local_addr()
+        .map_err(|error| format!("TLS listener address unavailable: {error}"))?.port();
+    listener.set_nonblocking(true)
+        .map_err(|error| format!("Could not prepare TLS listener: {error}"))?;
+    let timeout = Duration::from_millis(request.handshake_timeout_ms.unwrap_or(10_000).clamp(1, 60_000));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    start_local_announce_worker(announce_certificate, port, Arc::clone(&stop))?;
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new().name("syncpeer-tls-listener".to_string()).spawn(move || {
+        let config = Arc::new(config);
+        while !worker_stop.load(Ordering::Acquire) {
+            let (tcp, remote) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(format!("TLS listener accept failed: {error}")));
+                    return;
+                }
+            };
+            let result = (|| {
+                tcp.set_read_timeout(Some(timeout))
+                    .map_err(|error| format!("Could not set accepted TLS read timeout: {error}"))?;
+                tcp.set_write_timeout(Some(timeout))
+                    .map_err(|error| format!("Could not set accepted TLS write timeout: {error}"))?;
+                let connection = ServerConnection::new(Arc::clone(&config))
+                    .map_err(|error| format!("Could not create accepted TLS connection: {error}"))?;
+                let mut stream = StreamOwned::new(connection, tcp);
+                {
+                    let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+                    conn.complete_io(sock)
+                        .map_err(|error| format!("Incoming TLS handshake failed: {error}"))?;
+                }
+                let peer_certificate_der = stream.conn.peer_certificates()
+                    .and_then(|certs| certs.first()).map(|cert| cert.as_ref().to_vec())
+                    .ok_or_else(|| "Incoming TLS peer certificate missing.".to_string())?;
+                let alpn = stream.conn.alpn_protocol()
+                    .map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default();
+                let session_id = store_tls_session(&session_store, stream)?;
+                Ok(TlsAcceptResponse { session_id, peer_certificate_der,
+                    remote_address: remote.ip().to_string(), remote_port: remote.port(), alpn })
+            })();
+            if sender.send(result).is_err() { return; }
+        }
+    }).map_err(|error| format!("Could not start TLS listener worker: {error}"))?;
+    let mut guard = listener_store.lock()
+        .map_err(|_| "TLS listener store lock poisoned".to_string())?;
+    let listener_id = guard.next_id.saturating_add(1).max(1);
+    guard.next_id = listener_id;
+    guard.listeners.insert(listener_id, Arc::new(TlsListenerState {
+        stop, accepted: Mutex::new(receiver),
+    }));
+    Ok(TlsListenResponse { listener_id, port })
+}
+
+fn accept_tls_listener(store: &SharedTlsListenerStore,
+    request: TlsAcceptRequest) -> Result<TlsAcceptResponse, String> {
+    let listener = store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?
+        .listeners.get(&request.listener_id).cloned()
+        .ok_or_else(|| format!("Unknown TLS listener: {}", request.listener_id))?;
+    let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(30_000).clamp(1, 60_000));
+    let result = listener.accepted.lock().map_err(|_| "TLS listener accept lock poisoned".to_string())?
+        .recv_timeout(timeout).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => "TLS listener accept timed out.".to_string(),
+            mpsc::RecvTimeoutError::Disconnected => "TLS listener stopped.".to_string(),
+        })?;
+    result
+}
+
+fn close_tls_listener(store: &SharedTlsListenerStore,
+    request: TlsListenerCloseRequest) -> Result<(), String> {
+    let listener = store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?
+        .listeners.remove(&request.listener_id);
+    if let Some(listener) = listener {
+        listener.stop.store(true, Ordering::Release);
     }
     Ok(())
 }
@@ -2561,6 +2837,36 @@ async fn syncpeer_tls_open(
     .map_err(|error| format!("TLS open task join error: {error}"))?
 }
 
+#[tauri::command]
+async fn syncpeer_tls_listen(
+    sessions: tauri::State<'_, SharedTlsStore>,
+    listeners: tauri::State<'_, SharedTlsListenerStore>,
+    request: TlsListenRequest,
+) -> Result<TlsListenResponse, String> {
+    let session_store = sessions.inner().clone();
+    let listener_store = listeners.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || open_tls_listener(session_store, listener_store, request))
+        .await.map_err(|error| format!("TLS listen task join error: {error}"))?
+}
+
+#[tauri::command]
+async fn syncpeer_tls_accept(
+    listeners: tauri::State<'_, SharedTlsListenerStore>,
+    request: TlsAcceptRequest,
+) -> Result<TlsAcceptResponse, String> {
+    let listener_store = listeners.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || accept_tls_listener(&listener_store, request))
+        .await.map_err(|error| format!("TLS accept task join error: {error}"))?
+}
+
+#[tauri::command]
+async fn syncpeer_tls_listener_close(
+    listeners: tauri::State<'_, SharedTlsListenerStore>,
+    request: TlsListenerCloseRequest,
+) -> Result<(), String> {
+    close_tls_listener(listeners.inner(), request)
+}
+
 fn open_tls_session(
     shared_store: SharedTlsStore,
     request: TlsOpenRequest,
@@ -2591,11 +2897,20 @@ fn open_tls_session(
             .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
         tauri_log("tls.open.key_parsed");
 
-        let config = ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_client_auth_cert(cert_chain, private_key)
             .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
+        let alpn_protocols = if request.alpn_protocols.is_empty() {
+            vec!["bep/1.0".to_string()]
+        } else {
+            request.alpn_protocols.clone()
+        };
+        if alpn_protocols.len() > 8 || alpn_protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
+            return Err("Invalid TLS ALPN protocols".to_string());
+        }
+        config.alpn_protocols = alpn_protocols.iter().map(|value| value.as_bytes().to_vec()).collect();
         let config = Arc::new(config);
 
         tauri_log("tls.open.tcp_connect.start");
@@ -2627,14 +2942,7 @@ fn open_tls_session(
         verify_hostname_against_cert(&peer_certificate_der, &tls_host)?;
         tauri_log(&format!("tls.open.peer_cert peerCertBytes={}", peer_certificate_der.len()));
 
-        let mut guard = shared_store
-            .lock()
-            .map_err(|_| "TLS session store lock poisoned".to_string())?;
-        let next_id = guard.next_id.saturating_add(1).max(1);
-        guard.next_id = next_id;
-        guard
-            .sessions
-            .insert(next_id, create_tls_session(stream)?);
+        let next_id = store_tls_session(&shared_store, stream)?;
         tauri_log(&format!("tls.open.ready sessionId={}", next_id));
         Ok(TlsOpenResponse {
             session_id: next_id,
@@ -4509,6 +4817,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
+        .manage(Arc::new(Mutex::new(TlsListenerStore::default())))
         .manage(Arc::new(Mutex::new(QuicSessionStore::default())))
         .manage(Arc::new(Mutex::new(CacheWriterStore::default())))
         .manage(Arc::new(Mutex::new(replica_storage::ReplicaRoots::default())))
@@ -4529,6 +4838,9 @@ pub fn run() {
             syncpeer_discovery_fetch,
             syncpeer_discovery_local,
             syncpeer_tls_open,
+            syncpeer_tls_listen,
+            syncpeer_tls_accept,
+            syncpeer_tls_listener_close,
             syncpeer_quic_open,
             syncpeer_relay_open,
             syncpeer_tls_read,
@@ -4608,6 +4920,65 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_tls_listener_accepts_mutual_tls_and_exchanges_bytes() {
+        let server_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let client_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let sessions = Arc::new(Mutex::new(TlsSessionStore::default()));
+        let listeners = Arc::new(Mutex::new(TlsListenerStore::default()));
+        let listener = open_tls_listener(sessions.clone(), listeners.clone(), TlsListenRequest {
+            host: "127.0.0.1".into(), port: 0,
+            cert_pem: server_identity.serialize_pem().unwrap(),
+            key_pem: server_identity.serialize_private_key_pem(),
+            alpn_protocols: vec!["bep/1.0".into(), "syncpeer-pairing/1".into()],
+            handshake_timeout_ms: Some(2_000),
+        }).unwrap();
+        let listener_id = listener.listener_id;
+        let listener_port = listener.port;
+        let client_sessions = sessions.clone();
+        let client = thread::spawn(move || open_tls_session(client_sessions, TlsOpenRequest {
+            host: "localhost".into(), port: listener_port,
+            cert_pem: client_identity.serialize_pem().unwrap(),
+            key_pem: client_identity.serialize_private_key_pem(),
+            ca_pem: None, timeout_ms: Some(2_000),
+            alpn_protocols: vec!["syncpeer-pairing/1".into()],
+        }));
+        let accepted = accept_tls_listener(&listeners, TlsAcceptRequest {
+            listener_id, timeout_ms: Some(3_000),
+        }).unwrap();
+        let opened = client.join().unwrap().unwrap();
+        assert_eq!(accepted.alpn, "syncpeer-pairing/1");
+        assert!(!accepted.peer_certificate_der.is_empty());
+        write_tls_session(&sessions, TlsWriteRequest {
+            session_id: opened.session_id, bytes: b"client".to_vec(),
+        }).unwrap();
+        assert_eq!(read_tls_session(&sessions, TlsReadRequest {
+            session_id: accepted.session_id, max_bytes: Some(16),
+        }).unwrap().bytes, b"client");
+        write_tls_session(&sessions, TlsWriteRequest {
+            session_id: accepted.session_id, bytes: b"server".to_vec(),
+        }).unwrap();
+        assert_eq!(read_tls_session(&sessions, TlsReadRequest {
+            session_id: opened.session_id, max_bytes: Some(16),
+        }).unwrap().bytes, b"server");
+        close_tls_listener(&listeners, TlsListenerCloseRequest {
+            listener_id,
+        }).unwrap();
+        close_tls_session(&sessions, TlsCloseRequest { session_id: opened.session_id }).unwrap();
+        close_tls_session(&sessions, TlsCloseRequest { session_id: accepted.session_id }).unwrap();
+    }
+
+    #[test]
+    fn native_listener_uses_standard_syncthing_local_announcement() {
+        let cert = b"synthetic certificate DER";
+        let packet = local_announce_packet(cert, 22000, 42);
+        assert_eq!(&packet[..4], &LOCAL_DISCOVERY_MAGIC.to_be_bytes());
+        let announce = LocalDiscoveryAnnounce::decode(&packet[4..]).unwrap();
+        assert_eq!(announce.id, Sha256::digest(cert).to_vec());
+        assert_eq!(announce.addresses, vec!["tcp://0.0.0.0:22000"]);
+        assert_eq!(announce.instance_id, 42);
+    }
 
     #[test]
     fn profile_storage_error_preserves_native_reason() {

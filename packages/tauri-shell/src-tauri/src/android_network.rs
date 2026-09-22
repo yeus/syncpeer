@@ -13,6 +13,7 @@ use jni::{
 
 struct AndroidNetwork {
     tls_store: SharedTlsStore,
+    tls_listener_store: SharedTlsListenerStore,
     quic_store: SharedQuicStore,
 }
 
@@ -32,6 +33,11 @@ impl Drop for AndroidNetwork {
         for session in sessions {
             let (response, _) = mpsc::channel();
             let _ = session.commands.send(TlsCommand::Close { response });
+        }
+        if let Ok(mut guard) = self.tls_listener_store.lock() {
+            for (_, listener) in guard.listeners.drain() {
+                listener.stop.store(true, Ordering::Release);
+            }
         }
         if let Ok(mut guard) = self.quic_store.lock() {
             for (_, session) in guard.sessions.drain() {
@@ -69,6 +75,27 @@ fn execute(
             let response = open_tls_session(network.tls_store.clone(), input)?;
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode TLS response: {error}"))?)
+        }
+        "tlsListen" => {
+            let input: TlsListenRequest = serde_json::from_value(request.clone())
+                .map_err(|error| format!("Invalid TLS listen request: {error}"))?;
+            let response = open_tls_listener(network.tls_store.clone(),
+                network.tls_listener_store.clone(), input)?;
+            Ok(serde_json::to_value(response)
+                .map_err(|error| format!("Could not encode TLS listener response: {error}"))?)
+        }
+        "tlsAccept" => {
+            let input: TlsAcceptRequest = serde_json::from_value(request.clone())
+                .map_err(|error| format!("Invalid TLS accept request: {error}"))?;
+            let response = accept_tls_listener(&network.tls_listener_store, input)?;
+            Ok(serde_json::to_value(response)
+                .map_err(|error| format!("Could not encode TLS accept response: {error}"))?)
+        }
+        "tlsListenerClose" => {
+            let input: TlsListenerCloseRequest = serde_json::from_value(request.clone())
+                .map_err(|error| format!("Invalid TLS listener close request: {error}"))?;
+            close_tls_listener(&network.tls_listener_store, input)?;
+            Ok(serde_json::Value::Null)
         }
         "relayOpen" => {
             let input: RelayOpenRequest = serde_json::from_value(request.clone())
@@ -177,6 +204,7 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
             "nativeHandle",
             Arc::new(AndroidNetwork {
                 tls_store: Arc::new(Mutex::new(TlsSessionStore::default())),
+                tls_listener_store: Arc::new(Mutex::new(TlsListenerStore::default())),
                 quic_store: Arc::new(Mutex::new(QuicSessionStore::default())),
             }),
         )

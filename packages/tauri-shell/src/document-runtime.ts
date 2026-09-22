@@ -8,9 +8,12 @@ import { dispatchDocumentCommand } from "../../core/src/sync/documentCommands.js
 import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js";
 import { deriveUntrustedFolderCrypto } from "../../core/src/core/model/untrusted.js";
 import { createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDiskRange } from "../../core/src/sync/encryptedFilesystem.js";
-import { createSyncpeerCoreClient, type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket } from "../../core/src/client.js";
+import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate,
+  type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
-import { createConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
+import { createConnectionLifecycle, type ConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
+import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
+import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
 
@@ -34,11 +37,42 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
       void request({ operation: "diagnostic", event,
         message: typeof details?.message === "string" ? details.message : "Unknown runtime failure." });
     },
-    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal }) => {
-      const value = await request({ operation: "tlsOpen", host, port, certPem, keyPem, caPem: caPem ?? null, timeoutMs: timeoutMs ?? null }) as { sessionId: number; peerCertificateDer: number[] };
+    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal, alpnProtocols }) => {
+      const value = await request({ operation: "tlsOpen", host, port, certPem, keyPem, caPem: caPem ?? null,
+        timeoutMs: timeoutMs ?? null, alpnProtocols: [...alpnProtocols ?? ["bep/1.0"]] }) as { sessionId: number; peerCertificateDer: number[] };
       const result = socket(Number(value.sessionId), new Uint8Array(value.peerCertificateDer));
       if (signal?.aborted) { await result.close(); throw new Error("Connection attempt was cancelled."); }
       return result;
+    },
+    listenTls: async ({ host, port, certPem, keyPem, alpnProtocols, handshakeTimeoutMs }) => {
+      const opened = await request({ operation: "tlsListen", host, port, certPem, keyPem,
+        alpnProtocols: [...alpnProtocols], handshakeTimeoutMs: handshakeTimeoutMs ?? null }) as {
+        listenerId: number; port: number;
+      };
+      let closed = false;
+      return {
+        port: Number(opened.port),
+        accept: async () => {
+          while (!closed) {
+            try {
+              const accepted = await request({ operation: "tlsAccept", listenerId: opened.listenerId,
+                timeoutMs: 60_000 }) as { sessionId: number; peerCertificateDer: number[];
+                remoteAddress: string; remotePort: number; alpn: string };
+              return { socket: socket(Number(accepted.sessionId), new Uint8Array(accepted.peerCertificateDer)),
+                remoteAddress: accepted.remoteAddress, remotePort: Number(accepted.remotePort), alpn: accepted.alpn };
+            } catch (error) {
+              if (!closed && /accept timed out/i.test(String(error))) continue;
+              throw error;
+            }
+          }
+          throw new Error("TLS listener closed.");
+        },
+        close: async () => {
+          if (closed) return;
+          closed = true;
+          await request({ operation: "tlsListenerClose", listenerId: opened.listenerId });
+        },
+      };
     },
     connectQuic: async ({ host, port, certPem, keyPem, caPem, timeoutMs, keepaliveMs, idleTimeoutMs, signal }) => {
       const value = await request({ operation: "quicOpen", host, port, certPem, keyPem, caPem: caPem ?? null,
@@ -102,7 +136,38 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
   const core = createSyncpeerCoreClient(adapter);
   let activeOptions: ConnectOptions | null = null;
   let sharedFolderIds: string[] = [];
-  const lifecycle = createConnectionLifecycle<ConnectOptions>({
+  let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+  let incomingServiceKey = "";
+  const stopIncomingService = async () => {
+    const service = incomingService;
+    incomingService = null;
+    incomingServiceKey = "";
+    await service?.close();
+  };
+  const ensureIncomingService = async (options: ConnectOptions, coreOptions: SyncpeerConnectOptions) => {
+    if (!coreOptions.expectedDeviceId) return null;
+    const localDeviceId = await deviceIdFromCertificate(adapter, certificateDerFromPem(coreOptions.certPem));
+    const key = JSON.stringify([localDeviceId, coreOptions.expectedDeviceId,
+      coreOptions.certPem, coreOptions.keyPem]);
+    if (incomingService && incomingServiceKey === key) return incomingService;
+    await stopIncomingService();
+    const remoteDeviceId = coreOptions.expectedDeviceId;
+    incomingService = await startIncomingPeerService(adapter, {
+      host: "0.0.0.0", port: 22000, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      localDeviceId, approvedDeviceIds: [remoteDeviceId],
+      connectionOptions: (_remote, endpoint) => ({ ...coreOptions, ...endpoint }),
+      onSession: session => {
+        if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
+        void lifecycle.adopt(options, session);
+      },
+      onError: error => adapter.log?.("core.incoming.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    });
+    incomingServiceKey = key;
+    return incomingService;
+  };
+  const lifecycle: ConnectionLifecycle<ConnectOptions> = createConnectionLifecycle<ConnectOptions>({
     open: async (options, signal) => {
       let passwords: Record<string, string> = {};
       try {
@@ -134,7 +199,27 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         folderPasswords,
         sharedFolders,
       };
-      const session = await core.openSession(coreOptions, signal);
+      let listenerFailure: unknown;
+      let service: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+      try { service = await ensureIncomingService(options, coreOptions); }
+      catch (error) { listenerFailure = error; }
+      let session;
+      try { session = await core.openSession(coreOptions, signal); }
+      catch (error) {
+        if (listenerFailure) throw new AggregateError([error, listenerFailure],
+          "Could not connect to the peer or start the incoming LAN listener on TCP port 22000.",
+          { cause: error });
+        throw error;
+      }
+      if (service && options.remoteId) {
+        const admitted = await service.admitOutgoing(options.remoteId, session.connectedVia, session);
+        if (!admitted) {
+          const remote = options.remoteId.replace(/[^A-Z2-7]/gi, "").toUpperCase();
+          const selected = service.activeSessions().find(candidate => candidate.remoteDeviceId === remote);
+          if (!selected) throw new Error("The authenticated peer session was replaced before it became active.");
+          session = selected.session;
+        }
+      }
       sharedFolderIds = sharedFolders.map(folder => folder.id);
       return session;
     },
@@ -165,6 +250,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         activeOptions = null;
         sharedFolderIds = [];
         await lifecycle.disconnect();
+        await stopIncomingService();
         return { phase: "idle" };
       }
       if (request.operation === "syncFavorites") {
@@ -175,7 +261,12 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
       if (request.operation === "status") return { ...lifecycle.getState(), active: !!lifecycle.getSession(), hasOptions: !!activeOptions };
       throw new Error(`Unknown session operation: ${String(request.operation)}`);
     },
-    close: async () => { activeOptions = null; sharedFolderIds = []; await lifecycle.disconnect(); },
+    close: async () => {
+      activeOptions = null;
+      sharedFolderIds = [];
+      await lifecycle.disconnect();
+      await stopIncomingService();
+    },
   };
 }
 

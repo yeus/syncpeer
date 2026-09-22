@@ -61,10 +61,13 @@ const editorAuthority = `${editorPackage}.commands`;
 const peerHostFolder = process.env.SYNCPEER_PEER_HOST_FOLDER?.trim() || "";
 const peerGuiUrl = process.env.SYNCPEER_PEER_GUI_URL?.trim() || "";
 const peerApiKey = process.env.SYNCPEER_PEER_API_KEY?.trim() || "";
+const deviceSerial = process.env.ANDROID_SERIAL?.trim() || "";
 
 const runAdb = (args, timeout = 30_000) => {
   try {
-    return execFileSync("adb", args, {
+    return execFileSync("adb", args[0] === "devices" || !deviceSerial
+      ? args
+      : ["-s", deviceSerial, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout,
@@ -77,7 +80,8 @@ const runAdb = (args, timeout = 30_000) => {
 
 const listDevices = () => runAdb(["devices"]).split("\n")
   .slice(1)
-  .filter((line) => /^\S+\s+device(?:\s|$)/.test(line));
+  .filter((line) => /^\S+\s+device(?:\s|$)/.test(line))
+  .filter((line) => !deviceSerial || line.split(/\s+/)[0] === deviceSerial);
 
 const androidSdkVersion = () => Number(
   runAdb(["shell", "getprop", "ro.build.version.sdk"]).trim(),
@@ -1220,15 +1224,15 @@ const setAndroidAutomaticConnectionPaused = async (cdp, paused) => {
     'document.querySelector("[data-testid=connection-status-toggle]")?.getAttribute("aria-expanded") === "true"',
   );
   if (!detailsExpanded) await clickUiTestId(cdp, "connection-status-toggle");
-  const label = await cdp.evaluate(
-    'document.querySelector("[data-testid=expert-connection-control]")?.textContent?.trim() || ""',
-  );
-  if (paused && label === "Pause automatic connection") {
-    await clickUiTestId(cdp, "expert-connection-control");
-  }
-  if (!paused && label === "Resume automatic connection") {
-    await clickUiTestId(cdp, "expert-connection-control");
-  }
+  const desiredLabel = paused ? "Resume automatic connection" : "Pause automatic connection";
+  const actionLabel = paused ? "Pause automatic connection" : "Resume automatic connection";
+  await waitForUiCondition(cdp, `(() => {
+    const button = document.querySelector("[data-testid=expert-connection-control]");
+    const label = button?.textContent?.trim() || "";
+    if (label === ${JSON.stringify(desiredLabel)}) return true;
+    if (label === ${JSON.stringify(actionLabel)} && button instanceof HTMLButtonElement) button.click();
+    return false;
+  })()`, `${paused ? "pausing" : "resuming"} automatic connection`, 30_000);
 };
 
 const openAndroidConnection = async (cdp) => {
@@ -1830,6 +1834,201 @@ const runModernAndroidServiceSmoke = async () => {
   }
 };
 
+const openFolderSettings = async (cdp) => {
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=tab-folders]") !== null', "folder tab");
+  await clickUiTestId(cdp, "tab-folders");
+  const opened = await cdp.evaluate(`(() => {
+    const button = [...document.querySelectorAll("button")]
+      .find(element => element.textContent?.trim() === "Folder settings · New folder");
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!opened) throw new Error("Android UI could not open Folder settings.");
+  await waitForUiCondition(cdp,
+    'document.querySelector("h1")?.textContent?.trim() === "Folders"', "Folder settings page");
+};
+
+const pairingSectionControl = (heading, selector) => `(() => {
+  const heading = [...document.querySelectorAll("h2")]
+    .find(element => element.textContent?.trim() === ${JSON.stringify(heading)});
+  return heading?.closest("section")?.querySelector(${JSON.stringify(selector)}) ?? null;
+})()`;
+
+const setPairingValue = async (cdp, heading, selector, value) => {
+  const updated = await cdp.evaluate(`(() => {
+    const element = ${pairingSectionControl(heading, selector)};
+    if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value")?.set;
+    setter?.call(element, ${JSON.stringify(value)});
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    return element.value === ${JSON.stringify(value)};
+  })()`);
+  if (!updated) throw new Error(`Android pairing control was unavailable: ${selector}`);
+};
+
+const clickPairingButton = async (cdp, heading, label) => {
+  const clicked = await cdp.evaluate(`(() => {
+    const section = (${pairingSectionControl(heading, "button")})?.closest("section");
+    const button = [...(section?.querySelectorAll("button") ?? [])]
+      .find(element => element.textContent?.trim() === ${JSON.stringify(label)});
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!clicked) throw new Error(`Android pairing button was unavailable: ${label}`);
+};
+
+const setPairingChecked = async (cdp, heading, selector) => {
+  const updated = await cdp.evaluate(`(() => {
+    const element = ${pairingSectionControl(heading, selector)};
+    if (!(element instanceof HTMLInputElement)) return false;
+    if (!element.checked) element.click();
+    return element.checked;
+  })()`);
+  if (!updated) throw new Error(`Android pairing checkbox was unavailable: ${selector}`);
+};
+
+const runPairingInvitation = async (outputPath) => {
+  const advertisedHost = process.env.SYNCPEER_PAIRING_ADVERTISED_HOST?.trim();
+  if (!advertisedHost) throw new Error("SYNCPEER_PAIRING_ADVERTISED_HOST is required.");
+  const cdp = await launchAndroidApp(true);
+  try {
+    const status = await tauriInvoke(cdp, "syncpeer_document_command", {
+      request: { operation: "status" },
+    }, 60_000);
+    if (status.result.vault.phase === "uninitialized") {
+      await tauriInvoke(cdp, "syncpeer_document_command", { request: {
+        operation: "createVault", password: "synthetic-owner-master-password", remember: true,
+      } }, 60_000);
+    }
+    await openFolderSettings(cdp);
+    await cdp.evaluate("window.confirm = () => true");
+    const heading = "Pair another Syncpeer device";
+    await waitForUiCondition(cdp,
+      `${pairingSectionControl(heading, "input")} instanceof HTMLInputElement`,
+      "pair another device controls", 30_000);
+    await setPairingValue(cdp, heading, "input", advertisedHost);
+    await clickPairingButton(cdp, heading, "Create pairing invitation");
+    await waitForUiCondition(cdp,
+      `${pairingSectionControl(heading, "textarea[readonly]")}?.value?.length > 0`,
+      "pairing invitation", 30_000);
+    const invitation = await cdp.evaluate(
+      `${pairingSectionControl(heading, "textarea[readonly]")}?.value ?? ""`,
+    );
+    fs.writeFileSync(outputPath, `${invitation}\n`, { mode: 0o600 });
+    await waitForUiText(cdp, "Device paired and approved.", 120_000);
+    console.log("Android invitation owner confirmed and persisted the paired device.");
+  } finally { cdp.close(); }
+};
+
+const runPairingJoin = async (inputPath) => {
+  const invitation = fs.readFileSync(inputPath, "utf8").trim();
+  if (!invitation) throw new Error("Pairing invitation file is empty.");
+  const cdp = await launchAndroidApp(true);
+  try {
+    await openFolderSettings(cdp);
+    await cdp.evaluate("window.confirm = () => true");
+    const heading = "Join an existing personal space";
+    await waitForUiCondition(cdp,
+      `${pairingSectionControl(heading, "textarea")} instanceof HTMLTextAreaElement`,
+      "join personal space controls", 30_000);
+    await setPairingValue(cdp, heading, "textarea", invitation);
+    await setPairingValue(cdp, heading, 'input[type="password"]',
+      "synthetic-joining-master-password");
+    await setPairingChecked(cdp, heading, 'input[type="checkbox"]');
+    await clickPairingButton(cdp, heading, "Join personal space");
+    await waitForUiText(cdp, "Personal space joined and device approved.", 120_000);
+    console.log("Android joining device confirmed and persisted the personal space.");
+  } finally { cdp.close(); }
+};
+
+const documentCommand = async (cdp, request) => {
+  const response = await tauriInvoke(cdp, "syncpeer_document_command", { request }, 60_000);
+  return response.result;
+};
+
+const folderTestConfig = () => {
+  const id = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-direct-folder";
+  const password = process.env.SYNCPEER_E2E_FOLDER_PASSWORD?.trim() ||
+    "synthetic-direct-folder-password";
+  const remoteDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim();
+  if (!remoteDeviceId) throw new Error("SYNCPEER_DEV_SERVER_DEVICE_ID is required.");
+  return { id, password, remoteDeviceId };
+};
+
+const prepareWholeFolder = async () => {
+  const { id, password, remoteDeviceId } = folderTestConfig();
+  const cdp = await launchAndroidApp(true);
+  try {
+    await documentCommand(cdp, { operation: "register", id, label: id, password });
+    await documentCommand(cdp, { operation: "attachDownloads", id });
+    const settings = await documentCommand(cdp, { operation: "profileSettings" });
+    await documentCommand(cdp, { operation: "saveProfileSettings", settings: {
+      ...settings,
+      folders: { ...settings.folders, [id]: {
+        favorites: [{ key: `folder:${id}:`, folderId: id, path: "", name: id, kind: "folder" }],
+        exclusions: [], ignorePatterns: [], paused: false,
+      } },
+    } });
+    await documentCommand(cdp, { operation: "saveConnectionPasswords",
+      passwords: { [`${remoteDeviceId}:${id}`]: password } });
+    console.log(`Android favorite whole-folder replica prepared: ${id}.`);
+  } finally { cdp.close(); }
+};
+
+const runWholeFolderEdit = async () => {
+  folderTestConfig();
+  const operation = process.env.SYNCPEER_E2E_EDIT_OPERATION?.trim() || "write";
+  const name = process.env.SYNCPEER_E2E_FILE_NAME?.trim() || "direct.txt";
+  if (operation === "write") {
+    if (editorCommand("stat", name) !== "true") editorCommand("create", name);
+    editorCommand("write", name, {
+      content: process.env.SYNCPEER_E2E_FILE_CONTENT ?? "created-by-syncpeer",
+    });
+  } else if (operation === "rename") {
+    const target = process.env.SYNCPEER_E2E_RENAME_TARGET?.trim();
+    if (!target) throw new Error("SYNCPEER_E2E_RENAME_TARGET is required.");
+    editorCommand("rename", name, { target });
+  } else if (operation === "delete") editorCommand("delete", name);
+  else throw new Error(`Unknown whole-folder edit operation: ${operation}`);
+  console.log(`Separate Android editor APK applied whole-folder ${operation}: ${name}.`);
+};
+
+const runWholeFolderVerify = async () => {
+  folderTestConfig();
+  const name = process.env.SYNCPEER_E2E_FILE_NAME?.trim() || "direct.txt";
+  const expected = process.env.SYNCPEER_E2E_FILE_CONTENT;
+  const expectMissing = process.env.SYNCPEER_E2E_EXPECT_MISSING === "1";
+  const deadline = Date.now() + 120_000;
+  let observed;
+  while (Date.now() < deadline) {
+    const exists = editorCommand("stat", name) === "true";
+    if (!exists && expectMissing) return;
+    if (exists && !expectMissing) {
+      observed = editorCommand("read", name);
+      if (expected === undefined || observed === expected) return;
+    }
+    await wait(500);
+  }
+  throw new Error(expectMissing
+    ? `Android editor still sees deleted document: ${name}`
+    : `Android editor did not observe convergence: ${name} (${observed ?? "missing"})`);
+};
+
+const runWholeFolderConnection = async () => {
+  const cdp = await launchAndroidApp(true);
+  try {
+    if (!await openAndroidConnection(cdp)) throw new Error("Whole-folder peer did not connect.");
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 30_000);
+    await waitForSessionNotificationText("Peer session connected; selected sync is ready.", 120_000);
+    console.log("Android direct whole-folder session is running in the background service.");
+  } finally { cdp.close(); }
+};
+
 const main = async () => {
   runAdb(["wait-for-device"], 60_000);
 
@@ -1879,6 +2078,40 @@ const main = async () => {
       cdp.close();
     }
     fs.writeFileSync(runtimeProbePath, supported ? "supported\n" : "unsupported\n", { mode: 0o600 });
+    return;
+  }
+
+  const pairingInvitationPath = argumentValue("--pairing-invitation");
+  if (hasArgument("--pairing-owner")) {
+    if (!pairingInvitationPath) throw new Error("--pairing-invitation is required.");
+    await runPairingInvitation(pairingInvitationPath);
+    return;
+  }
+  if (hasArgument("--pairing-join")) {
+    if (!pairingInvitationPath) throw new Error("--pairing-invitation is required.");
+    await runPairingJoin(pairingInvitationPath);
+    return;
+  }
+  if (hasArgument("--prepare-whole-folder")) {
+    await prepareWholeFolder();
+    return;
+  }
+  if (hasArgument("--grant-whole-folder-editor")) {
+    await grantEditorFolder();
+    await waitForEditorGrant();
+    console.log("Separate Android editor APK received the whole-folder SAF grant.");
+    return;
+  }
+  if (hasArgument("--edit-whole-folder")) {
+    await runWholeFolderEdit();
+    return;
+  }
+  if (hasArgument("--verify-whole-folder")) {
+    await runWholeFolderVerify();
+    return;
+  }
+  if (hasArgument("--connect-whole-folder")) {
+    await runWholeFolderConnection();
     return;
   }
 

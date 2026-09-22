@@ -47,6 +47,17 @@ interface TlsReadResponse {
   eof?: boolean;
 }
 
+interface TlsListenResponse {
+  listenerId: number;
+  port: number;
+}
+
+interface TlsAcceptResponse extends TlsOpenResponse {
+  remoteAddress: string;
+  remotePort: number;
+  alpn: string;
+}
+
 interface CliNodeIdentityResponse {
   certPath: string;
   keyPath: string;
@@ -292,7 +303,7 @@ export const createTauriAdapters = (
 
   const hostAdapter: SyncpeerHostAdapter = {
     kdf: createWorkerPasswordKdf(),
-    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal }) => {
+    connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal, alpnProtocols }) => {
       const opened = await invokeWithLogging<TlsOpenResponse>("syncpeer_tls_open", {
         request: {
           host,
@@ -301,6 +312,7 @@ export const createTauriAdapters = (
           keyPem,
           caPem: caPem ?? null,
           timeoutMs: timeoutMs ?? null,
+          alpnProtocols: [...alpnProtocols ?? ["bep/1.0"]],
         },
       });
       const sessionId = Number(opened.sessionId);
@@ -313,6 +325,39 @@ export const createTauriAdapters = (
         sessionId,
         new Uint8Array(opened.peerCertificateDer),
       );
+    },
+    listenTls: async ({ host, port, certPem, keyPem, alpnProtocols, handshakeTimeoutMs }) => {
+      const opened = await invokeWithLogging<TlsListenResponse>("syncpeer_tls_listen", {
+        request: { host, port, certPem, keyPem, alpnProtocols: [...alpnProtocols],
+          handshakeTimeoutMs: handshakeTimeoutMs ?? null },
+      });
+      let closed = false;
+      return {
+        port: opened.port,
+        accept: async () => {
+          while (!closed) {
+            try {
+              const accepted = await invokeWithLogging<TlsAcceptResponse>("syncpeer_tls_accept", {
+                request: { listenerId: opened.listenerId, timeoutMs: 60_000 },
+              });
+              return { socket: createTlsSocket(invokeWithLogging, Number(accepted.sessionId),
+                new Uint8Array(accepted.peerCertificateDer)), remoteAddress: accepted.remoteAddress,
+              remotePort: accepted.remotePort, alpn: accepted.alpn };
+            } catch (error) {
+              if (!closed && /accept timed out/i.test(String(error))) continue;
+              throw error;
+            }
+          }
+          throw new Error("TLS listener closed.");
+        },
+        close: async () => {
+          if (closed) return;
+          closed = true;
+          await invokeWithLogging("syncpeer_tls_listener_close", {
+            request: { listenerId: opened.listenerId },
+          });
+        },
+      };
     },
     connectQuic: async ({
       host,
@@ -693,13 +738,17 @@ export const createTauriAdapters = (
     },
     show: async id => { await invokeWithLogging("syncpeer_document_command", { request: { operation: "show", id } }); },
   });
-  return { hostAdapter, platformAdapter: documents.platformAdapter, documentCommand: documentRequest,
+  const appPlatformAdapter = platform === "android"
+    ? { ...documents.platformAdapter, sessionSharedFolders: async () => [] }
+    : documents.platformAdapter;
+  return { hostAdapter, platformAdapter: appPlatformAdapter, documentCommand: documentRequest,
     connectDocumentFolder: documents.connectFolder,
     disconnectDocumentFolder: documents.disconnectFolder,
     syncDocumentFolders: documents.syncFolders,
     folderCredentials: detectRuntimeEnvironment() === "tauri" ? {
       load: () => documentRequest<Record<string, string>>({ operation: "connectionPasswords" }),
       save: async (passwords: Record<string, string>) => { await documentRequest({ operation: "saveConnectionPasswords", passwords }); },
+      merge: async (passwords: Record<string, string>) => { await documentRequest({ operation: "mergeConnectionPasswords", passwords }); },
     } : undefined,
     biometric: platform === "android" ? {
       status: async () => invokeWithLogging<{ available: boolean; enabled: boolean }>("syncpeer_android_biometric_status", { request: { profileId: "documents" } }),

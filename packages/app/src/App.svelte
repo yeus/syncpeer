@@ -203,7 +203,7 @@
       if (saved[id] !== undefined && saved[id] !== password) throw new Error("Conflicting saved folder passwords require review.");
     }
     const merged = { ...pending, ...saved };
-    await folderCredentials.save(merged);
+    await folderCredentials.merge(merged);
     const verifiedPasswords = await folderCredentials.load();
     if (Object.entries(merged).some(([id, value]) => verifiedPasswords[id] !== value)) {
       throw new Error("Encrypted credentials could not be verified; legacy data was retained.");
@@ -787,6 +787,15 @@
 {:else if app.currentPage === "folder-settings"}
   <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
     command={documentCommand} onImport={importPeerFolder}
+    onStartPairing={advertisedHost => client.startPairingInvitation({ advertisedHost,
+      confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}
+    onJoinPairing={(invitation, password, remember) => client.joinPairingInvitation({ invitation, password, remember,
+      confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}
+    onPairedDevice={deviceId => {
+      app.devices.newSavedDeviceId = deviceId;
+      app.devices.newSavedDeviceCustomName = "Paired Syncpeer device";
+      actions.addSavedDevice();
+    }}
     peerId={app.session.isConnected ? app.session.remoteDevice?.id ?? "" : ""} peerFolders={app.session.folders}
     onSettingsSaved={settings => {
       app.favorites.exclusions = Object.values(settings.folders).flatMap(folder => folder.exclusions);

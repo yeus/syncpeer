@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { defaultFolderSettings, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
+  import { defaultFolderSettings, type PairingInvitation, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import type { createDocumentFilesystem } from "@syncpeer/core/filesystem";
-  let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved, onImport, peerId, peerFolders, biometric, command }: {
+  let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved,
+    onImport, onStartPairing, onJoinPairing, onPairedDevice, peerId, peerFolders, biometric, command }: {
     onBack: () => void;
     onImport: (peerId: string, folderId: string, password: string) => Promise<void>;
     peerId: string;
@@ -13,6 +14,10 @@
     onRotateMasterPassword: (password: string) => Promise<void>;
     onMigrate: (folderId: string, target: "encrypted" | "plaintext") => Promise<void>;
     onSettingsSaved: (settings: SyncpeerProfileSettings) => void;
+    onStartPairing: (advertisedHost: string) => Promise<{ invitation: PairingInvitation;
+      completed: Promise<{ remoteDeviceId: string }>; cancel: () => Promise<void> }>;
+    onJoinPairing: (invitation: PairingInvitation, password: string, remember: boolean) => Promise<{ remoteDeviceId: string }>;
+    onPairedDevice: (deviceId: string) => void;
     biometric?: {
       status: () => Promise<{ available: boolean; enabled: boolean }>;
       setEnabled: (enabled: boolean) => Promise<{ available: boolean; enabled: boolean }>;
@@ -28,6 +33,42 @@
   let rememberMaster = $state(false), generatedPassword = $state(""), generatedSaved = $state(false);
   let importFolderId = $state(""), importPassword = $state(""), importApproved = $state(false);
   let recoveryPassword = $state(""), backupText = $state(""), backupFile = $state<File | null>(null);
+  let pairingHost = $state(""), pairingInvitation = $state(""), pairingMessage = $state("");
+  let pairingHandle: Awaited<ReturnType<typeof onStartPairing>> | null = null;
+
+  async function inviteDevice() {
+    if (!pairingHost.trim()) return;
+    busy = true; error = ""; pairingMessage = "";
+    try {
+      await pairingHandle?.cancel().catch(() => undefined);
+      pairingHandle = await onStartPairing(pairingHost.trim());
+      pairingInvitation = JSON.stringify(pairingHandle.invitation);
+      pairingMessage = "Invitation ready. Copy it to the other device; it expires in five minutes.";
+      void pairingHandle.completed.then(({ remoteDeviceId }) => {
+        onPairedDevice(remoteDeviceId);
+        pairingMessage = "Device paired and approved.";
+        pairingInvitation = ""; pairingHandle = null;
+      }).catch(failure => {
+        error = failure instanceof Error ? failure.message : "Pairing failed.";
+        pairingHandle = null;
+      });
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Pairing invitation failed."; }
+    finally { busy = false; }
+  }
+
+  async function joinDevice() {
+    if (masterPassword.length < 16 || !pairingInvitation.trim()) return;
+    busy = true; error = ""; pairingMessage = "";
+    try {
+      const invitation = JSON.parse(pairingInvitation) as PairingInvitation;
+      const result = await onJoinPairing(invitation, masterPassword, rememberMaster);
+      pairingInvitation = ""; masterPassword = "";
+      pairingMessage = "Personal space joined and device approved.";
+      await onUnlock(); await refresh();
+      onPairedDevice(result.remoteDeviceId);
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Pairing failed."; }
+    finally { busy = false; }
+  }
 
   async function transferBackup(restore: boolean) {
     busy = true; error = "";
@@ -173,7 +214,28 @@
       {/if}
       <button disabled={busy || !masterPassword || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
     </form>
+    <section>
+      <h2>Join an existing personal space</h2>
+      <p>Paste the short-lived invitation from an already unlocked Syncpeer device. Both devices must confirm the same six-digit code.</p>
+      <label>Pairing invitation <textarea rows="6" bind:value={pairingInvitation}></textarea></label>
+      <label>New local master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" /></label>
+      <label><input type="checkbox" bind:checked={rememberMaster} /> Remember on this device</label>
+      <button disabled={busy || masterPassword.length < 16 || !pairingInvitation.trim()} onclick={() => void joinDevice()}>Join personal space</button>
+      {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
+    </section>
   {:else if status?.vault.phase === "unlocked"}
+    <section>
+      <h2>Pair another Syncpeer device</h2>
+      <p>Enter this device’s LAN address. Creating an invitation temporarily disconnects the current sync session. The invitation expires after five minutes and transfers secrets only after both devices confirm the same code.</p>
+      <label>This device’s LAN host or IP (optional port) <input bind:value={pairingHost} placeholder="192.168.1.20" /></label>
+      <button disabled={busy || !pairingHost.trim()} onclick={() => void inviteDevice()}>Create pairing invitation</button>
+      {#if pairingInvitation}
+        <label>Invitation <textarea readonly rows="6" value={pairingInvitation} onclick={event => event.currentTarget.select()}></textarea></label>
+        <button disabled={busy} onclick={() => void navigator.clipboard.writeText(pairingInvitation)}>Copy invitation</button>
+        <button disabled={busy} onclick={() => { void pairingHandle?.cancel(); pairingHandle = null; pairingInvitation = ""; pairingMessage = "Pairing invitation cancelled."; }}>Cancel invitation</button>
+      {/if}
+      {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
+    </section>
     <section>
       <h2>Register or recover an encrypted peer folder</h2>
       <p>Connect to the peer first. Registration keeps the root browsable; only favorites download automatically. Recover a saved folder password from your personal-space backup, or enter and approve it here.</p>
@@ -235,7 +297,7 @@
   {#if status?.vault.phase === "unlocked" || status?.vault.phase === "uninitialized"}
     <section>
       <h2>Personal-space backup</h2>
-      <p>This password-encrypted backup contains folder credentials and settings. It contains neither downloaded documents nor device identity keys. Keep its recovery password separately; cross-device pairing and shared settings are outside the 0.6 release promise.</p>
+      <p>This password-encrypted backup contains folder credentials and settings. It contains neither downloaded documents nor device identity keys. Keep its recovery password separately.</p>
       <label>Backup recovery password <input type="password" bind:value={recoveryPassword} autocomplete="off" /></label>
       {#if status.vault.phase === "unlocked"}
         <button disabled={busy || !recoveryPassword} onclick={() => void transferBackup(false)}>Export encrypted backup</button>

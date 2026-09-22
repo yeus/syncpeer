@@ -232,6 +232,14 @@ export function createDocumentCache(options: {
     await options.show(documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
   };
   const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
+    exportPairingTransfer: () => request({ operation: "exportPairingTransfer" }),
+    importPairingTransfer: async (transfer, password, remember) => {
+      await request({ operation: "importPairingTransfer", transfer, password, remember });
+    },
+    sessionSharedFolders: async passwords => {
+      if (!options.enabled() || (await cacheStatus()).vault.phase !== "unlocked") return [];
+      return request({ operation: "sessionSharedFolders", passwords });
+    },
     loadProfileSettings,
     saveProfileSettings,
     loadDirectorySnapshot: (folderId, sourceDeviceId, path) => request({

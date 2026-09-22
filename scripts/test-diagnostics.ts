@@ -81,7 +81,7 @@ const main = async (): Promise<void> => {
     {
       name: "Syncpeer peer TLS interoperability",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-syncpeer-peers.ts"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-peer-session-manager.ts", "scripts/test-syncpeer-peers.ts"],
     },
     {
       name: "Durable folder replica indexes",
@@ -101,7 +101,12 @@ const main = async (): Promise<void> => {
     {
       name: "Encrypted filesystem format",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-encrypted-filesystem.ts", "scripts/test-native-filesystem.ts", "scripts/test-replica-persistence.ts", "scripts/test-encrypted-replica.ts", "scripts/test-credential-vault.ts", "scripts/test-personal-space.ts", "scripts/test-personal-space-sharing.ts", "scripts/test-personal-space-changes.ts", "scripts/test-personal-space-pairing.ts"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-encrypted-filesystem.ts", "scripts/test-native-filesystem.ts", "scripts/test-replica-persistence.ts", "scripts/test-encrypted-replica.ts", "scripts/test-credential-vault.ts", "scripts/test-personal-space.ts", "scripts/test-personal-space-sharing.ts", "scripts/test-personal-space-changes.ts", "scripts/test-personal-space-pairing.ts", "scripts/test-personal-space-pairing-transport.ts", "scripts/test-browser-pairing.ts", "scripts/test-personal-space-settings.ts"],
+    },
+    {
+      name: "Whole-folder retention safety",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-folder-retention.ts"],
     },
     {
       name: "Tauri document sink recovery",

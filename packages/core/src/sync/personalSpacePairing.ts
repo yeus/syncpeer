@@ -19,6 +19,12 @@ export interface PairingTransfer {
   ciphertext: string;
 }
 
+export interface PersonalSpacePairingTransfer {
+  spaceId: string;
+  settingsFolderId: string;
+  rootKey: string;
+}
+
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const decode = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
 const context = (invitation: PairingInvitation, request: PairingRequest) =>
@@ -77,7 +83,7 @@ export async function openPairingSession(subtle: SubtleCrypto, privateKey: Crypt
 export async function sealPairingTransfer(subtle: SubtleCrypto,
   session: Awaited<ReturnType<typeof openPairingSession>>,
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>,
-  value: { spaceId: string; settingsFolderId: string; rootKey: string }): Promise<PairingTransfer> {
+  value: PersonalSpacePairingTransfer): Promise<PairingTransfer> {
   if (!/^[a-f0-9]{32}$/.test(value.spaceId) || !/^[a-f0-9]{32}$/.test(value.settingsFolderId) ||
     !/^[a-f0-9]{64}$/.test(value.rootKey)) throw new Error("Invalid pairing transfer.");
   const nonce = await randomBytes(12);
@@ -100,6 +106,6 @@ export async function openPairingTransfer(subtle: SubtleCrypto,
     if (!value || typeof value !== "object" || !/^[a-f0-9]{32}$/.test((value as { spaceId?: string }).spaceId ?? "") ||
       !/^[a-f0-9]{32}$/.test((value as { settingsFolderId?: string }).settingsFolderId ?? "") ||
       !/^[a-f0-9]{64}$/.test((value as { rootKey?: string }).rootKey ?? "")) throw new Error("Invalid pairing transfer.");
-    return value as { spaceId: string; settingsFolderId: string; rootKey: string };
+    return value as PersonalSpacePairingTransfer;
   } catch { throw new Error("Pairing confirmation or encrypted transfer failed."); }
 }

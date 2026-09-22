@@ -161,6 +161,31 @@ test("manual disconnect cancels a pending retry", async () => {
   assert.equal(lifecycle.getState().phase, "idle");
 });
 
+test("an authenticated incoming session can satisfy the desired connection", async () => {
+  const outgoing = deferred<ReturnType<typeof session>>();
+  const incoming = session();
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => outgoing.promise,
+    keyFor: (value) => value,
+  });
+
+  const connecting = lifecycle.connect("peer");
+  await Promise.resolve();
+  assert.equal(await lifecycle.adopt("peer", incoming), true);
+  assert.equal(lifecycle.getSession(), incoming);
+  assert.equal(lifecycle.getState().phase, "connected");
+
+  const obsolete = session();
+  outgoing.resolve(obsolete);
+  assert.equal(await connecting, incoming);
+  assert.equal(obsolete.isClosed(), true);
+
+  const wrongPeer = session();
+  assert.equal(await lifecycle.adopt("different-peer", wrongPeer), false);
+  assert.equal(wrongPeer.isClosed(), true);
+  await lifecycle.disconnect();
+});
+
 test("manual disconnect aborts and cleans up a pending opening", async () => {
   const pending = deferred<ReturnType<typeof session>>();
   let openingSignal: AbortSignal | undefined;

@@ -24,6 +24,14 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
   switch (command.operation) {
     case "status": case "cacheRegistrations": return documents.status();
     case "connectionPasswords": return documents.connectionPasswords();
+    case "sessionSharedFolders": {
+      if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords) ||
+        Object.entries(command.passwords).some(([id, password]) => !id || id.length > 4096 ||
+          typeof password !== "string" || password.length > 4096)) {
+        throw new Error("Invalid folder credentials.");
+      }
+      return documents.sessionSharedFolders(command.passwords as Record<string, string>);
+    }
     case "profileSettings": return documents.profileSettings();
     case "loadDirectorySnapshot": return documents.loadDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
       command.path === "" ? "" : text("path"));
@@ -45,7 +53,20 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
       return documents.saveConnectionPasswords(command.passwords as Record<string, string>);
     }
+    case "mergeConnectionPasswords": {
+      if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
+      return documents.mergeConnectionPasswords(command.passwords as Record<string, string>);
+    }
     case "exportRecoveryBackup": return documents.exportRecoveryBackup(text("password"));
+    case "exportPairingTransfer": return documents.exportPairingTransfer();
+    case "importPairingTransfer": {
+      if (!command.transfer || typeof command.transfer !== "object" || Array.isArray(command.transfer) ||
+        (command.remember !== undefined && typeof command.remember !== "boolean")) {
+        throw new Error("Invalid personal-space pairing transfer.");
+      }
+      return documents.importPairingTransfer(command.transfer as Parameters<typeof documents.importPairingTransfer>[0],
+        text("password"), command.remember !== false);
+    }
     case "restoreRecoveryBackup": {
       if (!command.backup || typeof command.backup !== "object" || Array.isArray(command.backup)) {
         throw new Error("Invalid personal-space recovery backup.");

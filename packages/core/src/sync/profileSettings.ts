@@ -1,6 +1,7 @@
 import { DEFAULT_FAVORITE_IGNORE_PATTERNS, type FavoriteExclusion } from "../ui/favoriteSelection.js";
 import type { FavoriteRecord } from "../ui/browserClient.js";
 import type { FolderVersioningMode } from "./folderSync.js";
+import { settingsText } from "./settingsValidation.js";
 
 export interface SyncpeerFolderSettings {
   favorites: FavoriteRecord[];
@@ -50,16 +51,11 @@ export const defaultFolderSettings = (): SyncpeerFolderSettings => ({
   paused: false,
 });
 
-const safeText = (value: unknown, label: string, maximum = 4096) => {
-  if (typeof value !== "string" || value.length > maximum || value.includes("\0")) throw new Error(`Invalid ${label}.`);
-  return value;
-};
-
 const normalizeFavorite = (folderId: string, value: unknown): FavoriteRecord => {
   const item = value as Partial<FavoriteRecord>;
   if (!item || typeof item !== "object" || (item.kind !== "file" && item.kind !== "folder")) throw new Error("Invalid favorite settings.");
-  return { folderId, key: safeText(item.key, "favorite key"), path: safeText(item.path, "favorite path"),
-    name: safeText(item.name, "favorite name"), kind: item.kind };
+  return { folderId, key: settingsText(item.key, "favorite key"), path: settingsText(item.path, "favorite path"),
+    name: settingsText(item.name, "favorite name"), kind: item.kind };
 };
 
 const normalizeFolder = (folderId: string, value: unknown): SyncpeerFolderSettings => {
@@ -72,9 +68,9 @@ const normalizeFolder = (folderId: string, value: unknown): SyncpeerFolderSettin
     exclusions: folder.exclusions.map(value => {
       const item = value as Partial<FavoriteExclusion>;
       if (!item || typeof item !== "object" || (item.kind !== "file" && item.kind !== "folder")) throw new Error("Invalid favorite exclusion.");
-      return { folderId, path: safeText(item.path, "favorite exclusion"), kind: item.kind };
+      return { folderId, path: settingsText(item.path, "favorite exclusion"), kind: item.kind };
     }),
-    ignorePatterns: folder.ignorePatterns.map(value => safeText(value, "ignore pattern", 1024)),
+    ignorePatterns: folder.ignorePatterns.map(value => settingsText(value, "ignore pattern", 1024)),
     paused: folder.paused,
   };
 };
@@ -99,13 +95,13 @@ export function normalizeProfileSettings(value: unknown): SyncpeerProfileSetting
     throw new Error("Invalid cache settings.");
   }
   const folders = Object.fromEntries(Object.entries(settings.folders).map(([id, folder]) =>
-    [safeText(id, "settings folder identifier", 1024), normalizeFolder(id, folder)]));
+    [settingsText(id, "settings folder identifier", 1024), normalizeFolder(id, folder)]));
   const devices = Object.fromEntries(Object.entries(settings.devices).map(([id, device]) => {
     const item = device as { allowMetered?: unknown };
     if (!item || typeof item !== "object" || (item.allowMetered !== undefined && typeof item.allowMetered !== "boolean")) {
       throw new Error("Invalid device settings.");
     }
-    return [safeText(id, "settings device identifier", 1024),
+    return [settingsText(id, "settings device identifier", 1024),
       item.allowMetered === undefined ? {} : { allowMetered: item.allowMetered }];
   }));
   return { format: 1, profile: { versioning: profile.versioning as FolderVersioningMode,

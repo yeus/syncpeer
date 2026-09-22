@@ -8,7 +8,6 @@ import tls from "node:tls";
 import protobuf from "protobufjs";
 import {
   createSyncpeerCoreClient,
-  acceptSyncpeerSession,
   type SyncpeerConnectOptions,
   type SyncpeerSessionHandle,
   withMetadataSession,
@@ -21,6 +20,8 @@ import {
   type SyncpeerGlobalDiscoveryOptions,
   type SyncpeerHostAdapter,
   type SyncpeerTlsConnectOptions,
+  type SyncpeerTlsListenOptions,
+  type SyncpeerTlsListener,
   type SyncpeerTlsSocket,
 } from "./client.js";
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./ui/browserClient.js";
@@ -28,6 +29,8 @@ import type { SessionTransport } from "./ui/sessionTypes.js";
 import { createConnectionLifecycle } from "./ui/connectionLifecycle.js";
 import { createRecoveringRemoteFs } from "./ui/recoveringRemoteFs.js";
 import { connectNodeQuic } from "./core/transport/nodeQuic.js";
+import { startIncomingPeerService } from "./sync/incomingPeerService.js";
+import type { PeerSessionCandidate } from "./sync/peerSessionManager.js";
 export {
   classifyRuntimeArchitecture,
   classifyRuntimePlatform,
@@ -68,6 +71,21 @@ const LocalDiscoveryAnnounce = new protobuf.Type("Announce")
   .add(new protobuf.Field("id", 1, "bytes"))
   .add(new protobuf.Field("addresses", 2, "string", "repeated"))
   .add(new protobuf.Field("instance_id", 3, "int64"));
+
+export function createNodeLocalDiscoveryAnnouncement(certDer: Uint8Array, port: number,
+  instanceId = Date.now()): Uint8Array {
+  if (!certDer.length || !Number.isInteger(port) || port < 1 || port > 65535 ||
+    !Number.isSafeInteger(instanceId)) throw new Error("Invalid local discovery announcement.");
+  const body = LocalDiscoveryAnnounce.encode({
+    id: crypto.createHash("sha256").update(certDer).digest(),
+    addresses: [`tcp://0.0.0.0:${port}`],
+    instance_id: instanceId,
+  }).finish();
+  const packet = new Uint8Array(4 + body.length);
+  new DataView(packet.buffer).setUint32(0, LOCAL_DISCOVERY_MAGIC, false);
+  packet.set(body, 4);
+  return packet;
+}
 
 class NodeTlsSocket implements SyncpeerTlsSocket {
   private queue: Uint8Array[] = [];
@@ -159,7 +177,7 @@ async function connectNodeTls(options: SyncpeerTlsConnectOptions): Promise<Syncp
   const socket = tls.connect({
     host: options.host,
     port: options.port,
-    ALPNProtocols: ["bep/1.0"],
+    ALPNProtocols: [...options.alpnProtocols ?? ["bep/1.0"]],
     cert: options.certPem,
     key: options.keyPem,
     ca: options.caPem,
@@ -180,6 +198,73 @@ async function connectNodeTls(options: SyncpeerTlsConnectOptions): Promise<Syncp
     socket.once("error", (error) => { cleanup(); reject(error); });
   });
   return new NodeTlsSocket(socket);
+}
+
+async function listenNodeTls(options: SyncpeerTlsListenOptions): Promise<SyncpeerTlsListener> {
+  type Accepted = Awaited<ReturnType<SyncpeerTlsListener["accept"]>>;
+  const accepted: Accepted[] = [];
+  const waiters: Array<{ resolve: (value: Accepted) => void; reject: (error: Error) => void }> = [];
+  const sockets = new Set<net.Socket>();
+  let closedError: Error | undefined;
+  const fail = (error: Error) => {
+    closedError ??= error;
+    while (waiters.length) waiters.shift()?.reject(error);
+  };
+  const server = tls.createServer({ cert: options.certPem, key: options.keyPem,
+    requestCert: true, rejectUnauthorized: false, ALPNProtocols: [...options.alpnProtocols],
+    handshakeTimeout: options.handshakeTimeoutMs ?? 10000,
+  }, socket => {
+    const value = { socket: new NodeTlsSocket(socket), remoteAddress: socket.remoteAddress ?? "",
+      remotePort: socket.remotePort ?? 0, alpn: socket.alpnProtocol || "" };
+    const waiter = waiters.shift();
+    if (waiter) waiter.resolve(value);
+    else accepted.push(value);
+  });
+  server.on("connection", socket => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(new Error(
+      `Syncpeer could not listen on ${options.host}:${options.port}: ${error.message}`, { cause: error }));
+    server.once("error", onError);
+    server.listen(options.port, options.host, () => {
+      server.off("error", onError);
+      server.on("error", fail);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Listener address unavailable.");
+  const announcement = createNodeLocalDiscoveryAnnouncement(
+    new Uint8Array(new crypto.X509Certificate(options.certPem).raw), address.port);
+  const announcementSockets = [dgram.createSocket("udp4"), dgram.createSocket("udp6")];
+  for (const socket of announcementSockets) socket.on("error", () => undefined);
+  announcementSockets[0].bind(0, "0.0.0.0", () => announcementSockets[0].setBroadcast(true));
+  announcementSockets[1].bind(0, "::");
+  const announce = () => {
+    announcementSockets[0].send(announcement, LOCAL_DISCOVERY_PORT, "255.255.255.255", () => undefined);
+    announcementSockets[1].send(announcement, LOCAL_DISCOVERY_PORT, "ff12::8384", () => undefined);
+  };
+  const announcementTimer = setInterval(announce, 10000);
+  announcementTimer.unref();
+  announce();
+  return {
+    port: address.port,
+    accept: () => {
+      const value = accepted.shift();
+      if (value) return Promise.resolve(value);
+      if (closedError) return Promise.reject(closedError);
+      return new Promise<Accepted>((resolve, reject) => waiters.push({ resolve, reject }));
+    },
+    close: async () => {
+      fail(new Error("TLS listener closed."));
+      clearInterval(announcementTimer);
+      for (const socket of announcementSockets) socket.close();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    },
+  };
 }
 
 type NodeSocket = net.Socket | tls.TLSSocket;
@@ -895,6 +980,7 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
   const enableLogs = process.env.SYNCPEER_DEBUG === "1";
   return {
     connectTls: connectNodeTls,
+    listenTls: listenNodeTls,
     connectQuic: connectNodeQuic,
     connectRelay: connectNodeRelay,
     async sha256(data: Uint8Array): Promise<Uint8Array> {
@@ -920,53 +1006,33 @@ export async function resolveNodeGlobalDiscovery(
 
 export const createNodeSyncpeerClient = () => createSyncpeerCoreClient(createNodeHostAdapter());
 
-/** One explicitly approved peer per listener; the common core owns BEP. */
+export async function listenNodePeers(options: Omit<SyncpeerConnectOptions, "expectedDeviceId" | "port"> & {
+  port?: number;
+  approvedDeviceIds: readonly string[];
+  onSession: (session: SyncpeerSessionHandle, remoteDeviceId: string) => void;
+  onError?: (error: unknown) => void;
+}): Promise<{ port: number;
+  activeSessions: () => PeerSessionCandidate<SyncpeerSessionHandle>[];
+  admitOutgoing: (remoteDeviceId: string, connectionId: string, session: SyncpeerSessionHandle) => Promise<boolean>;
+  close: () => Promise<void> }> {
+  const adapter = createNodeHostAdapter();
+  const localCertificate = new crypto.X509Certificate(options.certPem);
+  const localDeviceId = canonicalDeviceId(computeDeviceIdFromDer(new Uint8Array(localCertificate.raw)));
+  return startIncomingPeerService(adapter, { ...options, localDeviceId,
+    handshakeTimeoutMs: options.timeoutMs,
+    connectionOptions: (expectedDeviceId, endpoint) =>
+      ({ ...options, ...endpoint, expectedDeviceId }) });
+}
+
+/** Compatibility wrapper for callers that approve one peer. */
 export async function listenNodePeer(options: SyncpeerConnectOptions & {
   expectedDeviceId: string;
   onSession: (session: SyncpeerSessionHandle) => void;
   onError?: (error: unknown) => void;
 }): Promise<{ port: number; close: () => Promise<void> }> {
-  if (!options.expectedDeviceId.trim()) throw new Error("An approved peer identity is required.");
-  const adapter = createNodeHostAdapter();
-  const sockets = new Set<net.Socket>();
-  const pending = new Set<Promise<void>>();
-  const sessions = new Set<SyncpeerSessionHandle>();
-  const server = tls.createServer({ cert: options.certPem, key: options.keyPem,
-    requestCert: true, rejectUnauthorized: false, ALPNProtocols: ["bep/1.0"],
-    handshakeTimeout: options.timeoutMs ?? 10000,
-  }, socket => {
-    if (socket.alpnProtocol !== "bep/1.0" || sockets.size > 1) { socket.destroy(); return; }
-    const task = acceptSyncpeerSession(adapter, new NodeTlsSocket(socket), {
-      ...options, host: socket.remoteAddress ?? options.host, port: socket.remotePort ?? 0,
-    }).then(session => {
-      sessions.add(session);
-      void session.closed.then(() => session.close()).finally(() => sessions.delete(session));
-      options.onSession(session);
-    }).catch(error => {
-      socket.destroy();
-      options.onError?.(error);
-    });
-    pending.add(task);
-    void task.finally(() => pending.delete(task));
-  });
-  server.on("connection", socket => {
-    // Track connections before TLS completes so shutdown also cancels handshakes.
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.port, options.host, resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Listener address unavailable.");
-  return { port: address.port, close: async () => {
-    const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    for (const socket of sockets) socket.destroy();
-    await Promise.allSettled(pending);
-    await Promise.allSettled([...sessions].map(session => session.close()));
-    await closed;
-  } };
+  const listener = await listenNodePeers({ ...options, approvedDeviceIds: [options.expectedDeviceId],
+    onSession: session => options.onSession(session) });
+  return { port: listener.port, close: listener.close };
 }
 
 const maybeInlinePem = (value: string | undefined): string | null => {

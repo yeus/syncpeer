@@ -20,6 +20,7 @@ export interface ConnectionLifecycleState {
 
 export interface ConnectionLifecycle<TOptions> {
   connect: (options: TOptions) => Promise<SyncpeerSessionHandle>;
+  adopt: (options: TOptions, session: SyncpeerSessionHandle) => Promise<boolean>;
   disconnect: () => Promise<void>;
   ensureSession: (options?: TOptions) => Promise<SyncpeerSessionHandle>;
   getSession: () => SyncpeerSessionHandle | null;
@@ -266,7 +267,31 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       if (!desired || deps.keyFor(desired) !== key) {
         throw new Error("Connection attempt was cancelled.");
       }
-      return openDesired(generation);
+      try {
+        return await openDesired(generation);
+      } catch (error) {
+        if (active && !active.isClosed() && activeKey === key) return active;
+        throw error;
+      }
+    },
+    adopt: async (options, session) => {
+      const key = deps.keyFor(options);
+      if (!desired || deps.keyFor(desired) !== key || !eligible() || session.isClosed()) {
+        await session.close().catch(() => undefined);
+        return false;
+      }
+      generation += 1;
+      cancelOpening();
+      const previous = active;
+      active = session;
+      activeKey = key;
+      connectedAtMs = now();
+      failureStreak = 0;
+      update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
+      watchClosure(session, generation);
+      scheduleUpgrade(generation);
+      if (previous && previous !== session) await previous.close().catch(() => undefined);
+      return true;
     },
     disconnect: async () => {
       desired = null;
@@ -287,7 +312,15 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       if (opening && desired && openingKey === deps.keyFor(desired)) return opening;
       generation += 1;
       if (opening) await opening.catch(() => undefined);
-      return openDesired(generation);
+      const current = desired;
+      if (!current) throw new Error("No connection options are active.");
+      const key = deps.keyFor(current);
+      try {
+        return await openDesired(generation);
+      } catch (error) {
+        if (active && !active.isClosed() && activeKey === key) return active;
+        throw error;
+      }
     },
     getSession: () => active,
     getState: () => ({ ...state }),

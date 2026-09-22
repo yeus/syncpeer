@@ -70,6 +70,7 @@ export interface SyncpeerTlsConnectOptions {
   caPem?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  alpnProtocols?: readonly string[];
 }
 
 export interface SyncpeerQuicConnectOptions extends SyncpeerTlsConnectOptions {
@@ -83,6 +84,28 @@ export interface SyncpeerTlsSocket {
   write: (data: Uint8Array) => Promise<void>;
   close: () => Promise<void>;
   peerCertificateDer: () => Promise<Uint8Array>;
+}
+
+export interface SyncpeerTlsListenOptions {
+  host: string;
+  port: number;
+  certPem: string;
+  keyPem: string;
+  alpnProtocols: readonly string[];
+  handshakeTimeoutMs?: number;
+}
+
+export interface SyncpeerAcceptedTlsSocket {
+  socket: SyncpeerTlsSocket;
+  remoteAddress: string;
+  remotePort: number;
+  alpn: string;
+}
+
+export interface SyncpeerTlsListener {
+  port: number;
+  accept: () => Promise<SyncpeerAcceptedTlsSocket>;
+  close: () => Promise<void>;
 }
 
 export interface SyncpeerRelayConnectOptions {
@@ -119,6 +142,9 @@ export interface SyncpeerHostAdapter {
   connectTls: (
     options: SyncpeerTlsConnectOptions,
   ) => Promise<SyncpeerTlsSocket>;
+  listenTls?: (
+    options: SyncpeerTlsListenOptions,
+  ) => Promise<SyncpeerTlsListener>;
   connectQuic?: (
     options: SyncpeerQuicConnectOptions,
   ) => Promise<SyncpeerTlsSocket>;
@@ -412,7 +438,7 @@ function toUint8Array(input: Uint8Array | ArrayBuffer): Uint8Array {
   return input instanceof Uint8Array ? input : new Uint8Array(input);
 }
 
-function parseFirstCertificateDer(pem: string): Uint8Array {
+export function certificateDerFromPem(pem: string): Uint8Array {
   const match = pem.match(
     /-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/,
   );
@@ -423,7 +449,7 @@ function parseFirstCertificateDer(pem: string): Uint8Array {
   return decodeBase64(body);
 }
 
-async function computeDeviceId(
+export async function deviceIdFromCertificate(
   adapter: SyncpeerHostAdapter,
   certDer: Uint8Array,
 ): Promise<string> {
@@ -2501,12 +2527,12 @@ async function openBepSessionOnSocketUncancelled(
     connectedPort,
     expectedDeviceId: opts.expectedDeviceId,
   });
-  const localCertDer = parseFirstCertificateDer(opts.certPem);
+  const localCertDer = certificateDerFromPem(opts.certPem);
   const localDeviceId = await adapter.sha256(localCertDer);
   const localDeviceIdEncoded = encodeDeviceId(localDeviceId);
   const peerCertDer = await socket.peerCertificateDer();
   const remoteDeviceIdBytes = await adapter.sha256(peerCertDer);
-  const remoteDeviceId = await computeDeviceId(adapter, peerCertDer);
+  const remoteDeviceId = await deviceIdFromCertificate(adapter, peerCertDer);
   adapter.log?.("core.bep.handshake.peer_cert", {
     connectedHost,
     connectedPort,

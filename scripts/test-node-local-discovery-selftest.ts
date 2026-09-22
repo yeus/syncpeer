@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import dgram from "node:dgram";
-import protobuf from "protobufjs";
 
 type ResolveNodeLocalDiscovery = (args: {
   expectedDeviceId?: string;
@@ -9,32 +8,34 @@ type ResolveNodeLocalDiscovery = (args: {
 }) => Promise<{
   candidates: Array<{ protocol?: string; host?: string; port?: number }>;
 }>;
+type CreateAnnouncement = (certDer: Uint8Array, port: number, instanceId?: number) => Uint8Array;
 
-const loadResolveNodeLocalDiscovery = async (): Promise<ResolveNodeLocalDiscovery> => {
+const loadLocalDiscovery = async (): Promise<{
+  resolve: ResolveNodeLocalDiscovery;
+  announce: CreateAnnouncement;
+}> => {
   try {
     const mod = (await import("../packages/core/dist/node.js")) as {
       resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
+      createNodeLocalDiscoveryAnnouncement?: CreateAnnouncement;
     };
-    if (typeof mod.resolveNodeLocalDiscovery === "function") {
-      return mod.resolveNodeLocalDiscovery;
+    if (typeof mod.resolveNodeLocalDiscovery === "function" &&
+      typeof mod.createNodeLocalDiscoveryAnnouncement === "function") {
+      return { resolve: mod.resolveNodeLocalDiscovery, announce: mod.createNodeLocalDiscoveryAnnouncement };
     }
   } catch {
     // Fall back to the TypeScript source when the build is unavailable.
   }
   const mod = (await import("../packages/core/src/node.ts")) as {
     resolveNodeLocalDiscovery?: ResolveNodeLocalDiscovery;
+    createNodeLocalDiscoveryAnnouncement?: CreateAnnouncement;
   };
-  if (typeof mod.resolveNodeLocalDiscovery !== "function") {
-    throw new Error("resolveNodeLocalDiscovery export not found");
+  if (typeof mod.resolveNodeLocalDiscovery !== "function" ||
+    typeof mod.createNodeLocalDiscoveryAnnouncement !== "function") {
+    throw new Error("Node local discovery exports not found");
   }
-  return mod.resolveNodeLocalDiscovery;
+  return { resolve: mod.resolveNodeLocalDiscovery, announce: mod.createNodeLocalDiscoveryAnnouncement };
 };
-
-const MAGIC = 0x2ea7d90b;
-const ANNOUNCE = new protobuf.Type("Announce")
-  .add(new protobuf.Field("id", 1, "bytes"))
-  .add(new protobuf.Field("addresses", 2, "string", "repeated"))
-  .add(new protobuf.Field("instance_id", 3, "int64"));
 
 function base32NoPadding(input: Uint8Array): string {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -53,21 +54,6 @@ function base32NoPadding(input: Uint8Array): string {
   return output;
 }
 
-function createAnnouncePacket(deviceIdBytes: Uint8Array): Uint8Array {
-  const encoded = ANNOUNCE.encode(
-    ANNOUNCE.create({
-      id: deviceIdBytes,
-      addresses: ["tcp://0.0.0.0:22000"],
-      instance_id: 1n,
-    }),
-  ).finish();
-  const out = new Uint8Array(4 + encoded.length);
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  view.setUint32(0, MAGIC, false);
-  out.set(encoded, 4);
-  return out;
-}
-
 async function sendOnce(port: number, packet: Uint8Array): Promise<void> {
   const socket = dgram.createSocket("udp4");
   await new Promise<void>((resolve, reject) => {
@@ -84,11 +70,12 @@ async function sendOnce(port: number, packet: Uint8Array): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const resolveNodeLocalDiscovery = await loadResolveNodeLocalDiscovery();
+  const { resolve: resolveNodeLocalDiscovery, announce } = await loadLocalDiscovery();
   const listenPort = 32127;
-  const idBytes = crypto.randomBytes(32);
+  const certificate = crypto.randomBytes(256);
+  const idBytes = crypto.createHash("sha256").update(certificate).digest();
   const expectedDeviceId = base32NoPadding(idBytes);
-  const packet = createAnnouncePacket(idBytes);
+  const packet = announce(certificate, 22000, 1);
 
   const discoveryPromise = resolveNodeLocalDiscovery({
     expectedDeviceId,

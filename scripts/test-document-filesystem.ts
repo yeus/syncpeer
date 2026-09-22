@@ -334,6 +334,7 @@ test("backup commands restore portable credentials without device-local roots or
   await source.saveConnectionPasswords({ photos: "synthetic-folder-password" });
   await source.saveUiState({ deviceLocal: "synthetic-private-device" });
   const backup = await dispatchDocumentCommand(source, { operation: "exportRecoveryBackup", password: "synthetic-backup-password" });
+  const pairingTransfer = await dispatchDocumentCommand(source, { operation: "exportPairingTransfer" });
   const target = await makeDocuments();
   await target.initialize();
   await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
@@ -345,7 +346,13 @@ test("backup commands restore portable credentials without device-local roots or
   assert.deepEqual(await target.connectionPasswords(), { photos: "synthetic-folder-password" });
   await target.register({ id: "photos", label: "Recovered photos", password: "synthetic-folder-password" });
   assert.deepEqual(await target.cachedFiles(), []);
+  const paired = await makeDocuments();
+  await paired.initialize();
+  await dispatchDocumentCommand(paired, { operation: "importPairingTransfer", transfer: pairingTransfer,
+    password: "paired-device-master", remember: false });
+  assert.deepEqual(await dispatchDocumentCommand(paired, { operation: "exportPairingTransfer" }), pairingTransfer);
+  assert.deepEqual(await paired.connectionPasswords(), {}, "Pairing does not copy device-local credentials directly");
   await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
     recoveryPassword: "synthetic-backup-password", password: "new-synthetic-master" }), /already exists/);
-  await source.close(); await target.close();
+  await source.close(); await target.close(); await paired.close();
 });

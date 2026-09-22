@@ -1,5 +1,10 @@
-import { createSyncpeerCoreClient, type SyncpeerHostAdapter, type SyncpeerSessionHandle, withMetadataSession } from "../client.js";
-import { createConnectionLifecycle, type ConnectionLifecycleState } from "./connectionLifecycle.js";
+import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate,
+  type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerSessionHandle,
+  withMetadataSession } from "../client.js";
+import { startIncomingPeerService } from "../sync/incomingPeerService.js";
+import { preferredPeerDirection } from "../sync/peerSessionManager.js";
+import { createConnectionLifecycle, type ConnectionLifecycle,
+  type ConnectionLifecycleState } from "./connectionLifecycle.js";
 import { createRecoveringRemoteFs } from "./recoveringRemoteFs.js";
 import type { ConnectionScope } from "../client.js";
 import type { SharedFolder } from "../client.js";
@@ -16,6 +21,9 @@ import type {
 } from "../core/model/remoteFs.js";
 import type { FileDownloadResult, FileDownloadSink, FileUploadSource } from "../transfer/stream.js";
 import type { SyncpeerProfileSettings } from "../sync/profileSettings.js";
+import { acceptPairingTransfer, joinPersonalSpace } from "../sync/personalSpacePairingTransport.js";
+import { createPairingInvitation, type PairingInvitation,
+  type PersonalSpacePairingTransfer } from "../sync/personalSpacePairing.js";
 
 export interface ConnectOptions {
   host: string;
@@ -197,6 +205,11 @@ export interface SyncpeerPlatformAdapter {
   removeFavorite?: (key: string) => Promise<FavoriteRecord[]>;
   loadProfileSettings?: () => Promise<SyncpeerProfileSettings>;
   saveProfileSettings?: (settings: SyncpeerProfileSettings) => Promise<void>;
+  exportPairingTransfer?: () => Promise<PersonalSpacePairingTransfer>;
+  importPairingTransfer?: (transfer: PersonalSpacePairingTransfer, password: string,
+    remember: boolean) => Promise<void>;
+  /** Folders currently owned by the encrypted document store and safe to advertise over BEP. */
+  sessionSharedFolders?: (folderPasswords: Record<string, string>) => Promise<SharedFolder[]>;
   loadDirectorySnapshot?: (folderId: string, sourceDeviceId: string, path: string) => Promise<{
     entries: FileEntry[]; versionKey: string; loadedAtMs: number;
   } | null>;
@@ -290,6 +303,11 @@ export interface SyncpeerBrowserClient {
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<LocalDiscoveredDevice[]>;
   disconnect: () => Promise<void>;
+  startPairingInvitation: (options: { advertisedHost: string; port?: number; expiresInMs?: number;
+    confirm: (code: string) => boolean | Promise<boolean> }) => Promise<{
+      invitation: PairingInvitation; completed: Promise<{ remoteDeviceId: string }>; cancel: () => Promise<void> }>;
+  joinPairingInvitation: (options: { invitation: PairingInvitation; password: string; remember: boolean;
+    confirm: (code: string) => boolean | Promise<boolean> }) => Promise<{ remoteDeviceId: string }>;
   subscribeLifecycle: (listener: (state: ConnectionLifecycleState) => void) => () => void;
   setOnline: (online: boolean) => Promise<void>;
   setForeground: (foreground: boolean) => Promise<void>;
@@ -376,6 +394,13 @@ const emitLog = (
     event,
     details,
   });
+};
+
+const deferred = <T,>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
+  return { promise, resolve, reject };
 };
 
 const logClient = (
@@ -522,6 +547,8 @@ export const createSyncpeerBrowserClient = (
   let activeConnectOptions: ConnectOptions | null = null;
   let activeResolvedConnectOptions: ConnectOptions | null = null;
   let focusedFolderId: string | null = null;
+  let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+  let incomingServiceKey = "";
 
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
     if (cachedDefaultIdentity) return cachedDefaultIdentity;
@@ -530,6 +557,89 @@ export const createSyncpeerBrowserClient = (
     }
     cachedDefaultIdentity = await platformAdapter.readDefaultIdentity();
     return cachedDefaultIdentity;
+  };
+
+  const stopIncomingService = async (): Promise<void> => {
+    const service = incomingService;
+    incomingService = null;
+    incomingServiceKey = "";
+    await service?.close();
+  };
+
+  const identityForPairing = async () => {
+    const identity = await resolveDefaultIdentity();
+    return { ...identity, deviceId: await deviceIdFromCertificate(coreAdapter,
+      certificateDerFromPem(identity.certPem)) };
+  };
+
+  const pairingEndpoint = (value: string) => {
+    let endpoint: URL;
+    try { endpoint = new URL(value.includes("://") ? value : `tcp://${value}`); }
+    catch { throw new Error("Invalid pairing invitation endpoint."); }
+    const port = Number(endpoint.port);
+    if (endpoint.protocol !== "tcp:" || !endpoint.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("Invalid pairing invitation endpoint.");
+    }
+    return { host: endpoint.hostname, port };
+  };
+
+  const advertisedPairingEndpoint = (value: string, fallbackPort: number) => {
+    let endpoint: URL;
+    try { endpoint = new URL(value.includes("://") ? value : `tcp://${value}`); }
+    catch { throw new Error("Invalid advertised pairing address."); }
+    if (endpoint.protocol !== "tcp:" || !endpoint.hostname ||
+      (endpoint.pathname !== "" && endpoint.pathname !== "/")) {
+      throw new Error("Invalid advertised pairing address.");
+    }
+    const port = endpoint.port ? Number(endpoint.port) : fallbackPort;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("Invalid advertised pairing address.");
+    }
+    const host = endpoint.hostname.includes(":") ? `[${endpoint.hostname}]` : endpoint.hostname;
+    return `${host}:${port}`;
+  };
+
+  const ensureIncomingService = async (connectOptions: ConnectOptions,
+    coreOptions: SyncpeerConnectOptions): Promise<typeof incomingService> => {
+    if (!coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
+    const localDeviceId = await deviceIdFromCertificate(coreAdapter,
+      certificateDerFromPem(coreOptions.certPem));
+    const key = JSON.stringify([localDeviceId, coreOptions.expectedDeviceId,
+      coreOptions.certPem, coreOptions.keyPem]);
+    if (incomingService && incomingServiceKey === key) return incomingService;
+    await stopIncomingService();
+    const remoteDeviceId = coreOptions.expectedDeviceId;
+    incomingService = await startIncomingPeerService(coreAdapter, {
+      host: "0.0.0.0",
+      port: 22000,
+      certPem: coreOptions.certPem,
+      keyPem: coreOptions.keyPem,
+      localDeviceId,
+      approvedDeviceIds: [remoteDeviceId],
+      connectionOptions: (_remote, endpoint) => ({ ...coreOptions, ...endpoint }),
+      onSession: (session) => {
+        if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
+        void lifecycle.adopt(connectOptions, session).then(adopted => {
+          if (!adopted) return;
+          activeResolvedConnectOptions = {
+            ...connectOptions,
+            host: coreOptions.host,
+            port: coreOptions.port,
+            cert: coreOptions.certPem,
+            key: coreOptions.keyPem,
+            remoteId: remoteDeviceId,
+          };
+          logClient(options.onLog, "client.session.incoming.ready", {
+            transportKind: session.transportKind, connectionScope: session.connectionScope,
+          });
+        });
+      },
+      onError: error => coreAdapter.log?.("core.incoming.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    });
+    incomingServiceKey = key;
+    return incomingService;
   };
 
   const openSession = async (
@@ -571,7 +681,9 @@ export const createSyncpeerBrowserClient = (
       throw new Error("Missing key. Provide PEM text or a readable file path.");
     }
 
-    const session = await coreClient.openSession({
+    const sharedFolders = normalized.sharedFolders ??
+      await platformAdapter.sessionSharedFolders?.(normalized.folderPasswords ?? {});
+    const coreOptions: SyncpeerConnectOptions = {
       host: normalized.host,
       port: normalized.port,
       discoveryMode: normalized.discoveryMode,
@@ -585,8 +697,39 @@ export const createSyncpeerBrowserClient = (
       relayOnly: normalized.relayOnly,
       quicOnly: normalized.quicOnly,
       folderPasswords: normalized.folderPasswords,
-      sharedFolders: normalized.sharedFolders,
-    }, signal);
+      sharedFolders,
+    };
+    let listenerFailure: unknown;
+    let service: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+    try {
+      service = await ensureIncomingService(connectOptions, coreOptions);
+    } catch (error) {
+      listenerFailure = error;
+      coreAdapter.log?.("core.incoming.listen.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    let session: SyncpeerSessionHandle;
+    try {
+      session = await coreClient.openSession(coreOptions, signal);
+    } catch (error) {
+      if (listenerFailure) {
+        throw new AggregateError([error, listenerFailure],
+          "Could not connect to the peer or start the incoming LAN listener on TCP port 22000.",
+          { cause: error });
+      }
+      throw error;
+    }
+    if (service && normalized.remoteId) {
+      const admitted = await service.admitOutgoing(normalized.remoteId, session.connectedVia, session);
+      if (!admitted) {
+        const selected = service.activeSessions().find(candidate =>
+          candidate.remoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase() ===
+          normalized.remoteId!.replace(/[^A-Z2-7]/gi, "").toUpperCase());
+        if (!selected) throw new Error("The authenticated peer session was replaced before it became active.");
+        session = selected.session;
+      }
+    }
     activeResolvedConnectOptions = {
       ...normalized,
       cert: certPem,
@@ -599,7 +742,7 @@ export const createSyncpeerBrowserClient = (
     return session;
   };
 
-  const lifecycle = createConnectionLifecycle<ConnectOptions>({
+  const lifecycle: ConnectionLifecycle<ConnectOptions> = createConnectionLifecycle<ConnectOptions>({
     open: openSession,
     keyFor: (connectOptions) => serializeConnectionKey(
       normalizeConnectOptions(connectOptions),
@@ -632,6 +775,72 @@ export const createSyncpeerBrowserClient = (
   });
 
   return {
+    startPairingInvitation: async pairingOptions => {
+      if (!coreAdapter.listenTls) throw new Error("This platform cannot accept LAN pairing connections.");
+      if (!platformAdapter.exportPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
+      const identity = await identityForPairing();
+      activeConnectOptions = null;
+      activeResolvedConnectOptions = null;
+      focusedFolderId = null;
+      await lifecycle.disconnect();
+      await stopIncomingService();
+      const completion = deferred<{ remoteDeviceId: string }>();
+      const invitationReady = deferred<Awaited<ReturnType<typeof createPairingInvitation>>>();
+      let settled = false;
+      incomingService = await startIncomingPeerService(coreAdapter, {
+        host: "0.0.0.0", port: pairingOptions.port ?? 22000, certPem: identity.certPem,
+        keyPem: identity.keyPem, localDeviceId: identity.deviceId, approvedDeviceIds: [],
+        connectionOptions: () => { throw new Error("A pairing invitation does not approve BEP access."); },
+        onSession: session => { void session.close(); },
+        onPairingSocket: async (accepted, remoteDeviceId) => {
+          if (settled) throw new Error("Pairing invitation is unavailable or already used.");
+          try {
+            const invitationRecord = await invitationReady.promise;
+            const result = await acceptPairingTransfer({ subtle: crypto.subtle, socket: accepted.socket,
+              invitation: invitationRecord, verifiedRemoteId: remoteDeviceId,
+              transfer: await platformAdapter.exportPairingTransfer!(), randomBytes: coreAdapter.randomBytes,
+              confirm: pairingOptions.confirm });
+            settled = true; completion.resolve({ remoteDeviceId: result.remoteDeviceId });
+            setTimeout(() => { void stopIncomingService(); }, 0);
+          } catch (error) {
+            settled = true; completion.reject(error); throw error;
+          }
+        },
+      });
+      incomingServiceKey = "pairing";
+      const advertisedEndpoint = advertisedPairingEndpoint(pairingOptions.advertisedHost,
+        incomingService.port);
+      const invitationRecord = await createPairingInvitation(crypto.subtle, coreAdapter.randomBytes,
+        identity.deviceId, advertisedEndpoint,
+        Date.now() + (pairingOptions.expiresInMs ?? 5 * 60_000));
+      invitationReady.resolve(invitationRecord);
+      const timer = setTimeout(() => {
+        if (!settled) { settled = true; completion.reject(new Error("Pairing invitation expired.")); }
+        void stopIncomingService();
+      }, Math.max(0, invitationRecord.invitation.expiresAt - Date.now()));
+      void completion.promise.finally(() => clearTimeout(timer)).catch(() => undefined);
+      return { invitation: invitationRecord.invitation, completed: completion.promise,
+        cancel: async () => {
+          if (!settled) { settled = true; completion.reject(new Error("Pairing invitation cancelled.")); }
+          await stopIncomingService();
+        } };
+    },
+    joinPairingInvitation: async pairingOptions => {
+      if (!platformAdapter.importPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
+      const identity = await identityForPairing();
+      const endpoint = pairingEndpoint(pairingOptions.invitation.endpoint);
+      const socket = await coreAdapter.connectTls({ ...endpoint, certPem: identity.certPem,
+        keyPem: identity.keyPem, alpnProtocols: ["syncpeer-pairing/1"] });
+      try {
+        const verifiedRemoteId = await deviceIdFromCertificate(coreAdapter, await socket.peerCertificateDer());
+        const joined = await joinPersonalSpace({ subtle: crypto.subtle, socket,
+          invitation: pairingOptions.invitation, localDeviceId: identity.deviceId,
+          verifiedRemoteId, randomBytes: coreAdapter.randomBytes, confirm: pairingOptions.confirm });
+        await platformAdapter.importPairingTransfer(joined.transfer, pairingOptions.password,
+          pairingOptions.remember);
+        return { remoteDeviceId: verifiedRemoteId };
+      } finally { await socket.close().catch(() => undefined); }
+    },
     connectAndSync: async (connectOptions: ConnectOptions): Promise<RemoteFsLike> => {
       await lifecycle.connect(connectOptions);
       activeConnectOptions = connectOptions;
@@ -703,6 +912,7 @@ export const createSyncpeerBrowserClient = (
       focusedFolderId = null;
       await platformAdapter.stopBackgroundSession?.();
       await lifecycle.disconnect();
+      await stopIncomingService();
     },
     subscribeLifecycle: lifecycle.subscribe,
     setOnline: lifecycle.setOnline,
@@ -720,6 +930,7 @@ export const createSyncpeerBrowserClient = (
       // service.  Starting the service first would create a race in which both
       // runtimes connect to the peer briefly.
       await lifecycle.setForeground(false);
+      await stopIncomingService();
       if (activeResolvedConnectOptions && platformAdapter.startBackgroundSession) {
         const backgroundOptions = Object.fromEntries(
           Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),

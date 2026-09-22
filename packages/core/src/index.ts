@@ -1,4 +1,5 @@
-export { createSyncpeerCoreClient, UploadOutcomeUnknownError, withMetadataSession } from "./client.js";
+export { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate,
+  UploadOutcomeUnknownError, withMetadataSession } from "./client.js";
 export { createReplicaController } from "./sync/replicaControl.js";
 export type { ReplicaState } from "./sync/replicaControl.js";
 export {
@@ -12,6 +13,51 @@ export type {
 } from "./ui/favoriteSelection.js";
 export { cacheQuotaBytes, defaultFolderSettings, defaultProfileSettings, normalizeProfileSettings, planCacheEvictions } from "./sync/profileSettings.js";
 export type { CacheCandidate, SyncpeerFolderSettings, SyncpeerProfileSettings } from "./sync/profileSettings.js";
+export {
+  assessFolderRetention,
+  authorizeReplicaRelease,
+  createDangerousLocalRelease,
+  defaultFolderRetentionPolicy,
+  folderManifestDigest,
+  signReplicaCompletion,
+  signRetentionReleaseProposal,
+  signRetentionVote,
+  verifyDangerousLocalRelease,
+} from "./sync/folderRetention.js";
+export {
+  defaultPersonalSpaceSettings,
+  folderRetentionPolicyFromSettings,
+  normalizePersonalSpaceSettings,
+  setDeviceFolderSelection,
+  updateFolderRetention,
+} from "./sync/personalSpaceSettings.js";
+export { createPeerSessionManager, preferredPeerDirection } from "./sync/peerSessionManager.js";
+export type {
+  ManagedPeerSession,
+  PeerConnectionDirection,
+  PeerSessionCandidate,
+  PeerSessionManager,
+} from "./sync/peerSessionManager.js";
+export { startIncomingPeerService } from "./sync/incomingPeerService.js";
+export type { IncomingPeerServiceOptions } from "./sync/incomingPeerService.js";
+export { acceptPairingTransfer, joinPersonalSpace } from "./sync/personalSpacePairingTransport.js";
+export { createPairingInvitation, createPairingRequest, openPairingSession,
+  openPairingTransfer, sealPairingTransfer } from "./sync/personalSpacePairing.js";
+export type { PairingInvitation, PairingRequest, PairingTransfer,
+  PersonalSpacePairingTransfer } from "./sync/personalSpacePairing.js";
+export type {
+  DeviceFolderSelection,
+  PersonalSpaceSettings,
+  SharedFolderSettings,
+} from "./sync/personalSpaceSettings.js";
+export type {
+  DangerousLocalRelease,
+  FolderManifestEntry,
+  FolderRetentionPolicy,
+  ReplicaCompletion,
+  RetentionReleaseProposal,
+  RetentionVote,
+} from "./sync/folderRetention.js";
 export {
   classifyRuntimeArchitecture,
   classifyRuntimePlatform,
@@ -37,6 +83,9 @@ export type {
   SyncpeerSessionClosure,
   SyncpeerQuicConnectOptions,
   SyncpeerTlsConnectOptions,
+  SyncpeerTlsListenOptions,
+  SyncpeerTlsListener,
+  SyncpeerAcceptedTlsSocket,
   SyncpeerTlsSocket,
 } from "./client.js";
 export {

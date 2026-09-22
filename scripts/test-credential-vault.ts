@@ -53,6 +53,33 @@ test("new personal-space vault wraps one stable random key instead of re-encrypt
   await reopened.close();
 });
 
+test("confirmed pairing transfer initializes the same personal space with a local password", async () => {
+  const makeStorage = () => {
+    let record: unknown = null, bootstrap: unknown = null;
+    return { profileId: "paired-space-fixture", randomBytes,
+      storage: { load: async () => structuredClone(record), save: async (value: unknown) => { record = structuredClone(value); },
+        withLock: async <T>(operation: () => Promise<T>) => operation() },
+      bootstrapStorage: { load: async () => structuredClone(bootstrap),
+        save: async (value: unknown) => { bootstrap = structuredClone(value); },
+        remove: async () => { bootstrap = null; } }, revokeAccess: async () => {} };
+  };
+  const owner = createCredentialVault(makeStorage());
+  await owner.create("owner-local-password", false);
+  const transfer = await owner.exportPairingTransfer();
+  const joined = createCredentialVault(makeStorage());
+  await joined.importPairingTransfer(transfer, "joined-local-password", false);
+  assert.deepEqual(await joined.exportPairingTransfer(), transfer);
+  await joined.lock();
+  await assert.rejects(joined.unlock("owner-local-password"));
+  await joined.unlock("joined-local-password");
+
+  const invalid = createCredentialVault(makeStorage());
+  await assert.rejects(invalid.importPairingTransfer({ ...transfer, rootKey: "00" }, "local-password", false),
+    /pairing transfer/i);
+  assert.equal(invalid.status().phase, "uninitialized");
+  await Promise.all([owner.close(), joined.close(), invalid.close()]);
+});
+
 test("encrypted UI state survives lock and reopen without a plaintext copy", async () => {
   const makeStorage = () => {
     let record: unknown = null, bootstrap: unknown = null;
@@ -169,6 +196,11 @@ test("successful manual unlock repairs remembered access after a temporary secur
   assert.equal((await first.create("synthetic-master")).remembered, false);
   await first.addFolder("fixture", "synthetic-remote-password");
   await first.saveConnectionPasswords({ fixture: "synthetic-remote-password" });
+  await first.mergeConnectionPasswords({ startup: "synthetic-startup-password" });
+  assert.deepEqual(await first.connectionPasswords(), {
+    fixture: "synthetic-remote-password",
+    startup: "synthetic-startup-password",
+  }, "Startup hydration merges with credentials saved after its initial read");
   await assert.rejects(first.saveConnectionPasswords({ fixture: "different-password" }), /migration/i);
   await assert.rejects(first.saveConnectionPasswords({ "SYNTHETICPEER:fixture": "different-password" }), /migration/i);
   assert.equal(JSON.stringify(record).includes("synthetic-remote-password"), false);
@@ -183,7 +215,10 @@ test("successful manual unlock repairs remembered access after a temporary secur
   const restarted = createCredentialVault(options);
   assert.equal((await restarted.initialize()).phase, "unlocked");
   assert.equal(await restarted.folderPassword("fixture"), "synthetic-remote-password");
-  assert.deepEqual(await restarted.connectionPasswords(), { fixture: "synthetic-remote-password" });
+  assert.deepEqual(await restarted.connectionPasswords(), {
+    fixture: "synthetic-remote-password",
+    startup: "synthetic-startup-password",
+  });
   await restarted.close();
 });
 

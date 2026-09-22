@@ -6,6 +6,7 @@ import { FOLDER_PASSWORD_SCOPE_SEPARATOR, isScopedFolderPasswordKey } from "../u
 import { normalizeProfileSettings, type SyncpeerProfileSettings } from "./profileSettings.js";
 import { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap,
   personalVaultKey, wrapPersonalSpaceBootstrap, type PersonalSpace, type PersonalSpaceBootstrap } from "./personalSpaceBootstrap.js";
+import type { PersonalSpacePairingTransfer } from "./personalSpacePairing.js";
 
 export interface CredentialVaultRecord {
   format: 1 | 2;
@@ -42,6 +43,25 @@ export interface RememberedUnlockSecretStore {
 const password = (value: unknown): string => {
   if (typeof value !== "string" || !value.length || value.length > 4096) throw new Error("Invalid vault password.");
   return value;
+};
+
+const validateConnectionPasswords = (data: VaultData, values: Record<string, string>) => {
+  for (const [id, value] of Object.entries(values)) {
+    const separator = id.indexOf(FOLDER_PASSWORD_SCOPE_SEPARATOR);
+    const folderId = isScopedFolderPasswordKey(id) ? id.slice(separator + 1).trim() : id;
+    if (Object.hasOwn(data.folders, folderId) && data.folders[folderId] !== value) {
+      throw new Error("Folder password changes require migration; the saved password was not changed.");
+    }
+  }
+};
+
+const pairingSpace = (value: PersonalSpacePairingTransfer): PersonalSpace => {
+  if (!value || !/^[a-f0-9]{32}$/.test(value.spaceId) ||
+    !/^[a-f0-9]{32}$/.test(value.settingsFolderId) || !/^[a-f0-9]{64}$/.test(value.rootKey)) {
+    throw new Error("Invalid personal-space pairing transfer.");
+  }
+  return { id: value.spaceId, settingsFolderId: value.settingsFolderId,
+    rootKey: Uint8Array.from(value.rootKey.match(/../g)!, byte => Number.parseInt(byte, 16)) };
 };
 
 const decodeRecord = (value: unknown): CredentialVaultRecord | null => {
@@ -259,6 +279,35 @@ export function createCredentialVault(options: {
         { format: 2, manualLocked: false, remember: false });
       return { format: 1, bootstrap, vault };
     }),
+    exportPairingTransfer: () => run(async (): Promise<PersonalSpacePairingTransfer> => {
+      await unlocked();
+      if (!personalSpace) throw new Error("Only personal-space profiles can pair devices.");
+      return { spaceId: personalSpace.id, settingsFolderId: personalSpace.settingsFolderId,
+        rootKey: [...personalSpace.rootKey].map(byte => byte.toString(16).padStart(2, "0")).join("") };
+    }),
+    importPairingTransfer: (transfer: PersonalSpacePairingTransfer, localMasterPassword: string,
+      remember = true) => run(async () => {
+      if (!options.bootstrapStorage) throw new Error("Personal-space recovery storage is unavailable.");
+      if (key || initialized || decodeRecord(await options.storage.load()) ||
+        await options.bootstrapStorage.load() !== null) {
+        throw new Error("Local profile already exists; pairing cannot replace it.");
+      }
+      const space = pairingSpace(transfer);
+      let secret: Uint8Array | undefined;
+      try {
+        const bootstrap = await wrapPersonalSpaceBootstrap(space, password(localMasterPassword), options.randomBytes, kdf);
+        await options.bootstrapStorage.save(bootstrap);
+        secret = personalVaultKey(space);
+        await save({ format: 1, defaultPassword: null, folders: {} }, secret,
+          { format: 2, manualLocked: false, remember });
+        key = secret; personalSpace = space; initialized = true; remembered = remember; issue = undefined;
+        if (remember) await rememberSecret(localMasterPassword);
+        return status();
+      } catch (error) {
+        if (!initialized) { secret?.fill(0); space.rootKey.fill(0); }
+        throw error;
+      }
+    }),
     restoreRecoveryBackup: (backup: PersonalSpaceRecoveryBackup, recoveryPassword: string,
       localMasterPassword: string) => run(async () => {
       if (!options.bootstrapStorage) throw new Error("Personal-space recovery storage is unavailable.");
@@ -362,13 +411,12 @@ export function createCredentialVault(options: {
       return { ...data.connectionPasswords };
     }),
     saveConnectionPasswords: (values: Record<string, string>) => update(data => {
-      for (const [id, value] of Object.entries(values)) {
-        const folderId = isScopedFolderPasswordKey(id) ? id.slice(id.indexOf(FOLDER_PASSWORD_SCOPE_SEPARATOR) + 1).trim() : id;
-        if (Object.hasOwn(data.folders, folderId) && data.folders[folderId] !== value) {
-          throw new Error("Folder password changes require migration; the saved password was not changed.");
-        }
-      }
+      validateConnectionPasswords(data, values);
       return { ...data, connectionPasswords: { ...values } };
+    }),
+    mergeConnectionPasswords: (values: Record<string, string>) => update(data => {
+      validateConnectionPasswords(data, values);
+      return { ...data, connectionPasswords: { ...values, ...data.connectionPasswords } };
     }),
     profileSettings: () => run(async () => {
       const { data } = await unlocked();

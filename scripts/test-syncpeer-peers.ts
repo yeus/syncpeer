@@ -9,8 +9,10 @@ import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
-import { createNodeSyncpeerClient, createNodeHostAdapter, createNodeFolderSyncStorage, listenNodePeer } from "../packages/core/dist/node.js";
+import { createNodeSyncpeerClient, createNodeHostAdapter, createNodeFolderSyncStorage, listenNodePeer,
+  listenNodePeers } from "../packages/core/dist/node.js";
 import { createSyncpeerCoreClient } from "../packages/core/dist/client.js";
+import { startIncomingPeerService } from "../packages/core/dist/sync/incomingPeerService.js";
 import { ClusterConfig, FrameParser, MessageTypeValues, encodeMessageFrame, type BepIndex, type BepClusterConfig } from "../packages/core/dist/core/protocol/bep.js";
 import type { SyncpeerSessionHandle } from "../packages/core/src/client.ts";
 import { createNodeFolderReplica } from "../packages/core/dist/sync/nodeReplica.js";
@@ -120,6 +122,65 @@ test("locked Syncpeer peers transfer ciphertext over TLS without folder keys", {
   } finally {
     crypto.folderKey.fill(0);
     await outgoing?.close(); await incoming?.close(); await listener?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("one listener accepts multiple approved Syncpeer peers concurrently", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-multi-peer-"));
+  let listener: Awaited<ReturnType<typeof listenNodePeers>> | undefined;
+  const outgoing: SyncpeerSessionHandle[] = [];
+  try {
+    const [owner, phone, tablet] = await Promise.all([
+      createTestPeerIdentity(root, "owner"), createTestPeerIdentity(root, "phone"),
+      createTestPeerIdentity(root, "tablet"),
+    ]);
+    const accepted = Promise.withResolvers<void>();
+    const incoming = new Map<string, SyncpeerSessionHandle>();
+    listener = await listenNodePeers({ ...owner, host: "127.0.0.1", port: 0,
+      approvedDeviceIds: [phone.deviceId, tablet.deviceId], sharedFolders: [], timeoutMs: 3000,
+      onSession: (session, remoteDeviceId) => {
+        incoming.set(remoteDeviceId, session);
+        if (incoming.size === 2) accepted.resolve();
+      } });
+    outgoing.push(...await Promise.all([phone, tablet].map(peer => createNodeSyncpeerClient().openSession({
+      ...peer, host: "127.0.0.1", port: listener!.port, expectedDeviceId: owner.deviceId,
+      discoveryMode: "direct", sharedFolders: [], timeoutMs: 3000,
+    }))));
+    await accepted.promise;
+    assert.equal(listener.activeSessions().length, 2);
+    assert.deepEqual(new Set(listener.activeSessions().map(item => item.remoteDeviceId)),
+      new Set([phone.deviceId.replaceAll("-", ""), tablet.deviceId.replaceAll("-", "")]));
+  } finally {
+    await Promise.allSettled(outgoing.map(session => session.close()));
+    await listener?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the LAN listener routes an unapproved certificate only to explicit pairing", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-pairing-listener-"));
+  const adapter = createNodeHostAdapter();
+  let listener: Awaited<ReturnType<typeof startIncomingPeerService>> | undefined;
+  let socket: Awaited<ReturnType<typeof adapter.connectTls>> | undefined;
+  try {
+    const [owner, joining] = await Promise.all([
+      createTestPeerIdentity(root, "owner"), createTestPeerIdentity(root, "joining"),
+    ]);
+    const accepted = Promise.withResolvers<string>();
+    listener = await startIncomingPeerService(adapter, {
+      ...owner, host: "127.0.0.1", port: 0, localDeviceId: owner.deviceId, approvedDeviceIds: [],
+      connectionOptions: () => assert.fail("Pairing must not enter the BEP session path"),
+      onSession: () => assert.fail("Pairing must not create an approved BEP session"),
+      onPairingSocket: async (_accepted, remoteDeviceId) => { accepted.resolve(remoteDeviceId); },
+    });
+    socket = await adapter.connectTls({ host: "127.0.0.1", port: listener.port,
+      certPem: joining.certPem, keyPem: joining.keyPem, alpnProtocols: ["syncpeer-pairing/1"] });
+    assert.equal(await accepted.promise, joining.deviceId.replaceAll("-", ""));
+    assert.deepEqual(listener.activeSessions(), []);
+  } finally {
+    await socket?.close();
+    await listener?.close();
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -169,8 +169,19 @@ test("discovery retains empty roots across peers and only downloads enter the lo
       { photos: "synthetic-remote-password" }),
     cache.platformAdapter.cacheFile!("photos", "image.bin", "image.bin", Uint8Array.of(1)),
   ]);
+  assert.deepEqual(await cache.platformAdapter.listFavorites!(), [legacyFavorite]);
+  const sharedFolders = await cache.platformAdapter.sessionSharedFolders!({
+    photos: "synthetic-remote-password",
+  });
+  assert.deepEqual(sharedFolders.map(folder => ({ id: folder.id, mode: folder.encryption.mode })), [
+    { id: "photos", mode: "encrypted" },
+  ]);
+  assert.equal(typeof sharedFolders[0].replica?.scan, "function");
   await assert.rejects(cache.connectFolder({ id: "photos", label: "Photos", password: "different-password" }), /migration/i);
   await cache.syncFolders([{ id: "music", label: "Music", readOnly: false }], {});
+  assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!({
+    photos: "synthetic-remote-password",
+  })).map(folder => folder.id), ["photos"], "Only whole-folder favorites are advertised as replicas");
   assert.deepEqual(await cache.platformAdapter.listFavorites!(), [legacyFavorite]);
   assert.deepEqual(legacyFavorites, [], "Legacy plaintext favorite settings are removed after encrypted migration");
   const favorite = legacyFavorite;

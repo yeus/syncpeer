@@ -995,10 +995,16 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   connectionPasswords: () => runQueued(runtime, () => runtime.vault.connectionPasswords()),
   saveConnectionPasswords: (passwords: Record<string, string>) =>
     runQueued(runtime, () => runtime.vault.saveConnectionPasswords(passwords)),
+  mergeConnectionPasswords: (passwords: Record<string, string>) =>
+    runQueued(runtime, () => runtime.vault.mergeConnectionPasswords(passwords)),
   profileSettings: () => runQueued(runtime, () => runtime.vault.profileSettings()),
   saveProfileSettings: (settings: Parameters<Vault["saveProfileSettings"]>[0]) =>
     runQueued(runtime, () => runtime.vault.saveProfileSettings(settings)),
   exportRecoveryBackup: (password: string) => runQueued(runtime, () => runtime.vault.exportRecoveryBackup(password)),
+  exportPairingTransfer: () => runQueued(runtime, () => runtime.vault.exportPairingTransfer()),
+  importPairingTransfer: (transfer: Parameters<Vault["importPairingTransfer"]>[0], password: string,
+    remember = true) => runQueued(runtime, () => unlockAfterVaultChange(runtime,
+      () => runtime.vault.importPairingTransfer(transfer, password, remember))),
   restoreRecoveryBackup: (backup: Parameters<Vault["restoreRecoveryBackup"]>[0], recoveryPassword: string, password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.restoreRecoveryBackup(backup, recoveryPassword, password))),
   uiState: () => runQueued(runtime, () => runtime.vault.uiState()),
@@ -1024,7 +1030,12 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
   clearFolderContents: (folderId: string) => runQueued(runtime, () => clearFolderContentsAction(runtime, folderId)),
   sessionSharedFolders: (passwords: Record<string, string>) => runQueued(runtime, async () => {
     const registry = requireUnlockedRegistry(runtime);
-    return registry.getState().filter(folder => folder.downloads).map(folder => {
+    const settings = await runtime.vault.profileSettings();
+    const selected = new Set(Object.entries(settings.folders)
+      .filter(([, folder]) => !folder.paused &&
+        folder.favorites.some(favorite => favorite.kind === "folder" && favorite.path === ""))
+      .map(([folderId]) => folderId));
+    return registry.getState().filter(folder => folder.downloads && selected.has(folder.id)).map(folder => {
       const replica = registry.getReplica(folder.id);
       if (!replica) throw new Error("Document folder is not open.");
       const password = passwords[folder.id]?.trim();

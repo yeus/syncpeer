@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import {
   assessFolderRetention,
@@ -7,10 +8,13 @@ import {
   createDangerousLocalRelease,
   defaultFolderRetentionPolicy,
   folderManifestDigest,
+  folderManifestDigestFromBep,
   signReplicaCompletion,
   signRetentionReleaseProposal,
   signRetentionVote,
+  verifyLocalReplicaManifest,
 } from "../packages/core/dist/sync/folderRetention.js";
+import { signOwnedRosterUpdate } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 const subtle = globalThis.crypto.subtle;
 
@@ -34,6 +38,16 @@ const identity = async () => {
     privateKey: pair.privateKey,
     publicKey: Buffer.from(await subtle.exportKey("spki", pair.publicKey)).toString("base64"),
   };
+};
+
+const signedRoster = async (signer: Awaited<ReturnType<typeof identity>>,
+  devices: Record<string, Awaited<ReturnType<typeof identity>>>) => {
+  const update = await signOwnedRosterUpdate(subtle, signer.privateKey, {
+    sequence: 1, previous: null, signer: "phone",
+    devices: Object.entries(devices).map(([id, keys]) => ({ id, syncthingId: id,
+      state: "active" as const, signingKey: keys.publicKey })),
+  });
+  return { genesisKey: signer.publicKey, knownHead: update.hash, updates: [update] };
 };
 
 const manifest = folderManifestDigest([
@@ -66,6 +80,57 @@ test("manifest identity is stable across entry, counter, and block ordering", ()
   ]), manifest);
 });
 
+test("manifest identity includes a symlink target", () => {
+  const link = { path: "latest", type: "symlink" as const, size: 0, deleted: false,
+    version: [], blocks: [] };
+  assert.throws(() => folderManifestDigest([link]), /symlink target/i);
+  assert.notEqual(
+    folderManifestDigest([{ ...link, symlinkTarget: "6e6f7465732f612e747874" }]),
+    folderManifestDigest([{ ...link, symlinkTarget: "6e6f7465732f622e747874" }]),
+  );
+});
+
+test("BEP manifest conversion preserves hashes, versions, tombstones, and symlink targets", () => {
+  const target = new TextEncoder().encode("notes/a.txt");
+  const entries = [
+    { name: "notes/a.txt", type: 0, size: 4, deleted: false,
+      version: { counters: [{ id: "9", value: "2" }] },
+      blocks: [{ offset: 0, size: 4, hash: Uint8Array.from({ length: 32 }, () => 7) }] },
+    { name: "old.txt", type: 0, size: 0, deleted: true, version: { counters: [] }, blocks: [] },
+    { name: "latest", type: 4, size: 0, deleted: false, version: { counters: [] },
+      symlink_target: target, blocks: [] },
+  ];
+  const digest = folderManifestDigestFromBep(entries);
+  assert.equal(digest, folderManifestDigest([
+    { path: "notes/a.txt", type: "file", size: 4, deleted: false,
+      version: [{ id: "9", value: "2" }], blocks: [Buffer.alloc(32, 7).toString("hex")] },
+    { path: "old.txt", type: "file", size: 0, deleted: true, version: [], blocks: [] },
+    { path: "latest", type: "symlink", size: 0, deleted: false, version: [], blocks: [],
+      symlinkTarget: Buffer.from(target).toString("hex") },
+  ]));
+  assert.notEqual(folderManifestDigestFromBep([
+    ...entries.slice(0, 2), { ...entries[2], symlink_target: new TextEncoder().encode("notes/b.txt") },
+  ]), digest);
+  assert.throws(() => folderManifestDigestFromBep([{ ...entries[0], invalid: true }]), /invalid BEP/i);
+});
+
+test("a complete local replica proof reads every block and rejects missing or changing files", async () => {
+  const bytes = new TextEncoder().encode("verified bytes");
+  const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+  const file = { name: "note.txt", type: 0, size: bytes.length, deleted: false,
+    version: { counters: [{ id: "1", value: "1" }] },
+    blocks: [{ offset: 0, size: bytes.length, hash }] };
+  const expected = [file];
+  const replica = { scan: async () => [file], readBlock: async () => bytes };
+  assert.equal(await verifyLocalReplicaManifest(replica, expected), folderManifestDigestFromBep(expected));
+  await assert.rejects(verifyLocalReplicaManifest({ ...replica,
+    readBlock: async () => new TextEncoder().encode("forged content") }, expected), /block|digest/i);
+  await assert.rejects(verifyLocalReplicaManifest({ ...replica, scan: async () => [] }, expected), /complete copy/i);
+  let scans = 0;
+  await assert.rejects(verifyLocalReplicaManifest({ ...replica,
+    scan: async () => ++scans === 1 ? [file] : [] }, expected), /complete copy/i);
+});
+
 test("only signed current completions count and Syncthing evidence must still be live", async () => {
   const phone = await identity();
   const observer = await identity();
@@ -93,12 +158,59 @@ test("only signed current completions count and Syncthing evidence must still be
     [oldManifest], publicKeys, 150)).completeHolderIds.length, 0);
 });
 
+test("future-dated receipts and overlong Syncthing observations cannot satisfy retention", async () => {
+  const phone = await identity();
+  const policy = { ...defaultFolderRetentionPolicy("folder", "roster-1"), minimumCopies: 1,
+    holders: [{ id: "phone", kind: "syncpeer" as const }, { id: "nas", kind: "syncthing" as const }] };
+  const future = await signReplicaCompletion(subtle, phone.privateKey, {
+    folderId: "folder", holderId: "phone", holderKind: "syncpeer", signerId: "phone",
+    manifestDigest: manifest, policyRevision: 1, completedAtMs: 201,
+  });
+  assert.deepEqual((await assessFolderRetention(subtle, policy, manifest, [future],
+    { phone: phone.publicKey }, 200)).completeHolderIds, []);
+  await assert.rejects(signReplicaCompletion(subtle, phone.privateKey, {
+    folderId: "folder", holderId: "nas", holderKind: "syncthing", signerId: "phone",
+    manifestDigest: manifest, policyRevision: 1, completedAtMs: 100,
+    liveUntilMs: 100 + 24 * 60 * 60_000,
+  }), /bounded|deadline|observation/i);
+});
+
+test("release quorum comes from the signed roster, including offline owned devices", async () => {
+  const phone = await identity(), laptop = await identity(), offlineTablet = await identity();
+  const trust = await signedRoster(phone, { phone, laptop, offlineTablet });
+  const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), minimumCopies: 1,
+    holders: [{ id: "phone", kind: "syncpeer" as const }, { id: "laptop", kind: "syncpeer" as const }] };
+  const receipts = await Promise.all([["phone", phone], ["laptop", laptop]].map(([id, key]) =>
+    signReplicaCompletion(subtle, key.privateKey, { folderId: "folder", holderId: String(id),
+      holderKind: "syncpeer", signerId: String(id), manifestDigest: manifest,
+      policyRevision: 1, completedAtMs: 100 })));
+  const proposal = await signRetentionReleaseProposal(subtle, phone.privateKey, {
+    folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
+    rosterHead: trust.knownHead, manifestDigest: manifest,
+  });
+  const phoneVote = await signRetentionVote(subtle, phone.privateKey, {
+    proposalId: proposal.id, folderId: "folder", policyRevision: 1,
+    rosterHead: trust.knownHead, voterId: "phone", approve: true,
+  });
+  await assert.rejects(authorizeReplicaRelease(subtle, {
+    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote],
+    completions: receipts, nowMs: 200,
+  }), /majority/i);
+  const laptopVote = await signRetentionVote(subtle, laptop.privateKey, {
+    ...phoneVote, voterId: "laptop", approve: true,
+  });
+  assert.deepEqual((await authorizeReplicaRelease(subtle, {
+    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote, laptopVote],
+    completions: receipts, nowMs: 200,
+  })).remainingCompleteHolderIds, ["laptop"]);
+});
+
 test("release requires a majority and enough current copies after the release", async () => {
   const phone = await identity();
   const laptop = await identity();
   const tablet = await identity();
-  const keys = { phone: phone.publicKey, laptop: laptop.publicKey, tablet: tablet.publicKey };
-  const policy = { ...defaultFolderRetentionPolicy("folder", "roster-1"), holders: [
+  const trust = await signedRoster(phone, { phone, laptop, tablet });
+  const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), holders: [
     { id: "phone", kind: "syncpeer" as const },
     { id: "laptop", kind: "syncpeer" as const },
     { id: "tablet", kind: "syncpeer" as const },
@@ -111,28 +223,27 @@ test("release requires a majority and enough current copies after the release", 
   })));
   const proposal = await signRetentionReleaseProposal(subtle, phone.privateKey, {
     folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
-    rosterHead: "roster-1", manifestDigest: manifest,
+    rosterHead: trust.knownHead, manifestDigest: manifest,
   });
   const phoneVote = await signRetentionVote(subtle, phone.privateKey, {
     proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: "roster-1", voterId: "phone", approve: true,
+    rosterHead: trust.knownHead, voterId: "phone", approve: true,
   });
   await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, currentManifestDigest: manifest, proposal, votes: [phoneVote], completions: receipts,
-    activeDeviceIds: ["phone", "laptop", "tablet"], publicKeys: keys, nowMs: 200,
+    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote], completions: receipts,
+    nowMs: 200,
   }), /majority/i);
   const laptopVote = await signRetentionVote(subtle, laptop.privateKey, {
     proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: "roster-1", voterId: "laptop", approve: true,
+    rosterHead: trust.knownHead, voterId: "laptop", approve: true,
   });
   await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, currentManifestDigest: "new-manifest", proposal, votes: [phoneVote, laptopVote],
-    completions: receipts, activeDeviceIds: ["phone", "laptop", "tablet"],
-    publicKeys: keys, nowMs: 200,
+    policy, trust, currentManifestDigest: "new-manifest", proposal, votes: [phoneVote, laptopVote],
+    completions: receipts, nowMs: 200,
   }), /stale/i);
   const result = await authorizeReplicaRelease(subtle, {
-    policy, currentManifestDigest: manifest, proposal, votes: [phoneVote, laptopVote], completions: receipts,
-    activeDeviceIds: ["phone", "laptop", "tablet"], publicKeys: keys, nowMs: 200,
+    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote, laptopVote],
+    completions: receipts, nowMs: 200,
   });
   assert.deepEqual(result.remainingCompleteHolderIds, ["laptop", "tablet"]);
 });
@@ -140,8 +251,8 @@ test("release requires a majority and enough current copies after the release", 
 test("a device cannot cast competing votes in one policy revision", async () => {
   const phone = await identity();
   const laptop = await identity();
-  const keys = { phone: phone.publicKey, laptop: laptop.publicKey };
-  const policy = { ...defaultFolderRetentionPolicy("folder", "roster-1"), minimumCopies: 1, holders: [
+  const trust = await signedRoster(phone, { phone, laptop });
+  const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), minimumCopies: 1, holders: [
     { id: "phone", kind: "syncpeer" as const }, { id: "laptop", kind: "syncpeer" as const },
   ] };
   const completions = await Promise.all([
@@ -152,16 +263,16 @@ test("a device cannot cast competing votes in one policy revision", async () => 
   })));
   const proposal = await signRetentionReleaseProposal(subtle, phone.privateKey, {
     folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
-    rosterHead: "roster-1", manifestDigest: manifest,
+    rosterHead: trust.knownHead, manifestDigest: manifest,
   });
   const approve = await signRetentionVote(subtle, phone.privateKey, {
     proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: "roster-1", voterId: "phone", approve: true,
+    rosterHead: trust.knownHead, voterId: "phone", approve: true,
   });
   const reject = await signRetentionVote(subtle, phone.privateKey, { ...approve, approve: false });
   await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, currentManifestDigest: manifest, proposal, votes: [approve, reject], completions,
-    activeDeviceIds: ["phone", "laptop"], publicKeys: keys, nowMs: 200,
+    policy, trust, currentManifestDigest: manifest, proposal, votes: [approve, reject], completions,
+    nowMs: 200,
   }), /one vote/i);
 });
 

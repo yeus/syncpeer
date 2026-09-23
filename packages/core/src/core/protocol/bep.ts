@@ -106,6 +106,7 @@ export interface BepFileInfo {
   invalid?: boolean;
   deleted?: boolean;
   encrypted?: Uint8Array;
+  symlink_target?: Uint8Array;
   blocks?: BepBlockInfo[];
   Blocks?: BepBlockInfo[];
   version?: BepVersionVector;

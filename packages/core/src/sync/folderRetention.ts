@@ -1,8 +1,15 @@
 import { sha256 } from "@noble/hashes/sha2.js";
+import type { BepFileInfo } from "../core/protocol/bep.js";
+import { equalHash, validateBlockPlan } from "../transfer/blockReuse.js";
+import type { LocalFolderReplica } from "./replicaIndex.js";
+import { isInternalReplicaPath } from "./replicaPaths.js";
+import { verifyOwnedRoster, type OwnedRosterTrust } from "./personalSpaceSharing.js";
 
 export interface FolderManifestEntry {
   path: string;
   type: "file" | "directory" | "symlink";
+  /** Hex-encoded BEP symlink_target bytes; required for symlinks. */
+  symlinkTarget?: string;
   size: number;
   deleted: boolean;
   version: readonly { id: string; value: string }[];
@@ -69,6 +76,7 @@ export interface DangerousLocalRelease {
 }
 
 const encoder = new TextEncoder();
+const MAX_SYNCTHING_OBSERVATION_MS = 5 * 60_000;
 const text = (value: unknown, label: string) => {
   if (typeof value !== "string" || !value || value.length > 4096 || value.includes("\0")) {
     throw new Error(`Invalid ${label}.`);
@@ -93,6 +101,10 @@ const canonicalManifestEntry = (entry: FolderManifestEntry) => {
   if (typeof entry.deleted !== "boolean" || !Array.isArray(entry.version) || !Array.isArray(entry.blocks)) {
     throw new Error("Invalid manifest entry.");
   }
+  const symlinkTarget = entry.symlinkTarget;
+  if (entry.type === "symlink" && !entry.deleted && !symlinkTarget ||
+    symlinkTarget !== undefined && (entry.type !== "symlink" || symlinkTarget.length > 4096 ||
+      !/^(?:[0-9a-f]{2})+$/i.test(symlinkTarget))) throw new Error("Invalid manifest symlink target.");
   const seen = new Set<string>();
   const version = entry.version.map(counter => {
     const id = String(BigInt(text(counter.id, "manifest version identifier")));
@@ -101,7 +113,8 @@ const canonicalManifestEntry = (entry: FolderManifestEntry) => {
     seen.add(id);
     return { id, value };
   }).sort((left, right) => BigInt(left.id) < BigInt(right.id) ? -1 : BigInt(left.id) > BigInt(right.id) ? 1 : 0);
-  return { path, type: entry.type, size: integer(entry.size, "manifest size"), deleted: entry.deleted === true,
+  return { path, type: entry.type, ...(symlinkTarget ? { symlinkTarget: symlinkTarget.toLowerCase() } : {}),
+    size: integer(entry.size, "manifest size"), deleted: entry.deleted === true,
     version, blocks: entry.blocks.map(block => text(block, "manifest block hash")) };
 };
 
@@ -115,6 +128,50 @@ export function folderManifestDigest(entries: readonly FolderManifestEntry[]): s
     paths.add(entry.path);
   }
   return digest(encoder.encode(`syncpeer.folder-manifest.v1\n${JSON.stringify(canonical)}`));
+}
+
+/** Converts a complete BEP index to a digest; it does not prove the indexed bytes are stored. */
+export function folderManifestDigestFromBep(files: readonly BepFileInfo[]): string {
+  return folderManifestDigest(files.map(file => {
+    const type = Number(file.type ?? 0);
+    if (file.invalid || ![0, 1, 2, 3, 4].includes(type)) throw new Error("Invalid BEP manifest entry.");
+    const blocks = file.blocks ?? file.Blocks ?? [];
+    if (type === 0 && !file.deleted) validateBlockPlan(blocks, Number(file.size ?? 0));
+    else if (blocks.length) throw new Error("Invalid BEP manifest block list.");
+    const kind = type === 0 ? "file" : type === 1 ? "directory" : "symlink";
+    return { path: file.name, type: kind, size: Number(file.size ?? 0), deleted: file.deleted === true,
+      version: (file.version?.counters ?? []).map(counter => ({ id: String(counter.id), value: String(counter.value) })),
+      blocks: blocks.map(block => hex(block.hash)),
+      ...(kind === "symlink" && file.symlink_target?.length
+        ? { symlinkTarget: hex(file.symlink_target) } : {}) };
+  }));
+}
+
+/** Proves a local replica matches an entire advertised index, not merely favorite paths. */
+export async function verifyLocalReplicaManifest(replica: Pick<LocalFolderReplica, "scan" | "readBlock">,
+  expectedFiles: readonly BepFileInfo[]): Promise<string> {
+  if (expectedFiles.some(file => isInternalReplicaPath(file.name))) {
+    throw new Error("Internal paths cannot be part of a retained folder manifest.");
+  }
+  const expectedDigest = folderManifestDigestFromBep(expectedFiles);
+  const scanDigest = async () => folderManifestDigestFromBep(
+    (await replica.scan()).filter(file => !isInternalReplicaPath(file.name)));
+  if (await scanDigest() !== expectedDigest) {
+    throw new Error("Local replica is not a complete copy of the current folder manifest.");
+  }
+  for (const file of expectedFiles) {
+    if (file.deleted || Number(file.type ?? 0) !== 0) continue;
+    for (const block of file.blocks ?? file.Blocks ?? []) {
+      const bytes = await replica.readBlock(file.name, block.offset, block.size, block.hash);
+      if (bytes.length !== block.size || !equalHash(sha256(bytes), block.hash)) {
+        throw new Error("Local replica block digest did not match the folder manifest.");
+      }
+    }
+  }
+  if (await scanDigest() !== expectedDigest) {
+    throw new Error("Local replica is not a complete copy of the current folder manifest.");
+  }
+  return expectedDigest;
 }
 
 export const defaultFolderRetentionPolicy = (folderId: string, rosterHead: string): FolderRetentionPolicy => ({
@@ -162,8 +219,10 @@ const validateCompletionData = (value: ReturnType<typeof completionData>) => {
   integer(value.policyRevision, "completion policy revision", 1);
   integer(value.completedAtMs, "completion time");
   if (!["syncpeer", "syncthing"].includes(value.holderKind) ||
-    value.liveUntilMs !== undefined && integer(value.liveUntilMs, "completion live deadline") < value.completedAtMs) {
-    throw new Error("Invalid replica completion.");
+    value.liveUntilMs !== undefined && (
+      integer(value.liveUntilMs, "completion live deadline") < value.completedAtMs ||
+      value.liveUntilMs - value.completedAtMs > MAX_SYNCTHING_OBSERVATION_MS)) {
+    throw new Error("Invalid or unbounded replica completion.");
   }
 };
 
@@ -198,7 +257,8 @@ export async function signReplicaCompletion(subtle: SubtleCrypto, key: CryptoKey
 
 const validCompletion = async (subtle: SubtleCrypto, completion: ReplicaCompletion,
   publicKeys: Readonly<Record<string, string>>, nowMs: number) => {
-  if (completion.format !== 1 || completion.holderKind === "syncpeer" && completion.signerId !== completion.holderId ||
+  if (completion.format !== 1 || completion.completedAtMs > nowMs ||
+    completion.holderKind === "syncpeer" && completion.signerId !== completion.holderId ||
     completion.holderKind === "syncthing" && (completion.liveUntilMs === undefined || completion.liveUntilMs < nowMs)) return false;
   const data = completionData(completion);
   try { validateCompletionData(data); } catch { return false; }
@@ -275,20 +335,27 @@ export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
   proposal: RetentionReleaseProposal;
   votes: readonly RetentionVote[];
   completions: readonly ReplicaCompletion[];
-  activeDeviceIds: readonly string[];
-  publicKeys: Readonly<Record<string, string>>;
+  trust: OwnedRosterTrust;
   nowMs: number;
 }) {
   validatePolicy(input.policy);
-  const active = new Set(input.activeDeviceIds);
-  if (!active.size || active.size !== input.activeDeviceIds.length) throw new Error("Invalid active owned-device roster.");
+  if (!input.trust || input.trust.knownHead !== input.policy.rosterHead ||
+    input.trust.knownHead !== input.trust.updates.at(-1)?.hash) {
+    throw new Error("Retention release has a stale or invalid trusted roster head.");
+  }
+  const roster = await verifyOwnedRoster(subtle, input.trust.updates,
+    input.trust.genesisKey, input.trust.knownHead);
+  const devices = roster.devices.filter(device => device.state === "active");
+  const active = new Set(devices.map(device => device.id));
+  const publicKeys = Object.fromEntries(devices.map(device => [device.id, device.signingKey]));
+  if (!active.size) throw new Error("Invalid active owned-device roster.");
   const proposal = input.proposal;
   const expectedProposal = proposalData(proposal);
   const expectedId = digest(recordBytes("syncpeer.retention-release-proposal.v1", expectedProposal));
   if (proposal.format !== 1 || proposal.action !== "release-local-copy" || proposal.id !== expectedId ||
     proposal.folderId !== input.policy.folderId || proposal.manifestDigest !== input.currentManifestDigest ||
     proposal.policyRevision !== input.policy.revision || proposal.rosterHead !== input.policy.rosterHead ||
-    !active.has(proposal.proposerId) || !await verify(subtle, input.publicKeys[proposal.proposerId],
+    !active.has(proposal.proposerId) || !await verify(subtle, publicKeys[proposal.proposerId],
       "syncpeer.retention-release-proposal.v1", expectedProposal, proposal.signature)) {
     throw new Error("Retention release proposal is invalid or stale.");
   }
@@ -299,7 +366,7 @@ export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
     const data = voteData(vote);
     if (vote.format !== 1 || vote.proposalId !== proposal.id || vote.folderId !== input.policy.folderId ||
       vote.policyRevision !== input.policy.revision || vote.rosterHead !== input.policy.rosterHead ||
-      !active.has(vote.voterId) || !await verify(subtle, input.publicKeys[vote.voterId],
+      !active.has(vote.voterId) || !await verify(subtle, publicKeys[vote.voterId],
         "syncpeer.retention-vote.v1", data, vote.signature)) throw new Error("Retention vote is invalid or stale.");
     if (voters.has(vote.voterId)) throw new Error("Each device has one vote per policy revision.");
     voters.add(vote.voterId);
@@ -310,7 +377,7 @@ export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
   }
   if (approvals < Math.floor(active.size / 2) + 1) throw new Error("Retention release lacks an active-device majority.");
   const assessment = await assessFolderRetention(subtle, input.policy, proposal.manifestDigest,
-    input.completions, input.publicKeys, input.nowMs);
+    input.completions, publicKeys, input.nowMs);
   if (!assessment.completeHolderIds.includes(proposal.releaseHolderId)) {
     throw new Error("The released holder has no current complete-copy receipt.");
   }

@@ -405,7 +405,14 @@ describe("Syncpeer LAN integration", () => {
     });
   });
 
-  it("reports public discovery reachability without gating the LAN run", async () => {
+  it("reports public discovery reachability without gating the LAN run", async function () {
+    if (process.env.SYNCPEER_LAN_SELF === "1") {
+      await reportPhase("public-smoke", "skipped", {
+        reason: "one-host tests do not contact public discovery",
+      });
+      this.skip();
+      return;
+    }
     await reportPhase("public-smoke", "running");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);

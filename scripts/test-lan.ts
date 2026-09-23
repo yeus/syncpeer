@@ -34,6 +34,7 @@ import {
   type TemporaryNixosFirewall,
 } from "./lan-test/firewall.ts";
 import { buildLanApp, runLanWdio } from "./lan-test/tauri-runner.ts";
+import { runWithPrivateSecretService } from "./lan-test/private-secret-service.mjs";
 
 const selfMode = process.argv.includes("--self");
 const selfClientMode = process.argv.includes("--self-client");
@@ -280,6 +281,7 @@ const runServer = async (args: {
       untrustedDeviceId: untrustedDeviceId || undefined,
       home: serverHome,
       mode: "direct",
+      publicNetwork: !args.self,
     });
     if (args.openFirewall) {
       firewall.open({ protocol: "tcp", port: fixture.fixture.directPort });
@@ -453,7 +455,14 @@ const main = async (): Promise<number> => {
   });
 };
 
-main().then((code) => {
+const run = () => selfMode && process.platform === "linux" &&
+  process.env.SYNCPEER_LAN_PRIVATE_KEYRING_READY !== "1"
+  ? runWithPrivateSecretService(process.execPath,
+      ["--experimental-strip-types", process.argv[1], ...process.argv.slice(2)],
+      { SYNCPEER_LAN_PRIVATE_KEYRING_READY: "1" })
+  : main();
+
+run().then((code) => {
   process.exitCode = code;
 }).catch((error) => {
   console.error(error instanceof Error ? error.stack ?? error.message : String(error));

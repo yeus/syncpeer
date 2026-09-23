@@ -26,10 +26,7 @@ const transferJobServiceComponent = `${packageName}/${transferJobServiceClass}`;
 const transferJobId = Number(process.env.SYNCPEER_ANDROID_TRANSFER_JOB_ID || 22067);
 const documentsProviderAuthority = process.env.SYNCPEER_ANDROID_DOCUMENTS_AUTHORITY?.trim()
   || `${packageName}.documents`;
-const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim()
-  || (fs.existsSync(".tmp/syncpeer-dev-client/server-device-id")
-    ? fs.readFileSync(".tmp/syncpeer-dev-client/server-device-id", "utf8").trim()
-    : "");
+const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim() || "";
 const discoveryServer = process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || "";
 // Global mode is relay-only in E2E builds; local TCP fixtures opt into automatic.
 const discoveryMode = process.env.SYNCPEER_ANDROID_DISCOVERY_MODE?.trim() || "global";
@@ -1739,7 +1736,7 @@ const runOptionalAndroidNetworkWorkflow = async () => {
     return;
   }
   if (!serverDeviceId) {
-    console.log("Android network UI workflow skipped: set SYNCPEER_DEV_SERVER_DEVICE_ID or save server-device-id.");
+    console.log("Android network UI workflow skipped: set SYNCPEER_DEV_SERVER_DEVICE_ID explicitly.");
     return;
   }
   let cdp = await connectCdp();

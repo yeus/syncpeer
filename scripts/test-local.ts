@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { configureSyncthingNetwork } from "./lan-test/syncthing.ts";
 
 /*
  * Local fully-automated Syncthing integration test.
@@ -227,6 +228,7 @@ function configureHome(home, opts) {
   let xml = fs.readFileSync(configPath, "utf8");
   xml = replaceGuiAddress(xml, opts.guiAddress);
   xml = setSingleListenAddress(xml, opts.listenAddress);
+  xml = configureSyncthingNetwork(xml, false, false);
   for (const remote of opts.remoteDevices) {
     xml = addTopLevelDevice(xml, remote.id, remote.name, remote.address, {
       untrusted: remote.untrusted === true,

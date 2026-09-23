@@ -21,6 +21,7 @@ import {
   type DiagnosticsBuiltinTest,
 } from "../packages/shared/modules/diagnosticsRunner.ts";
 import { sanitizeDiagnosticArtifact } from "../packages/shared/modules/diagnosticSanitizer.ts";
+import { externalPeerSkipReason } from "./external-test-gate.ts";
 
 const fixtureFolderId = LAN_FIXTURE_FOLDER_ID;
 const fixtureHello = LAN_FIXTURE_HELLO_CONTENT;
@@ -49,14 +50,9 @@ const clientEnvironment = (): NodeJS.ProcessEnv => {
 };
 
 const readServerDeviceId = (): string => {
-  const configured = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim();
-  const savedPath = path.join(clientRoot(), "server-device-id");
-  const saved = fs.existsSync(savedPath) ? fs.readFileSync(savedPath, "utf8").trim() : "";
-  const deviceId = normalizeDeviceId(configured || saved);
+  const deviceId = normalizeDeviceId(process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim() ?? "");
   if (!isValidSyncthingDeviceId(deviceId)) {
-    throw new Error(
-      "Set SYNCPEER_DEV_SERVER_DEVICE_ID or run the client once to save the server ID.",
-    );
+    throw new Error("Set a valid SYNCPEER_DEV_SERVER_DEVICE_ID explicitly for remote CLI diagnostics.");
   }
   return deviceId;
 };
@@ -231,6 +227,8 @@ const diagnosticsTests = (serverDeviceId: string): DiagnosticsBuiltinTest[] => {
 };
 
 const run = async (): Promise<void> => {
+  const skip = externalPeerSkipReason(process.env);
+  if (skip) throw new Error(skip);
   buildCli();
   const serverDeviceId = readServerDeviceId();
   const startedAtMs = Date.now();

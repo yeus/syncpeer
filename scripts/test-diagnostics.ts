@@ -1,19 +1,11 @@
 import fs from "node:fs";
-import path from "node:path";
+import { externalApiSkipReason, externalPeerSkipReason } from "./external-test-gate.ts";
 import {
   nodeScript,
   runTestSuite,
   tsxScript,
   type TestSuitePhase,
 } from "./test-suite-runner.ts";
-
-const hasRemoteServer = (): boolean => {
-  if (process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim()) return true;
-  const clientRoot = path.resolve(
-    process.env.SYNCPEER_LAN_CLIENT_ROOT ?? ".tmp/syncpeer-dev-client",
-  );
-  return fs.existsSync(path.join(clientRoot, "server-device-id"));
-};
 
 const remoteApiUrl = (): string | undefined =>
   process.env.SYNCPEER_SYNCTHING_API_URL?.trim() ||
@@ -286,11 +278,14 @@ const main = async (): Promise<void> => {
       name: "Tauri native discovery diagnostics",
     },
     {
+      name: "External peer opt-in safety",
+      command: process.execPath,
+      args: ["--experimental-strip-types", "--test", "scripts/test-external-test-gate.ts"],
+    },
+    {
       ...nodeScript("scripts/test-dev-cli.ts"),
       name: "Remote CLI diagnostics",
-      skipReason: () => hasRemoteServer()
-        ? undefined
-        : "no SYNCPEER_DEV_SERVER_DEVICE_ID or saved server-device-id",
+      skipReason: () => externalPeerSkipReason(process.env),
       required: requireExternal,
     },
     {
@@ -299,9 +294,7 @@ const main = async (): Promise<void> => {
         apiUrl ?? "",
       ]),
       name: "Syncthing REST API diagnostics",
-      skipReason: () => apiUrl
-        ? undefined
-        : "set SYNCPEER_SYNCTHING_API_URL to enable this external check",
+      skipReason: () => externalApiSkipReason(process.env, apiUrl),
       required: requireExternal,
     },
   ];

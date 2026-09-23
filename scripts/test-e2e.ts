@@ -1,14 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { nodeScript, runTestSuite, type TestSuitePhase } from "./test-suite-runner.ts";
-
-const hasRemoteServer = (): boolean => {
-  if (process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim()) return true;
-  const clientRoot = path.resolve(
-    process.env.SYNCPEER_LAN_CLIENT_ROOT ?? ".tmp/syncpeer-dev-client",
-  );
-  return fs.existsSync(path.join(clientRoot, "server-device-id"));
-};
+import { externalPeerSkipReason } from "./external-test-gate.ts";
 
 const main = async (): Promise<void> => {
   const requireExternal = process.env.SYNCPEER_REQUIRE_EXTERNAL_CHECKS === "1";
@@ -33,9 +26,7 @@ const main = async (): Promise<void> => {
     {
       ...nodeScript("scripts/test-dev.ts", ["--client", "--ui-smoke"]),
       name: "Remote Tauri UI workflows and in-app diagnostics",
-      skipReason: () => hasRemoteServer()
-        ? undefined
-        : "no SYNCPEER_DEV_SERVER_DEVICE_ID or saved server-device-id",
+      skipReason: () => externalPeerSkipReason(process.env),
       required: requireExternal,
     },
     {

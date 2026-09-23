@@ -79,6 +79,25 @@ test("the combined Android workflow owns all three emulator profiles", () => {
   assert.match(runner, /editorProject, "assembleDebug"/);
 });
 
+test("Android network tests cannot silently select a saved external peer", () => {
+  const runner = fs.readFileSync("scripts/test-android-e2e.mjs", "utf8");
+  assert.doesNotMatch(runner, /\.tmp\/syncpeer-dev-client\/server-device-id/);
+});
+
+test("remote CLI diagnostics require an explicit external peer", () => {
+  const runner = fs.readFileSync("scripts/test-dev-cli.ts", "utf8");
+  assert.doesNotMatch(runner, /server-device-id/);
+  assert.match(runner, /externalPeerSkipReason/);
+});
+
+test("one-host Tauri tests skip public discovery probes", () => {
+  const spec = fs.readFileSync("scripts/lan-test/spec.ts", "utf8");
+  const smoke = spec.split('it("reports public discovery reachability')[1];
+  assert.ok(smoke);
+  assert.match(smoke, /SYNCPEER_LAN_SELF/);
+  assert.match(smoke, /this\.skip\(\)/);
+});
+
 test("the synthetic document editor is a separate test-only APK", () => {
   const editorSettings = fs.readFileSync(
     "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/settings.gradle.kts",

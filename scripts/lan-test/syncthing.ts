@@ -46,13 +46,14 @@ const ensureDir = (directory: string): void => {
 export const syncthingListenAddresses = (
   syncPort: number,
   profile: SyncthingTransportProfile,
+  host = "0.0.0.0",
 ): string[] => {
-  if (profile === "tcp") return ["tcp4://0.0.0.0:" + syncPort];
-  if (profile === "quic") return ["quic4://0.0.0.0:" + syncPort];
+  if (profile === "tcp") return ["tcp4://" + host + ":" + syncPort];
+  if (profile === "quic") return ["quic4://" + host + ":" + syncPort];
   if (profile === "tcp-quic") {
-    return ["tcp4://0.0.0.0:" + syncPort, "quic4://0.0.0.0:" + syncPort];
+    return ["tcp4://" + host + ":" + syncPort, "quic4://" + host + ":" + syncPort];
   }
-  return ["tcp4://0.0.0.0:" + syncPort, SYNCTHING_RELAY_POOL];
+  return ["tcp4://" + host + ":" + syncPort, SYNCTHING_RELAY_POOL];
 };
 
 export const ensureSyncthingTools = (): void => {
@@ -166,25 +167,45 @@ const waitFor = async (
   throw new Error("Timed out waiting for " + label + ".");
 };
 
+export const waitForSyncthingGui = async (
+  probe: () => Promise<{ myID?: string }>,
+  fixtureExited: () => boolean,
+  timeoutMs = 30000,
+): Promise<{ myID: string }> => {
+  let ready: { myID: string } | null = null;
+  let consecutive = 0;
+  await waitFor(async () => {
+    if (fixtureExited()) throw new Error("Synthetic Syncthing fixture exited before its GUI API became ready.");
+    try {
+      const status = await probe();
+      if (!status.myID) { consecutive = 0; return false; }
+      ready = { myID: status.myID };
+      return ++consecutive >= 2;
+    } catch {
+      consecutive = 0;
+      return false;
+    }
+  }, timeoutMs, "Syncthing GUI API");
+  return ready!;
+};
+
 const waitForFile = (filePath: string, timeoutMs: number, label: string): Promise<void> =>
   waitFor(async () => fs.existsSync(filePath), timeoutMs, label);
-
-const waitForTcp = (host: string, port: number, timeoutMs: number, label: string): Promise<void> =>
-  waitFor(() => new Promise<boolean>((resolve) => {
-    const socket = net.connect({ host, port });
-    const finish = (value: boolean) => {
-      socket.destroy();
-      resolve(value);
-    };
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-    socket.setTimeout(500, () => finish(false));
-  }), timeoutMs, label);
 
 const replaceTag = (xml: string, tag: string, value: string): string => {
   const pattern = new RegExp("(<" + tag + ">)[\\s\\S]*?(</" + tag + ">)");
   if (pattern.test(xml)) return xml.replace(pattern, "$1" + escapeXml(value) + "$2");
   return xml.replace(/(<options>\s*\n)/, "$1        <" + tag + ">" + escapeXml(value) + "</" + tag + ">\n");
+};
+
+/** Keep synthetic local peers off public discovery, relays, and router port mapping. */
+export const configureSyncthingNetwork = (xml: string, publicNetwork: boolean,
+  localAnnounce: boolean): string => {
+  for (const [tag, enabled] of [
+    ["globalAnnounceEnabled", publicNetwork], ["localAnnounceEnabled", localAnnounce],
+    ["relaysEnabled", publicNetwork], ["natEnabled", publicNetwork],
+  ] as const) xml = replaceTag(xml, tag, String(enabled));
+  return xml;
 };
 
 const replaceRepeatedTag = (xml: string, tag: string, values: string[]): string => {
@@ -268,6 +289,7 @@ const configureHome = (home: string, args: {
   syncPort: number;
   transport: SyncthingTransportProfile;
   localAnnounce: boolean;
+  publicNetwork: boolean;
   trustedDeviceId?: string;
   untrustedDeviceId?: string;
   sharePath: string;
@@ -283,14 +305,12 @@ const configureHome = (home: string, args: {
     /(<gui\b[\s\S]*?<address>)[^<]*(<\/address>)/,
     (_match, prefix, suffix) => prefix + "127.0.0.1:" + args.guiPort + suffix,
   );
-  const addresses = syncthingListenAddresses(args.syncPort, args.transport);
+  const addresses = syncthingListenAddresses(args.syncPort, args.transport,
+    args.publicNetwork ? "0.0.0.0" : "127.0.0.1");
   xml = replaceRepeatedTag(xml, "listenAddress", addresses);
   xml = replaceRepeatedTag(xml, "globalAnnounceServer", ["default"]);
-  xml = replaceTag(xml, "globalAnnounceEnabled", "true");
-  xml = replaceTag(xml, "localAnnounceEnabled", String(args.localAnnounce));
+  xml = configureSyncthingNetwork(xml, args.publicNetwork, args.localAnnounce);
   xml = replaceTag(xml, "localAnnouncePort", String(SYNCTHING_LOCAL_DISCOVERY_PORT));
-  xml = replaceTag(xml, "relaysEnabled", "true");
-  xml = replaceTag(xml, "natEnabled", "true");
   if (args.trustedDeviceId) {
     xml = addDevice(xml, args.trustedDeviceId, "syncpeer-lan-client");
   }
@@ -424,6 +444,7 @@ export const createLanFixture = async (args: {
   mode: "direct" | "relay" | "quic";
   encryptedFolderType?: "sendonly" | "sendreceive";
   includeBlob?: boolean;
+  publicNetwork?: boolean;
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
   const root = args.root;
@@ -464,6 +485,7 @@ export const createLanFixture = async (args: {
     syncPort,
     transport,
     localAnnounce,
+    publicNetwork: args.publicNetwork !== false,
     trustedDeviceId: args.trustedDeviceId,
     untrustedDeviceId,
     sharePath,
@@ -473,24 +495,27 @@ export const createLanFixture = async (args: {
     password: encryptedPassword,
     encryptedFolderType: args.encryptedFolderType,
   });
-  let syncthingProcess: ChildProcess | null = null;
-  const start = async () => {
-    syncthingProcess = startProcess(binaryPath("syncthing"), [
-      "serve", "--home", home, "--no-browser", "--no-restart", "--no-upgrade",
-    ], root, path.join(root, "syncthing.log"));
-    await waitForTcp("127.0.0.1", guiPort, 30000, "Syncthing GUI");
-  };
   configure(args.mode === "relay" ? "relay" : args.mode === "quic" ? "quic" : "tcp-quic", args.mode !== "relay", args.untrustedDeviceId);
-  await start();
   const apiKey = apiKeyFor(home);
   const syncGuiUrl = "http://127.0.0.1:" + guiPort;
   const request = <T>(call: SyncthingApiCall): Promise<T> =>
     apiRequest<T>(syncGuiUrl, apiKey, call);
+  let syncthingProcess: ChildProcess | null = null;
+  const guiReady = () => waitForSyncthingGui(
+    () => request<{ myID?: string }>({ pathname: "/rest/system/status", signal: AbortSignal.timeout(1000) }),
+    () => syncthingProcess?.exitCode != null || syncthingProcess?.signalCode != null,
+  );
+  const start = async () => {
+    syncthingProcess = startProcess(binaryPath("syncthing"), [
+      "serve", "--home", home, "--no-browser", "--no-restart", "--no-upgrade",
+    ], root, path.join(root, "syncthing.log"));
+    return guiReady();
+  };
+  const status = await start();
   const expectedFiles = ["hello.txt", "nested/file.txt", ...(args.includeBlob === false ? [] : ["blob.bin"])].map((relativePath) => ({
     path: relativePath,
     ...hashFile(path.join(sharePath, relativePath)),
   }));
-  const status = await request<{ myID?: string }>({ pathname: "/rest/system/status" });
   const fixture: LanFixture = {
     runId: path.basename(root),
     serverHost: args.serverHost,
@@ -516,6 +541,10 @@ export const createLanFixture = async (args: {
       ensureDir(received);
       const senderRequest = <T>(call: SyncthingApiCall) => apiRequest<T>(sender.syncGuiUrl, sender.apiKey, call);
       await sender.approveDevice({ deviceId: fixture.remoteDeviceId, untrusted: true });
+      await waitForSyncthingGui(
+        () => senderRequest<{ myID?: string }>({ pathname: "/rest/system/status", signal: AbortSignal.timeout(1000) }),
+        () => false,
+      );
       const defaults = await request<Record<string, unknown>>({ pathname: "/rest/config/defaults/device" });
       await request({ pathname: "/rest/config/devices", method: "POST", body: {
         ...defaults, deviceID: sender.fixture.remoteDeviceId, name: "encrypted-fixture-sender",
@@ -530,6 +559,7 @@ export const createLanFixture = async (args: {
         ...folder, path: received, type: "receiveencrypted",
         devices: [{ deviceID: fixture.remoteDeviceId }, { deviceID: sender.fixture.remoteDeviceId }],
       } });
+      await guiReady();
       const query = "?folder=" + encodeURIComponent(encryptedFolderId);
       await senderRequest({ pathname: "/rest/db/scan" + query, method: "POST" });
       const expected = await senderRequest<{ localFiles: number }>({ pathname: "/rest/db/status" + query });

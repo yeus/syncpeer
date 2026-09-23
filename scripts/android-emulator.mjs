@@ -30,6 +30,10 @@ export const create = ({ avdName, systemImage }) => {
 };
 
 export const profile = (name) => {
+  if (name === "legacy") return {
+    avdName: "syncpeer-api24",
+    systemImage: "system-images;android-24;google_apis;x86_64",
+  };
   if (name === "compat") return {
     avdName: "syncpeer-api29",
     systemImage: "system-images;android-29;google_apis_playstore;x86_64",
@@ -63,7 +67,7 @@ const main = (args) => {
     return;
   }
   if (command !== "start") {
-    throw new Error("Usage: android-emulator.mjs <create|start> [compat|modern]");
+    throw new Error("Usage: android-emulator.mjs <create|start> [legacy|compat|modern]");
   }
   create(selected);
   start(selected, emulatorArguments);

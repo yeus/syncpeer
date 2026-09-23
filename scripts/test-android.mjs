@@ -180,6 +180,9 @@ const main = async () => {
       if (!webViewFixture) throw new Error("Modern WebView fixture was not captured.");
       installWebViewFixture(webViewFixture);
     }, true);
+    await runProfile("legacy", [
+      "--expect-sdk", "24", "--reboot", "--skip-network",
+    ], undefined, true);
     run(process.execPath, [
       "--experimental-strip-types",
       "scripts/test-android-peer.ts",

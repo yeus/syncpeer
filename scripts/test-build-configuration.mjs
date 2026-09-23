@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { profile } from "./android-emulator.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+
+test("the Android release matrix names API 24, 29, and 36 emulator profiles", () => {
+  assert.match(profile("legacy").systemImage, /android-24/);
+  assert.match(profile("compat").systemImage, /android-29/);
+  assert.match(profile("modern").systemImage, /android-36/);
+  const runner = fs.readFileSync("scripts/test-android.mjs", "utf8");
+  assert.match(runner, /runProfile\("legacy"/);
+  const editor = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build.gradle.kts", "utf8");
+  assert.match(editor, /minSdk = 24/);
+});
 
 test("application builds compile the core workspace first", () => {
   const scripts = json("package.json").scripts;
@@ -52,13 +63,14 @@ test("Android compatibility testing has one explicit API 29 owner", () => {
   );
 });
 
-test("the combined Android workflow owns both emulator profiles", () => {
+test("the combined Android workflow owns all three emulator profiles", () => {
   const scripts = json("package.json").scripts;
   const runner = fs.readFileSync("scripts/test-android.mjs", "utf8");
   assert.equal(scripts["test:android"], "node scripts/test-android.mjs");
   assert.match(runner, /build:android:e2e/);
   assert.match(runner, /compat/);
   assert.match(runner, /modern/);
+  assert.match(runner, /legacy/);
   assert.match(runner, /test-android-e2e\.mjs/);
   assert.match(runner, /--skip-network/);
   assert.match(runner, /uninstallIfPresent\("dev\.syncpeer\.app"\)/);

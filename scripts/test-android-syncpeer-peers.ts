@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { androidPeerTargets, androidPeerCdpPort } from "./android-peer-targets.ts";
 
 const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
@@ -27,19 +28,15 @@ const onlineSerials = () => execFileSync("adb", ["devices"], { encoding: "utf8" 
   .map(line => line.split(/\s+/)[0]!);
 
 const selectedSerials = () => {
-  const configured = process.env.SYNCPEER_ANDROID_SERIALS?.split(",")
-    .map(value => value.trim()).filter(Boolean);
-  const serials = configured?.length ? configured : onlineSerials();
-  if (serials.length !== 2) {
-    throw new Error(`Expected two Android emulators, found ${serials.length}.`);
-  }
-  return serials;
+  return androidPeerTargets(onlineSerials(), process.env.SYNCPEER_ANDROID_SERIALS,
+    process.env.SYNCPEER_ANDROID_RESET_EMULATORS === "1",
+    serial => adb(serial, ["shell", "getprop", "ro.kernel.qemu"]).trim() === "1");
 };
 
 const phaseEnvironment = (serial: string, remoteDeviceId = "") => ({
   ...process.env,
   ANDROID_SERIAL: serial,
-  SYNCPEER_ANDROID_CDP_PORT: serial.endsWith("4") ? "9224" : "9226",
+  SYNCPEER_ANDROID_CDP_PORT: String(androidPeerCdpPort(serial)),
   SYNCPEER_DEV_SERVER_DEVICE_ID: remoteDeviceId,
   SYNCPEER_E2E_FOLDER_ID: folderId,
   SYNCPEER_E2E_FOLDER_PASSWORD: folderPassword,

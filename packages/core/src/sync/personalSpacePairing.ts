@@ -1,3 +1,6 @@
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, verifyOwnedRoster,
+  type OwnedRosterTrust, type OwnedSpaceDevice } from "./personalSpaceSharing.js";
+
 export interface PairingInvitation {
   format: 1;
   deviceId: string;
@@ -12,6 +15,8 @@ export interface PairingRequest {
   deviceId: string;
   nonce: string;
   publicKey: string;
+  device: OwnedSpaceDevice;
+  deviceProof: string;
 }
 
 export interface PairingTransfer {
@@ -23,12 +28,15 @@ export interface PersonalSpacePairingTransfer {
   spaceId: string;
   settingsFolderId: string;
   rootKey: string;
+  trust: OwnedRosterTrust;
 }
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const decode = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
 const context = (invitation: PairingInvitation, request: PairingRequest) =>
   new TextEncoder().encode(`syncpeer.owned-pairing.v1\n${JSON.stringify([invitation, request])}`);
+const deviceProofBytes = (invitation: PairingInvitation, device: OwnedSpaceDevice) =>
+  new TextEncoder().encode(`syncpeer.owned-pairing-device.v1\n${JSON.stringify([invitation, device])}`);
 const validDeviceId = (value: string) => typeof value === "string" && /^[A-Za-z0-9-]{1,128}$/.test(value);
 const keyPair = async (subtle: SubtleCrypto) => subtle.generateKey(
   { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
@@ -53,8 +61,14 @@ export async function createPairingRequest(subtle: SubtleCrypto,
     !validDeviceId(deviceId) || deviceId === verifiedRemoteId) throw new Error("Pairing identity mismatch or expired invitation.");
   const pair = await keyPair(subtle), nonce = await randomBytes(16);
   if (nonce.length !== 16) throw new Error("Invalid pairing random source.");
+  const deviceIdentity = await createOwnedDeviceIdentity(subtle, randomBytes, deviceId);
+  const device = { id: deviceIdentity.id, syncthingId: deviceIdentity.syncthingId,
+    state: deviceIdentity.state, signingKey: deviceIdentity.signingKey };
+  const signingKey = await openOwnedDeviceSigningKey(subtle, deviceIdentity);
   return { privateKey: pair.privateKey, request: { format: 1 as const, deviceId, nonce: encode(nonce),
-    publicKey: encode(new Uint8Array(await subtle.exportKey("raw", pair.publicKey))) } };
+    publicKey: encode(new Uint8Array(await subtle.exportKey("raw", pair.publicKey))),
+    device, deviceProof: encode(new Uint8Array(await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signingKey,
+      deviceProofBytes(invitation, device)))) }, deviceIdentity };
 }
 
 /** The transport must supply the peer ID from its verified TLS certificate. */
@@ -62,10 +76,18 @@ export async function openPairingSession(subtle: SubtleCrypto, privateKey: Crypt
   invitation: PairingInvitation, request: PairingRequest, verifiedRemoteId: string) {
   if (invitation.format !== 1 || request.format !== 1 || invitation.expiresAt <= Date.now() ||
     !validDeviceId(invitation.deviceId) || !validDeviceId(request.deviceId) ||
+    request.device?.syncthingId !== request.deviceId || request.device.state !== "active" ||
+    request.device.retiredSyncthingIds !== undefined || !request.device.id || !request.device.signingKey ||
     invitation.deviceId === request.deviceId ||
     (verifiedRemoteId !== invitation.deviceId && verifiedRemoteId !== request.deviceId)) {
     throw new Error("Pairing identity mismatch or expired invitation.");
   }
+  try {
+    const signingKey = await subtle.importKey("spki", decode(request.device.signingKey),
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    if (!await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, signingKey, decode(request.deviceProof),
+      deviceProofBytes(invitation, request.device))) throw new Error();
+  } catch { throw new Error("Pairing device signing identity is invalid."); }
   const remote = verifiedRemoteId === invitation.deviceId ? invitation.publicKey : request.publicKey;
   const publicKey = await subtle.importKey("raw", decode(remote), { name: "ECDH", namedCurve: "P-256" }, false, []);
   const shared = new Uint8Array(await subtle.deriveBits({ name: "ECDH", public: publicKey }, privateKey, 256));
@@ -85,7 +107,9 @@ export async function sealPairingTransfer(subtle: SubtleCrypto,
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>,
   value: PersonalSpacePairingTransfer): Promise<PairingTransfer> {
   if (!/^[a-f0-9]{32}$/.test(value.spaceId) || !/^[a-f0-9]{32}$/.test(value.settingsFolderId) ||
-    !/^[a-f0-9]{64}$/.test(value.rootKey)) throw new Error("Invalid pairing transfer.");
+    !/^[a-f0-9]{64}$/.test(value.rootKey) || !value.trust ||
+    value.trust.knownHead !== value.trust.updates.at(-1)?.hash) throw new Error("Invalid pairing transfer.");
+  await verifyOwnedRoster(subtle, value.trust.updates, value.trust.genesisKey, value.trust.knownHead);
   const nonce = await randomBytes(12);
   if (nonce.length !== 12) throw new Error("Invalid pairing random source.");
   const key = await subtle.importKey("raw", session.key, "AES-GCM", false, ["encrypt"]);
@@ -106,6 +130,11 @@ export async function openPairingTransfer(subtle: SubtleCrypto,
     if (!value || typeof value !== "object" || !/^[a-f0-9]{32}$/.test((value as { spaceId?: string }).spaceId ?? "") ||
       !/^[a-f0-9]{32}$/.test((value as { settingsFolderId?: string }).settingsFolderId ?? "") ||
       !/^[a-f0-9]{64}$/.test((value as { rootKey?: string }).rootKey ?? "")) throw new Error("Invalid pairing transfer.");
-    return value as PersonalSpacePairingTransfer;
+    const opened = value as PersonalSpacePairingTransfer;
+    if (!opened.trust || opened.trust.knownHead !== opened.trust.updates?.at(-1)?.hash) {
+      throw new Error("Invalid pairing transfer.");
+    }
+    await verifyOwnedRoster(subtle, opened.trust.updates, opened.trust.genesisKey, opened.trust.knownHead);
+    return opened;
   } catch { throw new Error("Pairing confirmation or encrypted transfer failed."); }
 }

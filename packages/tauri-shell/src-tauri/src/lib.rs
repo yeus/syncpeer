@@ -1770,7 +1770,7 @@ fn open_tls_listener(
                     return;
                 }
             };
-            let result = (|| {
+            let result: Result<TlsAcceptResponse, String> = (|| {
                 tcp.set_read_timeout(Some(timeout))
                     .map_err(|error| format!("Could not set accepted TLS read timeout: {error}"))?;
                 tcp.set_write_timeout(Some(timeout))
@@ -1792,7 +1792,18 @@ fn open_tls_listener(
                 Ok(TlsAcceptResponse { session_id, peer_certificate_der,
                     remote_address: remote.ip().to_string(), remote_port: remote.port(), alpn })
             })();
-            if sender.send(result).is_err() { return; }
+            // A rejected peer is not a listener failure. Only successful handshakes
+            // enter the accept queue; socket-local errors must not stop JS acceptance.
+            match result {
+                Ok(accepted) => {
+                    let session_id = accepted.session_id;
+                    if worker_stop.load(Ordering::Acquire) || sender.send(Ok(accepted)).is_err() {
+                        let _ = close_tls_session(&session_store, TlsCloseRequest { session_id });
+                        return;
+                    }
+                }
+                Err(_) => continue,
+            }
         }
     }).map_err(|error| format!("Could not start TLS listener worker: {error}"))?;
     let mut guard = listener_store.lock()
@@ -4936,6 +4947,10 @@ mod tests {
         }).unwrap();
         let listener_id = listener.listener_id;
         let listener_port = listener.port;
+        // A failed peer handshake must not poison the next accept operation.
+        let mut invalid = TcpStream::connect(("127.0.0.1", listener_port)).unwrap();
+        invalid.write_all(b"not a TLS handshake").unwrap();
+        drop(invalid);
         let client_sessions = sessions.clone();
         let client = thread::spawn(move || open_tls_session(client_sessions, TlsOpenRequest {
             host: "localhost".into(), port: listener_port,

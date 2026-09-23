@@ -26,6 +26,10 @@ import { cacheQuotaBytes, planCacheEvictions } from "./profileSettings.js";
 import { planVersionRemovals } from "./folderSync.js";
 import { loadCacheAccess, loadDirectorySnapshot, saveCacheAccess,
   saveDirectorySnapshot, type StoredDirectorySnapshot } from "./documentPrivateRecords.js";
+import { createPersonalSpaceSettingsJournal } from "./personalSpaceSettingsJournal.js";
+import { createPersonalSpaceRosterJournal } from "./personalSpaceRosterJournal.js";
+import type { PersonalSpaceChange } from "./personalSpaceChanges.js";
+import type { OwnedDeviceIdentity, OwnedSpaceDevice } from "./personalSpaceSharing.js";
 
 type NativeFs = Awaited<ReturnType<typeof createNativeFilesystem>>;
 type Vault = ReturnType<typeof createCredentialVault>;
@@ -76,6 +80,7 @@ interface DocumentRuntime {
   readonly folderKeys: Map<string, Uint8Array>;
   readonly handles: Map<number, DocumentHandle>;
   readonly recoveryIssues: Map<string, string[]>;
+  settingsFolder?: { id: string; replica: LocalFolderReplica; close: () => Promise<void> };
   vault: Vault;
   registry: FolderRegistry | undefined;
   nextHandle: number;
@@ -152,6 +157,8 @@ const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>): Promise<T
 const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
   const pending = [...runtime.handles.values()]; runtime.handles.clear();
   const results = await Promise.allSettled(pending.map(handle => handle.writer?.close()));
+  const settingsResult = await Promise.allSettled([runtime.settingsFolder?.close()]);
+  runtime.settingsFolder = undefined;
   const registryResult = await Promise.allSettled([runtime.registry?.close()]);
   runtime.registry = undefined;
   // A failed controller/storage close must never retain unlocked folder keys.
@@ -159,8 +166,62 @@ const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
   runtime.folderKeys.clear();
   const storageResults = await Promise.allSettled([...runtime.storage.values()].map(bytes => bytes.close()));
   runtime.storage.clear();
-  const errors = [...results, ...registryResult, ...storageResults].filter(result => result.status === "rejected");
+  const errors = [...results, ...settingsResult, ...registryResult, ...storageResults]
+    .filter(result => result.status === "rejected");
   if (errors.length) throw new Error("Some document handles could not be closed.");
+};
+
+const settingsStorageId = (folderId: string) =>
+  `personal-space-${[...sha256(new TextEncoder().encode(folderId))]
+    .map(byte => byte.toString(16).padStart(2, "0")).join("")}`;
+
+const reconcileOwnedRoster = async (runtime: DocumentRuntime) => {
+  if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
+  let local = await runtime.vault.ownedRoster();
+  if (!local) return null;
+  const journal = createPersonalSpaceRosterJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id);
+  const remote = await journal.load();
+  for (let index = 0; index < Math.min(remote.length, local.trust.updates.length); index++) {
+    if (remote[index].hash !== local.trust.updates[index].hash) throw new Error("Trusted device list fork detected.");
+  }
+  if (remote.length > local.trust.updates.length) {
+    await runtime.vault.acceptOwnedRoster({ genesisKey: local.trust.genesisKey,
+      knownHead: remote.at(-1)!.hash, updates: remote });
+    local = (await runtime.vault.ownedRoster())!;
+  } else if (remote.length < local.trust.updates.length) {
+    await journal.appendMissing(local.trust.updates);
+  }
+  return local;
+};
+
+const openPersonalSpaceFolder = async (runtime: DocumentRuntime): Promise<void> => {
+  const descriptor = await runtime.vault.personalSpaceFolder();
+  if (!descriptor || runtime.settingsFolder?.id === descriptor.id) return;
+  await runtime.settingsFolder?.close();
+  runtime.settingsFolder = undefined;
+  const crypto = await deriveUntrustedFolderCrypto(descriptor.id, descriptor.password, runtime.options.kdf);
+  let bytes: NativeFs | undefined;
+  try {
+    bytes = await runtime.options.openStorage(settingsStorageId(descriptor.id));
+    await bytes.initializeReplica();
+    await bytes.withLock(() => removeAbandonedEncryptedScratch(bytes!));
+    const encrypted = createEncryptedReplicaStorage(bytes, {
+      folderKey: crypto.folderKey, randomBytes: runtime.options.randomBytes,
+      withLock: bytes.withLock, checkHealth: bytes.checkHealth, archive: async () => {},
+    });
+    const replica = createReplicaController(createFolderReplica(
+      encrypted, runtime.options.deviceCounterId, sha256));
+    await replica.scan();
+    runtime.settingsFolder = { id: descriptor.id, replica, close: async () => {
+      try { await bytes!.close(); } finally { crypto.folderKey.fill(0); }
+    } };
+    await reconcileOwnedRoster(runtime);
+  } catch (error) {
+    runtime.settingsFolder = undefined;
+    crypto.folderKey.fill(0);
+    await bytes?.close().catch(() => undefined);
+    throw error;
+  }
 };
 
 const openFolderStorage = async (
@@ -256,6 +317,7 @@ const openFolderRuntime = async (
 
 const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> => {
   if (runtime.vault.status().phase !== "unlocked") return;
+  await openPersonalSpaceFolder(runtime);
   runtime.registry ??= createFolderRegistry({
     ...runtime.configs,
     open: (folder) => openFolderRuntime(runtime, folder),
@@ -1000,19 +1062,45 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   profileSettings: () => runQueued(runtime, () => runtime.vault.profileSettings()),
   saveProfileSettings: (settings: Parameters<Vault["saveProfileSettings"]>[0]) =>
     runQueued(runtime, () => runtime.vault.saveProfileSettings(settings)),
+  personalSpaceChanges: () => runQueued(runtime, () => {
+    if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
+    return createPersonalSpaceSettingsJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id).load();
+  }),
+  appendPersonalSpaceChange: (change: PersonalSpaceChange) => runQueued(runtime, () => {
+    if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
+    return createPersonalSpaceSettingsJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id).append(change);
+  }),
   exportRecoveryBackup: (password: string) => runQueued(runtime, () => runtime.vault.exportRecoveryBackup(password)),
-  exportPairingTransfer: () => runQueued(runtime, () => runtime.vault.exportPairingTransfer()),
-  importPairingTransfer: (transfer: Parameters<Vault["importPairingTransfer"]>[0], password: string,
-    remember = true) => runQueued(runtime, () => unlockAfterVaultChange(runtime,
-      () => runtime.vault.importPairingTransfer(transfer, password, remember))),
+  exportPairingTransfer: (localSyncthingId: string, joiningDevice: OwnedSpaceDevice) => runQueued(runtime, async () => {
+    const transfer = await runtime.vault.exportPairingTransfer(localSyncthingId, joiningDevice);
+    await reconcileOwnedRoster(runtime);
+    return transfer;
+  }),
+  importPairingTransfer: (transfer: Parameters<Vault["importPairingTransfer"]>[0], identity: OwnedDeviceIdentity,
+    password: string, remember = true) => runQueued(runtime, () => unlockAfterVaultChange(runtime,
+      () => runtime.vault.importPairingTransfer(transfer, identity, password, remember))),
+  ownedDevices: () => runQueued(runtime, async () => {
+    const roster = await reconcileOwnedRoster(runtime);
+    return { localDeviceId: roster?.localDeviceId ?? null, devices: roster?.devices ?? [] };
+  }),
+  revokeOwnedDevice: (deviceId: string) => runQueued(runtime, async () => {
+    await runtime.vault.revokeOwnedDevice(deviceId);
+    await reconcileOwnedRoster(runtime);
+  }),
   restoreRecoveryBackup: (backup: Parameters<Vault["restoreRecoveryBackup"]>[0], recoveryPassword: string, password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.restoreRecoveryBackup(backup, recoveryPassword, password))),
   uiState: () => runQueued(runtime, () => runtime.vault.uiState()),
   saveUiState: (value: unknown) => runQueued(runtime, () => runtime.vault.saveUiState(value)),
   rememberFolder: (folder: { id: string; label: string }) =>
     runQueued(runtime, () => rememberFolderAction(runtime, folder)),
-  createVault: (password: string, remember = false) =>
-    runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.create(password, remember))),
+  createVault: (password: string, remember = false, localDeviceId?: string) => runQueued(runtime, async () => {
+    const status = await unlockAfterVaultChange(runtime, () => runtime.vault.create(password, remember));
+    if (localDeviceId) {
+      await runtime.vault.initializeOwnedDevice(localDeviceId);
+      await reconcileOwnedRoster(runtime);
+    }
+    return status;
+  }),
   unlock: (password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.unlock(password))),
   unlockRemembered: () =>
@@ -1030,12 +1118,16 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
   clearFolderContents: (folderId: string) => runQueued(runtime, () => clearFolderContentsAction(runtime, folderId)),
   sessionSharedFolders: (passwords: Record<string, string>) => runQueued(runtime, async () => {
     const registry = requireUnlockedRegistry(runtime);
+    const personalSpaceFolder = await runtime.vault.personalSpaceFolder();
+    if (personalSpaceFolder && runtime.settingsFolder?.id !== personalSpaceFolder.id) {
+      throw new Error("Personal-space settings storage is unavailable.");
+    }
     const settings = await runtime.vault.profileSettings();
     const selected = new Set(Object.entries(settings.folders)
       .filter(([, folder]) => !folder.paused &&
         folder.favorites.some(favorite => favorite.kind === "folder" && favorite.path === ""))
       .map(([folderId]) => folderId));
-    return registry.getState().filter(folder => folder.downloads && selected.has(folder.id)).map(folder => {
+    const documents = registry.getState().filter(folder => folder.downloads && selected.has(folder.id)).map(folder => {
       const replica = registry.getReplica(folder.id);
       if (!replica) throw new Error("Document folder is not open.");
       const password = passwords[folder.id]?.trim();
@@ -1048,6 +1140,10 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
           : { mode: "plaintext" as const },
       };
     });
+    return [...(personalSpaceFolder ? [{ id: personalSpaceFolder.id,
+      label: "Syncpeer personal-space settings", replica: runtime.settingsFolder!.replica,
+      internal: true, encryption: { mode: "encrypted" as const,
+        password: personalSpaceFolder.password } }] : []), ...documents];
   }),
   favoriteSyncState: (folderId: string) => runQueued(runtime, async () => {
     const { bytes, key } = favoriteStateTarget(runtime, folderId);

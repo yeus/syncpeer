@@ -7,6 +7,7 @@ import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { deriveUntrustedFolderCrypto } from "@syncpeer/core/filesystem";
 import { writeEncryptedRecord } from "../packages/core/dist/sync/encryptedRecord.js";
 import { resolveFolderPasswordsForDevice } from "../packages/core/dist/ui/sessionPasswords.js";
+import { createOwnedDeviceIdentity } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 test("headless sessions resolve peer-scoped folder passwords after restart", () => {
   const deviceId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -65,16 +66,19 @@ test("confirmed pairing transfer initializes the same personal space with a loca
   };
   const owner = createCredentialVault(makeStorage());
   await owner.create("owner-local-password", false);
-  const transfer = await owner.exportPairingTransfer();
+  const identity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "JOINED");
+  const joiningDevice = { id: identity.id, syncthingId: identity.syncthingId,
+    state: identity.state, signingKey: identity.signingKey };
+  const transfer = await owner.exportPairingTransfer("OWNER", joiningDevice);
   const joined = createCredentialVault(makeStorage());
-  await joined.importPairingTransfer(transfer, "joined-local-password", false);
-  assert.deepEqual(await joined.exportPairingTransfer(), transfer);
+  await joined.importPairingTransfer(transfer, identity, "joined-local-password", false);
+  assert.deepEqual((await joined.ownedRoster())?.devices, transfer.trust.updates.at(-1)?.devices);
   await joined.lock();
   await assert.rejects(joined.unlock("owner-local-password"));
   await joined.unlock("joined-local-password");
 
   const invalid = createCredentialVault(makeStorage());
-  await assert.rejects(invalid.importPairingTransfer({ ...transfer, rootKey: "00" }, "local-password", false),
+  await assert.rejects(invalid.importPairingTransfer({ ...transfer, rootKey: "00" }, identity, "local-password", false),
     /pairing transfer/i);
   assert.equal(invalid.status().phase, "uninitialized");
   await Promise.all([owner.close(), joined.close(), invalid.close()]);

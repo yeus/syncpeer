@@ -33,6 +33,14 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return documents.sessionSharedFolders(command.passwords as Record<string, string>);
     }
     case "profileSettings": return documents.profileSettings();
+    case "personalSpaceChanges": return documents.personalSpaceChanges();
+    case "appendPersonalSpaceChange": {
+      if (!command.change || typeof command.change !== "object" || Array.isArray(command.change)) {
+        throw new Error("Invalid personal-space change.");
+      }
+      return documents.appendPersonalSpaceChange(
+        command.change as Parameters<typeof documents.appendPersonalSpaceChange>[0]);
+    }
     case "loadDirectorySnapshot": return documents.loadDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
       command.path === "" ? "" : text("path"));
     case "saveDirectorySnapshot": {
@@ -58,14 +66,25 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return documents.mergeConnectionPasswords(command.passwords as Record<string, string>);
     }
     case "exportRecoveryBackup": return documents.exportRecoveryBackup(text("password"));
-    case "exportPairingTransfer": return documents.exportPairingTransfer();
+    case "ownedDevices": return documents.ownedDevices();
+    case "revokeOwnedDevice": return documents.revokeOwnedDevice(text("deviceId"));
+    case "exportPairingTransfer": {
+      if (!command.joiningDevice || typeof command.joiningDevice !== "object" || Array.isArray(command.joiningDevice)) {
+        throw new Error("Invalid joining device identity.");
+      }
+      return documents.exportPairingTransfer(text("localDeviceId"),
+        command.joiningDevice as Parameters<typeof documents.exportPairingTransfer>[1]);
+    }
     case "importPairingTransfer": {
       if (!command.transfer || typeof command.transfer !== "object" || Array.isArray(command.transfer) ||
         (command.remember !== undefined && typeof command.remember !== "boolean")) {
         throw new Error("Invalid personal-space pairing transfer.");
       }
+      if (!command.identity || typeof command.identity !== "object" || Array.isArray(command.identity)) {
+        throw new Error("Invalid local device identity.");
+      }
       return documents.importPairingTransfer(command.transfer as Parameters<typeof documents.importPairingTransfer>[0],
-        text("password"), command.remember !== false);
+        command.identity as Parameters<typeof documents.importPairingTransfer>[1], text("password"), command.remember !== false);
     }
     case "restoreRecoveryBackup": {
       if (!command.backup || typeof command.backup !== "object" || Array.isArray(command.backup)) {
@@ -139,7 +158,8 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     case "setSyncBaseline": return documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") });
     case "createVault": {
       if (command.remember !== undefined && typeof command.remember !== "boolean") throw new Error("Invalid remember setting.");
-      return documents.createVault(text("password"), command.remember === true);
+      return documents.createVault(text("password"), command.remember === true,
+        command.localDeviceId === undefined ? undefined : text("localDeviceId"));
     }
     case "unlock": return documents.unlock(text("password"));
     case "unlockRemembered": return documents.unlockRemembered();

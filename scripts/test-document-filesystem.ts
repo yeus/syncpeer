@@ -5,6 +5,7 @@ import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFil
 import { deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { scryptPasswordKdf, type PasswordKdf } from "../packages/core/dist/kdf.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
+import { createOwnedDeviceIdentity } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 test("first-run folder storage requires a recoverable master password and retains files across restarts", async () => {
   const { openStorage } = memoryDocumentStorage();
@@ -16,7 +17,11 @@ test("first-run folder storage requires a recoverable master password and retain
     } };
   let documents = createDocumentFilesystem(options);
   assert.equal((await documents.initialize()).vault.phase, "uninitialized");
-  await documents.createVault("synthetic-master-password", true);
+  await documents.createVault("synthetic-master-password", true, "FIRST-DEVICE");
+  const initialRoster = await documents.ownedDevices();
+  assert.equal(initialRoster.devices.length, 1);
+  assert.equal(initialRoster.devices[0].syncthingId, "FIRST-DEVICE");
+  assert.equal(initialRoster.localDeviceId, initialRoster.devices[0].id);
   assert.deepEqual(await documents.list("syncpeer-root"), []);
   await documents.rememberFolder({ id: "photos", label: "Photos" });
   const [photos] = await documents.list("syncpeer-root");
@@ -65,14 +70,19 @@ test("an injected password KDF port serves vault creation and unlock", async () 
   await documents.initialize();
   await documents.createVault("synthetic-master-password", false);
   await documents.close();
-  assert.deepEqual(calls, [{ password: "synthetic-master-password", saltLength: 16 }]);
+  assert.deepEqual(calls.map(call => ({ passwordLength: call.password.length, saltLength: call.saltLength })), [
+    { passwordLength: "synthetic-master-password".length, saltLength: 16 },
+    { passwordLength: 64, saltLength: 41 },
+  ]);
   const reopened = createDocumentFilesystem(options);
   assert.equal((await reopened.initialize()).vault.phase, "locked");
   await reopened.unlock("synthetic-master-password");
   await reopened.close();
-  assert.deepEqual(calls, [
-    { password: "synthetic-master-password", saltLength: 16 },
-    { password: "synthetic-master-password", saltLength: 16 },
+  assert.deepEqual(calls.map(call => ({ passwordLength: call.password.length, saltLength: call.saltLength })), [
+    { passwordLength: "synthetic-master-password".length, saltLength: 16 },
+    { passwordLength: 64, saltLength: 41 },
+    { passwordLength: "synthetic-master-password".length, saltLength: 16 },
+    { passwordLength: 64, saltLength: 41 },
   ]);
 });
 
@@ -330,11 +340,20 @@ test("backup commands restore portable credentials without device-local roots or
   const source = await makeDocuments();
   await source.initialize();
   await source.createVault("synthetic-master-password", false);
+  const [sourceSettings] = await source.sessionSharedFolders({});
+  assert.match(sourceSettings.id, /^[a-f0-9]{32}$/);
+  assert.equal(sourceSettings.encryption.mode, "encrypted");
+  assert.equal((sourceSettings.encryption as { password: string }).password.length, 64);
+  assert.deepEqual(await source.list("syncpeer-root"), [], "The settings folder is never user-visible");
   await source.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
   await source.saveConnectionPasswords({ photos: "synthetic-folder-password" });
   await source.saveUiState({ deviceLocal: "synthetic-private-device" });
   const backup = await dispatchDocumentCommand(source, { operation: "exportRecoveryBackup", password: "synthetic-backup-password" });
-  const pairingTransfer = await dispatchDocumentCommand(source, { operation: "exportPairingTransfer" });
+  const pairedIdentity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "PAIRED");
+  const joiningDevice = { id: pairedIdentity.id, syncthingId: pairedIdentity.syncthingId,
+    state: pairedIdentity.state, signingKey: pairedIdentity.signingKey };
+  const pairingTransfer = await dispatchDocumentCommand(source, { operation: "exportPairingTransfer",
+    localDeviceId: "SOURCE", joiningDevice });
   const target = await makeDocuments();
   await target.initialize();
   await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
@@ -349,10 +368,42 @@ test("backup commands restore portable credentials without device-local roots or
   const paired = await makeDocuments();
   await paired.initialize();
   await dispatchDocumentCommand(paired, { operation: "importPairingTransfer", transfer: pairingTransfer,
-    password: "paired-device-master", remember: false });
-  assert.deepEqual(await dispatchDocumentCommand(paired, { operation: "exportPairingTransfer" }), pairingTransfer);
+    identity: pairedIdentity, password: "paired-device-master", remember: false });
+  const [pairedSettings] = await paired.sessionSharedFolders({});
+  assert.equal(pairedSettings.id, sourceSettings.id);
+  assert.deepEqual(pairedSettings.encryption, sourceSettings.encryption);
+  assert.deepEqual(await paired.list("syncpeer-root"), [], "Pairing does not expose the settings folder");
+  assert.deepEqual((await dispatchDocumentCommand(paired, { operation: "ownedDevices" }) as { devices: unknown[] }).devices,
+    pairingTransfer.trust.updates.at(-1)?.devices);
   assert.deepEqual(await paired.connectionPasswords(), {}, "Pairing does not copy device-local credentials directly");
   await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
     recoveryPassword: "synthetic-backup-password", password: "new-synthetic-master" }), /already exists/);
   await source.close(); await target.close(); await paired.close();
+});
+
+test("personal-space settings replica survives restart and is revoked by lock", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  let remembered: string | null = null;
+  const options = { profileId: "settings-folder-fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024,
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => remembered,
+      save: async (value: string) => { remembered = value; }, remove: async () => { remembered = null; } } };
+  let documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", true);
+  const [settings] = await documents.sessionSharedFolders({});
+  const change = { id: "one", deviceId: "device-one", path: ["folders", "photos", "minimumCopies"],
+    parents: [], value: 2 };
+  await documents.appendPersonalSpaceChange(change);
+  await assert.rejects(documents.appendPersonalSpaceChange(change), /already exists|duplicate/i);
+  await documents.close();
+
+  documents = createDocumentFilesystem(options);
+  assert.equal((await documents.initialize()).vault.phase, "unlocked");
+  const [reopened] = await documents.sessionSharedFolders({});
+  assert.equal(reopened.id, settings.id);
+  assert.deepEqual(await documents.personalSpaceChanges(), [change]);
+  await documents.lock();
+  await assert.rejects(documents.sessionSharedFolders({}), /locked/i);
+  await documents.close();
 });

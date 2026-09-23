@@ -196,6 +196,8 @@ export interface SyncpeerConnectOptions {
 export type SharedFolder = {
   id: string;
   label?: string;
+  /** Participates in BEP but is omitted from the user-facing folder catalog. */
+  internal?: boolean;
 } & ({
   replica?: LocalFolderReplica;
   ciphertextReplica?: never;
@@ -959,7 +961,8 @@ class BepSession {
       if (folder.encryption.mode === "ciphertext") {
         if (!folder.ciphertextReplica || folder.replica) throw new Error("Ciphertext sharing requires exactly one ciphertext replica.");
         const identity = createCiphertextIndex({ folderId: id, passwordToken: folder.encryption.passwordToken }).identity;
-        this.sharedFolders.set(id, { id, label, ciphertextReplica: folder.ciphertextReplica,
+        this.sharedFolders.set(id, { id, label, internal: folder.internal === true,
+          ciphertextReplica: folder.ciphertextReplica,
           encryption: { mode: "ciphertext", passwordToken: identity.passwordToken } });
         continue;
       }
@@ -973,6 +976,7 @@ class BepSession {
         this.sharedFolders.set(id, {
           id,
           label,
+          internal: folder.internal === true,
           encryption: { mode: "encrypted", password },
           replica: folder.replica,
         });
@@ -980,6 +984,7 @@ class BepSession {
         this.sharedFolders.set(id, {
           id,
           label,
+          internal: folder.internal === true,
           encryption: { mode: "plaintext" },
           replica: folder.replica,
         });
@@ -2431,6 +2436,7 @@ class BepSession {
         this.publishDeletion(folderId, path, options),
       (folderId, path, source, options) =>
         this.publishFileFromSource(folderId, path, source, options),
+      new Set([...this.sharedFolders].filter(([, folder]) => folder.internal).map(([id]) => id)),
     );
   }
 

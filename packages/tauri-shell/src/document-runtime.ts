@@ -9,12 +9,14 @@ import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js"
 import { deriveUntrustedFolderCrypto } from "../../core/src/core/model/untrusted.js";
 import { createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDiskRange } from "../../core/src/sync/encryptedFilesystem.js";
 import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate,
-  type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket } from "../../core/src/client.js";
+  type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket,
+  type SyncpeerSessionHandle } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
 import { createConnectionLifecycle, type ConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
+import { resolveApprovedPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
 import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
@@ -124,6 +126,7 @@ async function startDocuments(android: AndroidRuntime) {
     command: (input: unknown) => dispatchDocumentCommand(documents, input),
     close: documents.close,
     connectionPasswords: documents.connectionPasswords,
+    ownedDevices: documents.ownedDevices,
     sessionSharedFolders: documents.sessionSharedFolders,
     rememberFolder: documents.rememberFolder,
     syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1], excludeFolderIds: readonly string[]) =>
@@ -147,19 +150,28 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
   const ensureIncomingService = async (options: ConnectOptions, coreOptions: SyncpeerConnectOptions) => {
     if (!coreOptions.expectedDeviceId) return null;
     const localDeviceId = await deviceIdFromCertificate(adapter, certificateDerFromPem(coreOptions.certPem));
-    const key = JSON.stringify([localDeviceId, coreOptions.expectedDeviceId,
+    const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
+    const approvedDeviceIds = resolveApprovedPeerDeviceIds(coreOptions.expectedDeviceId, trustedDevices);
+    if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
+    const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem]);
-    if (incomingService && incomingServiceKey === key) return incomingService;
-    await stopIncomingService();
     const remoteDeviceId = coreOptions.expectedDeviceId;
-    incomingService = await startIncomingPeerService(adapter, {
-      host: "0.0.0.0", port: 22000, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
-      localDeviceId, approvedDeviceIds: [remoteDeviceId],
-      connectionOptions: (_remote, endpoint) => ({ ...coreOptions, ...endpoint }),
-      onSession: session => {
+    const sessionHandlers = {
+      connectionOptions: (remote: string, endpoint: { host: string; port: number }) =>
+        ({ ...coreOptions, ...endpoint, expectedDeviceId: remote }),
+      onSession: (session: SyncpeerSessionHandle) => {
         if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(options, session);
       },
+    };
+    if (incomingService && incomingServiceKey === key) {
+      incomingService.updateSessionHandlers(sessionHandlers);
+      return incomingService;
+    }
+    await stopIncomingService();
+    incomingService = await startIncomingPeerService(adapter, {
+      host: "0.0.0.0", port: 22000, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      localDeviceId, approvedDeviceIds, ...sessionHandlers,
       onError: error => adapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
       }),
@@ -178,6 +190,10 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         // unlock it later before requesting a favorite download.
       }
       if (!options.cert || !options.key) throw new Error("Background session is missing the resolved identity.");
+      const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
+      if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices).includes(options.remoteId)) {
+        throw new Error("This peer was removed from the trusted device list.");
+      }
       const folderPasswords = {
         ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
         ...options.folderPasswords,

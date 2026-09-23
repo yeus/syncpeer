@@ -3,6 +3,7 @@
   import { defaultFolderSettings, type PairingInvitation, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import type { createDocumentFilesystem } from "@syncpeer/core/filesystem";
   let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved,
+    onTrustedDevicesChanged, getDefaultDeviceId,
     onImport, onStartPairing, onJoinPairing, onPairedDevice, peerId, peerFolders, biometric, command }: {
     onBack: () => void;
     onImport: (peerId: string, folderId: string, password: string) => Promise<void>;
@@ -14,6 +15,8 @@
     onRotateMasterPassword: (password: string) => Promise<void>;
     onMigrate: (folderId: string, target: "encrypted" | "plaintext") => Promise<void>;
     onSettingsSaved: (settings: SyncpeerProfileSettings) => void;
+    onTrustedDevicesChanged: () => Promise<void>;
+    getDefaultDeviceId: () => Promise<string>;
     onStartPairing: (advertisedHost: string) => Promise<{ invitation: PairingInvitation;
       completed: Promise<{ remoteDeviceId: string }>; cancel: () => Promise<void> }>;
     onJoinPairing: (invitation: PairingInvitation, password: string, remember: boolean) => Promise<{ remoteDeviceId: string }>;
@@ -34,6 +37,8 @@
   let importFolderId = $state(""), importPassword = $state(""), importApproved = $state(false);
   let recoveryPassword = $state(""), backupText = $state(""), backupFile = $state<File | null>(null);
   let pairingHost = $state(""), pairingInvitation = $state(""), pairingMessage = $state("");
+  let trustedDevices = $state<Array<{ id: string; syncthingId: string; state: "active" | "revoked" }>>([]);
+  let localTrustedDeviceId = $state<string | null>(null);
   let pairingHandle: Awaited<ReturnType<typeof onStartPairing>> | null = null;
 
   async function inviteDevice() {
@@ -48,6 +53,7 @@
         onPairedDevice(remoteDeviceId);
         pairingMessage = "Device paired and approved.";
         pairingInvitation = ""; pairingHandle = null;
+        void refresh();
       }).catch(failure => {
         error = failure instanceof Error ? failure.message : "Pairing failed.";
         pairingHandle = null;
@@ -100,7 +106,21 @@
       settings = await command<SyncpeerProfileSettings>({ operation: "profileSettings" });
       patternDrafts = Object.fromEntries(Object.entries(settings.folders)
         .map(([folderId, folder]) => [folderId, folder.ignorePatterns.join("\n")]));
+      const roster = await command<{ localDeviceId: string | null; devices: typeof trustedDevices }>
+        ({ operation: "ownedDevices" });
+      trustedDevices = roster.devices;
+      localTrustedDeviceId = roster.localDeviceId;
     }
+  }
+  async function revokeDevice(deviceId: string) {
+    busy = true; error = "";
+    try {
+      await command({ operation: "revokeOwnedDevice", deviceId });
+      await onTrustedDevicesChanged();
+      await refresh();
+    }
+    catch (failure) { error = failure instanceof Error ? failure.message : "The trusted device could not be removed."; }
+    finally { busy = false; }
   }
   async function saveSettings(next: SyncpeerProfileSettings) {
     busy = true; error = "";
@@ -137,7 +157,8 @@
     if (!masterPassword || (generatedPassword && !generatedSaved)) return;
     busy = true; error = "";
     try {
-      await command({ operation: "createVault", password: masterPassword, remember: rememberMaster });
+      await command({ operation: "createVault", password: masterPassword, remember: rememberMaster,
+        localDeviceId: await getDefaultDeviceId() });
       generatedPassword = ""; generatedSaved = false; masterPassword = "";
       await onUnlock(); await refresh();
     } catch { error = "The encrypted profile could not be created."; }
@@ -236,6 +257,22 @@
       {/if}
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
     </section>
+    {#if trustedDevices.length}
+      <section>
+        <h2>Trusted devices</h2>
+        <p>Each device has its own permanent signing key. Removing a device blocks future trusted-list updates and synchronization after peers receive the revocation.</p>
+        <ul>
+          {#each trustedDevices as device (device.id)}
+            <li>
+              <code>{device.syncthingId}</code> — {device.id === localTrustedDeviceId ? "this device" : device.state}
+              {#if device.state === "active" && device.id !== localTrustedDeviceId}
+                <button disabled={busy} onclick={() => void revokeDevice(device.id)}>Remove device</button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
     <section>
       <h2>Register or recover an encrypted peer folder</h2>
       <p>Connect to the peer first. Registration keeps the root browsable; only favorites download automatically. Recover a saved folder password from your personal-space backup, or enter and approve it here.</p>

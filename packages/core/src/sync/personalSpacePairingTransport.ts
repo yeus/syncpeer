@@ -58,7 +58,7 @@ export async function acceptPairingTransfer(options: {
   socket: SyncpeerTlsSocket;
   invitation: { privateKey: CryptoKey; invitation: PairingInvitation };
   verifiedRemoteId: string;
-  transfer: PersonalSpacePairingTransfer;
+  createTransfer: (device: PairingRequest["device"]) => Promise<PersonalSpacePairingTransfer>;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
   confirm: (confirmationCode: string) => boolean | Promise<boolean>;
 }) {
@@ -70,7 +70,8 @@ export async function acceptPairingTransfer(options: {
   await writeMessage(options.socket, { format: 1, kind: "confirmation", accepted });
   const remoteAccepted = requireKind(await read(), "confirmation").accepted;
   if (!accepted || !remoteAccepted) throw new Error("Pairing confirmation was rejected.");
-  const transfer = await sealPairingTransfer(options.subtle, session, options.randomBytes, options.transfer);
+  const transfer = await sealPairingTransfer(options.subtle, session, options.randomBytes,
+    await options.createTransfer(request.device));
   await writeMessage(options.socket, { format: 1, kind: "transfer", transfer });
   return { remoteDeviceId: request.deviceId, confirmationCode: session.confirmationCode };
 }
@@ -96,5 +97,5 @@ export async function joinPersonalSpace(options: {
   if (!accepted || !remoteAccepted) throw new Error("Pairing confirmation was rejected.");
   const transfer = requireKind(await read(), "transfer").transfer;
   return { transfer: await openPairingTransfer(options.subtle, session, transfer),
-    confirmationCode: session.confirmationCode };
+    deviceIdentity: created.deviceIdentity, confirmationCode: session.confirmationCode };
 }

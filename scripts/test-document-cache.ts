@@ -173,15 +173,19 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   const sharedFolders = await cache.platformAdapter.sessionSharedFolders!({
     photos: "synthetic-remote-password",
   });
+  const settingsFolderId = sharedFolders[0].id;
+  assert.match(settingsFolderId, /^[a-f0-9]{32}$/);
   assert.deepEqual(sharedFolders.map(folder => ({ id: folder.id, mode: folder.encryption.mode })), [
+    { id: settingsFolderId, mode: "encrypted" },
     { id: "photos", mode: "encrypted" },
   ]);
-  assert.equal(typeof sharedFolders[0].replica?.scan, "function");
+  assert.equal(sharedFolders.every(folder => typeof folder.replica?.scan === "function"), true);
   await assert.rejects(cache.connectFolder({ id: "photos", label: "Photos", password: "different-password" }), /migration/i);
   await cache.syncFolders([{ id: "music", label: "Music", readOnly: false }], {});
   assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!({
     photos: "synthetic-remote-password",
-  })).map(folder => folder.id), ["photos"], "Only whole-folder favorites are advertised as replicas");
+  })).map(folder => folder.id), [settingsFolderId, "photos"],
+  "The hidden settings folder and whole-folder favorites are advertised as replicas");
   assert.deepEqual(await cache.platformAdapter.listFavorites!(), [legacyFavorite]);
   assert.deepEqual(legacyFavorites, [], "Legacy plaintext favorite settings are removed after encrypted migration");
   const favorite = legacyFavorite;

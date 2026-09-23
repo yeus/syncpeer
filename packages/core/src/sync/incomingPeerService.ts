@@ -24,6 +24,7 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
     activeSessions: () => PeerSessionCandidate<SyncpeerSessionHandle>[];
     admitOutgoing: (remoteDeviceId: string, connectionId: string,
       session: SyncpeerSessionHandle) => Promise<boolean>;
+    updateSessionHandlers: (handlers: Pick<IncomingPeerServiceOptions, "connectionOptions" | "onSession">) => void;
     close: () => Promise<void> }> {
   if (!adapter.listenTls) throw new Error("This platform does not provide a TLS listener.");
   const approved = new Map(options.approvedDeviceIds.map(id => [canonicalId(id), id]));
@@ -33,6 +34,8 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
   }
   const manager = createPeerSessionManager<SyncpeerSessionHandle>(options.localDeviceId);
   const pending = new Set<Promise<void>>();
+  const pendingSockets = new Set<SyncpeerAcceptedTlsSocket["socket"]>();
+  let sessionHandlers: Pick<IncomingPeerServiceOptions, "connectionOptions" | "onSession"> = options;
   const listener = await adapter.listenTls({ host: options.host, port: options.port ?? 22000,
     certPem: options.certPem, keyPem: options.keyPem,
     alpnProtocols: options.onPairingSocket ? ["bep/1.0", "syncpeer-pairing/1"] : ["bep/1.0"],
@@ -40,7 +43,9 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
   let stopping = false;
 
   const handle = (accepted: Awaited<ReturnType<typeof listener.accept>>) => {
+    pendingSockets.add(accepted.socket);
     const task = (async () => {
+      if (stopping) { await accepted.socket.close(); return; }
       const remoteDeviceId = canonicalId(await deviceIdFromCertificate(adapter,
         await accepted.socket.peerCertificateDer()));
       if (accepted.alpn === "syncpeer-pairing/1" && options.onPairingSocket) {
@@ -54,19 +59,20 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
       const approvedDeviceId = approved.get(remoteDeviceId);
       if (!approvedDeviceId) throw new Error(`Incoming peer device ID mismatch: ${remoteDeviceId} is not approved.`);
       const endpoint = { host: accepted.remoteAddress || options.host, port: accepted.remotePort };
-      const sessionOptions = options.connectionOptions(approvedDeviceId, endpoint);
+      const handlers = sessionHandlers;
+      const sessionOptions = handlers.connectionOptions(approvedDeviceId, endpoint);
       const session = await acceptSyncpeerSession(adapter, accepted.socket,
         { ...sessionOptions, ...endpoint, expectedDeviceId: approvedDeviceId });
       const connectionId = `${endpoint.host}:${endpoint.port}`;
       if (await manager.admit({ remoteDeviceId, direction: "incoming", connectionId, session })) {
-        options.onSession(session, remoteDeviceId);
+        handlers.onSession(session, remoteDeviceId);
       }
     })().catch(error => {
       void accepted.socket.close().catch(() => undefined);
       options.onError?.(error);
     });
     pending.add(task);
-    void task.finally(() => pending.delete(task));
+    void task.finally(() => { pending.delete(task); pendingSockets.delete(accepted.socket); });
   };
   const acceptLoop = (async () => {
     while (!stopping) {
@@ -79,10 +85,12 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
   })();
 
   return { port: listener.port, activeSessions: manager.active,
+    updateSessionHandlers: handlers => { sessionHandlers = handlers; },
     admitOutgoing: (remoteDeviceId, connectionId, session) =>
       manager.admit({ remoteDeviceId, direction: "outgoing", connectionId, session }),
     close: async () => {
       stopping = true;
+      await Promise.allSettled([...pendingSockets].map(socket => socket.close()));
       await listener.close();
       await acceptLoop;
       await Promise.allSettled(pending);

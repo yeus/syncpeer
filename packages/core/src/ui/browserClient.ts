@@ -24,6 +24,8 @@ import type { SyncpeerProfileSettings } from "../sync/profileSettings.js";
 import { acceptPairingTransfer, joinPersonalSpace } from "../sync/personalSpacePairingTransport.js";
 import { createPairingInvitation, type PairingInvitation,
   type PersonalSpacePairingTransfer } from "../sync/personalSpacePairing.js";
+import { resolveApprovedPeerDeviceIds,
+  type OwnedDeviceIdentity, type OwnedSpaceDevice } from "../sync/personalSpaceSharing.js";
 
 export interface ConnectOptions {
   host: string;
@@ -205,9 +207,11 @@ export interface SyncpeerPlatformAdapter {
   removeFavorite?: (key: string) => Promise<FavoriteRecord[]>;
   loadProfileSettings?: () => Promise<SyncpeerProfileSettings>;
   saveProfileSettings?: (settings: SyncpeerProfileSettings) => Promise<void>;
-  exportPairingTransfer?: () => Promise<PersonalSpacePairingTransfer>;
-  importPairingTransfer?: (transfer: PersonalSpacePairingTransfer, password: string,
-    remember: boolean) => Promise<void>;
+  exportPairingTransfer?: (localDeviceId: string, joiningDevice: OwnedSpaceDevice) => Promise<PersonalSpacePairingTransfer>;
+  importPairingTransfer?: (transfer: PersonalSpacePairingTransfer, identity: OwnedDeviceIdentity,
+    password: string, remember: boolean) => Promise<void>;
+  ownedDevices?: () => Promise<OwnedSpaceDevice[]>;
+  revokeOwnedDevice?: (deviceId: string) => Promise<void>;
   /** Folders currently owned by the encrypted document store and safe to advertise over BEP. */
   sessionSharedFolders?: (folderPasswords: Record<string, string>) => Promise<SharedFolder[]>;
   loadDirectorySnapshot?: (folderId: string, sourceDeviceId: string, path: string) => Promise<{
@@ -604,20 +608,16 @@ export const createSyncpeerBrowserClient = (
     if (!coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
     const localDeviceId = await deviceIdFromCertificate(coreAdapter,
       certificateDerFromPem(coreOptions.certPem));
-    const key = JSON.stringify([localDeviceId, coreOptions.expectedDeviceId,
+    const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
+    const approvedDeviceIds = resolveApprovedPeerDeviceIds(coreOptions.expectedDeviceId, trustedDevices);
+    if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
+    const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem]);
-    if (incomingService && incomingServiceKey === key) return incomingService;
-    await stopIncomingService();
     const remoteDeviceId = coreOptions.expectedDeviceId;
-    incomingService = await startIncomingPeerService(coreAdapter, {
-      host: "0.0.0.0",
-      port: 22000,
-      certPem: coreOptions.certPem,
-      keyPem: coreOptions.keyPem,
-      localDeviceId,
-      approvedDeviceIds: [remoteDeviceId],
-      connectionOptions: (_remote, endpoint) => ({ ...coreOptions, ...endpoint }),
-      onSession: (session) => {
+    const sessionHandlers = {
+      connectionOptions: (remote: string, endpoint: { host: string; port: number }) =>
+        ({ ...coreOptions, ...endpoint, expectedDeviceId: remote }),
+      onSession: (session: SyncpeerSessionHandle) => {
         if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(connectOptions, session).then(adopted => {
           if (!adopted) return;
@@ -634,6 +634,15 @@ export const createSyncpeerBrowserClient = (
           });
         });
       },
+    };
+    if (incomingService && incomingServiceKey === key) {
+      incomingService.updateSessionHandlers(sessionHandlers);
+      return incomingService;
+    }
+    await stopIncomingService();
+    incomingService = await startIncomingPeerService(coreAdapter, {
+      host: "0.0.0.0", port: 22000, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      localDeviceId, approvedDeviceIds, ...sessionHandlers,
       onError: error => coreAdapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
       }),
@@ -647,6 +656,9 @@ export const createSyncpeerBrowserClient = (
     signal: AbortSignal,
   ): Promise<SyncpeerSessionHandle> => {
     const normalized = normalizeConnectOptions(connectOptions);
+    const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
+    if (normalized.remoteId && !resolveApprovedPeerDeviceIds(normalized.remoteId, trustedDevices)
+      .includes(normalized.remoteId)) throw new Error("This peer was removed from the trusted device list.");
     let certPem: string | null = null;
     let keyPem: string | null = null;
     let defaultIdentityError: string | null = null;
@@ -778,6 +790,8 @@ export const createSyncpeerBrowserClient = (
     startPairingInvitation: async pairingOptions => {
       if (!coreAdapter.listenTls) throw new Error("This platform cannot accept LAN pairing connections.");
       if (!platformAdapter.exportPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
+      // Validate before opening a listener; port zero is resolved after binding.
+      advertisedPairingEndpoint(pairingOptions.advertisedHost, pairingOptions.port || 22000);
       const identity = await identityForPairing();
       activeConnectOptions = null;
       activeResolvedConnectOptions = null;
@@ -786,6 +800,7 @@ export const createSyncpeerBrowserClient = (
       await stopIncomingService();
       const completion = deferred<{ remoteDeviceId: string }>();
       const invitationReady = deferred<Awaited<ReturnType<typeof createPairingInvitation>>>();
+      void invitationReady.promise.catch(() => undefined);
       let settled = false;
       incomingService = await startIncomingPeerService(coreAdapter, {
         host: "0.0.0.0", port: pairingOptions.port ?? 22000, certPem: identity.certPem,
@@ -798,7 +813,8 @@ export const createSyncpeerBrowserClient = (
             const invitationRecord = await invitationReady.promise;
             const result = await acceptPairingTransfer({ subtle: crypto.subtle, socket: accepted.socket,
               invitation: invitationRecord, verifiedRemoteId: remoteDeviceId,
-              transfer: await platformAdapter.exportPairingTransfer!(), randomBytes: coreAdapter.randomBytes,
+              createTransfer: joiningDevice => platformAdapter.exportPairingTransfer!(identity.deviceId, joiningDevice),
+              randomBytes: coreAdapter.randomBytes,
               confirm: pairingOptions.confirm });
             settled = true; completion.resolve({ remoteDeviceId: result.remoteDeviceId });
             setTimeout(() => { void stopIncomingService(); }, 0);
@@ -808,12 +824,21 @@ export const createSyncpeerBrowserClient = (
         },
       });
       incomingServiceKey = "pairing";
-      const advertisedEndpoint = advertisedPairingEndpoint(pairingOptions.advertisedHost,
-        incomingService.port);
-      const invitationRecord = await createPairingInvitation(crypto.subtle, coreAdapter.randomBytes,
-        identity.deviceId, advertisedEndpoint,
-        Date.now() + (pairingOptions.expiresInMs ?? 5 * 60_000));
-      invitationReady.resolve(invitationRecord);
+      let invitationRecord: Awaited<ReturnType<typeof createPairingInvitation>>;
+      try {
+        const advertisedEndpoint = advertisedPairingEndpoint(pairingOptions.advertisedHost,
+          incomingService.port);
+        invitationRecord = await createPairingInvitation(crypto.subtle, coreAdapter.randomBytes,
+          identity.deviceId, advertisedEndpoint,
+          Date.now() + (pairingOptions.expiresInMs ?? 5 * 60_000));
+        invitationReady.resolve(invitationRecord);
+      } catch (error) {
+        settled = true;
+        invitationReady.reject(error);
+        void completion.promise.catch(() => undefined);
+        await stopIncomingService();
+        throw error;
+      }
       const timer = setTimeout(() => {
         if (!settled) { settled = true; completion.reject(new Error("Pairing invitation expired.")); }
         void stopIncomingService();
@@ -836,7 +861,7 @@ export const createSyncpeerBrowserClient = (
         const joined = await joinPersonalSpace({ subtle: crypto.subtle, socket,
           invitation: pairingOptions.invitation, localDeviceId: identity.deviceId,
           verifiedRemoteId, randomBytes: coreAdapter.randomBytes, confirm: pairingOptions.confirm });
-        await platformAdapter.importPairingTransfer(joined.transfer, pairingOptions.password,
+        await platformAdapter.importPairingTransfer(joined.transfer, joined.deviceIdentity, pairingOptions.password,
           pairingOptions.remember);
         return { remoteDeviceId: verifiedRemoteId };
       } finally { await socket.close().catch(() => undefined); }

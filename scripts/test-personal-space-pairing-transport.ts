@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 import { createPairingInvitation } from "../packages/core/dist/sync/personalSpacePairing.js";
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signOwnedRosterUpdate } from
+  "../packages/core/dist/sync/personalSpaceSharing.js";
 import { acceptPairingTransfer, joinPersonalSpace } from
   "../packages/core/dist/sync/personalSpacePairingTransport.js";
 
@@ -35,15 +37,24 @@ const socketPair = () => {
   return [socket(0), socket(1)] as const;
 };
 
+const pairingTransfer = async () => {
+  const owner = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "OWNER");
+  const genesis = await signOwnedRosterUpdate(crypto.subtle,
+    await openOwnedDeviceSigningKey(crypto.subtle, owner), { sequence: 1, previous: null, signer: owner.id,
+      devices: [{ id: owner.id, syncthingId: owner.syncthingId, state: owner.state, signingKey: owner.signingKey }] });
+  return { spaceId: "a".repeat(32), settingsFolderId: "b".repeat(32), rootKey: "c".repeat(64),
+    trust: { genesisKey: owner.signingKey, knownHead: genesis.hash, updates: [genesis] } };
+};
+
 test("pairing transport confirms the same code before transferring personal-space secrets", async () => {
   const invitation = await createPairingInvitation(crypto.subtle, randomBytes, "OWNER", "127.0.0.1:22000",
     Date.now() + 60_000);
   const [ownerSocket, newSocket] = socketPair();
   const codes: string[] = [];
-  const transfer = { spaceId: "a".repeat(32), settingsFolderId: "b".repeat(32), rootKey: "c".repeat(64) };
+  const transfer = await pairingTransfer();
   const [accepted, joined] = await Promise.all([
     acceptPairingTransfer({ subtle: crypto.subtle, socket: ownerSocket, invitation,
-      verifiedRemoteId: "NEW", transfer, randomBytes,
+      verifiedRemoteId: "NEW", createTransfer: async () => transfer, randomBytes,
       confirm: async code => { codes.push(`owner:${code}`); return true; } }),
     joinPersonalSpace({ subtle: crypto.subtle, socket: newSocket, invitation: invitation.invitation,
       localDeviceId: "NEW", verifiedRemoteId: "OWNER", randomBytes,
@@ -58,13 +69,15 @@ test("either device rejecting the displayed code prevents secret transfer", asyn
   const invitation = await createPairingInvitation(crypto.subtle, randomBytes, "OWNER", "127.0.0.1:22000",
     Date.now() + 60_000);
   const [ownerSocket, newSocket] = socketPair();
+  const transfer = await pairingTransfer();
+  let transferCreated = false;
   const outcomes = await Promise.allSettled([
     acceptPairingTransfer({ subtle: crypto.subtle, socket: ownerSocket, invitation,
-      verifiedRemoteId: "NEW", transfer: {
-        spaceId: "a".repeat(32), settingsFolderId: "b".repeat(32), rootKey: "c".repeat(64),
-      }, randomBytes, confirm: async () => true }),
+      verifiedRemoteId: "NEW", createTransfer: async () => { transferCreated = true; return transfer; },
+      randomBytes, confirm: async () => true }),
     joinPersonalSpace({ subtle: crypto.subtle, socket: newSocket, invitation: invitation.invitation,
       localDeviceId: "NEW", verifiedRemoteId: "OWNER", randomBytes, confirm: async () => false }),
   ]);
   assert.ok(outcomes.every(outcome => outcome.status === "rejected"));
+  assert.equal(transferCreated, false);
 });

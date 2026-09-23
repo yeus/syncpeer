@@ -791,6 +791,8 @@
       confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}
     onJoinPairing={(invitation, password, remember) => client.joinPairingInvitation({ invitation, password, remember,
       confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}
+    onTrustedDevicesChanged={() => client.disconnect()}
+    getDefaultDeviceId={() => client.getDefaultDeviceId()}
     onPairedDevice={deviceId => {
       app.devices.newSavedDeviceId = deviceId;
       app.devices.newSavedDeviceCustomName = "Paired Syncpeer device";

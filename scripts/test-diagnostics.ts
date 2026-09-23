@@ -81,7 +81,7 @@ const main = async (): Promise<void> => {
     {
       name: "Syncpeer peer TLS interoperability",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-peer-session-manager.ts", "scripts/test-syncpeer-peers.ts"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-peer-session-manager.ts", "scripts/test-incoming-peer-service.ts", "scripts/test-android-peer-targets.ts", "scripts/test-syncpeer-peers.ts"],
     },
     {
       name: "Durable folder replica indexes",

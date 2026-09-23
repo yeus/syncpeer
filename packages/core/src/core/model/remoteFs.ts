@@ -315,6 +315,7 @@ export class RemoteFs {
   private requestFolderIndexUpdate: (folderId: string) => Promise<void>;
   private setFocusedFolderId: (folderId: string | null) => void;
   private hashBytes?: (bytes: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+  private internalFolderIds: ReadonlySet<string>;
 
   constructor(
     folders: Map<string, FolderState>,
@@ -353,6 +354,7 @@ export class RemoteFs {
       source: FileUploadSource,
       options?: FileUploadOptions,
     ) => Promise<void>,
+    internalFolderIds: ReadonlySet<string> = new Set(),
   ) {
     this.folders = folders;
     this.requestBlock = requestBlock;
@@ -365,6 +367,7 @@ export class RemoteFs {
     this.requestFolderIndexUpdate = requestFolderIndexUpdate;
     this.setFocusedFolderId = setFocusedFolderId;
     this.hashBytes = hashBytes;
+    this.internalFolderIds = internalFolderIds;
   }
 
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
@@ -372,7 +375,7 @@ export class RemoteFs {
   }
 
   async listFolders(): Promise<FolderInfo[]> {
-    return [...this.folders.values()].map((f) => ({
+    return [...this.folders.values()].filter(f => !this.internalFolderIds.has(f.id)).map((f) => ({
       id: f.id,
       label: f.label,
       readOnly: f.readOnly,
@@ -387,7 +390,7 @@ export class RemoteFs {
   }
 
   async listFolderSyncStates(): Promise<FolderSyncState[]> {
-    return [...this.folders.values()].map((f) => ({
+    return [...this.folders.values()].filter(f => !this.internalFolderIds.has(f.id)).map((f) => ({
       folderId: f.id,
       remoteIndexId: String(f.remoteIndexId ?? "0"),
       remoteMaxSequence: String(f.remoteMaxSequence ?? "0"),

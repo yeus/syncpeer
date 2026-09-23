@@ -7,6 +7,7 @@ import type { FolderRegistration } from "./folderRegistry.js";
 import { assertReplicaPath } from "./replicaPaths.js";
 import type { FolderInfo } from "../core/model/remoteFs.js";
 import { defaultFolderSettings, defaultProfileSettings, type SyncpeerProfileSettings } from "./profileSettings.js";
+import type { OwnedSpaceDevice } from "./personalSpaceSharing.js";
 
 /** Route prepared folders to the service owner, never mirror two writable copies.
  * Migration changes ownership only after bytes and cleanup have been verified.
@@ -232,10 +233,13 @@ export function createDocumentCache(options: {
     await options.show(documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
   };
   const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
-    exportPairingTransfer: () => request({ operation: "exportPairingTransfer" }),
-    importPairingTransfer: async (transfer, password, remember) => {
-      await request({ operation: "importPairingTransfer", transfer, password, remember });
+    exportPairingTransfer: (localDeviceId, joiningDevice) => request({ operation: "exportPairingTransfer",
+      localDeviceId, joiningDevice }),
+    importPairingTransfer: async (transfer, identity, password, remember) => {
+      await request({ operation: "importPairingTransfer", transfer, identity, password, remember });
     },
+    ownedDevices: async () => (await request<{ devices: OwnedSpaceDevice[] }>({ operation: "ownedDevices" })).devices,
+    revokeOwnedDevice: deviceId => request({ operation: "revokeOwnedDevice", deviceId }),
     sessionSharedFolders: async passwords => {
       if (!options.enabled() || (await cacheStatus()).vault.phase !== "unlocked") return [];
       return request({ operation: "sessionSharedFolders", passwords });

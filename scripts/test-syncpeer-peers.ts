@@ -12,6 +12,7 @@ import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
 import { createNodeSyncpeerClient, createNodeHostAdapter, createNodeFolderSyncStorage, listenNodePeer,
   listenNodePeers } from "../packages/core/dist/node.js";
 import { createSyncpeerCoreClient } from "../packages/core/dist/client.js";
+import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
 import { startIncomingPeerService } from "../packages/core/dist/sync/incomingPeerService.js";
 import { ClusterConfig, FrameParser, MessageTypeValues, encodeMessageFrame, type BepIndex, type BepClusterConfig } from "../packages/core/dist/core/protocol/bep.js";
 import type { SyncpeerSessionHandle } from "../packages/core/src/client.ts";
@@ -19,8 +20,8 @@ import { createNodeFolderReplica } from "../packages/core/dist/sync/nodeReplica.
 import { randomBytes } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createCiphertextReplica, deriveUntrustedFolderCrypto, writeEncryptedDiskFile,
-  loadCiphertextDiskMetadata, readCiphertextBlock } from "@syncpeer/core/filesystem";
-import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
+  loadCiphertextDiskMetadata, readCiphertextBlock, createOwnedDeviceIdentity } from "@syncpeer/core/filesystem";
+import { memoryDocumentStorage, memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 
 async function createTestPeerIdentity(root: string, name: string) {
   const cert = path.join(root, `${name}.pem`);
@@ -30,6 +31,71 @@ async function createTestPeerIdentity(root: string, name: string) {
   const certPem = await readFile(cert, "utf8");
   return { certPem, keyPem: await readFile(key, "utf8"), deviceId: computeDeviceId(new X509Certificate(certPem).raw) };
 }
+
+test("paired peers synchronize the encrypted settings replica without exposing it as a document folder",
+  { timeout: 15000 }, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-settings-peer-"));
+    const makeDocuments = async (profileId: string) => {
+      const { openStorage } = memoryDocumentStorage();
+      return createDocumentFilesystem({ profileId, deviceCounterId: profileId === "a" ? "1" : "2",
+        openStorage, profile: await openStorage("profile"), randomBytes,
+        availableBytes: async () => 1024 * 1024 * 1024,
+        rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
+          save: async () => {}, remove: async () => {} } });
+    };
+    const source = await makeDocuments("a"), target = await makeDocuments("b");
+    let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
+    let outgoing: SyncpeerSessionHandle | undefined, incoming: SyncpeerSessionHandle | undefined;
+    try {
+      await source.initialize(); await target.initialize();
+      await source.createVault("synthetic-settings-master", false);
+      const targetIdentity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "TARGET");
+      const targetDevice = { id: targetIdentity.id, syncthingId: targetIdentity.syncthingId,
+        state: targetIdentity.state, signingKey: targetIdentity.signingKey };
+      await target.importPairingTransfer(await source.exportPairingTransfer("SOURCE", targetDevice),
+        targetIdentity, "synthetic-target-master", false);
+      const [sourceFolder] = await source.sessionSharedFolders({});
+      const [targetFolder] = await target.sessionSharedFolders({});
+      assert.equal(sourceFolder.internal, true); assert.equal(targetFolder.id, sourceFolder.id);
+      const change = { id: "change-one", deviceId: "device-a",
+        path: ["folders", "photos", "minimumCopies"], parents: [], value: 2 };
+      await source.appendPersonalSpaceChange(change);
+      const [a, b] = await Promise.all([createTestPeerIdentity(root, "a"), createTestPeerIdentity(root, "b")]);
+      const accepted = Promise.withResolvers<SyncpeerSessionHandle>();
+      listener = await listenNodePeer({ ...a, host: "127.0.0.1", port: 0,
+        expectedDeviceId: b.deviceId, sharedFolders: [sourceFolder], timeoutMs: 3000,
+        replicaScanIntervalMs: 100, onSession: session => accepted.resolve(session) });
+      outgoing = await createSyncpeerCoreClient(createNodeHostAdapter()).openSession({ ...b,
+        host: "127.0.0.1", port: listener.port,
+        expectedDeviceId: a.deviceId, deviceName: "settings-target", discoveryMode: "direct",
+        timeoutMs: 3000, replicaScanIntervalMs: 100, sharedFolders: [targetFolder] });
+      incoming = await accepted.promise;
+      assert.deepEqual(await outgoing.remoteFs.listFolders(), []);
+      assert.deepEqual(await incoming.remoteFs.listFolders(), []);
+      const deadline = Date.now() + 3000;
+      let received = false;
+      while (!received) {
+        received = (await target.personalSpaceChanges()).some(item => item.id === change.id);
+        assert.ok(Date.now() < deadline, "Hidden settings replica did not converge");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.deepEqual(await target.personalSpaceChanges(), [change]);
+      await source.revokeOwnedDevice(targetIdentity.id);
+      let revoked = false;
+      while (!revoked) {
+        revoked = (await target.ownedDevices()).devices.some(device =>
+          device.id === targetIdentity.id && device.state === "revoked");
+        assert.ok(Date.now() < deadline + 3000, "Trusted-device revocation did not converge");
+        if (!revoked) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      await assert.rejects(target.exportPairingTransfer("TARGET", {
+        id: "third-device", syncthingId: "THIRD", state: "active", signingKey: targetIdentity.signingKey,
+      }), /no longer active/i);
+    } finally {
+      await outgoing?.close(); await incoming?.close(); await listener?.close();
+      await source.close(); await target.close(); await rm(root, { recursive: true, force: true });
+    }
+  });
 
 test("locked Syncpeer peers transfer ciphertext over TLS without folder keys", { timeout: 15000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-locked-peers-"));

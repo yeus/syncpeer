@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import {
   assessFolderRetention,
@@ -12,6 +13,18 @@ import {
 } from "../packages/core/dist/sync/folderRetention.js";
 
 const subtle = globalThis.crypto.subtle;
+
+test("manifest identity is independent of the operating-system locale", () => {
+  const script = `import { folderManifestDigest } from './packages/core/dist/sync/folderRetention.js';
+    console.log(folderManifestDigest(['ä', 'z', 'a', 'A'].map(path => ({
+      path, type: 'file', size: 0, deleted: false, version: [], blocks: []
+    }))));`;
+  const hashes = ["en_US.UTF-8", "sv_SE.UTF-8"].map(locale =>
+    execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8", env: { ...process.env, LANG: locale, LC_ALL: locale },
+    }).trim());
+  assert.equal(hashes[0], hashes[1]);
+});
 
 const identity = async () => {
   const pair = await subtle.generateKey(

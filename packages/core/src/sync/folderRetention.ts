@@ -108,7 +108,8 @@ const canonicalManifestEntry = (entry: FolderManifestEntry) => {
 /** Identifies the complete BEP-visible state, independent of local enumeration order. */
 export function folderManifestDigest(entries: readonly FolderManifestEntry[]): string {
   const paths = new Set<string>();
-  const canonical = entries.map(canonicalManifestEntry).sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = entries.map(canonicalManifestEntry)
+    .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
   for (const entry of canonical) {
     if (paths.has(entry.path)) throw new Error("Duplicate manifest path.");
     paths.add(entry.path);

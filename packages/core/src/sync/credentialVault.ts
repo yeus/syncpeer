@@ -244,9 +244,9 @@ export function createCredentialVault(options: {
         trustedRoster: { ...data.trustedRoster, knownHead: update.hash,
           updates: [...data.trustedRoster.updates, update] } };
     }
+    if (data.trustedRoster) throw new Error("This recovered profile requires trusted-device recovery enrollment.");
     if (!recoveryKey) throw new Error("A separate offline recovery signing kit is required before enrolling the first device.");
     await validateOwnedRecoveryPublicKey(subtle, recoveryKey);
-    if (data.trustedRoster) throw new Error("This recovered profile requires trusted-device recovery enrollment.");
     const identity = await createOwnedDeviceIdentity(subtle, options.randomBytes, syncthingId);
     const key = await openOwnedDeviceSigningKey(subtle, identity);
     const device = { id: identity.id, syncthingId: identity.syncthingId,
@@ -294,9 +294,9 @@ export function createCredentialVault(options: {
     }),
     create: (masterPassword: string, remember = true, localSyncthingId?: string, recoveryKey?: string) => run(async () => {
       if (key || initialized) throw new Error("Credential vault already initialized; recover missing storage instead of replacing it.");
+      if (decodeRecord(await options.storage.load())) throw new Error("Credential vault already exists.");
       if (localSyncthingId && !recoveryKey) throw new Error("A separate offline recovery signing kit is required before enrolling the first device.");
       if (recoveryKey && !localSyncthingId) throw new Error("A local device ID is required for trusted-device enrollment.");
-      if (decodeRecord(await options.storage.load())) throw new Error("Credential vault already exists.");
       if (options.bootstrapStorage) {
         if (await options.bootstrapStorage.load() !== null) throw new Error("Personal-space recovery record already exists.");
         const { record: bootstrap, space } = await createPersonalSpaceBootstrap(password(masterPassword), options.randomBytes, kdf);

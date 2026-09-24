@@ -451,6 +451,8 @@ test("encrypted folders can be migrated back to verified plaintext storage", asy
   await cache.disconnectFolder("reverse");
   assert.equal((await cache.platformAdapter.listCachedFiles!()).length, 1, "Plain migration retains the verified local file");
   assert.equal((await documents.status()).folders[0].downloads, undefined, "Encrypted ownership is detached only after verification");
+  assert.equal((await documents.cachedFiles("reverse")).length, 1,
+    "Switching storage owners must not publish a synchronized deletion or silently release the encrypted copy");
   await documents.close();
 });
 

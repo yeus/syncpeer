@@ -529,15 +529,6 @@ const detachDownloadsAction = async (runtime: DocumentRuntime, id: string) => {
   return documentStatus(runtime);
 };
 
-const clearFolderContentsAction = async (runtime: DocumentRuntime, folderId: string) => {
-  const replica = requireOpenReplica(runtime, folderId);
-  const paths = (await replica.scan())
-    .filter(value => !value.deleted && !value.invalid && !isInternalReplicaPath(value.name))
-    .map(value => value.name);
-  await removeReplicaPaths(replica, folderId, paths);
-  return documentStatus(runtime);
-};
-
 const loadDirectorySnapshotAction = async (
   runtime: DocumentRuntime,
   folderId: string,
@@ -1220,7 +1211,6 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
     runQueued(runtime, () => registerFolderAction(runtime, folder)),
   attachDownloads: (id: string) => runQueued(runtime, () => attachDownloadsAction(runtime, id)),
   detachDownloads: (id: string) => runQueued(runtime, () => detachDownloadsAction(runtime, id)),
-  clearFolderContents: (folderId: string) => runQueued(runtime, () => clearFolderContentsAction(runtime, folderId)),
   sessionSharedFolders: (remoteDeviceId: string) => runQueued(runtime, async () => {
     if (!remoteDeviceId) return [];
     const registry = requireUnlockedRegistry(runtime);

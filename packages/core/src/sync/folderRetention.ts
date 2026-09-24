@@ -51,17 +51,6 @@ export interface RetentionReleaseProposal {
   signature: string;
 }
 
-export interface RetentionVote {
-  format: 1;
-  proposalId: string;
-  folderId: string;
-  policyRevision: number;
-  rosterHead: string;
-  voterId: string;
-  approve: boolean;
-  signature: string;
-}
-
 export interface DangerousLocalRelease {
   format: 1;
   scope: "local-copy-only";
@@ -76,7 +65,7 @@ export interface DangerousLocalRelease {
 }
 
 const encoder = new TextEncoder();
-const MAX_SYNCTHING_OBSERVATION_MS = 5 * 60_000;
+const MAX_COMPLETION_AGE_MS = 5 * 60_000;
 const text = (value: unknown, label: string) => {
   if (typeof value !== "string" || !value || value.length > 4096 || value.includes("\0")) {
     throw new Error(`Invalid ${label}.`);
@@ -221,7 +210,7 @@ const validateCompletionData = (value: ReturnType<typeof completionData>) => {
   if (!["syncpeer", "syncthing"].includes(value.holderKind) ||
     value.liveUntilMs !== undefined && (
       integer(value.liveUntilMs, "completion live deadline") < value.completedAtMs ||
-      value.liveUntilMs - value.completedAtMs > MAX_SYNCTHING_OBSERVATION_MS)) {
+      value.liveUntilMs - value.completedAtMs > MAX_COMPLETION_AGE_MS)) {
     throw new Error("Invalid or unbounded replica completion.");
   }
 };
@@ -307,34 +296,13 @@ export async function signRetentionReleaseProposal(subtle: SubtleCrypto, key: Cr
   return { ...data, id, signature: await sign(subtle, key, "syncpeer.retention-release-proposal.v1", data) };
 }
 
-const voteData = (value: Omit<RetentionVote, "format" | "signature">) => ({
-  format: 1 as const,
-  proposalId: value.proposalId,
-  folderId: value.folderId,
-  policyRevision: value.policyRevision,
-  rosterHead: value.rosterHead,
-  voterId: value.voterId,
-  approve: value.approve,
-});
-
-export async function signRetentionVote(subtle: SubtleCrypto, key: CryptoKey,
-  value: Omit<RetentionVote, "format" | "signature">): Promise<RetentionVote> {
-  const data = voteData(value);
-  text(data.proposalId, "vote proposal identifier");
-  text(data.folderId, "vote folder identifier");
-  text(data.rosterHead, "vote roster head");
-  text(data.voterId, "voter identifier");
-  integer(data.policyRevision, "vote policy revision", 1);
-  if (typeof data.approve !== "boolean") throw new Error("Invalid retention vote.");
-  return { ...data, signature: await sign(subtle, key, "syncpeer.retention-vote.v1", data) };
-}
-
 export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
   policy: FolderRetentionPolicy;
   currentManifestDigest: string;
   proposal: RetentionReleaseProposal;
-  votes: readonly RetentionVote[];
   completions: readonly ReplicaCompletion[];
+  /** Holder IDs with a live authenticated session at the release decision, supplied by the local session owner. */
+  onlineHolderIds: readonly string[];
   trust: OwnedRosterTrust;
   nowMs: number;
 }) {
@@ -359,33 +327,20 @@ export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
       "syncpeer.retention-release-proposal.v1", expectedProposal, proposal.signature)) {
     throw new Error("Retention release proposal is invalid or stale.");
   }
-  const voters = new Set<string>();
-  const approvingVoters = new Set<string>();
-  let approvals = 0;
-  for (const vote of input.votes) {
-    const data = voteData(vote);
-    if (vote.format !== 1 || vote.proposalId !== proposal.id || vote.folderId !== input.policy.folderId ||
-      vote.policyRevision !== input.policy.revision || vote.rosterHead !== input.policy.rosterHead ||
-      !active.has(vote.voterId) || !await verify(subtle, publicKeys[vote.voterId],
-        "syncpeer.retention-vote.v1", data, vote.signature)) throw new Error("Retention vote is invalid or stale.");
-    if (voters.has(vote.voterId)) throw new Error("Each device has one vote per policy revision.");
-    voters.add(vote.voterId);
-    if (vote.approve) {
-      approvals += 1;
-      approvingVoters.add(vote.voterId);
-    }
-  }
-  if (approvals < Math.floor(active.size / 2) + 1) throw new Error("Retention release lacks an active-device majority.");
+  const recentCompletions = input.completions.filter(completion =>
+    input.nowMs - completion.completedAtMs <= MAX_COMPLETION_AGE_MS);
   const assessment = await assessFolderRetention(subtle, input.policy, proposal.manifestDigest,
-    input.completions, publicKeys, input.nowMs);
+    recentCompletions, publicKeys, input.nowMs);
   if (!assessment.completeHolderIds.includes(proposal.releaseHolderId)) {
     throw new Error("The released holder has no current complete-copy receipt.");
   }
-  const remainingCompleteHolderIds = assessment.completeHolderIds.filter(id => id !== proposal.releaseHolderId);
+  const online = new Set(input.onlineHolderIds);
+  const remainingCompleteHolderIds = assessment.completeHolderIds.filter(id =>
+    id !== proposal.releaseHolderId && online.has(id));
   if (remainingCompleteHolderIds.length < input.policy.minimumCopies) {
-    throw new Error("Retention release would violate the minimum copy count.");
+    throw new Error("Retention release lacks the minimum online complete copies.");
   }
-  return { proposalId: proposal.id, approvingDeviceIds: [...approvingVoters].sort(), remainingCompleteHolderIds };
+  return { proposalId: proposal.id, remainingCompleteHolderIds };
 }
 
 const dangerousReleaseData = (value: Omit<DangerousLocalRelease,

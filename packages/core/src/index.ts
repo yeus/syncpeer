@@ -21,7 +21,6 @@ export {
   folderManifestDigest,
   signReplicaCompletion,
   signRetentionReleaseProposal,
-  signRetentionVote,
   verifyDangerousLocalRelease,
 } from "./sync/folderRetention.js";
 export {
@@ -56,7 +55,6 @@ export type {
   FolderRetentionPolicy,
   ReplicaCompletion,
   RetentionReleaseProposal,
-  RetentionVote,
 } from "./sync/folderRetention.js";
 export {
   classifyRuntimeArchitecture,

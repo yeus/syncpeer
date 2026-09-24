@@ -11,7 +11,6 @@ import {
   folderManifestDigestFromBep,
   signReplicaCompletion,
   signRetentionReleaseProposal,
-  signRetentionVote,
   verifyLocalReplicaManifest,
 } from "../packages/core/dist/sync/folderRetention.js";
 import { signOwnedRosterUpdate } from "../packages/core/dist/sync/personalSpaceSharing.js";
@@ -175,7 +174,7 @@ test("future-dated receipts and overlong Syncthing observations cannot satisfy r
   }), /bounded|deadline|observation/i);
 });
 
-test("release quorum comes from the signed roster, including offline owned devices", async () => {
+test("an offline owned device need not approve a safe release", async () => {
   const phone = await identity(), laptop = await identity(), offlineTablet = await identity();
   const trust = await signedRoster(phone, { phone, laptop, offlineTablet });
   const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), minimumCopies: 1,
@@ -188,24 +187,13 @@ test("release quorum comes from the signed roster, including offline owned devic
     folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
     rosterHead: trust.knownHead, manifestDigest: manifest,
   });
-  const phoneVote = await signRetentionVote(subtle, phone.privateKey, {
-    proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: trust.knownHead, voterId: "phone", approve: true,
-  });
-  await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote],
-    completions: receipts, nowMs: 200,
-  }), /majority/i);
-  const laptopVote = await signRetentionVote(subtle, laptop.privateKey, {
-    ...phoneVote, voterId: "laptop", approve: true,
-  });
   assert.deepEqual((await authorizeReplicaRelease(subtle, {
-    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote, laptopVote],
-    completions: receipts, nowMs: 200,
+    policy, trust, currentManifestDigest: manifest, proposal,
+    completions: receipts, onlineHolderIds: ["phone", "laptop"], nowMs: 200,
   })).remainingCompleteHolderIds, ["laptop"]);
 });
 
-test("release requires a majority and enough current copies after the release", async () => {
+test("release requires enough current online copies after the release", async () => {
   const phone = await identity();
   const laptop = await identity();
   const tablet = await identity();
@@ -225,55 +213,27 @@ test("release requires a majority and enough current copies after the release", 
     folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
     rosterHead: trust.knownHead, manifestDigest: manifest,
   });
-  const phoneVote = await signRetentionVote(subtle, phone.privateKey, {
-    proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: trust.knownHead, voterId: "phone", approve: true,
-  });
   await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote], completions: receipts,
-    nowMs: 200,
-  }), /majority/i);
-  const laptopVote = await signRetentionVote(subtle, laptop.privateKey, {
-    proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: trust.knownHead, voterId: "laptop", approve: true,
-  });
-  await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, trust, currentManifestDigest: "new-manifest", proposal, votes: [phoneVote, laptopVote],
-    completions: receipts, nowMs: 200,
+    policy, trust, currentManifestDigest: "new-manifest", proposal,
+    completions: receipts, onlineHolderIds: ["phone", "laptop", "tablet"], nowMs: 200,
   }), /stale/i);
   const result = await authorizeReplicaRelease(subtle, {
-    policy, trust, currentManifestDigest: manifest, proposal, votes: [phoneVote, laptopVote],
-    completions: receipts, nowMs: 200,
+    policy, trust, currentManifestDigest: manifest, proposal,
+    completions: receipts, onlineHolderIds: ["phone", "laptop", "tablet"], nowMs: 200,
   });
   assert.deepEqual(result.remainingCompleteHolderIds, ["laptop", "tablet"]);
-});
-
-test("a device cannot cast competing votes in one policy revision", async () => {
-  const phone = await identity();
-  const laptop = await identity();
-  const trust = await signedRoster(phone, { phone, laptop });
-  const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), minimumCopies: 1, holders: [
-    { id: "phone", kind: "syncpeer" as const }, { id: "laptop", kind: "syncpeer" as const },
-  ] };
-  const completions = await Promise.all([
-    ["phone", phone], ["laptop", laptop],
-  ].map(([holderId, key]) => signReplicaCompletion(subtle, key.privateKey, {
-    folderId: "folder", holderId: String(holderId), holderKind: "syncpeer",
-    signerId: String(holderId), manifestDigest: manifest, policyRevision: 1, completedAtMs: 100,
-  })));
-  const proposal = await signRetentionReleaseProposal(subtle, phone.privateKey, {
-    folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
-    rosterHead: trust.knownHead, manifestDigest: manifest,
-  });
-  const approve = await signRetentionVote(subtle, phone.privateKey, {
-    proposalId: proposal.id, folderId: "folder", policyRevision: 1,
-    rosterHead: trust.knownHead, voterId: "phone", approve: true,
-  });
-  const reject = await signRetentionVote(subtle, phone.privateKey, { ...approve, approve: false });
   await assert.rejects(authorizeReplicaRelease(subtle, {
-    policy, trust, currentManifestDigest: manifest, proposal, votes: [approve, reject], completions,
-    nowMs: 200,
-  }), /one vote/i);
+    policy, trust, currentManifestDigest: manifest, proposal,
+    completions: receipts, onlineHolderIds: ["phone", "laptop"], nowMs: 200,
+  }), /online complete cop/i, "An offline tablet receipt cannot satisfy the minimum");
+  assert.deepEqual((await authorizeReplicaRelease(subtle, {
+    policy, trust, currentManifestDigest: manifest, proposal,
+    completions: receipts, onlineHolderIds: ["phone", "laptop", "tablet"], nowMs: 100 + 5 * 60_000,
+  })).remainingCompleteHolderIds, ["laptop", "tablet"], "Five-minute-old evidence is still fresh");
+  await assert.rejects(authorizeReplicaRelease(subtle, {
+    policy, trust, currentManifestDigest: manifest, proposal,
+    completions: receipts, onlineHolderIds: ["phone", "laptop", "tablet"], nowMs: 100 + 5 * 60_000 + 1,
+  }), /current complete|online complete cop/i, "An old receipt cannot prove that an online holder still has the bytes");
 });
 
 test("dangerous release is local-only, explicit, and signed", async () => {

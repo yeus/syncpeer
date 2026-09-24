@@ -164,7 +164,6 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     }
     case "attachDownloads": return documents.attachDownloads(text("id"));
     case "detachDownloads": return documents.detachDownloads(text("id"));
-    case "clearFolderContents": return documents.clearFolderContents(text("folderId"));
     case "beginDownload": {
       if (typeof command.encrypted !== "boolean") throw new Error("Invalid download encryption metadata.");
       return documents.beginDownload(text("folderId"), text("path"), integer("size"), integer("modifiedMs"),

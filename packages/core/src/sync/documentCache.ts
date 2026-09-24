@@ -455,7 +455,6 @@ export function createDocumentCache(options: {
             }
           } finally { await original.close(); }
         }
-        await request({ operation: "clearFolderContents", folderId });
         await request({ operation: "detachDownloads", id: folderId });
       } finally { staged.forEach(value => value.bytes.fill(0)); }
     } finally { migrating.delete(folderId); }

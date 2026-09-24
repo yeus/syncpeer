@@ -10,6 +10,7 @@
     "test": "npm run test:headless",
     "test:headless": "node --experimental-strip-types scripts/test-diagnostics.ts",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
+    "test:tauri:deb": "npm run security:scan && node scripts/test-tauri-deb.mjs",
     "security:scan": "node scripts/scan-sensitive-identifiers.mjs",
     "security:export-dependabot": "node scripts/export-dependabot-alerts.mjs",
     "ci:logs": "node scripts/download-ci-logs.mjs",

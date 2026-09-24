@@ -2,7 +2,8 @@ import { decryptUntrustedBytes as decryptEncryptedBytes } from "./untrusted.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import type { BepFileInfo, BepVersionVector } from "../protocol/bep.js";
 import { BEP_MAX_BLOCK_SIZE } from "../protocol/blockLimits.js";
-import { prepareCachedBlocks, verifyBlockDigests, validateBlockPlan, planBlockRange, type RangeDigest } from "../../transfer/blockReuse.js";
+import { fingerprintForBlocks, prepareCachedBlocks, verifyBlockDigests, validateBlockPlan,
+  planBlockRange, type RangeDigest } from "../../transfer/blockReuse.js";
 import type {
   FileDownloadMetadata,
   FileDownloadResult,
@@ -42,10 +43,6 @@ export interface FileBlock {
   size: number;
   hash: Uint8Array;
 }
-
-const contentIdForBlocks = (blocks: FileBlock[]): string => blocks
-  .map((block) => `${block.offset}:${block.size}:${Array.from(block.hash, (byte) => byte.toString(16).padStart(2, "0")).join("")}`)
-  .join("|");
 
 const contentIdForBytes = (bytes: Uint8Array): string => {
   let hash = 0xcbf29ce484222325n;
@@ -219,7 +216,7 @@ function toEntry(path: string, file: BepFileInfo): FileEntry {
   const modifiedMs = Number(file.modified_s ?? 0) * 1000 + Math.floor(Number(file.modified_ns ?? 0) / 1e6);
   const fingerprint = blocks
     ? blocks.length > 0
-      ? blocks.map((block) => `${block.offset}:${block.size}:${Array.from(block.hash).join(",")}`).join("|")
+      ? fingerprintForBlocks(blocks, size)
       : `empty:${size}`
     : `metadata:${size}:${modifiedMs}`;
   return {
@@ -817,7 +814,7 @@ export class RemoteFs {
       normalizePath(path),
       totalBytes,
       false,
-      contentIdForBlocks(entry.blocks),
+      fingerprintForBlocks(entry.blocks, totalBytes),
       plan,
       6,
       (next) => requestWithTemporaryFallback(next.offset, next.size, {
@@ -961,7 +958,7 @@ export class RemoteFs {
       normalizePath(path),
       entry.size,
       true,
-      contentIdForBlocks(entry.blocks),
+      fingerprintForBlocks(entry.blocks, entry.size),
       plan,
       6,
       next => this.readEncryptedBlock(folder.id, resolvedFile!, next.blockNo, signal),

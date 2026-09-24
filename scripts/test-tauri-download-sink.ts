@@ -33,16 +33,22 @@ test("the Tauri document bridge resumes encrypted partial bytes after suspension
     const source = new Uint8Array([1, 2, 3, 4, 5, 6]);
     const hash = (bytes: Uint8Array) => new Uint8Array(createHash("sha256").update(bytes).digest());
     const blocks = [0, 3].map(offset => ({ offset, size: 3, hash: hash(source.subarray(offset, offset + 3)) }));
-    const contentId = blocks.map(block => `${block.offset}:${block.size}:${Buffer.from(block.hash).toString("hex")}`).join("|");
-    const first = await adapter.createFileDownloadSink!({ folderId: "folder", path: "file", name: "file" });
-    await first.begin({ folderId: "folder", path: "file", sizeBytes: 6, encrypted: false, contentId });
-    await first.write(0, source.subarray(0, 3));
-    await first.suspend!();
     const requests: number[] = [];
     const remote = new RemoteFs(new Map([["folder", { id: "folder", indexReceived: true,
       files: new Map([["file", { indexFile: { name: "file", size: 6,
         blocks } }]]) }]]) as never,
     async (_folder, _path, offset, size) => { requests.push(offset); return source.slice(offset, offset + size); });
+    let contentId = "";
+    await assert.rejects(remote.readFileToSink("folder", "file", {
+      begin: async metadata => { contentId = metadata.contentId ?? ""; throw new Error("Synthetic stop before blocks"); },
+      write: async () => assert.fail("Metadata probe must not read blocks"),
+      commit: async () => assert.fail("Metadata probe must not commit"),
+      abort: async () => {},
+    }), /Synthetic stop/);
+    const first = await adapter.createFileDownloadSink!({ folderId: "folder", path: "file", name: "file" });
+    await first.begin({ folderId: "folder", path: "file", sizeBytes: 6, encrypted: false, contentId });
+    await first.write(0, source.subarray(0, 3));
+    await first.suspend!();
     const resumed = await adapter.createFileDownloadSink!({ folderId: "folder", path: "file", name: "file" });
     await remote.readFileToSink("folder", "file", resumed);
     assert.deepEqual(requests, [3]);

@@ -15,6 +15,35 @@ const blocks = [0, 4, 8].map((offset) => ({
   offset, size: 4, hash: sha256(new Uint8Array(4).fill(offset)),
 }));
 
+test("large BEP files have bounded directory fingerprints", async () => {
+  const largeBlocks = Array.from({ length: 64 }, (_, index) => ({
+    offset: index * 131072, size: 131072, hash: sha256(Uint8Array.of(index)),
+  }));
+  const folder = { id: "fixture-folder", indexReceived: true,
+    files: new Map([["large.bin", { indexFile: { name: "large.bin", type: 0,
+      size: 64 * 131072, blocks: largeBlocks } }]]) };
+  const view = new RemoteFs(new Map([[folder.id, folder]]) as never,
+    async () => assert.fail("Listing must not read file content"), async () => {}, () => {});
+  const [entry] = await view.listFiles(folder.id);
+  assert.ok(entry.fingerprint && entry.fingerprint.length < 128);
+  let contentId = "";
+  await assert.rejects(view.readFileToSink(folder.id, "large.bin", {
+    begin: async metadata => { contentId = metadata.contentId ?? ""; throw new Error("Synthetic stop after metadata"); },
+    write: async () => assert.fail("Stopped before file blocks"),
+    commit: async () => assert.fail("Stopped before commit"),
+    abort: async () => {},
+  }), /Synthetic stop/);
+  assert.ok(contentId.startsWith("blocks:") && contentId.length < 128,
+    "Resumable transfer identity must fit the document command boundary for large files");
+  const changed = new RemoteFs(new Map([[folder.id, { ...folder, files: new Map([["large.bin", {
+    indexFile: { name: "large.bin", type: 0, size: 64 * 131072,
+      blocks: [...largeBlocks.slice(0, -1), { ...largeBlocks.at(-1)!, hash: sha256(Uint8Array.of(99)) }],
+    },
+  }]]) }]]) as never,
+  async () => assert.fail("Listing must not read file content"), async () => {}, () => {});
+  assert.notEqual((await changed.listFiles(folder.id))[0].fingerprint, entry.fingerprint);
+});
+
 test("Syncthing empty-file blocks publish without requesting zero bytes", async () => {
   for (const hash of [sha256(new Uint8Array()), new Uint8Array(32)]) {
     let committed = false;

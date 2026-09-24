@@ -2,6 +2,7 @@ import { copyFile, lstat, open, mkdir, readFile, readdir, rename, rm, stat, utim
 import { constants } from "node:fs";
 import type { FileEntry } from "../core/model/remoteFs.js";
 import { digestRanges } from "../transfer/nodeStorage.js";
+import { fingerprintForBlocks, type RangeDigest } from "../transfer/blockReuse.js";
 import type { ReplicaEntry } from "./replicaIndex.js";
 import { isInternalReplicaPath } from "./replicaPaths.js";
 import path from "node:path";
@@ -78,13 +79,11 @@ const fingerprintFile = async (absolute: string, size: number, blocks?: FileEntr
   const file = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const ranges = blocks ?? Array.from({ length: Math.ceil(size / 131072) }, (_, i) => ({ offset: i * 131072, size: Math.min(131072, size - i * 131072) }));
-    const parts: string[] = [];
+    const digests: RangeDigest[] = [];
     for (let start = 0; start < ranges.length; start += 256) {
-      for (const range of await digestRanges(file, ranges.slice(start, start + 256), false)) {
-        parts.push(`${range.offset}:${range.size}:${Array.from(range.hash).join(",")}`);
-      }
+      digests.push(...await digestRanges(file, ranges.slice(start, start + 256), false));
     }
-    return parts.length ? parts.join("|") : `empty:${size}`;
+    return digests.length ? fingerprintForBlocks(digests, size) : `empty:${size}`;
   } finally { await file.close(); }
 };
 

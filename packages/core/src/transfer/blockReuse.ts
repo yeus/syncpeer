@@ -17,6 +17,18 @@ export interface CachedRangeStorage {
 
 const rangeKey = (range: DownloadRange): string => `${range.offset}:${range.size}`;
 
+/** Fixed-size identity for an ordered block plan, shared by remote indexes and local scans. */
+export const fingerprintForBlocks = (blocks: readonly RangeDigest[], size: number): string => {
+  const hash = sha256.create(), encoder = new TextEncoder();
+  hash.update(encoder.encode(`syncpeer.file-blocks.v1:${size}\n`));
+  for (const block of blocks) {
+    hash.update(encoder.encode(`${block.offset}:${block.size}:`));
+    hash.update(block.hash);
+    hash.update(Uint8Array.of(0));
+  }
+  return `blocks:${Array.from(hash.digest(), byte => byte.toString(16).padStart(2, "0")).join("")}`;
+};
+
 export const equalHash = (left: Uint8Array, right: Uint8Array): boolean =>
   left.length === 32 && right.length === 32 && left.every((byte, index) => byte === right[index]);
 

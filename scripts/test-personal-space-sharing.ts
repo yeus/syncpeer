@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, resolveApprovedPeerDeviceIds, resolveFolderShareDevices,
+import { createOwnedDeviceIdentity, createOwnedRecoveryKit, openOwnedRecoveryKit, openOwnedDeviceSigningKey,
+  resolveApprovedPeerDeviceIds, resolveFolderShareDevices,
   settingsFolderDevices, signOwnedRosterUpdate, verifyOwnedRoster } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 
@@ -15,6 +16,21 @@ const roster = [
     retiredSyncthingIds: ["OLD"], signingKey: "cGhvbmU=" },
   { id: "laptop", syncthingId: "LAPTOP", state: "active" as const, signingKey: "bGFwdG9w" },
 ];
+
+test("offline recovery signing kit protects its key and rejects tampering", async () => {
+  const randomBytes = (size: number) => crypto.getRandomValues(new Uint8Array(size));
+  const kit = await createOwnedRecoveryKit(subtle, randomBytes, "synthetic-offline-kit-password");
+  assert.equal(JSON.stringify(kit).includes("PRIVATE KEY"), false);
+  await assert.rejects(openOwnedRecoveryKit(subtle, kit, "wrong-password"), /recovery kit/i);
+  const privateKey = await openOwnedRecoveryKit(subtle, kit, "synthetic-offline-kit-password");
+  const challenge = new TextEncoder().encode("synthetic recovery proof");
+  const signature = await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, challenge);
+  const publicKey = await subtle.importKey("spki", Buffer.from(kit.publicKey, "base64"),
+    { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  assert.equal(await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, signature, challenge), true);
+  await assert.rejects(openOwnedRecoveryKit(subtle, { ...kit, publicKey: "invalid" },
+    "synthetic-offline-kit-password"), /recovery kit/i);
+});
 
 test("each device generates its own persistent signing identity", async () => {
   const randomBytes = (size: number) => crypto.getRandomValues(new Uint8Array(size));
@@ -44,11 +60,13 @@ test("revoked owned identities cannot re-enter through an individual target", ()
 
 test("retired IDs cannot impersonate external devices after a replacement", () => {
   assert.deepEqual(resolveFolderShareDevices([{ kind: "device", syncthingId: "OLD" }], roster), []);
+  assert.deepEqual(resolveFolderShareDevices([{ kind: "device", syncthingId: "O-L-D" }], roster), []);
 });
 
 test("incoming authorization excludes revoked identities but permits a selected external peer", () => {
   const devices = roster.map(device => device.id === "laptop" ? { ...device, state: "revoked" as const } : device);
   assert.deepEqual(resolveApprovedPeerDeviceIds("LAPTOP", devices), ["PHONE"]);
+  assert.deepEqual(resolveApprovedPeerDeviceIds("L-A-P-T-O-P", devices), ["PHONE"]);
   assert.deepEqual(resolveApprovedPeerDeviceIds("EXTERNAL", devices), ["EXTERNAL", "PHONE"]);
 });
 
@@ -102,6 +120,12 @@ test("each roster slot requires one unique permanent device key", async () => {
     sequence: 1, previous: null, signer: "phone",
     devices: [{ id: "phone", syncthingId: "PHONE", state: "active", signingKey: firstPublic },
       { id: "laptop", syncthingId: "LAPTOP", state: "active", signingKey: firstPublic }],
+  }), /device roster/i);
+  await assert.rejects(signOwnedRosterUpdate(subtle, first.privateKey, {
+    sequence: 1, previous: null, signer: "phone",
+    devices: [{ id: "phone", syncthingId: "PHONE", state: "active", signingKey: firstPublic },
+      { id: "alias", syncthingId: "P-H-O-N-E", state: "active",
+        signingKey: await publicKey(replacement.publicKey) }],
   }), /device roster/i);
   const genesis = await signOwnedRosterUpdate(subtle, first.privateKey, {
     sequence: 1, previous: null, signer: "phone",

@@ -29,6 +29,16 @@ export interface OwnedRosterTrust {
   updates: OwnedRosterUpdate[];
 }
 
+/** Store this separately from the space backup and every device-local vault. */
+export interface OwnedRecoveryKit {
+  format: 1;
+  kdf: "scrypt-N32768-r8-p1";
+  publicKey: string;
+  salt: number[];
+  nonce: number[];
+  ciphertext: number[];
+}
+
 export type FolderShareTarget = { kind: "personal-space" } | { kind: "device"; syncthingId: string };
 
 const validateRoster = (devices: readonly OwnedSpaceDevice[]) => {
@@ -43,8 +53,9 @@ const validateRoster = (devices: readonly OwnedSpaceDevice[]) => {
     slots.add(device.id);
     signingKeys.add(device.signingKey);
     for (const identity of [device.syncthingId, ...(device.retiredSyncthingIds ?? [])]) {
-      if (!identity || identities.has(identity)) throw new Error("Invalid personal-space device roster.");
-      identities.add(identity);
+      const comparable = normalizeDeviceId(identity);
+      if (!comparable || identities.has(comparable)) throw new Error("Invalid personal-space device roster.");
+      identities.add(comparable);
     }
   }
 };
@@ -70,6 +81,26 @@ const validateRosterTransition = (previous: readonly OwnedSpaceDevice[], next: r
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const decode = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
+const kitBytes = (value: unknown, length: number) => {
+  if (!Array.isArray(value) || value.length !== length || value.some(byte =>
+    !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid owned recovery kit.");
+  return Uint8Array.from(value);
+};
+const recoveryPassword = (value: string) => {
+  if (typeof value !== "string" || value.length < 16 || value.length > 4096) {
+    throw new Error("Owned recovery kit password must have at least 16 characters.");
+  }
+  return new TextEncoder().encode(value);
+};
+const recoveryAad = (publicKey: string) =>
+  new TextEncoder().encode(`syncpeer.owned-recovery-kit.v1\n${publicKey}`);
+export async function validateOwnedRecoveryPublicKey(subtle: SubtleCrypto, publicKey: string): Promise<void> {
+  try {
+    if (typeof publicKey !== "string" || !publicKey || publicKey.length > 4096) throw new Error();
+    await subtle.importKey("spki", decode(publicKey),
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  } catch { throw new Error("Invalid offline recovery signing key."); }
+}
 const random = async (source: (size: number) => Uint8Array | Promise<Uint8Array>, size: number) => {
   const value = await source(size);
   if (!(value instanceof Uint8Array) || value.length !== size) throw new Error("Invalid device identity random source.");
@@ -110,6 +141,53 @@ export async function openOwnedDeviceSigningKey(subtle: SubtleCrypto,
     }
     return privateKey;
   } catch { throw new Error("Invalid owned device identity."); }
+}
+
+export async function createOwnedRecoveryKit(subtle: SubtleCrypto,
+  randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>, kitPassword: string,
+  kdf: PasswordKdf = scryptPasswordKdf): Promise<OwnedRecoveryKit> {
+  const passwordBytes = recoveryPassword(kitPassword);
+  let key: Uint8Array | undefined, privateBytes: Uint8Array | undefined;
+  try {
+    const pair = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const publicKey = encode(new Uint8Array(await subtle.exportKey("spki", pair.publicKey)));
+    privateBytes = new Uint8Array(await subtle.exportKey("pkcs8", pair.privateKey));
+    const salt = await random(randomBytes, 16), nonce = await random(randomBytes, 24);
+    key = await kdf(passwordBytes, salt);
+    return { format: 1, kdf: "scrypt-N32768-r8-p1", publicKey,
+      salt: Array.from(salt), nonce: Array.from(nonce),
+      ciphertext: Array.from(xchacha20poly1305(key, nonce, recoveryAad(publicKey)).encrypt(privateBytes)) };
+  } finally { key?.fill(0); passwordBytes.fill(0); privateBytes?.fill(0); }
+}
+
+export async function openOwnedRecoveryKit(subtle: SubtleCrypto, kit: OwnedRecoveryKit,
+  kitPassword: string, kdf: PasswordKdf = scryptPasswordKdf): Promise<CryptoKey> {
+  if (!kit || kit.format !== 1 || kit.kdf !== "scrypt-N32768-r8-p1" ||
+    typeof kit.publicKey !== "string" || kit.publicKey.length > 4096 ||
+    !Array.isArray(kit.ciphertext) || kit.ciphertext.length < 64 || kit.ciphertext.length > 4096 ||
+    kit.ciphertext.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+    throw new Error("Invalid owned recovery kit.");
+  }
+  const salt = kitBytes(kit.salt, 16), nonce = kitBytes(kit.nonce, 24);
+  const passwordBytes = recoveryPassword(kitPassword);
+  let key: Uint8Array | undefined, plaintext: Uint8Array<ArrayBufferLike> = new Uint8Array();
+  try {
+    key = await kdf(passwordBytes, salt);
+    plaintext = xchacha20poly1305(key, nonce, recoveryAad(kit.publicKey))
+      .decrypt(Uint8Array.from(kit.ciphertext));
+    const [privateKey, publicKey] = await Promise.all([
+      subtle.importKey("pkcs8", new Uint8Array(plaintext),
+        { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]),
+      subtle.importKey("spki", decode(kit.publicKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]),
+    ]);
+    const challenge = new TextEncoder().encode("syncpeer.owned-recovery-kit.v1");
+    const signature = await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privateKey, challenge);
+    if (!await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, signature, challenge)) {
+      throw new Error("Owned recovery kit key mismatch.");
+    }
+    return privateKey;
+  } catch { throw new Error("Invalid owned recovery kit or password."); }
+  finally { key?.fill(0); passwordBytes.fill(0); plaintext.fill(0); }
 }
 
 /** A full roster snapshot signed by the device authorized in the preceding snapshot. */
@@ -173,8 +251,13 @@ export function settingsFolderDevices(devices: readonly OwnedSpaceDevice[]): str
 export function resolveApprovedPeerDeviceIds(selectedDeviceId: string,
   devices: readonly OwnedSpaceDevice[]): string[] {
   if (!devices.length) return selectedDeviceId ? [selectedDeviceId] : [];
-  return [...new Set([...settingsFolderDevices(devices),
-    ...resolveFolderShareDevices([{ kind: "device", syncthingId: selectedDeviceId }], devices)])].sort();
+  const approved = new Map<string, string>();
+  for (const id of [...settingsFolderDevices(devices),
+    ...resolveFolderShareDevices([{ kind: "device", syncthingId: selectedDeviceId }], devices)]) {
+    const comparable = normalizeDeviceId(id);
+    if (!approved.has(comparable)) approved.set(comparable, id);
+  }
+  return [...approved.values()].sort();
 }
 
 /** Resolve policy at the Syncpeer boundary; BEP still sees ordinary device IDs. */
@@ -182,14 +265,23 @@ export function resolveFolderShareDevices(targets: readonly FolderShareTarget[],
   devices: readonly OwnedSpaceDevice[]): string[] {
   validateRoster(devices);
   const revoked = new Set(devices.flatMap(device => [
-    ...(device.state === "revoked" ? [device.syncthingId] : []), ...(device.retiredSyncthingIds ?? [])]));
-  const selected = new Set<string>();
+    ...(device.state === "revoked" ? [device.syncthingId] : []), ...(device.retiredSyncthingIds ?? [])])
+    .map(normalizeDeviceId));
+  const selected = new Map<string, string>();
   for (const target of targets) {
     if (target.kind === "personal-space") {
-      for (const device of devices) if (device.state === "active") selected.add(device.syncthingId);
+      for (const device of devices) if (device.state === "active") {
+        selected.set(normalizeDeviceId(device.syncthingId), device.syncthingId);
+      }
     } else if (target.kind === "device" && target.syncthingId) {
-      if (!revoked.has(target.syncthingId)) selected.add(target.syncthingId);
+      const comparable = normalizeDeviceId(target.syncthingId);
+      if (comparable && !revoked.has(comparable) && !selected.has(comparable)) {
+        selected.set(comparable, target.syncthingId);
+      }
     } else throw new Error("Invalid folder sharing target.");
   }
-  return [...selected].sort();
+  return [...selected.values()].sort();
 }
+import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
+import { scryptPasswordKdf, type PasswordKdf } from "../core/model/passwordKdf.js";
+import { normalizeDeviceId } from "../ui/helpers.js";

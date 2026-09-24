@@ -6,7 +6,9 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
   const command = input as Record<string, unknown>;
   const text = (field: string) => {
     const value = command[field];
-    if (typeof value !== "string" || !value.length || value.length > 4096) throw new Error("Invalid document argument.");
+    if (typeof value !== "string" || !value.length || value.length > 4096) {
+      throw new Error(`Invalid document ${field}: expected 1 to 4096 characters.`);
+    }
     return value;
   };
   const integer = (field: string) => {
@@ -25,15 +27,29 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     case "status": case "cacheRegistrations": return documents.status();
     case "connectionPasswords": return documents.connectionPasswords();
     case "sessionSharedFolders": {
-      if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords) ||
-        Object.entries(command.passwords).some(([id, password]) => !id || id.length > 4096 ||
-          typeof password !== "string" || password.length > 4096)) {
-        throw new Error("Invalid folder credentials.");
+      if (typeof command.remoteDeviceId !== "string" || command.remoteDeviceId.length > 128) {
+        throw new Error("Invalid remote device identity.");
       }
-      return documents.sessionSharedFolders(command.passwords as Record<string, string>);
+      return documents.sessionSharedFolders(command.remoteDeviceId);
     }
     case "profileSettings": return documents.profileSettings();
     case "personalSpaceChanges": return documents.personalSpaceChanges();
+    case "sharedPersonalSpaceSettings": return documents.sharedPersonalSpaceSettings();
+    case "savePersonalSpaceSetting": {
+      if (!Array.isArray(command.path) || command.path.length < 3 || command.path.length > 4 ||
+        command.path.some(part => typeof part !== "string" || !part || part.length > 1024)) {
+        throw new Error("Invalid shared setting path.");
+      }
+      if (!Object.hasOwn(command, "value")) throw new Error("Shared setting value is missing.");
+      return documents.savePersonalSpaceSetting(command.path as string[], command.value);
+    }
+    case "resolvePersonalSpaceConflict": {
+      if (!Array.isArray(command.path) || command.path.length < 3 || command.path.length > 4 ||
+        command.path.some(part => typeof part !== "string" || !part || part.length > 1024)) {
+        throw new Error("Invalid shared setting path.");
+      }
+      return documents.resolvePersonalSpaceConflict(command.path as string[], text("selectedHead"));
+    }
     case "appendPersonalSpaceChange": {
       if (!command.change || typeof command.change !== "object" || Array.isArray(command.change)) {
         throw new Error("Invalid personal-space change.");

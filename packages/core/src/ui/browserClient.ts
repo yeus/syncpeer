@@ -27,6 +27,7 @@ import { createPairingInvitation, type PairingInvitation,
   type PersonalSpacePairingTransfer } from "../sync/personalSpacePairing.js";
 import { resolveApprovedPeerDeviceIds,
   type OwnedDeviceIdentity, type OwnedSpaceDevice } from "../sync/personalSpaceSharing.js";
+import { sameDeviceId } from "./helpers.js";
 
 export interface ConnectOptions {
   host: string;
@@ -216,7 +217,7 @@ export interface SyncpeerPlatformAdapter {
   ownedDevices?: () => Promise<OwnedSpaceDevice[]>;
   revokeOwnedDevice?: (deviceId: string) => Promise<void>;
   /** Folders currently owned by the encrypted document store and safe to advertise over BEP. */
-  sessionSharedFolders?: (folderPasswords: Record<string, string>) => Promise<SharedFolder[]>;
+  sessionSharedFolders?: (remoteDeviceId: string) => Promise<SharedFolder[]>;
   loadDirectorySnapshot?: (folderId: string, sourceDeviceId: string, path: string) => Promise<{
     entries: FileEntry[]; versionKey: string; loadedAtMs: number;
   } | null>;
@@ -640,8 +641,10 @@ export const createSyncpeerBrowserClient = (
       coreOptions.certPem, coreOptions.keyPem, listenPort]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
     const sessionHandlers = {
-      connectionOptions: (remote: string, endpoint: { host: string; port: number }) =>
-        ({ ...coreOptions, ...endpoint, expectedDeviceId: remote }),
+      connectionOptions: async (remote: string, endpoint: { host: string; port: number }) =>
+        ({ ...coreOptions, ...endpoint, expectedDeviceId: remote,
+          sharedFolders: remote === coreOptions.expectedDeviceId && connectOptions.sharedFolders
+            ? connectOptions.sharedFolders : await platformAdapter.sessionSharedFolders?.(remote) ?? [] }),
       onSession: (session: SyncpeerSessionHandle) => {
         if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(connectOptions, session).then(adopted => {
@@ -683,7 +686,9 @@ export const createSyncpeerBrowserClient = (
     const normalized = normalizeConnectOptions(connectOptions);
     const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
     if (normalized.remoteId && !resolveApprovedPeerDeviceIds(normalized.remoteId, trustedDevices)
-      .includes(normalized.remoteId)) throw new Error("This peer was removed from the trusted device list.");
+      .some(id => sameDeviceId(id, normalized.remoteId!))) {
+      throw new Error("This peer was removed from the trusted device list.");
+    }
     let certPem: string | null = null;
     let keyPem: string | null = null;
     let defaultIdentityError: string | null = null;
@@ -719,7 +724,7 @@ export const createSyncpeerBrowserClient = (
     }
 
     const sharedFolders = normalized.sharedFolders ??
-      await platformAdapter.sessionSharedFolders?.(normalized.folderPasswords ?? {});
+      await platformAdapter.sessionSharedFolders?.(normalized.remoteId ?? "");
     const coreOptions: SyncpeerConnectOptions = {
       host: normalized.host,
       port: normalized.port,

@@ -2,6 +2,9 @@ import type { FavoriteRecord } from "../ui/browserClient.js";
 import type { FavoriteExclusion } from "../ui/favoriteSelection.js";
 import type { FolderRetentionPolicy } from "./folderRetention.js";
 import type { FolderShareTarget } from "./personalSpaceSharing.js";
+import { verifyOwnedRoster, type OwnedRosterTrust } from "./personalSpaceSharing.js";
+import { resolvePersonalSpaceChanges, verifyPersonalSpaceChange,
+  type PersonalSpaceChange } from "./personalSpaceChanges.js";
 import { settingsInteger, settingsText } from "./settingsValidation.js";
 
 export interface DeviceFolderSelection {
@@ -113,6 +116,60 @@ export function normalizePersonalSpaceSettings(value: unknown): PersonalSpaceSet
 
 const folderOrDefault = (settings: PersonalSpaceSettings, folderId: string) =>
   settings.folders[folderId] ?? defaultSharedFolderSettings();
+
+const applySharedChange = (settings: PersonalSpaceSettings,
+  change: { path: string[]; value?: unknown; deleted?: true }, deviceId?: string): PersonalSpaceSettings => {
+  const [scope, folderId, field, owner] = change.path;
+  if (scope !== "folders" || !folderId || !field ||
+    !(change.path.length === 3 && (field === "shareTargets" || field === "retention") ||
+      change.path.length === 4 && field === "devices" && owner === deviceId)) {
+    throw new Error("Unsupported personal-space setting path or device selection owner.");
+  }
+  const folder = folderOrDefault(settings, folderId);
+  let updated: SharedFolderSettings;
+  if (field === "shareTargets") {
+    if (change.deleted || !Array.isArray(change.value)) throw new Error("Invalid shared folder targets.");
+    updated = { ...folder, shareTargets: change.value as FolderShareTarget[] };
+  } else if (field === "retention") {
+    const value = change.value as Partial<SharedFolderSettings> | null;
+    if (change.deleted || !value || typeof value !== "object") throw new Error("Invalid shared retention policy.");
+    updated = { ...folder, minimumCopies: value.minimumCopies!,
+      retentionRevision: value.retentionRevision!, holders: value.holders! };
+  } else {
+    const devices = { ...folder.devices };
+    if (change.deleted) delete devices[owner!];
+    else devices[owner!] = change.value as DeviceFolderSelection;
+    updated = { ...folder, devices };
+  }
+  return normalizePersonalSpaceSettings({ ...settings,
+    folders: { ...settings.folders, [folderId]: updated } });
+};
+
+/** Materialize only recognized paths from a complete journal pinned to the verified owned roster. */
+export async function materializePersonalSpaceSettings(subtle: SubtleCrypto, trust: OwnedRosterTrust,
+  changes: readonly PersonalSpaceChange[]): Promise<{
+    settings: PersonalSpaceSettings | null;
+    conflicts: ReturnType<typeof resolvePersonalSpaceChanges>["conflicts"];
+  }> {
+  if (!trust || trust.knownHead !== trust.updates?.at(-1)?.hash) throw new Error("Invalid trusted device list.");
+  const roster = await verifyOwnedRoster(subtle, trust.updates, trust.genesisKey, trust.knownHead);
+  const known = new Map(roster.devices.map(device => [device.id, device.signingKey]));
+  const resolved = resolvePersonalSpaceChanges(changes);
+  const baseline = defaultPersonalSpaceSettings(trust.knownHead);
+  for (const change of changes) {
+    const signingKey = known.get(change.deviceId);
+    if (!signingKey) throw new Error("Personal-space setting author is not a trusted device.");
+    if (!await verifyPersonalSpaceChange(subtle, change, signingKey)) {
+      throw new Error("Personal-space setting signature is invalid.");
+    }
+    applySharedChange(baseline, change, change.deviceId);
+  }
+  if (resolved.conflicts.length) return { settings: null, conflicts: resolved.conflicts };
+  const owners = new Map(changes.map(change => [change.id, change.deviceId]));
+  const settings = resolved.values.reduce((current, value) =>
+    applySharedChange(current, value, owners.get(value.heads[0])), baseline);
+  return { settings, conflicts: [] };
+}
 
 export function setDeviceFolderSelection(settings: PersonalSpaceSettings, folderId: string, deviceId: string,
   selection: DeviceFolderSelection): PersonalSpaceSettings {

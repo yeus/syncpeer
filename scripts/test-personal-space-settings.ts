@@ -3,10 +3,79 @@ import { test } from "node:test";
 import {
   defaultPersonalSpaceSettings,
   folderRetentionPolicyFromSettings,
+  materializePersonalSpaceSettings,
   normalizePersonalSpaceSettings,
   setDeviceFolderSelection,
   updateFolderRetention,
 } from "../packages/core/dist/sync/personalSpaceSettings.js";
+import { createOwnedDeviceIdentity, signOwnedRosterUpdate } from
+  "../packages/core/dist/sync/personalSpaceSharing.js";
+import { signPersonalSpaceChange } from "../packages/core/dist/sync/personalSpaceChanges.js";
+
+const trustedOwner = async () => {
+  const identity = await createOwnedDeviceIdentity(crypto.subtle,
+    size => crypto.getRandomValues(new Uint8Array(size)), "OWNER");
+  const genesis = await signOwnedRosterUpdate(crypto.subtle,
+    await crypto.subtle.importKey("pkcs8", Buffer.from(identity.privateKey, "base64"),
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]),
+    { sequence: 1, previous: null, signer: identity.id,
+      devices: [{ id: identity.id, syncthingId: identity.syncthingId,
+        state: "active", signingKey: identity.signingKey }] });
+  return { deviceId: identity.id,
+    privateKey: await crypto.subtle.importKey("pkcs8", Buffer.from(identity.privateKey, "base64"),
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]),
+    trust: { genesisKey: identity.signingKey, knownHead: genesis.hash, updates: [genesis] } };
+};
+
+test("a verified journal applies shared policy and only this device's favorites", async () => {
+  const { deviceId, trust, privateKey } = await trustedOwner();
+  const changes = await Promise.all([
+    { id: "retention", deviceId, path: ["folders", "photos", "retention"], parents: [],
+      value: { minimumCopies: 3, retentionRevision: 2,
+        holders: [{ id: "OWNER", kind: "syncpeer" }, { id: "NAS", kind: "syncthing" }] } },
+    { id: "selection", deviceId, path: ["folders", "photos", "devices", deviceId], parents: [],
+      value: { favorites: [{ key: "file:photos:a", folderId: "photos", path: "a", name: "A", kind: "file" }],
+        exclusions: [] } },
+  ].map(change => signPersonalSpaceChange(crypto.subtle, privateKey, change)));
+  const result = await materializePersonalSpaceSettings(crypto.subtle, trust, changes);
+  assert.deepEqual(result.conflicts, []);
+  assert.equal(result.settings?.folders.photos.minimumCopies, 3);
+  assert.equal(result.settings?.folders.photos.devices[deviceId].favorites[0]?.path, "a");
+  assert.equal(result.settings?.rosterHead, trust.knownHead);
+  await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust,
+    [{ ...changes[0], value: { minimumCopies: 1, retentionRevision: 2, holders: [] } }]), /signature/i);
+  await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust,
+    [{ ...changes[1], deviceId: "forged-other-device" }]), /trusted device/i);
+  await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust,
+    [await signPersonalSpaceChange(crypto.subtle, privateKey,
+      { ...changes[1], signature: undefined, path: ["folders", "photos", "devices", "another-device"] })]),
+  /device selection/i);
+});
+
+test("conflicting settings remain unresolved until an explicit descendant chooses a value", async () => {
+  const { deviceId, trust, privateKey } = await trustedOwner();
+  const first = { id: "first", deviceId, path: ["folders", "photos", "retention"], parents: [],
+    value: { minimumCopies: 2, retentionRevision: 2, holders: [] } };
+  const second = { ...first, id: "second",
+    value: { minimumCopies: 3, retentionRevision: 2, holders: [] } };
+  const signedFirst = await signPersonalSpaceChange(crypto.subtle, privateKey, first);
+  const signedSecond = await signPersonalSpaceChange(crypto.subtle, privateKey, second);
+  const conflicted = await materializePersonalSpaceSettings(crypto.subtle, trust, [signedFirst, signedSecond]);
+  assert.equal(conflicted.settings, null);
+  assert.deepEqual(conflicted.conflicts[0]?.heads, ["first", "second"]);
+  const resolved = await materializePersonalSpaceSettings(crypto.subtle, trust,
+    [signedFirst, signedSecond, await signPersonalSpaceChange(crypto.subtle, privateKey,
+      { ...first, id: "resolution", parents: ["first", "second"] })]);
+  assert.equal(resolved.settings?.folders.photos.minimumCopies, 2);
+});
+
+test("a roster member cannot spoof another member's settings event", async () => {
+  const { deviceId, trust } = await trustedOwner();
+  await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust, [{
+    id: "forged", deviceId, path: ["folders", "photos", "retention"], parents: [],
+    value: { minimumCopies: 1, retentionRevision: 2, holders: [] }, signature: "not-a-signature",
+  }]), /signature/i);
+});
 
 test("shared settings start versioned with a two-copy folder default", () => {
   const settings = defaultPersonalSpaceSettings("roster-1");

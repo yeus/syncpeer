@@ -56,11 +56,12 @@ test("paired peers synchronize the encrypted settings replica without exposing i
         state: targetIdentity.state, signingKey: targetIdentity.signingKey };
       await target.importPairingTransfer(await source.exportPairingTransfer("SOURCE", targetDevice),
         targetIdentity, "synthetic-target-master", false);
-      const [sourceFolder] = await source.sessionSharedFolders({});
-      const [targetFolder] = await target.sessionSharedFolders({});
+      const [sourceFolder] = await source.sessionSharedFolders("TARGET");
+      const [targetFolder] = await target.sessionSharedFolders("SOURCE");
       assert.equal(sourceFolder.internal, true); assert.equal(targetFolder.id, sourceFolder.id);
-      const change = { id: "change-one", deviceId: "device-a",
-        path: ["folders", "photos", "minimumCopies"], parents: [], value: 2 };
+      const change = { id: "change-one", deviceId: (await source.ownedDevices()).localDeviceId!,
+        path: ["folders", "photos", "retention"], parents: [],
+        value: { minimumCopies: 2, retentionRevision: 2, holders: [] } };
       await source.appendPersonalSpaceChange(change);
       const [a, b] = await Promise.all([createTestPeerIdentity(root, "a"), createTestPeerIdentity(root, "b")]);
       const accepted = Promise.withResolvers<SyncpeerSessionHandle>();
@@ -81,7 +82,8 @@ test("paired peers synchronize the encrypted settings replica without exposing i
         assert.ok(Date.now() < deadline, "Hidden settings replica did not converge");
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      assert.deepEqual(await target.personalSpaceChanges(), [change]);
+      assert.equal((await target.personalSpaceChanges())[0]?.id, change.id);
+      assert.equal((await target.sharedPersonalSpaceSettings()).settings?.folders.photos.minimumCopies, 2);
       await source.revokeOwnedDevice(targetIdentity.id);
       let revoked = false;
       while (!revoked) {

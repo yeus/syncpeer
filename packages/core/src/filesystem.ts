@@ -32,6 +32,7 @@ export { createPairingInvitation, createPairingRequest, openPairingSession,
 export type { PairingInvitation, PairingRequest, PairingTransfer } from "./sync/personalSpacePairing.js";
 export { resolvePersonalSpaceChanges } from "./sync/personalSpaceChanges.js";
 export type { PersonalSpaceChange } from "./sync/personalSpaceChanges.js";
+export { materializePersonalSpaceSettings } from "./sync/personalSpaceSettings.js";
 export { createPersonalSpaceSettingsJournal } from "./sync/personalSpaceSettingsJournal.js";
 export { createPersonalSpaceRosterJournal } from "./sync/personalSpaceRosterJournal.js";
 export { createDocumentFilesystem } from "./sync/documentFilesystem.js";

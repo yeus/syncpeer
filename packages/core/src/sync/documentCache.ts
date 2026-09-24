@@ -240,9 +240,9 @@ export function createDocumentCache(options: {
     },
     ownedDevices: async () => (await request<{ devices: OwnedSpaceDevice[] }>({ operation: "ownedDevices" })).devices,
     revokeOwnedDevice: deviceId => request({ operation: "revokeOwnedDevice", deviceId }),
-    sessionSharedFolders: async passwords => {
+    sessionSharedFolders: async remoteDeviceId => {
       if (!options.enabled() || (await cacheStatus()).vault.phase !== "unlocked") return [];
-      return request({ operation: "sessionSharedFolders", passwords });
+      return request({ operation: "sessionSharedFolders", remoteDeviceId });
     },
     loadProfileSettings,
     saveProfileSettings,

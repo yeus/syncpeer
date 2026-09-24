@@ -3,6 +3,7 @@ import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem, dispatchDocumentCommand } from "../packages/core/dist/filesystem.js";
 import { createDocumentCache } from "../packages/core/dist/sync/documentCache.js";
+import { createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 import { createServer } from "vite";
 import { createInitialSessionState } from "../packages/core/dist/ui/sessionPolicies.js";
@@ -151,7 +152,8 @@ test("discovery retains empty roots across peers and only downloads enter the lo
       save: async value => { secret = value; }, remove: async () => { secret = null; },
     } });
   await documents.initialize();
-  await documents.createVault("synthetic-master-password", true);
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await documents.createVault("synthetic-master-password", true, "OWNER", kit.publicKey);
   const legacyFavorite = { key: "folder:photos:", folderId: "photos", path: "", name: "Photos", kind: "folder" as const };
   let legacyFavorites = [legacyFavorite];
   const cache = createDocumentCache({ enabled: () => true,
@@ -170,21 +172,21 @@ test("discovery retains empty roots across peers and only downloads enter the lo
     cache.platformAdapter.cacheFile!("photos", "image.bin", "image.bin", Uint8Array.of(1)),
   ]);
   assert.deepEqual(await cache.platformAdapter.listFavorites!(), [legacyFavorite]);
-  const sharedFolders = await cache.platformAdapter.sessionSharedFolders!({
-    photos: "synthetic-remote-password",
-  });
+  const sharedFolders = await cache.platformAdapter.sessionSharedFolders!("OWNER");
   const settingsFolderId = sharedFolders[0].id;
   assert.match(settingsFolderId, /^[a-f0-9]{32}$/);
   assert.deepEqual(sharedFolders.map(folder => ({ id: folder.id, mode: folder.encryption.mode })), [
     { id: settingsFolderId, mode: "encrypted" },
     { id: "photos", mode: "encrypted" },
   ]);
+  assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!("OWNER"))
+    .map(folder => folder.encryption.mode), ["encrypted", "encrypted"],
+  "A registered encrypted folder must never be advertised as plaintext when connection passwords are absent");
   assert.equal(sharedFolders.every(folder => typeof folder.replica?.scan === "function"), true);
   await assert.rejects(cache.connectFolder({ id: "photos", label: "Photos", password: "different-password" }), /migration/i);
   await cache.syncFolders([{ id: "music", label: "Music", readOnly: false }], {});
-  assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!({
-    photos: "synthetic-remote-password",
-  })).map(folder => folder.id), [settingsFolderId, "photos"],
+  assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!("OWNER"))
+    .map(folder => folder.id), [settingsFolderId, "photos"],
   "The hidden settings folder and whole-folder favorites are advertised as replicas");
   assert.deepEqual(await cache.platformAdapter.listFavorites!(), [legacyFavorite]);
   assert.deepEqual(legacyFavorites, [], "Legacy plaintext favorite settings are removed after encrypted migration");
@@ -194,6 +196,15 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   const settings = await cache.platformAdapter.loadProfileSettings!();
   assert.equal(settings.profile.versioning, "staggered");
   assert.equal(settings.folders.photos?.ignorePatterns.includes("node_modules/"), true);
+  assert.deepEqual(await cache.platformAdapter.sessionSharedFolders!("EXTERNAL"), [],
+    "Unlisted external devices receive neither documents nor private settings");
+  await documents.savePersonalSpaceSetting(["folders", "photos", "shareTargets"],
+    [{ kind: "device", syncthingId: "EXTERNAL" }]);
+  assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!("EXTERNAL"))
+    .map(folder => folder.id), ["photos"],
+  "An explicitly shared document folder does not also disclose the personal-space settings folder");
+  assert.deepEqual((await cache.platformAdapter.sessionSharedFolders!("OWNER"))
+    .map(folder => folder.id), [settingsFolderId]);
   assert.deepEqual(await cache.platformAdapter.removeFavorite!(favorite.key), []);
   const known = await cache.syncFolders([], {});
   assert.deepEqual(known.map(folder => folder.label), ["Photos", "Music"]);

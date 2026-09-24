@@ -17,6 +17,7 @@ import { startIncomingPeerService } from "../../core/src/sync/incomingPeerServic
 import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { resolveApprovedPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
+import { sameDeviceId } from "../../core/src/ui/helpers.js";
 import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
@@ -126,6 +127,7 @@ async function startDocuments(android: AndroidRuntime) {
     command: (input: unknown) => dispatchDocumentCommand(documents, input),
     close: documents.close,
     connectionPasswords: documents.connectionPasswords,
+    status: documents.status,
     ownedDevices: documents.ownedDevices,
     sessionSharedFolders: documents.sessionSharedFolders,
     rememberFolder: documents.rememberFolder,
@@ -153,12 +155,24 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
     const approvedDeviceIds = resolveApprovedPeerDeviceIds(coreOptions.expectedDeviceId, trustedDevices);
     if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
+    const listenPort = options.listenPort ?? 22000;
+    if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+      throw new Error("Incoming TCP port must be between 1 and 65535.");
+    }
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
-      coreOptions.certPem, coreOptions.keyPem]);
+      coreOptions.certPem, coreOptions.keyPem, listenPort]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
     const sessionHandlers = {
-      connectionOptions: (remote: string, endpoint: { host: string; port: number }) =>
-        ({ ...coreOptions, ...endpoint, expectedDeviceId: remote }),
+      connectionOptions: async (remote: string, endpoint: { host: string; port: number }) => {
+        const saved = await documents.connectionPasswords().catch(() => ({}));
+        const folderPasswords = {
+          ...resolveFolderPasswordsForDevice(saved, remote),
+          ...(remote === options.remoteId ? options.folderPasswords : {}),
+        };
+        return { ...coreOptions, ...endpoint, expectedDeviceId: remote, folderPasswords,
+          sharedFolders: (await documents.status()).vault.phase === "unlocked"
+            ? await documents.sessionSharedFolders(remote) : [] };
+      },
       onSession: (session: SyncpeerSessionHandle) => {
         if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(options, session);
@@ -170,7 +184,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     }
     await stopIncomingService();
     incomingService = await startIncomingPeerService(adapter, {
-      host: "0.0.0.0", port: 22000, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
       localDeviceId, approvedDeviceIds, ...sessionHandlers,
       onError: error => adapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
@@ -191,14 +205,15 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
       }
       if (!options.cert || !options.key) throw new Error("Background session is missing the resolved identity.");
       const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
-      if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices).includes(options.remoteId)) {
+      if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices)
+        .some(id => sameDeviceId(id, options.remoteId!))) {
         throw new Error("This peer was removed from the trusted device list.");
       }
       const folderPasswords = {
         ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
         ...options.folderPasswords,
       };
-      const sharedFolders = await documents.sessionSharedFolders(folderPasswords);
+      const sharedFolders = await documents.sessionSharedFolders(options.remoteId ?? "");
       const coreOptions: SyncpeerConnectOptions = {
         host: options.host,
         port: options.port,
@@ -223,7 +238,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
       try { session = await core.openSession(coreOptions, signal); }
       catch (error) {
         if (listenerFailure) throw new AggregateError([error, listenerFailure],
-          "Could not connect to the peer or start the incoming LAN listener on TCP port 22000.",
+          `Could not connect to the peer or start the incoming LAN listener on TCP port ${options.listenPort ?? 22000}.`,
           { cause: error });
         throw error;
       }

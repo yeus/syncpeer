@@ -5,6 +5,32 @@ export interface PersonalSpaceChange {
   parents: string[];
   value?: unknown;
   deleted?: true;
+  signature?: string;
+}
+
+const unsignedChange = (change: PersonalSpaceChange) => ({ id: change.id, deviceId: change.deviceId,
+  path: change.path, parents: change.parents,
+  ...(change.deleted ? { deleted: true as const } : { value: change.value }) });
+const changeBytes = (change: PersonalSpaceChange) =>
+  new TextEncoder().encode(`syncpeer.personal-space-change.v1\n${canonical(unsignedChange(change))}`);
+
+export async function signPersonalSpaceChange(subtle: SubtleCrypto, key: CryptoKey,
+  change: PersonalSpaceChange): Promise<PersonalSpaceChange> {
+  if (change.signature !== undefined) throw new Error("Personal-space change is already signed.");
+  const signature = new Uint8Array(await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key,
+    changeBytes(change)));
+  return { ...change, signature: btoa(String.fromCharCode(...signature)) };
+}
+
+export async function verifyPersonalSpaceChange(subtle: SubtleCrypto, change: PersonalSpaceChange,
+  publicKey: string): Promise<boolean> {
+  if (typeof change.signature !== "string" || !change.signature) return false;
+  try {
+    const key = await subtle.importKey("spki", Uint8Array.from(atob(publicKey), char => char.charCodeAt(0)),
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    return subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key,
+      Uint8Array.from(atob(change.signature), char => char.charCodeAt(0)), changeBytes(change));
+  } catch { return false; }
 }
 
 const pathKey = (path: readonly string[]) => JSON.stringify(path);

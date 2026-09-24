@@ -11,6 +11,7 @@ import type { PersonalSpacePairingTransfer } from "./personalSpacePairing.js";
 import { createOwnedDeviceIdentity, openOwnedRecoveryKit, openOwnedDeviceSigningKey, signOwnedRosterUpdate,
   validateOwnedRecoveryPublicKey, verifyOwnedRoster, type OwnedDeviceIdentity, type OwnedRecoveryKit, type OwnedRosterTrust,
   type OwnedSpaceDevice } from "./personalSpaceSharing.js";
+import { signPersonalSpaceChange, type PersonalSpaceChange } from "./personalSpaceChanges.js";
 
 export interface CredentialVaultRecord {
   format: 1 | 2;
@@ -374,6 +375,17 @@ export function createCredentialVault(options: {
       const verified = await verifyTrust(data.trustedRoster);
       return { trust: data.trustedRoster, localDeviceId: data.ownedDevice?.id ?? null,
         devices: verified.devices };
+    }),
+    signPersonalSpaceChange: (change: PersonalSpaceChange) => run(async () => {
+      const { data } = await unlocked();
+      if (!data.ownedDevice || !data.trustedRoster || change.deviceId !== data.ownedDevice.id) {
+        throw new Error("Personal-space setting author is not this enrolled device.");
+      }
+      const roster = await verifyTrust(data.trustedRoster);
+      if (!roster.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
+        throw new Error("Revoked devices cannot sign personal-space settings.");
+      }
+      return signPersonalSpaceChange(subtle, await openOwnedDeviceSigningKey(subtle, data.ownedDevice), change);
     }),
     acceptOwnedRoster: (trust: OwnedRosterTrust) => run(async () => {
       const { record, data } = await unlocked();

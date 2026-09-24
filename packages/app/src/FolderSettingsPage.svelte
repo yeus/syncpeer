@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { defaultFolderSettings, type PairingInvitation, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
+  import { defaultFolderSettings, type PairingInvitation, type PersonalSpaceSettings,
+    type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { formatProfileCreationError } from "./app/storageErrors.ts";
   let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved,
@@ -33,6 +34,11 @@
   let label = $state(""), password = $state(""), masterPassword = $state(""), error = $state(""), busy = $state(false), migrating = $state("");
   let biometricState = $state<{ available: boolean; enabled: boolean } | null>(null);
   let settings = $state<SyncpeerProfileSettings | null>(null);
+  let sharedSettings = $state<PersonalSpaceSettings | null>(null);
+  let sharedConflicts = $state<Array<{ path: string[]; heads: string[];
+    changes: Array<{ id: string; deviceId: string; value?: unknown; deleted?: true }> }>>([]);
+  let newHolderIds = $state<Record<string, string>>({});
+  let newHolderKinds = $state<Record<string, "syncpeer" | "syncthing">>({});
   let patternDrafts = $state<Record<string, string>>({});
   let rememberMaster = $state(false), generatedPassword = $state(""), generatedSaved = $state(false);
   let importFolderId = $state(""), importPassword = $state(""), importApproved = $state(false);
@@ -136,6 +142,11 @@
         ({ operation: "ownedDevices" });
       trustedDevices = roster.devices;
       localTrustedDeviceId = roster.localDeviceId;
+      if (roster.devices.length) {
+        const shared = await command<{ settings: PersonalSpaceSettings | null; conflicts: typeof sharedConflicts }>
+          ({ operation: "sharedPersonalSpaceSettings" });
+        sharedSettings = shared.settings; sharedConflicts = shared.conflicts;
+      } else { sharedSettings = null; sharedConflicts = []; }
     }
   }
   async function revokeDevice(deviceId: string) {
@@ -156,6 +167,28 @@
       onSettingsSaved(next);
     } catch { error = "Settings could not be saved."; }
     finally { busy = false; }
+  }
+  async function saveSharedSetting(path: string[], value: unknown) {
+    busy = true; error = "";
+    try {
+      await command({ operation: "savePersonalSpaceSetting", path, value });
+      await refresh();
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Shared settings could not be saved."; }
+    finally { busy = false; }
+  }
+  async function chooseConflict(path: string[], selectedHead: string) {
+    busy = true; error = "";
+    try {
+      await command({ operation: "resolvePersonalSpaceConflict", path, selectedHead });
+      await refresh();
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Shared-settings conflict could not be resolved."; }
+    finally { busy = false; }
+  }
+  function saveRetention(folderId: string, minimumCopies: number,
+    holders: Array<{ id: string; kind: "syncpeer" | "syncthing" }>) {
+    const revision = sharedSettings?.folders[folderId]?.retentionRevision ?? 1;
+    void saveSharedSetting(["folders", folderId, "retention"],
+      { minimumCopies, retentionRevision: revision + 1, holders });
   }
   const updateFolder = (folderId: string, update: (folder: ReturnType<typeof defaultFolderSettings>) => ReturnType<typeof defaultFolderSettings>) => {
     if (!settings) return;
@@ -282,6 +315,20 @@
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
     </section>
   {:else if status?.vault.phase === "unlocked"}
+    {#if sharedConflicts.length}
+      <section>
+        <h2>Shared settings need a choice</h2>
+        <p>Devices changed the same setting independently. Choose one value to create an explicit merged update; no conflicting value is applied automatically.</p>
+        {#each sharedConflicts as conflict (conflict.path.join("/"))}
+          <p>{conflict.path.join(" / ")}</p>
+          {#each conflict.changes as change (change.id)}
+            <button disabled={busy} onclick={() => void chooseConflict(conflict.path, change.id)}>
+              Use {change.deleted ? "deleted value" : JSON.stringify(change.value)} from {change.deviceId.slice(0, 8)}
+            </button>
+          {/each}
+        {/each}
+      </section>
+    {/if}
     {#if !localTrustedDeviceId && trustedDevices.length}
       <section>
         <h2>Recover trusted device access</h2>
@@ -294,8 +341,8 @@
     {/if}
     <section>
       <h2>Pair another Syncpeer device</h2>
-      <p>Enter this device’s LAN address. Creating an invitation temporarily disconnects the current sync session. The invitation expires after five minutes and transfers secrets only after both devices confirm the same code.</p>
-      <label>This device’s LAN host or IP (optional port) <input bind:value={pairingHost} placeholder="192.168.1.20" /></label>
+      <p>Enter this device’s LAN address or a Syncthing relay URL that both devices can reach. Creating an invitation temporarily disconnects the current sync session. The invitation expires after five minutes and transfers secrets only after both devices confirm the same code.</p>
+      <label>LAN host/IP or relay:// URL <input bind:value={pairingHost} placeholder="192.168.1.20" /></label>
       <button disabled={busy || !pairingHost.trim()} onclick={() => void inviteDevice()}>Create pairing invitation</button>
       {#if pairingInvitation}
         <label>Invitation <textarea readonly rows="6" value={pairingInvitation} onclick={event => event.currentTarget.select()}></textarea></label>
@@ -410,6 +457,35 @@
       {/if}
       {#if settings}
         {@const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings()}
+        {#if sharedSettings && localTrustedDeviceId}
+          {@const retention = sharedSettings.folders[folder.id]}
+          <section>
+            <h3>Whole-folder retention policy</h3>
+            <label>Minimum complete copies
+              <input type="number" min="1" value={retention?.minimumCopies ?? 2} disabled={busy}
+                onchange={event => saveRetention(folder.id, Number(event.currentTarget.value), retention?.holders ?? [])} />
+            </label>
+            <p>Named holders (policy only; a complete copy still needs current evidence):</p>
+            <ul>{#each retention?.holders ?? [] as holder (holder.id)}
+              <li>{holder.id} ({holder.kind})
+                <button disabled={busy} onclick={() => saveRetention(folder.id, retention?.minimumCopies ?? 2,
+                  (retention?.holders ?? []).filter(item => item.id !== holder.id))}>Remove holder</button></li>
+            {/each}</ul>
+            <label>Holder device ID <input value={newHolderIds[folder.id] ?? ""}
+              oninput={event => { newHolderIds[folder.id] = event.currentTarget.value; }} /></label>
+            <label>Holder type <select value={newHolderKinds[folder.id] ?? "syncpeer"}
+              onchange={event => { newHolderKinds[folder.id] = event.currentTarget.value as "syncpeer" | "syncthing"; }}>
+              <option value="syncpeer">Syncpeer</option><option value="syncthing">Syncthing</option>
+            </select></label>
+            <button disabled={busy || !newHolderIds[folder.id]?.trim()} onclick={() => {
+              const id = newHolderIds[folder.id]?.trim();
+              if (!id) return;
+              saveRetention(folder.id, retention?.minimumCopies ?? 2,
+                [...retention?.holders ?? [], { id, kind: newHolderKinds[folder.id] ?? "syncpeer" }]);
+              newHolderIds[folder.id] = "";
+            }}>Add holder</button>
+          </section>
+        {/if}
         <label><input type="checkbox" checked={folderSettings.paused}
           onchange={event => updateFolder(folder.id, value => ({ ...value, paused: event.currentTarget.checked }))} /> Pause favorite synchronization</label>
         <label>Ignored patterns

@@ -136,6 +136,7 @@ export {
 export {
   defaultPersonalSpaceSettings,
   folderRetentionPolicyFromSettings,
+  materializePersonalSpaceSettings,
   normalizePersonalSpaceSettings,
   setDeviceFolderSelection,
   updateFolderRetention,

@@ -67,6 +67,13 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     }
     case "exportRecoveryBackup": return documents.exportRecoveryBackup(text("password"));
     case "ownedDevices": return documents.ownedDevices();
+    case "recoverOwnedDevice": {
+      if (!command.kit || typeof command.kit !== "object" || Array.isArray(command.kit)) {
+        throw new Error("Invalid owned recovery kit.");
+      }
+      return documents.recoverOwnedDevice(text("localDeviceId"),
+        command.kit as Parameters<typeof documents.recoverOwnedDevice>[1], text("password"));
+    }
     case "revokeOwnedDevice": return documents.revokeOwnedDevice(text("deviceId"));
     case "exportPairingTransfer": {
       if (!command.joiningDevice || typeof command.joiningDevice !== "object" || Array.isArray(command.joiningDevice)) {
@@ -159,7 +166,8 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     case "createVault": {
       if (command.remember !== undefined && typeof command.remember !== "boolean") throw new Error("Invalid remember setting.");
       return documents.createVault(text("password"), command.remember === true,
-        command.localDeviceId === undefined ? undefined : text("localDeviceId"));
+        command.localDeviceId === undefined ? undefined : text("localDeviceId"),
+        command.recoveryKey === undefined ? undefined : text("recoveryKey"));
     }
     case "unlock": return documents.unlock(text("password"));
     case "unlockRemembered": return documents.unlockRemembered();

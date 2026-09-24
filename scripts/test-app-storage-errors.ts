@@ -3,7 +3,22 @@ import test from "node:test";
 import {
   documentStoragePreparationIssue,
   formatDocumentStoragePreparationError,
+  formatProfileCreationError,
+  safeNativeFailureText,
 } from "../packages/app/src/app/storageErrors.ts";
+
+test("profile creation reports its reason without exposing a local path", () => {
+  assert.equal(formatProfileCreationError(new Error("Replica root is busy")),
+    "The encrypted profile could not be created. Reason: the private storage directory is already in use by another Syncpeer process.");
+  const message = formatProfileCreationError(new Error("Could not open /home/alice/private/profile: unusual failure"));
+  assert.match(message, /Could not open \[path\]: unusual failure/);
+  assert.doesNotMatch(message, /\/home\/alice/);
+});
+
+test("diagnostic failure details also redact sandbox paths", () => {
+  assert.equal(safeNativeFailureText(new Error("Could not open /workspace/private/store.sqlite: invalid")),
+    "Could not open [path]: invalid");
+});
 
 test("explains private document storage initialization on first startup", () => {
   assert.equal(

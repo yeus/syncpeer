@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { build } from "vite";
+import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
 
 const cliArguments = process.argv.slice(2);
 const hasArgument = (name) => cliArguments.includes(name);
@@ -1897,8 +1898,12 @@ const runPairingInvitation = async (outputPath) => {
       request: { operation: "status" },
     }, 60_000);
     if (status.result.vault.phase === "uninitialized") {
+      const kit = await createOwnedRecoveryKit(crypto.subtle,
+        size => crypto.getRandomValues(new Uint8Array(size)), "synthetic-offline-kit-password");
+      const deviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id", {}, 60_000);
       await tauriInvoke(cdp, "syncpeer_document_command", { request: {
         operation: "createVault", password: "synthetic-owner-master-password", remember: true,
+        localDeviceId: deviceId, recoveryKey: kit.publicKey,
       } }, 60_000);
     }
     await openFolderSettings(cdp);

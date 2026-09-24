@@ -17,12 +17,12 @@ const privateStorageResetMessage =
   "You can reset Syncpeer's private local data and start fresh. This removes local settings, downloaded copies, " +
   "unsynced edits, and this device's identity. External folders and other devices are not changed.";
 
-const safeNativeFailureText = (error: unknown): string | null => {
+export const safeNativeFailureText = (error: unknown): string | null => {
   const message = rawErrorText(error).replace(/\s+/g, " ").trim();
   if (!message) return null;
   const withoutPaths = message
     .replace(/file:\/\/[^\s"'`,;):]+/gi, "[path]")
-    .replace(/(?:[A-Za-z]:[\\/]|\/(?:home|users|tmp|var|private|data|storage|mnt)\/)[^\s"'`,;):]+/gi, "[path]");
+    .replace(/(?:[A-Za-z]:[\\/]|\/(?:home|users|tmp|var|private|data|storage|mnt|workspace)\/)[^\s"'`,;):]+/gi, "[path]");
   const withoutLongTokens = withoutPaths.replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted]");
   return withoutLongTokens.length > 240 ? `${withoutLongTokens.slice(0, 237)}...` : withoutLongTokens;
 };
@@ -90,3 +90,8 @@ export const documentStoragePreparationIssue = (folderCount: number, error?: unk
 
 export const formatDocumentStoragePreparationError = (folderCount: number, error?: unknown): string =>
   documentStoragePreparationIssue(folderCount, error).message;
+
+export const formatProfileCreationError = (error: unknown): string => {
+  const reason = storageFailureReason(error)?.replace(/[.!?]+$/, "");
+  return `The encrypted profile could not be created.${reason ? ` Reason: ${reason}.` : ""}`;
+};

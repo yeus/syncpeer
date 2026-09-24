@@ -172,8 +172,8 @@ const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
 };
 
 const settingsStorageId = (folderId: string) =>
-  `personal-space-${[...sha256(new TextEncoder().encode(folderId))]
-    .map(byte => byte.toString(16).padStart(2, "0")).join("")}`;
+  [...sha256(new TextEncoder().encode(`syncpeer.personal-settings-storage.v1:${folderId}`)).slice(0, 16)]
+    .map(byte => byte.toString(16).padStart(2, "0")).join("");
 
 const reconcileOwnedRoster = async (runtime: DocumentRuntime) => {
   if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
@@ -1093,13 +1093,16 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   saveUiState: (value: unknown) => runQueued(runtime, () => runtime.vault.saveUiState(value)),
   rememberFolder: (folder: { id: string; label: string }) =>
     runQueued(runtime, () => rememberFolderAction(runtime, folder)),
-  createVault: (password: string, remember = false, localDeviceId?: string) => runQueued(runtime, async () => {
-    const status = await unlockAfterVaultChange(runtime, () => runtime.vault.create(password, remember));
-    if (localDeviceId) {
-      await runtime.vault.initializeOwnedDevice(localDeviceId);
+  recoverOwnedDevice: (syncthingId: string, kit: Parameters<Vault["recoverOwnedDevice"]>[1], password: string) =>
+    runQueued(runtime, async () => {
       await reconcileOwnedRoster(runtime);
-    }
-    return status;
+      const trust = await runtime.vault.recoverOwnedDevice(syncthingId, kit, password);
+      await reconcileOwnedRoster(runtime);
+      return trust;
+    }),
+  createVault: (password: string, remember = false, localDeviceId?: string, recoveryKey?: string) => runQueued(runtime, async () => {
+    return unlockAfterVaultChange(runtime,
+      () => runtime.vault.create(password, remember, localDeviceId, recoveryKey));
   }),
   unlock: (password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.unlock(password))),

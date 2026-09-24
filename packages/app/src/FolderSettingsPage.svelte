@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { defaultFolderSettings, type PairingInvitation, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
-  import type { createDocumentFilesystem } from "@syncpeer/core/filesystem";
+  import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
+  import { formatProfileCreationError } from "./app/storageErrors.ts";
   let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId,
     onImport, onStartPairing, onJoinPairing, onPairedDevice, peerId, peerFolders, biometric, command }: {
@@ -36,6 +37,8 @@
   let rememberMaster = $state(false), generatedPassword = $state(""), generatedSaved = $state(false);
   let importFolderId = $state(""), importPassword = $state(""), importApproved = $state(false);
   let recoveryPassword = $state(""), backupText = $state(""), backupFile = $state<File | null>(null);
+  let kitPassword = $state(""), kitText = $state(""), kitFile = $state<File | null>(null);
+  let kitSaved = $state(false);
   let pairingHost = $state(""), pairingInvitation = $state(""), pairingMessage = $state("");
   let trustedDevices = $state<Array<{ id: string; syncthingId: string; state: "active" | "revoked" }>>([]);
   let localTrustedDeviceId = $state<string | null>(null);
@@ -92,6 +95,29 @@
       }
     } catch { error = "Backup operation failed. Check the backup and passwords. Existing data was retained."; }
     finally { recoveryPassword = ""; busy = false; }
+  }
+  async function prepareRecoveryKit() {
+    busy = true; error = "";
+    try {
+      const kit = await createOwnedRecoveryKit(crypto.subtle,
+        size => crypto.getRandomValues(new Uint8Array(size)), kitPassword);
+      kitText = JSON.stringify(kit);
+      kitSaved = false;
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Recovery kit could not be created."; }
+    finally { kitPassword = ""; busy = false; }
+  }
+  async function recoverTrustedDevice() {
+    busy = true; error = "";
+    try {
+      if (kitFile && kitFile.size > 16 * 1024) throw new Error("Recovery kit is too large.");
+      const encoded = kitFile ? await kitFile.text() : kitText;
+      if (encoded.length > 16 * 1024) throw new Error("Recovery kit is too large.");
+      await command({ operation: "recoverOwnedDevice", localDeviceId: await getDefaultDeviceId(),
+        kit: JSON.parse(encoded), password: kitPassword });
+      kitText = ""; kitFile = null;
+      await onTrustedDevicesChanged(); await refresh();
+    } catch (failure) { error = failure instanceof Error ? failure.message : "Trusted-device recovery failed."; }
+    finally { kitPassword = ""; busy = false; }
   }
   async function importFolder() {
     if (!importApproved || !peerId || !importFolderId) return;
@@ -154,14 +180,15 @@
     finally { password = ""; busy = false; }
   }
   async function createProfile() {
-    if (!masterPassword || (generatedPassword && !generatedSaved)) return;
+    if (!masterPassword || !kitText || !kitSaved || (generatedPassword && !generatedSaved)) return;
     busy = true; error = "";
     try {
       await command({ operation: "createVault", password: masterPassword, remember: rememberMaster,
-        localDeviceId: await getDefaultDeviceId() });
+        localDeviceId: await getDefaultDeviceId(), recoveryKey: JSON.parse(kitText).publicKey });
+      kitText = ""; kitSaved = false;
       generatedPassword = ""; generatedSaved = false; masterPassword = "";
       await onUnlock(); await refresh();
-    } catch { error = "The encrypted profile could not be created."; }
+    } catch (failure) { error = formatProfileCreationError(failure); }
     finally { busy = false; }
   }
   function generatePassword() {
@@ -233,7 +260,17 @@
         <p><code>{generatedPassword}</code></p>
         <label><input type="checkbox" bind:checked={generatedSaved} /> I saved this recovery password</label>
       {/if}
-      <button disabled={busy || !masterPassword || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
+      <p>Create and save a separate offline signing kit before creating this personal space. You need both this kit and a recent personal-space backup if every trusted device is lost. The kit is not saved in this app or included in the backup.</p>
+      <label>Offline kit password (at least 16 characters) <input type="password" bind:value={kitPassword} autocomplete="new-password" minlength="16" disabled={Boolean(kitText)} /></label>
+      {#if kitText}
+        <label>Encrypted offline signing kit — save separately <textarea readonly rows="6" value={kitText} onclick={event => event.currentTarget.select()}></textarea></label>
+        <a download="syncpeer-offline-signing-kit.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(kitText)}`}>Save offline kit file</a>
+        <label><input type="checkbox" bind:checked={kitSaved} /> I saved the kit and its password separately from this device</label>
+        <button type="button" disabled={busy} onclick={() => { kitText = ""; kitSaved = false; }}>Generate a different kit</button>
+      {:else}
+        <button type="button" disabled={busy || kitPassword.length < 16} onclick={() => void prepareRecoveryKit()}>Generate encrypted offline kit</button>
+      {/if}
+      <button disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
     </form>
     <section>
       <h2>Join an existing personal space</h2>
@@ -245,6 +282,16 @@
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
     </section>
   {:else if status?.vault.phase === "unlocked"}
+    {#if !localTrustedDeviceId && trustedDevices.length}
+      <section>
+        <h2>Recover trusted device access</h2>
+        <p>This backup has no device identity key. Use the separate offline signing kit to enroll this device and revoke every device in the backup's trusted list. Use the latest backup; an older roster may conflict with later changes.</p>
+        <label>Offline signing kit file <input type="file" accept="application/json,.json" onchange={event => { kitFile = event.currentTarget.files?.[0] ?? null; }} /></label>
+        <label>Or paste encrypted kit <textarea rows="6" bind:value={kitText}></textarea></label>
+        <label>Offline kit password <input type="password" bind:value={kitPassword} autocomplete="off" /></label>
+        <button disabled={busy || !kitPassword || (!kitFile && !kitText)} onclick={() => void recoverTrustedDevice()}>Enroll this replacement device</button>
+      </section>
+    {/if}
     <section>
       <h2>Pair another Syncpeer device</h2>
       <p>Enter this device’s LAN address. Creating an invitation temporarily disconnects the current sync session. The invitation expires after five minutes and transfers secrets only after both devices confirm the same code.</p>

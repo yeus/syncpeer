@@ -5,19 +5,27 @@ import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFil
 import { deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { scryptPasswordKdf, type PasswordKdf } from "../packages/core/dist/kdf.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
-import { createOwnedDeviceIdentity } from "../packages/core/dist/sync/personalSpaceSharing.js";
+import { createOwnedDeviceIdentity, createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 test("first-run folder storage requires a recoverable master password and retains files across restarts", async () => {
   const { openStorage } = memoryDocumentStorage();
   let secret: string | null = null;
-  const options = { profileId: "fixture", deviceCounterId: "42", openStorage,
+  const restrictedOpenStorage = async (id: string) => {
+    assert.match(id, /^(profile|[a-f0-9]{32})$/, "Encrypted profile storage IDs must match the native boundary.");
+    return openStorage(id);
+  };
+  const options = { profileId: "fixture", deviceCounterId: "42", openStorage: restrictedOpenStorage,
     profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024, rememberedSecret: {
       isDeviceUnlocked: async () => true, load: async () => secret,
       save: async (value: string) => { secret = value; }, remove: async () => { secret = null; },
     } };
   let documents = createDocumentFilesystem(options);
   assert.equal((await documents.initialize()).vault.phase, "uninitialized");
-  await documents.createVault("synthetic-master-password", true, "FIRST-DEVICE");
+  await assert.rejects(documents.createVault("synthetic-master-password", true, "FIRST-DEVICE"), /recovery signing kit/i);
+  await assert.rejects(documents.createVault("synthetic-master-password", true, "FIRST-DEVICE", "invalid"), /recovery signing key/i);
+  assert.equal((await documents.status()).vault.phase, "uninitialized");
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await documents.createVault("synthetic-master-password", true, "FIRST-DEVICE", kit.publicKey);
   const initialRoster = await documents.ownedDevices();
   assert.equal(initialRoster.devices.length, 1);
   assert.equal(initialRoster.devices[0].syncthingId, "FIRST-DEVICE");
@@ -339,7 +347,8 @@ test("backup commands restore portable credentials without device-local roots or
   };
   const source = await makeDocuments();
   await source.initialize();
-  await source.createVault("synthetic-master-password", false);
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await source.createVault("synthetic-master-password", false, "SOURCE", kit.publicKey);
   const [sourceSettings] = await source.sessionSharedFolders({});
   assert.match(sourceSettings.id, /^[a-f0-9]{32}$/);
   assert.equal(sourceSettings.encryption.mode, "encrypted");
@@ -360,6 +369,12 @@ test("backup commands restore portable credentials without device-local roots or
     recoveryPassword: "wrong-password", password: "new-synthetic-master" }));
   await dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
     recoveryPassword: "synthetic-backup-password", password: "new-synthetic-master" });
+  await assert.rejects(dispatchDocumentCommand(target, { operation: "recoverOwnedDevice",
+    localDeviceId: "RECOVERED", kit, password: "wrong-password" }), /recovery kit/i);
+  await dispatchDocumentCommand(target, { operation: "recoverOwnedDevice",
+    localDeviceId: "RECOVERED", kit, password: "synthetic-offline-kit-password" });
+  assert.deepEqual((await target.ownedDevices()).devices.map(device => [device.syncthingId, device.state]),
+    [["SOURCE", "revoked"], ["RECOVERED", "active"]]);
   assert.deepEqual((await target.status()).folders, []);
   assert.equal(await target.uiState(), null);
   assert.deepEqual(await target.connectionPasswords(), { photos: "synthetic-folder-password" });

@@ -7,7 +7,7 @@ import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { deriveUntrustedFolderCrypto } from "@syncpeer/core/filesystem";
 import { writeEncryptedRecord } from "../packages/core/dist/sync/encryptedRecord.js";
 import { resolveFolderPasswordsForDevice } from "../packages/core/dist/ui/sessionPasswords.js";
-import { createOwnedDeviceIdentity } from "../packages/core/dist/sync/personalSpaceSharing.js";
+import { createOwnedDeviceIdentity, createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 test("headless sessions resolve peer-scoped folder passwords after restart", () => {
   const deviceId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -19,6 +19,28 @@ test("headless sessions resolve peer-scoped folder passwords after restart", () 
     photos: "peer-password",
     notes: "legacy-password",
   });
+});
+
+test("first owned vault save already contains the signed genesis", async () => {
+  let record: unknown = null, bootstrap: unknown = null, vaultSaves = 0;
+  const options = { profileId: "atomic-owned-genesis", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async (value: unknown) => {
+      vaultSaves++;
+      record = structuredClone(value);
+    }, withLock: async <T>(operation: () => Promise<T>) => operation() },
+    bootstrapStorage: { load: async () => structuredClone(bootstrap),
+      save: async (value: unknown) => { bootstrap = structuredClone(value); },
+      remove: async () => { bootstrap = null; } }, revokeAccess: async () => {} };
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  const owner = createCredentialVault(options);
+  await owner.create("synthetic-master-password", false, "OWNER", kit.publicKey);
+  assert.equal(vaultSaves, 1);
+  assert.deepEqual((await owner.ownedRoster())?.devices.map(device => device.syncthingId), ["OWNER"]);
+  await owner.close();
+  const reopened = createCredentialVault(options);
+  await reopened.unlock("synthetic-master-password");
+  assert.deepEqual((await reopened.ownedRoster())?.devices.map(device => device.syncthingId), ["OWNER"]);
+  await reopened.close();
 });
 
 test("new personal-space vault wraps one stable random key instead of re-encrypting settings on password change", async () => {
@@ -66,6 +88,8 @@ test("confirmed pairing transfer initializes the same personal space with a loca
   };
   const owner = createCredentialVault(makeStorage());
   await owner.create("owner-local-password", false);
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-pairing-kit-password");
+  await owner.initializeOwnedDevice("OWNER", kit.publicKey);
   const identity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "JOINED");
   const joiningDevice = { id: identity.id, syncthingId: identity.syncthingId,
     state: identity.state, signingKey: identity.signingKey };
@@ -143,6 +167,38 @@ test("offline recovery backup restores settings with a new device password and n
   const third = createCredentialVault(makeStorage());
   await assert.rejects(third.restoreRecoveryBackup(tampered, "separate-offline-recovery-password", "third-device-password"));
   assert.equal(third.status().phase, "uninitialized");
+});
+
+test("the separate offline kit enrolls a replacement when every prior device is lost", async () => {
+  const makeStorage = () => {
+    let record: unknown = null, bootstrap: unknown = null;
+    return { profileId: "lost-devices-fixture", randomBytes,
+      storage: { load: async () => structuredClone(record), save: async (value: unknown) => { record = structuredClone(value); },
+        withLock: async <T>(operation: () => Promise<T>) => operation() },
+      bootstrapStorage: { load: async () => structuredClone(bootstrap),
+        save: async (value: unknown) => { bootstrap = structuredClone(value); },
+        remove: async () => { bootstrap = null; } }, revokeAccess: async () => {} };
+  };
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  const original = createCredentialVault(makeStorage());
+  await original.create("synthetic-first-device-password", false);
+  await original.initializeOwnedDevice("ORIGINAL", kit.publicKey);
+  const backup = await original.exportRecoveryBackup("synthetic-backup-password");
+  assert.equal(JSON.stringify(backup).includes(kit.ciphertext.join(",")), false);
+  assert.equal(JSON.stringify(backup).includes(kit.publicKey), false);
+  await original.close();
+
+  const replacement = createCredentialVault(makeStorage());
+  await replacement.restoreRecoveryBackup(backup, "synthetic-backup-password", "synthetic-replacement-password");
+  await assert.rejects(replacement.initializeOwnedDevice("REPLACEMENT"), /recovery enrollment/i);
+  await assert.rejects(replacement.recoverOwnedDevice("REPLACEMENT", kit, "wrong-password"), /recovery kit/i);
+  const trust = await replacement.recoverOwnedDevice("REPLACEMENT", kit, "synthetic-offline-kit-password");
+  assert.equal(trust.updates.at(-1)?.signer, "recovery");
+  assert.deepEqual((await replacement.ownedRoster())?.devices.map(device => [device.syncthingId, device.state]),
+    [["ORIGINAL", "revoked"], ["REPLACEMENT", "active"]]);
+  await assert.rejects(replacement.recoverOwnedDevice("THIRD", kit, "synthetic-offline-kit-password"),
+    /already enrolled/i);
+  await replacement.close();
 });
 
 test("personal-space password change rolls back when its recovery record cannot be saved", async () => {

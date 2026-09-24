@@ -77,6 +77,29 @@ const fixture = async (): Promise<LanFixture> => {
 const clickTestId = async (testId: string): Promise<void> => {
   await $("[data-testid='" + testId + "']").click();
 };
+const createFreshProfile = async (): Promise<void> => {
+  await clickTestId("tab-folders");
+  await $("button=Folder settings · New folder").click();
+  const master = $("//label[contains(., 'Master password (at least 16 characters)')]/input");
+  await master.waitForExist();
+  await master.setValue("synthetic-desktop-master-password");
+  await $("//label[contains(., 'Offline kit password')]/input")
+    .setValue("synthetic-offline-kit-password");
+  await $("button=Generate encrypted offline kit").click();
+  const kit = $("a[download='syncpeer-offline-signing-kit.json']");
+  await kit.waitForExist();
+  const encoded = await $("textarea[readonly]").getValue();
+  assert.ok(JSON.parse(encoded).publicKey, "The generated synthetic kit must have a public key.");
+  await $("//label[contains(., 'I saved the kit')]/input").click();
+  await $("button=Create encrypted profile").click();
+  try {
+    await $("button=Create encrypted profile").waitForExist({ reverse: true, timeout: 30_000 });
+  } catch (error) {
+    const issue = await $("p[role='alert']").getText().catch(() => "No profile error was shown.");
+    throw new Error(`Fresh profile setup did not complete: ${issue}`, { cause: error });
+  }
+  await $("button=Back").click();
+};
 const connect = async (
   currentFixture: LanFixture,
   mode: "automatic" | "direct" | "lan" | "global",
@@ -156,6 +179,7 @@ describe("Syncpeer LAN integration", () => {
     if (process.env.SYNCPEER_LAN_MANUAL_IDS !== "1") {
       await request("POST", "/v1/register", { profile: "trusted", deviceId });
     }
+    await createFreshProfile();
     currentFixture = await fixture();
   });
 

@@ -20,7 +20,8 @@ import { createNodeFolderReplica } from "../packages/core/dist/sync/nodeReplica.
 import { randomBytes } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createCiphertextReplica, deriveUntrustedFolderCrypto, writeEncryptedDiskFile,
-  loadCiphertextDiskMetadata, readCiphertextBlock, createOwnedDeviceIdentity } from "@syncpeer/core/filesystem";
+  loadCiphertextDiskMetadata, readCiphertextBlock, createOwnedDeviceIdentity,
+  createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
 import { memoryDocumentStorage, memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 
 async function createTestPeerIdentity(root: string, name: string) {
@@ -48,7 +49,8 @@ test("paired peers synchronize the encrypted settings replica without exposing i
     let outgoing: SyncpeerSessionHandle | undefined, incoming: SyncpeerSessionHandle | undefined;
     try {
       await source.initialize(); await target.initialize();
-      await source.createVault("synthetic-settings-master", false);
+      const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+      await source.createVault("synthetic-settings-master", false, "SOURCE", kit.publicKey);
       const targetIdentity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "TARGET");
       const targetDevice = { id: targetIdentity.id, syncthingId: targetIdentity.syncthingId,
         state: targetIdentity.state, signingKey: targetIdentity.signingKey };

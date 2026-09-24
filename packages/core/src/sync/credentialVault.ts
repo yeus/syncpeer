@@ -8,8 +8,9 @@ import { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap,
   personalVaultKey, settingsFolderPassword, wrapPersonalSpaceBootstrap,
   type PersonalSpace, type PersonalSpaceBootstrap } from "./personalSpaceBootstrap.js";
 import type { PersonalSpacePairingTransfer } from "./personalSpacePairing.js";
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signOwnedRosterUpdate, verifyOwnedRoster,
-  type OwnedDeviceIdentity, type OwnedRosterTrust, type OwnedSpaceDevice } from "./personalSpaceSharing.js";
+import { createOwnedDeviceIdentity, openOwnedRecoveryKit, openOwnedDeviceSigningKey, signOwnedRosterUpdate,
+  validateOwnedRecoveryPublicKey, verifyOwnedRoster, type OwnedDeviceIdentity, type OwnedRecoveryKit, type OwnedRosterTrust,
+  type OwnedSpaceDevice } from "./personalSpaceSharing.js";
 
 export interface CredentialVaultRecord {
   format: 1 | 2;
@@ -221,8 +222,9 @@ export function createCredentialVault(options: {
     if (!trust || trust.knownHead !== trust.updates.at(-1)?.hash) throw new Error("Invalid trusted device list.");
     return verifyOwnedRoster(subtle, trust.updates, trust.genesisKey, knownHead);
   };
-  const prepareOwnedDevice = async (data: VaultData, syncthingId: string) => {
-    if (!personalSpace) throw new Error("Only personal-space profiles have a trusted device list.");
+  const prepareOwnedDevice = async (space: PersonalSpace | undefined, data: VaultData,
+    syncthingId: string, recoveryKey?: string) => {
+    if (!space) throw new Error("Only personal-space profiles have a trusted device list.");
     if (data.ownedDevice) {
       await openOwnedDeviceSigningKey(subtle, data.ownedDevice);
       if (!data.trustedRoster) throw new Error("Trusted device list is missing.");
@@ -241,13 +243,15 @@ export function createCredentialVault(options: {
         trustedRoster: { ...data.trustedRoster, knownHead: update.hash,
           updates: [...data.trustedRoster.updates, update] } };
     }
+    if (!recoveryKey) throw new Error("A separate offline recovery signing kit is required before enrolling the first device.");
+    await validateOwnedRecoveryPublicKey(subtle, recoveryKey);
     if (data.trustedRoster) throw new Error("This recovered profile requires trusted-device recovery enrollment.");
     const identity = await createOwnedDeviceIdentity(subtle, options.randomBytes, syncthingId);
     const key = await openOwnedDeviceSigningKey(subtle, identity);
     const device = { id: identity.id, syncthingId: identity.syncthingId,
       state: identity.state, signingKey: identity.signingKey };
     const genesis = await signOwnedRosterUpdate(subtle, key,
-      { sequence: 1, previous: null, signer: identity.id, devices: [device] });
+      { sequence: 1, previous: null, signer: identity.id, recoveryKey, devices: [device] });
     return { ...data, ownedDevice: identity,
       trustedRoster: { genesisKey: identity.signingKey, knownHead: genesis.hash, updates: [genesis] } };
   };
@@ -287,17 +291,23 @@ export function createCredentialVault(options: {
       }
       return status();
     }),
-    create: (masterPassword: string, remember = true) => run(async () => {
+    create: (masterPassword: string, remember = true, localSyncthingId?: string, recoveryKey?: string) => run(async () => {
       if (key || initialized) throw new Error("Credential vault already initialized; recover missing storage instead of replacing it.");
+      if (localSyncthingId && !recoveryKey) throw new Error("A separate offline recovery signing kit is required before enrolling the first device.");
+      if (recoveryKey && !localSyncthingId) throw new Error("A local device ID is required for trusted-device enrollment.");
       if (decodeRecord(await options.storage.load())) throw new Error("Credential vault already exists.");
       if (options.bootstrapStorage) {
         if (await options.bootstrapStorage.load() !== null) throw new Error("Personal-space recovery record already exists.");
         const { record: bootstrap, space } = await createPersonalSpaceBootstrap(password(masterPassword), options.randomBytes, kdf);
         let secret: Uint8Array | undefined;
         try {
+          const initialData: VaultData = { format: 1, defaultPassword: null, folders: {} };
+          const data = localSyncthingId
+            ? await prepareOwnedDevice(space, initialData, localSyncthingId, recoveryKey)
+            : initialData;
           await options.bootstrapStorage.save(bootstrap);
           secret = personalVaultKey(space);
-          await save({ format: 1, defaultPassword: null, folders: {} }, secret,
+          await save(data, secret,
             { format: 2, manualLocked: false, remember });
           key = secret; personalSpace = space; initialized = true;
           if (remember) await rememberSecret(masterPassword);
@@ -332,7 +342,7 @@ export function createCredentialVault(options: {
     exportPairingTransfer: (localSyncthingId: string, joiningDevice: OwnedSpaceDevice) => run(async (): Promise<PersonalSpacePairingTransfer> => {
       const { record, data: stored } = await unlocked();
       if (!personalSpace) throw new Error("Only personal-space profiles can pair devices.");
-      let data = await prepareOwnedDevice(stored, localSyncthingId);
+      let data = await prepareOwnedDevice(personalSpace, stored, localSyncthingId);
       const current = await verifyTrust(data.trustedRoster!);
       if (!current.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
         throw new Error("This device is no longer active in the trusted device list.");
@@ -399,11 +409,34 @@ export function createCredentialVault(options: {
       return personalSpace ? { id: personalSpace.settingsFolderId,
         password: settingsFolderPassword(personalSpace) } : null;
     }),
-    initializeOwnedDevice: (syncthingId: string) => run(async () => {
+    initializeOwnedDevice: (syncthingId: string, recoveryKey?: string) => run(async () => {
       const { record, data } = await unlocked();
-      const prepared = await prepareOwnedDevice(data, syncthingId);
+      const prepared = await prepareOwnedDevice(personalSpace, data, syncthingId, recoveryKey);
       await save(prepared, key!, record);
       return prepared.trustedRoster!;
+    }),
+    recoverOwnedDevice: (syncthingId: string, kit: OwnedRecoveryKit, kitPassword: string) => run(async () => {
+      const { record, data } = await unlocked();
+      if (!personalSpace || !data.trustedRoster) throw new Error("Trusted-device recovery needs a restored personal-space backup.");
+      if (data.ownedDevice) throw new Error("This device is already enrolled in the personal space.");
+      const current = await verifyTrust(data.trustedRoster);
+      if (!kit || kit.publicKey !== data.trustedRoster.updates[0].recoveryKey) {
+        throw new Error("Recovery kit does not match this personal space.");
+      }
+      const recoveryKey = await openOwnedRecoveryKit(subtle, kit, kitPassword, kdf);
+      const identity = await createOwnedDeviceIdentity(subtle, options.randomBytes, syncthingId);
+      const devices: OwnedSpaceDevice[] = [...current.devices.map(device => ({ ...device,
+        state: "revoked" as const })), { id: identity.id, syncthingId: identity.syncthingId,
+        signingKey: identity.signingKey, state: "active" }];
+      const next = await signOwnedRosterUpdate(subtle, recoveryKey, {
+        sequence: data.trustedRoster.updates.length + 1, previous: data.trustedRoster.knownHead,
+        signer: "recovery", recoveryKey: kit.publicKey, devices,
+      });
+      const trust = { ...data.trustedRoster, knownHead: next.hash,
+        updates: [...data.trustedRoster.updates, next] };
+      await verifyTrust(trust, data.trustedRoster.knownHead);
+      await save({ ...data, ownedDevice: identity, trustedRoster: trust }, key!, record);
+      return trust;
     }),
     importPairingTransfer: (transfer: PersonalSpacePairingTransfer, identity: OwnedDeviceIdentity, localMasterPassword: string,
       remember = true) => run(async () => {

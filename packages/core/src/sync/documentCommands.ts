@@ -127,6 +127,14 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     }
     case "rememberFolder": return documents.rememberFolder({ id: text("id"), label: text("label") });
     case "cachedFiles": return documents.cachedFiles();
+    case "digestCachedFiles": {
+      if (!Array.isArray(command.files) || command.files.length > 256 || command.files.some(file =>
+        !file || typeof file !== "object" || typeof file.folderId !== "string" || !file.folderId ||
+        file.folderId.length > 4096 || typeof file.path !== "string" || !file.path || file.path.length > 4096)) {
+        throw new Error("Invalid cached document digest request.");
+      }
+      return documents.digestCachedFiles(command.files.map(file => ({ folderId: file.folderId, path: file.path })));
+    }
     case "folderFiles": return documents.cachedFiles(text("folderId"));
     case "cachedStatuses": {
       if (!Array.isArray(command.paths) || command.paths.length > 4096 || command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");

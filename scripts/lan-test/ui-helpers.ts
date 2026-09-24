@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { $ } from "@wdio/globals";
@@ -168,16 +167,15 @@ export const readCachedHash = async (
   browser: TauriBrowser,
   relativePath: string,
 ): Promise<string | null> => {
-  const records = await browser.tauri.execute((tauri) =>
-    tauri.core.invoke("syncpeer_list_cached_files"),
-  ) as Array<{ path: string; localPath?: string }>;
-  const record = records.find((candidate) => candidate.path === relativePath);
-  if (!record?.localPath) return null;
-  const bytes = await browser.tauri.execute((tauri, filePath: string) =>
-    tauri.core.invoke("syncpeer_read_binary_file", { request: { path: filePath } }),
-    record.localPath,
-  ) as number[];
-  return createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+  if (relativePath === "blob.bin") console.log("Large transfer digest request started.");
+  const digest = await browser.execute(async (path: string) => {
+    const testWindow = window as Window & {
+      __syncpeerDigestCachedFile?: (path: string) => Promise<string | null>;
+    };
+    return testWindow.__syncpeerDigestCachedFile?.(path) ?? null;
+  }, relativePath);
+  if (relativePath === "blob.bin") console.log("Large transfer digest request returned.");
+  return digest;
 };
 
 export const readSessionEventNames = async (

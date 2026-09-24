@@ -223,6 +223,22 @@ export function createDocumentCache(options: {
     return legacy.filter(file => !attached.some(folder => folder.id === file.folderId))
       .concat(await request<CachedFileRecord[]>({ operation: "cachedFiles" }));
   };
+  const digestCachedFiles: NonNullable<SyncpeerPlatformAdapter["digestCachedFiles"]> = async files => {
+    const encryptedFiles: Array<{ folderId: string; path: string }> = [];
+    const legacy: Array<{ folderId: string; path: string }> = [];
+    for (const file of files) {
+      const folder = await owner(file.folderId);
+      if (!folder) { legacy.push(file); continue; }
+      encryptedFiles.push(file);
+    }
+    const current = encryptedFiles.length ? await request<Array<{ folderId: string; path: string; hash: string }>>(
+      { operation: "digestCachedFiles", files: encryptedFiles }) : [];
+    const old = legacy.length ? await options.legacy.digestCachedFiles?.(legacy) ?? [] : [];
+    const encrypted = new Map(current.map(file => [JSON.stringify([file.folderId, file.path]), file.hash]));
+    const legacyByKey = new Map(old.map(file => [JSON.stringify([file.folderId, file.path]), file.hash]));
+    return files.map(file => ({ ...file, hash: encrypted.get(JSON.stringify([file.folderId, file.path]))
+      ?? legacyByKey.get(JSON.stringify([file.folderId, file.path])) }));
+  };
   const show = async (folderId: string, path: string, parent: boolean) => {
     const folder = await owner(folderId);
     if (!folder) {
@@ -233,6 +249,7 @@ export function createDocumentCache(options: {
     await options.show(documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
   };
   const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
+    digestCachedFiles,
     exportPairingTransfer: (localDeviceId, joiningDevice) => request({ operation: "exportPairingTransfer",
       localDeviceId, joiningDevice }),
     importPairingTransfer: async (transfer, identity, password, remember) => {

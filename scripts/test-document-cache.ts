@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createDocumentFilesystem, dispatchDocumentCommand } from "../packages/core/dist/filesystem.js";
 import { createDocumentCache } from "../packages/core/dist/sync/documentCache.js";
 import { createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
@@ -265,11 +265,16 @@ test("cache migration verifies and removes plaintext originals", async t => {
   const original = Uint8Array.of(1, 2, 3, 4);
   let legacyWrites = 0;
   let failVerification = true, failRemoval = false;
+  let digestOperations: string[] | null = null;
   const records = [{ key: "fixture-folder:sample.bin", folderId: "fixture-folder", path: "sample.bin", name: "sample.bin",
     localPath: "/synthetic/sample.bin", sizeBytes: 4, cachedAtMs: 10, modifiedMs: 10 }];
   const cache = createDocumentCache({ enabled: () => true,
-    request: async <T>(request: Record<string, unknown>) => await dispatchDocumentCommand(documents, request) as T,
+    request: async <T>(request: Record<string, unknown>) => {
+      if (digestOperations) digestOperations.push(String(request.operation));
+      return await dispatchDocumentCommand(documents, request) as T;
+    },
     legacy: { listCachedFiles: async () => records, cacheFile: async () => { legacyWrites++; },
+      digestCachedFiles: async files => files.map(file => ({ ...file, hash: "synthetic-legacy-hash" })),
       removeCachedFile: async (folderId, path) => {
         if (failRemoval) return false;
         const index = records.findIndex(value => value.folderId === folderId && value.path === path);
@@ -282,6 +287,9 @@ test("cache migration verifies and removes plaintext originals", async t => {
     show: async () => {},
   });
   assert.equal((await cache.platformAdapter.listCachedFiles!())[0].localPath, records[0].localPath);
+  assert.deepEqual(await cache.platformAdapter.digestCachedFiles!([{ folderId: "fixture-folder", path: "sample.bin" }]),
+    [{ folderId: "fixture-folder", path: "sample.bin", hash: "synthetic-legacy-hash" }],
+    "Unmigrated files retain the native digest path");
   await assert.rejects(cache.connectFolder({ id: "fixture-folder", label: "Fixture", password: "synthetic-folder-password" }), /changed/i);
   assert.equal((await documents.status()).folders[0].downloads, undefined, "Failed verification must not switch owners");
   failVerification = false;
@@ -293,6 +301,13 @@ test("cache migration verifies and removes plaintext originals", async t => {
   assert.ok(baseline?.hash, "Downloads retain an encrypted sync baseline across app restarts");
   assert.ok(cached.localPath?.startsWith("syncpeer-document:"));
   assert.deepEqual(await cache.platformAdapter.readBinaryFile!(cached.localPath!), original);
+  digestOperations = [];
+  assert.deepEqual(await cache.platformAdapter.digestCachedFiles!([{ folderId: cached.folderId, path: cached.path }]),
+    [{ folderId: cached.folderId, path: cached.path, hash: baseline.hash }],
+    "Automatic refresh hashes the encrypted document, not the old plaintext cache");
+  assert.ok(digestOperations.includes("digestCachedFiles"), "The document owner should hash its own bytes");
+  assert.equal(digestOperations.includes("read"), false, "Hashing must not stream file ranges through the UI bridge");
+  digestOperations = null;
   await documents.detachDownloads("fixture-folder");
   records.push({ key: "fixture-folder:retry.bin", folderId: "fixture-folder", path: "retry.bin", name: "retry.bin",
     localPath: "/synthetic/retry.bin", sizeBytes: 4, cachedAtMs: 11, modifiedMs: 11 });
@@ -310,6 +325,10 @@ test("cache migration verifies and removes plaintext originals", async t => {
   await documents.write(picker, 0, Uint8Array.of(9)); await documents.release(picker);
   assert.deepEqual((await cache.platformAdapter.listCachedFiles!())[0].syncBaseline, baseline, "Picker edits must not change the last remote baseline");
   assert.deepEqual(await cache.platformAdapter.readBinaryFile!(cached.localPath!), Uint8Array.of(9, 2, 3, 4));
+  assert.deepEqual(await cache.platformAdapter.digestCachedFiles!([{ folderId: cached.folderId, path: cached.path }]),
+    [{ folderId: cached.folderId, path: cached.path,
+      hash: createHash("sha256").update(Uint8Array.of(9, 2, 3, 4)).digest("hex") }],
+    "An external document edit must change the digest used for conflict detection");
   assert.equal(await cache.platformAdapter.acknowledgeCachedSync!("fixture-folder", "sample.bin", baseline!), true);
   assert.deepEqual(await cache.platformAdapter.readBinaryFile!(cached.localPath!), Uint8Array.of(9, 2, 3, 4), "Acknowledging an uploaded snapshot never replays old bytes over picker edits");
   await cache.platformAdapter.cacheFile!("fixture-folder", "nested/new.bin", "new.bin", Uint8Array.of(8, 7), 20);

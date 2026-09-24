@@ -98,6 +98,13 @@ test("one-host Tauri tests skip public discovery probes", () => {
   assert.match(smoke, /this\.skip\(\)/);
 });
 
+test("large desktop cache checks avoid full-byte WebDriver exports", () => {
+  const helper = fs.readFileSync("scripts/lan-test/ui-helpers.ts", "utf8");
+  assert.match(helper, /__syncpeerDigestCachedFile/);
+  assert.doesNotMatch(helper, /syncpeer_read_binary_file/);
+  assert.doesNotMatch(helper, /__syncpeerReadCachedBytes/);
+});
+
 test("the synthetic document editor is a separate test-only APK", () => {
   const editorSettings = fs.readFileSync(
     "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/settings.gradle.kts",

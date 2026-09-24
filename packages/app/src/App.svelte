@@ -82,6 +82,7 @@
       percent: number,
     ) => void;
     __syncpeerClearDownloadProgress?: () => void;
+    __syncpeerDigestCachedFile?: (path: string) => Promise<string | null>;
   };
 
   let app = $state(createInitialState());
@@ -460,6 +461,11 @@
         app.favorites.activeDownloads = {};
         app.ui.downloadNotice = "";
       };
+      testWindow.__syncpeerDigestCachedFile = async (path: string) => {
+        const matches = (await platformAdapter.listCachedFiles?.() ?? []).filter(file => file.path === path);
+        if (matches.length !== 1 || !platformAdapter.digestCachedFiles) return null;
+        return (await platformAdapter.digestCachedFiles([{ folderId: matches[0].folderId, path }]))[0]?.hash ?? null;
+      };
     }
 
     return () => {
@@ -467,6 +473,7 @@
         const testWindow = window as SyncpeerTestWindow;
         delete testWindow.__syncpeerSetDownloadProgress;
         delete testWindow.__syncpeerClearDownloadProgress;
+        delete testWindow.__syncpeerDigestCachedFile;
       }
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);

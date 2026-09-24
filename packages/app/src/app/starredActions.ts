@@ -224,7 +224,7 @@ const syncStarredFiles = async () => {
       const cached = cachedByKey.get(key);
 
       if (!cached) {
-        const localHash = await downloadStarredFile(
+        const downloadedHash = await downloadStarredFile(
           favorite.folderId,
           targetPath,
           favorite.name,
@@ -232,7 +232,7 @@ const syncStarredFiles = async () => {
           remoteEntry.modifiedMs || Date.now(),
         );
         state.sync.starredFileSyncState[key] = {
-          lastLocalHash: localHash,
+          lastLocalHash: downloadedHash,
           lastRemoteModifiedMs: remoteEntry.modifiedMs || Date.now(),
           lastRemoteSizeBytes: remoteEntry.size,
           lastSyncAtMs: Date.now(),
@@ -257,8 +257,8 @@ const syncStarredFiles = async () => {
       const nativeLocalHash = nativeDigestByKey.get(key);
       let localBytes: Uint8Array | null = null;
       let localHash: string;
-      if (nativeLocalHash !== undefined) {
-        localHash = nativeLocalHash ?? previous?.lastLocalHash ?? "";
+      if (nativeLocalHash) {
+        localHash = nativeLocalHash;
         if (previous && localHash !== previous.lastLocalHash) {
           localBytes = await readCachedBytes(cached, favorite.folderId, targetPath);
           if (!localBytes) {
@@ -276,10 +276,12 @@ const syncStarredFiles = async () => {
         cached,
       );
       if (remoteChanged) {
-        if (cached.syncBaseline && (!localBytes || localChanged)) {
-          throw new Error("Both the document and remote file may have changed. Local edits were preserved; resolve the conflict before downloading a replacement.");
+        const localUnchanged = Boolean(previous && localHash === previous.lastLocalHash &&
+          (nativeLocalHash || localBytes));
+        if (!localUnchanged) {
+          throw new Error("The local document could not be verified unchanged against its remote baseline. Local edits were preserved; resolve the conflict before downloading a replacement.");
         }
-        const localHash = await downloadStarredFile(
+        const downloadedHash = await downloadStarredFile(
           favorite.folderId,
           targetPath,
           favorite.name,
@@ -288,7 +290,7 @@ const syncStarredFiles = async () => {
           cached.syncBaselineRequired ? previous?.lastLocalHash : undefined,
         );
         state.sync.starredFileSyncState[key] = {
-          lastLocalHash: localHash,
+          lastLocalHash: downloadedHash,
           lastRemoteModifiedMs: remoteModifiedMs || Date.now(),
           lastRemoteSizeBytes: remoteEntry.size,
           lastSyncAtMs: Date.now(),

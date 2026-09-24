@@ -591,6 +591,23 @@ const cachedFilesAction = async (
   return files;
 };
 
+const digestCachedFilesAction = async (
+  runtime: DocumentRuntime,
+  files: readonly { folderId: string; path: string }[],
+) => {
+  if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
+  const folders = new Set(runtime.registry!.getState().filter(folder => folder.downloads).map(folder => folder.id));
+  const digests: Array<{ folderId: string; path: string; hash: string }> = [];
+  for (const file of files) {
+    if (!folders.has(file.folderId)) throw new Error("Downloads are not attached.");
+    assertReplicaPath(file.path);
+    if (isInternalReplicaPath(file.path)) throw new Error("Private document.");
+    const replica = runtime.registry!.getReplica(file.folderId)!;
+    digests.push({ ...file, hash: await hashReplicaFile(replica, file.path) });
+  }
+  return digests;
+};
+
 const cachedStatusesAction = async (
   runtime: DocumentRuntime,
   folderId: string,
@@ -1274,6 +1291,8 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
 
 const createDirectoryActions = (runtime: DocumentRuntime) => ({
   cachedFiles: (folderId?: string) => runQueued(runtime, () => cachedFilesAction(runtime, folderId)),
+  digestCachedFiles: (files: readonly { folderId: string; path: string }[]) =>
+    runQueued(runtime, () => digestCachedFilesAction(runtime, files)),
   cachedStatuses: (folderId: string, paths: string[]) => runQueued(runtime, () => cachedStatusesAction(runtime, folderId, paths)),
   remove: (id: string) => runQueued(runtime, () => removeDocumentAction(runtime, id)),
   rename: (id: string, name: string) => runQueued(runtime, () => renameDocumentAction(runtime, id, name)),

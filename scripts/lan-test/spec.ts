@@ -298,6 +298,10 @@ describe("Syncpeer LAN integration", () => {
       await waitForText(lanBrowser, "Downloaded blob.bin", 120_000);
       const result = await churn;
       assert.ok(result.ticks >= 4);
+      const cachedHash = await readCachedHash(lanBrowser, "blob.bin");
+      assert.equal(cachedHash,
+        currentFixture.expectedFiles.find(file => file.path === "blob.bin")?.sha256,
+        "A completed large transfer must match the peer's published SHA-256");
     });
   });
 

@@ -331,33 +331,14 @@ export const createTauriAdapters = (
         request: { host, port, certPem, keyPem, alpnProtocols: [...alpnProtocols],
           handshakeTimeoutMs: handshakeTimeoutMs ?? null },
       });
-      let closed = false;
-      return {
-        port: opened.port,
-        accept: async () => {
-          while (!closed) {
-            try {
-              const accepted = await invokeWithLogging<TlsAcceptResponse>("syncpeer_tls_accept", {
-                request: { listenerId: opened.listenerId, timeoutMs: 60_000 },
-              });
-              return { socket: createTlsSocket(invokeWithLogging, Number(accepted.sessionId),
-                new Uint8Array(accepted.peerCertificateDer)), remoteAddress: accepted.remoteAddress,
-              remotePort: accepted.remotePort, alpn: accepted.alpn };
-            } catch (error) {
-              if (!closed && /accept timed out/i.test(String(error))) continue;
-              throw error;
-            }
-          }
-          throw new Error("TLS listener closed.");
-        },
-        close: async () => {
-          if (closed) return;
-          closed = true;
-          await invokeWithLogging("syncpeer_tls_listener_close", {
-            request: { listenerId: opened.listenerId },
-          });
-        },
-      };
+      return createNativeTlsListener(invokeWithLogging, opened);
+    },
+    listenRelay: async ({ relayAddress, certPem, keyPem, alpnProtocols, handshakeTimeoutMs }) => {
+      const opened = await invokeWithLogging<TlsListenResponse>("syncpeer_relay_listen", {
+        request: { relayAddress, certPem, keyPem, alpnProtocols: [...alpnProtocols],
+          handshakeTimeoutMs: handshakeTimeoutMs ?? null },
+      });
+      return createNativeTlsListener(invokeWithLogging, opened);
     },
     connectQuic: async ({
       host,
@@ -395,7 +376,8 @@ export const createTauriAdapters = (
         "syncpeer_quic",
       );
     },
-    connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs, signal }) => {
+    connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs, signal,
+      alpnProtocols }) => {
       const opened = await invokeWithLogging<RelayOpenResponse>("syncpeer_relay_open", {
         request: {
           relayAddress,
@@ -404,6 +386,7 @@ export const createTauriAdapters = (
           keyPem,
           caPem: caPem ?? null,
           timeoutMs: timeoutMs ?? null,
+          alpnProtocols: [...alpnProtocols ?? ["bep/1.0"]],
         },
       });
       const sessionId = Number(opened.sessionId);
@@ -755,6 +738,34 @@ export const createTauriAdapters = (
       setEnabled: async (enabled: boolean) => invokeWithLogging<{ available: boolean; enabled: boolean }>("syncpeer_android_biometric_set_enabled", { request: { profileId: "documents", enabled } }),
       authenticate: async () => invokeWithLogging<boolean>("syncpeer_android_biometric_authenticate", { request: { profileId: "documents" } }),
     } : undefined };
+};
+
+const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse) => {
+  let closed = false;
+  return {
+    port: opened.port,
+    accept: async () => {
+      while (!closed) {
+        try {
+          const accepted = await invoke<TlsAcceptResponse>("syncpeer_tls_accept", {
+            request: { listenerId: opened.listenerId, timeoutMs: 60_000 },
+          });
+          return { socket: createTlsSocket(invoke, Number(accepted.sessionId),
+            new Uint8Array(accepted.peerCertificateDer)), remoteAddress: accepted.remoteAddress,
+          remotePort: accepted.remotePort, alpn: accepted.alpn };
+        } catch (error) {
+          if (!closed && /accept timed out/i.test(String(error))) continue;
+          throw error;
+        }
+      }
+      throw new Error("TLS listener closed.");
+    },
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await invoke("syncpeer_tls_listener_close", { request: { listenerId: opened.listenerId } });
+    },
+  };
 };
 
 export const reportUiError = (

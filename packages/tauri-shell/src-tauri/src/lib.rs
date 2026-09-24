@@ -13,7 +13,7 @@ mod vault_secret;
 mod local_reset;
 use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
 use native_cache_metadata::NativeCacheMetadata;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, DistinguishedName, ServerConfig,
     ServerConnection, SignatureScheme, StreamOwned};
 use prost::Message;
@@ -402,6 +402,17 @@ struct RelayOpenRequest {
     key_pem: String,
     ca_pem: Option<String>,
     timeout_ms: Option<u64>,
+    alpn_protocols: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayListenRequest {
+    relay_address: String,
+    cert_pem: String,
+    key_pem: String,
+    alpn_protocols: Vec<String>,
+    handshake_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,6 +693,9 @@ const SYNCPEER_DISCOVERY_PORT: u16 = 21037;
 const SYNCPEER_DISCOVERY_KIND_PROBE: u8 = 1;
 const SYNCPEER_DISCOVERY_KIND_REPLY: u8 = 2;
 const SYNCPEER_SYNC_PORT: u16 = 22000;
+const RELAY_MESSAGE_TYPE_PING: u32 = 0;
+const RELAY_MESSAGE_TYPE_PONG: u32 = 1;
+const RELAY_MESSAGE_TYPE_JOIN_RELAY_REQUEST: u32 = 2;
 const RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST: u32 = 3;
 const RELAY_MESSAGE_TYPE_RESPONSE: u32 = 4;
 const RELAY_MESSAGE_TYPE_CONNECT_REQUEST: u32 = 5;
@@ -2015,24 +2029,49 @@ fn relay_write_message<W: Write>(
     Ok(())
 }
 
-fn relay_read_message<R: Read>(reader: &mut R) -> Result<(u32, Vec<u8>), String> {
+fn relay_read_exact<R: Read>(reader: &mut R, output: &mut [u8], allow_idle: bool)
+    -> Result<bool, String> {
+    let mut offset = 0;
+    while offset < output.len() {
+        match reader.read(&mut output[offset..]) {
+            Ok(0) => return Err("Relay connection closed".to_string()),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if allow_idle && offset == 0 &&
+                matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => return Ok(false),
+            Err(error) => return Err(format!("Relay read failed: {error}")),
+        }
+    }
+    Ok(true)
+}
+
+fn relay_read_message_inner<R: Read>(reader: &mut R, allow_idle: bool)
+    -> Result<Option<(u32, Vec<u8>)>, String> {
     let mut header = [0u8; 12];
-    reader
-        .read_exact(&mut header)
-        .map_err(|error| format!("Relay read header failed: {error}"))?;
+    if !relay_read_exact(reader, &mut header, allow_idle)? { return Ok(None); }
     let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if magic != RELAY_MAGIC {
         return Err(format!("Unexpected relay magic 0x{magic:08X}"));
     }
     let message_type = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
     let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    if length > 1024 * 1024 {
+        return Err("Relay message exceeds the supported limit".to_string());
+    }
     let mut payload = vec![0u8; length];
     if length > 0 {
-        reader
-            .read_exact(&mut payload)
-            .map_err(|error| format!("Relay read payload failed: {error}"))?;
+        relay_read_exact(reader, &mut payload, false)?;
     }
-    Ok((message_type, payload))
+    Ok(Some((message_type, payload)))
+}
+
+fn relay_read_message<R: Read>(reader: &mut R) -> Result<(u32, Vec<u8>), String> {
+    relay_read_message_inner(reader, false)?
+        .ok_or_else(|| "Relay message missing".to_string())
+}
+
+fn relay_read_message_poll<R: Read>(reader: &mut R) -> Result<Option<(u32, Vec<u8>)>, String> {
+    relay_read_message_inner(reader, true)
 }
 
 fn relay_parse_response(payload: &[u8]) -> Result<(u32, String), String> {
@@ -2041,6 +2080,33 @@ fn relay_parse_response(payload: &[u8]) -> Result<(u32, String), String> {
     let message_raw = xdr_read_opaque(payload, &mut offset)?;
     let message = String::from_utf8_lossy(&message_raw).to_string();
     Ok((code, message))
+}
+
+struct RelayInvitation {
+    from: [u8; 32],
+    key: Vec<u8>,
+    host: String,
+    port: u16,
+    server_socket: bool,
+}
+
+fn parse_relay_invitation(payload: &[u8], fallback_host: &str,
+    fallback_port: u16) -> Result<RelayInvitation, String> {
+    let mut offset = 0;
+    let from = xdr_read_opaque(payload, &mut offset)?;
+    let key = xdr_read_opaque(payload, &mut offset)?;
+    let address = xdr_read_opaque(payload, &mut offset)?;
+    let port = xdr_read_u32(payload, &mut offset)?;
+    let role = xdr_read_u32(payload, &mut offset)?;
+    if offset != payload.len() || from.len() != 32 || key.is_empty() || key.len() > 32 ||
+        port > u16::MAX as u32 || role > 1 {
+        return Err("Invalid relay session invitation".to_string());
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&from);
+    Ok(RelayInvitation { from: id, key,
+        host: parse_ip_from_relay_address(&address).unwrap_or_else(|| fallback_host.to_string()),
+        port: if port == 0 { fallback_port } else { port as u16 }, server_socket: role == 1 })
 }
 
 fn parse_ip_from_relay_address(address: &[u8]) -> Option<String> {
@@ -2973,86 +3039,207 @@ async fn syncpeer_relay_open(
         .map_err(|error| format!("Relay open task join error: {error}"))?
 }
 
+fn relay_endpoint(address: &str) -> Result<(String, u16, Option<String>), String> {
+    let url = Url::parse(address).map_err(|error| format!("Invalid relay address: {error}"))?;
+    if url.scheme() != "relay" { return Err("Relay address must use relay:// scheme".to_string()); }
+    let host = url.host_str().ok_or_else(|| "Relay address is missing host".to_string())?.to_string();
+    let port = url.port().unwrap_or(22067);
+    let expected_id = url.query_pairs().find(|(key, _)| key == "id").map(|(_, value)| value.to_string());
+    Ok((host, port, expected_id))
+}
+
+fn relay_identity(cert_pem: &str, key_pem: &str)
+    -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    let certificates = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid relay client certificate PEM: {error}"))?;
+    if certificates.is_empty() { return Err("Relay client certificate is missing".to_string()); }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|error| format!("Invalid relay client key PEM: {error}"))?
+        .ok_or_else(|| "Relay client private key is missing".to_string())?;
+    Ok((certificates, key))
+}
+
+fn open_relay_control(address: &str, certs: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>, timeout_ms: Option<u64>)
+    -> Result<(StreamOwned<ClientConnection, TcpStream>, String, u16), String> {
+    let (host, port, expected_id) = relay_endpoint(address)?;
+    let mut config = ClientConfig::builder().dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_client_auth_cert(certs.to_vec(), key.clone_key())
+        .map_err(|error| format!("Invalid relay client cert/key pair: {error}"))?;
+    config.alpn_protocols = vec![b"bep-relay".to_vec()];
+    let tcp = connect_tcp_with_timeout(&format!("{host}:{port}"), timeout_ms)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("Could not set relay read timeout: {error}"))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("Could not set relay write timeout: {error}"))?;
+    let server_name = ServerName::try_from(host.clone())
+        .or_else(|_| ServerName::try_from("relay.local".to_string()))
+        .map_err(|error| format!("Invalid relay TLS host: {error}"))?;
+    let connection = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|error| format!("Could not create relay TLS client: {error}"))?;
+    let mut stream = StreamOwned::new(connection, tcp);
+    { let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+      conn.complete_io(sock).map_err(|error| format!("Relay TLS handshake failed: {error}"))?; }
+    if let Some(expected) = expected_id {
+        let der = stream.conn.peer_certificates().and_then(|certs| certs.first())
+            .ok_or_else(|| "Relay certificate missing".to_string())?;
+        if canonical_device_id(&compute_device_id_from_der(der.as_ref())) != canonical_device_id(&expected) {
+            return Err("Relay certificate ID mismatch".to_string());
+        }
+    }
+    Ok((stream, host, port))
+}
+
+fn join_relay_session(invitation: &RelayInvitation, timeout_ms: Option<u64>) -> Result<TcpStream, String> {
+    let mut socket = connect_tcp_with_timeout(&format!("{}:{}", invitation.host, invitation.port), timeout_ms)?;
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000).clamp(1, 60_000));
+    socket.set_read_timeout(Some(timeout)).map_err(|error| format!("Relay session read timeout: {error}"))?;
+    socket.set_write_timeout(Some(timeout)).map_err(|error| format!("Relay session write timeout: {error}"))?;
+    relay_write_message(&mut socket, RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST,
+        &xdr_write_opaque(&invitation.key))?;
+    let (kind, payload) = relay_read_message(&mut socket)?;
+    if kind != RELAY_MESSAGE_TYPE_RESPONSE { return Err("Unexpected relay session response".to_string()); }
+    let (code, message) = relay_parse_response(&payload)?;
+    if code != 0 { return Err(format!("Relay join failed ({code}): {message}")); }
+    Ok(socket)
+}
+
+fn relay_peer_certificate(cert: Option<&CertificateDer<'_>>,
+    invitation: &RelayInvitation) -> Result<Vec<u8>, String> {
+    let cert = cert
+        .ok_or_else(|| "Relay peer certificate missing".to_string())?;
+    let der = cert.as_ref().to_vec();
+    if Sha256::digest(&der).as_slice() != invitation.from {
+        return Err("Relay invitation peer certificate mismatch".to_string());
+    }
+    Ok(der)
+}
+
+fn accept_relay_session(store: &SharedTlsStore, invitation: &RelayInvitation,
+    server_config: Arc<ServerConfig>, client_config: Arc<ClientConfig>,
+    timeout_ms: Option<u64>) -> Result<TlsAcceptResponse, String> {
+    let socket = join_relay_session(invitation, timeout_ms)?;
+    let (session_id, peer_certificate_der, alpn) = if invitation.server_socket {
+        let connection = ServerConnection::new(server_config)
+            .map_err(|error| format!("Relay server TLS setup failed: {error}"))?;
+        let mut stream = StreamOwned::new(connection, socket);
+        { let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+          conn.complete_io(sock).map_err(|error| format!("Relay peer TLS handshake failed: {error}"))?; }
+        let peer = relay_peer_certificate(stream.conn.peer_certificates().and_then(|certs| certs.first()), invitation)?;
+        let alpn = stream.conn.alpn_protocol().map(|value| String::from_utf8_lossy(value).to_string())
+            .unwrap_or_default();
+        (store_tls_session(store, stream)?, peer, alpn)
+    } else {
+        let name = ServerName::try_from(invitation.host.clone())
+            .or_else(|_| ServerName::try_from("peer.local".to_string()))
+            .map_err(|error| format!("Invalid relay session host: {error}"))?;
+        let connection = ClientConnection::new(client_config, name)
+            .map_err(|error| format!("Relay client TLS setup failed: {error}"))?;
+        let mut stream = StreamOwned::new(connection, socket);
+        { let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+          conn.complete_io(sock).map_err(|error| format!("Relay peer TLS handshake failed: {error}"))?; }
+        let peer = relay_peer_certificate(stream.conn.peer_certificates().and_then(|certs| certs.first()), invitation)?;
+        let alpn = stream.conn.alpn_protocol().map(|value| String::from_utf8_lossy(value).to_string())
+            .unwrap_or_default();
+        (store_tls_session(store, stream)?, peer, alpn)
+    };
+    Ok(TlsAcceptResponse { session_id, peer_certificate_der, alpn,
+        remote_address: invitation.host.clone(), remote_port: invitation.port })
+}
+
+fn open_relay_listener(session_store: SharedTlsStore, listener_store: SharedTlsListenerStore,
+    request: RelayListenRequest) -> Result<TlsListenResponse, String> {
+    if request.alpn_protocols.is_empty() || request.alpn_protocols.len() > 8 ||
+        request.alpn_protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
+        return Err("Relay listener requires valid ALPN protocols".to_string());
+    }
+    let (certs, key) = relay_identity(&request.cert_pem, &request.key_pem)?;
+    let mut server_config = ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+        .with_single_cert(certs.clone(), key.clone_key())
+        .map_err(|error| format!("Invalid relay listener certificate: {error}"))?;
+    let mut client_config = ClientConfig::builder().dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_client_auth_cert(certs.clone(), key.clone_key())
+        .map_err(|error| format!("Invalid relay listener certificate: {error}"))?;
+    let protocols: Vec<Vec<u8>> = request.alpn_protocols.iter().map(|value| value.as_bytes().to_vec()).collect();
+    server_config.alpn_protocols = protocols.clone();
+    client_config.alpn_protocols = protocols;
+    let (mut control, host, port) = open_relay_control(&request.relay_address, &certs, &key,
+        request.handshake_timeout_ms)?;
+    relay_write_message(&mut control, RELAY_MESSAGE_TYPE_JOIN_RELAY_REQUEST, &[])?;
+    let (kind, payload) = relay_read_message(&mut control)?;
+    if kind != RELAY_MESSAGE_TYPE_RESPONSE { return Err("Unexpected relay registration response".to_string()); }
+    let (code, message) = relay_parse_response(&payload)?;
+    if code != 0 { return Err(format!("Relay registration failed ({code}): {message}")); }
+    control.sock.set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("Could not set relay listener timeout: {error}"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let (sender, receiver) = mpsc::channel();
+    let timeout_ms = request.handshake_timeout_ms;
+    thread::Builder::new().name("syncpeer-relay-listener".into()).spawn(move || {
+        let server_config = Arc::new(server_config);
+        let client_config = Arc::new(client_config);
+        let mut last_ping = std::time::Instant::now();
+        while !worker_stop.load(Ordering::Acquire) {
+            if last_ping.elapsed() >= Duration::from_secs(15) {
+                if let Err(error) = relay_write_message(&mut control, RELAY_MESSAGE_TYPE_PING, &[]) {
+                    let _ = sender.send(Err(error)); return;
+                }
+                last_ping = std::time::Instant::now();
+            }
+            let (kind, payload) = match relay_read_message_poll(&mut control) {
+                Ok(Some(message)) => message,
+                Ok(None) => continue,
+                Err(error) => { let _ = sender.send(Err(error)); return; }
+            };
+            if kind == RELAY_MESSAGE_TYPE_PING {
+                if let Err(error) = relay_write_message(&mut control, RELAY_MESSAGE_TYPE_PONG, &[]) {
+                    let _ = sender.send(Err(error)); return;
+                }
+                continue;
+            }
+            if kind == RELAY_MESSAGE_TYPE_PONG { continue; }
+            if kind != RELAY_MESSAGE_TYPE_SESSION_INVITATION { continue; }
+            let Ok(invitation) = parse_relay_invitation(&payload, &host, port) else { continue; };
+            let result = accept_relay_session(&session_store, &invitation, Arc::clone(&server_config),
+                Arc::clone(&client_config), timeout_ms);
+            if let Ok(accepted) = result {
+                let id = accepted.session_id;
+                if worker_stop.load(Ordering::Acquire) || sender.send(Ok(accepted)).is_err() {
+                    let _ = close_tls_session(&session_store, TlsCloseRequest { session_id: id }); return;
+                }
+            }
+        }
+    }).map_err(|error| format!("Could not start relay listener: {error}"))?;
+    let mut guard = listener_store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?;
+    let id = guard.next_id.saturating_add(1).max(1);
+    guard.next_id = id;
+    guard.listeners.insert(id, Arc::new(TlsListenerState { stop, accepted: Mutex::new(receiver) }));
+    Ok(TlsListenResponse { listener_id: id, port: 0 })
+}
+
+#[tauri::command]
+async fn syncpeer_relay_listen(sessions: tauri::State<'_, SharedTlsStore>,
+    listeners: tauri::State<'_, SharedTlsListenerStore>, request: RelayListenRequest)
+    -> Result<TlsListenResponse, String> {
+    let session_store = sessions.inner().clone();
+    let listener_store = listeners.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || open_relay_listener(session_store, listener_store, request))
+        .await.map_err(|error| format!("Relay listen task join error: {error}"))?
+}
+
 fn open_relay_session(
     shared_store: SharedTlsStore,
     request: RelayOpenRequest,
 ) -> Result<TlsOpenResponse, String> {
-        let relay_url = Url::parse(&request.relay_address).map_err(|error| {
-            format!("Invalid relay address '{}': {error}", request.relay_address)
-        })?;
-        if relay_url.scheme() != "relay" {
-            return Err(format!(
-                "Relay address must use relay:// scheme, got {}",
-                relay_url.scheme()
-            ));
-        }
-        let relay_host = relay_url
-            .host_str()
-            .ok_or_else(|| "Relay address is missing host".to_string())?
-            .to_string();
-        let relay_port = relay_url.port().unwrap_or(22067);
-        let relay_server_id = relay_url
-            .query_pairs()
-            .find(|(key, _)| key == "id")
-            .map(|(_, value)| value.to_string());
-
         tauri_log("relay.open.start");
-
-        let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
-        let cert_chain = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Invalid client certificate PEM: {error}"))?;
-        if cert_chain.is_empty() {
-            return Err("Client certificate PEM did not contain any certificate".to_string());
-        }
-        let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|error| format!("Invalid client private key PEM: {error}"))?
-            .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
-
-        let mut relay_config = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_client_auth_cert(cert_chain.clone(), private_key.clone_key())
-            .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
-        relay_config.alpn_protocols = vec![b"bep-relay".to_vec()];
-        let relay_config = Arc::new(relay_config);
-
-        let relay_address = format!("{relay_host}:{relay_port}");
-        let relay_tcp = connect_tcp_with_timeout(&relay_address, request.timeout_ms)?;
-        relay_tcp
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("Could not set relay read timeout: {error}"))?;
-        relay_tcp
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("Could not set relay write timeout: {error}"))?;
-        let relay_server_name = ServerName::try_from(relay_host.clone())
-            .or_else(|_| ServerName::try_from("relay.local".to_string()))
-            .map_err(|error| format!("Invalid relay TLS host '{relay_host}': {error}"))?;
-        let relay_connection = ClientConnection::new(relay_config, relay_server_name)
-            .map_err(|error| format!("Could not create relay TLS client: {error}"))?;
-        let mut relay_stream = StreamOwned::new(relay_connection, relay_tcp);
-        {
-            let (conn, sock) = (&mut relay_stream.conn, &mut relay_stream.sock);
-            conn.complete_io(sock)
-                .map_err(|error| format!("Relay TLS handshake failed: {error}"))?;
-        }
-
-        if let Some(expected_relay_id) = relay_server_id.as_deref() {
-            let relay_peer_der = relay_stream
-                .conn
-                .peer_certificates()
-                .and_then(|certs| certs.first())
-                .map(|cert| cert.as_ref().to_vec())
-                .ok_or_else(|| "Relay certificate missing".to_string())?;
-            let got = canonical_device_id(&compute_device_id_from_der(&relay_peer_der));
-            let want = canonical_device_id(expected_relay_id);
-            if got != want {
-                return Err(format!(
-                    "Relay certificate ID mismatch: expected {expected_relay_id}, got {got}"
-                ));
-            }
-        }
+        let (cert_chain, private_key) = relay_identity(&request.cert_pem, &request.key_pem)?;
+        let (mut relay_stream, relay_host, relay_port) = open_relay_control(
+            &request.relay_address, &cert_chain, &private_key, request.timeout_ms)?;
 
         let target_device_id = decode_device_id_bytes(&request.expected_device_id)?;
         relay_write_message(
@@ -3078,107 +3265,41 @@ fn open_relay_session(
             ));
         }
 
-        let mut invitation_offset = 0usize;
-        let _from = xdr_read_opaque(&payload, &mut invitation_offset)?;
-        let session_key = xdr_read_opaque(&payload, &mut invitation_offset)?;
-        let relay_session_address = xdr_read_opaque(&payload, &mut invitation_offset)?;
-        let session_port = xdr_read_u32(&payload, &mut invitation_offset)? as u16;
-        let server_socket = xdr_read_u32(&payload, &mut invitation_offset)?;
-        if server_socket != 0 {
-            return Err(
-                "Relay invitation requested server-socket mode, which is not implemented yet"
-                    .to_string(),
-            );
+        let invitation = parse_relay_invitation(&payload, &relay_host, relay_port)?;
+        if invitation.from.as_slice() != target_device_id {
+            return Err("Relay invitation came from an unexpected device".to_string());
         }
-
-        let session_host =
-            parse_ip_from_relay_address(&relay_session_address).unwrap_or(relay_host);
-        let session_port = if session_port == 0 {
-            relay_port
-        } else {
-            session_port
-        };
-        let relay_session_endpoint = format!("{session_host}:{session_port}");
-        tauri_log(&format!("relay.open.session keyLen={}", session_key.len()));
-
-        let session_tcp = connect_tcp_with_timeout(
-            &relay_session_endpoint,
-            request.timeout_ms,
-        )?;
-        session_tcp
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("Could not set relay session read timeout: {error}"))?;
-        session_tcp
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("Could not set relay session write timeout: {error}"))?;
-
-        let mut relay_session_socket = session_tcp;
-        relay_write_message(
-            &mut relay_session_socket,
-            RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST,
-            &xdr_write_opaque(&session_key),
-        )?;
-        let (join_type, join_payload) = relay_read_message(&mut relay_session_socket)?;
-        if join_type != RELAY_MESSAGE_TYPE_RESPONSE {
-            return Err(format!(
-                "Unexpected relay session response type {join_type}, expected Response"
-            ));
-        }
-        let (join_code, join_message) = relay_parse_response(&join_payload)?;
-        if join_code != 0 {
-            return Err(format!(
-                "Relay join session failed (code {join_code}): {}",
-                if join_message.is_empty() {
-                    "no message".to_string()
-                } else {
-                    join_message
-                }
-            ));
-        }
-
-        let mut bep_config = ClientConfig::builder()
+        let mut client_config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_client_auth_cert(cert_chain, private_key)
+            .with_client_auth_cert(cert_chain.clone(), private_key.clone_key())
             .map_err(|error| format!("Invalid BEP client cert/key pair: {error}"))?;
-        bep_config.alpn_protocols = vec![b"bep/1.0".to_vec()];
-        let bep_config = Arc::new(bep_config);
-        let bep_server_name = ServerName::try_from(session_host.clone())
-            .or_else(|_| ServerName::try_from("peer.local".to_string()))
-            .map_err(|error| format!("Invalid relay peer TLS host '{session_host}': {error}"))?;
-        let bep_connection = ClientConnection::new(bep_config, bep_server_name)
-            .map_err(|error| format!("Could not create relay BEP TLS client: {error}"))?;
-        let mut bep_stream = StreamOwned::new(bep_connection, relay_session_socket);
-        {
-            let (conn, sock) = (&mut bep_stream.conn, &mut bep_stream.sock);
-            conn.complete_io(sock)
-                .map_err(|error| format!("Relay BEP TLS handshake failed: {error}"))?;
+        let protocols: Vec<Vec<u8>> = request
+            .alpn_protocols
+            .unwrap_or_else(|| vec!["bep/1.0".to_string()])
+            .into_iter()
+            .map(|protocol| protocol.into_bytes())
+            .collect();
+        if protocols.is_empty() || protocols.len() > 8 ||
+            protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
+            return Err("Relay session requires valid ALPN protocols".to_string());
         }
-        let peer_certificate_der = bep_stream
-            .conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .map(|cert| cert.as_ref().to_vec())
-            .ok_or_else(|| "Relay BEP peer certificate missing".to_string())?;
-        tauri_log(&format!("relay.open.peer_cert peerCertBytes={}", peer_certificate_der.len()));
-
-        let mut guard = shared_store
-            .lock()
-            .map_err(|_| "TLS session store lock poisoned".to_string())?;
-        let next_id = guard.next_id.saturating_add(1).max(1);
-        guard.next_id = next_id;
-        guard.sessions.insert(
-            next_id,
-            create_tls_session(bep_stream)?,
-        );
+        client_config.alpn_protocols = protocols.clone();
+        let mut server_config = ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+            .with_single_cert(cert_chain, private_key)
+            .map_err(|error| format!("Invalid BEP server cert/key pair: {error}"))?;
+        server_config.alpn_protocols = protocols;
+        let accepted = accept_relay_session(&shared_store, &invitation,
+            Arc::new(server_config), Arc::new(client_config), request.timeout_ms)?;
         Ok(TlsOpenResponse {
-            session_id: next_id,
-            peer_certificate_der,
+            session_id: accepted.session_id,
+            peer_certificate_der: accepted.peer_certificate_der,
             connected_via: Some(format!(
                 "relay://{}:{} -> {}",
-                relay_url.host_str().unwrap_or(""),
+                relay_host,
                 relay_port,
-                relay_session_endpoint
+                format!("{}:{}", invitation.host, invitation.port)
             )),
         })
 }
@@ -4854,6 +4975,7 @@ pub fn run() {
             syncpeer_tls_listener_close,
             syncpeer_quic_open,
             syncpeer_relay_open,
+            syncpeer_relay_listen,
             syncpeer_tls_read,
             syncpeer_tls_write,
             syncpeer_tls_close,
@@ -4931,6 +5053,105 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_listener_distinguishes_idle_reads_from_partial_frames() {
+        struct TimedReader { bytes: Vec<u8>, offset: usize }
+        impl Read for TimedReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.offset == self.bytes.len() {
+                    return Err(std::io::Error::new(ErrorKind::TimedOut, "synthetic timeout"));
+                }
+                let count = out.len().min(self.bytes.len() - self.offset);
+                out[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+                self.offset += count;
+                Ok(count)
+            }
+        }
+        assert!(relay_read_message_poll(&mut TimedReader { bytes: vec![], offset: 0 })
+            .unwrap().is_none());
+        assert!(relay_read_message_poll(&mut TimedReader { bytes: vec![0x7e], offset: 0 })
+            .is_err());
+    }
+
+    #[test]
+    fn relay_invitation_rejects_invalid_identity_port_and_role() {
+        let mut payload = xdr_write_opaque(&[7u8; 32]);
+        payload.extend(xdr_write_opaque(&[9u8; 32]));
+        payload.extend(xdr_write_opaque(&[127, 0, 0, 1]));
+        payload.extend(22067u32.to_be_bytes());
+        payload.extend(1u32.to_be_bytes());
+        let parsed = parse_relay_invitation(&payload, "fallback", 22067).unwrap();
+        assert_eq!(parsed.from, [7u8; 32]);
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert!(parsed.server_socket);
+        let mut invalid = payload.clone();
+        invalid[3] = 31;
+        assert!(parse_relay_invitation(&invalid, "fallback", 22067).is_err());
+        let mut invalid = payload.clone();
+        let last = invalid.len() - 1;
+        invalid[last] = 2;
+        assert!(parse_relay_invitation(&invalid, "fallback", 22067).is_err());
+    }
+
+    #[test]
+    fn native_relay_session_authenticates_both_tls_roles() {
+        for server_socket in [false, true] {
+            let local = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let peer = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let (local_certs, local_key) = relay_identity(&local.serialize_pem().unwrap(),
+                &local.serialize_private_key_pem()).unwrap();
+            let (peer_certs, peer_key) = relay_identity(&peer.serialize_pem().unwrap(),
+                &peer.serialize_private_key_pem()).unwrap();
+            let peer_der = peer_certs[0].as_ref().to_vec();
+            let mut server_config = ServerConfig::builder()
+                .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+                .with_single_cert(local_certs, local_key.clone_key()).unwrap();
+            server_config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
+            let mut client_config = ClientConfig::builder().dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                .with_client_auth_cert(vec![CertificateDer::from(local.serialize_der().unwrap())],
+                    local_key).unwrap();
+            client_config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let invitation = RelayInvitation { from: Sha256::digest(&peer_der).into(),
+                key: vec![11; 32], host: "127.0.0.1".into(), port, server_socket };
+            let remote = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (kind, _) = relay_read_message(&mut socket).unwrap();
+                assert_eq!(kind, RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST);
+                let mut payload = 0u32.to_be_bytes().to_vec();
+                payload.extend(xdr_write_opaque(b""));
+                relay_write_message(&mut socket, RELAY_MESSAGE_TYPE_RESPONSE, &payload).unwrap();
+                if server_socket {
+                    let mut config = ClientConfig::builder().dangerous()
+                        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                        .with_client_auth_cert(peer_certs, peer_key).unwrap();
+                    config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
+                    let conn = ClientConnection::new(Arc::new(config),
+                        ServerName::try_from("localhost".to_string()).unwrap()).unwrap();
+                    let mut stream = StreamOwned::new(conn, socket);
+                    stream.conn.complete_io(&mut stream.sock).unwrap();
+                } else {
+                    let mut config = ServerConfig::builder()
+                        .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+                        .with_single_cert(peer_certs, peer_key).unwrap();
+                    config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
+                    let conn = ServerConnection::new(Arc::new(config)).unwrap();
+                    let mut stream = StreamOwned::new(conn, socket);
+                    stream.conn.complete_io(&mut stream.sock).unwrap();
+                }
+            });
+            let sessions = Arc::new(Mutex::new(TlsSessionStore::default()));
+            let accepted = accept_relay_session(&sessions, &invitation,
+                Arc::new(server_config), Arc::new(client_config), Some(2_000)).unwrap();
+            assert_eq!(accepted.peer_certificate_der, peer_der);
+            assert_eq!(accepted.alpn, "syncpeer-pairing/1");
+            remote.join().unwrap();
+            close_tls_session(&sessions, TlsCloseRequest { session_id: accepted.session_id }).unwrap();
+        }
+    }
 
     #[test]
     fn native_tls_listener_accepts_mutual_tls_and_exchanges_bytes() {

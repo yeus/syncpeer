@@ -14,6 +14,7 @@ import {
   type DiscoveredCandidate,
   type SyncpeerRelayConnectOptions,
   type SyncpeerRelayConnectResult,
+  type SyncpeerRelayListenOptions,
   resolveGlobalDiscovery,
   type SyncpeerDiscoveryFetchInit,
   type SyncpeerDiscoveryResponse,
@@ -62,6 +63,9 @@ type ByteBuffer = Buffer<ArrayBufferLike>;
 const LOCAL_DISCOVERY_MAGIC = 0x2ea7d90b;
 const LOCAL_DISCOVERY_PORT = 21027;
 const RELAY_MAGIC = 0x9e79bc40;
+const RELAY_MESSAGE_TYPE_PING = 0;
+const RELAY_MESSAGE_TYPE_PONG = 1;
+const RELAY_MESSAGE_TYPE_JOIN_RELAY_REQUEST = 2;
 const RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST = 3;
 const RELAY_MESSAGE_TYPE_RESPONSE = 4;
 const RELAY_MESSAGE_TYPE_CONNECT_REQUEST = 5;
@@ -311,6 +315,14 @@ class NodeSocketReader {
     this.socket.off("data", this.onData);
     this.socket.off("error", this.onError);
     this.socket.off("close", this.onClose);
+    this.onError(new Error("Relay reader closed"));
+  }
+
+  detachForTls(): void {
+    this.socket.pause();
+    this.dispose();
+    for (const chunk of [...this.chunks].reverse()) this.socket.unshift(chunk);
+    this.chunks = [];
   }
 
   private readChunk(): Promise<Buffer> {
@@ -359,6 +371,7 @@ async function readRelayMessage(reader: NodeSocketReader): Promise<{ type: numbe
   if (header.readUInt32BE(0) !== RELAY_MAGIC) throw new Error("Unexpected relay magic");
   const type = header.readUInt32BE(4);
   const length = header.readUInt32BE(8);
+  if (length > 1024 * 1024) throw new Error("Relay message exceeds the supported limit");
   return { type, payload: await reader.readExact(length) };
 }
 
@@ -405,13 +418,14 @@ function connectNodeTcp(host: string, port: number, signal?: AbortSignal): Promi
 
 function connectNodeRelayTls(
   socket: net.Socket | undefined,
-  options: { host: string; port: number; certPem: string; keyPem: string; alpn: string; signal?: AbortSignal },
+  options: { host: string; port: number; certPem: string; keyPem: string;
+    alpn: string | readonly string[]; signal?: AbortSignal },
 ): Promise<tls.TLSSocket> {
   return new Promise((resolve, reject) => {
     const secureSocket = tls.connect({
       ...(socket ? { socket } : { host: options.host, port: options.port }),
       servername: options.host,
-      ALPNProtocols: [options.alpn],
+      ALPNProtocols: typeof options.alpn === "string" ? [options.alpn] : [...options.alpn],
       cert: options.certPem,
       key: options.keyPem,
       rejectUnauthorized: false,
@@ -428,75 +442,192 @@ function connectNodeRelayTls(
     options.signal?.addEventListener("abort", onAbort, { once: true });
     secureSocket.once("secureConnect", () => { cleanup(); resolve(secureSocket); });
     secureSocket.once("error", (error) => { cleanup(); reject(error); });
+    secureSocket.once("close", () => { cleanup(); reject(new Error("Relay TLS socket closed before handshake.")); });
+  });
+}
+
+function relayEndpoint(address: string) {
+  const relayUrl = new URL(address);
+  if (relayUrl.protocol !== "relay:") throw new Error("Relay address must use relay:// scheme");
+  const host = relayUrl.hostname.replace(/^\[|\]$/g, "");
+  const port = Number(relayUrl.port || 22067);
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid relay address");
+  return { host, port, expectedId: relayUrl.searchParams.get("id") };
+}
+
+async function openRelayControl(address: string, certPem: string, keyPem: string, signal?: AbortSignal) {
+  const endpoint = relayEndpoint(address);
+  const relaySocket = await connectNodeRelayTls(undefined, {
+    host: endpoint.host,
+    port: endpoint.port,
+    certPem,
+    keyPem,
+    alpn: "bep-relay",
+    signal,
+  });
+  const relayPeer = relaySocket.getPeerCertificate(true);
+  if (endpoint.expectedId && canonicalDeviceId(computeDeviceIdFromDer(relayPeer.raw)) !==
+    canonicalDeviceId(endpoint.expectedId)) {
+    relaySocket.destroy();
+    throw new Error("Relay certificate ID mismatch");
+  }
+  return { ...endpoint, socket: relaySocket, reader: new NodeSocketReader(relaySocket) };
+}
+
+function parseRelayInvitation(payload: Buffer, fallbackHost: string, fallbackPort: number) {
+  let offset = 0;
+  const from = readXdrOpaque(payload, offset); offset = from.next;
+  const key = readXdrOpaque(payload, offset); offset = key.next;
+  const address = readXdrOpaque(payload, offset); offset = address.next;
+  if (from.value.length !== 32 || key.value.length < 1 || key.value.length > 32 || offset + 8 !== payload.length) {
+    throw new Error("Invalid relay session invitation");
+  }
+  const port = payload.readUInt32BE(offset); offset += 4;
+  const serverSocket = payload.readUInt32BE(offset);
+  if (port > 65535 || serverSocket !== 0 && serverSocket !== 1) throw new Error("Invalid relay session endpoint");
+  return { from: from.value, key: key.value, host: relayAddressHost(address.value, fallbackHost),
+    port: port || fallbackPort, serverSocket: serverSocket === 1 };
+}
+
+async function joinRelaySession(invitation: ReturnType<typeof parseRelayInvitation>, signal?: AbortSignal) {
+  const sessionTcp = await connectNodeTcp(invitation.host, invitation.port, signal);
+  const reader = new NodeSocketReader(sessionTcp);
+  try {
+    await new Promise<void>((resolve, reject) => sessionTcp.write(
+      relayMessage(RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST, xdrOpaque(invitation.key)),
+      error => error ? reject(error) : resolve(),
+    ));
+    const joined = await readRelayMessage(reader);
+    if (joined.type !== RELAY_MESSAGE_TYPE_RESPONSE) throw new Error("Unexpected relay join response type");
+    const response = relayResponse(joined.payload);
+    if (response.code !== 0) throw new Error(`Relay join failed (${response.code}): ${response.message || "no message"}`);
+    reader.detachForTls();
+    return sessionTcp;
+  } catch (error) { reader.dispose(); sessionTcp.destroy(); throw error; }
+}
+
+async function wrapRelaySessionTls(sessionTcp: net.Socket, invitation: ReturnType<typeof parseRelayInvitation>,
+  certPem: string, keyPem: string, alpnProtocols: readonly string[], signal?: AbortSignal) {
+  if (!invitation.serverSocket) return connectNodeRelayTls(sessionTcp, {
+    host: invitation.host, port: invitation.port, certPem, keyPem, alpn: alpnProtocols, signal,
+  });
+  return new Promise<tls.TLSSocket>((resolve, reject) => {
+    const server = tls.createServer({ cert: certPem, key: keyPem,
+      ALPNProtocols: [...alpnProtocols], requestCert: true, rejectUnauthorized: false,
+      handshakeTimeout: 10000 });
+    const fail = (error: Error) => { sessionTcp.destroy(); reject(error); };
+    server.once("tlsClientError", fail);
+    server.once("secureConnection", socket => { server.off("tlsClientError", fail); resolve(socket); });
+    server.emit("connection", sessionTcp);
   });
 }
 
 async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<SyncpeerRelayConnectResult> {
-  const relayUrl = new URL(options.relayAddress);
-  if (relayUrl.protocol !== "relay:") throw new Error("Relay address must use relay:// scheme");
-  const relayHost = relayUrl.hostname.replace(/^\[|\]$/g, "");
-  const relayPort = Number(relayUrl.port || 22067);
-  const relaySocket = await connectNodeRelayTls(undefined, {
-    host: relayHost,
-    port: relayPort,
-    certPem: options.certPem,
-    keyPem: options.keyPem,
-    alpn: "bep-relay",
-    signal: options.signal,
-  });
-  const relayPeer = relaySocket.getPeerCertificate(true);
-  const expectedRelayId = relayUrl.searchParams.get("id");
-  if (expectedRelayId && canonicalDeviceId(computeDeviceIdFromDer(relayPeer.raw)) !== canonicalDeviceId(expectedRelayId)) {
+  const relay = await openRelayControl(options.relayAddress, options.certPem, options.keyPem, options.signal);
+  const { socket: relaySocket, reader: relayReader } = relay;
+  try {
+    await new Promise<void>((resolve, reject) => relaySocket.write(
+      relayMessage(RELAY_MESSAGE_TYPE_CONNECT_REQUEST,
+        xdrOpaque(base32DecodeNoPadding(canonicalDeviceId(options.expectedDeviceId)))),
+      error => error ? reject(error) : resolve(),
+    ));
+    const invitation = await readRelayMessage(relayReader);
+    if (invitation.type === RELAY_MESSAGE_TYPE_RESPONSE) {
+      const response = relayResponse(invitation.payload);
+      throw new Error(`Relay connect request failed (${response.code}): ${response.message || "no message"}`);
+    }
+    if (invitation.type !== RELAY_MESSAGE_TYPE_SESSION_INVITATION) throw new Error("Unexpected relay response type");
+    const session = parseRelayInvitation(invitation.payload, relay.host, relay.port);
+    if (!session.from.equals(base32DecodeNoPadding(canonicalDeviceId(options.expectedDeviceId)))) {
+      throw new Error("Relay invitation came from an unexpected device");
+    }
+    relayReader.dispose();
     relaySocket.destroy();
-    throw new Error("Relay certificate ID mismatch");
-  }
-  const relayReader = new NodeSocketReader(relaySocket);
-  await new Promise<void>((resolve, reject) => relaySocket.write(
-    relayMessage(RELAY_MESSAGE_TYPE_CONNECT_REQUEST, xdrOpaque(base32DecodeNoPadding(canonicalDeviceId(options.expectedDeviceId)))),
-    (error) => error ? reject(error) : resolve(),
-  ));
-  const invitation = await readRelayMessage(relayReader);
-  if (invitation.type === RELAY_MESSAGE_TYPE_RESPONSE) {
-    const response = relayResponse(invitation.payload);
-    throw new Error(`Relay connect request failed (${response.code}): ${response.message || "no message"}`);
-  }
-  if (invitation.type !== RELAY_MESSAGE_TYPE_SESSION_INVITATION) {
-    throw new Error("Unexpected relay response type");
-  }
-  let offset = 0;
-  const from = readXdrOpaque(invitation.payload, offset); offset = from.next;
-  const key = readXdrOpaque(invitation.payload, offset); offset = key.next;
-  const address = readXdrOpaque(invitation.payload, offset); offset = address.next;
-  const sessionPort = invitation.payload.readUInt32BE(offset); offset += 4;
-  const serverSocket = invitation.payload.readUInt32BE(offset);
-  if (serverSocket !== 0) throw new Error("Relay server-socket mode is not supported");
-  relayReader.dispose();
-  relaySocket.destroy();
+    const sessionTcp = await joinRelaySession(session, options.signal);
+    const bepSocket = await wrapRelaySessionTls(sessionTcp, session, options.certPem, options.keyPem,
+      options.alpnProtocols ?? ["bep/1.0"], options.signal);
+    return { socket: new NodeTlsSocket(bepSocket),
+      connectedVia: `relay://${relay.host}:${relay.port} -> ${session.host}:${session.port}` };
+  } finally { relayReader.dispose(); relaySocket.destroy(); }
+}
 
-  const sessionHost = relayAddressHost(address.value, relayHost);
-  const sessionTcp = await connectNodeTcp(sessionHost, sessionPort || relayPort, options.signal);
-  const sessionReader = new NodeSocketReader(sessionTcp);
-  await new Promise<void>((resolve, reject) => sessionTcp.write(
-    relayMessage(RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST, xdrOpaque(key.value)),
-    (error) => error ? reject(error) : resolve(),
-  ));
-  const joined = await readRelayMessage(sessionReader);
-  if (joined.type !== RELAY_MESSAGE_TYPE_RESPONSE) throw new Error("Unexpected relay join response type");
-  const response = relayResponse(joined.payload);
-  if (response.code !== 0) throw new Error(`Relay join failed (${response.code}): ${response.message || "no message"}`);
-  sessionReader.dispose();
-  const bepSocket = await connectNodeRelayTls(sessionTcp, {
-    host: sessionHost,
-    port: sessionPort || relayPort,
-    certPem: options.certPem,
-    keyPem: options.keyPem,
-    alpn: "bep/1.0",
-    signal: options.signal,
-  });
-  return {
-    socket: new NodeTlsSocket(bepSocket),
-    connectedVia: `relay://${relayHost}:${relayPort} -> ${sessionHost}:${sessionPort || relayPort}`,
+async function listenNodeRelay(options: SyncpeerRelayListenOptions): Promise<SyncpeerTlsListener> {
+  type Accepted = Awaited<ReturnType<SyncpeerTlsListener["accept"]>>;
+  const relay = await openRelayControl(options.relayAddress, options.certPem, options.keyPem);
+  const accepted: Accepted[] = [];
+  const waiters: Array<{ resolve: (value: Accepted) => void; reject: (error: Error) => void }> = [];
+  const sockets = new Set<net.Socket>();
+  const pending = new Set<Promise<void>>();
+  let closed = false, closedError: Error | undefined;
+  const fail = (error: Error) => {
+    closedError ??= error;
+    while (waiters.length) waiters.shift()?.reject(error);
   };
+  try {
+    await new Promise<void>((resolve, reject) => relay.socket.write(
+      relayMessage(RELAY_MESSAGE_TYPE_JOIN_RELAY_REQUEST, new Uint8Array()),
+      error => error ? reject(error) : resolve(),
+    ));
+    const joined = await readRelayMessage(relay.reader);
+    if (joined.type !== RELAY_MESSAGE_TYPE_RESPONSE || relayResponse(joined.payload).code !== 0) {
+      throw new Error("Relay refused the permanent device registration");
+    }
+  } catch (error) { relay.reader.dispose(); relay.socket.destroy(); throw error; }
+  const pingTimer = setInterval(() => {
+    if (!closed) relay.socket.write(relayMessage(RELAY_MESSAGE_TYPE_PING, new Uint8Array()));
+  }, 20000);
+  pingTimer.unref();
+  const handleInvitation = (payload: Buffer) => {
+    const task = (async () => {
+      const invitation = parseRelayInvitation(payload, relay.host, relay.port);
+      const tcp = await joinRelaySession(invitation);
+      sockets.add(tcp);
+      tcp.once("close", () => sockets.delete(tcp));
+      try {
+        const secure = await wrapRelaySessionTls(tcp, invitation, options.certPem, options.keyPem,
+          options.alpnProtocols);
+        const peer = secure.getPeerCertificate(true);
+        if (!peer.raw || !crypto.createHash("sha256").update(peer.raw).digest().equals(invitation.from)) {
+          throw new Error("Relay invitation identity does not match the peer certificate");
+        }
+        const value = { socket: new NodeTlsSocket(secure), remoteAddress: relay.host,
+          remotePort: invitation.port, alpn: secure.alpnProtocol || "" };
+        const waiter = waiters.shift();
+        if (waiter) waiter.resolve(value);
+        else accepted.push(value);
+      } catch (error) { tcp.destroy(); throw error; }
+    })().catch(() => { /* A bad invitation cannot stop the permanent relay registration. */ });
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  };
+  const loop = (async () => {
+    try {
+      while (!closed) {
+        const message = await readRelayMessage(relay.reader);
+        if (message.type === RELAY_MESSAGE_TYPE_SESSION_INVITATION) handleInvitation(message.payload);
+        else if (message.type === RELAY_MESSAGE_TYPE_PING) {
+          relay.socket.write(relayMessage(RELAY_MESSAGE_TYPE_PONG, new Uint8Array()));
+        } else if (message.type !== RELAY_MESSAGE_TYPE_PONG) throw new Error("Unexpected permanent relay message");
+      }
+    } catch (error) { if (!closed) fail(error instanceof Error ? error : new Error(String(error))); }
+  })();
+  return { port: 0,
+    accept: () => {
+      const value = accepted.shift();
+      if (value) return Promise.resolve(value);
+      if (closedError) return Promise.reject(closedError);
+      return new Promise<Accepted>((resolve, reject) => waiters.push({ resolve, reject }));
+    },
+    close: async () => {
+      closed = true;
+      fail(new Error("Relay listener closed."));
+      clearInterval(pingTimer);
+      relay.reader.dispose();
+      relay.socket.destroy();
+      for (const socket of sockets) socket.destroy();
+      await Promise.allSettled([...pending]);
+      await loop;
+    } };
 }
 
 function normalizeDeviceId(id: string): string {
@@ -983,6 +1114,7 @@ export function createNodeHostAdapter(): SyncpeerHostAdapter {
     listenTls: listenNodeTls,
     connectQuic: connectNodeQuic,
     connectRelay: connectNodeRelay,
+    listenRelay: listenNodeRelay,
     async sha256(data: Uint8Array): Promise<Uint8Array> {
       const digest = crypto.createHash("sha256").update(Buffer.from(data)).digest();
       return new Uint8Array(digest);

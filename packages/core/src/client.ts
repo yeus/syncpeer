@@ -116,11 +116,20 @@ export interface SyncpeerRelayConnectOptions {
   caPem?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  alpnProtocols?: readonly string[];
 }
 
 export interface SyncpeerRelayConnectResult {
   socket: SyncpeerTlsSocket;
   connectedVia: string;
+}
+
+export interface SyncpeerRelayListenOptions {
+  relayAddress: string;
+  certPem: string;
+  keyPem: string;
+  alpnProtocols: readonly string[];
+  handshakeTimeoutMs?: number;
 }
 
 export interface SyncpeerDiscoveryFetchInit {
@@ -151,6 +160,9 @@ export interface SyncpeerHostAdapter {
   connectRelay?: (
     options: SyncpeerRelayConnectOptions,
   ) => Promise<SyncpeerRelayConnectResult>;
+  listenRelay?: (
+    options: SyncpeerRelayListenOptions,
+  ) => Promise<SyncpeerTlsListener>;
   sha256: (data: Uint8Array) => Promise<Uint8Array> | Uint8Array;
   randomBytes: (length: number) => Promise<Uint8Array> | Uint8Array;
   /** Defaults to the in-process scrypt derivation; platforms may inject a worker. */

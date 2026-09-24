@@ -42,3 +42,34 @@ test("shutdown closes a pending pairing socket before waiting for its handler", 
     await closing;
   }
 });
+
+test("a dropped permanent relay registration is re-established", async () => {
+  const replaced = Promise.withResolvers<void>();
+  const accepting = Promise.withResolvers<never>();
+  let registrations = 0;
+  const errors: string[] = [];
+  const service = await startIncomingPeerService({ ...createNodeHostAdapter(),
+    listenRelay: async () => {
+      registrations++;
+      if (registrations === 1) return { port: 0,
+        accept: async () => { throw new Error("Synthetic relay connection dropped"); },
+        close: async () => {},
+      };
+      replaced.resolve();
+      return { port: 0, accept: () => accepting.promise,
+        close: async () => { accepting.reject(new Error("Listener closed")); },
+      };
+    },
+  }, { mode: "relay", relayAddress: "relay://synthetic.invalid:22067",
+    host: "127.0.0.1", certPem: "synthetic", keyPem: "synthetic", localDeviceId: "AAAA",
+    approvedDeviceIds: ["BBBB"], connectionOptions: () => { throw new Error("Not a BEP test"); },
+    onSession: () => {}, onError: error => errors.push(String(error)),
+  });
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([replaced.promise, new Promise<never>((_resolve, reject) =>
+      { timeout = setTimeout(() => reject(new Error("Relay listener did not reconnect")), 2500); })]);
+    assert.equal(registrations, 2);
+    assert.match(errors[0] ?? "", /Synthetic relay connection dropped/);
+  } finally { clearTimeout(timeout); await service.close(); }
+});

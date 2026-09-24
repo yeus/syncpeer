@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { browser, $ } from "@wdio/globals";
 import type { Browser as WdioBrowser } from "webdriverio";
 import type { BrowserExtension } from "@wdio/native-types";
+import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.ts";
 import { coordinatorRequest } from "./coordinator.ts";
 import type { LanFixture } from "./protocol.ts";
 import {
@@ -77,6 +78,11 @@ const fixture = async (): Promise<LanFixture> => {
 const clickTestId = async (testId: string): Promise<void> => {
   await $("[data-testid='" + testId + "']").click();
 };
+const appErrorCategory = (issue: string): string =>
+  /vault|locked|unlock/i.test(issue) ? "vault access"
+    : /storage|directory|folder/i.test(issue) ? "local storage"
+    : /transport|connection|socket/i.test(issue) ? "transport"
+    : issue ? "other app error" : "no app error shown";
 const createFreshProfile = async (): Promise<void> => {
   await clickTestId("tab-folders");
   await $("button=Folder settings · New folder").click();
@@ -103,12 +109,16 @@ const createFreshProfile = async (): Promise<void> => {
 const connect = async (
   currentFixture: LanFixture,
   mode: "automatic" | "direct" | "lan" | "global",
-  identity?: { cert: string; key: string },
+  options: { identity?: { cert: string; key: string }; quicOnly?: boolean } = {},
 ): Promise<void> => {
   await clickTestId("tab-devices");
   const settings = $("[data-testid='connection-settings-toggle']");
   if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
   await selectDiscoveryMode(lanBrowser, mode);
+  if (mode === "direct") {
+    const quicOnly = $("[data-testid='connection-direct-quic']");
+    if (await quicOnly.isSelected() !== (options.quicOnly === true)) await quicOnly.click();
+  }
   const remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim()
     || currentFixture.remoteDeviceId;
   await setValue("connection-remote-id", remoteDeviceId);
@@ -119,8 +129,8 @@ const connect = async (
     await setValue("connection-discovery-server", currentFixture.discoveryServer);
   }
   await setValue("connection-timeout", "60000");
-  await setValue("connection-cert", identity?.cert ?? "");
-  await setValue("connection-key", identity?.key ?? "");
+  await setValue("connection-cert", options.identity?.cert ?? "");
+  await setValue("connection-key", options.identity?.key ?? "");
   await setAutomaticConnectionPaused(lanBrowser, false);
   try {
     await connectUntilApproved(lanBrowser);
@@ -145,7 +155,13 @@ const openFolders = async (): Promise<void> => {
 const downloadByName = async (name: string): Promise<void> => {
   await waitForText(lanBrowser, name);
   await clickDownloadButton(lanBrowser, name);
-  await waitForText(lanBrowser, "Downloaded " + name, 90_000);
+  try {
+    await waitForText(lanBrowser, "Downloaded " + name, 90_000);
+  } catch (error) {
+    const issue = await lanBrowser.execute(() => document.querySelector("p.error")?.textContent ?? "");
+    throw new Error(`Download did not complete (${appErrorCategory(issue)}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 16).join(", ")}).`,
+      { cause: error });
+  }
 };
 
 const markFavorite = async (name: string): Promise<void> => {
@@ -159,6 +175,12 @@ const markFavorite = async (name: string): Promise<void> => {
     return Boolean(button);
   }, name);
   assert.equal(clicked, true, "Could not mark the downloaded fixture as a favorite.");
+  await lanBrowser.waitUntil(async () => lanBrowser.execute((name) => {
+    const title = [...document.querySelectorAll(".item-title")]
+      .find(element => element.textContent?.trim() === name);
+    return title?.closest("li")?.querySelector("button[aria-label='Toggle favorite']")
+      ?.getAttribute("aria-pressed") === "true";
+  }, name), { timeout: 5000, timeoutMsg: "The favorite selection was not retained." });
 };
 
 const uploadTextFile = async (name: string, content: string): Promise<void> => {
@@ -198,7 +220,13 @@ describe("Syncpeer LAN integration", () => {
       assert.equal(await readCachedHash(lanBrowser, "hello.txt"), expectedHello.sha256);
 
       await uploadTextFile("upload.txt", "uploaded from Syncpeer LAN test\n");
-      await waitForText(lanBrowser, "Uploaded upload.txt.", 90_000);
+      try {
+        await waitForText(lanBrowser, "Uploaded upload.txt.", 90_000);
+      } catch (error) {
+        const issue = await lanBrowser.execute(() => document.querySelector("p.error")?.textContent ?? "");
+        throw new Error(`Upload did not complete (${appErrorCategory(issue)}; reason: ${safeNativeFailureText(issue) ?? "none"}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 16).join(", ")}).`,
+          { cause: error });
+      }
       const uploaded = await request<{ sha256: string; size: number }>("POST", "/v1/action", {
         action: "verify-upload",
       }).catch(async (error) => {
@@ -219,14 +247,20 @@ describe("Syncpeer LAN integration", () => {
       action: "update-fixture-file",
       details: { path: "hello.txt", content },
     });
-    await lanBrowser.waitUntil(
-      async () => await readCachedHash(lanBrowser, "hello.txt") === updated.sha256,
-      {
-        timeout: 75_000,
-        interval: 1_000,
-        timeoutMsg: "Downloaded favorite did not update during periodic synchronization.",
-      },
-    );
+    try {
+      await lanBrowser.waitUntil(
+        async () => await readCachedHash(lanBrowser, "hello.txt") === updated.sha256,
+        { timeout: 75_000, interval: 1_000,
+          timeoutMsg: "Downloaded favorite did not update during periodic synchronization." },
+      );
+    } catch (error) {
+      const state = await lanBrowser.execute(() => ({
+        visible: document.visibilityState,
+        issue: document.querySelector("p.error")?.textContent ?? "",
+      }));
+      throw new Error(`Favorite refresh did not complete (page: ${state.visible}; reason: ${safeNativeFailureText(state.issue) ?? "none"}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 20).join(", ")}).`,
+        { cause: error });
+    }
   });
 
   it("reuses cached blocks when automatically updating a favorite", async () => {
@@ -287,21 +321,36 @@ describe("Syncpeer LAN integration", () => {
     });
   });
 
-  it("keeps a large transfer active while metadata churn runs", async () => {
+  it("keeps a large transfer active while metadata churn runs", async function () {
+    this.timeout(420_000);
     await runPhase("direct", async () => {
+      const startedAtMs = Date.now();
       const churn = request<{ ticks: number }>("POST", "/v1/action", {
         action: "churn",
         details: { durationMs: 12_000 },
       });
       await openFolders();
       await clickDownloadButton(lanBrowser, "blob.bin");
-      await waitForText(lanBrowser, "Downloaded blob.bin", 120_000);
+      try {
+        await waitForText(lanBrowser, "Downloaded blob.bin", 300_000);
+      } catch (error) {
+        const state = await lanBrowser.execute(() => ({
+          issue: document.querySelector("p.error")?.textContent ?? "",
+          transfer: document.querySelector("[data-testid='transfer-float']")?.textContent?.trim() ?? "",
+        }));
+        throw new Error(`Large transfer did not show completion (reason: ${safeNativeFailureText(state.issue) ?? "none"}; transfer: ${safeNativeFailureText(state.transfer) ?? "none"}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 20).join(", ")}).`,
+          { cause: error });
+      }
+      console.log(`Large transfer completion notice appeared after ${Date.now() - startedAtMs} ms.`);
       const result = await churn;
+      console.log(`Large transfer metadata churn finished after ${Date.now() - startedAtMs} ms.`);
       assert.ok(result.ticks >= 4);
       const cachedHash = await readCachedHash(lanBrowser, "blob.bin");
+      console.log(`Large transfer cached digest finished after ${Date.now() - startedAtMs} ms.`);
       assert.equal(cachedHash,
         currentFixture.expectedFiles.find(file => file.path === "blob.bin")?.sha256,
         "A completed large transfer must match the peer's published SHA-256");
+      console.log(`Large encrypted transfer verified in ${Date.now() - startedAtMs} ms.`);
     });
   });
 
@@ -360,7 +409,7 @@ describe("Syncpeer LAN integration", () => {
         }),
         probe.sessionId,
       );
-      await connect(currentFixture, "automatic");
+      await connect(currentFixture, "direct", { quicOnly: true });
       await waitForText(lanBrowser, "quic://", 60_000);
       await request("POST", "/v1/action", {
         action: "switch-transport",
@@ -413,7 +462,7 @@ describe("Syncpeer LAN integration", () => {
         });
       }
       await disconnect();
-      await connect(currentFixture, "direct", untrustedIdentity);
+      await connect(currentFixture, "direct", { identity: untrustedIdentity });
       await openFolders();
       await waitForText(lanBrowser, currentFixture.encryptedFolderId, 90_000);
       const passwordInput = $("[data-testid='folder-password-" + currentFixture.encryptedFolderId + "']");

@@ -98,6 +98,15 @@ test("one-host Tauri tests skip public discovery probes", () => {
   assert.match(smoke, /this\.skip\(\)/);
 });
 
+test("one-host QUIC uses an explicit direct endpoint", () => {
+  const spec = fs.readFileSync("scripts/lan-test/spec.ts", "utf8");
+  const quic = spec.split('it("connects to a real Syncthing QUIC listener')[1]
+    ?.split('it("connects through official global discovery')[0];
+  assert.ok(quic);
+  assert.match(quic, /connect\(currentFixture, "direct", \{ quicOnly: true \}\)/);
+  assert.doesNotMatch(quic, /connect\(currentFixture, "automatic"\)/);
+});
+
 test("large desktop cache checks avoid full-byte WebDriver exports", () => {
   const helper = fs.readFileSync("scripts/lan-test/ui-helpers.ts", "utf8");
   assert.match(helper, /__syncpeerDigestCachedFile/);

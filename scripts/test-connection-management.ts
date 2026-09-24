@@ -5,7 +5,8 @@ import {
   retryDelayMs,
   type ConnectionLifecycleState,
 } from "../packages/core/dist/ui/connectionLifecycle.js";
-import { fromConnectionSettings } from "../packages/core/dist/ui/connectionState.js";
+import { buildConnectionDetails, fromConnectionSettings, toConnectionSettings } from
+  "../packages/core/dist/ui/connectionState.js";
 import { createSyncpeerSessionStore } from "../packages/core/dist/ui/sessionStore.js";
 import {
   candidateCooldownMs,
@@ -68,6 +69,23 @@ test("legacy global discovery migrates to automatic", () => {
   });
   assert.equal(stored.discoveryMode, "automatic");
   assert.equal(fromConnectionSettings(null).discoveryMode, "automatic");
+});
+
+test("the incoming listen port is independent of the remote peer port and survives settings storage", () => {
+  const defaults = fromConnectionSettings(null);
+  assert.equal(defaults.listenPort, 22000);
+  const configured = fromConnectionSettings({ ...defaults, port: 22001, listenPort: 22999 });
+  assert.equal(buildConnectionDetails(configured, {}).port, 22001);
+  assert.equal(buildConnectionDetails(configured, {}).listenPort, 22999);
+  assert.equal(fromConnectionSettings(toConnectionSettings(configured)).listenPort, 22999);
+  assert.equal(fromConnectionSettings({ ...configured, listenPort: 70000 }).listenPort, 22000);
+});
+
+test("direct QUIC survives settings storage and reaches the connector", () => {
+  const configured = { ...fromConnectionSettings(null), discoveryMode: "direct" as const, quicOnly: true };
+  const restored = fromConnectionSettings(toConnectionSettings(configured));
+  assert.equal(restored.quicOnly, true);
+  assert.equal(buildConnectionDetails(restored, {}).quicOnly, true);
 });
 
 test("retry backoff is bounded and supports deterministic jitter", () => {

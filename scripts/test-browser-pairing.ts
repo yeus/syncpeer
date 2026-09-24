@@ -57,6 +57,7 @@ test("a reused browser listener advertises current folders and adopts current co
   const adapter = createNodeHostAdapter();
   let port = 0;
   let listenCount = 0;
+  const requestedPorts: number[] = [];
   let outgoing: SyncpeerSessionHandle | undefined;
   const [ownerIdentity, joiningIdentity] = (await Promise.all([
     identity(root, "one"), identity(root, "two"),
@@ -65,6 +66,7 @@ test("a reused browser listener advertises current folders and adopts current co
     connectTls: async () => { throw new Error("Synthetic outbound failure"); },
     listenTls: async options => {
       listenCount++;
+      requestedPorts.push(options.port);
       const listener = await adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 });
       port = listener.port;
       return listener;
@@ -75,7 +77,7 @@ test("a reused browser listener advertises current folders and adopts current co
     if (state.phase === "connected") connected.resolve();
   });
   try {
-    const options = { host: "127.0.0.1", port: 1, remoteId: joiningIdentity.deviceId,
+    const options = { host: "127.0.0.1", port: 1, listenPort: 22999, remoteId: joiningIdentity.deviceId,
       deviceName: "synthetic-owner", discoveryMode: "direct" as const, timeoutMs: 1000 };
     for (const id of ["old-folder", "new-folder"]) {
       await assert.rejects(owner.connectAndSync({ ...options,
@@ -84,6 +86,7 @@ test("a reused browser listener advertises current folders and adopts current co
       }));
     }
     assert.equal(listenCount, 1);
+    assert.deepEqual(requestedPorts, [22999]);
     outgoing = await createSyncpeerCoreClient(adapter).openSession({ ...joiningIdentity,
       host: "127.0.0.1", port, expectedDeviceId: ownerIdentity.deviceId,
       deviceName: "synthetic-joiner", discoveryMode: "direct", timeoutMs: 1000,

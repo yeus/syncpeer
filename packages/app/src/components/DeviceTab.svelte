@@ -380,11 +380,34 @@
           </div>
         {/if}
 
+        {#if app.connection.discoveryMode === "direct"}
+          <label class="checkbox-row">
+            <input
+              data-testid="connection-direct-quic"
+              type="checkbox"
+              bind:checked={app.connection.quicOnly}
+            />
+            <span>Use QUIC instead of TCP for this direct connection</span>
+          </label>
+        {/if}
+
         {#if app.connection.discoveryMode === "automatic"}
           <div class="hint">
             Automatic mode races saved, LAN, global, direct, and relay paths and keeps the best available connection.
           </div>
         {/if}
+
+        <label>
+          Incoming TCP port
+          <input
+            data-testid="connection-listen-port"
+            type="number"
+            bind:value={app.connection.listenPort}
+            min="1"
+            max="65535"
+          />
+        </label>
+        <div class="hint">Other peers can reach this device on this port when LAN access is available. Default: 22000.</div>
 
         <label>
           Saved Devices

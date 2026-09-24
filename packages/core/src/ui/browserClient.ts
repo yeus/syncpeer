@@ -31,6 +31,8 @@ import { resolveApprovedPeerDeviceIds,
 export interface ConnectOptions {
   host: string;
   port: number;
+  /** Local port advertised by the incoming mutual-TLS listener. */
+  listenPort?: number;
   discoveryMode?: "automatic" | "global" | "lan" | "direct";
   discoveryServer?: string;
   cert?: string;
@@ -417,9 +419,18 @@ const logClient = (
   console.log(`[syncpeer-core-ui] ${event}`);
 };
 
+const localListenPort = (value?: number) => {
+  const port = value ?? 22000;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Incoming TCP port must be between 1 and 65535.");
+  }
+  return port;
+};
+
 const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   host: options.host,
   port: options.port,
+  listenPort: localListenPort(options.listenPort),
   discoveryMode: options.discoveryMode ?? "automatic",
   discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
   cert: options.cert && options.cert.trim() !== "" ? options.cert.trim() : undefined,
@@ -480,6 +491,7 @@ const serializeConnectionKey = (
   JSON.stringify({
     host: options.host,
     port: options.port,
+    listenPort: options.listenPort ?? 22000,
     discoveryMode: options.discoveryMode ?? "automatic",
     discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
     remoteId: options.remoteId ?? "",
@@ -623,8 +635,9 @@ export const createSyncpeerBrowserClient = (
     const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
     const approvedDeviceIds = resolveApprovedPeerDeviceIds(coreOptions.expectedDeviceId, trustedDevices);
     if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
+    const listenPort = localListenPort(connectOptions.listenPort);
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
-      coreOptions.certPem, coreOptions.keyPem]);
+      coreOptions.certPem, coreOptions.keyPem, listenPort]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
     const sessionHandlers = {
       connectionOptions: (remote: string, endpoint: { host: string; port: number }) =>
@@ -653,7 +666,7 @@ export const createSyncpeerBrowserClient = (
     }
     await stopIncomingService();
     incomingService = await startIncomingPeerService(coreAdapter, {
-      host: "0.0.0.0", port: 22000, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
       localDeviceId, approvedDeviceIds, ...sessionHandlers,
       onError: error => coreAdapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
@@ -739,7 +752,7 @@ export const createSyncpeerBrowserClient = (
     } catch (error) {
       if (listenerFailure) {
         throw new AggregateError([error, listenerFailure],
-          "Could not connect to the peer or start the incoming LAN listener on TCP port 22000.",
+          `Could not connect to the peer or start the incoming LAN listener on TCP port ${connectOptions.listenPort ?? 22000}.`,
           { cause: error });
       }
       throw error;

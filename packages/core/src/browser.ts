@@ -30,6 +30,7 @@ export type {
   SyncpeerTlsListener,
   SyncpeerAcceptedTlsSocket,
   SyncpeerTlsSocket,
+  SyncpeerRelayListenOptions,
 } from "./client.js";
 export { isTransportFailure, RemoteFs } from "./core/model/remoteFs.js";
 export type {

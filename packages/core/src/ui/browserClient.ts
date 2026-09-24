@@ -1,5 +1,6 @@
 import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate,
   type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerSessionHandle,
+  type SyncpeerTlsSocket,
   withMetadataSession } from "../client.js";
 import { startIncomingPeerService } from "../sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../sync/peerSessionManager.js";
@@ -603,6 +604,17 @@ export const createSyncpeerBrowserClient = (
     return `${host}:${port}`;
   };
 
+  const relayPairingEndpoint = (value: string) => {
+    let endpoint: URL;
+    try { endpoint = new URL(value); }
+    catch { throw new Error("Invalid advertised relay pairing address."); }
+    if (endpoint.protocol !== "relay:" || !endpoint.hostname || endpoint.username || endpoint.password ||
+      endpoint.hash || (endpoint.pathname !== "" && endpoint.pathname !== "/")) {
+      throw new Error("Invalid advertised relay pairing address.");
+    }
+    return endpoint.toString();
+  };
+
   const ensureIncomingService = async (connectOptions: ConnectOptions,
     coreOptions: SyncpeerConnectOptions): Promise<typeof incomingService> => {
     if (!coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
@@ -788,10 +800,15 @@ export const createSyncpeerBrowserClient = (
 
   return {
     startPairingInvitation: async pairingOptions => {
-      if (!coreAdapter.listenTls) throw new Error("This platform cannot accept LAN pairing connections.");
+      const relayAddress = pairingOptions.advertisedHost.startsWith("relay://")
+        ? relayPairingEndpoint(pairingOptions.advertisedHost) : null;
+      if (relayAddress ? !coreAdapter.listenRelay : !coreAdapter.listenTls) {
+        throw new Error(relayAddress ? "This platform cannot accept relay pairing connections."
+          : "This platform cannot accept LAN pairing connections.");
+      }
       if (!platformAdapter.exportPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
       // Validate before opening a listener; port zero is resolved after binding.
-      advertisedPairingEndpoint(pairingOptions.advertisedHost, pairingOptions.port || 22000);
+      if (!relayAddress) advertisedPairingEndpoint(pairingOptions.advertisedHost, pairingOptions.port || 22000);
       const identity = await identityForPairing();
       activeConnectOptions = null;
       activeResolvedConnectOptions = null;
@@ -803,6 +820,7 @@ export const createSyncpeerBrowserClient = (
       void invitationReady.promise.catch(() => undefined);
       let settled = false;
       incomingService = await startIncomingPeerService(coreAdapter, {
+        mode: relayAddress ? "relay" : "direct", ...(relayAddress ? { relayAddress } : {}),
         host: "0.0.0.0", port: pairingOptions.port ?? 22000, certPem: identity.certPem,
         keyPem: identity.keyPem, localDeviceId: identity.deviceId, approvedDeviceIds: [],
         connectionOptions: () => { throw new Error("A pairing invitation does not approve BEP access."); },
@@ -826,7 +844,7 @@ export const createSyncpeerBrowserClient = (
       incomingServiceKey = "pairing";
       let invitationRecord: Awaited<ReturnType<typeof createPairingInvitation>>;
       try {
-        const advertisedEndpoint = advertisedPairingEndpoint(pairingOptions.advertisedHost,
+        const advertisedEndpoint = relayAddress ?? advertisedPairingEndpoint(pairingOptions.advertisedHost,
           incomingService.port);
         invitationRecord = await createPairingInvitation(crypto.subtle, coreAdapter.randomBytes,
           identity.deviceId, advertisedEndpoint,
@@ -853,9 +871,19 @@ export const createSyncpeerBrowserClient = (
     joinPairingInvitation: async pairingOptions => {
       if (!platformAdapter.importPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
       const identity = await identityForPairing();
-      const endpoint = pairingEndpoint(pairingOptions.invitation.endpoint);
-      const socket = await coreAdapter.connectTls({ ...endpoint, certPem: identity.certPem,
-        keyPem: identity.keyPem, alpnProtocols: ["syncpeer-pairing/1"] });
+      const relayAddress = pairingOptions.invitation.endpoint.startsWith("relay://")
+        ? relayPairingEndpoint(pairingOptions.invitation.endpoint) : null;
+      let socket: SyncpeerTlsSocket;
+      if (relayAddress) {
+        if (!coreAdapter.connectRelay) throw new Error("This platform cannot join relay pairing connections.");
+        socket = (await coreAdapter.connectRelay({ relayAddress,
+          expectedDeviceId: pairingOptions.invitation.deviceId,
+          certPem: identity.certPem, keyPem: identity.keyPem,
+          alpnProtocols: ["syncpeer-pairing/1"] })).socket;
+      } else {
+        socket = await coreAdapter.connectTls({ ...pairingEndpoint(pairingOptions.invitation.endpoint),
+          certPem: identity.certPem, keyPem: identity.keyPem, alpnProtocols: ["syncpeer-pairing/1"] });
+      }
       try {
         const verifiedRemoteId = await deviceIdFromCertificate(coreAdapter, await socket.peerCertificateDer());
         const joined = await joinPersonalSpace({ subtle: crypto.subtle, socket,

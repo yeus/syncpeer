@@ -29,17 +29,18 @@ export const create = ({ avdName, systemImage }) => {
   ], { input: "no\n", stdio: ["pipe", "inherit", "inherit"] });
 };
 
-export const profile = (name) => {
+export const profile = (name, avdPrefix = process.env.SYNCPEER_ANDROID_AVD_PREFIX || "syncpeer") => {
+  if (!/^[A-Za-z0-9_-]+$/.test(avdPrefix)) throw new Error("Invalid Android AVD prefix.");
   if (name === "legacy") return {
-    avdName: "syncpeer-api24",
+    avdName: `${avdPrefix}-api24`,
     systemImage: "system-images;android-24;google_apis;x86_64",
   };
   if (name === "compat") return {
-    avdName: "syncpeer-api29",
+    avdName: `${avdPrefix}-api29`,
     systemImage: "system-images;android-29;google_apis_playstore;x86_64",
   };
   if (name === "modern") return {
-    avdName: "syncpeer-api36-play",
+    avdName: `${avdPrefix}-api36-play`,
     systemImage: "system-images;android-36;google_apis_playstore;x86_64",
   };
   throw new Error(`Unknown Android emulator profile: ${name}`);

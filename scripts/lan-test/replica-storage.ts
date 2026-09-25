@@ -34,7 +34,21 @@ export function memoryDocumentStorage() {
   const openStorage = async (id: string) => {
     if (!roots.has(id)) roots.set(id, memoryReplicaStorage());
     const fixture = roots.get(id)!;
-    return { ...fixture.storage, initializeReplica: async () => {}, checkHealth: async () => {}, close: async () => {},
+    return { ...fixture.storage, createSink: async (path: string, size: number) => {
+      const sink = await fixture.storage.createSink(path, size);
+      return { ...sink, commit: async () => {
+        const parts = path.split("/");
+        for (let index = 1; index < parts.length; index++) {
+          const parent = parts.slice(0, index).join("/");
+          if (!fixture.files.has(parent)) await fixture.storage.makeDirectory(parent);
+        }
+        await sink.commit();
+      } };
+    }, initializeReplica: async () => {
+      if (fixture.files.has(".stfolder")) return;
+      if (fixture.files.size) throw new Error("Replica initialization requires an empty folder");
+      await fixture.storage.makeDirectory(".stfolder");
+    }, checkHealth: async () => {}, close: async () => {},
       withLock: async <T>(fn: () => Promise<T>) => fn(),
       copy: async (source: string, target: string) => {
         const bytes = fixture.files.get(source)!.bytes.slice();

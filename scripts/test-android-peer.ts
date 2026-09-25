@@ -132,11 +132,7 @@ const main = async (): Promise<void> => {
       "--probe-document-runtime", runtimeProbePath,
     ]);
     if (fs.readFileSync(runtimeProbePath, "utf8").trim() !== "supported") {
-      console.log(
-        "Android real-peer acceptance skipped: the managed WebView lacks " +
-        "JS_FEATURE_MESSAGE_PORTS required by the document runtime.",
-      );
-      return;
+      throw new Error("Android document runtime is unavailable; real-peer acceptance cannot be skipped.");
     }
     fixture = await createLanFixture({
       root: path.join(root, "host"),

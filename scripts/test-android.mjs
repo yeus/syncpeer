@@ -133,14 +133,20 @@ const captureWebViewFixture = (directory) => {
   return { libraryApk, webViewApk, version };
 };
 
-const installWebViewFixture = (fixture) => {
+export const webViewSelected = (state, version) => state.includes(
+  `Current WebView package (name, version): (com.google.android.webview, ${version})`,
+);
+
+const installWebViewFixture = async (fixture) => {
   run("adb", ["install", "-r", "-d", fixture.libraryApk]);
   run("adb", ["install", "-r", "-d", fixture.webViewApk]);
   run("adb", ["shell", "cmd", "webviewupdate", "set-webview-implementation", "com.google.android.webview"]);
-  const state = adb(["shell", "dumpsys", "webviewupdate"]);
-  if (!state.includes(`Current WebView package (name, version): (com.google.android.webview, ${fixture.version})`)) {
-    throw new Error(`API 29 did not select the provisioned WebView ${fixture.version}.`);
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (webViewSelected(adb(["shell", "dumpsys", "webviewupdate"]), fixture.version)) return;
+    await wait(250);
   }
+  throw new Error(`API 29 did not select the provisioned WebView ${fixture.version} within 30 seconds.`);
 };
 
 const runProfile = async (profileName, testArguments, prepareDevice, installEditor = false) => {
@@ -176,13 +182,13 @@ const main = async () => {
     });
     await runProfile("compat", [
       "--expect-sdk", "29", "--reboot", "--skip-network",
-    ], () => {
+    ], async () => {
       if (!webViewFixture) throw new Error("Modern WebView fixture was not captured.");
-      installWebViewFixture(webViewFixture);
+      await installWebViewFixture(webViewFixture);
     }, true);
     await runProfile("legacy", [
-      "--expect-sdk", "24", "--reboot", "--skip-network",
-    ], undefined, true);
+      "--expect-sdk", "24", "--legacy-smoke",
+    ]);
     run(process.execPath, [
       "--experimental-strip-types",
       "scripts/test-android-peer.ts",

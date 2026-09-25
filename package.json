@@ -42,7 +42,7 @@
     "build:android:e2e": "npm run build:android:e2e -w @syncpeer/tauri-shell",
     "android:emulator:compat": "node scripts/android-emulator.mjs start compat",
     "android:emulator:modern": "node scripts/android-emulator.mjs start modern",
-    "android:install:e2e": "adb install -r packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk",
+    "android:install:e2e": "adb install --no-streaming -r packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk",
     "test:android": "node scripts/test-android.mjs",
     "test:android:compat": "npm run build:android:e2e && npm run android:install:e2e && node scripts/test-android-e2e.mjs --expect-sdk 29 --reboot",
     "test:android:modern-smoke": "npm run build:android:e2e && npm run android:install:e2e && node scripts/test-android-e2e.mjs --modern-smoke",

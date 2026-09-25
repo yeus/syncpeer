@@ -30,7 +30,15 @@ try {
     SYNCPEER_LAN_LOG_LEVEL: "error",
     XDG_DATA_DIRS: process.env.SYNCPEER_DEB_XDG_DATA_DIRS ?? "/usr/share",
   });
-  process.exitCode = code;
+  assert.equal(code, 0, "The packaged fresh-profile smoke test failed.");
+  const pairing = spawnSync("xvfb-run", ["-a", process.execPath, "--import", "tsx",
+    path.resolve("node_modules/@wdio/cli/bin/wdio.js"), "run",
+    path.resolve("scripts/lan-test/wdio-pairing.conf.ts")], {
+    stdio: "inherit", env: { ...process.env, SYNCPEER_LAN_APP_BINARY: binary,
+      XDG_DATA_DIRS: process.env.SYNCPEER_DEB_XDG_DATA_DIRS ?? "/usr/share" },
+  });
+  if (pairing.error) throw pairing.error;
+  assert.equal(pairing.status, 0, "The two-instance packaged pairing test failed.");
 } finally {
   await rm(root, { recursive: true, force: true });
 }

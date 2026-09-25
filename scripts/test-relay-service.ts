@@ -60,6 +60,9 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
         certPem: await readFile(a.certPath, "utf8"), keyPem: await readFile(a.keyPath, "utf8"),
         alpnProtocols: ["bep/1.0"] });
       const accepted = listener.accept();
+      // If dialing fails, closing the listener also rejects this pending accept.
+      // Observe both errors so the dial failure remains the reported root cause.
+      void accepted.catch(() => undefined);
       const connected = await adapter.connectRelay!({ relayAddress, expectedDeviceId: a.deviceId,
         certPem: await readFile(b.certPath, "utf8"), keyPem: await readFile(b.keyPath, "utf8") });
       const incoming = await accepted;
@@ -72,11 +75,14 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
       await listener.close();
       listener = undefined;
 
-      const ownerIdentity = { certPem: await readFile(a.certPath, "utf8"),
-        keyPem: await readFile(a.keyPath, "utf8"), deviceId: a.deviceId };
-      const joiningIdentity = { certPem: await readFile(b.certPath, "utf8"),
-        keyPem: await readFile(b.keyPath, "utf8"), deviceId: b.deviceId };
-      const signing = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, a.deviceId);
+      // Use separate devices for pairing: relay presence can outlive socket close briefly.
+      const pairingOwner = generateSyncthingIdentity(path.join(root, "pairing-owner"));
+      const pairingJoiner = generateSyncthingIdentity(path.join(root, "pairing-joiner"));
+      const ownerIdentity = { certPem: await readFile(pairingOwner.certPath, "utf8"),
+        keyPem: await readFile(pairingOwner.keyPath, "utf8"), deviceId: pairingOwner.deviceId };
+      const joiningIdentity = { certPem: await readFile(pairingJoiner.certPath, "utf8"),
+        keyPem: await readFile(pairingJoiner.keyPath, "utf8"), deviceId: pairingJoiner.deviceId };
+      const signing = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, pairingOwner.deviceId);
       let imported = false;
       const owner = createSyncpeerBrowserClient({ hostAdapter: adapter, platformAdapter: {
         readDefaultIdentity: async () => ownerIdentity,
@@ -103,7 +109,7 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
         assert.equal(pairing.invitation.endpoint, relayAddress);
         await joining.joinPairingInvitation({ invitation: pairing.invitation,
           password: "synthetic-local-password", remember: false, confirm: async () => true });
-        assert.equal((await pairing.completed).remoteDeviceId, b.deviceId.replaceAll("-", ""));
+        assert.equal((await pairing.completed).remoteDeviceId, pairingJoiner.deviceId.replaceAll("-", ""));
         assert.equal(imported, true);
       } finally {
         await pairing?.cancel().catch(() => undefined);

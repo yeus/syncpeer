@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
+import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 
@@ -13,6 +14,22 @@ test("the Android release matrix names API 24, 29, and 36 emulator profiles", ()
   assert.match(runner, /runProfile\("legacy"/);
   const editor = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build.gradle.kts", "utf8");
   assert.match(editor, /minSdk = 24/);
+});
+
+test("Android release validation can use isolated emulator names", () => {
+  assert.equal(profile("legacy", "syncpeer-release").avdName, "syncpeer-release-api24");
+  assert.equal(profile("compat", "syncpeer-release").avdName, "syncpeer-release-api29");
+  assert.equal(profile("modern", "syncpeer-release").avdName, "syncpeer-release-api36-play");
+  assert.throws(() => profile("legacy", "../other"), /AVD prefix/);
+});
+
+test("API 29 waits for the provisioned WebView to become current", () => {
+  const version = "133.0.6943.137";
+  assert.equal(webViewSelected("Current WebView package is null", version), false);
+  assert.equal(webViewSelected(
+    `Preferred WebView package (name, version): (com.google.android.webview, ${version})`, version), false);
+  assert.equal(webViewSelected(
+    `Current WebView package (name, version): (com.google.android.webview, ${version})`, version), true);
 });
 
 test("application builds compile the core workspace first", () => {
@@ -191,4 +208,10 @@ test("Android 10 runs compatibility checks instead of being skipped", () => {
   assert.doesNotMatch(script, /Android E2E skipped: Android 14/);
   assert.match(script, /Expected Android API/);
   assert.match(script, /picker\.includes\("com\.android\.documentsui"\)/);
+});
+
+test("real-peer Android acceptance cannot skip a failed document runtime probe", () => {
+  const runner = fs.readFileSync("scripts/test-android-peer.ts", "utf8");
+  assert.doesNotMatch(runner, /JS_FEATURE_MESSAGE_PORTS required by the document runtime/);
+  assert.match(runner, /throw new Error\("Android document runtime is unavailable/);
 });

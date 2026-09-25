@@ -794,7 +794,8 @@
 {:else if app.currentPage === "folder-settings"}
   <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
     command={documentCommand} onImport={importPeerFolder}
-    onStartPairing={advertisedHost => client.startPairingInvitation({ advertisedHost,
+    onRelease={(folderId, mode, confirmedText) => client.releaseLocalCopy(folderId, mode, confirmedText)}
+    onStartPairing={advertisedHost => client.startPairingInvitation({ advertisedHost, port: 0,
       confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}
     onJoinPairing={(invitation, password, remember) => client.joinPairingInvitation({ invitation, password, remember,
       confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}

@@ -48,13 +48,13 @@ const validateMembership = (devices: readonly OwnedSpaceDevice[]) => {
       slots.has(device.id) || !Array.isArray(device.retiredSyncthingIds ?? []) ||
       typeof device.signingKey !== "string" || !device.signingKey || device.signingKey.length > 4096 ||
       signingKeys.has(device.signingKey)) {
-      throw new Error("Invalid personal-space device membership.");
+      throw new Error("Invalid space device membership.");
     }
     slots.add(device.id);
     signingKeys.add(device.signingKey);
     for (const identity of [device.syncthingId, ...(device.retiredSyncthingIds ?? [])]) {
       const comparable = normalizeDeviceId(identity);
-      if (!comparable || identities.has(comparable)) throw new Error("Invalid personal-space device membership.");
+      if (!comparable || identities.has(comparable)) throw new Error("Invalid space device membership.");
       identities.add(comparable);
     }
   }
@@ -64,17 +64,17 @@ const validateMembershipTransition = (previous: readonly OwnedSpaceDevice[], nex
   const nextById = new Map(next.map(device => [device.id, device]));
   for (const device of previous) {
     const updated = nextById.get(device.id);
-    if (!updated) throw new Error("Space device membership device disappeared.");
-    if (updated.signingKey !== device.signingKey) throw new Error("Space device membership device key changed.");
+    if (!updated) throw new Error("Device disappeared from space membership.");
+    if (updated.signingKey !== device.signingKey) throw new Error("Device key changed in space membership.");
     if (device.state === "revoked" && updated.state !== "revoked") {
-      throw new Error("Space device membership revoked device cannot be reactivated.");
+      throw new Error("Revoked device cannot be reactivated in space membership.");
     }
     const retired = new Set(updated.retiredSyncthingIds ?? []);
     for (const identity of device.retiredSyncthingIds ?? []) {
-      if (!retired.has(identity)) throw new Error("Space device membership retired identity disappeared.");
+      if (!retired.has(identity)) throw new Error("Retired identity disappeared from space membership.");
     }
     if (updated.syncthingId !== device.syncthingId && !retired.has(device.syncthingId)) {
-      throw new Error("Space device membership certificate replacement must retain the retired identity.");
+      throw new Error("Certificate replacement must retain the retired identity in space membership.");
     }
   }
 };
@@ -109,7 +109,11 @@ const random = async (source: (size: number) => Uint8Array | Promise<Uint8Array>
 const hex = (value: Uint8Array) => [...value].map(byte => byte.toString(16).padStart(2, "0")).join("");
 const unsignedUpdate = (value: Pick<SpaceMembershipUpdate, "sequence" | "previous" | "signer" | "devices" | "recoveryKey">) =>
   ({ format: 1 as const, sequence: value.sequence, previous: value.previous, signer: value.signer,
-    ...(value.recoveryKey ? { recoveryKey: value.recoveryKey } : {}), devices: value.devices });
+    ...(value.recoveryKey ? { recoveryKey: value.recoveryKey } : {}),
+    devices: value.devices.map(device => ({ id: device.id, syncthingId: device.syncthingId,
+      state: device.state, signingKey: device.signingKey,
+      ...(device.retiredSyncthingIds ? { retiredSyncthingIds: device.retiredSyncthingIds } : {}) })) });
+// This domain is signed; renaming it would invalidate existing membership history.
 const updateBytes = (value: ReturnType<typeof unsignedUpdate>) =>
   new TextEncoder().encode(`syncpeer.owned-roster.v1\n${JSON.stringify(value)}`);
 

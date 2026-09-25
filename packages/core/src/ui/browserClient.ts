@@ -198,6 +198,8 @@ export interface AndroidCalendarEventRecord {
 }
 
 export interface SyncpeerPlatformAdapter {
+  releaseLocalCopy?: (folderId: string, mode: "safe" | "dangerous", confirmedText: string,
+    sessions: readonly Pick<SyncpeerSessionHandle, "remoteDeviceId" | "remoteFs" | "isClosed">[]) => Promise<void>;
   startBackgroundSession?: (options: Omit<ConnectOptions, "sharedFolders">) => Promise<void>;
   stopBackgroundSession?: () => Promise<void>;
   acknowledgeCachedSync?: (folderId: string, path: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => Promise<boolean>;
@@ -305,6 +307,7 @@ export interface CreateSyncpeerBrowserClientOptions {
 }
 
 export interface SyncpeerBrowserClient {
+  releaseLocalCopy: (folderId: string, mode: "safe" | "dangerous", confirmedText?: string) => Promise<void>;
   acknowledgeCachedSync?: SyncpeerPlatformAdapter["acknowledgeCachedSync"];
   connectAndSync: (options: ConnectOptions) => Promise<RemoteFsLike>;
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
@@ -419,6 +422,11 @@ const logClient = (
   emitLog(onLog, "info", event, details);
   console.log(`[syncpeer-core-ui] ${event}`);
 };
+
+const sharedFolderCounts = (folders: readonly SharedFolder[]) => ({
+  count: folders.length,
+  internalCount: folders.filter(folder => folder.internal === true).length,
+});
 
 const localListenPort = (value?: number) => {
   const port = value ?? 22000;
@@ -616,7 +624,6 @@ export const createSyncpeerBrowserClient = (
     const host = endpoint.hostname.includes(":") ? `[${endpoint.hostname}]` : endpoint.hostname;
     return `${host}:${port}`;
   };
-
   const relayPairingEndpoint = (value: string) => {
     let endpoint: URL;
     try { endpoint = new URL(value); }
@@ -641,10 +648,12 @@ export const createSyncpeerBrowserClient = (
       coreOptions.certPem, coreOptions.keyPem, listenPort]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
     const sessionHandlers = {
-      connectionOptions: async (remote: string, endpoint: { host: string; port: number }) =>
-        ({ ...coreOptions, ...endpoint, expectedDeviceId: remote,
-          sharedFolders: remote === coreOptions.expectedDeviceId && connectOptions.sharedFolders
-            ? connectOptions.sharedFolders : await platformAdapter.sessionSharedFolders?.(remote) ?? [] }),
+      connectionOptions: async (remote: string, endpoint: { host: string; port: number }) => {
+        const folders = remote === coreOptions.expectedDeviceId && connectOptions.sharedFolders
+          ? connectOptions.sharedFolders : await platformAdapter.sessionSharedFolders?.(remote) ?? [];
+        logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(folders));
+        return { ...coreOptions, ...endpoint, expectedDeviceId: remote, sharedFolders: folders };
+      },
       onSession: (session: SyncpeerSessionHandle) => {
         if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(connectOptions, session).then(adopted => {
@@ -725,6 +734,7 @@ export const createSyncpeerBrowserClient = (
 
     const sharedFolders = normalized.sharedFolders ??
       await platformAdapter.sessionSharedFolders?.(normalized.remoteId ?? "");
+    logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(sharedFolders ?? []));
     const coreOptions: SyncpeerConnectOptions = {
       host: normalized.host,
       port: normalized.port,
@@ -816,7 +826,41 @@ export const createSyncpeerBrowserClient = (
     getActiveSession: lifecycle.getSession,
   });
 
+  const setSessionForeground = async (foreground: boolean) => {
+    if (foreground) {
+      await platformAdapter.stopBackgroundSession?.();
+      await lifecycle.setForeground(true);
+      return;
+    }
+    await lifecycle.setForeground(false);
+    await stopIncomingService();
+    if (activeResolvedConnectOptions && platformAdapter.startBackgroundSession) {
+      const backgroundOptions = Object.fromEntries(
+        Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),
+      ) as Omit<ConnectOptions, "sharedFolders">;
+      await platformAdapter.startBackgroundSession(backgroundOptions);
+    }
+  };
+
   return {
+    releaseLocalCopy: async (folderId: string, mode: "safe" | "dangerous", confirmedText = "") => {
+      if (!platformAdapter.releaseLocalCopy) throw new Error("Local copy release is unavailable on this platform.");
+      const handoff = mode === "safe" && !!platformAdapter.startBackgroundSession;
+      if (handoff && !activeResolvedConnectOptions) throw new Error("Connect to a peer before verifying online copies.");
+      try {
+        if (handoff) await setSessionForeground(false);
+        const sessions = [...incomingService?.activeSessions().map(value => value.session) ?? [],
+          ...(lifecycle.getSession() ? [lifecycle.getSession()!] : [])]
+          .filter(session => !session.isClosed());
+        await platformAdapter.releaseLocalCopy(folderId, mode, confirmedText, sessions);
+        if (!handoff) {
+          await lifecycle.disconnect();
+          await stopIncomingService();
+        }
+      } finally {
+        if (handoff) await setSessionForeground(true);
+      }
+    },
     startPairingInvitation: async pairingOptions => {
       const relayAddress = pairingOptions.advertisedHost.startsWith("relay://")
         ? relayPairingEndpoint(pairingOptions.advertisedHost) : null;
@@ -987,28 +1031,7 @@ export const createSyncpeerBrowserClient = (
     },
     subscribeLifecycle: lifecycle.subscribe,
     setOnline: lifecycle.setOnline,
-    setForeground: async (foreground) => {
-      if (foreground) {
-        // Stop the service before reopening the Activity-owned session.  The
-        // stop call waits for the service's core session to close, so two
-        // authenticated sessions never own the same peer at once.
-        await platformAdapter.stopBackgroundSession?.();
-        await lifecycle.setForeground(true);
-        return;
-      }
-
-      // Release the Activity-owned session before handing the options to the
-      // service.  Starting the service first would create a race in which both
-      // runtimes connect to the peer briefly.
-      await lifecycle.setForeground(false);
-      await stopIncomingService();
-      if (activeResolvedConnectOptions && platformAdapter.startBackgroundSession) {
-        const backgroundOptions = Object.fromEntries(
-          Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),
-        ) as Omit<ConnectOptions, "sharedFolders">;
-        await platformAdapter.startBackgroundSession(backgroundOptions);
-      }
-    },
+    setForeground: setSessionForeground,
     setTransferActive: lifecycle.setTransferActive,
     acknowledgeCachedSync: platformAdapter.acknowledgeCachedSync,
     listFavorites: async (): Promise<FavoriteRecord[]> =>

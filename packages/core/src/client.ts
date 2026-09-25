@@ -247,6 +247,8 @@ export interface SyncpeerGlobalDiscoveryResult {
 }
 
 export interface SyncpeerSessionHandle {
+  /** Identity verified from the peer certificate during the TLS handshake. */
+  remoteDeviceId: string;
   remoteFs: RemoteFs;
   connectedVia: string;
   transportKind: "direct-tcp" | "direct-quic" | "relay";
@@ -1359,7 +1361,9 @@ class BepSession {
       const replica = this.sharedFolders.get(folderId)?.replica;
       if (replica?.isPaused?.()) continue;
       if (changedOnly && !replica) continue;
+      if (replica) this.log("shared_folder.index.scan.start");
       const files = replica ? await replica.scan() : [...folder.files.values()].map(file => file.indexFile);
+      if (replica) this.log("shared_folder.index.scan.done", { fileCount: files.length });
       const advertisedFiles = folder.folderCrypto
         ? await Promise.all(files.map(async file => encryptUntrustedFileInfo(
           folder.folderCrypto!.folderKey, file, await this.adapter.randomBytes(24))))
@@ -2621,6 +2625,7 @@ async function openBepSessionOnSocketUncancelled(
     remoteDeviceId,
   });
   return {
+    remoteDeviceId,
     remoteFs: session.buildRemoteFs(remoteDeviceInfo),
     connectedVia,
     transportKind,

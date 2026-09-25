@@ -69,7 +69,7 @@ test("conflicting settings remain unresolved until an explicit descendant choose
   assert.equal(resolved.settings?.folders.photos.minimumCopies, 2);
 });
 
-test("a space member cannot spoof another member's settings event", async () => {
+test("a space device cannot spoof another member's settings event", async () => {
   const { deviceId, trust } = await trustedOwner();
   await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust, [{
     id: "forged", deviceId, path: ["folders", "photos", "retention"], parents: [],
@@ -120,9 +120,23 @@ test("retention changes advance only that folder policy revision", () => {
 });
 
 test("unknown or incomplete shared settings fail closed", () => {
-  assert.throws(() => normalizePersonalSpaceSettings({ format: 2, rosterHead: "roster", folders: {} }),
+  assert.throws(() => normalizePersonalSpaceSettings({ format: 2, rosterHead: "membership", folders: {} }),
     /unsupported/i);
-  assert.throws(() => normalizePersonalSpaceSettings({ format: 1, rosterHead: "roster", folders: {
+  assert.throws(() => normalizePersonalSpaceSettings({ format: 1, rosterHead: "membership", folders: {
     photos: { minimumCopies: 2 },
   } }), /invalid/i);
+});
+
+test("signed folder credentials materialize only for valid encrypted personal-space settings", async () => {
+  const { deviceId, trust, privateKey } = await trustedOwner();
+  const credential = { label: "Photos", password: "synthetic-shared-folder-password" };
+  const change = await signPersonalSpaceChange(crypto.subtle, privateKey,
+    { id: "credential", deviceId, path: ["folders", "photos", "credential"], parents: [], value: credential });
+  const result = await materializePersonalSpaceSettings(crypto.subtle, trust, [change]);
+  assert.deepEqual(result.settings?.folders.photos.credential, credential);
+  await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust,
+    [{ ...change, value: { ...credential, password: "tampered" } }]), /signature/i);
+  assert.throws(() => normalizePersonalSpaceSettings({ format: 1, rosterHead: trust.knownHead, folders: {
+    photos: { ...result.settings?.folders.photos, credential: { label: "Photos", password: "" } },
+  } }), /credential/i);
 });

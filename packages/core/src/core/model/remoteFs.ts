@@ -406,6 +406,21 @@ export class RemoteFs {
     };
   }
 
+  /** Complete BEP-visible index for a folder whose current index was received. */
+  async completeFolderIndex(folderId: string): Promise<BepFileInfo[]> {
+    const folder = this.folders.get(folderId);
+    if (!folder?.indexReceived || folder.needsPassword || folder.passwordError || folder.stopReason) {
+      throw new Error("Remote folder index is unavailable for complete-copy verification.");
+    }
+    return [...folder.files.values()].map(({ indexFile }) => ({ ...indexFile,
+      blocks: indexFile.blocks?.map(block => ({ ...block, hash: block.hash.slice() })),
+      Blocks: indexFile.Blocks?.map(block => ({ ...block, hash: block.hash.slice() })),
+      version: indexFile.version ? { counters: indexFile.version.counters?.map(counter => ({ ...counter })) } : undefined,
+      symlink_target: indexFile.symlink_target?.slice(),
+      encrypted: indexFile.encrypted?.slice(),
+    }));
+  }
+
   async requestFolderIndex(folderId: string): Promise<void> {
     const normalizedFolderId = String(folderId ?? "").trim();
     if (!normalizedFolderId) return;

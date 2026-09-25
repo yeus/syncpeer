@@ -4,7 +4,7 @@
     type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { formatProfileCreationError } from "./app/storageErrors.ts";
-  let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onSettingsSaved,
+  let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onRelease, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId,
     onImport, onStartPairing, onJoinPairing, onPairedDevice, peerId, peerFolders, biometric, command }: {
     onBack: () => void;
@@ -16,6 +16,7 @@
     onUnlockBiometric: () => Promise<void>;
     onRotateMasterPassword: (password: string) => Promise<void>;
     onMigrate: (folderId: string, target: "encrypted" | "plaintext") => Promise<void>;
+    onRelease: (folderId: string, mode: "safe" | "dangerous", confirmedText: string) => Promise<void>;
     onSettingsSaved: (settings: SyncpeerProfileSettings) => void;
     onTrustedDevicesChanged: () => Promise<void>;
     getDefaultDeviceId: () => Promise<string>;
@@ -39,6 +40,9 @@
     changes: Array<{ id: string; deviceId: string; value?: unknown; deleted?: true }> }>>([]);
   let newHolderIds = $state<Record<string, string>>({});
   let newHolderKinds = $state<Record<string, "syncpeer" | "syncthing">>({});
+  let unsafeReleaseTexts = $state<Record<string, string>>({});
+  let releaseHistory = $state<Array<{ kind: "safe"; proposal: { folderId: string } } |
+    { kind: "dangerous"; exception: { folderId: string; guaranteeBroken: true } }>>([]);
   let patternDrafts = $state<Record<string, string>>({});
   let rememberMaster = $state(false), generatedPassword = $state(""), generatedSaved = $state(false);
   let importFolderId = $state(""), importPassword = $state(""), importApproved = $state(false);
@@ -64,10 +68,14 @@
         pairingInvitation = ""; pairingHandle = null;
         void refresh();
       }).catch(failure => {
-        error = failure instanceof Error ? failure.message : "Pairing failed.";
+        const message = failure instanceof Error ? failure.message : failure;
+        error = typeof message === "string" && message.trim() ? message : "Pairing failed.";
         pairingHandle = null;
       });
-    } catch (failure) { error = failure instanceof Error ? failure.message : "Pairing invitation failed."; }
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : failure;
+      error = typeof message === "string" && message.trim() ? message : "Pairing invitation failed.";
+    }
     finally { busy = false; }
   }
 
@@ -81,7 +89,8 @@
       pairingMessage = "Personal space joined and device approved.";
       await onUnlock(); await refresh();
       onPairedDevice(result.remoteDeviceId);
-    } catch (failure) { error = failure instanceof Error ? failure.message : "Pairing failed."; }
+    } catch (failure) { error = failure instanceof Error ? failure.message :
+      typeof failure === "string" ? failure : "Pairing failed."; }
     finally { busy = false; }
   }
 
@@ -135,6 +144,7 @@
   async function refresh() {
     status = await command<NonNullable<typeof status>>({ operation: "status" });
     if (status.vault.phase === "unlocked") {
+      releaseHistory = await command<typeof releaseHistory>({ operation: "localReleaseHistory" });
       settings = await command<SyncpeerProfileSettings>({ operation: "profileSettings" });
       patternDrafts = Object.fromEntries(Object.entries(settings.folders)
         .map(([folderId, folder]) => [folderId, folder.ignorePatterns.join("\n")]));
@@ -260,6 +270,20 @@
     try { await onMigrate(folderId, target); await refresh(); }
     catch { error = "Folder migration was not completed. Existing data was retained; check the password and available storage, then retry."; }
     finally { migrating = ""; }
+  }
+  async function releaseLocalCopy(folderId: string, mode: "safe" | "dangerous") {
+    const confirmedText = unsafeReleaseTexts[folderId] ?? "";
+    if (mode === "dangerous" && confirmedText !== "RELEASE LOCAL COPY") return;
+    if (!window.confirm(mode === "safe"
+      ? "Release this device's local copy? Syncpeer will first verify enough complete online copies."
+      : "This may permanently lose the folder if other copies are unavailable. Release only this device's local copy?")) return;
+    busy = true; error = "";
+    try { await onRelease(folderId, mode, confirmedText); unsafeReleaseTexts[folderId] = ""; await refresh(); }
+    catch (failure) {
+      await refresh().catch(() => undefined);
+      error = failure instanceof Error ? failure.message : String(failure);
+    }
+    finally { busy = false; }
   }
   onMount(() => {
     void refresh().catch(() => { error = "Folder storage is unavailable."; });
@@ -387,7 +411,7 @@
       <label>New folder name <input bind:value={label} required /></label>
       <button disabled={busy || !label.trim()}>Create folder</button>
     </form>
-    <p>New folders receive a random password stored securely on this device. Creating a local folder does not automatically share it with another device.</p>
+    <p>New folders receive a random password stored securely on this device. Approved devices in this personal space receive the folder credential through encrypted settings; other peers require a separately approved folder share.</p>
     <form onsubmit={event => { event.preventDefault(); void saveMasterPassword(); }}>
       <label>Change personal-space master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" required /></label>
       <button disabled={busy || !masterPassword}>Change master password</button>
@@ -446,13 +470,31 @@
     </section>
   {/if}
   <ul>{#each status?.folders ?? [] as folder (folder.id)}
+    {@const lastRelease = releaseHistory.filter(value =>
+      (value.kind === "safe" ? value.proposal.folderId : value.exception.folderId) === folder.id).at(-1)}
     <li>
       <span>{folder.label}</span>
+      {#if status?.pendingLocalReleases.includes(folder.id)}
+        <p>Local-copy cleanup is unfinished. Syncpeer will retry after the next unlock; this folder cannot be reattached yet.</p>
+      {:else if folder.browseOnly}<p>Browse-only: no complete local copy is stored or shared.</p>{/if}
+      {#if folder.browseOnly && lastRelease?.kind === "dangerous"}
+        <p>Copy guarantee broken: this device released its copy without verifying enough other complete online copies.</p>
+      {/if}
       {#if status?.vault.phase === "unlocked"}
         {#if folder.downloads}
           <button disabled={busy || migrating === folder.id} onclick={() => void migrate(folder.id, "plaintext")}>Move to plaintext storage</button>
+          <p>Release this device's copy but keep the folder registered for remote browsing and later re-download.</p>
+          <button disabled={busy} onclick={() => void releaseLocalCopy(folder.id, "safe")}>Release after verifying online copies</button>
+          <p>If enough complete copies cannot be verified online, releasing anyway can permanently lose data.</p>
+          <label>Type RELEASE LOCAL COPY to accept that risk
+            <input value={unsafeReleaseTexts[folder.id] ?? ""}
+              oninput={event => { unsafeReleaseTexts[folder.id] = event.currentTarget.value; }} />
+          </label>
+          <button disabled={busy || unsafeReleaseTexts[folder.id] !== "RELEASE LOCAL COPY"}
+            onclick={() => void releaseLocalCopy(folder.id, "dangerous")}>Release anyway (unsafe)</button>
         {:else}
-          <button disabled={busy || migrating === folder.id} onclick={() => void migrate(folder.id, "encrypted")}>Use encrypted storage</button>
+          <button disabled={busy || migrating === folder.id || status?.pendingLocalReleases.includes(folder.id)}
+            onclick={() => void migrate(folder.id, "encrypted")}>Reattach encrypted local storage</button>
         {/if}
       {/if}
       {#if settings}
@@ -471,12 +513,27 @@
                 <button disabled={busy} onclick={() => saveRetention(folder.id, retention?.minimumCopies ?? 2,
                   (retention?.holders ?? []).filter(item => item.id !== holder.id))}>Remove holder</button></li>
             {/each}</ul>
-            <label>Holder device ID <input value={newHolderIds[folder.id] ?? ""}
-              oninput={event => { newHolderIds[folder.id] = event.currentTarget.value; }} /></label>
             <label>Holder type <select value={newHolderKinds[folder.id] ?? "syncpeer"}
-              onchange={event => { newHolderKinds[folder.id] = event.currentTarget.value as "syncpeer" | "syncthing"; }}>
+              onchange={event => {
+                newHolderKinds[folder.id] = event.currentTarget.value as "syncpeer" | "syncthing";
+                newHolderIds[folder.id] = "";
+              }}>
               <option value="syncpeer">Syncpeer</option><option value="syncthing">Syncthing</option>
             </select></label>
+            {#if (newHolderKinds[folder.id] ?? "syncpeer") === "syncpeer"}
+              <label>Personal-space device
+                <select value={newHolderIds[folder.id] ?? ""}
+                  onchange={event => { newHolderIds[folder.id] = event.currentTarget.value; }}>
+                  <option value="">Select a trusted device</option>
+                  {#each trustedDevices.filter(device => device.state === "active") as device (device.id)}
+                    <option value={device.id}>{device.id === localTrustedDeviceId ? "This device" : device.syncthingId}</option>
+                  {/each}
+                </select>
+              </label>
+            {:else}
+              <label>Syncthing device ID <input value={newHolderIds[folder.id] ?? ""}
+                oninput={event => { newHolderIds[folder.id] = event.currentTarget.value; }} /></label>
+            {/if}
             <button disabled={busy || !newHolderIds[folder.id]?.trim()} onclick={() => {
               const id = newHolderIds[folder.id]?.trim();
               if (!id) return;

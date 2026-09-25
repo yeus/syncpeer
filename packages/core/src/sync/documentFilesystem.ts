@@ -33,6 +33,12 @@ import { createSpaceMembershipJournal } from "./spaceMembershipJournal.js";
 import type { PersonalSpaceChange } from "./personalSpaceChanges.js";
 import { resolveFolderShareDevices, settingsFolderDevices,
   type OwnedDeviceIdentity, type OwnedSpaceDevice } from "./personalSpaceSharing.js";
+import { authorizeReplicaRelease, defaultFolderRetentionPolicy, folderManifestDigestFromBep,
+  verifyLocalReplicaManifest, verifyRemoteReplicaManifest, type FolderRetentionPolicy,
+  type LocalReleaseRecord } from "./folderRetention.js";
+import { folderRetentionPolicyFromSettings } from "./personalSpaceSettings.js";
+import { purgePrivateReplicaContents } from "./replicaPurge.js";
+import type { SyncpeerSessionHandle } from "../client.js";
 
 type NativeFs = Awaited<ReturnType<typeof createNativeFilesystem>>;
 type Vault = ReturnType<typeof createCredentialVault>;
@@ -192,7 +198,7 @@ const reconcileSpaceDeviceMembership = async (runtime: DocumentRuntime) => {
       knownHead: remote.at(-1)!.hash, updates: remote });
     local = (await runtime.vault.spaceDeviceMembership())!;
   } else if (remote.length < local.trust.updates.length) {
-    await journal.appendMissing(local.trust.updates);
+    await journal.appendMissing(local.trust.updates, local.localDeviceId);
   }
   return local;
 };
@@ -323,12 +329,22 @@ const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> =>
   await openPersonalSpaceFolder(runtime);
   runtime.registry ??= createFolderRegistry({
     ...runtime.configs,
+    commitRelease: (folders, record) => runtime.vault.commitLocalRelease(record, folders),
     open: (folder) => openFolderRuntime(runtime, folder),
   });
   await runtime.registry.initialize();
+  for (const release of await runtime.vault.pendingLocalReleases()) {
+    const id = release.kind === "safe" ? release.proposal.folderId : release.exception.folderId;
+    const folder = runtime.registry.getState().find(value => value.id === id && value.browseOnly);
+    if (!folder) throw new Error("Pending local release has no browse-only folder registration.");
+    const storage = await runtime.options.openStorage(folder.storageId);
+    try { await purgePrivateReplicaContents(storage); }
+    finally { await storage.close(); }
+    await runtime.vault.completeLocalRelease(id);
+  }
   if (runtime.vault.status().phase === "unlocked") {
     for (const folder of runtime.registry.getState()) {
-      if (await runtime.vault.folderPassword(folder.id)) await runtime.registry.open(folder.id);
+      if (!folder.browseOnly && await runtime.vault.folderPassword(folder.id)) await runtime.registry.open(folder.id);
     }
   }
 };
@@ -336,6 +352,9 @@ const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> =>
 const documentStatus = async (runtime: DocumentRuntime) => ({
   vault: runtime.vault.status(),
   folders: runtime.vault.status().phase === "unlocked" ? await runtime.configs.load() : [],
+  pendingLocalReleases: runtime.vault.status().phase === "unlocked"
+    ? (await runtime.vault.pendingLocalReleases()).map(record => record.kind === "safe"
+      ? record.proposal.folderId : record.exception.folderId) : [],
   recoveryIssues: [...runtime.recoveryIssues.values()].flat(),
 });
 
@@ -458,15 +477,6 @@ const findVisibleFolder = (
   return folder && registry.getReplica(folderId) ? folder : null;
 };
 
-const requireOpenReplica = (runtime: DocumentRuntime, folderId: string): LocalFolderReplica => {
-  const registry = requireUnlockedRegistry(runtime);
-  const folder = registry.getState().find(value => value.id === folderId);
-  if (!folder) throw new Error("Document folder is unavailable.");
-  const replica = registry.getReplica(folderId);
-  if (!replica) throw new Error("Document folder is not open.");
-  return replica;
-};
-
 const favoriteStateTarget = (runtime: DocumentRuntime, folderId: string) => {
   const registry = requireUnlockedRegistry(runtime);
   const folder = registry.getState().find(value => value.id === folderId);
@@ -487,11 +497,20 @@ const rememberFolderAction = async (
   return documentStatus(runtime);
 };
 
+const assertNoPendingLocalRelease = async (runtime: DocumentRuntime, folderId: string) => {
+  const pending = await runtime.vault.pendingLocalReleases();
+  if (pending.some(record => (record.kind === "safe" ? record.proposal.folderId : record.exception.folderId) === folderId)) {
+    throw new Error("Complete the pending local release cleanup before reopening this folder.");
+  }
+};
+
 const registerFolderAction = async (
   runtime: DocumentRuntime,
   folder: { id: string; label: string; password?: string },
+  publishCredential = true,
 ) => {
   if (!runtime.registry) throw new Error("Folder storage is unavailable.");
+  await assertNoPendingLocalRelease(runtime, folder.id);
   if (!folder.id.trim() || !folder.label.trim() || folder.id !== folder.id.trim() || folder.label !== folder.label.trim()) {
     throw new Error("Invalid folder registration.");
   }
@@ -502,6 +521,7 @@ const registerFolderAction = async (
   }
   if (runtime.registry.getState().some(value => value.id === folder.id)) await runtime.registry.open(folder.id);
   else await runtime.registry.add({ id: folder.id, label: folder.label, storageId: await randomStorageId(runtime) });
+  if (publishCredential) await publishSharedFolderCredential(runtime, folder.id, folder.label);
   return documentStatus(runtime);
 };
 
@@ -518,6 +538,7 @@ const attachDownloadsAction = async (runtime: DocumentRuntime, id: string): Prom
   if (runtime.vault.status().phase !== "unlocked" || !runtime.registry) {
     throw new Error("Document vault is locked.");
   }
+  await assertNoPendingLocalRelease(runtime, id);
   await runtime.registry.attachDownloads(id);
 };
 
@@ -568,7 +589,8 @@ const cachedFilesAction = async (
 ): Promise<CachedFileRecord[]> => {
   if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
   const files: CachedFileRecord[] = [];
-  for (const folder of runtime.registry!.getState().filter(folder => folderId ? folder.id === folderId : folder.downloads)) {
+  for (const folder of runtime.registry!.getState().filter(folder =>
+    !folder.browseOnly && (folderId ? folder.id === folderId : folder.downloads))) {
     for (const info of await runtime.registry!.getReplica(folder.id)!.scan()) {
       if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0) continue;
       const modifiedMs = Number(info.modified_s ?? 0) * 1000 + Number(info.modified_ns ?? 0) / 1000000;
@@ -1060,7 +1082,13 @@ const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
 
 const createLifecycleActions = (runtime: DocumentRuntime) => ({
   initialize: () => runQueued(runtime, () => initializeFilesystem(runtime)),
-  status: () => runQueued(runtime, () => documentStatus(runtime)),
+  status: () => runQueued(runtime, async () => {
+    if (runtime.vault.status().phase === "unlocked" && runtime.settingsFolder &&
+      await runtime.vault.spaceDeviceMembership()) {
+      await syncSharedFolderCredentials(runtime, await sharedSettingsContext(runtime));
+    }
+    return documentStatus(runtime);
+  }),
   close: () => closeFilesystem(runtime),
 });
 
@@ -1075,6 +1103,140 @@ const sharedSettingsContext = async (runtime: DocumentRuntime, requireActive = f
   const changes = await journal.load();
   const result = await materializePersonalSpaceSettings(crypto.subtle, membership.trust, changes);
   return { membership, journal, changes, result };
+};
+
+const syncSharedFolderCredentials = async (runtime: DocumentRuntime,
+  context: Awaited<ReturnType<typeof sharedSettingsContext>>) => {
+  if (!context.result.settings) return;
+  for (const [id, folder] of Object.entries(context.result.settings.folders)) {
+    if (!folder.credential) continue;
+    const existing = await runtime.vault.folderPassword(id);
+    if (existing && existing !== folder.credential.password) {
+      throw new Error("A shared folder credential conflicts with this device's existing folder; no data was replaced.");
+    }
+    if (existing !== null && runtime.registry?.getState().some(value => value.id === id)) continue;
+    await registerFolderAction(runtime, { id, ...folder.credential }, false);
+  }
+};
+
+const publishSharedFolderCredential = async (runtime: DocumentRuntime, id: string, label: string) => {
+  if (!runtime.settingsFolder || !await runtime.vault.spaceDeviceMembership()) return;
+  const context = await sharedSettingsContext(runtime, true);
+  if (context.result.conflicts.length) throw new Error("Resolve shared-settings conflicts before sharing a folder.");
+  const password = await runtime.vault.folderPassword(id);
+  if (!password) throw new Error("Registered folder credentials are unavailable.");
+  const credential = { label, password };
+  const prior = context.result.settings?.folders[id]?.credential;
+  if (prior) {
+    if (prior.password !== password) throw new Error("A different shared folder credential already exists.");
+    return;
+  }
+  await appendSharedEdit(runtime, context, {
+    path: ["folders", id, "credential"], parents: [], value: credential,
+  });
+};
+
+type ReleaseRequest = { mode: "dangerous"; confirmedText: string } |
+  { mode: "safe"; sessions: readonly Pick<SyncpeerSessionHandle, "remoteDeviceId" | "remoteFs" | "isClosed">[] };
+
+const observeOnlineHolders = async (runtime: DocumentRuntime, folderId: string,
+  policy: FolderRetentionPolicy, context: Awaited<ReturnType<typeof sharedSettingsContext>>,
+  sessions: Extract<ReleaseRequest, { mode: "safe" }>["sessions"], manifestDigest: string) => {
+  const observations: Array<{ holderId: string; session: typeof sessions[number];
+    completion: Awaited<ReturnType<Vault["signReplicaCompletion"]>> }> = [];
+  const failures: string[] = [];
+  for (const holder of policy.holders.filter(value => value.id !== context.membership.localDeviceId)) {
+    const peerId = holder.kind === "syncpeer"
+      ? context.membership.devices.find(device => device.id === holder.id && device.state === "active")?.syncthingId
+      : holder.id;
+    const session = peerId && sessions.find(value => !value.isClosed() && sameDeviceId(value.remoteDeviceId, peerId));
+    if (!session) { failures.push("a named holder is not connected with its authenticated identity"); continue; }
+    try {
+      if (await verifyRemoteReplicaManifest(session.remoteFs, folderId) !== manifestDigest || session.isClosed()) {
+        failures.push("a connected holder's complete folder manifest differs from this device");
+        continue;
+      }
+    } catch {
+      failures.push("a connected holder could not provide every verified file block");
+      continue;
+    }
+    const completedAtMs = Date.now();
+    const completion = await runtime.vault.signReplicaCompletion({ folderId,
+      holderId: holder.id, holderKind: holder.kind, manifestDigest,
+      policyRevision: policy.revision, completedAtMs, liveUntilMs: completedAtMs + 5 * 60_000 });
+    observations.push({ holderId: holder.id, session, completion });
+  }
+  return { observations, failures };
+};
+
+const prepareSafeRelease = async (runtime: DocumentRuntime, folderId: string,
+  policy: FolderRetentionPolicy, context: Awaited<ReturnType<typeof sharedSettingsContext>>,
+  replica: LocalFolderReplica | undefined, files: Awaited<ReturnType<LocalFolderReplica["scan"]>>,
+  sessions: Extract<ReleaseRequest, { mode: "safe" }>["sessions"], manifestDigest: string): Promise<LocalReleaseRecord> => {
+  const localId = context.membership.localDeviceId;
+  if (!replica || !localId || !policy.holders.some(holder => holder.kind === "syncpeer" && holder.id === localId)) {
+    throw new Error("Add this device as a complete-copy holder before a safe release.");
+  }
+  await verifyLocalReplicaManifest(replica, files);
+  const { observations, failures } = await observeOnlineHolders(runtime, folderId, policy, context, sessions, manifestDigest);
+  if (observations.filter(value => !value.session.isClosed()).length < policy.minimumCopies) {
+    throw new Error(`Safe release needs more online verified complete copies: ${failures.join("; ") || "none were verified"}.`);
+  }
+  const current = await sharedSettingsContext(runtime, true);
+  if (await verifyLocalReplicaManifest(replica, files) !== manifestDigest || !current.result.settings ||
+    JSON.stringify(folderRetentionPolicyFromSettings(current.result.settings, folderId)) !== JSON.stringify(policy)) {
+    throw new Error("Folder or trusted settings changed during release verification.");
+  }
+  const proposal = await runtime.vault.signRetentionReleaseProposal({ folderId,
+    releaseHolderId: localId, policyRevision: policy.revision,
+    rosterHead: policy.rosterHead, manifestDigest });
+  const completions = [await runtime.vault.signReplicaCompletion({ folderId,
+    holderId: localId, holderKind: "syncpeer", manifestDigest,
+    policyRevision: policy.revision, completedAtMs: Date.now() }), ...observations.map(value => value.completion)];
+  await authorizeReplicaRelease(crypto.subtle, { policy, currentManifestDigest: manifestDigest,
+    proposal, completions, onlineHolderIds: [localId, ...observations.filter(value => !value.session.isClosed())
+      .map(value => value.holderId)], trust: current.membership.trust, nowMs: Date.now() });
+  return { kind: "safe", proposal, completions, decidedAtMs: Date.now() };
+};
+
+const releaseLocalCopyAction = async (runtime: DocumentRuntime, folderId: string,
+  request: ReleaseRequest) => {
+  if (request.mode === "dangerous" && request.confirmedText !== "RELEASE LOCAL COPY") {
+    throw new Error("Type RELEASE LOCAL COPY to confirm the dangerous local release.");
+  }
+  const registry = requireUnlockedRegistry(runtime);
+  const folder = registry.getState().find(value => value.id === folderId && value.downloads);
+  if (!folder) throw new Error("This folder has no local copy to release.");
+  if ([...runtime.handles.values()].some(handle => JSON.parse(handle.documentId)[0] === folder.storageId)) {
+    throw new Error("Close this folder's open documents before releasing its local copy.");
+  }
+  const context = await sharedSettingsContext(runtime, true);
+  const policy = context.result.settings
+    ? folderRetentionPolicyFromSettings(context.result.settings, folderId)
+    : defaultFolderRetentionPolicy(folderId, context.membership.trust.knownHead);
+  const replica = registry.getReplica(folderId);
+  let files: Awaited<ReturnType<LocalFolderReplica["scan"]>> = [];
+  let manifestDigest = "unavailable";
+  try {
+    if (replica) {
+      files = (await replica.scan()).filter(file => !isInternalReplicaPath(file.name));
+      manifestDigest = folderManifestDigestFromBep(files);
+    }
+  } catch (error) { if (request.mode === "safe") throw error; }
+  let record: LocalReleaseRecord;
+  if (request.mode === "dangerous") {
+    const exception = await runtime.vault.signDangerousLocalRelease({ folderId,
+      policyRevision: policy.revision, rosterHead: policy.rosterHead,
+      manifestDigest, createdAtMs: Date.now(), confirmedText: request.confirmedText });
+    record = { kind: "dangerous", exception };
+  } else record = await prepareSafeRelease(runtime, folderId, policy, context, replica, files,
+    request.sessions, manifestDigest);
+  await registry.commitBrowseOnlyRelease(folderId, record);
+  const storage = await runtime.options.openStorage(folder.storageId);
+  try { await purgePrivateReplicaContents(storage); }
+  finally { await storage.close(); }
+  await runtime.vault.completeLocalRelease(folderId);
+  return record;
 };
 
 const appendSharedEdit = async (runtime: DocumentRuntime,
@@ -1207,26 +1369,35 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
 });
 
 const createFolderActions = (runtime: DocumentRuntime) => ({
+  releaseLocalCopy: (folderId: string, request: ReleaseRequest) =>
+    runQueued(runtime, () => releaseLocalCopyAction(runtime, folderId, request)),
+  localReleaseHistory: () => runQueued(runtime, () => runtime.vault.localReleaseHistory()),
   register: (folder: { id: string; label: string; password?: string }) =>
     runQueued(runtime, () => registerFolderAction(runtime, folder)),
   attachDownloads: (id: string) => runQueued(runtime, () => attachDownloadsAction(runtime, id)),
   detachDownloads: (id: string) => runQueued(runtime, () => detachDownloadsAction(runtime, id)),
   sessionSharedFolders: (remoteDeviceId: string) => runQueued(runtime, async () => {
     if (!remoteDeviceId) return [];
-    const registry = requireUnlockedRegistry(runtime);
+    requireUnlockedRegistry(runtime);
     const personalSpaceFolder = await runtime.vault.personalSpaceFolder();
     if (personalSpaceFolder && runtime.settingsFolder?.id !== personalSpaceFolder.id) {
       throw new Error("Personal-space settings storage is unavailable.");
     }
-    const context = await sharedSettingsContext(runtime);
+    // A not-yet-enrolled vault has no space device membership even if its encrypted
+    // personal-space storage already exists. Explicit root favorites can still
+    // be shared with the authenticated ordinary Syncthing peer.
+    const context = await runtime.vault.spaceDeviceMembership()
+      ? await sharedSettingsContext(runtime) : null;
+    if (context) await syncSharedFolderCredentials(runtime, context);
+    const registry = requireUnlockedRegistry(runtime);
     const settings = await effectiveProfileSettings(runtime);
-    const shared = context.result.settings;
-    const owned = settingsFolderDevices(context.membership.devices)
+    const shared = context?.result.settings;
+    const owned = context && settingsFolderDevices(context.membership.devices)
       .some(id => sameDeviceId(id, remoteDeviceId));
     const selected = new Set(Object.entries(settings.folders)
       .filter(([, folder]) => !folder.paused &&
         folder.favorites.some(favorite => favorite.kind === "folder" && favorite.path === ""))
-      .filter(([folderId]) => shared && resolveFolderShareDevices(
+      .filter(([folderId]) => !context || shared && resolveFolderShareDevices(
         shared.folders[folderId]?.shareTargets ?? [{ kind: "personal-space" }],
         context.membership.devices).some(id => sameDeviceId(id, remoteDeviceId)))
       .map(([folderId]) => folderId));

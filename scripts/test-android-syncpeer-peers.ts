@@ -184,7 +184,20 @@ const main = async () => {
 
     edit(firstSerial, secondId, "delete", "renamed.txt");
     verify(secondSerial, firstId, "renamed.txt", undefined, true);
-    console.log("Two packaged Android Syncpeer peers passed pairing and bidirectional whole-folder CRUD.");
+    edit(firstSerial, secondId, "write", "retained.txt", "retained-by-second-peer");
+    verify(secondSerial, firstId, "retained.txt", "retained-by-second-peer");
+    runPhase(firstSerial, [process.env.SYNCPEER_ANDROID_TEST_SAFE_UI === "1"
+      ? "--release-whole-folder-safe-ui" : "--release-whole-folder-safe"], {
+      SYNCPEER_DEV_SERVER_DEVICE_ID: secondId,
+      SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
+      SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2",
+      SYNCPEER_ANDROID_DIRECT_PORT: first.port,
+    });
+    verify(secondSerial, firstId, "retained.txt", "retained-by-second-peer");
+    runPhase(secondSerial, ["--release-whole-folder-dangerous"], {
+      SYNCPEER_DEV_SERVER_DEVICE_ID: firstId,
+    });
+    console.log("Two packaged Android Syncpeer peers passed pairing, whole-folder CRUD, safe and unsafe local release.");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

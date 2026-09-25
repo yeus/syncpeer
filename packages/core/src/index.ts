@@ -22,6 +22,7 @@ export {
   signReplicaCompletion,
   signRetentionReleaseProposal,
   verifyDangerousLocalRelease,
+  verifyRemoteReplicaManifest,
 } from "./sync/folderRetention.js";
 export {
   defaultPersonalSpaceSettings,

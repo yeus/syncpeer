@@ -496,6 +496,17 @@ export const createTauriAdapters = (
   };
 
   const platformAdapter: SyncpeerPlatformAdapter = {
+    releaseLocalCopy: async (folderId, mode, confirmedText, sessions) => {
+      if (platform === "android") {
+        await invokeWithLogging("syncpeer_android_release_local_copy", {
+          request: { folderId, mode, confirmedText },
+        });
+        return;
+      }
+      const documents = await desktopDocuments();
+      await documents.releaseLocalCopy(folderId, mode === "safe"
+        ? { mode, sessions } : { mode, confirmedText });
+    },
     startBackgroundSession: platform === "android" ? async (options: Omit<ConnectOptions, "sharedFolders">) => {
       let allowMetered = false;
       try {

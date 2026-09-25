@@ -211,6 +211,25 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
+  fun releaseLocalCopy(invoke: Invoke) {
+    val args = invoke.parseArgs(DocumentCommandArgs::class.java)
+    if (args.request.length > 4096) { invoke.reject("Invalid local release request."); return }
+    Thread {
+      try {
+        val request = JSONObject(args.request)
+        check(request.optString("mode") in listOf("safe", "dangerous")) { "Invalid local release mode." }
+        request.put("operation", "releaseLocalCopy")
+        val uri = Uri.parse("content://${activity.packageName}.documents")
+        val result = activity.applicationContext.contentResolver.call(uri, "syncpeerReleaseLocalCopy", request.toString(), null)
+        invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(result?.getString("result"))))
+      } catch (error: Exception) {
+        invoke.reject(privateStorageFailureMessage(error) ?: error.message ?: error.cause?.message
+          ?: "Local copy release failed; the signed decision remains recoverable.")
+      }
+    }.start()
+  }
+
+  @Command
   fun vaultSecret(invoke: Invoke) {
     try {
       val args = invoke.parseArgs(VaultSecretArgs::class.java)

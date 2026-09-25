@@ -347,6 +347,9 @@ test("encrypted metadata uses Syncthing's wrapper without leaking original count
   assert.equal(encrypted.modified_s, 1234567890);
   const decoded = await decryptUntrustedFileInfo(crypto.folderKey, encrypted);
   assert.equal(decoded.fileInfo.name, original.name);
+  assert.equal(typeof decoded.fileInfo.size, "number");
+  assert.equal(typeof decoded.fileInfo.blocks?.[0]?.offset, "number");
+  assert.equal(typeof decoded.fileInfo.blocks?.[0]?.size, "number");
   assert.equal(String(decoded.fileInfo.version.counters[0].value), "9007199254740993");
   assert.equal(Number(decoded.fileInfo.sequence), 9);
   const deleted = await encryptUntrustedFileInfo(crypto.folderKey, { ...original, deleted: true, blocks: [], size: 0 }, new Uint8Array(24).fill(9));

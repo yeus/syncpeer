@@ -33,6 +33,7 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return documents.sessionSharedFolders(command.remoteDeviceId);
     }
     case "profileSettings": return documents.profileSettings();
+    case "localReleaseHistory": return documents.localReleaseHistory();
     case "personalSpaceChanges": return documents.personalSpaceChanges();
     case "sharedPersonalSpaceSettings": return documents.sharedPersonalSpaceSettings();
     case "savePersonalSpaceSetting": {
@@ -83,6 +84,7 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
     }
     case "exportRecoveryBackup": return documents.exportRecoveryBackup(text("password"));
     case "ownedDevices": return documents.ownedDevices();
+    case "revokeOwnedDevice": return documents.revokeOwnedDevice(text("deviceId"));
     case "recoverOwnedDevice": {
       if (!command.kit || typeof command.kit !== "object" || Array.isArray(command.kit)) {
         throw new Error("Invalid owned recovery kit.");
@@ -90,7 +92,6 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return documents.recoverOwnedDevice(text("localDeviceId"),
         command.kit as Parameters<typeof documents.recoverOwnedDevice>[1], text("password"));
     }
-    case "revokeOwnedDevice": return documents.revokeOwnedDevice(text("deviceId"));
     case "exportPairingTransfer": {
       if (!command.joiningDevice || typeof command.joiningDevice !== "object" || Array.isArray(command.joiningDevice)) {
         throw new Error("Invalid joining device identity.");

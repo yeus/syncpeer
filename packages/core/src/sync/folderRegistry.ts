@@ -1,5 +1,6 @@
 import type { createReplicaController, ReplicaState } from "./replicaControl.js";
 import type { LocalFolderReplica } from "./replicaIndex.js";
+import type { LocalReleaseRecord } from "./folderRetention.js";
 
 export interface FolderRegistration {
   id: string;
@@ -8,6 +9,8 @@ export interface FolderRegistration {
   storageId: string;
   /** Explicit opt-in: this service is the cache owner for this folder. */
   downloads?: boolean;
+  /** Kept for remote browsing, but excluded from automatic local-copy attachment. */
+  browseOnly?: boolean;
 }
 
 export interface RegisteredFolderState extends FolderRegistration {
@@ -30,8 +33,11 @@ export const validateRegistrations = (values: FolderRegistration[]) => {
     if (ids.has(value.id)) throw new Error("Folder is already registered.");
     if (roots.has(value.storageId)) throw new Error("Storage root is already registered.");
     ids.add(value.id); roots.add(value.storageId);
-    if (value.downloads !== undefined && typeof value.downloads !== "boolean") throw new Error("Invalid download registration.");
-    return { id: value.id, label: value.label, storageId: value.storageId, ...(value.downloads ? { downloads: true } : {}) };
+    if (value.downloads !== undefined && typeof value.downloads !== "boolean" ||
+      value.browseOnly !== undefined && typeof value.browseOnly !== "boolean" ||
+      value.downloads && value.browseOnly) throw new Error("Invalid folder copy registration.");
+    return { id: value.id, label: value.label, storageId: value.storageId,
+      ...(value.downloads ? { downloads: true } : {}), ...(value.browseOnly ? { browseOnly: true } : {}) };
   });
 };
 
@@ -39,6 +45,7 @@ export const validateRegistrations = (values: FolderRegistration[]) => {
 export function createFolderRegistry(dependencies: {
   load: () => Promise<FolderRegistration[]>;
   save: (folders: FolderRegistration[]) => Promise<void>;
+  commitRelease?: (folders: FolderRegistration[], record: LocalReleaseRecord) => Promise<void>;
   open: (folder: FolderRegistration, signal: AbortSignal) => Promise<OpenedFolder>;
 }) {
   const entries = new Map<string, { config: FolderRegistration; state: ReplicaState | { phase: "opening"; error?: string };
@@ -121,7 +128,8 @@ export function createFolderRegistry(dependencies: {
     open: (id: string) => enqueue(() => openEntry(id)),
     attachDownloads: (id: string) => enqueue(async () => {
       const entry = requireEntry(id);
-      const config = { ...entry.config, downloads: true };
+      const config = { id: entry.config.id, label: entry.config.label,
+        storageId: entry.config.storageId, downloads: true };
       await dependencies.save([...entries.values()].map(value => value === entry ? config : value.config));
       entry.config = config; notify();
     }),
@@ -131,6 +139,25 @@ export function createFolderRegistry(dependencies: {
       const config = { id: entry.config.id, label: entry.config.label, storageId: entry.config.storageId };
       await dependencies.save([...entries.values()].map(value => value === entry ? config : value.config));
       entry.config = config; notify();
+    }),
+    markBrowseOnly: (id: string) => enqueue(async () => {
+      const entry = requireEntry(id);
+      const config = { id: entry.config.id, label: entry.config.label,
+        storageId: entry.config.storageId, browseOnly: true };
+      await dependencies.save([...entries.values()].map(value => value === entry ? config : value.config));
+      entry.config = config; notify();
+      await stopEntry(entry);
+    }),
+    commitBrowseOnlyRelease: (id: string, record: LocalReleaseRecord) => enqueue(async () => {
+      const entry = requireEntry(id);
+      if (!entry.config.downloads || !dependencies.commitRelease) {
+        throw new Error("Local copy release is unavailable for this folder.");
+      }
+      const config = { id: entry.config.id, label: entry.config.label,
+        storageId: entry.config.storageId, browseOnly: true };
+      await dependencies.commitRelease([...entries.values()].map(value => value === entry ? config : value.config), record);
+      entry.config = config; notify();
+      await stopEntry(entry);
     }),
     getReplica: (id: string): LocalFolderReplica | undefined => requireEntry(id).opened?.replica,
     pause: (id: string) => enqueue(async () => {

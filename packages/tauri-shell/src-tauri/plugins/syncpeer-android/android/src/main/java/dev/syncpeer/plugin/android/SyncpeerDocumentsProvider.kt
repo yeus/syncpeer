@@ -19,6 +19,7 @@ import android.os.storage.StorageManager
 import android.system.ErrnoException
 import android.system.OsConstants
 import android.provider.DocumentsContract
+import android.os.SystemClock
 import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
@@ -161,10 +162,40 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
 
   /** Configuration is private to Syncpeer; a document URI grant never grants vault control. */
   override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
-    if (method != "syncpeerDocumentCommand") return super.call(method, arg, extras)
+    if (method != "syncpeerDocumentCommand" && method != "syncpeerReleaseLocalCopy") return super.call(method, arg, extras)
     check(Binder.getCallingUid() == context!!.applicationInfo.uid) { "Vault control is private to Syncpeer." }
-    val result = command(JSONObject(checkNotNull(arg)))
+    val result = if (method == "syncpeerReleaseLocalCopy") {
+      val request = JSONObject(checkNotNull(arg))
+      check(request.optString("operation") == "releaseLocalCopy") { "Invalid local release operation." }
+      ensureRuntime()
+      if (Build.VERSION.SDK_INT < 26 || !bound) throw FileNotFoundException(summary())
+      val owner = ready.get(30, TimeUnit.SECONDS)
+      try {
+        if (request.optString("mode") == "safe") waitForSafeReleaseSession(owner)
+        owner.sessionCommand(request).get().opt("result").takeUnless { it == JSONObject.NULL }
+      } catch (error: Exception) {
+        val status = owner.backgroundSessionStatus()
+        val phase = status.optString("phase", "unknown")
+        val reason = status.optString("error").takeIf { it.isNotBlank() && it != "null" }
+        throw IllegalStateException("Background peer session is $phase${reason?.let { ": $it" } ?: ""}.", error)
+      }
+    } else command(JSONObject(checkNotNull(arg)))
     return Bundle().apply { putString("result", JSONObject().put("result", result ?: JSONObject.NULL).toString()) }
+  }
+
+  private fun waitForSafeReleaseSession(owner: DocumentRuntimeService.RuntimeBinder) {
+    val deadline = SystemClock.elapsedRealtime() + 45_000
+    while (SystemClock.elapsedRealtime() < deadline) {
+      val status = owner.backgroundSessionStatus()
+      if (status.optBoolean("active")) return
+      val phase = status.optString("phase", "unknown")
+      val reason = status.optString("error").takeIf { it.isNotBlank() && it != "null" }
+      if (phase == "error" || phase == "waiting") {
+        throw IllegalStateException("Background peer session is $phase${reason?.let { ": $it" } ?: ""}.")
+      }
+      Thread.sleep(100)
+    }
+    throw IllegalStateException("Background peer session did not connect before safe release.")
   }
 
   override fun openDocument(

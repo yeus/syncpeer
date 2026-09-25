@@ -91,6 +91,20 @@ test("space device membership updates require an active signer and reject rollba
   await assert.rejects(verifySpaceDeviceMembership(subtle, [genesis, next, forged], await publicKey(first.publicKey)), /signature/i);
 });
 
+test("signed space membership updates survive JSON bridge key reordering", async () => {
+  const key = await signingKeyPair();
+  const identity = { id: "synthetic-slot", syncthingId: "SYNTHETIC", state: "active" as const,
+    signingKey: await publicKey(key.publicKey) };
+  const signed = await signSpaceMembershipUpdate(subtle, key.privateKey, {
+    sequence: 1, previous: null, signer: identity.id, devices: [identity],
+  });
+  const bridged = { ...signed, devices: [{ signingKey: identity.signingKey, state: identity.state,
+    syncthingId: identity.syncthingId, id: identity.id }] };
+  assert.deepEqual((await verifySpaceDeviceMembership(subtle, [bridged], identity.signingKey)).devices, bridged.devices);
+  await assert.rejects(verifySpaceDeviceMembership(subtle, [{ ...bridged,
+    devices: [{ ...bridged.devices[0], syncthingId: "TAMPERED" }] }], identity.signingKey), /hash/i);
+});
+
 test("a recovery key can authorize a replacement after every device is lost", async () => {
   const first = await signingKeyPair();
   const recovery = await signingKeyPair();
@@ -108,7 +122,7 @@ test("a recovery key can authorize a replacement after every device is lost", as
     restored.devices);
 });
 
-test("each space device slot requires one unique permanent device key", async () => {
+test("each space device slot requires one unique permanent key", async () => {
   const first = await signingKeyPair();
   const replacement = await signingKeyPair();
   const firstPublic = await publicKey(first.publicKey);

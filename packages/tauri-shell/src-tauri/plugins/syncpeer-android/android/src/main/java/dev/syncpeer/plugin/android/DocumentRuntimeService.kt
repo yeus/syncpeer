@@ -146,6 +146,15 @@ class DocumentRuntimeService : Service() {
       }
     }
 
+    fun sessionCommand(input: JSONObject): CompletableFuture<JSONObject> {
+      return evaluate("""
+        if (!globalThis.syncpeerDocuments) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
+        if (!globalThis.syncpeerSession) globalThis.syncpeerSession = await globalThis.syncpeerDocumentsCore.startSession(android, globalThis.syncpeerDocuments);
+        const result = await globalThis.syncpeerSession.command(input);
+        return JSON.stringify({result: result === undefined ? null : result});
+      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8)).thenApply { JSONObject(it) }
+    }
+
     internal fun startBackgroundSession(input: JSONObject): CompletableFuture<JSONObject> {
       return scheduleBackgroundSession(input.toString(), persist = true)
     }

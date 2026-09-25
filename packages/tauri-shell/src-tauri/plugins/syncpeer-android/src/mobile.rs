@@ -27,6 +27,9 @@ impl<R: Runtime> SyncpeerAndroid<R> {
   pub fn document_command(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("documentCommand", json!({ "request": request.to_string() })).map_err(Into::into)
   }
+  pub fn release_local_copy(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
+    self.0.run_mobile_plugin("releaseLocalCopy", json!({ "request": request.to_string() })).map_err(Into::into)
+  }
   pub fn vault_secret(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("vaultSecret", request).map_err(Into::into)
   }

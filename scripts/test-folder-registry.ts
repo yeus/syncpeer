@@ -51,6 +51,49 @@ test("detaching drains the existing controller and stops stale session reference
   await assert.rejects(replica.scan(), /paused|closed/i);
 });
 
+test("browse-only release keeps registration but closes stale local replicas", async () => {
+  const config = { id: "fixture-folder", label: "Fixture", storageId: "root", downloads: true };
+  let saved = [config];
+  const registry = createFolderRegistry({ load: async () => saved,
+    save: async value => { saved = value; },
+    open: async () => ({ replica: createReplicaController({ scan: async () => [],
+      readBlock: async () => new Uint8Array() }), close: async () => {} }) });
+  await registry.initialize();
+  await registry.open(config.id);
+  const stale = registry.getReplica(config.id)!;
+  await registry.markBrowseOnly(config.id);
+  assert.deepEqual(saved, [{ id: config.id, label: config.label, storageId: config.storageId,
+    browseOnly: true }]);
+  assert.equal(registry.getReplica(config.id), undefined);
+  await assert.rejects(stale.scan(), /closed/i);
+  await registry.close();
+});
+
+test("signed release commits its record with browse-only state before closing the replica", async () => {
+  const config = { id: "fixture-folder", label: "Fixture", storageId: "root", downloads: true };
+  const release = { kind: "dangerous" as const, exception: { folderId: config.id } };
+  let saved: typeof config[] | Array<{ id: string; label: string; storageId: string; browseOnly: true }> = [config];
+  let committed = false, closed = false;
+  const registry = createFolderRegistry({ load: async () => saved,
+    save: async () => { throw new Error("unsigned browse-only save is not allowed"); },
+    commitRelease: async (folders, record) => {
+      assert.deepEqual(record, release);
+      saved = folders as typeof saved;
+      committed = true;
+    },
+    open: async () => ({ replica: createReplicaController({ scan: async () => [],
+      readBlock: async () => new Uint8Array() }), close: async () => {
+      assert.equal(committed, true);
+      closed = true;
+    } }) });
+  await registry.initialize(); await registry.open(config.id);
+  await registry.commitBrowseOnlyRelease(config.id, release);
+  assert.equal(closed, true);
+  assert.deepEqual(saved, [{ id: config.id, label: config.label, storageId: config.storageId,
+    browseOnly: true }]);
+  await registry.close();
+});
+
 test("failed catalog persistence does not forget a configured folder", async () => {
   const config = { id: "fixture-folder", label: "Fixture", storageId: "root" };
   const registry = createFolderRegistry({ load: async () => [config], save: async () => { throw new Error("fixture save failure"); },

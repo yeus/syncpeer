@@ -12,6 +12,9 @@ import { createOwnedDeviceIdentity, openOwnedRecoveryKit, openOwnedDeviceSigning
   validateOwnedRecoveryPublicKey, verifySpaceDeviceMembership, type OwnedDeviceIdentity, type OwnedRecoveryKit, type SpaceDeviceMembershipTrust,
   type OwnedSpaceDevice } from "./personalSpaceSharing.js";
 import { signPersonalSpaceChange, type PersonalSpaceChange } from "./personalSpaceChanges.js";
+import { createDangerousLocalRelease, signReplicaCompletion, signRetentionReleaseProposal,
+  type DangerousLocalRelease, type LocalReleaseRecord, type ReplicaCompletion,
+  type RetentionReleaseProposal } from "./folderRetention.js";
 
 export interface CredentialVaultRecord {
   format: 1 | 2;
@@ -38,8 +41,9 @@ interface VaultData {
   registrations?: FolderRegistration[];
   /** Device-local private identity; excluded from portable recovery and pairing transfers. */
   ownedDevice?: OwnedDeviceIdentity;
-  /** Public signed history plus this device's pinned trust anchors. */
+  /** Persisted v1 key: public signed history plus this device's pinned trust anchors. */
   trustedRoster?: SpaceDeviceMembershipTrust;
+  localReleases?: Array<{ record: LocalReleaseRecord; pending: boolean }>;
 }
 
 export interface RememberedUnlockSecretStore {
@@ -83,8 +87,8 @@ const decodeRecord = (value: unknown): CredentialVaultRecord | null => {
 };
 
 const decodeData = (bytes: Uint8Array): VaultData => {
-  let data;
-  try { data = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+  let data: VaultData;
+  try { data = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as VaultData; }
   catch { throw new Error("Invalid credential vault contents."); }
   if (!data || data.format !== 1 || !data.folders || typeof data.folders !== "object" || Array.isArray(data.folders) ||
     Object.keys(data.folders).length > 10000) throw new Error("Invalid credential vault contents.");
@@ -104,6 +108,13 @@ const decodeData = (bytes: Uint8Array): VaultData => {
   if (data.trustedRoster !== undefined && (!data.trustedRoster || typeof data.trustedRoster !== "object" ||
     typeof data.trustedRoster.genesisKey !== "string" || typeof data.trustedRoster.knownHead !== "string" ||
     !Array.isArray(data.trustedRoster.updates))) throw new Error("Invalid trusted device list.");
+  if (data.localReleases !== undefined && (!Array.isArray(data.localReleases) ||
+    data.localReleases.length > 1000 || data.localReleases.some(entry => !entry ||
+      typeof entry.pending !== "boolean" || !entry.record ||
+      (entry.record.kind === "safe" ? !entry.record.proposal || !Array.isArray(entry.record.completions)
+        : entry.record.kind === "dangerous" ? !entry.record.exception : true)))) {
+    throw new Error("Invalid local release history.");
+  }
   return data;
 };
 
@@ -336,7 +347,8 @@ export function createCredentialVault(options: {
       const { record, data } = await unlocked();
       if (record.format !== 2 || !personalSpace) throw new Error("Only personal-space profiles can be backed up.");
       const bootstrap = await wrapPersonalSpaceBootstrap(personalSpace, recoveryPassword, options.randomBytes, kdf);
-      const vault = await encrypt({ ...data, registrations: undefined, uiState: undefined, ownedDevice: undefined }, key!,
+      const vault = await encrypt({ ...data, registrations: undefined, uiState: undefined,
+        ownedDevice: undefined, localReleases: undefined }, key!,
         { format: 2, manualLocked: false, remember: false });
       return { format: 1, bootstrap, vault };
     }),
@@ -386,6 +398,39 @@ export function createCredentialVault(options: {
         throw new Error("Revoked devices cannot sign personal-space settings.");
       }
       return signPersonalSpaceChange(subtle, await openOwnedDeviceSigningKey(subtle, data.ownedDevice), change);
+    }),
+    signReplicaCompletion: (value: Omit<ReplicaCompletion, "format" | "signature" | "signerId">) => run(async () => {
+      const { data } = await unlocked();
+      if (!data.ownedDevice || !data.trustedRoster) throw new Error("Trusted local signing identity is unavailable.");
+      const membership = await verifyTrust(data.trustedRoster);
+      if (!membership.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
+        throw new Error("Revoked devices cannot sign copy observations.");
+      }
+      return signReplicaCompletion(subtle, await openOwnedDeviceSigningKey(subtle, data.ownedDevice),
+        { ...value, signerId: data.ownedDevice.id });
+    }),
+    signRetentionReleaseProposal: (value: Omit<RetentionReleaseProposal,
+      "format" | "action" | "id" | "signature" | "proposerId">) => run(async () => {
+      const { data } = await unlocked();
+      if (!data.ownedDevice || !data.trustedRoster) throw new Error("Trusted local signing identity is unavailable.");
+      const membership = await verifyTrust(data.trustedRoster);
+      if (!membership.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
+        throw new Error("Revoked devices cannot sign local releases.");
+      }
+      return signRetentionReleaseProposal(subtle, await openOwnedDeviceSigningKey(subtle, data.ownedDevice),
+        { ...value, proposerId: data.ownedDevice.id });
+    }),
+    signDangerousLocalRelease: (value: Omit<DangerousLocalRelease,
+      "format" | "scope" | "guaranteeBroken" | "signature" | "localHolderId"> &
+      { confirmedText: string }) => run(async () => {
+      const { data } = await unlocked();
+      if (!data.ownedDevice || !data.trustedRoster) throw new Error("Trusted local signing identity is unavailable.");
+      const membership = await verifyTrust(data.trustedRoster);
+      if (!membership.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
+        throw new Error("Revoked devices cannot sign local releases.");
+      }
+      return createDangerousLocalRelease(subtle, await openOwnedDeviceSigningKey(subtle, data.ownedDevice),
+        { ...value, localHolderId: data.ownedDevice.id });
     }),
     acceptSpaceDeviceMembership: (trust: SpaceDeviceMembershipTrust) => run(async () => {
       const { record, data } = await unlocked();
@@ -598,6 +643,31 @@ export function createCredentialVault(options: {
     registrations: () => run(async () => (await unlocked()).data.registrations ?? null),
     saveRegistrations: (folders: FolderRegistration[]) => update(data =>
       ({ ...data, registrations: validateRegistrations(folders) })),
+    commitLocalRelease: (record: LocalReleaseRecord,
+      folders: FolderRegistration[]) => update(data => {
+      const folderId = record.kind === "safe" ? record.proposal.folderId : record.exception.folderId;
+      const before = data.registrations ?? [];
+      const after = validateRegistrations(folders);
+      if (!before.some(folder => folder.id === folderId && folder.downloads) ||
+        JSON.stringify(after) !== JSON.stringify(before.map(folder => folder.id === folderId
+          ? { id: folder.id, label: folder.label, storageId: folder.storageId, browseOnly: true } : folder)) ||
+        data.localReleases?.some(entry => entry.pending &&
+          (entry.record.kind === "safe" ? entry.record.proposal.folderId : entry.record.exception.folderId) === folderId) ||
+        (data.localReleases?.length ?? 0) >= 1000) {
+        throw new Error("Local release registration is stale or already pending.");
+      }
+      return { ...data, registrations: after,
+        localReleases: [...data.localReleases ?? [], { record, pending: true }] };
+    }),
+    pendingLocalReleases: () => run(async () => (await unlocked()).data.localReleases
+      ?.filter(entry => entry.pending).map(entry => entry.record) ?? []),
+    localReleaseHistory: () => run(async () => (await unlocked()).data.localReleases
+      ?.map(entry => entry.record) ?? []),
+    completeLocalRelease: (folderId: string) => update(data => ({ ...data,
+      localReleases: data.localReleases?.map(entry => {
+        const id = entry.record.kind === "safe" ? entry.record.proposal.folderId : entry.record.exception.folderId;
+        return id === folderId ? { ...entry, pending: false } : entry;
+      }) })),
     uiState: () => run(async () => {
       const { data } = await unlocked();
       return data.uiState ?? null;

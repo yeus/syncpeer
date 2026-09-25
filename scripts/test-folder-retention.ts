@@ -12,7 +12,9 @@ import {
   signReplicaCompletion,
   signRetentionReleaseProposal,
   verifyLocalReplicaManifest,
+  verifyRemoteReplicaManifest,
 } from "../packages/core/dist/sync/folderRetention.js";
+import { RemoteFs } from "../packages/core/dist/core/model/remoteFs.js";
 import { signSpaceMembershipUpdate } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 const subtle = globalThis.crypto.subtle;
@@ -39,7 +41,7 @@ const identity = async () => {
   };
 };
 
-const signedRoster = async (signer: Awaited<ReturnType<typeof identity>>,
+const signedMembership = async (signer: Awaited<ReturnType<typeof identity>>,
   devices: Record<string, Awaited<ReturnType<typeof identity>>>) => {
   const update = await signSpaceMembershipUpdate(subtle, signer.privateKey, {
     sequence: 1, previous: null, signer: "phone",
@@ -130,6 +132,33 @@ test("a complete local replica proof reads every block and rejects missing or ch
     scan: async () => ++scans === 1 ? [file] : [] }, expected), /complete copy/i);
 });
 
+test("a live remote proof reads every block and rejects a changed index", async () => {
+  const first = new TextEncoder().encode("first"), second = new TextEncoder().encode("second");
+  const file = { name: "note.txt", type: 0, size: first.length + second.length,
+    version: { counters: [{ id: "1", value: "1" }] },
+    blocks: [first, second].map((bytes, index) => ({ offset: index ? first.length : 0,
+      size: bytes.length, hash: new Uint8Array(createHash("sha256").update(bytes).digest()) })) };
+  const folder = { id: "folder", label: "Folder", readOnly: true, advertisedDevices: [],
+    encrypted: false, needsPassword: false, indexReceived: true,
+    files: new Map([[file.name, { indexFile: file }]]) };
+  const requested: number[] = [];
+  const remote = new RemoteFs(new Map([[folder.id, folder]]),
+    async (_folderId, _path, offset) => { requested.push(offset); return offset ? second : first; },
+    async () => {}, () => {});
+  const snapshot = await remote.completeFolderIndex("folder");
+  snapshot[0].blocks[0].hash.fill(0);
+  assert.notDeepEqual(snapshot[0].blocks[0].hash, file.blocks[0].hash,
+    "The proof snapshot must not alias a mutable live index");
+  assert.equal(await verifyRemoteReplicaManifest(remote, "folder"), folderManifestDigestFromBep([file]));
+  assert.deepEqual(requested, [0, first.length]);
+  const changing = new RemoteFs(new Map([[folder.id, folder]]),
+    async (_folderId, _path, offset) => {
+      folder.files.clear();
+      return offset ? second : first;
+    }, async () => {}, () => {});
+  await assert.rejects(verifyRemoteReplicaManifest(changing, "folder"), /complete copy/i);
+});
+
 test("only signed current completions count and Syncthing evidence must still be live", async () => {
   const phone = await identity();
   const observer = await identity();
@@ -157,6 +186,27 @@ test("only signed current completions count and Syncthing evidence must still be
     [oldManifest], publicKeys, 150)).completeHolderIds.length, 0);
 });
 
+test("a bounded local full-block observation counts for a Syncpeer holder", async () => {
+  const observer = await identity();
+  const policy = { ...defaultFolderRetentionPolicy("folder", "membership-1"), minimumCopies: 1,
+    holders: [{ id: "stable-phone-slot", kind: "syncpeer" as const }] };
+  const observation = await signReplicaCompletion(subtle, observer.privateKey, {
+    folderId: "folder", holderId: "stable-phone-slot", holderKind: "syncpeer",
+    signerId: "observer", manifestDigest: manifest, policyRevision: 1,
+    completedAtMs: 100, liveUntilMs: 200,
+  });
+  assert.deepEqual((await assessFolderRetention(subtle, policy, manifest,
+    [observation], { observer: observer.publicKey }, 150)).completeHolderIds,
+  ["stable-phone-slot"]);
+  assert.deepEqual((await assessFolderRetention(subtle, policy, manifest,
+    [observation], { observer: observer.publicKey }, 201)).completeHolderIds, []);
+  await assert.rejects(signReplicaCompletion(subtle, observer.privateKey, {
+    folderId: "folder", holderId: "stable-phone-slot", holderKind: "syncpeer",
+    signerId: "observer", manifestDigest: manifest, policyRevision: 1,
+    completedAtMs: 100,
+  }), /bounded|observation/i);
+});
+
 test("future-dated receipts and overlong Syncthing observations cannot satisfy retention", async () => {
   const phone = await identity();
   const policy = { ...defaultFolderRetentionPolicy("folder", "membership-1"), minimumCopies: 1,
@@ -176,13 +226,17 @@ test("future-dated receipts and overlong Syncthing observations cannot satisfy r
 
 test("an offline owned device need not approve a safe release", async () => {
   const phone = await identity(), laptop = await identity(), offlineTablet = await identity();
-  const trust = await signedRoster(phone, { phone, laptop, offlineTablet });
+  const trust = await signedMembership(phone, { phone, laptop, offlineTablet });
   const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), minimumCopies: 1,
     holders: [{ id: "phone", kind: "syncpeer" as const }, { id: "laptop", kind: "syncpeer" as const }] };
-  const receipts = await Promise.all([["phone", phone], ["laptop", laptop]].map(([id, key]) =>
-    signReplicaCompletion(subtle, key.privateKey, { folderId: "folder", holderId: String(id),
-      holderKind: "syncpeer", signerId: String(id), manifestDigest: manifest,
-      policyRevision: 1, completedAtMs: 100 })));
+  const receipts = [
+    await signReplicaCompletion(subtle, phone.privateKey, { folderId: "folder", holderId: "phone",
+      holderKind: "syncpeer", signerId: "phone", manifestDigest: manifest,
+      policyRevision: 1, completedAtMs: 100 }),
+    await signReplicaCompletion(subtle, phone.privateKey, { folderId: "folder", holderId: "laptop",
+      holderKind: "syncpeer", signerId: "phone", manifestDigest: manifest,
+      policyRevision: 1, completedAtMs: 100, liveUntilMs: 200 }),
+  ];
   const proposal = await signRetentionReleaseProposal(subtle, phone.privateKey, {
     folderId: "folder", releaseHolderId: "phone", proposerId: "phone", policyRevision: 1,
     rosterHead: trust.knownHead, manifestDigest: manifest,
@@ -197,7 +251,7 @@ test("release requires enough current online copies after the release", async ()
   const phone = await identity();
   const laptop = await identity();
   const tablet = await identity();
-  const trust = await signedRoster(phone, { phone, laptop, tablet });
+  const trust = await signedMembership(phone, { phone, laptop, tablet });
   const policy = { ...defaultFolderRetentionPolicy("folder", trust.knownHead), holders: [
     { id: "phone", kind: "syncpeer" as const },
     { id: "laptop", kind: "syncpeer" as const },

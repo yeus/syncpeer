@@ -15,6 +15,9 @@ import { createNodeSyncpeerClient, createNodeHostAdapter, createNodeFolderSyncSt
   listenNodePeers } from "../packages/core/dist/node.js";
 import { createSyncpeerCoreClient } from "../packages/core/dist/client.js";
 import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
+import { createDocumentCache } from "../packages/core/dist/sync/documentCache.js";
+import { dispatchDocumentCommand } from "../packages/core/dist/sync/documentCommands.js";
+import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserClient.js";
 import { startIncomingPeerService } from "../packages/core/dist/sync/incomingPeerService.js";
 import { ClusterConfig, FrameParser, MessageTypeValues, encodeMessageFrame, type BepIndex, type BepClusterConfig } from "../packages/core/dist/core/protocol/bep.js";
 import type { SyncpeerSessionHandle } from "../packages/core/src/client.ts";
@@ -33,6 +36,15 @@ async function createTestPeerIdentity(root: string, name: string) {
     "-nodes", "-days", "1", "-subj", "/CN=synthetic-peer", "-keyout", key, "-out", cert], { stdio: "ignore" });
   const certPem = await readFile(cert, "utf8");
   return { certPem, keyPem: await readFile(key, "utf8"), deviceId: computeDeviceId(new X509Certificate(certPem).raw) };
+}
+
+async function makeDocuments(profileId: string) {
+  const { openStorage } = memoryDocumentStorage();
+  return createDocumentFilesystem({ profileId, deviceCounterId: profileId === "a" ? "1" : "2",
+    openStorage, profile: await openStorage("profile"), randomBytes,
+    availableBytes: async () => 1024 * 1024 * 1024,
+    rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
+      save: async () => {}, remove: async () => {} } });
 }
 
 async function freeLocalPort() {
@@ -79,34 +91,26 @@ test("a direct peer that completes TLS but never sends BEP hello times out", { t
 test("paired peers synchronize the encrypted settings replica without exposing it as a document folder",
   { timeout: 15000 }, async () => {
     const root = await mkdtemp(path.join(tmpdir(), "syncpeer-settings-peer-"));
-    const makeDocuments = async (profileId: string) => {
-      const { openStorage } = memoryDocumentStorage();
-      return createDocumentFilesystem({ profileId, deviceCounterId: profileId === "a" ? "1" : "2",
-        openStorage, profile: await openStorage("profile"), randomBytes,
-        availableBytes: async () => 1024 * 1024 * 1024,
-        rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
-          save: async () => {}, remove: async () => {} } });
-    };
     const source = await makeDocuments("a"), target = await makeDocuments("b");
     let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
     let outgoing: SyncpeerSessionHandle | undefined, incoming: SyncpeerSessionHandle | undefined;
     try {
+      const [a, b] = await Promise.all([createTestPeerIdentity(root, "a"), createTestPeerIdentity(root, "b")]);
       await source.initialize(); await target.initialize();
       const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
-      await source.createVault("synthetic-settings-master", false, "SOURCE", kit.publicKey);
-      const targetIdentity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "TARGET");
+      await source.createVault("synthetic-settings-master", false, a.deviceId, kit.publicKey);
+      const targetIdentity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, b.deviceId);
       const targetDevice = { id: targetIdentity.id, syncthingId: targetIdentity.syncthingId,
         state: targetIdentity.state, signingKey: targetIdentity.signingKey };
-      await target.importPairingTransfer(await source.exportPairingTransfer("SOURCE", targetDevice),
+      await target.importPairingTransfer(await source.exportPairingTransfer(a.deviceId, targetDevice),
         targetIdentity, "synthetic-target-master", false);
-      const [sourceFolder] = await source.sessionSharedFolders("TARGET");
-      const [targetFolder] = await target.sessionSharedFolders("SOURCE");
+      const [sourceFolder] = await source.sessionSharedFolders(b.deviceId);
+      const [targetFolder] = await target.sessionSharedFolders(a.deviceId);
       assert.equal(sourceFolder.internal, true); assert.equal(targetFolder.id, sourceFolder.id);
       const change = { id: "change-one", deviceId: (await source.ownedDevices()).localDeviceId!,
         path: ["folders", "photos", "retention"], parents: [],
         value: { minimumCopies: 2, retentionRevision: 2, holders: [] } };
       await source.appendPersonalSpaceChange(change);
-      const [a, b] = await Promise.all([createTestPeerIdentity(root, "a"), createTestPeerIdentity(root, "b")]);
       const accepted = Promise.withResolvers<SyncpeerSessionHandle>();
       listener = await listenNodePeer({ ...a, host: "127.0.0.1", port: 0,
         expectedDeviceId: b.deviceId, sharedFolders: [sourceFolder], timeoutMs: 3000,
@@ -116,6 +120,8 @@ test("paired peers synchronize the encrypted settings replica without exposing i
         expectedDeviceId: a.deviceId, deviceName: "settings-target", discoveryMode: "direct",
         timeoutMs: 3000, replicaScanIntervalMs: 100, sharedFolders: [targetFolder] });
       incoming = await accepted.promise;
+      assert.equal(outgoing.remoteDeviceId, a.deviceId);
+      assert.equal(incoming.remoteDeviceId, b.deviceId);
       assert.deepEqual(await outgoing.remoteFs.listFolders(), []);
       assert.deepEqual(await incoming.remoteFs.listFolders(), []);
       const deadline = Date.now() + 3000;
@@ -127,6 +133,15 @@ test("paired peers synchronize the encrypted settings replica without exposing i
       }
       assert.equal((await target.personalSpaceChanges())[0]?.id, change.id);
       assert.equal((await target.sharedPersonalSpaceSettings()).settings?.folders.photos.minimumCopies, 2);
+      await source.register({ id: "synthetic-shared-folder", label: "Synthetic shared folder",
+        password: "synthetic-shared-folder-password" });
+      let imported = false;
+      const credentialDeadline = Date.now() + 3000;
+      while (!imported) {
+        imported = (await target.status()).folders.some(folder => folder.id === "synthetic-shared-folder");
+        assert.ok(Date.now() < credentialDeadline, "Signed folder credential did not converge over the live settings replica");
+        if (!imported) await new Promise(resolve => setTimeout(resolve, 10));
+      }
       await source.revokeOwnedDevice(targetIdentity.id);
       let revoked = false;
       while (!revoked) {
@@ -135,11 +150,78 @@ test("paired peers synchronize the encrypted settings replica without exposing i
         assert.ok(Date.now() < deadline + 3000, "Trusted-device revocation did not converge");
         if (!revoked) await new Promise(resolve => setTimeout(resolve, 10));
       }
-      await assert.rejects(target.exportPairingTransfer("TARGET", {
+      await assert.rejects(target.exportPairingTransfer(b.deviceId, {
         id: "third-device", syncthingId: "THIRD", state: "active", signingKey: targetIdentity.signingKey,
       }), /no longer active/i);
     } finally {
       await outgoing?.close(); await incoming?.close(); await listener?.close();
+      await source.close(); await target.close(); await rm(root, { recursive: true, force: true });
+    }
+  });
+
+test("browser clients exchange a new approved folder credential through their selected settings replicas",
+  { timeout: 20000 }, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-browser-settings-"));
+    const source = await makeDocuments("a"), target = await makeDocuments("b");
+    let owner: ReturnType<typeof createSyncpeerBrowserClient> | undefined;
+    let joiner: ReturnType<typeof createSyncpeerBrowserClient> | undefined;
+    try {
+      const [a, b] = await Promise.all([createTestPeerIdentity(root, "a"), createTestPeerIdentity(root, "b")]);
+      await source.initialize(); await target.initialize();
+      const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+      await source.createVault("synthetic-owner-master", false, a.deviceId, kit.publicKey);
+      const identity = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, b.deviceId);
+      await target.importPairingTransfer(await source.exportPairingTransfer(a.deviceId, {
+        id: identity.id, syncthingId: identity.syncthingId, state: identity.state,
+        signingKey: identity.signingKey,
+      }), identity, "synthetic-joiner-master", false);
+      const adapter = createNodeHostAdapter();
+      const selectedFolders: Array<{ internalCount: number }> = [];
+      const documentAdapter = (documents: typeof source, identityRecord: typeof a) =>
+        createDocumentCache({ enabled: () => true,
+          request: async <T>(request: Record<string, unknown>) =>
+            await dispatchDocumentCommand(documents, request) as T,
+          legacy: { readDefaultIdentity: async () => identityRecord },
+          openLegacySource: async () => { throw new Error("No legacy files in this fixture."); },
+          show: async () => {} }).platformAdapter;
+      owner = createSyncpeerBrowserClient({ hostAdapter: adapter,
+        onLog: entry => {
+          if (entry.event === "client.shared_folders.selected") {
+            selectedFolders.push(entry.details as { internalCount: number });
+          }
+        }, platformAdapter: {
+        ...documentAdapter(source, a),
+        readDefaultIdentity: async () => a,
+      } });
+      joiner = createSyncpeerBrowserClient({ hostAdapter: adapter,
+        onLog: entry => {
+          if (entry.event === "client.shared_folders.selected") {
+            selectedFolders.push(entry.details as { internalCount: number });
+          }
+        }, platformAdapter: {
+        ...documentAdapter(target, b),
+        readDefaultIdentity: async () => b,
+      } });
+      await target.rememberFolder({ id: "new-folder", label: "New folder" });
+      await source.register({ id: "new-folder", label: "New folder", password: "synthetic-folder-password" });
+      const [ownerPort, joinerPort] = await Promise.all([freeLocalPort(), freeLocalPort()]);
+      const options = { host: "127.0.0.1", discoveryMode: "direct" as const,
+        timeoutMs: 3000 };
+      await Promise.allSettled([
+        owner.connectAndSync({ ...options, port: joinerPort, listenPort: ownerPort,
+          remoteId: b.deviceId, deviceName: "synthetic-owner" }),
+        joiner.connectAndSync({ ...options, port: ownerPort, listenPort: joinerPort,
+          remoteId: a.deviceId, deviceName: "synthetic-joiner" }),
+      ]);
+      assert.ok(selectedFolders.length >= 2 && selectedFolders.every(value => value.internalCount === 1),
+        "Both browser-client sessions must select the hidden settings replica.");
+      const deadline = Date.now() + 7000;
+      while (!(await target.status()).folders.some(folder => folder.id === "new-folder")) {
+        assert.ok(Date.now() < deadline, "Browser-client settings session did not carry the new folder credential");
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    } finally {
+      await owner?.disconnect(); await joiner?.disconnect();
       await source.close(); await target.close(); await rm(root, { recursive: true, force: true });
     }
   });

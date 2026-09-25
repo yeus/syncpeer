@@ -13,6 +13,7 @@ export interface DeviceFolderSelection {
 }
 
 export interface SharedFolderSettings {
+  credential?: { label: string; password: string };
   shareTargets: FolderShareTarget[];
   minimumCopies: number;
   retentionRevision: number;
@@ -22,6 +23,7 @@ export interface SharedFolderSettings {
 
 export interface PersonalSpaceSettings {
   format: 1;
+  /** Signed v1 field name for the current space device membership hash. */
   rosterHead: string;
   folders: Record<string, SharedFolderSettings>;
 }
@@ -96,7 +98,14 @@ const normalizeFolder = (folderId: string, value: unknown): SharedFolderSettings
       exclusions: selection.exclusions.map(item => normalizeExclusion(folderId, item)),
     }];
   }));
-  return { shareTargets: normalizeTargets(folder.shareTargets),
+  let credential: SharedFolderSettings["credential"];
+  if (folder.credential !== undefined) {
+    const label = settingsText(folder.credential?.label, "shared folder credential label", 1024);
+    const password = settingsText(folder.credential?.password, "shared folder credential password");
+    if (!label.trim() || !password) throw new Error("Invalid shared folder credential.");
+    credential = { label, password };
+  }
+  return { ...(credential ? { credential } : {}), shareTargets: normalizeTargets(folder.shareTargets),
     minimumCopies: settingsInteger(folder.minimumCopies, "shared minimum copy count", 1),
     retentionRevision: settingsInteger(folder.retentionRevision, "shared retention revision", 1),
     holders, devices };
@@ -121,13 +130,18 @@ const applySharedChange = (settings: PersonalSpaceSettings,
   change: { path: string[]; value?: unknown; deleted?: true }, deviceId?: string): PersonalSpaceSettings => {
   const [scope, folderId, field, owner] = change.path;
   if (scope !== "folders" || !folderId || !field ||
-    !(change.path.length === 3 && (field === "shareTargets" || field === "retention") ||
+    !(change.path.length === 3 && (field === "shareTargets" || field === "retention" || field === "credential") ||
       change.path.length === 4 && field === "devices" && owner === deviceId)) {
     throw new Error("Unsupported personal-space setting path or device selection owner.");
   }
   const folder = folderOrDefault(settings, folderId);
   let updated: SharedFolderSettings;
-  if (field === "shareTargets") {
+  if (field === "credential") {
+    if (change.deleted || !change.value || typeof change.value !== "object") {
+      throw new Error("Invalid shared folder credential.");
+    }
+    updated = { ...folder, credential: change.value as SharedFolderSettings["credential"] };
+  } else if (field === "shareTargets") {
     if (change.deleted || !Array.isArray(change.value)) throw new Error("Invalid shared folder targets.");
     updated = { ...folder, shareTargets: change.value as FolderShareTarget[] };
   } else if (field === "retention") {

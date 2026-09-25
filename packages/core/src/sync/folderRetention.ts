@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import type { BepFileInfo } from "../core/protocol/bep.js";
+import type { RemoteFs } from "../core/model/remoteFs.js";
 import { equalHash, validateBlockPlan } from "../transfer/blockReuse.js";
 import type { LocalFolderReplica } from "./replicaIndex.js";
 import { isInternalReplicaPath } from "./replicaPaths.js";
@@ -21,6 +22,7 @@ export interface FolderRetentionPolicy {
   folderId: string;
   minimumCopies: number;
   revision: number;
+  /** Signed v1 field name for the current space device membership hash. */
   rosterHead: string;
   holders: readonly { id: string; kind: "syncpeer" | "syncthing" }[];
 }
@@ -63,6 +65,11 @@ export interface DangerousLocalRelease {
   createdAtMs: number;
   signature: string;
 }
+
+/** Durable local audit entry; pending entries resume only their private byte cleanup. */
+export type LocalReleaseRecord =
+  | { kind: "safe"; proposal: RetentionReleaseProposal; completions: ReplicaCompletion[]; decidedAtMs: number }
+  | { kind: "dangerous"; exception: DangerousLocalRelease };
 
 const encoder = new TextEncoder();
 const MAX_COMPLETION_AGE_MS = 5 * 60_000;
@@ -163,6 +170,16 @@ export async function verifyLocalReplicaManifest(replica: Pick<LocalFolderReplic
   return expectedDigest;
 }
 
+/** Re-read a peer's entire index and every block; the caller owns session authentication/liveness. */
+export async function verifyRemoteReplicaManifest(remote: Pick<RemoteFs,
+  "completeFolderIndex" | "readFileRange">, folderId: string): Promise<string> {
+  const expected = await remote.completeFolderIndex(folderId);
+  return verifyLocalReplicaManifest({
+    scan: () => remote.completeFolderIndex(folderId),
+    readBlock: (path, offset, size) => remote.readFileRange(folderId, path, offset, size),
+  }, expected);
+}
+
 export const defaultFolderRetentionPolicy = (folderId: string, rosterHead: string): FolderRetentionPolicy => ({
   format: 1,
   folderId: text(folderId, "retention folder identifier"),
@@ -233,11 +250,9 @@ const verify = async (subtle: SubtleCrypto, publicKey: string | undefined, domai
 
 export async function signReplicaCompletion(subtle: SubtleCrypto, key: CryptoKey,
   value: Omit<ReplicaCompletion, "format" | "signature">): Promise<ReplicaCompletion> {
-  if (value.holderKind === "syncpeer" && value.signerId !== value.holderId) {
-    throw new Error("A Syncpeer completion must be signed by its holder.");
-  }
-  if (value.holderKind === "syncthing" && value.liveUntilMs === undefined) {
-    throw new Error("A Syncthing completion must be a bounded live observation.");
+  if ((value.holderKind === "syncthing" || value.signerId !== value.holderId) &&
+    value.liveUntilMs === undefined) {
+    throw new Error("A local full-copy observation must be bounded.");
   }
   const data = completionData(value);
   validateCompletionData(data);
@@ -247,8 +262,8 @@ export async function signReplicaCompletion(subtle: SubtleCrypto, key: CryptoKey
 const validCompletion = async (subtle: SubtleCrypto, completion: ReplicaCompletion,
   publicKeys: Readonly<Record<string, string>>, nowMs: number) => {
   if (completion.format !== 1 || completion.completedAtMs > nowMs ||
-    completion.holderKind === "syncpeer" && completion.signerId !== completion.holderId ||
-    completion.holderKind === "syncthing" && (completion.liveUntilMs === undefined || completion.liveUntilMs < nowMs)) return false;
+    (completion.holderKind === "syncthing" || completion.signerId !== completion.holderId) &&
+    (completion.liveUntilMs === undefined || completion.liveUntilMs < nowMs)) return false;
   const data = completionData(completion);
   try { validateCompletionData(data); } catch { return false; }
   return verify(subtle, publicKeys[completion.signerId], "syncpeer.replica-completion.v1", data, completion.signature);
@@ -309,14 +324,14 @@ export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
   validatePolicy(input.policy);
   if (!input.trust || input.trust.knownHead !== input.policy.rosterHead ||
     input.trust.knownHead !== input.trust.updates.at(-1)?.hash) {
-    throw new Error("Retention release has a stale or invalid trusted membership head.");
+    throw new Error("Retention release has a stale or invalid space device membership head.");
   }
   const membership = await verifySpaceDeviceMembership(subtle, input.trust.updates,
     input.trust.genesisKey, input.trust.knownHead);
   const devices = membership.devices.filter(device => device.state === "active");
   const active = new Set(devices.map(device => device.id));
   const publicKeys = Object.fromEntries(devices.map(device => [device.id, device.signingKey]));
-  if (!active.size) throw new Error("Invalid active owned-device membership.");
+  if (!active.size) throw new Error("Invalid active space device membership.");
   const proposal = input.proposal;
   const expectedProposal = proposalData(proposal);
   const expectedId = digest(recordBytes("syncpeer.retention-release-proposal.v1", expectedProposal));

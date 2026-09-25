@@ -125,6 +125,7 @@ async function startDocuments(android: AndroidRuntime) {
   await documents.initialize();
   return {
     command: (input: unknown) => dispatchDocumentCommand(documents, input),
+    releaseLocalCopy: documents.releaseLocalCopy,
     close: documents.close,
     connectionPasswords: documents.connectionPasswords,
     status: documents.status,
@@ -288,6 +289,28 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         const session = lifecycle.getSession();
         if (!session) return { phase: "waiting" };
         return documents.syncFavorites(session.remoteFs, sharedFolderIds);
+      }
+      if (request.operation === "releaseLocalCopy") {
+        if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096) {
+          throw new Error("Invalid release folder identity.");
+        }
+        let result;
+        if (request.mode === "dangerous") {
+          if (typeof request.confirmedText !== "string") throw new Error("Release confirmation is missing.");
+          result = await documents.releaseLocalCopy(request.folderId,
+            { mode: "dangerous", confirmedText: request.confirmedText });
+        } else {
+          if (request.mode !== "safe") throw new Error("Invalid local release mode.");
+          const sessions = [...incomingService?.activeSessions().map(value => value.session) ?? [],
+            ...(lifecycle.getSession() ? [lifecycle.getSession()!] : [])]
+            .filter(session => !session.isClosed());
+          if (!sessions.length) throw new Error("No peer connected to the Android background service for safe release.");
+          result = await documents.releaseLocalCopy(request.folderId, { mode: "safe", sessions });
+        }
+        await lifecycle.disconnect();
+        await stopIncomingService();
+        sharedFolderIds = [];
+        return result;
       }
       if (request.operation === "status") return { ...lifecycle.getState(), active: !!lifecycle.getSession(), hasOptions: !!activeOptions };
       throw new Error(`Unknown session operation: ${String(request.operation)}`);

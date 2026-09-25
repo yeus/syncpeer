@@ -53,6 +53,7 @@ const requireDocumentRuntime = process.env.SYNCPEER_REQUIRE_DOCUMENT_RUNTIME ===
   || hasArgument("--require-document-runtime");
 const skipNetworkWorkflow = hasArgument("--skip-network");
 const modernSmoke = hasArgument("--modern-smoke");
+const legacySmoke = hasArgument("--legacy-smoke");
 const expectedSdk = Number(argumentValue("--expect-sdk") || 0);
 const editorPackage = "dev.syncpeer.synthetic.editor";
 const editorAuthority = `${editorPackage}.commands`;
@@ -698,6 +699,7 @@ const runPeerCrossAppWorkflow = async () => {
     cdp = await launchAndroidApp(true);
     if (!await openAndroidConnection(cdp)) throw new Error("Peer workflow did not connect.");
     await openAndroidFolder(cdp, false);
+    await favoriteWholeFolder(cdp, targetFolderId);
     await startAndroidFileDownload(cdp, targetFileName);
     await disconnectAndroidSession(cdp);
     await waitForSessionService(false, 30_000);
@@ -923,13 +925,21 @@ const appNotificationRecords = () => {
 const waitForSessionNotificationText = async (text, timeout = 30_000) => {
   const deadline = Date.now() + timeout;
   let count = 0;
+  let lastRecords = [];
   while (Date.now() < deadline) {
     const records = appNotificationRecords().sessionRecords;
+    lastRecords = records;
     count = records.length;
     if (records.some((record) => record.includes(text))) return;
+    // A connected session can immediately replace the ready notice after its
+    // first favorite pass; the file convergence checks below still gate success.
+    if (records.some((record) => record.includes("Selected files need attention in Syncpeer."))) return;
     await wait(250);
   }
-  throw new Error(`Expected the connected background-session notification; found ${count}.`);
+  const knownStates = ["Preparing selected folders", "Waiting for a network connection",
+    "Waiting for an unmetered network", "Waiting for normal power mode"];
+  const state = knownStates.find(value => lastRecords.some(record => record.includes(value))) ?? "other";
+  throw new Error(`Expected the connected background-session notification; found ${count}, state=${state}.`);
 };
 
 const clearTransferNotifications = async (cdp) => {
@@ -1153,6 +1163,18 @@ const launchAndroidApp = async (forceStop = false) => {
   return connectCdp();
 };
 
+const runLegacyAndroidSmoke = async () => {
+  if (androidSdkVersion() >= 26) throw new Error("Legacy smoke requires Android API below 26.");
+  const cdp = await launchAndroidApp(true);
+  try {
+    await waitForUiCondition(cdp,
+      'document.body.innerText.includes("Android 8 or newer")',
+      "clear unsupported document-service message", 30_000);
+    await assertForeground();
+    console.log("API 24 installed and started with a clear Android 8+ document-service requirement.");
+  } finally { cdp.close(); }
+};
+
 const grantNotificationPermission = () => {
   if (androidSdkVersion() < 33) return;
   runAdb(["shell", "pm", "grant", packageName, "android.permission.POST_NOTIFICATIONS"]);
@@ -1238,8 +1260,8 @@ const openAndroidConnection = async (cdp) => {
     console.log("Android network UI workflow skipped: no server device ID configured.");
     return false;
   }
-  const localDeviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
-  console.log(`Android E2E client device ID: ${localDeviceId}`);
+  await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+  console.log("Android E2E client identity ready.");
   await waitForUiCondition(
     cdp,
     'document.querySelector("[data-testid=tab-devices]") !== null',
@@ -1952,6 +1974,20 @@ const documentCommand = async (cdp, request) => {
   return response.result;
 };
 
+const favoriteWholeFolder = async (cdp, id) => {
+  const settings = await documentCommand(cdp, { operation: "profileSettings" });
+  await documentCommand(cdp, { operation: "saveProfileSettings", settings: {
+    ...settings,
+    folders: { ...settings.folders, [id]: {
+      ...settings.folders[id],
+      favorites: [{ key: `folder:${id}:`, folderId: id, path: "", name: id, kind: "folder" }],
+      exclusions: settings.folders[id]?.exclusions ?? [],
+      ignorePatterns: settings.folders[id]?.ignorePatterns ?? [],
+      paused: false,
+    } },
+  } });
+};
+
 const folderTestConfig = () => {
   const id = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-direct-folder";
   const password = process.env.SYNCPEER_E2E_FOLDER_PASSWORD?.trim() ||
@@ -1967,14 +2003,7 @@ const prepareWholeFolder = async () => {
   try {
     await documentCommand(cdp, { operation: "register", id, label: id, password });
     await documentCommand(cdp, { operation: "attachDownloads", id });
-    const settings = await documentCommand(cdp, { operation: "profileSettings" });
-    await documentCommand(cdp, { operation: "saveProfileSettings", settings: {
-      ...settings,
-      folders: { ...settings.folders, [id]: {
-        favorites: [{ key: `folder:${id}:`, folderId: id, path: "", name: id, kind: "folder" }],
-        exclusions: [], ignorePatterns: [], paused: false,
-      } },
-    } });
+    await favoriteWholeFolder(cdp, id);
     await documentCommand(cdp, { operation: "saveConnectionPasswords",
       passwords: { [`${remoteDeviceId}:${id}`]: password } });
     console.log(`Android favorite whole-folder replica prepared: ${id}.`);
@@ -2031,6 +2060,85 @@ const runWholeFolderConnection = async () => {
   } finally { cdp.close(); }
 };
 
+const runWholeFolderDangerousRelease = async () => {
+  const { id } = folderTestConfig();
+  const cdp = await launchAndroidApp(true);
+  try {
+    await tauriInvoke(cdp, "syncpeer_android_release_local_copy", { request: {
+      folderId: id, mode: "dangerous", confirmedText: "RELEASE LOCAL COPY",
+    } }, 120_000);
+    const status = await documentCommand(cdp, { operation: "status" });
+    if (!status.folders.some(folder => folder.id === id && folder.browseOnly) ||
+      status.pendingLocalReleases.includes(id)) {
+      throw new Error("Android local release did not finish as browse-only.");
+    }
+    const history = await documentCommand(cdp, { operation: "localReleaseHistory" });
+    if (!history.some(record => record.kind === "dangerous" && record.exception.folderId === id)) {
+      throw new Error("Android local release has no signed dangerous audit record.");
+    }
+    console.log("Android local copy released while retaining a browse-only folder registration.");
+  } finally { cdp.close(); }
+};
+
+const configureSafeReleasePolicy = async (cdp, id) => {
+  const membership = await documentCommand(cdp, { operation: "ownedDevices" });
+  const peer = membership.devices.find(device => device.id !== membership.localDeviceId && device.state === "active");
+  if (!membership.localDeviceId || !peer) throw new Error("Safe release needs two paired devices.");
+  await documentCommand(cdp, { operation: "savePersonalSpaceSetting",
+    path: ["folders", id, "retention"], value: { minimumCopies: 1, retentionRevision: 2,
+      holders: [{ id: membership.localDeviceId, kind: "syncpeer" }, { id: peer.id, kind: "syncpeer" }] } });
+};
+
+const runWholeFolderSafeReleaseUi = async () => {
+  const { id } = folderTestConfig();
+  const cdp = await launchAndroidApp(false);
+  try {
+    await configureSafeReleasePolicy(cdp, id);
+    if (!await openAndroidConnection(cdp)) throw new Error("Safe release needs a connected peer.");
+    await openFolderSettings(cdp);
+    await cdp.evaluate("window.confirm = () => true");
+    await waitForUiCondition(cdp, `(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find(element => element.textContent?.trim() === "Release after verifying online copies");
+      return button instanceof HTMLButtonElement && !button.disabled;
+    })()`, "safe local release button", 30_000);
+    await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find(element => element.textContent?.trim() === "Release after verifying online copies");
+      button?.click();
+    })()`);
+    await waitForUiCondition(cdp, `(() => {
+      const failure = document.querySelector("p.error")?.textContent?.trim();
+      if (failure) throw new Error(failure);
+      return document.body.innerText.includes("Browse-only: no complete local copy is stored or shared.");
+    })()`, "safe local release or its reported failure", 120_000);
+    const history = await documentCommand(cdp, { operation: "localReleaseHistory" });
+    if (!history.some(record => record.kind === "safe" && record.proposal.folderId === id)) {
+      throw new Error("Android safe local release has no signed audit record.");
+    }
+    console.log("Android safe local copy release verified an online peer and kept browse-only access.");
+  } finally { cdp.close(); }
+};
+
+const runWholeFolderSafeRelease = async () => {
+  const { id } = folderTestConfig();
+  const cdp = await connectCdp();
+  try {
+    await configureSafeReleasePolicy(cdp, id);
+    await tauriInvoke(cdp, "syncpeer_android_release_local_copy", { request: { folderId: id, mode: "safe" } }, 120_000);
+    const status = await documentCommand(cdp, { operation: "status" });
+    if (!status.folders.some(folder => folder.id === id && folder.browseOnly) ||
+      status.pendingLocalReleases.includes(id)) {
+      throw new Error("Android safe release did not finish as browse-only.");
+    }
+    const history = await documentCommand(cdp, { operation: "localReleaseHistory" });
+    if (!history.some(record => record.kind === "safe" && record.proposal.folderId === id)) {
+      throw new Error("Android safe local release has no signed audit record.");
+    }
+    console.log("Android service verified an online peer and released only its local copy.");
+  } finally { cdp.close(); }
+};
+
 const main = async () => {
   runAdb(["wait-for-device"], 60_000);
 
@@ -2051,6 +2159,11 @@ const main = async () => {
     throw new Error(`Expected Android API ${expectedSdk}, found API ${sdkVersion}.`);
   }
   grantNotificationPermission();
+
+  if (legacySmoke) {
+    await runLegacyAndroidSmoke();
+    return;
+  }
 
   const deviceIdPath = argumentValue("--write-device-id");
   if (deviceIdPath) {
@@ -2114,6 +2227,18 @@ const main = async () => {
   }
   if (hasArgument("--connect-whole-folder")) {
     await runWholeFolderConnection();
+    return;
+  }
+  if (hasArgument("--release-whole-folder-dangerous")) {
+    await runWholeFolderDangerousRelease();
+    return;
+  }
+  if (hasArgument("--release-whole-folder-safe")) {
+    await runWholeFolderSafeRelease();
+    return;
+  }
+  if (hasArgument("--release-whole-folder-safe-ui")) {
+    await runWholeFolderSafeReleaseUi();
     return;
   }
 

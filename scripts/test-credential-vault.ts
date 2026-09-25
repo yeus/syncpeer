@@ -43,6 +43,35 @@ test("first owned vault save already contains the signed genesis", async () => {
   await reopened.close();
 });
 
+test("local-copy release intent and browse-only registration persist in one vault save", async () => {
+  let record: unknown = null, bootstrap: unknown = null;
+  const options = { profileId: "local-release-fixture", randomBytes,
+    storage: { load: async () => structuredClone(record), save: async (value: unknown) => { record = structuredClone(value); },
+      withLock: async <T>(operation: () => Promise<T>) => operation() },
+    bootstrapStorage: { load: async () => structuredClone(bootstrap),
+      save: async (value: unknown) => { bootstrap = structuredClone(value); },
+      remove: async () => { bootstrap = null; } }, revokeAccess: async () => {} };
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  const vault = createCredentialVault(options);
+  await vault.create("synthetic-master-password", false, "OWNER", kit.publicKey);
+  await vault.saveRegistrations([{ id: "photos", label: "Photos", storageId: "private-root", downloads: true }]);
+  const release = await vault.signDangerousLocalRelease({ folderId: "photos", policyRevision: 1,
+    rosterHead: (await vault.spaceDeviceMembership())!.trust.knownHead, manifestDigest: "manifest",
+    createdAtMs: 100, confirmedText: "RELEASE LOCAL COPY" });
+  await vault.commitLocalRelease({ kind: "dangerous", exception: release }, [{ id: "photos", label: "Photos",
+    storageId: "private-root", browseOnly: true }]);
+  await vault.close();
+  const reopened = createCredentialVault(options);
+  await reopened.unlock("synthetic-master-password");
+  assert.deepEqual(await reopened.registrations(), [{ id: "photos", label: "Photos",
+    storageId: "private-root", browseOnly: true }]);
+  assert.deepEqual(await reopened.pendingLocalReleases(), [{ kind: "dangerous", exception: release }]);
+  await reopened.completeLocalRelease("photos");
+  assert.deepEqual(await reopened.pendingLocalReleases(), []);
+  assert.deepEqual(await reopened.localReleaseHistory(), [{ kind: "dangerous", exception: release }]);
+  await reopened.close();
+});
+
 test("new personal-space vault wraps one stable random key instead of re-encrypting settings on password change", async () => {
   let record: unknown = null;
   let bootstrap: unknown = null;

@@ -213,6 +213,23 @@ test("discovery retains empty roots across peers and only downloads enter the lo
   await documents.close();
 });
 
+test("automatic folder discovery does not reattach a browse-only local copy", async () => {
+  const requests: string[] = [];
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      requests.push(String(input.operation));
+      if (input.operation === "cacheRegistrations") return { vault: { phase: "unlocked" },
+        folders: [{ id: "folder", label: "Folder", storageId: "root", browseOnly: true }] } as T;
+      return undefined as T;
+    },
+    legacy: { listCachedFiles: async () => [] },
+    openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  await cache.syncFolders([{ id: "folder", label: "Folder", readOnly: true }], {});
+  assert.ok(requests.includes("rememberFolder"));
+  assert.ok(!requests.includes("register") && !requests.includes("attachDownloads"));
+});
+
 test("fresh-install startup uses default settings while keeping existing plaintext cache browsable", async t => {
   const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
   t.after(() => server.close());

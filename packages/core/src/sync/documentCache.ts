@@ -471,6 +471,10 @@ export function createDocumentCache(options: {
       for (const folder of folders) {
         const signature = JSON.stringify([folder.label, folder.encrypted, folder.needsPassword, passwords[folder.id]]);
         if (observed.get(folder.id) === signature) continue;
+        if ((await registrations()).some(value => value.id === folder.id && value.browseOnly)) {
+          observed.set(folder.id, signature);
+          continue;
+        }
         if (!folder.needsPassword && (!folder.encrypted || passwords[folder.id])) {
           await connectFolder({ id: folder.id, label: folder.label || folder.id, password: passwords[folder.id] });
         }

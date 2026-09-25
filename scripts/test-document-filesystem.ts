@@ -10,6 +10,167 @@ import { createCredentialVault } from "../packages/core/dist/sync/credentialVaul
 import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } from
   "../packages/core/dist/sync/credentialVaultStorage.js";
 import { defaultFolderSettings, defaultProfileSettings } from "../packages/core/dist/sync/profileSettings.js";
+import { purgePrivateReplicaContents } from "../packages/core/dist/sync/replicaPurge.js";
+
+test("an ordinary Syncthing peer can receive an explicitly selected folder without a personal space", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "ordinary-peer-fixture", deviceCounterId: "45",
+    openStorage, profile: await openStorage("profile"), randomBytes,
+    availableBytes: async () => 1024 * 1024 * 1024 });
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false);
+  await documents.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
+  await documents.attachDownloads("photos");
+  const settings = await documents.profileSettings();
+  settings.folders.photos = { ...defaultFolderSettings(), favorites: [{ key: "folder:photos:",
+    folderId: "photos", path: "", name: "Photos", kind: "folder" }] };
+  await documents.saveProfileSettings(settings);
+  const folders = await documents.sessionSharedFolders("SYNTHETIC-ORDINARY-PEER");
+  assert.deepEqual(folders.map(folder => folder.id), ["photos"]);
+  assert.equal(folders[0]?.encryption?.mode, "encrypted");
+  await documents.close();
+});
+
+test("local-only purge keeps the replica marker and never emits BEP tombstones", async () => {
+  const { openStorage, roots } = memoryDocumentStorage();
+  const storage = await openStorage("synthetic-root");
+  await storage.makeDirectory(".stfolder");
+  await storage.makeDirectory("encrypted-directory");
+  const file = await storage.createSink("encrypted-directory/block", 3);
+  await file.write(0, Uint8Array.of(1, 2, 3)); await file.commit();
+  const index = await storage.createSink(".syncpeer-replica-index", 1);
+  await index.write(0, Uint8Array.of(4)); await index.commit();
+  await purgePrivateReplicaContents(storage);
+  assert.deepEqual([...roots.get("synthetic-root")!.files.keys()], [".stfolder"]);
+  await storage.close();
+  const empty = await openStorage("unmarked-root");
+  await assert.rejects(purgePrivateReplicaContents(empty), /marker/i);
+  await empty.close();
+});
+
+test("acknowledged local release persists browse-only state, purges only its private copy, and survives restart", async () => {
+  const { roots, openStorage } = memoryDocumentStorage();
+  const options = { profileId: "release-fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024 };
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  let documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false, "OWNER", kit.publicKey);
+  await documents.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
+  await documents.attachDownloads("photos");
+  const handle = await documents.beginDownload("photos", "keep.txt", 3, 100);
+  await documents.write(handle, 0, Uint8Array.of(1, 2, 3));
+  await documents.finishDownload(handle);
+  const before = (await documents.status()).folders.find(folder => folder.id === "photos")!;
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "dangerous", confirmedText: "release" }),
+    /RELEASE LOCAL COPY/i);
+  assert.equal((await documents.status()).folders.find(folder => folder.id === "photos")?.downloads, true);
+  await documents.releaseLocalCopy("photos", { mode: "dangerous", confirmedText: "RELEASE LOCAL COPY" });
+  assert.equal((await documents.status()).folders.find(folder => folder.id === "photos")?.browseOnly, true);
+  assert.deepEqual([...roots.get(before.storageId)!.files.keys()], [".stfolder"]);
+  assert.equal((await documents.localReleaseHistory())[0]?.kind, "dangerous");
+  const { dispatchDocumentCommand } = await import("../packages/core/dist/sync/documentCommands.js");
+  assert.equal((await dispatchDocumentCommand(documents, { operation: "localReleaseHistory" }) as
+    Array<{ kind: string }>)[0]?.kind, "dangerous");
+  await documents.close();
+  documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.unlock("synthetic-master-password");
+  assert.equal((await documents.status()).folders.find(folder => folder.id === "photos")?.browseOnly, true);
+  assert.deepEqual(await documents.cachedFiles(), []);
+  await documents.close();
+});
+
+test("safe release requires a live authenticated peer whose full blocks match the local manifest", async () => {
+  const { roots, openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "safe-release-fixture", deviceCounterId: "42",
+    openStorage, profile: await openStorage("profile"), randomBytes,
+    availableBytes: async () => 1024 * 1024 * 1024 });
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false, "OWNER", kit.publicKey);
+  await documents.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
+  await documents.attachDownloads("photos");
+  const content = Uint8Array.of(1, 2, 3, 4);
+  const handle = await documents.beginDownload("photos", "keep.txt", content.length, 100);
+  await documents.write(handle, 0, content); await documents.finishDownload(handle);
+  const localId = (await documents.ownedDevices()).localDeviceId!;
+  await documents.savePersonalSpaceSetting(["folders", "photos", "retention"], {
+    minimumCopies: 2, retentionRevision: 2,
+    holders: [{ id: localId, kind: "syncpeer" }, { id: "PEER", kind: "syncthing" },
+      { id: "PEER2", kind: "syncthing" }],
+  });
+  await documents.savePersonalSpaceSetting(["folders", "photos", "shareTargets"],
+    [{ kind: "device", syncthingId: "PEER" }]);
+  const settings = await documents.profileSettings();
+  settings.folders.photos = { ...defaultFolderSettings(), favorites: [{ key: "folder:photos:",
+    folderId: "photos", path: "", name: "Photos", kind: "folder" }] };
+  await documents.saveProfileSettings(settings);
+  const [shared] = await documents.sessionSharedFolders("PEER");
+  const files = await shared.replica!.scan();
+  let closed = false;
+  const session = { remoteDeviceId: "PEER", isClosed: () => closed,
+    remoteFs: { completeFolderIndex: async () => files,
+      readFileRange: async (_folderId: string, _path: string, offset: number, size: number) => content.slice(offset, offset + size) } };
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "safe", sessions: [] }), /online|copy/i);
+  closed = true;
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "safe", sessions: [session] }), /online|closed/i);
+  closed = false;
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "safe", sessions: [session] }), /online|copy/i);
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "safe", sessions: [session,
+    { ...session, remoteDeviceId: "PEER", claimedHolderId: "PEER2" }] }), /online|copy/i);
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "safe", sessions: [session,
+    { ...session, remoteDeviceId: "PEER2", remoteFs: { ...session.remoteFs,
+      readFileRange: async () => Uint8Array.of(0, 0, 0, 0) } }] }), /online|copy/i);
+  await documents.releaseLocalCopy("photos", { mode: "safe", sessions: [session,
+    { ...session, remoteDeviceId: "PEER2" }] });
+  const folder = (await documents.status()).folders.find(value => value.id === "photos")!;
+  assert.equal(folder.browseOnly, true);
+  assert.deepEqual([...roots.get(folder.storageId)!.files.keys()], [".stfolder"]);
+  assert.equal((await documents.localReleaseHistory())[0]?.kind, "safe");
+  await documents.close();
+});
+
+test("an interrupted private purge resumes from the signed pending release on unlock", async () => {
+  const { roots, openStorage: backingStorage } = memoryDocumentStorage();
+  let failPurge = false;
+  const openStorage = async (id: string) => {
+    const storage = await backingStorage(id);
+    return { ...storage, remove: async (path: string, directory: boolean) => {
+      if (id !== "profile" && failPurge && path !== ".stfolder") {
+        failPurge = false;
+        throw new Error("synthetic interrupted purge");
+      }
+      await storage.remove(path, directory);
+    } };
+  };
+  const options = { profileId: "release-recovery-fixture", deviceCounterId: "42", openStorage,
+    profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024 };
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  let documents = createDocumentFilesystem(options);
+  await documents.initialize();
+  await documents.createVault("synthetic-master-password", false, "OWNER", kit.publicKey);
+  await documents.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
+  await documents.attachDownloads("photos");
+  const handle = await documents.beginDownload("photos", "keep.txt", 1, 100);
+  await documents.write(handle, 0, Uint8Array.of(9)); await documents.finishDownload(handle);
+  const folder = (await documents.status()).folders.find(value => value.id === "photos")!;
+  failPurge = true;
+  await assert.rejects(documents.releaseLocalCopy("photos", { mode: "dangerous",
+    confirmedText: "RELEASE LOCAL COPY" }), /interrupted purge/i);
+  assert.equal((await documents.status()).folders.find(value => value.id === "photos")?.browseOnly, true);
+  assert.equal((await documents.status()).pendingLocalReleases?.length, 1);
+  await assert.rejects(documents.attachDownloads("photos"), /pending local release/i);
+  await assert.rejects(documents.register({ id: "photos", label: "Photos" }), /pending local release/i);
+  assert.ok(roots.get(folder.storageId)!.files.size > 1);
+  await documents.close();
+  documents = createDocumentFilesystem(options);
+  await documents.initialize(); await documents.unlock("synthetic-master-password");
+  assert.deepEqual([...roots.get(folder.storageId)!.files.keys()], [".stfolder"]);
+  assert.deepEqual((await documents.status()).pendingLocalReleases, []);
+  assert.equal((await documents.localReleaseHistory()).length, 1);
+  await documents.close();
+});
 
 test("document bridge identifies an invalid transfer field without echoing its value", async () => {
   const { dispatchDocumentCommand } = await import("../packages/core/dist/sync/documentCommands.js");
@@ -42,10 +203,10 @@ test("first-run folder storage requires a recoverable master password and retain
   assert.equal((await documents.status()).vault.phase, "uninitialized");
   const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
   await documents.createVault("synthetic-master-password", true, "FIRST-DEVICE", kit.publicKey);
-  const initialRoster = await documents.ownedDevices();
-  assert.equal(initialRoster.devices.length, 1);
-  assert.equal(initialRoster.devices[0].syncthingId, "FIRST-DEVICE");
-  assert.equal(initialRoster.localDeviceId, initialRoster.devices[0].id);
+  const initialMembership = await documents.ownedDevices();
+  assert.equal(initialMembership.devices.length, 1);
+  assert.equal(initialMembership.devices[0].syncthingId, "FIRST-DEVICE");
+  assert.equal(initialMembership.localDeviceId, initialMembership.devices[0].id);
   assert.deepEqual(await documents.list("syncpeer-root"), []);
   await documents.rememberFolder({ id: "photos", label: "Photos" });
   const [photos] = await documents.list("syncpeer-root");
@@ -373,6 +534,8 @@ test("backup commands restore portable credentials without device-local roots or
   assert.equal((sourceSettings.encryption as { password: string }).password.length, 64);
   assert.deepEqual(await source.list("syncpeer-root"), [], "The settings folder is never user-visible");
   await source.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
+  assert.deepEqual((await source.sharedPersonalSpaceSettings()).settings?.folders.photos.credential,
+    { label: "Photos", password: "synthetic-folder-password" });
   await source.saveConnectionPasswords({ photos: "synthetic-folder-password" });
   await source.saveUiState({ deviceLocal: "synthetic-private-device" });
   const backup = await dispatchDocumentCommand(source, { operation: "exportRecoveryBackup", password: "synthetic-backup-password" });
@@ -415,6 +578,13 @@ test("backup commands restore portable credentials without device-local roots or
   assert.deepEqual((await dispatchDocumentCommand(paired, { operation: "ownedDevices" }) as { devices: unknown[] }).devices,
     pairingTransfer.trust.updates.at(-1)?.devices);
   assert.deepEqual(await paired.connectionPasswords(), {}, "Pairing does not copy device-local credentials directly");
+  assert.equal(await pairedSettings.replica?.receive?.(pairedSettings.id,
+    await sourceSettings.replica!.scan(), sourceSettings.replica!.readBlock), true);
+  await paired.sessionSharedFolders("SOURCE");
+  assert.deepEqual((await paired.status()).folders.map(folder => folder.id), ["photos"],
+    "The approved peer imports the signed credential after encrypted settings replica exchange.");
+  await assert.rejects(paired.register({ id: "photos", label: "Photos", password: "wrong-password" }),
+    /password changes/i);
   await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,
     recoveryPassword: "synthetic-backup-password", password: "new-synthetic-master" }), /already exists/);
   await source.close(); await target.close(); await paired.close();
@@ -460,6 +630,33 @@ test("personal-space settings replica survives restart and is revoked by lock", 
   await documents.close();
 });
 
+test("an approved device registers a signed shared folder credential without auto-downloading", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "shared-credential-fixture", deviceCounterId: "42",
+    openStorage, profile: await openStorage("profile"), randomBytes,
+    availableBytes: async () => 1024 * 1024 * 1024 });
+  await documents.initialize();
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await documents.createVault("synthetic-master-password", false, "DEVICE", kit.publicKey);
+  const deviceId = (await documents.ownedDevices()).localDeviceId!;
+  await documents.rememberFolder({ id: "photos", label: "Photos" });
+  await documents.appendPersonalSpaceChange({ id: "shared-credential", deviceId,
+    path: ["folders", "photos", "credential"], parents: [],
+    value: { label: "Photos", password: "synthetic-shared-folder-password" } });
+  await documents.sessionSharedFolders("DEVICE");
+  assert.deepEqual((await documents.status()).folders.map(folder => [folder.id, Boolean(folder.downloads)]),
+    [["photos", false]]);
+  await assert.rejects(documents.register({ id: "photos", label: "Photos",
+    password: "wrong-password" }), /password changes/i);
+  await documents.register({ id: "photos", label: "Photos",
+    password: "synthetic-shared-folder-password" });
+  assert.deepEqual((await documents.status()).folders.map(folder => [folder.id, Boolean(folder.downloads)]),
+    [["photos", false]], "A rejected password must not replace the signed credential or start downloads.");
+  assert.equal((await documents.personalSpaceChanges()).length, 1,
+    "Importing a shared credential must not republish it as a conflicting edit.");
+  await documents.close();
+});
+
 test("shared favorite selections apply to the local profile while other devices remain isolated", async () => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "shared-favorites-fixture", deviceCounterId: "43", openStorage,
@@ -488,6 +685,7 @@ test("shared favorite selections apply to the local profile while other devices 
 test("an existing vault keeps local favorites until its device writes a shared selection", async () => {
   const { openStorage } = memoryDocumentStorage();
   const profile = await openStorage("profile");
+  await profile.initializeReplica();
   const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
   const favorite = { folderId: "photos", key: "folder:photos:", path: "", name: "Photos", kind: "folder" as const };
   const vault = createCredentialVault({ profileId: "existing-favorites-fixture", randomBytes,

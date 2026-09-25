@@ -3127,12 +3127,24 @@ async function openSession(
 ): Promise<SyncpeerSessionHandle> {
   const discoveryMode = opts.discoveryMode ?? "automatic";
   if (discoveryMode === "direct") {
-    if (opts.quicOnly) {
-      throwIfConnectionAborted(signal);
-      return openQuicSession(adapter, opts, opts.host, opts.port, opts.timeoutMs, undefined, signal);
-    }
     throwIfConnectionAborted(signal);
-    return openDirectSession(adapter, opts, opts.host, opts.port, opts.timeoutMs, undefined, signal);
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs! > 0 ? opts.timeoutMs! : 15000;
+    const attempt = new AbortController();
+    const forwardAbort = () => attempt.abort();
+    signal?.addEventListener("abort", forwardAbort, { once: true });
+    const timer = setTimeout(forwardAbort, timeoutMs);
+    try {
+      const opening = opts.quicOnly
+        ? openQuicSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal)
+        : openDirectSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal);
+      return await withSessionTimeout(opening, timeoutMs);
+    } catch (error) {
+      attempt.abort();
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", forwardAbort);
+    }
   }
 
   const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0

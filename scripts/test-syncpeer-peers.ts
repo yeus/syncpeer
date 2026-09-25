@@ -8,6 +8,8 @@ import { X509Certificate } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import net from "node:net";
+import { createServer as createTlsServer, type TLSSocket } from "node:tls";
 import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
 import { createNodeSyncpeerClient, createNodeHostAdapter, createNodeFolderSyncStorage, listenNodePeer,
   listenNodePeers } from "../packages/core/dist/node.js";
@@ -32,6 +34,47 @@ async function createTestPeerIdentity(root: string, name: string) {
   const certPem = await readFile(cert, "utf8");
   return { certPem, keyPem: await readFile(key, "utf8"), deviceId: computeDeviceId(new X509Certificate(certPem).raw) };
 }
+
+async function freeLocalPort() {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return address.port;
+}
+
+test("a direct peer that completes TLS but never sends BEP hello times out", { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-half-open-"));
+  const sockets = new Set<TLSSocket>();
+  let server: ReturnType<typeof createTlsServer> | undefined;
+  try {
+    const [local, remote] = await Promise.all([
+      createTestPeerIdentity(root, "local"), createTestPeerIdentity(root, "remote"),
+    ]);
+    server = createTlsServer({ cert: remote.certPem, key: remote.keyPem,
+      requestCert: true, rejectUnauthorized: false, ALPNProtocols: ["bep/1.0"] }, socket => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+    await new Promise<void>((resolve, reject) => server!.listen(0, "127.0.0.1", resolve).once("error", reject));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const outcome = await Promise.race([
+      createNodeSyncpeerClient().openSession({ ...local, host: "127.0.0.1", port: address.port,
+        expectedDeviceId: remote.deviceId, discoveryMode: "direct", timeoutMs: 300,
+        deviceName: "synthetic-timeout-client" }).then(
+        session => session.close().then(() => "unexpected-session"), error => String(error)),
+      new Promise<string>(resolve => setTimeout(() => resolve("stalled"), 1500)),
+    ]);
+    assert.notEqual(outcome, "stalled", "The BEP handshake must respect the direct connection timeout.");
+    assert.match(outcome, /timed out|timeout|cancelled/i);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server?.close(() => resolve()) ?? resolve());
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("paired peers synchronize the encrypted settings replica without exposing it as a document folder",
   { timeout: 15000 }, async () => {

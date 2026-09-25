@@ -1,7 +1,6 @@
 package dev.syncpeer.plugin.android
 
 import java.io.File
-import java.nio.file.Files
 
 internal const val PRIVATE_STORAGE_FORMAT_FILE = ".syncpeer-storage-format.json"
 internal const val PRIVATE_STORAGE_UNRECOGNIZED = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED"
@@ -13,9 +12,12 @@ private val currentMarker = Regex(
 private fun unrecognizedPrivateStorage(detail: String): Nothing =
   error("$PRIVATE_STORAGE_UNRECOGNIZED: $detail")
 
+private fun isSymbolicLink(file: File): Boolean =
+  file.canonicalFile != File(file.parentFile.canonicalFile, file.name)
+
 private fun markerIsCurrent(marker: File): Boolean {
   if (!marker.exists()) return false
-  if (!marker.isFile || Files.isSymbolicLink(marker.toPath())) {
+  if (!marker.isFile || isSymbolicLink(marker)) {
     unrecognizedPrivateStorage("the storage format marker is not a regular file")
   }
   val value = marker.readText()
@@ -24,7 +26,7 @@ private fun markerIsCurrent(marker: File): Boolean {
 
 internal fun preparePrivateStorageRoot(root: File): File {
   if (root.exists()) {
-    if (!root.isDirectory || Files.isSymbolicLink(root.toPath())) {
+    if (!root.isDirectory || isSymbolicLink(root)) {
       unrecognizedPrivateStorage("the private storage root is not a regular directory")
     }
   } else if (!root.mkdirs()) {

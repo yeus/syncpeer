@@ -44,4 +44,27 @@ class PrivateStorageFormatTest {
       }
     } finally { root.deleteRecursively() }
   }
+
+  @Test fun rejectsSymlinkedRootAndMarker() {
+    val parent = Files.createTempDirectory("syncpeer-private-storage")
+    try {
+      val real = Files.createDirectory(parent.resolve("real")).toFile()
+      val linkedRoot = Files.createSymbolicLink(parent.resolve("linked"), real.toPath()).toFile()
+      try {
+        preparePrivateStorageRoot(linkedRoot)
+        fail("Expected a symlinked private root to be rejected")
+      } catch (error: IllegalStateException) {
+        assertTrue(error.message.orEmpty().startsWith(PRIVATE_STORAGE_UNRECOGNIZED))
+      }
+      val markerTarget = parent.resolve("marker-target")
+      markerTarget.toFile().writeText("{\"owner\":\"syncpeer\",\"version\":1}")
+      Files.createSymbolicLink(real.toPath().resolve(PRIVATE_STORAGE_FORMAT_FILE), markerTarget)
+      try {
+        preparePrivateStorageRoot(real)
+        fail("Expected a symlinked format marker to be rejected")
+      } catch (error: IllegalStateException) {
+        assertTrue(error.message.orEmpty().startsWith(PRIVATE_STORAGE_UNRECOGNIZED))
+      }
+    } finally { parent.toFile().deleteRecursively() }
+  }
 }

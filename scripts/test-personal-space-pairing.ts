@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { randomBytes } from "node:crypto";
 import { createPairingInvitation, createPairingRequest, openPairingSession,
   sealPairingTransfer, openPairingTransfer } from "../packages/core/dist/sync/personalSpacePairing.js";
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signOwnedRosterUpdate } from
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 
 test("pairing binds both certificate identities and requires matching confirmation codes", async () => {
@@ -16,7 +16,7 @@ test("pairing binds both certificate identities and requires matching confirmati
     joiner.request, "OWNED");
   assert.equal(first.confirmationCode, second.confirmationCode);
   const owner = await createOwnedDeviceIdentity(subtle, randomBytes, "OWNED");
-  const genesis = await signOwnedRosterUpdate(subtle, await openOwnedDeviceSigningKey(subtle, owner), {
+  const genesis = await signSpaceMembershipUpdate(subtle, await openOwnedDeviceSigningKey(subtle, owner), {
     sequence: 1, previous: null, signer: owner.id,
     devices: [{ id: owner.id, syncthingId: owner.syncthingId, state: owner.state, signingKey: owner.signingKey }],
   });

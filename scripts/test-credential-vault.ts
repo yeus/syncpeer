@@ -35,11 +35,11 @@ test("first owned vault save already contains the signed genesis", async () => {
   const owner = createCredentialVault(options);
   await owner.create("synthetic-master-password", false, "OWNER", kit.publicKey);
   assert.equal(vaultSaves, 1);
-  assert.deepEqual((await owner.ownedRoster())?.devices.map(device => device.syncthingId), ["OWNER"]);
+  assert.deepEqual((await owner.spaceDeviceMembership())?.devices.map(device => device.syncthingId), ["OWNER"]);
   await owner.close();
   const reopened = createCredentialVault(options);
   await reopened.unlock("synthetic-master-password");
-  assert.deepEqual((await reopened.ownedRoster())?.devices.map(device => device.syncthingId), ["OWNER"]);
+  assert.deepEqual((await reopened.spaceDeviceMembership())?.devices.map(device => device.syncthingId), ["OWNER"]);
   await reopened.close();
 });
 
@@ -96,7 +96,7 @@ test("confirmed pairing transfer initializes the same personal space with a loca
   const transfer = await owner.exportPairingTransfer("OWNER", joiningDevice);
   const joined = createCredentialVault(makeStorage());
   await joined.importPairingTransfer(transfer, identity, "joined-local-password", false);
-  assert.deepEqual((await joined.ownedRoster())?.devices, transfer.trust.updates.at(-1)?.devices);
+  assert.deepEqual((await joined.spaceDeviceMembership())?.devices, transfer.trust.updates.at(-1)?.devices);
   await joined.lock();
   await assert.rejects(joined.unlock("owner-local-password"));
   await joined.unlock("joined-local-password");
@@ -194,7 +194,7 @@ test("the separate offline kit enrolls a replacement when every prior device is 
   await assert.rejects(replacement.recoverOwnedDevice("REPLACEMENT", kit, "wrong-password"), /recovery kit/i);
   const trust = await replacement.recoverOwnedDevice("REPLACEMENT", kit, "synthetic-offline-kit-password");
   assert.equal(trust.updates.at(-1)?.signer, "recovery");
-  assert.deepEqual((await replacement.ownedRoster())?.devices.map(device => [device.syncthingId, device.state]),
+  assert.deepEqual((await replacement.spaceDeviceMembership())?.devices.map(device => [device.syncthingId, device.state]),
     [["ORIGINAL", "revoked"], ["REPLACEMENT", "active"]]);
   await assert.rejects(replacement.recoverOwnedDevice("THIRD", kit, "synthetic-offline-kit-password"),
     /already enrolled/i);

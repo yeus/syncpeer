@@ -8,14 +8,14 @@ import {
   setDeviceFolderSelection,
   updateFolderRetention,
 } from "../packages/core/dist/sync/personalSpaceSettings.js";
-import { createOwnedDeviceIdentity, signOwnedRosterUpdate } from
+import { createOwnedDeviceIdentity, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 import { signPersonalSpaceChange } from "../packages/core/dist/sync/personalSpaceChanges.js";
 
 const trustedOwner = async () => {
   const identity = await createOwnedDeviceIdentity(crypto.subtle,
     size => crypto.getRandomValues(new Uint8Array(size)), "OWNER");
-  const genesis = await signOwnedRosterUpdate(crypto.subtle,
+  const genesis = await signSpaceMembershipUpdate(crypto.subtle,
     await crypto.subtle.importKey("pkcs8", Buffer.from(identity.privateKey, "base64"),
       { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]),
     { sequence: 1, previous: null, signer: identity.id,
@@ -69,7 +69,7 @@ test("conflicting settings remain unresolved until an explicit descendant choose
   assert.equal(resolved.settings?.folders.photos.minimumCopies, 2);
 });
 
-test("a roster member cannot spoof another member's settings event", async () => {
+test("a space member cannot spoof another member's settings event", async () => {
   const { deviceId, trust } = await trustedOwner();
   await assert.rejects(materializePersonalSpaceSettings(crypto.subtle, trust, [{
     id: "forged", deviceId, path: ["folders", "photos", "retention"], parents: [],
@@ -78,16 +78,16 @@ test("a roster member cannot spoof another member's settings event", async () =>
 });
 
 test("shared settings start versioned with a two-copy folder default", () => {
-  const settings = defaultPersonalSpaceSettings("roster-1");
-  assert.deepEqual(settings, { format: 1, rosterHead: "roster-1", folders: {} });
+  const settings = defaultPersonalSpaceSettings("membership-1");
+  assert.deepEqual(settings, { format: 1, rosterHead: "membership-1", folders: {} });
   assert.deepEqual(folderRetentionPolicyFromSettings(settings, "photos"), {
     format: 1, folderId: "photos", minimumCopies: 2, revision: 1,
-    rosterHead: "roster-1", holders: [],
+    rosterHead: "membership-1", holders: [],
   });
 });
 
 test("favorite and exclusion selections are isolated per owned device", () => {
-  const original = defaultPersonalSpaceSettings("roster-1");
+  const original = defaultPersonalSpaceSettings("membership-1");
   const phone = setDeviceFolderSelection(original, "photos", "phone", {
     favorites: [{ key: "folder:photos:", folderId: "photos", path: "", name: "Photos", kind: "folder" }],
     exclusions: [],
@@ -103,7 +103,7 @@ test("favorite and exclusion selections are isolated per owned device", () => {
 });
 
 test("retention changes advance only that folder policy revision", () => {
-  const initial = setDeviceFolderSelection(defaultPersonalSpaceSettings("roster-1"), "photos", "phone", {
+  const initial = setDeviceFolderSelection(defaultPersonalSpaceSettings("membership-1"), "photos", "phone", {
     favorites: [], exclusions: [],
   });
   const updated = updateFolderRetention(initial, "photos", {
@@ -112,7 +112,7 @@ test("retention changes advance only that folder policy revision", () => {
   });
   assert.deepEqual(folderRetentionPolicyFromSettings(updated, "photos"), {
     format: 1, folderId: "photos", minimumCopies: 3, revision: 2,
-    rosterHead: "roster-1", holders: [
+    rosterHead: "membership-1", holders: [
       { id: "phone", kind: "syncpeer" }, { id: "nas", kind: "syncthing" },
     ],
   });

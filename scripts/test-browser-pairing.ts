@@ -10,7 +10,7 @@ import { createNodeHostAdapter } from "../packages/core/dist/node.js";
 import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserClient.js";
 import { createSyncpeerCoreClient, type SyncpeerSessionHandle } from "../packages/core/dist/client.js";
 import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signOwnedRosterUpdate } from
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 
 useTemporaryMetadataRoot();
@@ -118,9 +118,9 @@ test("browser clients pair over the production LAN TLS adapters and persist only
         const key = await openOwnedDeviceSigningKey(crypto.subtle, ownerSigning);
         const ownerDevice = { id: ownerSigning.id, syncthingId: ownerSigning.syncthingId,
           state: ownerSigning.state, signingKey: ownerSigning.signingKey };
-        const genesis = await signOwnedRosterUpdate(crypto.subtle, key,
+        const genesis = await signSpaceMembershipUpdate(crypto.subtle, key,
           { sequence: 1, previous: null, signer: ownerDevice.id, devices: [ownerDevice] });
-        const update = await signOwnedRosterUpdate(crypto.subtle, key, { sequence: 2, previous: genesis.hash,
+        const update = await signSpaceMembershipUpdate(crypto.subtle, key, { sequence: 2, previous: genesis.hash,
           signer: ownerDevice.id, devices: [ownerDevice, joiningDevice] });
         return { spaceId: "a".repeat(32), settingsFolderId: "b".repeat(32), rootKey: "c".repeat(64),
           trust: { genesisKey: ownerDevice.signingKey, knownHead: update.hash, updates: [genesis, update] } };

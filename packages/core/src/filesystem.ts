@@ -24,9 +24,9 @@ export { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap, rewrapPersona
 export type { PersonalSpace, PersonalSpaceBootstrap } from "./sync/personalSpaceBootstrap.js";
 export { createOwnedDeviceIdentity, createOwnedRecoveryKit, openOwnedRecoveryKit, openOwnedDeviceSigningKey,
   resolveApprovedPeerDeviceIds, resolveFolderShareDevices,
-  settingsFolderDevices, signOwnedRosterUpdate, verifyOwnedRoster } from "./sync/personalSpaceSharing.js";
-export type { FolderShareTarget, OwnedDeviceIdentity, OwnedRecoveryKit, OwnedRosterTrust,
-  OwnedSpaceDevice, OwnedRosterUpdate } from "./sync/personalSpaceSharing.js";
+  settingsFolderDevices, signSpaceMembershipUpdate, verifySpaceDeviceMembership } from "./sync/personalSpaceSharing.js";
+export type { FolderShareTarget, OwnedDeviceIdentity, OwnedRecoveryKit, SpaceDeviceMembershipTrust,
+  OwnedSpaceDevice, SpaceMembershipUpdate } from "./sync/personalSpaceSharing.js";
 export { createPairingInvitation, createPairingRequest, openPairingSession,
   sealPairingTransfer, openPairingTransfer } from "./sync/personalSpacePairing.js";
 export type { PairingInvitation, PairingRequest, PairingTransfer } from "./sync/personalSpacePairing.js";
@@ -34,7 +34,7 @@ export { resolvePersonalSpaceChanges } from "./sync/personalSpaceChanges.js";
 export type { PersonalSpaceChange } from "./sync/personalSpaceChanges.js";
 export { materializePersonalSpaceSettings } from "./sync/personalSpaceSettings.js";
 export { createPersonalSpaceSettingsJournal } from "./sync/personalSpaceSettingsJournal.js";
-export { createPersonalSpaceRosterJournal } from "./sync/personalSpaceRosterJournal.js";
+export { createSpaceMembershipJournal } from "./sync/spaceMembershipJournal.js";
 export { createDocumentFilesystem } from "./sync/documentFilesystem.js";
 export { dispatchDocumentCommand } from "./sync/documentCommands.js";
 export { createDocumentCache } from "./sync/documentCache.js";

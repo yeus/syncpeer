@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { createNodeHostAdapter } from "../packages/core/dist/node.js";
 import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserClient.js";
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signOwnedRosterUpdate } from
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
 import { binaryPath, ensureSyncthingTools, generateSyncthingIdentity } from "./lan-test/syncthing.ts";
@@ -84,9 +84,9 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
           const key = await openOwnedDeviceSigningKey(crypto.subtle, signing);
           const ownerDevice = { id: signing.id, syncthingId: signing.syncthingId,
             state: signing.state, signingKey: signing.signingKey };
-          const genesis = await signOwnedRosterUpdate(crypto.subtle, key,
+          const genesis = await signSpaceMembershipUpdate(crypto.subtle, key,
             { sequence: 1, previous: null, signer: ownerDevice.id, devices: [ownerDevice] });
-          const update = await signOwnedRosterUpdate(crypto.subtle, key, { sequence: 2,
+          const update = await signSpaceMembershipUpdate(crypto.subtle, key, { sequence: 2,
             previous: genesis.hash, signer: ownerDevice.id, devices: [ownerDevice, joiningDevice] });
           return { spaceId: "a".repeat(32), settingsFolderId: "b".repeat(32), rootKey: "c".repeat(64),
             trust: { genesisKey: ownerDevice.signingKey, knownHead: update.hash,

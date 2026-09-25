@@ -3,7 +3,7 @@ import type { BepFileInfo } from "../core/protocol/bep.js";
 import { equalHash, validateBlockPlan } from "../transfer/blockReuse.js";
 import type { LocalFolderReplica } from "./replicaIndex.js";
 import { isInternalReplicaPath } from "./replicaPaths.js";
-import { verifyOwnedRoster, type OwnedRosterTrust } from "./personalSpaceSharing.js";
+import { verifySpaceDeviceMembership, type SpaceDeviceMembershipTrust } from "./personalSpaceSharing.js";
 
 export interface FolderManifestEntry {
   path: string;
@@ -168,14 +168,14 @@ export const defaultFolderRetentionPolicy = (folderId: string, rosterHead: strin
   folderId: text(folderId, "retention folder identifier"),
   minimumCopies: 2,
   revision: 1,
-  rosterHead: text(rosterHead, "owned roster head"),
+  rosterHead: text(rosterHead, "space device membership head"),
   holders: [],
 });
 
 const validatePolicy = (policy: FolderRetentionPolicy) => {
   if (policy.format !== 1) throw new Error("Unsupported folder retention policy format.");
   text(policy.folderId, "retention folder identifier");
-  text(policy.rosterHead, "owned roster head");
+  text(policy.rosterHead, "space device membership head");
   integer(policy.revision, "retention policy revision", 1);
   integer(policy.minimumCopies, "minimum copy count", 1);
   const ids = new Set<string>();
@@ -289,7 +289,7 @@ export async function signRetentionReleaseProposal(subtle: SubtleCrypto, key: Cr
   text(data.folderId, "proposal folder identifier");
   text(data.releaseHolderId, "released holder identifier");
   text(data.proposerId, "proposal signer identifier");
-  text(data.rosterHead, "proposal roster head");
+  text(data.rosterHead, "proposal membership head");
   text(data.manifestDigest, "proposal manifest digest");
   integer(data.policyRevision, "proposal policy revision", 1);
   const id = digest(recordBytes("syncpeer.retention-release-proposal.v1", data));
@@ -303,20 +303,20 @@ export async function authorizeReplicaRelease(subtle: SubtleCrypto, input: {
   completions: readonly ReplicaCompletion[];
   /** Holder IDs with a live authenticated session at the release decision, supplied by the local session owner. */
   onlineHolderIds: readonly string[];
-  trust: OwnedRosterTrust;
+  trust: SpaceDeviceMembershipTrust;
   nowMs: number;
 }) {
   validatePolicy(input.policy);
   if (!input.trust || input.trust.knownHead !== input.policy.rosterHead ||
     input.trust.knownHead !== input.trust.updates.at(-1)?.hash) {
-    throw new Error("Retention release has a stale or invalid trusted roster head.");
+    throw new Error("Retention release has a stale or invalid trusted membership head.");
   }
-  const roster = await verifyOwnedRoster(subtle, input.trust.updates,
+  const membership = await verifySpaceDeviceMembership(subtle, input.trust.updates,
     input.trust.genesisKey, input.trust.knownHead);
-  const devices = roster.devices.filter(device => device.state === "active");
+  const devices = membership.devices.filter(device => device.state === "active");
   const active = new Set(devices.map(device => device.id));
   const publicKeys = Object.fromEntries(devices.map(device => [device.id, device.signingKey]));
-  if (!active.size) throw new Error("Invalid active owned-device roster.");
+  if (!active.size) throw new Error("Invalid active owned-device membership.");
   const proposal = input.proposal;
   const expectedProposal = proposalData(proposal);
   const expectedId = digest(recordBytes("syncpeer.retention-release-proposal.v1", expectedProposal));
@@ -365,7 +365,7 @@ export async function createDangerousLocalRelease(subtle: SubtleCrypto, key: Cry
   const data = dangerousReleaseData(value);
   text(data.folderId, "dangerous release folder identifier");
   text(data.localHolderId, "dangerous release holder identifier");
-  text(data.rosterHead, "dangerous release roster head");
+  text(data.rosterHead, "dangerous release membership head");
   text(data.manifestDigest, "dangerous release manifest digest");
   integer(data.policyRevision, "dangerous release policy revision", 1);
   integer(data.createdAtMs, "dangerous release time");

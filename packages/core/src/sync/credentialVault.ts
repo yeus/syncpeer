@@ -8,8 +8,8 @@ import { createPersonalSpaceBootstrap, openPersonalSpaceBootstrap,
   personalVaultKey, settingsFolderPassword, wrapPersonalSpaceBootstrap,
   type PersonalSpace, type PersonalSpaceBootstrap } from "./personalSpaceBootstrap.js";
 import type { PersonalSpacePairingTransfer } from "./personalSpacePairing.js";
-import { createOwnedDeviceIdentity, openOwnedRecoveryKit, openOwnedDeviceSigningKey, signOwnedRosterUpdate,
-  validateOwnedRecoveryPublicKey, verifyOwnedRoster, type OwnedDeviceIdentity, type OwnedRecoveryKit, type OwnedRosterTrust,
+import { createOwnedDeviceIdentity, openOwnedRecoveryKit, openOwnedDeviceSigningKey, signSpaceMembershipUpdate,
+  validateOwnedRecoveryPublicKey, verifySpaceDeviceMembership, type OwnedDeviceIdentity, type OwnedRecoveryKit, type SpaceDeviceMembershipTrust,
   type OwnedSpaceDevice } from "./personalSpaceSharing.js";
 import { signPersonalSpaceChange, type PersonalSpaceChange } from "./personalSpaceChanges.js";
 
@@ -39,7 +39,7 @@ interface VaultData {
   /** Device-local private identity; excluded from portable recovery and pairing transfers. */
   ownedDevice?: OwnedDeviceIdentity;
   /** Public signed history plus this device's pinned trust anchors. */
-  trustedRoster?: OwnedRosterTrust;
+  trustedRoster?: SpaceDeviceMembershipTrust;
 }
 
 export interface RememberedUnlockSecretStore {
@@ -219,9 +219,9 @@ export function createCredentialVault(options: {
     const { record, data } = await unlocked();
     await save(await transform(data), key!, record);
   });
-  const verifyTrust = async (trust: OwnedRosterTrust, knownHead = trust.knownHead) => {
+  const verifyTrust = async (trust: SpaceDeviceMembershipTrust, knownHead = trust.knownHead) => {
     if (!trust || trust.knownHead !== trust.updates.at(-1)?.hash) throw new Error("Invalid trusted device list.");
-    return verifyOwnedRoster(subtle, trust.updates, trust.genesisKey, knownHead);
+    return verifySpaceDeviceMembership(subtle, trust.updates, trust.genesisKey, knownHead);
   };
   const prepareOwnedDevice = async (space: PersonalSpace | undefined, data: VaultData,
     syncthingId: string, recoveryKey?: string) => {
@@ -237,7 +237,7 @@ export function createCredentialVault(options: {
         ? { ...device, syncthingId,
             retiredSyncthingIds: [...new Set([...(device.retiredSyncthingIds ?? []), device.syncthingId])] }
         : device);
-      const update = await signOwnedRosterUpdate(subtle, key, { sequence: data.trustedRoster.updates.length + 1,
+      const update = await signSpaceMembershipUpdate(subtle, key, { sequence: data.trustedRoster.updates.length + 1,
         previous: data.trustedRoster.knownHead, signer: data.ownedDevice.id, devices,
         recoveryKey: data.trustedRoster.updates[0].recoveryKey });
       return { ...data, ownedDevice: { ...data.ownedDevice, syncthingId },
@@ -251,7 +251,7 @@ export function createCredentialVault(options: {
     const key = await openOwnedDeviceSigningKey(subtle, identity);
     const device = { id: identity.id, syncthingId: identity.syncthingId,
       state: identity.state, signingKey: identity.signingKey };
-    const genesis = await signOwnedRosterUpdate(subtle, key,
+    const genesis = await signSpaceMembershipUpdate(subtle, key,
       { sequence: 1, previous: null, signer: identity.id, recoveryKey, devices: [device] });
     return { ...data, ownedDevice: identity,
       trustedRoster: { genesisKey: identity.signingKey, knownHead: genesis.hash, updates: [genesis] } };
@@ -356,7 +356,7 @@ export function createCredentialVault(options: {
       }
       if (!existing) {
         const signingKey = await openOwnedDeviceSigningKey(subtle, data.ownedDevice!);
-        const update = await signOwnedRosterUpdate(subtle, signingKey, {
+        const update = await signSpaceMembershipUpdate(subtle, signingKey, {
           sequence: data.trustedRoster!.updates.length + 1, previous: data.trustedRoster!.knownHead,
           signer: data.ownedDevice!.id, devices: [...current.devices, joiningDevice],
           recoveryKey: data.trustedRoster!.updates[0].recoveryKey,
@@ -369,7 +369,7 @@ export function createCredentialVault(options: {
         rootKey: [...personalSpace.rootKey].map(byte => byte.toString(16).padStart(2, "0")).join(""),
         trust: data.trustedRoster! };
     }),
-    ownedRoster: () => run(async () => {
+    spaceDeviceMembership: () => run(async () => {
       const { data } = await unlocked();
       if (!data.trustedRoster) return null;
       const verified = await verifyTrust(data.trustedRoster);
@@ -381,13 +381,13 @@ export function createCredentialVault(options: {
       if (!data.ownedDevice || !data.trustedRoster || change.deviceId !== data.ownedDevice.id) {
         throw new Error("Personal-space setting author is not this enrolled device.");
       }
-      const roster = await verifyTrust(data.trustedRoster);
-      if (!roster.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
+      const membership = await verifyTrust(data.trustedRoster);
+      if (!membership.devices.some(device => device.id === data.ownedDevice!.id && device.state === "active")) {
         throw new Error("Revoked devices cannot sign personal-space settings.");
       }
       return signPersonalSpaceChange(subtle, await openOwnedDeviceSigningKey(subtle, data.ownedDevice), change);
     }),
-    acceptOwnedRoster: (trust: OwnedRosterTrust) => run(async () => {
+    acceptSpaceDeviceMembership: (trust: SpaceDeviceMembershipTrust) => run(async () => {
       const { record, data } = await unlocked();
       if (!data.trustedRoster || trust.genesisKey !== data.trustedRoster.genesisKey) {
         throw new Error("Trusted device list genesis does not match.");
@@ -405,14 +405,14 @@ export function createCredentialVault(options: {
       if (!target) throw new Error("Trusted device was not found.");
       if (target.state === "revoked") return data.trustedRoster;
       const signingKey = await openOwnedDeviceSigningKey(subtle, data.ownedDevice);
-      const rosterUpdate = await signOwnedRosterUpdate(subtle, signingKey, {
+      const membershipUpdate = await signSpaceMembershipUpdate(subtle, signingKey, {
         sequence: data.trustedRoster.updates.length + 1, previous: data.trustedRoster.knownHead,
         signer: data.ownedDevice.id,
         devices: verified.devices.map(device => device.id === deviceId ? { ...device, state: "revoked" as const } : device),
         recoveryKey: data.trustedRoster.updates[0].recoveryKey,
       });
-      const trust = { ...data.trustedRoster, knownHead: rosterUpdate.hash,
-        updates: [...data.trustedRoster.updates, rosterUpdate] };
+      const trust = { ...data.trustedRoster, knownHead: membershipUpdate.hash,
+        updates: [...data.trustedRoster.updates, membershipUpdate] };
       await save({ ...data, trustedRoster: trust }, key!, record);
       return trust;
     }),
@@ -440,7 +440,7 @@ export function createCredentialVault(options: {
       const devices: OwnedSpaceDevice[] = [...current.devices.map(device => ({ ...device,
         state: "revoked" as const })), { id: identity.id, syncthingId: identity.syncthingId,
         signingKey: identity.signingKey, state: "active" }];
-      const next = await signOwnedRosterUpdate(subtle, recoveryKey, {
+      const next = await signSpaceMembershipUpdate(subtle, recoveryKey, {
         sequence: data.trustedRoster.updates.length + 1, previous: data.trustedRoster.knownHead,
         signer: "recovery", recoveryKey: kit.publicKey, devices,
       });
@@ -461,8 +461,8 @@ export function createCredentialVault(options: {
       let secret: Uint8Array | undefined;
       try {
         await openOwnedDeviceSigningKey(subtle, identity);
-        const roster = await verifyTrust(transfer.trust);
-        const enrolled = roster.devices.find(device => device.id === identity.id);
+        const membership = await verifyTrust(transfer.trust);
+        const enrolled = membership.devices.find(device => device.id === identity.id);
         if (!enrolled || enrolled.syncthingId !== identity.syncthingId ||
           enrolled.signingKey !== identity.signingKey || enrolled.state !== "active") {
           throw new Error("Pairing transfer did not enroll this device.");

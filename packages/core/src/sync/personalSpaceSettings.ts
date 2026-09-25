@@ -2,7 +2,7 @@ import type { FavoriteRecord } from "../ui/browserClient.js";
 import type { FavoriteExclusion } from "../ui/favoriteSelection.js";
 import type { FolderRetentionPolicy } from "./folderRetention.js";
 import type { FolderShareTarget } from "./personalSpaceSharing.js";
-import { verifyOwnedRoster, type OwnedRosterTrust } from "./personalSpaceSharing.js";
+import { verifySpaceDeviceMembership, type SpaceDeviceMembershipTrust } from "./personalSpaceSharing.js";
 import { resolvePersonalSpaceChanges, verifyPersonalSpaceChange,
   type PersonalSpaceChange } from "./personalSpaceChanges.js";
 import { settingsInteger, settingsText } from "./settingsValidation.js";
@@ -36,7 +36,7 @@ const defaultSharedFolderSettings = (): SharedFolderSettings => ({
 
 export const defaultPersonalSpaceSettings = (rosterHead: string): PersonalSpaceSettings => ({
   format: 1,
-  rosterHead: settingsText(rosterHead, "shared settings roster head"),
+  rosterHead: settingsText(rosterHead, "shared settings membership head"),
   folders: {},
 });
 
@@ -111,7 +111,7 @@ export function normalizePersonalSpaceSettings(value: unknown): PersonalSpaceSet
     const id = settingsText(folderId, "shared settings folder identity");
     return [id, normalizeFolder(id, folder)];
   }));
-  return { format: 1, rosterHead: settingsText(settings.rosterHead, "shared settings roster head"), folders };
+  return { format: 1, rosterHead: settingsText(settings.rosterHead, "shared settings membership head"), folders };
 }
 
 const folderOrDefault = (settings: PersonalSpaceSettings, folderId: string) =>
@@ -145,15 +145,15 @@ const applySharedChange = (settings: PersonalSpaceSettings,
     folders: { ...settings.folders, [folderId]: updated } });
 };
 
-/** Materialize only recognized paths from a complete journal pinned to the verified owned roster. */
-export async function materializePersonalSpaceSettings(subtle: SubtleCrypto, trust: OwnedRosterTrust,
+/** Materialize only recognized paths from a complete journal pinned to the verified space device membership. */
+export async function materializePersonalSpaceSettings(subtle: SubtleCrypto, trust: SpaceDeviceMembershipTrust,
   changes: readonly PersonalSpaceChange[]): Promise<{
     settings: PersonalSpaceSettings | null;
     conflicts: ReturnType<typeof resolvePersonalSpaceChanges>["conflicts"];
   }> {
   if (!trust || trust.knownHead !== trust.updates?.at(-1)?.hash) throw new Error("Invalid trusted device list.");
-  const roster = await verifyOwnedRoster(subtle, trust.updates, trust.genesisKey, trust.knownHead);
-  const known = new Map(roster.devices.map(device => [device.id, device.signingKey]));
+  const membership = await verifySpaceDeviceMembership(subtle, trust.updates, trust.genesisKey, trust.knownHead);
+  const known = new Map(membership.devices.map(device => [device.id, device.signingKey]));
   const resolved = resolvePersonalSpaceChanges(changes);
   const baseline = defaultPersonalSpaceSettings(trust.knownHead);
   for (const change of changes) {

@@ -1,5 +1,5 @@
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, verifyOwnedRoster,
-  type OwnedRosterTrust, type OwnedSpaceDevice } from "./personalSpaceSharing.js";
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, verifySpaceDeviceMembership,
+  type SpaceDeviceMembershipTrust, type OwnedSpaceDevice } from "./personalSpaceSharing.js";
 
 export interface PairingInvitation {
   format: 1;
@@ -28,7 +28,7 @@ export interface PersonalSpacePairingTransfer {
   spaceId: string;
   settingsFolderId: string;
   rootKey: string;
-  trust: OwnedRosterTrust;
+  trust: SpaceDeviceMembershipTrust;
 }
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
@@ -109,7 +109,7 @@ export async function sealPairingTransfer(subtle: SubtleCrypto,
   if (!/^[a-f0-9]{32}$/.test(value.spaceId) || !/^[a-f0-9]{32}$/.test(value.settingsFolderId) ||
     !/^[a-f0-9]{64}$/.test(value.rootKey) || !value.trust ||
     value.trust.knownHead !== value.trust.updates.at(-1)?.hash) throw new Error("Invalid pairing transfer.");
-  await verifyOwnedRoster(subtle, value.trust.updates, value.trust.genesisKey, value.trust.knownHead);
+  await verifySpaceDeviceMembership(subtle, value.trust.updates, value.trust.genesisKey, value.trust.knownHead);
   const nonce = await randomBytes(12);
   if (nonce.length !== 12) throw new Error("Invalid pairing random source.");
   const key = await subtle.importKey("raw", session.key, "AES-GCM", false, ["encrypt"]);
@@ -134,7 +134,7 @@ export async function openPairingTransfer(subtle: SubtleCrypto,
     if (!opened.trust || opened.trust.knownHead !== opened.trust.updates?.at(-1)?.hash) {
       throw new Error("Invalid pairing transfer.");
     }
-    await verifyOwnedRoster(subtle, opened.trust.updates, opened.trust.genesisKey, opened.trust.knownHead);
+    await verifySpaceDeviceMembership(subtle, opened.trust.updates, opened.trust.genesisKey, opened.trust.knownHead);
     return opened;
   } catch { throw new Error("Pairing confirmation or encrypted transfer failed."); }
 }

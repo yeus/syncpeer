@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 import { createPairingInvitation } from "../packages/core/dist/sync/personalSpacePairing.js";
-import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signOwnedRosterUpdate } from
+import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 import { acceptPairingTransfer, joinPersonalSpace } from
   "../packages/core/dist/sync/personalSpacePairingTransport.js";
@@ -39,7 +39,7 @@ const socketPair = () => {
 
 const pairingTransfer = async () => {
   const owner = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "OWNER");
-  const genesis = await signOwnedRosterUpdate(crypto.subtle,
+  const genesis = await signSpaceMembershipUpdate(crypto.subtle,
     await openOwnedDeviceSigningKey(crypto.subtle, owner), { sequence: 1, previous: null, signer: owner.id,
       devices: [{ id: owner.id, syncthingId: owner.syncthingId, state: owner.state, signingKey: owner.signingKey }] });
   return { spaceId: "a".repeat(32), settingsFolderId: "b".repeat(32), rootKey: "c".repeat(64),

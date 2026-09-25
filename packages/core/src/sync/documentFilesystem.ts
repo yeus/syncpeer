@@ -29,7 +29,7 @@ import { loadCacheAccess, loadDirectorySnapshot, saveCacheAccess,
 import { createPersonalSpaceSettingsJournal } from "./personalSpaceSettingsJournal.js";
 import { materializePersonalSpaceSettings } from "./personalSpaceSettings.js";
 import { resolvePersonalSpaceChanges } from "./personalSpaceChanges.js";
-import { createPersonalSpaceRosterJournal } from "./personalSpaceRosterJournal.js";
+import { createSpaceMembershipJournal } from "./spaceMembershipJournal.js";
 import type { PersonalSpaceChange } from "./personalSpaceChanges.js";
 import { resolveFolderShareDevices, settingsFolderDevices,
   type OwnedDeviceIdentity, type OwnedSpaceDevice } from "./personalSpaceSharing.js";
@@ -178,19 +178,19 @@ const settingsStorageId = (folderId: string) =>
   [...sha256(new TextEncoder().encode(`syncpeer.personal-settings-storage.v1:${folderId}`)).slice(0, 16)]
     .map(byte => byte.toString(16).padStart(2, "0")).join("");
 
-const reconcileOwnedRoster = async (runtime: DocumentRuntime) => {
+const reconcileSpaceDeviceMembership = async (runtime: DocumentRuntime) => {
   if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
-  let local = await runtime.vault.ownedRoster();
+  let local = await runtime.vault.spaceDeviceMembership();
   if (!local) return null;
-  const journal = createPersonalSpaceRosterJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id);
+  const journal = createSpaceMembershipJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id);
   const remote = await journal.load();
   for (let index = 0; index < Math.min(remote.length, local.trust.updates.length); index++) {
     if (remote[index].hash !== local.trust.updates[index].hash) throw new Error("Trusted device list fork detected.");
   }
   if (remote.length > local.trust.updates.length) {
-    await runtime.vault.acceptOwnedRoster({ genesisKey: local.trust.genesisKey,
+    await runtime.vault.acceptSpaceDeviceMembership({ genesisKey: local.trust.genesisKey,
       knownHead: remote.at(-1)!.hash, updates: remote });
-    local = (await runtime.vault.ownedRoster())!;
+    local = (await runtime.vault.spaceDeviceMembership())!;
   } else if (remote.length < local.trust.updates.length) {
     await journal.appendMissing(local.trust.updates);
   }
@@ -218,7 +218,7 @@ const openPersonalSpaceFolder = async (runtime: DocumentRuntime): Promise<void> 
     runtime.settingsFolder = { id: descriptor.id, replica, close: async () => {
       try { await bytes!.close(); } finally { crypto.folderKey.fill(0); }
     } };
-    await reconcileOwnedRoster(runtime);
+    await reconcileSpaceDeviceMembership(runtime);
   } catch (error) {
     runtime.settingsFolder = undefined;
     crypto.folderKey.fill(0);
@@ -1065,16 +1065,16 @@ const createLifecycleActions = (runtime: DocumentRuntime) => ({
 });
 
 const sharedSettingsContext = async (runtime: DocumentRuntime, requireActive = false) => {
-  const roster = await reconcileOwnedRoster(runtime);
-  if (!roster || !runtime.settingsFolder) throw new Error("Trusted personal-space settings are unavailable.");
-  if (requireActive && (!roster.localDeviceId || !roster.devices.some(device =>
-    device.id === roster.localDeviceId && device.state === "active"))) {
+  const membership = await reconcileSpaceDeviceMembership(runtime);
+  if (!membership || !runtime.settingsFolder) throw new Error("Trusted personal-space settings are unavailable.");
+  if (requireActive && (!membership.localDeviceId || !membership.devices.some(device =>
+    device.id === membership.localDeviceId && device.state === "active"))) {
     throw new Error("An active enrolled device is required to change shared settings.");
   }
   const journal = createPersonalSpaceSettingsJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id);
   const changes = await journal.load();
-  const result = await materializePersonalSpaceSettings(crypto.subtle, roster.trust, changes);
-  return { roster, journal, changes, result };
+  const result = await materializePersonalSpaceSettings(crypto.subtle, membership.trust, changes);
+  return { membership, journal, changes, result };
 };
 
 const appendSharedEdit = async (runtime: DocumentRuntime,
@@ -1082,9 +1082,9 @@ const appendSharedEdit = async (runtime: DocumentRuntime,
   const random = await runtime.options.randomBytes(16);
   if (random.length !== 16) throw new Error("Invalid shared setting random source.");
   const draft: PersonalSpaceChange = { id: Array.from(random, byte => byte.toString(16).padStart(2, "0")).join(""),
-    deviceId: context.roster.localDeviceId!, ...change };
+    deviceId: context.membership.localDeviceId!, ...change };
   const edit = await runtime.vault.signPersonalSpaceChange(draft);
-  const next = await materializePersonalSpaceSettings(crypto.subtle, context.roster.trust,
+  const next = await materializePersonalSpaceSettings(crypto.subtle, context.membership.trust,
     [...context.changes, edit]);
   await context.journal.append(edit);
   return next;
@@ -1093,13 +1093,13 @@ const appendSharedEdit = async (runtime: DocumentRuntime,
 const effectiveProfileSettings = async (runtime: DocumentRuntime): Promise<SyncpeerProfileSettings> => {
   const base = await runtime.vault.profileSettings();
   if (!runtime.settingsFolder) return base;
-  if (!await runtime.vault.ownedRoster()) return base;
-  const { roster, result } = await sharedSettingsContext(runtime);
-  if (!roster.localDeviceId || !result.settings) return base;
+  if (!await runtime.vault.spaceDeviceMembership()) return base;
+  const { membership, result } = await sharedSettingsContext(runtime);
+  if (!membership.localDeviceId || !result.settings) return base;
   const ids = new Set([...Object.keys(base.folders), ...Object.keys(result.settings.folders)]);
   const folders = Object.fromEntries([...ids].map(id => {
     const local = base.folders[id] ?? defaultFolderSettings();
-    const selection = result.settings!.folders[id]?.devices[roster.localDeviceId!];
+    const selection = result.settings!.folders[id]?.devices[membership.localDeviceId!];
     return [id, { ...local, favorites: selection?.favorites ?? local.favorites,
       exclusions: selection?.exclusions ?? local.exclusions }];
   }));
@@ -1108,8 +1108,8 @@ const effectiveProfileSettings = async (runtime: DocumentRuntime): Promise<Syncp
 
 const saveEffectiveProfileSettings = async (runtime: DocumentRuntime, next: SyncpeerProfileSettings) => {
   const previous = await effectiveProfileSettings(runtime);
-  const roster = await reconcileOwnedRoster(runtime);
-  if (roster?.localDeviceId) {
+  const membership = await reconcileSpaceDeviceMembership(runtime);
+  if (membership?.localDeviceId) {
     for (const id of new Set([...Object.keys(previous.folders), ...Object.keys(next.folders)])) {
       const old = previous.folders[id] ?? defaultFolderSettings();
       const current = next.folders[id] ?? defaultFolderSettings();
@@ -1118,7 +1118,7 @@ const saveEffectiveProfileSettings = async (runtime: DocumentRuntime, next: Sync
       if (JSON.stringify(selection) === JSON.stringify(oldSelection)) continue;
       const context = await sharedSettingsContext(runtime, true);
       if (context.result.conflicts.length) throw new Error("Resolve shared-settings conflicts before changing favorites.");
-      const path = ["folders", id, "devices", roster.localDeviceId];
+      const path = ["folders", id, "devices", membership.localDeviceId];
       const prior = resolvePersonalSpaceChanges(context.changes).values.find(item =>
         JSON.stringify(item.path) === JSON.stringify(path));
       await appendSharedEdit(runtime, context, { path, parents: prior?.heads ?? [], value: selection });
@@ -1166,19 +1166,19 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   exportRecoveryBackup: (password: string) => runQueued(runtime, () => runtime.vault.exportRecoveryBackup(password)),
   exportPairingTransfer: (localSyncthingId: string, joiningDevice: OwnedSpaceDevice) => runQueued(runtime, async () => {
     const transfer = await runtime.vault.exportPairingTransfer(localSyncthingId, joiningDevice);
-    await reconcileOwnedRoster(runtime);
+    await reconcileSpaceDeviceMembership(runtime);
     return transfer;
   }),
   importPairingTransfer: (transfer: Parameters<Vault["importPairingTransfer"]>[0], identity: OwnedDeviceIdentity,
     password: string, remember = true) => runQueued(runtime, () => unlockAfterVaultChange(runtime,
       () => runtime.vault.importPairingTransfer(transfer, identity, password, remember))),
   ownedDevices: () => runQueued(runtime, async () => {
-    const roster = await reconcileOwnedRoster(runtime);
-    return { localDeviceId: roster?.localDeviceId ?? null, devices: roster?.devices ?? [] };
+    const membership = await reconcileSpaceDeviceMembership(runtime);
+    return { localDeviceId: membership?.localDeviceId ?? null, devices: membership?.devices ?? [] };
   }),
   revokeOwnedDevice: (deviceId: string) => runQueued(runtime, async () => {
     await runtime.vault.revokeOwnedDevice(deviceId);
-    await reconcileOwnedRoster(runtime);
+    await reconcileSpaceDeviceMembership(runtime);
   }),
   restoreRecoveryBackup: (backup: Parameters<Vault["restoreRecoveryBackup"]>[0], recoveryPassword: string, password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.restoreRecoveryBackup(backup, recoveryPassword, password))),
@@ -1188,9 +1188,9 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
     runQueued(runtime, () => rememberFolderAction(runtime, folder)),
   recoverOwnedDevice: (syncthingId: string, kit: Parameters<Vault["recoverOwnedDevice"]>[1], password: string) =>
     runQueued(runtime, async () => {
-      await reconcileOwnedRoster(runtime);
+      await reconcileSpaceDeviceMembership(runtime);
       const trust = await runtime.vault.recoverOwnedDevice(syncthingId, kit, password);
-      await reconcileOwnedRoster(runtime);
+      await reconcileSpaceDeviceMembership(runtime);
       return trust;
     }),
   createVault: (password: string, remember = false, localDeviceId?: string, recoveryKey?: string) => runQueued(runtime, async () => {
@@ -1221,14 +1221,14 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
     const context = await sharedSettingsContext(runtime);
     const settings = await effectiveProfileSettings(runtime);
     const shared = context.result.settings;
-    const owned = settingsFolderDevices(context.roster.devices)
+    const owned = settingsFolderDevices(context.membership.devices)
       .some(id => sameDeviceId(id, remoteDeviceId));
     const selected = new Set(Object.entries(settings.folders)
       .filter(([, folder]) => !folder.paused &&
         folder.favorites.some(favorite => favorite.kind === "folder" && favorite.path === ""))
       .filter(([folderId]) => shared && resolveFolderShareDevices(
         shared.folders[folderId]?.shareTargets ?? [{ kind: "personal-space" }],
-        context.roster.devices).some(id => sameDeviceId(id, remoteDeviceId)))
+        context.membership.devices).some(id => sameDeviceId(id, remoteDeviceId)))
       .map(([folderId]) => folderId));
     const documents = await Promise.all(registry.getState().filter(folder => folder.downloads && selected.has(folder.id))
       .map(async folder => {

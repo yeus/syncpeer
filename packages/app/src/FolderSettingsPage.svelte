@@ -138,11 +138,11 @@
       settings = await command<SyncpeerProfileSettings>({ operation: "profileSettings" });
       patternDrafts = Object.fromEntries(Object.entries(settings.folders)
         .map(([folderId, folder]) => [folderId, folder.ignorePatterns.join("\n")]));
-      const roster = await command<{ localDeviceId: string | null; devices: typeof trustedDevices }>
+      const membership = await command<{ localDeviceId: string | null; devices: typeof trustedDevices }>
         ({ operation: "ownedDevices" });
-      trustedDevices = roster.devices;
-      localTrustedDeviceId = roster.localDeviceId;
-      if (roster.devices.length) {
+      trustedDevices = membership.devices;
+      localTrustedDeviceId = membership.localDeviceId;
+      if (membership.devices.length) {
         const shared = await command<{ settings: PersonalSpaceSettings | null; conflicts: typeof sharedConflicts }>
           ({ operation: "sharedPersonalSpaceSettings" });
         sharedSettings = shared.settings; sharedConflicts = shared.conflicts;
@@ -332,7 +332,7 @@
     {#if !localTrustedDeviceId && trustedDevices.length}
       <section>
         <h2>Recover trusted device access</h2>
-        <p>This backup has no device identity key. Use the separate offline signing kit to enroll this device and revoke every device in the backup's trusted list. Use the latest backup; an older roster may conflict with later changes.</p>
+        <p>This backup has no device identity key. Use the separate offline signing kit to enroll this device and revoke every device in the backup's trusted list. Use the latest backup; an older copy of this space's device membership may conflict with later changes.</p>
         <label>Offline signing kit file <input type="file" accept="application/json,.json" onchange={event => { kitFile = event.currentTarget.files?.[0] ?? null; }} /></label>
         <label>Or paste encrypted kit <textarea rows="6" bind:value={kitText}></textarea></label>
         <label>Offline kit password <input type="password" bind:value={kitPassword} autocomplete="off" /></label>
@@ -353,7 +353,7 @@
     </section>
     {#if trustedDevices.length}
       <section>
-        <h2>Trusted devices</h2>
+        <h2>Devices with access to this space</h2>
         <p>Each device has its own permanent signing key. Removing a device blocks future trusted-list updates and synchronization after peers receive the revocation.</p>
         <ul>
           {#each trustedDevices as device (device.id)}

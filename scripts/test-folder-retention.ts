@@ -13,7 +13,7 @@ import {
   signRetentionReleaseProposal,
   verifyLocalReplicaManifest,
 } from "../packages/core/dist/sync/folderRetention.js";
-import { signOwnedRosterUpdate } from "../packages/core/dist/sync/personalSpaceSharing.js";
+import { signSpaceMembershipUpdate } from "../packages/core/dist/sync/personalSpaceSharing.js";
 
 const subtle = globalThis.crypto.subtle;
 
@@ -41,7 +41,7 @@ const identity = async () => {
 
 const signedRoster = async (signer: Awaited<ReturnType<typeof identity>>,
   devices: Record<string, Awaited<ReturnType<typeof identity>>>) => {
-  const update = await signOwnedRosterUpdate(subtle, signer.privateKey, {
+  const update = await signSpaceMembershipUpdate(subtle, signer.privateKey, {
     sequence: 1, previous: null, signer: "phone",
     devices: Object.entries(devices).map(([id, keys]) => ({ id, syncthingId: id,
       state: "active" as const, signingKey: keys.publicKey })),
@@ -56,12 +56,12 @@ const manifest = folderManifestDigest([
 ]);
 
 test("the default policy requires two explicitly selected complete copies", () => {
-  assert.deepEqual(defaultFolderRetentionPolicy("folder", "roster-1"), {
+  assert.deepEqual(defaultFolderRetentionPolicy("folder", "membership-1"), {
     format: 1,
     folderId: "folder",
     minimumCopies: 2,
     revision: 1,
-    rosterHead: "roster-1",
+    rosterHead: "membership-1",
     holders: [],
   });
 });
@@ -133,7 +133,7 @@ test("a complete local replica proof reads every block and rejects missing or ch
 test("only signed current completions count and Syncthing evidence must still be live", async () => {
   const phone = await identity();
   const observer = await identity();
-  const policy = { ...defaultFolderRetentionPolicy("folder", "roster-1"), holders: [
+  const policy = { ...defaultFolderRetentionPolicy("folder", "membership-1"), holders: [
     { id: "phone", kind: "syncpeer" as const },
     { id: "nas", kind: "syncthing" as const },
   ] };
@@ -159,7 +159,7 @@ test("only signed current completions count and Syncthing evidence must still be
 
 test("future-dated receipts and overlong Syncthing observations cannot satisfy retention", async () => {
   const phone = await identity();
-  const policy = { ...defaultFolderRetentionPolicy("folder", "roster-1"), minimumCopies: 1,
+  const policy = { ...defaultFolderRetentionPolicy("folder", "membership-1"), minimumCopies: 1,
     holders: [{ id: "phone", kind: "syncpeer" as const }, { id: "nas", kind: "syncthing" as const }] };
   const future = await signReplicaCompletion(subtle, phone.privateKey, {
     folderId: "folder", holderId: "phone", holderKind: "syncpeer", signerId: "phone",
@@ -239,11 +239,11 @@ test("release requires enough current online copies after the release", async ()
 test("dangerous release is local-only, explicit, and signed", async () => {
   const phone = await identity();
   await assert.rejects(createDangerousLocalRelease(subtle, phone.privateKey, {
-    folderId: "folder", localHolderId: "phone", policyRevision: 1, rosterHead: "roster-1",
+    folderId: "folder", localHolderId: "phone", policyRevision: 1, rosterHead: "membership-1",
     manifestDigest: manifest, confirmedText: "release", createdAtMs: 100,
   }), /type RELEASE LOCAL COPY/i);
   const override = await createDangerousLocalRelease(subtle, phone.privateKey, {
-    folderId: "folder", localHolderId: "phone", policyRevision: 1, rosterHead: "roster-1",
+    folderId: "folder", localHolderId: "phone", policyRevision: 1, rosterHead: "membership-1",
     manifestDigest: manifest, confirmedText: "RELEASE LOCAL COPY", createdAtMs: 100,
   });
   assert.equal(override.scope, "local-copy-only");

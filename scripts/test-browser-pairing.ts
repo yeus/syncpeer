@@ -57,13 +57,14 @@ test("a reused browser listener advertises current folders and adopts current co
   const adapter = createNodeHostAdapter();
   let port = 0;
   let listenCount = 0;
+  let outgoingAttempts = 0;
   const requestedPorts: number[] = [];
   let outgoing: SyncpeerSessionHandle | undefined;
   const [ownerIdentity, joiningIdentity] = (await Promise.all([
     identity(root, "one"), identity(root, "two"),
   ])).sort((a, b) => b.deviceId.replaceAll("-", "").localeCompare(a.deviceId.replaceAll("-", "")));
   const owner = createSyncpeerBrowserClient({ hostAdapter: { ...adapter,
-    connectTls: async () => { throw new Error("Synthetic outbound failure"); },
+    connectTls: async () => { outgoingAttempts++; throw new Error("Synthetic outbound failure"); },
     listenTls: async options => {
       listenCount++;
       requestedPorts.push(options.port);
@@ -86,6 +87,7 @@ test("a reused browser listener advertises current folders and adopts current co
       }));
     }
     assert.equal(listenCount, 1);
+    assert.equal(outgoingAttempts, 0, "The higher-ID peer should wait for its preferred incoming session.");
     assert.deepEqual(requestedPorts, [22999]);
     outgoing = await createSyncpeerCoreClient(adapter).openSession({ ...joiningIdentity,
       host: "127.0.0.1", port, expectedDeviceId: ownerIdentity.deviceId,

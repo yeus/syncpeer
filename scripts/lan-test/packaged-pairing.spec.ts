@@ -104,13 +104,15 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
   await peer.execute(() => {
     const observed = window as typeof window & { __syntheticFolderCounts?: number[];
       __syntheticEvents?: string[]; __syntheticFailures?: string[]; __syntheticIndexes?: string[];
-      __syntheticSelectionEvents?: number; __syntheticNativeCalls?: Record<string, number> };
+      __syntheticSelectionEvents?: number; __syntheticNativeCalls?: Record<string, number>;
+      __syntheticHandshakeStages?: string[] };
     observed.__syntheticFolderCounts = [];
     observed.__syntheticEvents = [];
     observed.__syntheticFailures = [];
     observed.__syntheticIndexes = [];
     observed.__syntheticSelectionEvents = 0;
     observed.__syntheticNativeCalls = {};
+    observed.__syntheticHandshakeStages = [];
     const summary = [...document.querySelectorAll("summary")]
       .find(value => value.textContent?.includes("View logs"));
     const list = summary?.parentElement?.querySelector("ul.list");
@@ -130,7 +132,19 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
         }
         if (event && /^(client\.|core\.)/.test(event) &&
           !observed.__syntheticEvents?.includes(event)) observed.__syntheticEvents?.push(event);
-        if (event === "core.upload.request.failed" || event === "core.replica.receive.failed") {
+        if (event?.startsWith("core.bep.handshake.") || event === "core.bep.cluster_config.wait") {
+          const details = node.querySelector("pre.log-details")?.textContent;
+          if (details) {
+            const stage = JSON.parse(details) as { direction?: string; connectedHost?: string;
+              connectedPort?: number };
+            const summary = `${event}:${stage.direction ?? "unknown"}:${stage.connectedHost ?? "?"}:${stage.connectedPort ?? "?"}`;
+            if (!observed.__syntheticHandshakeStages?.includes(summary)) {
+              observed.__syntheticHandshakeStages?.push(summary);
+            }
+          }
+        }
+        if (event === "core.upload.request.failed" || event === "core.replica.receive.failed" ||
+          event === "core.socket.closed" || event === "core.incoming.failed") {
           const details = entry.closest("li")?.querySelector("pre.log-details")?.textContent;
           if (details) {
             const message = (JSON.parse(details) as { message?: string }).message;
@@ -216,6 +230,9 @@ describe("Two isolated packaged desktop apps", () => {
     await Promise.all([owner, joiner].map(async peer => {
       await peer.$("[data-testid='tab-devices']").click();
       await peer.$("[data-testid='current-device-id']").waitForExist({ timeout: 60_000 });
+      await peer.waitUntil(async () => /^[A-Z2-7-]{40,}$/.test(
+        await peer.$("[data-testid='current-device-id']").getText()),
+      { timeout: 60_000, timeoutMsg: "The protected device identity did not finish loading." });
     }));
     const ownerId = await owner.$("[data-testid='current-device-id']").getText();
     const joinerId = await joiner.$("[data-testid='current-device-id']").getText();
@@ -362,6 +379,10 @@ describe("Two isolated packaged desktop apps", () => {
         error: await peer.$("p.error").getText().catch(() => "none"),
         events: await peer.execute(() => (window as typeof window & {
           __syntheticEvents?: string[] }).__syntheticEvents ?? []),
+        failures: await peer.execute(() => (window as typeof window & {
+          __syntheticFailures?: string[] }).__syntheticFailures ?? []),
+        handshake: await peer.execute(() => (window as typeof window & {
+          __syntheticHandshakeStages?: string[] }).__syntheticHandshakeStages ?? []),
         selections: await peer.execute(() => (window as typeof window & {
           __syntheticFolderCounts?: number[] }).__syntheticFolderCounts ?? []),
         selectionEvents: await peer.execute(() => (window as typeof window & {

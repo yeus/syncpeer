@@ -7,7 +7,7 @@ import path from "node:path";
 import { $, browser } from "@wdio/globals";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 
-const folderId = "syncpeer-crossapp-folder";
+const folderId = "syncpeer-crossapp-folder"; // synthetic disposable emulator fixture
 const password = "synthetic-crossapp-folder-password";
 
 function android(serial: string, args: string[], extra: NodeJS.ProcessEnv = {}) {

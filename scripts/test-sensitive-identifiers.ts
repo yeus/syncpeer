@@ -42,6 +42,18 @@ test("treats explicit test fixtures as informational findings", () => {
   );
 });
 
+test("treats explicitly named synthetic folder IDs as fixtures outside test-prefixed paths", () => {
+  const findings = scanText(
+    'const folderId = "syncpeer-crossapp-folder"; // synthetic fixture',
+    "scripts/lan-test/packaged-android-pairing.spec.ts",
+  );
+
+  assert.deepEqual(
+    findings.map(({ kind, severity }) => ({ kind, severity })),
+    [{ kind: "folder-id", severity: "info" }],
+  );
+});
+
 test("scans unquoted credentials in configuration files", () => {
   const findings = scanText("api_key: hardcoded-value\n", "settings.yaml");
 

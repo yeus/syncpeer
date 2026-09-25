@@ -654,8 +654,9 @@ export const createSyncpeerBrowserClient = (
         logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(folders));
         return { ...coreOptions, ...endpoint, expectedDeviceId: remote, sharedFolders: folders };
       },
-      onSession: (session: SyncpeerSessionHandle) => {
-        if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
+      onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
+        if (!sameDeviceId(connectedRemoteDeviceId, remoteDeviceId) ||
+          preferredPeerDirection(localDeviceId, connectedRemoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(connectOptions, session).then(adopted => {
           if (!adopted) return;
           activeResolvedConnectOptions = {
@@ -664,7 +665,7 @@ export const createSyncpeerBrowserClient = (
             port: coreOptions.port,
             cert: coreOptions.certPem,
             key: coreOptions.keyPem,
-            remoteId: remoteDeviceId,
+            remoteId: connectedRemoteDeviceId,
           };
           logClient(options.onLog, "client.session.incoming.ready", {
             transportKind: session.transportKind, connectionScope: session.connectionScope,
@@ -760,6 +761,23 @@ export const createSyncpeerBrowserClient = (
       coreAdapter.log?.("core.incoming.listen.failed", {
         message: error instanceof Error ? error.message : String(error),
       });
+    }
+    if (service && normalized.remoteId && preferredPeerDirection(
+      await deviceIdFromCertificate(coreAdapter, certificateDerFromPem(certPem)), normalized.remoteId,
+    ) === "incoming") {
+      const deadline = Date.now() + (coreOptions.timeoutMs ?? 15000);
+      while (!signal.aborted && Date.now() < deadline) {
+        const candidate = service.activeSessions().find(value =>
+          sameDeviceId(value.remoteDeviceId, normalized.remoteId!) && !value.session.isClosed());
+        if (candidate) return candidate.session;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (signal.aborted) {
+        const error = new Error("Connection attempt was cancelled.");
+        error.name = "AbortError";
+        throw error;
+      }
+      throw new Error(`Timed out waiting for the preferred incoming connection from ${normalized.remoteId}.`);
     }
     let session: SyncpeerSessionHandle;
     try {

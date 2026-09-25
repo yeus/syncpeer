@@ -2545,6 +2545,7 @@ async function openBepSessionOnSocketUncancelled(
   incoming = false,
 ): Promise<SyncpeerSessionHandle> {
   adapter.log?.("core.bep.handshake.start", {
+    direction: incoming ? "incoming" : "outgoing",
     connectedHost,
     connectedPort,
     expectedDeviceId: opts.expectedDeviceId,
@@ -2556,6 +2557,7 @@ async function openBepSessionOnSocketUncancelled(
   const remoteDeviceIdBytes = await adapter.sha256(peerCertDer);
   const remoteDeviceId = await deviceIdFromCertificate(adapter, peerCertDer);
   adapter.log?.("core.bep.handshake.peer_cert", {
+    direction: incoming ? "incoming" : "outgoing",
     connectedHost,
     connectedPort,
     localDeviceId: localDeviceIdEncoded,
@@ -2575,6 +2577,7 @@ async function openBepSessionOnSocketUncancelled(
   }
 
   adapter.log?.("core.bep.handshake.hello_send", {
+    direction: incoming ? "incoming" : "outgoing",
     connectedHost,
     connectedPort,
   });
@@ -2584,8 +2587,20 @@ async function openBepSessionOnSocketUncancelled(
     client_version: formatClientVersion(opts.clientVersion),
   });
   await socket.write(helloFrame);
+  adapter.log?.("core.bep.handshake.hello_sent", {
+    direction: incoming ? "incoming" : "outgoing",
+    connectedHost,
+    connectedPort,
+    bytes: helloFrame.length,
+  });
+  adapter.log?.("core.bep.handshake.hello_read.start", {
+    direction: incoming ? "incoming" : "outgoing",
+    connectedHost,
+    connectedPort,
+  });
   const { hello, leftover } = await readRemoteHello(socket);
   adapter.log?.("core.bep.handshake.hello_recv", {
+    direction: incoming ? "incoming" : "outgoing",
     connectedHost,
     connectedPort,
     remoteDeviceName: String(hello.device_name ?? "unknown"),
@@ -2614,12 +2629,14 @@ async function openBepSessionOnSocketUncancelled(
   await session.initialize(leftover);
   if (incoming) await session.advertiseSharedFolders();
   adapter.log?.("core.bep.cluster_config.wait", {
+    direction: incoming ? "incoming" : "outgoing",
     connectedHost,
     connectedPort,
   });
   await session.waitForReady();
   session.startReplicaSync(opts.replicaScanIntervalMs);
   adapter.log?.("core.bep.handshake.ready", {
+    direction: incoming ? "incoming" : "outgoing",
     connectedHost,
     connectedPort,
     remoteDeviceId,

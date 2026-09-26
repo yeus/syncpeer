@@ -1,330 +1,171 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="syncpeer"
-DEFAULT_SCOPE="android-release-signing"
-DEFAULT_KEYSTORE_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/syncpeer/android-release.jks"
-DEFAULT_KEY_ALIAS="syncpeer-release-key"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/android-signing-common.sh"
 
-usage() {
-  cat <<'USAGE'
-Usage:
-  scripts/sync-android-signing-secrets.sh [owner/repo]
-
-Wizard behavior:
-  - Loads Android signing values from Linux Secret Service.
-  - Missing values are auto-created with safe defaults (no free-text prompts).
-  - Ensures keystore exists locally (restores from Secret Service base64 or creates default).
-  - Secret Service is treated as source of truth and overwrites GitHub Actions secrets.
-
-GitHub secrets written:
-  ANDROID_KEYSTORE_BASE64
-  ANDROID_KEYSTORE_PASSWORD
-  ANDROID_KEY_ALIAS
-  ANDROID_KEY_PASSWORD
-
-Secret Service entries written:
-  android_keystore_path
-  android_keystore_base64
-  android_keystore_password
-  android_key_alias
-  android_key_password
-USAGE
-}
-
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
+  echo "Usage: scripts/sync-android-signing-secrets.sh owner/repo"
+  echo "Validates the existing Android signing identity and uploads it to GitHub."
+  echo "A new identity requires an empty Secret Service and typing CREATE."
   exit 0
 fi
 
-require_cmd() {
-  local cmd="$1"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Missing required command: $cmd" >&2
+syncpeer_require_keytool || exit 1
+for command in secret-tool gh base64; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing required command: $command" >&2
     exit 1
   fi
-}
+done
 
-require_cmd secret-tool
-require_cmd gh
-require_cmd git
-require_cmd base64
-require_cmd keytool
-
-secret_lookup() {
-  local key="$1"
-  secret-tool lookup app "$APP_NAME" scope "$DEFAULT_SCOPE" key "$key" 2>/dev/null || true
-}
+target_repo="${1:-}"
+if [[ ! "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "Pass the target GitHub repository as owner/repo." >&2
+  exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  echo "GitHub CLI is not authenticated." >&2
+  exit 1
+fi
+syncpeer_secret_service_ready || exit 1
 
 secret_store() {
   local key="$1"
-  local label="$2"
-  local value="$3"
-  printf '%s' "$value" | \
-    secret-tool store \
-      --label "$label" \
-      app "$APP_NAME" \
-      scope "$DEFAULT_SCOPE" \
-      key "$key" >/dev/null
+  local value="$2"
+  printf '%s' "$value" | secret-tool store \
+    --label "Syncpeer Android $key" \
+    app syncpeer scope android-release-signing key "$key" >/dev/null
 }
 
-decode_base64_to_file() {
+decode_backup() {
   local value="$1"
   local destination="$2"
+  if ! printf '%s' "$value" | base64 -d >"$destination" 2>/dev/null; then
+    echo "android_keystore_base64 is not valid base64; nothing was changed." >&2
+    return 1
+  fi
+  chmod 600 "$destination"
+}
 
-  if printf '%s' "$value" | base64 -d >"$destination" 2>/dev/null; then
+encode_keystore() {
+  if base64 -w 0 "$1" 2>/dev/null; then
     return 0
   fi
-  if printf '%s' "$value" | base64 --decode >"$destination" 2>/dev/null; then
-    return 0
-  fi
-  if printf '%s' "$value" | base64 -D >"$destination" 2>/dev/null; then
-    return 0
-  fi
-  return 1
-}
-
-encode_file_base64() {
-  local file_path="$1"
-  if encoded="$(base64 -w 0 "$file_path" 2>/dev/null)"; then
-    printf '%s' "$encoded"
-  else
-    base64 "$file_path" | tr -d '\n'
-  fi
-}
-
-expand_home_path() {
-  local path="$1"
-  local expanded="$path"
-  expanded="${expanded/#\~/$HOME}"
-  expanded="${expanded//\$\{HOME\}/$HOME}"
-  expanded="${expanded//\$HOME/$HOME}"
-  printf '%s' "$expanded"
-}
-
-require_non_empty_secret() {
-  local key="$1"
-  local value="$2"
-  if [[ -z "$value" ]]; then
-    echo "Missing required Secret Service entry after reconciliation: $key" >&2
-    exit 1
-  fi
-}
-
-prompt_yes_no() {
-  local prompt="$1"
-  local answer=""
-  while true; do
-    read -r -p "$prompt [Y/n]: " answer
-    case "${answer:-Y}" in
-      Y|y|yes|YES) return 0 ;;
-      N|n|no|NO) return 1 ;;
-      *) echo "Please answer y or n." >&2 ;;
-    esac
-  done
+  base64 "$1" | tr -d '\n'
 }
 
 generate_password() {
   head -c 48 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32
 }
 
-get_or_create_default_secret() {
-  local key="$1"
-  local label="$2"
-  local default_value="$3"
-
-  local value
-  value="$(secret_lookup "$key")"
-  if [[ -n "$value" ]]; then
-    printf '%s' "$value"
-    return 0
-  fi
-
-  secret_store "$key" "$label" "$default_value"
-  echo "Created Secret Service entry: $key" >&2
-  printf '%s' "$default_value"
-}
-
-get_or_create_generated_secret() {
-  local key="$1"
-  local label="$2"
-
-  local value
-  value="$(secret_lookup "$key")"
-  if [[ -n "$value" ]]; then
-    printf '%s' "$value"
-    return 0
-  fi
-
-  value="$(generate_password)"
-  secret_store "$key" "$label" "$value"
-  echo "Created Secret Service entry: $key" >&2
-  printf '%s' "$value"
-}
-
-ensure_default_keystore() {
-  local keystore_path="$1"
-  local key_alias="$2"
-  local store_password="$3"
-  local key_password="$4"
-
-  mkdir -p "$(dirname "$keystore_path")"
-
-  if [[ -f "$keystore_path" ]]; then
-    return 0
-  fi
-
-  keytool -genkeypair \
-    -keystore "$keystore_path" \
-    -storetype JKS \
-    -alias "$key_alias" \
-    -keyalg RSA \
-    -keysize 2048 \
-    -validity 10000 \
-    -storepass "$store_password" \
-    -keypass "$key_password" \
-    -dname "CN=Syncpeer, OU=Syncpeer, O=Syncpeer, L=Unknown, ST=Unknown, C=US" >/dev/null
-
-  echo "Created default keystore: $keystore_path"
-}
-
-keystore_has_alias() {
-  local keystore_path="$1"
-  local store_password="$2"
-  local key_alias="$3"
-  keytool -list -keystore "$keystore_path" -storepass "$store_password" -alias "$key_alias" >/dev/null 2>&1
-}
-
-infer_repo_from_git() {
-  local remote
-  remote="$(git remote get-url origin 2>/dev/null || true)"
-  if [[ -z "$remote" ]]; then
-    echo ""
-    return 0
-  fi
-
-  if [[ "$remote" =~ ^git@github.com:([^/]+)/([^/.]+)(\.git)?$ ]]; then
-    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-    return 0
-  fi
-
-  if [[ "$remote" =~ ^https://github.com/([^/]+)/([^/.]+)(\.git)?$ ]]; then
-    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-    return 0
-  fi
-
-  echo ""
-}
-
 upload_secret() {
-  local repo="$1"
-  local name="$2"
-  local value="$3"
-  gh secret set "$name" --repo "$repo" --body "$value"
-  echo "Uploaded GitHub secret: $name"
+  local name="$1"
+  local value="$2"
+  printf '%s' "$value" | gh secret set "$name" --repo "$target_repo"
 }
 
-TARGET_REPO="${1:-}"
-if [[ -z "$TARGET_REPO" ]]; then
-  TARGET_REPO="$(infer_repo_from_git)"
-fi
+default_path="${XDG_CONFIG_HOME:-$HOME/.config}/syncpeer/android-release.jks"
+stored_path="$(syncpeer_secret_lookup android_keystore_path)" || exit 1
+stored_backup="$(syncpeer_secret_lookup android_keystore_base64)" || exit 1
+store_password="$(syncpeer_secret_lookup android_keystore_password)" || exit 1
+key_alias="$(syncpeer_secret_lookup android_key_alias)" || exit 1
+key_password="$(syncpeer_secret_lookup android_key_password)" || exit 1
 
-if [[ -z "$TARGET_REPO" ]]; then
-  echo "Could not infer GitHub repo from git remote. Pass it explicitly, e.g. scripts/sync-android-signing-secrets.sh owner/repo" >&2
+keystore_path="${stored_path:-$default_path}"
+keystore_path="${keystore_path/#\~/$HOME}"
+keystore_path="${keystore_path//\$\{HOME\}/$HOME}"
+keystore_path="${keystore_path//\$HOME/$HOME}"
+if [[ "$keystore_path" != /* ]]; then
+  echo "Android keystore path must be absolute." >&2
   exit 1
 fi
 
-if ! gh auth status >/dev/null 2>&1; then
-  echo "GitHub CLI is not authenticated. Run: gh auth login" >&2
-  exit 1
-fi
+temp_keystore="$(mktemp "${TMPDIR:-/tmp}/syncpeer-signing-check.XXXXXX.jks")"
+cleanup() { rm -f -- "$temp_keystore"; }
+trap cleanup EXIT
 
-stored_keystore_path="$(get_or_create_default_secret \
-  "android_keystore_path" \
-  "Syncpeer Android keystore path" \
-  "$DEFAULT_KEYSTORE_PATH")"
-keystore_path="$(expand_home_path "$stored_keystore_path")"
-if [[ "$keystore_path" != "$stored_keystore_path" ]]; then
-  secret_store "android_keystore_path" "Syncpeer Android keystore path" "$keystore_path"
-  echo "Normalized Secret Service entry: android_keystore_path"
-fi
-
-key_alias="$(get_or_create_default_secret \
-  "android_key_alias" \
-  "Syncpeer Android key alias" \
-  "$DEFAULT_KEY_ALIAS")"
-
-keystore_password="$(get_or_create_generated_secret \
-  "android_keystore_password" \
-  "Syncpeer Android keystore password")"
-
-key_password="$(get_or_create_generated_secret \
-  "android_key_password" \
-  "Syncpeer Android key password")"
-
-keystore_b64_from_store="$(secret_lookup "android_keystore_base64")"
-
-printf 'Wizard summary:\n'
-printf '  Repo: %s\n' "$TARGET_REPO"
-printf '  Keystore path: %s\n' "$keystore_path"
-printf '  Key alias: %s\n' "$key_alias"
-printf '  Missing values were auto-created in Secret Service.\n'
-printf '  Secret Service is the source of truth and will overwrite GitHub secrets.\n'
-
-if ! prompt_yes_no "Proceed to reconcile local Secret Service + keystore and overwrite GitHub secrets?"; then
-  echo "Aborted by user."
-  exit 0
-fi
-
-if [[ ! -f "$keystore_path" ]]; then
-  mkdir -p "$(dirname "$keystore_path")"
-  if [[ -n "$keystore_b64_from_store" ]]; then
-    if decode_base64_to_file "$keystore_b64_from_store" "$keystore_path"; then
-      chmod 600 "$keystore_path"
-      echo "Restored keystore from Secret Service base64: $keystore_path"
-    else
-      echo "Stored 'android_keystore_base64' is not valid base64; cannot restore keystore." >&2
-      exit 1
-    fi
-  else
-    ensure_default_keystore "$keystore_path" "$key_alias" "$keystore_password" "$key_password"
+fresh=0
+if [[ -n "$stored_backup" ]]; then
+  decode_backup "$stored_backup" "$temp_keystore"
+  echo "Signing source: Secret Service android_keystore_base64."
+  if [[ -f "$keystore_path" ]] && ! cmp -s -- "$keystore_path" "$temp_keystore"; then
+    echo "Local keystore differs from the stored backup; leaving it unchanged." >&2
   fi
-fi
-
-if ! keystore_has_alias "$keystore_path" "$keystore_password" "$key_alias"; then
-  backup_path="${keystore_path}.bak.$(date +%s)"
-  if prompt_yes_no "Default keystore exists but alias '$key_alias' is missing. Recreate default keystore (backup -> $backup_path)?"; then
-    mv "$keystore_path" "$backup_path"
-    ensure_default_keystore "$keystore_path" "$key_alias" "$keystore_password" "$key_password"
-  else
-    echo "Aborted because keystore alias is missing." >&2
+elif [[ -f "$keystore_path" && ! -L "$keystore_path" ]]; then
+  install -m 600 "$keystore_path" "$temp_keystore"
+  echo "Signing source: existing local keystore."
+elif [[ -n "$stored_path$store_password$key_alias$key_password" || -e "$keystore_path" || -L "$keystore_path" || -e "$default_path" || -L "$default_path" ]]; then
+  echo "Incomplete existing Android signing identity; restore the original key and Secret Service values. No new key was created." >&2
+  exit 1
+else
+  echo "No SyncPeer signing identity was found. A new key cannot update APKs signed with an old key." >&2
+  printf 'Type CREATE to create a new identity and upload it to %s: ' "$target_repo" >&2
+  answer=""
+  if ! IFS= read -r answer || [[ "$answer" != CREATE ]]; then
+    echo "Cancelled without changes." >&2
     exit 1
   fi
+  fresh=1
+  store_password="$(generate_password)"
+  key_password="$(generate_password)"
+  key_alias="syncpeer-release-key"
+  rm -f -- "$temp_keystore"
+  umask 077
+  KEYTOOL_STORE_PASSWORD="$store_password" KEYTOOL_KEY_PASSWORD="$key_password" \
+    keytool -genkeypair -keystore "$temp_keystore" -storetype JKS \
+    -alias "$key_alias" -keyalg RSA -keysize 2048 -validity 10000 \
+    -storepass:env KEYTOOL_STORE_PASSWORD -keypass:env KEYTOOL_KEY_PASSWORD \
+    -dname "CN=Syncpeer, OU=Syncpeer, O=Syncpeer, L=Unknown, ST=Unknown, C=US" >/dev/null
 fi
-secret_store "android_keystore_path" "Syncpeer Android keystore path" "$keystore_path"
 
-if [[ ! -f "$keystore_path" ]]; then
-  echo "Keystore file does not exist: $keystore_path" >&2
+if [[ -z "$store_password" || -z "$key_alias" || -z "$key_password" ]]; then
+  echo "Existing keystore requires the original android_keystore_password, android_key_alias, and android_key_password entries." >&2
+  exit 1
+fi
+syncpeer_validate_keystore "$temp_keystore" "$store_password" "$key_alias" "$key_password"
+if [[ -n "$stored_backup" && -f "$keystore_path" ]] &&
+  ! cmp -s -- "$keystore_path" "$temp_keystore" &&
+  syncpeer_validate_keystore "$keystore_path" "$store_password" "$key_alias" "$key_password" >/dev/null 2>&1; then
+  echo "Two valid but byte-different Android signing keystores were found; refusing to choose an identity. Compare their signing certificates first." >&2
   exit 1
 fi
 
-keystore_b64="$(encode_file_base64 "$keystore_path")"
-secret_store "android_keystore_base64" "Syncpeer Android keystore base64" "$keystore_b64"
+if (( fresh == 0 )); then
+  printf 'Upload validated Android signing values to %s? Type YES to continue: ' "$target_repo" >&2
+  answer=""
+  if ! IFS= read -r answer || [[ "$answer" != YES ]]; then
+    echo "Cancelled without changes." >&2
+    exit 0
+  fi
+fi
 
-local_keystore_b64="$(secret_lookup "android_keystore_base64")"
-local_keystore_password="$(secret_lookup "android_keystore_password")"
-local_key_alias="$(secret_lookup "android_key_alias")"
-local_key_password="$(secret_lookup "android_key_password")"
+keystore_b64="$(encode_keystore "$temp_keystore")"
+if (( fresh == 1 )); then
+  mkdir -p -- "$(dirname -- "$keystore_path")"
+  staging_dir="$(mktemp -d "$(dirname -- "$keystore_path")/.syncpeer-signing.XXXXXX")"
+  install -m 600 "$temp_keystore" "$staging_dir/android-release.jks"
+  if ! ln -- "$staging_dir/android-release.jks" "$keystore_path"; then
+    rm -f -- "$staging_dir/android-release.jks"
+    rmdir -- "$staging_dir"
+    echo "Keystore appeared at the destination; refusing to replace it." >&2
+    exit 1
+  fi
+  rm -f -- "$staging_dir/android-release.jks"
+  rmdir -- "$staging_dir"
+  secret_store android_keystore_password "$store_password"
+  secret_store android_key_alias "$key_alias"
+  secret_store android_key_password "$key_password"
+fi
+if [[ -z "$stored_path" ]]; then
+  secret_store android_keystore_path "$keystore_path"
+fi
+if [[ -z "$stored_backup" || "$stored_backup" != "$keystore_b64" ]]; then
+  secret_store android_keystore_base64 "$keystore_b64"
+fi
 
-require_non_empty_secret "android_keystore_base64" "$local_keystore_b64"
-require_non_empty_secret "android_keystore_password" "$local_keystore_password"
-require_non_empty_secret "android_key_alias" "$local_key_alias"
-require_non_empty_secret "android_key_password" "$local_key_password"
-
-upload_secret "$TARGET_REPO" "ANDROID_KEYSTORE_BASE64" "$local_keystore_b64"
-upload_secret "$TARGET_REPO" "ANDROID_KEYSTORE_PASSWORD" "$local_keystore_password"
-upload_secret "$TARGET_REPO" "ANDROID_KEY_ALIAS" "$local_key_alias"
-upload_secret "$TARGET_REPO" "ANDROID_KEY_PASSWORD" "$local_key_password"
-
-echo
-printf 'Done. Uploaded Android release signing secrets to %s\n' "$TARGET_REPO"
+upload_secret ANDROID_KEYSTORE_BASE64 "$keystore_b64"
+upload_secret ANDROID_KEYSTORE_PASSWORD "$store_password"
+upload_secret ANDROID_KEY_ALIAS "$key_alias"
+upload_secret ANDROID_KEY_PASSWORD "$key_password"
+printf 'Validated Android signing identity uploaded to %s.\n' "$target_repo"

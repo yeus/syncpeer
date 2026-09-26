@@ -195,6 +195,26 @@ GitHub Actions:
 npm run sync:android:secrets -- yeus/syncpeer
 ```
 
+The sync command checks that Secret Service is unlocked, validates the stored
+keystore backup (or a local keystore if no backup exists), and asks for explicit
+confirmation before changing Secret Service or GitHub secrets. It never
+recreates an existing signing identity after a password or alias mismatch. If
+both the local file and stored backup validate but differ in bytes, it stops
+until you identify which signing certificate was used for published APKs.
+Only when no signing entries or local keystore exist can you type `CREATE` to
+make a new identity. A new key cannot update APKs signed with the old one.
+The release build signs from a temporary keystore copy, checks both passwords
+and the private-key alias before Gradle, and does not modify the local key or
+Secret Service. A missing absolute path from an old computer is not rewritten
+to a same-named file on the new computer; use the stored backup or explicitly
+configure the correct path. You can run the synthetic signing checks with
+`node scripts/test-android-signing.mjs`.
+
+Run the release build from SyncPeer's own `nix develop` shell, which includes
+JDK 17 `keytool`. The build and secret-sync commands check for `keytool`
+before accessing signing secrets; a missing tool is reported as a shell setup
+error rather than as a keystore password failure.
+
 ## Development Run Targets
 
 Run desktop app in dev mode:

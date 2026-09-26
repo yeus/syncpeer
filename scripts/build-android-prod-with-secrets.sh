@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="syncpeer"
-SECRET_SCOPE="android-release-signing"
-
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-
-secret_lookup() {
-  local key="$1"
-  secret-tool lookup app "$APP_NAME" scope "$SECRET_SCOPE" key "$key" 2>/dev/null || true
-}
+source "$script_dir/android-signing-common.sh"
+syncpeer_require_keytool || exit 1
 
 load_from_secret_store_if_missing() {
   local env_name="$1"
@@ -21,7 +15,7 @@ load_from_secret_store_if_missing() {
   fi
 
   local value
-  value="$(secret_lookup "$secret_key")"
+  value="$(syncpeer_secret_lookup "$secret_key")" || return 1
   if [[ -n "$value" ]]; then
     export "$env_name=$value"
   fi
@@ -44,8 +38,13 @@ decode_base64_to_file() {
 }
 
 temp_keystore_path=""
+temp_gradle_backup=""
 temp_keystore_properties_paths=()
 cleanup_temp_keystore() {
+  if [[ -n "$temp_gradle_backup" && -f "$temp_gradle_backup" ]]; then
+    cp -- "$temp_gradle_backup" "$repo_root/packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts"
+    rm -f -- "$temp_gradle_backup"
+  fi
   if [[ -n "$temp_keystore_path" && -f "$temp_keystore_path" ]]; then
     rm -f "$temp_keystore_path"
   fi
@@ -66,7 +65,6 @@ materialize_keystore_from_base64() {
     exit 1
   fi
   chmod 600 "$temp_keystore_path"
-  echo "$temp_keystore_path"
 }
 
 copy_keystore_to_temp() {
@@ -75,7 +73,6 @@ copy_keystore_to_temp() {
   temp_keystore_path="$(mktemp "$temp_dir/syncpeer-android-release.XXXXXX.jks")"
   cp "$source_path" "$temp_keystore_path"
   chmod 600 "$temp_keystore_path"
-  echo "$temp_keystore_path"
 }
 
 normalize_keystore_path() {
@@ -86,22 +83,6 @@ normalize_keystore_path() {
   normalized="${normalized//\$\{HOME\}/$HOME}"
   normalized="${normalized//\$HOME/$HOME}"
 
-  if [[ "$normalized" =~ ^/home/[^/]+(/.*)$ ]]; then
-    local rewritten="$HOME${BASH_REMATCH[1]}"
-    if [[ -f "$rewritten" ]]; then
-      echo "$rewritten"
-      return 0
-    fi
-  fi
-
-  if [[ "$normalized" =~ ^/Users/[^/]+(/.*)$ ]]; then
-    local rewritten="$HOME${BASH_REMATCH[1]}"
-    if [[ -f "$rewritten" ]]; then
-      echo "$rewritten"
-      return 0
-    fi
-  fi
-
   echo "$normalized"
 }
 
@@ -109,7 +90,7 @@ create_gradle_keystore_properties() {
   local destination="$1"
   mkdir -p "$(dirname "$destination")"
   umask 077
-  cat >"$destination" <<EOF
+  ( set -C; cat >"$destination" ) <<EOF
 storeFile=$ANDROID_KEYSTORE_PATH
 password=$ANDROID_KEYSTORE_PASSWORD
 storePassword=$ANDROID_KEYSTORE_PASSWORD
@@ -124,6 +105,13 @@ ensure_gradle_release_signing_config() {
 
   if grep -q "syncpeer-release-signing" "$gradle_file"; then
     return 0
+  fi
+
+  temp_gradle_backup="$(mktemp "${TMPDIR:-/tmp}/syncpeer-android-gradle.XXXXXX.kts")"
+  if ! cp -- "$gradle_file" "$temp_gradle_backup"; then
+    rm -f -- "$temp_gradle_backup"
+    temp_gradle_backup=""
+    return 1
   fi
 
   cat >>"$gradle_file" <<'EOF'
@@ -338,8 +326,8 @@ sign_unsigned_release_apk_if_needed() {
     cp "$unsigned_apk" "$signed_apk"
     "$jarsigner_bin" \
       -keystore "$ANDROID_KEYSTORE_PATH" \
-      -storepass "$ANDROID_KEYSTORE_PASSWORD" \
-      -keypass "$ANDROID_KEY_PASSWORD" \
+      -storepass:env ANDROID_KEYSTORE_PASSWORD \
+      -keypass:env ANDROID_KEY_PASSWORD \
       "$signed_apk" \
       "$ANDROID_KEY_ALIAS"
     "$jarsigner_bin" -verify "$signed_apk"
@@ -385,20 +373,14 @@ fi
 [[ -n "${ANDROID_KEY_ALIAS:-}" ]] || needs_lookup=1
 [[ -n "${ANDROID_KEY_PASSWORD:-}" ]] || needs_lookup=1
 
-if (( needs_lookup == 1 )) && ! command -v secret-tool >/dev/null 2>&1; then
-  echo "Warning: Linux Secret Service tooling is unavailable (missing 'secret-tool')." >&2
-  echo "Cancelling Android production build before Gradle/Tauri starts." >&2
-  echo "This build requires signing secrets from Secret Service or pre-exported ANDROID_* variables." >&2
-  echo "If you usually store secrets in Secret Service, run this outside the sandbox:" >&2
-  echo "  scripts/sync-android-signing-secrets.sh <owner/repo>" >&2
-  exit 1
+if (( needs_lookup == 1 )); then
+  syncpeer_secret_service_ready || exit 1
+  load_from_secret_store_if_missing "ANDROID_KEYSTORE_BASE64" "android_keystore_base64"
+  load_from_secret_store_if_missing "ANDROID_KEYSTORE_PATH" "android_keystore_path"
+  load_from_secret_store_if_missing "ANDROID_KEYSTORE_PASSWORD" "android_keystore_password"
+  load_from_secret_store_if_missing "ANDROID_KEY_ALIAS" "android_key_alias"
+  load_from_secret_store_if_missing "ANDROID_KEY_PASSWORD" "android_key_password"
 fi
-
-load_from_secret_store_if_missing "ANDROID_KEYSTORE_PATH" "android_keystore_path"
-load_from_secret_store_if_missing "ANDROID_KEYSTORE_BASE64" "android_keystore_base64"
-load_from_secret_store_if_missing "ANDROID_KEYSTORE_PASSWORD" "android_keystore_password"
-load_from_secret_store_if_missing "ANDROID_KEY_ALIAS" "android_key_alias"
-load_from_secret_store_if_missing "ANDROID_KEY_PASSWORD" "android_key_password"
 
 missing=()
 if [[ -z "${ANDROID_KEYSTORE_PATH:-}" && -z "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
@@ -413,9 +395,12 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
+local_keystore_path=""
 if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
-  export ANDROID_KEYSTORE_PATH
-  ANDROID_KEYSTORE_PATH="$(materialize_keystore_from_base64 "$ANDROID_KEYSTORE_BASE64")"
+  local_keystore_path="$(normalize_keystore_path \
+    "${ANDROID_KEYSTORE_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/syncpeer/android-release.jks}")"
+  materialize_keystore_from_base64 "$ANDROID_KEYSTORE_BASE64"
+  export ANDROID_KEYSTORE_PATH="$temp_keystore_path"
   echo "Prepared temp keystore file from ANDROID_KEYSTORE_BASE64."
 else
   resolved_keystore_path="$(normalize_keystore_path "$ANDROID_KEYSTORE_PATH")"
@@ -437,18 +422,35 @@ else
     exit 1
   fi
 
-  export ANDROID_KEYSTORE_PATH
-  ANDROID_KEYSTORE_PATH="$(copy_keystore_to_temp "$ANDROID_KEYSTORE_PATH")"
+  copy_keystore_to_temp "$ANDROID_KEYSTORE_PATH"
+  export ANDROID_KEYSTORE_PATH="$temp_keystore_path"
   echo "Prepared temp keystore file from ANDROID_KEYSTORE_PATH."
 fi
 
+syncpeer_validate_keystore "$ANDROID_KEYSTORE_PATH" "$ANDROID_KEYSTORE_PASSWORD" \
+  "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD"
+if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -f "$local_keystore_path" ]] &&
+  ! cmp -s -- "$local_keystore_path" "$ANDROID_KEYSTORE_PATH" &&
+  syncpeer_validate_keystore "$local_keystore_path" "$ANDROID_KEYSTORE_PASSWORD" \
+    "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" >/dev/null 2>&1; then
+  echo "Two valid but byte-different Android signing keystores were found; refusing to choose an identity. Compare their signing certificates first." >&2
+  exit 1
+fi
+
 cd "$repo_root"
-temp_keystore_properties_paths=(
+properties_candidates=(
   "$repo_root/packages/tauri-shell/src-tauri/gen/android/keystore.properties"
   "$repo_root/packages/tauri-shell/src-tauri/gen/android/app/keystore.properties"
 )
-for path in "${temp_keystore_properties_paths[@]}"; do
+for path in "${properties_candidates[@]}"; do
+  if [[ -e "$path" || -L "$path" ]]; then
+    echo "Android keystore.properties already exists; refusing to overwrite it: $path" >&2
+    exit 1
+  fi
+done
+for path in "${properties_candidates[@]}"; do
   create_gradle_keystore_properties "$path"
+  temp_keystore_properties_paths+=("$path")
 done
 echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
 ensure_gradle_release_signing_config

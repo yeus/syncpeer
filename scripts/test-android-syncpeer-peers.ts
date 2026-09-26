@@ -2,7 +2,8 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { androidPeerTargets, androidPeerCdpPort } from "./android-peer-targets.ts";
+import { androidPeerTargets, androidPeerCdpPort, androidSingleListeningPort,
+  androidAppListeningOnPort } from "./android-peer-targets.ts";
 
 const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
@@ -101,12 +102,20 @@ const connectBoth = async (
     ? [first, second]
     : [second, first];
   const accepting = connect(acceptor);
-  await new Promise(resolve => setTimeout(resolve, 3_000));
-  const dialing = connect(dialer);
-  try { await Promise.all([accepting.completed, dialing.completed]); }
+  let dialing: ReturnType<typeof connect> | undefined;
+  try {
+    const appUid = Number(adb(acceptor.serial, ["shell", "run-as", appPackage, "id", "-u"]).trim());
+    const deadline = Date.now() + 120_000;
+    while (!androidAppListeningOnPort(adb(acceptor.serial, ["shell", "cat", "/proc/net/tcp"]), appUid, 22000)) {
+      if (Date.now() >= deadline) throw new Error("Android accepting peer did not open its direct-sync listener.");
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    dialing = connect(dialer);
+    await Promise.all([accepting.completed, dialing.completed]);
+  }
   catch (error) {
     accepting.child.kill("SIGTERM");
-    dialing.child.kill("SIGTERM");
+    dialing?.child.kill("SIGTERM");
     throw error;
   }
 };
@@ -140,10 +149,16 @@ const main = async () => {
       try { adb(serial, ["uninstall", editorPackage], true); } catch { /* Fresh install is best-effort. */ }
       adb(serial, ["install", "-r", appApk], true);
       adb(serial, ["install", "-r", editorApk], true);
+      // Some emulator images reject uninstall while preserving the package's
+      // private data. Clearing both installed test packages is mandatory here.
+      for (const packageName of [appPackage, editorPackage]) {
+        if (adb(serial, ["shell", "pm", "clear", packageName]).trim() !== "Success") {
+          throw new Error("The disposable emulator did not clear the installed test app.");
+        }
+      }
       try { adb(serial, ["emu", "redir", "del", "tcp:23000"], true); } catch { /* No stale redirect. */ }
       try { adb(serial, ["emu", "redir", "del", "tcp:23001"], true); } catch { /* No stale redirect. */ }
     }
-    adb(firstSerial, ["emu", "redir", "add", "tcp:23000:22000"], true);
     adb(secondSerial, ["emu", "redir", "add", "tcp:23001:22000"], true);
 
     const owner = spawnPhase(firstSerial,
@@ -151,8 +166,14 @@ const main = async () => {
         SYNCPEER_PAIRING_ADVERTISED_HOST: "10.0.2.2:23000",
       });
     await waitForFile(invitation);
+    const appUid = Number(adb(firstSerial, ["shell", "run-as", appPackage, "id", "-u"]).trim());
+    const pairingPort = androidSingleListeningPort(
+      adb(firstSerial, ["shell", "cat", "/proc/net/tcp"]), appUid);
+    adb(firstSerial, ["emu", "redir", "add", `tcp:23000:${pairingPort}`], true);
     runPhase(secondSerial, ["--pairing-join", "--pairing-invitation", invitation]);
     await owner.completed;
+    adb(firstSerial, ["emu", "redir", "del", "tcp:23000"], true);
+    adb(firstSerial, ["emu", "redir", "add", "tcp:23000:22000"], true);
 
     const firstId = readDeviceId(firstSerial, directory);
     const secondId = readDeviceId(secondSerial, directory);
@@ -168,6 +189,8 @@ const main = async () => {
     runPhase(secondSerial, ["--grant-whole-folder-editor"], {
       SYNCPEER_DEV_SERVER_DEVICE_ID: firstId,
     });
+    runPhase(firstSerial, ["--verify-offline-editor"]);
+    runPhase(secondSerial, ["--verify-offline-editor"]);
     const first = { serial: firstSerial, localId: firstId, remoteId: secondId, port: "23001" };
     const second = { serial: secondSerial, localId: secondId, remoteId: firstId, port: "23000" };
 

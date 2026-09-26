@@ -7,6 +7,36 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class PrivateStorageFormatTest {
+  @Test fun ignoresOtherOwnersInAndroidNoBackupDirectory() {
+    val androidRoot = Files.createTempDirectory("syncpeer-android-no-backup").toFile()
+    try {
+      val webViewFile = androidRoot.resolve(".webview/BrowserMetrics-spare.pma")
+      assertTrue(webViewFile.parentFile.mkdirs())
+      webViewFile.writeText("synthetic WebView data")
+      val root = prepareSyncpeerPrivateStorageRoot(androidRoot)
+      assertEquals(androidRoot.resolve("syncpeer"), root)
+      assertTrue(root.resolve(PRIVATE_STORAGE_FORMAT_FILE).isFile)
+      assertEquals("synthetic WebView data", webViewFile.readText())
+      assertEquals(root, prepareSyncpeerPrivateStorageRoot(androidRoot))
+    } finally { androidRoot.deleteRecursively() }
+  }
+
+  @Test fun preservesPreviousSyncpeerRootUntilConfirmedReset() {
+    val androidRoot = Files.createTempDirectory("syncpeer-android-no-backup").toFile()
+    try {
+      val oldMarker = androidRoot.resolve(PRIVATE_STORAGE_FORMAT_FILE)
+      oldMarker.writeText("{\"owner\":\"syncpeer\",\"version\":1}")
+      try {
+        prepareSyncpeerPrivateStorageRoot(androidRoot)
+        fail("Previous Syncpeer data must not silently acquire a new identity")
+      } catch (error: IllegalStateException) {
+        assertTrue(error.message.orEmpty().startsWith(PRIVATE_STORAGE_UNRECOGNIZED))
+      }
+      assertTrue(oldMarker.isFile)
+      assertTrue(!androidRoot.resolve("syncpeer").exists())
+    } finally { androidRoot.deleteRecursively() }
+  }
+
   @Test fun marksAnEmptyRootAndAcceptsItAgain() {
     val root = Files.createTempDirectory("syncpeer-private-storage").toFile()
     try {

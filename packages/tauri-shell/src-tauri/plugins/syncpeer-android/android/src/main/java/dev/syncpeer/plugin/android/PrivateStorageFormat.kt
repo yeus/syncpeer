@@ -4,6 +4,7 @@ import java.io.File
 
 internal const val PRIVATE_STORAGE_FORMAT_FILE = ".syncpeer-storage-format.json"
 internal const val PRIVATE_STORAGE_UNRECOGNIZED = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED"
+private const val privateStorageDirectory = "syncpeer"
 private const val privateStorageFormatVersion = 1
 private val currentMarker = Regex(
   """\s*\{\s*"owner"\s*:\s*"syncpeer"\s*,\s*"version"\s*:\s*$privateStorageFormatVersion\s*\}\s*""",
@@ -46,6 +47,18 @@ internal fun preparePrivateStorageRoot(root: File): File {
     if (temporary.exists()) temporary.delete()
   }
   return root
+}
+
+internal fun syncpeerPrivateStorageRoot(androidNoBackupRoot: File): File =
+  androidNoBackupRoot.resolve(privateStorageDirectory)
+
+internal fun prepareSyncpeerPrivateStorageRoot(androidNoBackupRoot: File): File {
+  val oldFiles = androidNoBackupRoot.listFiles() ?: error("Private storage could not be inspected")
+  if (oldFiles.any { it.name == PRIVATE_STORAGE_FORMAT_FILE || it.name == "documents" ||
+      it.name == "metadata" || it.name.startsWith("syncpeer.vault.") }) {
+    unrecognizedPrivateStorage("older Syncpeer data requires a confirmed local reset")
+  }
+  return preparePrivateStorageRoot(syncpeerPrivateStorageRoot(androidNoBackupRoot))
 }
 
 internal fun privateStorageFailureMessage(error: Throwable): String? {

@@ -567,8 +567,18 @@ const hierarchyResourceBounds = (xml, resourceId) => {
 
 const tapDocumentUiText = async (text, timeout = 30_000) => {
   const deadline = Date.now() + timeout;
+  let systemUiRecovered = false;
   while (Date.now() < deadline) {
     const xml = await captureUiHierarchy("/sdcard/syncpeer-editor-picker.xml");
+    const waitButton = xml.includes("System UI isn't responding")
+      ? hierarchyTextBounds(xml, "Wait") : null;
+    if (waitButton) {
+      if (!systemUiRecovered) console.warn("Android emulator System UI stalled; waiting for picker recovery.");
+      systemUiRecovered = true;
+      runAdb(["shell", "input", "tap", String(waitButton.x), String(waitButton.y)]);
+      await wait(1_000);
+      continue;
+    }
     const bounds = hierarchyTextBounds(xml, text);
     if (bounds) {
       runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
@@ -596,7 +606,7 @@ const tapDocumentUiResource = async (resourceId, timeout = 30_000) => {
 const grantEditorFolder = async () => {
   runAdb(["shell", "am", "force-stop", editorPackage]);
   runAdb(["shell", "am", "start", "-n", `${editorPackage}/.GrantActivity`]);
-  await tapDocumentUiText(targetFolderTitle);
+  await tapDocumentUiText(targetFolderTitle, 60_000);
   await tapDocumentUiResource("android:id/button1");
   try {
     await waitForEditorGrant(1_500);
@@ -621,7 +631,7 @@ const editorCommand = (method, name = "", extras = {}) => {
   return result;
 };
 
-const waitForEditorGrant = async (timeout = 10_000) => {
+const waitForEditorGrant = async (timeout = 30_000) => {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     try {
@@ -1182,6 +1192,45 @@ const grantNotificationPermission = () => {
 
 const setAirplaneMode = (enabled) => {
   runAdb(["shell", "cmd", "connectivity", "airplane-mode", enabled ? "enable" : "disable"]);
+};
+
+const verifyOfflineEditorAfterColdStart = () => {
+  const existing = "synthetic-offline-existing.txt";
+  const created = "synthetic-offline-created.txt";
+  let airplaneMode = false;
+  try {
+    for (const name of [existing, created]) {
+      if (editorCommand("stat", name) === "true") editorCommand("delete", name);
+    }
+    editorCommand("create", existing);
+    editorCommand("write", existing, { content: "available-before-disconnect" });
+    setAirplaneMode(true);
+    airplaneMode = true;
+    runAdb(["shell", "am", "force-stop", packageName]);
+    runAdb(["shell", "am", "force-stop", editorPackage]);
+    if (!editorCommand("status")) throw new Error("Offline editor lost its SAF grant.");
+    if (editorCommand("read", existing) !== "available-before-disconnect") {
+      throw new Error("Cold-started DocumentsProvider could not read an existing file offline.");
+    }
+    editorCommand("write", existing, { content: "offline-modified" });
+    if (editorCommand("read", existing) !== "offline-modified") {
+      throw new Error("Cold-started DocumentsProvider could not modify an offline file.");
+    }
+    editorCommand("create", created);
+    editorCommand("write", created, { content: "offline-created" });
+    if (editorCommand("read", created) !== "offline-created") {
+      throw new Error("Cold-started DocumentsProvider could not read a new offline file.");
+    }
+    editorCommand("delete", created);
+    if (editorCommand("stat", created) !== "false") throw new Error("Offline editor could not delete its test file.");
+  } finally {
+    if (airplaneMode) setAirplaneMode(false);
+    for (const name of [existing, created]) {
+      try { if (editorCommand("stat", name) === "true") editorCommand("delete", name); }
+      catch { /* The test error above remains the primary failure. */ }
+    }
+  }
+  console.log("Cold-started DocumentsProvider passed separate-APK offline create, read, edit and delete.");
 };
 
 const setDeviceIdle = (enabled) => {
@@ -2215,6 +2264,10 @@ const main = async () => {
     await grantEditorFolder();
     await waitForEditorGrant();
     console.log("Separate Android editor APK received the whole-folder SAF grant.");
+    return;
+  }
+  if (hasArgument("--verify-offline-editor")) {
+    verifyOfflineEditorAfterColdStart();
     return;
   }
   if (hasArgument("--edit-whole-folder")) {

@@ -551,7 +551,9 @@ class DocumentRuntimeService : Service() {
         opening.addListener({ runCatching { opening.get().close() } }, { it.run() })
         throw error
       }
-      when (selectDocumentRuntime(true, requiredFeatures, sandbox::isFeatureSupported)) {
+      val featuresAvailable = requiredFeatures.all(sandbox::isFeatureSupported)
+      val webCryptoAvailable = featuresAvailable && sandboxSupportsWebCrypto(sandbox)
+      when (selectDocumentRuntime(true, requiredFeatures, webCryptoAvailable, sandbox::isFeatureSupported)) {
         DocumentRuntimeKind.SANDBOX -> SandboxDocumentRuntimeHost.create(
           sandbox, code, storageWorker, networkWorker,
           ::executeStorageRequest, ::executeNetworkRequest, terminated,
@@ -583,7 +585,14 @@ class DocumentRuntimeService : Service() {
     val request = JSONObject(raw)
     val reply = JSONObject().put("id", request.getLong("id"))
     try { reply.put("result", checkNotNull(storage).execute(request) ?: JSONObject.NULL) }
-    catch (_: Exception) { reply.put("error", "Document storage operation failed.") }
+    catch (error: Exception) {
+      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        Log.w("SyncpeerRuntime", "storage ${request.optString("method")} failed: " +
+          generateSequence(error as Throwable?) { it.cause }.take(4)
+            .joinToString(">") { it.javaClass.simpleName })
+      }
+      reply.put("error", "Document storage operation failed.")
+    }
     return reply.toString()
   }
 

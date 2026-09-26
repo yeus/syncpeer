@@ -179,7 +179,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       try {
         val uri = Uri.parse("content://${activity.packageName}.documents")
         val request = JSONObject(args.request)
-        val privateRoot = preparePrivateStorageRoot(activity.noBackupFilesDir)
+        val privateRoot = prepareSyncpeerPrivateStorageRoot(activity.noBackupFilesDir)
         // A never-configured vault must not require JavaScriptEngine just to use the legacy cache.
         if (request.optString("operation") == "cacheRegistrations" && !File(privateRoot, "documents/profile").exists()) {
           invoke.resolve(app.tauri.plugin.JSObject("{\"result\":{\"folders\":[]}}")); return@Thread
@@ -204,6 +204,11 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         }
         invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(result?.getString("result"))))
       } catch (error: Exception) {
+        if (activity.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+          android.util.Log.w("SyncpeerRuntime", "document command failed: " +
+            generateSequence(error as Throwable?) { it.cause }.take(4)
+              .joinToString(">") { it.javaClass.simpleName })
+        }
         invoke.reject(privateStorageFailureMessage(error)
           ?: "Document operation failed. Check the vault password and Android System WebView.")
       }

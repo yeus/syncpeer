@@ -7,14 +7,14 @@ class DocumentRuntimeCompatibilityTest {
   @Test fun unavailableSandboxSelectsWebView() {
     assertEquals(
       DocumentRuntimeKind.WEB_VIEW,
-      selectDocumentRuntime(false, listOf("message-ports")) { true },
+      selectDocumentRuntime(false, listOf("message-ports"), true) { true },
     )
   }
 
   @Test fun missingSandboxFeatureSelectsWebView() {
     assertEquals(
       DocumentRuntimeKind.WEB_VIEW,
-      selectDocumentRuntime(true, listOf("promises", "message-ports", "array-buffers")) {
+      selectDocumentRuntime(true, listOf("promises", "message-ports", "array-buffers"), true) {
         it != "message-ports"
       },
     )
@@ -23,7 +23,14 @@ class DocumentRuntimeCompatibilityTest {
   @Test fun completeCapabilitySetSelectsSandbox() {
     assertEquals(
       DocumentRuntimeKind.SANDBOX,
-      selectDocumentRuntime(true, listOf("message-ports")) { true },
+      selectDocumentRuntime(true, listOf("message-ports"), true) { true },
+    )
+  }
+
+  @Test fun sandboxWithoutWebCryptoSelectsWebView() {
+    assertEquals(
+      DocumentRuntimeKind.WEB_VIEW,
+      selectDocumentRuntime(true, listOf("message-ports"), false) { true },
     )
   }
 }

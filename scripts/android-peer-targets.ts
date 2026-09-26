@@ -8,6 +8,22 @@ export function androidPeerCdpPort(serial: string): number {
   return port;
 }
 
+const androidListeningPorts = (procNetTcp: string, appUid: number): number[] =>
+  procNetTcp.split("\n").slice(1).map(line => line.trim().split(/\s+/))
+    .filter(fields => fields[3] === "0A" && Number(fields[7]) === appUid)
+    .map(fields => Number.parseInt(fields[1]?.split(":").at(-1) ?? "", 16))
+    .filter(port => Number.isInteger(port) && port > 0 && port <= 65_535);
+
+export const androidAppListeningOnPort = (procNetTcp: string, appUid: number, port: number): boolean =>
+  androidListeningPorts(procNetTcp, appUid).includes(port);
+
+/** Resolve the temporary pairing listener from a disposable emulator's synthetic /proc/net/tcp snapshot. */
+export function androidSingleListeningPort(procNetTcp: string, appUid: number): number {
+  const ports = androidListeningPorts(procNetTcp, appUid);
+  if (ports.length !== 1) throw new Error("Expected one app-owned pairing listener on the disposable emulator.");
+  return ports[0]!;
+}
+
 export function androidPeerTargets(online: string[], configured: string | undefined,
   allowReset: boolean, isEmulator: (serial: string) => boolean): string[] {
   if (!allowReset) {

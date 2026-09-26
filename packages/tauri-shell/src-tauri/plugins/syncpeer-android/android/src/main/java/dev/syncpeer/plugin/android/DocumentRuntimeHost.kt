@@ -34,6 +34,24 @@ internal interface DocumentRuntimeHost : AutoCloseable {
   fun evaluate(code: String, input: ByteArray): CompletableFuture<String>
 }
 
+internal fun sandboxSupportsWebCrypto(sandbox: JavaScriptSandbox): Boolean {
+  val isolate = sandbox.createIsolate(IsolateStartupParameters())
+  return try {
+    isolate.evaluateJavaScriptAsync("""
+      (() => {
+        const crypto = globalThis.crypto;
+        return !!crypto && typeof crypto.getRandomValues === 'function' &&
+          !!crypto.subtle && ['digest', 'importKey', 'deriveBits', 'encrypt', 'decrypt', 'sign', 'verify']
+            .every(name => typeof crypto.subtle[name] === 'function');
+      })()
+    """.trimIndent()).get(5, TimeUnit.SECONDS) == "true"
+  } catch (_: Exception) {
+    false
+  } finally {
+    isolate.close()
+  }
+}
+
 internal class SandboxDocumentRuntimeHost private constructor(
   private val sandbox: JavaScriptSandbox,
   private val isolate: JavaScriptIsolate,

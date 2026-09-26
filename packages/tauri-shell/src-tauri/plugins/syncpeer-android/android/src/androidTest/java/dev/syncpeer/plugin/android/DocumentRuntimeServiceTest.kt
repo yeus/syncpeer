@@ -156,7 +156,8 @@ class DocumentRuntimeServiceTest {
       .put("operation", "connect")
       .put("options", JSONObject().put("host", "synthetic.invalid").put("port", 22000))
       .toString()
-    val file = File(context.noBackupFilesDir, "syncpeer.vault.background-session.secret")
+    val file = File(syncpeerPrivateStorageRoot(context.noBackupFilesDir),
+      "syncpeer.vault.background-session.secret")
     try {
       store.clear()
       store.save(request)

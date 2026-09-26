@@ -264,6 +264,14 @@ export function resolveApprovedPeerDeviceIds(selectedDeviceId: string,
   return [...approved.values()].sort();
 }
 
+/** A listener accepts remote members, never this device's own certificate. */
+export function resolveIncomingPeerDeviceIds(selectedDeviceId: string, localDeviceId: string,
+  devices: readonly OwnedSpaceDevice[]): string[] {
+  const local = normalizeDeviceId(localDeviceId);
+  return resolveApprovedPeerDeviceIds(selectedDeviceId, devices)
+    .filter(id => normalizeDeviceId(id) !== local);
+}
+
 /** Resolve policy at the Syncpeer boundary; BEP still sees ordinary device IDs. */
 export function resolveFolderShareDevices(targets: readonly FolderShareTarget[],
   devices: readonly OwnedSpaceDevice[]): string[] {

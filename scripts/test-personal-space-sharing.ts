@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createOwnedDeviceIdentity, createOwnedRecoveryKit, openOwnedRecoveryKit, openOwnedDeviceSigningKey,
-  resolveApprovedPeerDeviceIds, resolveFolderShareDevices,
+  resolveApprovedPeerDeviceIds, resolveFolderShareDevices, resolveIncomingPeerDeviceIds,
   settingsFolderDevices, signSpaceMembershipUpdate, verifySpaceDeviceMembership } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 
@@ -68,6 +68,11 @@ test("incoming authorization excludes revoked identities but permits a selected 
   assert.deepEqual(resolveApprovedPeerDeviceIds("LAPTOP", devices), ["PHONE"]);
   assert.deepEqual(resolveApprovedPeerDeviceIds("L-A-P-T-O-P", devices), ["PHONE"]);
   assert.deepEqual(resolveApprovedPeerDeviceIds("EXTERNAL", devices), ["EXTERNAL", "PHONE"]);
+});
+
+test("incoming listeners never prepare or accept the local device", () => {
+  assert.deepEqual(resolveIncomingPeerDeviceIds("PHONE", "L-A-P-T-O-P", membership), ["PHONE"]);
+  assert.deepEqual(resolveIncomingPeerDeviceIds("EXTERNAL", "LAPTOP", membership), ["EXTERNAL", "PHONE"]);
 });
 
 test("space device membership updates require an active signer and reject rollback", async () => {

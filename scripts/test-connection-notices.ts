@@ -4,7 +4,7 @@ import {
   folderRootEmptyNotice,
   localDiscoveryUnavailableNotice,
 } from "../packages/app/src/app/connectionNotices.ts";
-import { createTauriAdapters, reportUiError } from "../packages/app/src/lib/tauriAdapters.ts";
+import { createTauriAdapters, reportUiError, shouldLogInvokeLifecycle } from "../packages/app/src/lib/tauriAdapters.ts";
 import { reportClientError } from "@syncpeer/core/browser";
 
 test("explains an empty folder list on a healthy connection", () => {
@@ -27,6 +27,13 @@ test("explains local discovery port contention without implying connection failu
 
 test("does not reclassify unrelated discovery failures", () => {
   assert.equal(localDiscoveryUnavailableNotice(new Error("Network request failed")), null);
+});
+
+test("high-frequency storage and socket operations do not flood the visible session log", () => {
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_replica_storage"), false);
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_read"), false);
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_write"), false);
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_listen"), true);
 });
 
 test("serializes overlapping native local discovery calls", async () => {

@@ -11,6 +11,38 @@ import { encryptUntrustedBytes, deriveUntrustedFileKey } from "../packages/core/
 import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { openCiphertextView } from "../packages/core/dist/sync/ciphertextView.js";
 
+test("encrypted replica retries a concurrent metadata replacement but rejects persistent changes", async () => {
+  const { storage } = memoryReplicaStorage();
+  const folder = await deriveUntrustedFolderCrypto("synthetic-changing-index", "synthetic-password");
+  const options = { folderKey: folder.folderKey, randomBytes,
+    withLock: async <T>(operation: () => Promise<T>) => operation(),
+    checkHealth: async () => {}, archive: async () => {} };
+  const source = createFolderReplica(createEncryptedReplicaStorage(storage, options), "1", sha256);
+  await source.edit({ method: "write", folderId: "synthetic-changing-index", path: "synthetic-file",
+    source: { size: 3, readRange: async () => Uint8Array.of(1, 2, 3) },
+    expectedVersion: null, modifiedMs: 1000 });
+  let reads = 0;
+  const once = { ...storage, stat: async (path: string) => {
+    const value = await storage.stat(path);
+    return path === ".syncpeer-replica-index" && ++reads === 2 && value
+      ? { ...value, revision: "synthetic-concurrent-replacement" } : value;
+  } };
+  const reopened = createFolderReplica(createEncryptedReplicaStorage(once, options), "1", sha256);
+  assert.equal((await reopened.scan())[0]?.name, "synthetic-file");
+  assert.ok(reads >= 4, "A changed index read must be retried from a fresh revision.");
+
+  let generation = 0;
+  const always = { ...storage, stat: async (path: string) => {
+    const value = await storage.stat(path);
+    return path === ".syncpeer-replica-index" && value
+      ? { ...value, revision: `synthetic-${++generation}` } : value;
+  } };
+  await assert.rejects(createFolderReplica(createEncryptedReplicaStorage(always, options), "1", sha256).scan(),
+    /changed during read/);
+  assert.ok(generation <= 12, "Repeated replacement must have a bounded retry budget.");
+  folder.folderKey.fill(0);
+});
+
 const legacyCiphertextIndex = (bytes: Uint8Array, identity: { folderId: string; passwordToken: Uint8Array }) => {
   const stored = JSON.parse(new TextDecoder().decode(bytes));
   const legacy = { ...stored, format: 1, identity: {

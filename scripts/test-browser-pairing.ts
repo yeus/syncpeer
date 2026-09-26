@@ -104,6 +104,64 @@ test("a reused browser listener advertises current folders and adopts current co
   }
 });
 
+test("incoming Hello uses folders prepared before listening, without reopening document storage", { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-offline-folder-preparation-"));
+  const adapter = createNodeHostAdapter();
+  const [ownerIdentity, joiningIdentity] = (await Promise.all([
+    identity(root, "one"), identity(root, "two"),
+  ])).sort((a, b) => b.deviceId.replaceAll("-", "").localeCompare(a.deviceId.replaceAll("-", "")));
+  let prepared = false;
+  let lookups = 0;
+  let port = 0;
+  let revision = 0;
+  let invalidate = () => {};
+  const owner = createSyncpeerBrowserClient({ hostAdapter: { ...adapter,
+    listenTls: async options => {
+      assert.equal(prepared, true, "Local folders must be ready before the listener starts.");
+      const listener = await adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 });
+      port = listener.port;
+      return listener;
+    },
+  }, platformAdapter: {
+    readDefaultIdentity: async () => ownerIdentity,
+    ownedDevices: async () => [
+      { id: "synthetic-owner-slot", syncthingId: ownerIdentity.deviceId,
+        state: "active" as const, signingKey: "synthetic-owner-key" },
+      { id: "synthetic-joiner-slot", syncthingId: joiningIdentity.deviceId,
+        state: "active" as const, signingKey: "synthetic-joiner-key" },
+    ],
+    sessionConfigurationRevision: () => revision,
+    onSessionConfigurationChange: listener => { invalidate = listener; },
+    sessionSharedFolders: async () => {
+      lookups++;
+      if (lookups > 1) throw new Error("Incoming Hello waited for a second document lookup.");
+      prepared = true;
+      return [{ id: "offline-folder", encryption: { mode: "plaintext" } }];
+    },
+  } });
+  let outgoing: SyncpeerSessionHandle | undefined;
+  try {
+    await assert.rejects(owner.connectAndSync({ host: "127.0.0.1", port: 1,
+      remoteId: joiningIdentity.deviceId, deviceName: "synthetic-owner",
+      discoveryMode: "direct", timeoutMs: 1000 }));
+    outgoing = await createSyncpeerCoreClient(adapter).openSession({ ...joiningIdentity,
+      host: "127.0.0.1", port, expectedDeviceId: ownerIdentity.deviceId,
+      deviceName: "synthetic-joiner", discoveryMode: "direct", timeoutMs: 2000,
+      sharedFolders: [{ id: "offline-folder", encryption: { mode: "plaintext" } }],
+    });
+    assert.equal(lookups, 1);
+    assert.deepEqual((await outgoing.remoteFs.listFolders()).map(folder => folder.id), ["offline-folder"]);
+    revision++;
+    invalidate();
+    await outgoing.closed;
+    assert.equal(outgoing.isClosed(), true, "A sharing change must retire the old prepared session.");
+  } finally {
+    await outgoing?.close();
+    await owner.disconnect();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("browser clients pair over the production LAN TLS adapters and persist only after confirmation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-browser-pairing-"));
   let handle: Awaited<ReturnType<ReturnType<typeof createSyncpeerBrowserClient>["startPairingInvitation"]>> | undefined;

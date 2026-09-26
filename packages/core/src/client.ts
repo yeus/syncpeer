@@ -1748,10 +1748,22 @@ class BepSession {
       passwordError: state.passwordError ?? null,
     });
     const replica = this.sharedFolders.get(folderId)?.replica;
+    this.log("replica.index.decision", {
+      internal: this.sharedFolders.get(folderId)?.internal === true,
+      hasReceiver: !!replica?.receive,
+      paused: replica?.isPaused?.() ?? false,
+      needsPassword: state.needsPassword,
+      fileCount: replicaFiles.length,
+    });
     if (replica?.receive && !replica.isPaused?.() && !state.needsPassword) {
       try {
-        if (await replica.receive(folderId, replicaFiles,
-          (path, offset, size, hash) => this.requestReplicaRange(folderId, path, offset, size, hash))) await this.sendSharedFolderIndexes();
+        this.log("replica.index.receive.start", { internal: this.sharedFolders.get(folderId)?.internal === true,
+          fileCount: replicaFiles.length });
+        const changed = await replica.receive(folderId, replicaFiles,
+          (path, offset, size, hash) => this.requestReplicaRange(folderId, path, offset, size, hash));
+        this.log("replica.index.receive.done", { internal: this.sharedFolders.get(folderId)?.internal === true,
+          changed });
+        if (changed) await this.sendSharedFolderIndexes();
       } catch (error) {
         if (!this.closed) this.log("replica.receive.failed", { message: error instanceof Error ? error.message : String(error) });
       }

@@ -7,8 +7,9 @@ export interface ReplicaState {
 
 /** Stop new work immediately; let already admitted storage operations finish safely. */
 export function createReplicaController(replica: LocalFolderReplica, settings?: {
-  paused: boolean;
-  savePaused: (paused: boolean) => Promise<void>;
+  paused?: boolean;
+  savePaused?: (paused: boolean) => Promise<void>;
+  onCommittedChange?: () => void;
 }) {
   let paused = settings?.paused ?? false;
   let stopped = false;
@@ -51,7 +52,7 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
     }
   };
   const persist = (value: boolean, drained: Promise<void>) => {
-    const operation = Promise.all([drained, Promise.resolve().then(() => settings?.savePaused(value))]).then(() => {
+    const operation = Promise.all([drained, Promise.resolve().then(() => settings?.savePaused?.(value))]).then(() => {
       paused = value;
       if (!value) error = undefined;
     }, failure => {
@@ -68,8 +69,16 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
   return {
     scan: () => run("scanning", replica.scan),
     readBlock: ((...args) => run("syncing", () => replica.readBlock(...args))) as LocalFolderReplica["readBlock"],
-    ...(replica.receive ? { receive: ((...args) => run("syncing", () => replica.receive!(...args))) as NonNullable<LocalFolderReplica["receive"]> } : {}),
-    ...(replica.edit ? { edit: ((...args) => run("syncing", () => replica.edit!(...args))) as NonNullable<LocalFolderReplica["edit"]> } : {}),
+    ...(replica.receive ? { receive: ((...args) => run("syncing", async () => {
+      const changed = await replica.receive!(...args);
+      if (changed) settings?.onCommittedChange?.();
+      return changed;
+    })) as NonNullable<LocalFolderReplica["receive"]> } : {}),
+    ...(replica.edit ? { edit: ((...args) => run("syncing", async () => {
+      const result = await replica.edit!(...args);
+      settings?.onCommittedChange?.();
+      return result;
+    })) as NonNullable<LocalFolderReplica["edit"]> } : {}),
     isPaused: () => paused || stopped,
     close: () => {
       if (closeTask) return closeTask;

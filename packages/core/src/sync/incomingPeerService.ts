@@ -69,9 +69,11 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
   const handle = (accepted: Awaited<ReturnType<Listener["accept"]>>) => {
     pendingSockets.add(accepted.socket);
     const task = (async () => {
+      adapter.log?.("core.incoming.trace.accepted", { alpn: accepted.alpn });
       if (stopping) { await accepted.socket.close(); return; }
       const remoteDeviceId = canonicalId(await deviceIdFromCertificate(adapter,
         await accepted.socket.peerCertificateDer()));
+      adapter.log?.("core.incoming.trace.identity_ready", {});
       if (accepted.alpn === "syncpeer-pairing/1" && options.onPairingSocket) {
         try { await options.onPairingSocket(accepted, remoteDeviceId); }
         finally { await accepted.socket.close().catch(() => undefined); }
@@ -84,7 +86,10 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
       if (!approvedDeviceId) throw new Error(`Incoming peer device ID mismatch: ${remoteDeviceId} is not approved.`);
       const endpoint = { host: accepted.remoteAddress || options.host, port: accepted.remotePort };
       const handlers = sessionHandlers;
+      adapter.log?.("core.incoming.trace.options_start", {});
       const sessionOptions = await handlers.connectionOptions(approvedDeviceId, endpoint);
+      adapter.log?.("core.incoming.trace.options_ready", {});
+      adapter.log?.("core.incoming.trace.handshake_start", {});
       const session = await acceptSyncpeerSession(adapter, accepted.socket,
         { ...sessionOptions, ...endpoint, expectedDeviceId: approvedDeviceId });
       const connectionId = `${endpoint.host}:${endpoint.port}`;

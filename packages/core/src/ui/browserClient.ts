@@ -25,7 +25,7 @@ import type { SyncpeerProfileSettings } from "../sync/profileSettings.js";
 import { acceptPairingTransfer, joinPersonalSpace } from "../sync/personalSpacePairingTransport.js";
 import { createPairingInvitation, type PairingInvitation,
   type PersonalSpacePairingTransfer } from "../sync/personalSpacePairing.js";
-import { resolveApprovedPeerDeviceIds,
+import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds,
   type OwnedDeviceIdentity, type OwnedSpaceDevice } from "../sync/personalSpaceSharing.js";
 import { sameDeviceId } from "./helpers.js";
 
@@ -220,6 +220,9 @@ export interface SyncpeerPlatformAdapter {
   revokeOwnedDevice?: (deviceId: string) => Promise<void>;
   /** Folders currently owned by the encrypted document store and safe to advertise over BEP. */
   sessionSharedFolders?: (remoteDeviceId: string) => Promise<SharedFolder[]>;
+  /** Synchronous invalidation guards prepared listener state against vault and sharing changes. */
+  sessionConfigurationRevision?: () => number;
+  onSessionConfigurationChange?: (listener: () => void) => void;
   loadDirectorySnapshot?: (folderId: string, sourceDeviceId: string, path: string) => Promise<{
     entries: FileEntry[]; versionKey: string; loadedAtMs: number;
   } | null>;
@@ -575,6 +578,7 @@ export const createSyncpeerBrowserClient = (
   let focusedFolderId: string | null = null;
   let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
   let incomingServiceKey = "";
+  let incomingServiceClosing = Promise.resolve();
 
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
     if (cachedDefaultIdentity) return cachedDefaultIdentity;
@@ -585,11 +589,13 @@ export const createSyncpeerBrowserClient = (
     return cachedDefaultIdentity;
   };
 
-  const stopIncomingService = async (): Promise<void> => {
+  const stopIncomingService = (): Promise<void> => {
     const service = incomingService;
     incomingService = null;
     incomingServiceKey = "";
-    await service?.close();
+    const closing = incomingServiceClosing.then(() => service?.close());
+    incomingServiceClosing = closing.catch(() => undefined);
+    return closing;
   };
 
   const identityForPairing = async () => {
@@ -638,21 +644,43 @@ export const createSyncpeerBrowserClient = (
   const ensureIncomingService = async (connectOptions: ConnectOptions,
     coreOptions: SyncpeerConnectOptions): Promise<typeof incomingService> => {
     if (!coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
+    coreAdapter.log?.("core.incoming.prepare.identity_start", {});
     const localDeviceId = await deviceIdFromCertificate(coreAdapter,
       certificateDerFromPem(coreOptions.certPem));
+    coreAdapter.log?.("core.incoming.prepare.trust_start", {});
     const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
-    const approvedDeviceIds = resolveApprovedPeerDeviceIds(coreOptions.expectedDeviceId, trustedDevices);
+    coreAdapter.log?.("core.incoming.prepare.trust_done", { deviceCount: trustedDevices.length });
+    const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
+      localDeviceId, trustedDevices);
     if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
     const listenPort = localListenPort(connectOptions.listenPort);
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem, listenPort]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
-    const sessionHandlers = {
-      connectionOptions: async (remote: string, endpoint: { host: string; port: number }) => {
-        const folders = remote === coreOptions.expectedDeviceId && connectOptions.sharedFolders
-          ? connectOptions.sharedFolders : await platformAdapter.sessionSharedFolders?.(remote) ?? [];
+    const revision = platformAdapter.sessionConfigurationRevision?.();
+    const prepared = new Map<string, SyncpeerConnectOptions>();
+    for (const remote of approvedDeviceIds) {
+      try {
+        const folders = sameDeviceId(remote, remoteDeviceId) && coreOptions.sharedFolders
+          ? coreOptions.sharedFolders : await platformAdapter.sessionSharedFolders?.(remote) ?? [];
         logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(folders));
-        return { ...coreOptions, ...endpoint, expectedDeviceId: remote, sharedFolders: folders };
+        prepared.set(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase(),
+          { ...coreOptions, expectedDeviceId: remote, sharedFolders: folders,
+            folderPasswords: sameDeviceId(remote, remoteDeviceId) ? coreOptions.folderPasswords : {} });
+      } catch (error) {
+        coreAdapter.log?.("core.incoming.prepare.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const sessionHandlers = {
+      connectionOptions: (remote: string, endpoint: { host: string; port: number }) => {
+        if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
+          throw new Error("Incoming peer folder preparation changed; reconnect to refresh it.");
+        }
+        const ready = prepared.get(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase());
+        if (!ready) throw new Error("Incoming peer folder preparation is unavailable.");
+        return { ...ready, ...endpoint };
       },
       onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
         if (!sameDeviceId(connectedRemoteDeviceId, remoteDeviceId) ||
@@ -673,11 +701,16 @@ export const createSyncpeerBrowserClient = (
         });
       },
     };
+    if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
+      throw new Error("Incoming peer folder preparation changed before the listener started.");
+    }
     if (incomingService && incomingServiceKey === key) {
       incomingService.updateSessionHandlers(sessionHandlers);
       return incomingService;
     }
+    coreAdapter.log?.("core.incoming.prepare.previous_close_start", {});
     await stopIncomingService();
+    coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
     incomingService = await startIncomingPeerService(coreAdapter, {
       host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
       localDeviceId, approvedDeviceIds, ...sessionHandlers,
@@ -694,7 +727,9 @@ export const createSyncpeerBrowserClient = (
     signal: AbortSignal,
   ): Promise<SyncpeerSessionHandle> => {
     const normalized = normalizeConnectOptions(connectOptions);
+    coreAdapter.log?.("core.session.open.trust_start", {});
     const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
+    coreAdapter.log?.("core.session.open.trust_done", { deviceCount: trustedDevices.length });
     if (normalized.remoteId && !resolveApprovedPeerDeviceIds(normalized.remoteId, trustedDevices)
       .some(id => sameDeviceId(id, normalized.remoteId!))) {
       throw new Error("This peer was removed from the trusted device list.");
@@ -720,6 +755,8 @@ export const createSyncpeerBrowserClient = (
       }
     }
 
+    coreAdapter.log?.("core.session.open.identity_done", {});
+
     if (!certPem) {
       if (defaultIdentityError) {
         throw new Error(`Missing cert. Provide PEM text or a readable file path. Default identity lookup failed: ${defaultIdentityError}`);
@@ -733,6 +770,7 @@ export const createSyncpeerBrowserClient = (
       throw new Error("Missing key. Provide PEM text or a readable file path.");
     }
 
+    coreAdapter.log?.("core.session.open.folders_start", {});
     const sharedFolders = normalized.sharedFolders ??
       await platformAdapter.sessionSharedFolders?.(normalized.remoteId ?? "");
     logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(sharedFolders ?? []));
@@ -819,6 +857,11 @@ export const createSyncpeerBrowserClient = (
       connectOptions.cert ?? "default-cert",
       connectOptions.key ?? "default-key",
     ),
+  });
+  platformAdapter.onSessionConfigurationChange?.(() => {
+    void stopIncomingService().catch(error => coreAdapter.log?.("core.incoming.refresh.failed", {
+      message: error instanceof Error ? error.message : String(error),
+    }));
   });
 
   const ensureSession = (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> =>

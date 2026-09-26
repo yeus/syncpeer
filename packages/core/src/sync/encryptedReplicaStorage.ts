@@ -31,17 +31,23 @@ export function createEncryptedReplicaStorage(bytes: ReplicaByteStorage, options
     return encryptUntrustedFilename(options.folderKey, path);
   };
   const readStored = async <T>(path: string, operation: (source: EncryptedFileSource) => Promise<T>) => {
-    await options.checkHealth();
-    const before = await bytes.stat(path);
-    if (!before || before.type !== "file") throw new Error("Encrypted replica file unavailable.");
-    const value = await operation({ size: before.size, readRange: (offset, size) => bytes.readRange(path, offset, size) });
-    const after = await bytes.stat(path);
-    if (!after || after.revision !== before.revision || after.size !== before.size || after.type !== "file") {
-      if (value instanceof Uint8Array) value.fill(0);
-      throw new Error("Encrypted replica changed during read.");
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await options.checkHealth();
+      const before = await bytes.stat(path);
+      if (!before || before.type !== "file") throw new Error("Encrypted replica file unavailable.");
+      const source = { size: before.size, readRange: (offset: number, size: number) => bytes.readRange(path, offset, size) };
+      const outcome = await operation(source).then(value => ({ value }), error => ({ error }));
+      const after = await bytes.stat(path);
+      if (!after || after.revision !== before.revision || after.size !== before.size || after.type !== "file") {
+        if ("value" in outcome && outcome.value instanceof Uint8Array) outcome.value.fill(0);
+        if (attempt < 4) continue;
+        throw new Error("Encrypted replica changed during read.");
+      }
+      if ("error" in outcome) throw outcome.error;
+      await options.checkHealth();
+      return outcome.value;
     }
-    await options.checkHealth();
-    return value;
+    throw new Error("Encrypted replica changed during read.");
   };
   const loadIndex: ReplicaStorage["loadIndex"] = async () => {
     await options.checkHealth();

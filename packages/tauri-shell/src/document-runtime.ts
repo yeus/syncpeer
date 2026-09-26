@@ -4,7 +4,7 @@ import "./document-runtime-polyfills.js";
 import { installAndroidTimers } from "./document-runtime-polyfills.js";
 import { createPortRequest } from "./document-runtime-port.js";
 import { createDocumentFilesystem } from "../../core/src/sync/documentFilesystem.js";
-import { dispatchDocumentCommand } from "../../core/src/sync/documentCommands.js";
+import { changesSessionConfiguration, dispatchDocumentCommand } from "../../core/src/sync/documentCommands.js";
 import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js";
 import { deriveUntrustedFolderCrypto } from "../../core/src/core/model/untrusted.js";
 import { createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDiskRange } from "../../core/src/sync/encryptedFilesystem.js";
@@ -16,7 +16,7 @@ import { createConnectionLifecycle, type ConnectionLifecycle } from "../../core/
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
-import { resolveApprovedPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
+import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
 import { sameDeviceId } from "../../core/src/ui/helpers.js";
 import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
 
@@ -123,8 +123,19 @@ async function startDocuments(android: AndroidRuntime) {
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
       remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true } });
   await documents.initialize();
+  let sessionConfigurationRevision = 0;
+  const sessionConfigurationListeners = new Set<() => void>();
   return {
-    command: (input: unknown) => dispatchDocumentCommand(documents, input),
+    command: (input: unknown) => {
+      if (changesSessionConfiguration((input as { operation?: unknown } | null)?.operation,
+        (input as { path?: unknown } | null)?.path)) {
+        sessionConfigurationRevision++;
+        for (const listener of sessionConfigurationListeners) listener();
+      }
+      return dispatchDocumentCommand(documents, input);
+    },
+    sessionConfigurationRevision: () => sessionConfigurationRevision,
+    onSessionConfigurationChange: (listener: () => void) => { sessionConfigurationListeners.add(listener); },
     releaseLocalCopy: documents.releaseLocalCopy,
     close: documents.close,
     connectionPasswords: documents.connectionPasswords,
@@ -144,17 +155,21 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
   let sharedFolderIds: string[] = [];
   let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
   let incomingServiceKey = "";
-  const stopIncomingService = async () => {
+  let incomingServiceClosing = Promise.resolve();
+  const stopIncomingService = () => {
     const service = incomingService;
     incomingService = null;
     incomingServiceKey = "";
-    await service?.close();
+    const closing = incomingServiceClosing.then(() => service?.close());
+    incomingServiceClosing = closing.catch(() => undefined);
+    return closing;
   };
   const ensureIncomingService = async (options: ConnectOptions, coreOptions: SyncpeerConnectOptions) => {
     if (!coreOptions.expectedDeviceId) return null;
     const localDeviceId = await deviceIdFromCertificate(adapter, certificateDerFromPem(coreOptions.certPem));
     const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
-    const approvedDeviceIds = resolveApprovedPeerDeviceIds(coreOptions.expectedDeviceId, trustedDevices);
+    const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
+      localDeviceId, trustedDevices);
     if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
     const listenPort = options.listenPort ?? 22000;
     if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
@@ -163,22 +178,45 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem, listenPort]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
-    const sessionHandlers = {
-      connectionOptions: async (remote: string, endpoint: { host: string; port: number }) => {
-        const saved = await documents.connectionPasswords().catch(() => ({}));
+    const revision = documents.sessionConfigurationRevision();
+    const saved = await documents.connectionPasswords().catch(() => ({}));
+    const unlocked = (await documents.status()).vault.phase === "unlocked";
+    const prepared = new Map<string, SyncpeerConnectOptions>();
+    for (const remote of approvedDeviceIds) {
+      try {
         const folderPasswords = {
           ...resolveFolderPasswordsForDevice(saved, remote),
-          ...(remote === options.remoteId ? options.folderPasswords : {}),
+          ...(sameDeviceId(remote, options.remoteId ?? "") ? options.folderPasswords : {}),
         };
-        return { ...coreOptions, ...endpoint, expectedDeviceId: remote, folderPasswords,
-          sharedFolders: (await documents.status()).vault.phase === "unlocked"
-            ? await documents.sessionSharedFolders(remote) : [] };
+        const sharedFolders = unlocked
+          ? sameDeviceId(remote, remoteDeviceId) && coreOptions.sharedFolders
+            ? coreOptions.sharedFolders : await documents.sessionSharedFolders(remote)
+          : [];
+        prepared.set(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase(),
+          { ...coreOptions, expectedDeviceId: remote, folderPasswords, sharedFolders });
+      } catch (error) {
+        adapter.log?.("core.incoming.prepare.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const sessionHandlers = {
+      connectionOptions: (remote: string, endpoint: { host: string; port: number }) => {
+        if (revision !== documents.sessionConfigurationRevision()) {
+          throw new Error("Incoming peer folder preparation changed; reconnect to refresh it.");
+        }
+        const ready = prepared.get(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase());
+        if (!ready) throw new Error("Incoming peer folder preparation is unavailable.");
+        return { ...ready, ...endpoint };
       },
       onSession: (session: SyncpeerSessionHandle) => {
         if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
         void lifecycle.adopt(options, session);
       },
     };
+    if (revision !== documents.sessionConfigurationRevision()) {
+      throw new Error("Incoming peer folder preparation changed before the listener started.");
+    }
     if (incomingService && incomingServiceKey === key) {
       incomingService.updateSessionHandlers(sessionHandlers);
       return incomingService;
@@ -257,6 +295,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     },
     keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName }),
   });
+  documents.onSessionConfigurationChange(() => { void stopIncomingService(); });
   return {
     command: async (input: unknown) => {
       if (!input || typeof input !== "object" || Array.isArray(input)) {

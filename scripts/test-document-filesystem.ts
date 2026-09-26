@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
-import { deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
+import { changesSessionConfiguration, deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { scryptPasswordKdf, type PasswordKdf } from "../packages/core/dist/kdf.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 import { createOwnedDeviceIdentity, createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
@@ -12,11 +12,29 @@ import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } fro
 import { defaultFolderSettings, defaultProfileSettings } from "../packages/core/dist/sync/profileSettings.js";
 import { purgePrivateReplicaContents } from "../packages/core/dist/sync/replicaPurge.js";
 
+test("listener snapshots are invalidated by sharing changes, not ordinary document edits", () => {
+  for (const operation of ["lock", "unlock", "saveProfileSettings", "savePersonalSpaceSetting",
+    "revokeOwnedDevice", "register", "attachDownloads", "saveConnectionPasswords"]) {
+    assert.equal(changesSessionConfiguration(operation), true, operation);
+  }
+  for (const operation of ["status", "sessionSharedFolders", "read", "write", "flush", "remove", "rename"]) {
+    assert.equal(changesSessionConfiguration(operation), false, operation);
+  }
+  assert.equal(changesSessionConfiguration("savePersonalSpaceSetting", ["folders", "photos", "retention"]), false);
+  assert.equal(changesSessionConfiguration("resolvePersonalSpaceConflict", ["folders", "photos", "retention"]), false);
+  for (const path of [["folders", "photos", "credential"], ["folders", "photos", "shareTargets"],
+    ["folders", "photos", "devices", "owner"]]) {
+    assert.equal(changesSessionConfiguration("savePersonalSpaceSetting", path), true);
+  }
+});
+
 test("an ordinary Syncthing peer can receive an explicitly selected folder without a personal space", async () => {
   const { openStorage } = memoryDocumentStorage();
+  const preparationStages: string[] = [];
   const documents = createDocumentFilesystem({ profileId: "ordinary-peer-fixture", deviceCounterId: "45",
     openStorage, profile: await openStorage("profile"), randomBytes,
-    availableBytes: async () => 1024 * 1024 * 1024 });
+    availableBytes: async () => 1024 * 1024 * 1024,
+    onDiagnostic: event => preparationStages.push(event) });
   await documents.initialize();
   await documents.createVault("synthetic-master-password", false);
   await documents.register({ id: "photos", label: "Photos", password: "synthetic-folder-password" });
@@ -28,6 +46,37 @@ test("an ordinary Syncthing peer can receive an explicitly selected folder witho
   const folders = await documents.sessionSharedFolders("SYNTHETIC-ORDINARY-PEER");
   assert.deepEqual(folders.map(folder => folder.id), ["photos"]);
   assert.equal(folders[0]?.encryption?.mode, "encrypted");
+  assert.deepEqual(preparationStages.filter(event => event.startsWith("document.session_folders.")), [
+    "document.session_folders.queued", "document.session_folders.queued_done",
+    "document.session_folders.membership_done",
+    "document.session_folders.context_done", "document.session_folders.credentials_done",
+    "document.session_folders.settings_done", "document.session_folders.done",
+  ]);
+  await documents.close();
+});
+
+test("status refreshes shared credentials only when the settings replica changes", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const events: string[] = [];
+  const documents = createDocumentFilesystem({ profileId: "settings-refresh-fixture", deviceCounterId: "46",
+    openStorage, profile: await openStorage("profile"), randomBytes,
+    availableBytes: async () => 1024 * 1024 * 1024,
+    onDiagnostic: event => events.push(event) });
+  await documents.initialize();
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await documents.createVault("synthetic-master-password", false, "DEVICE", kit.publicKey);
+  const peer = await createOwnedDeviceIdentity(crypto.subtle, randomBytes, "PEER");
+  await documents.exportPairingTransfer("DEVICE", { id: peer.id, syncthingId: peer.syncthingId,
+    state: peer.state, signingKey: peer.signingKey });
+  const deviceId = (await documents.ownedDevices()).localDeviceId!;
+  await documents.status();
+  await documents.status();
+  assert.equal(events.filter(event => event === "document.settings_refresh.started").length, 1);
+  await documents.appendPersonalSpaceChange({ id: "new-credential", deviceId,
+    path: ["folders", "photos", "credential"], parents: [],
+    value: { label: "Photos", password: "synthetic-shared-folder-password" } });
+  assert.deepEqual((await documents.status()).folders.map(folder => folder.id), ["photos"]);
+  assert.equal(events.filter(event => event === "document.settings_refresh.started").length, 2);
   await documents.close();
 });
 
@@ -580,7 +629,6 @@ test("backup commands restore portable credentials without device-local roots or
   assert.deepEqual(await paired.connectionPasswords(), {}, "Pairing does not copy device-local credentials directly");
   assert.equal(await pairedSettings.replica?.receive?.(pairedSettings.id,
     await sourceSettings.replica!.scan(), sourceSettings.replica!.readBlock), true);
-  await paired.sessionSharedFolders("SOURCE");
   assert.deepEqual((await paired.status()).folders.map(folder => folder.id), ["photos"],
     "The approved peer imports the signed credential after encrypted settings replica exchange.");
   await assert.rejects(paired.register({ id: "photos", label: "Photos", password: "wrong-password" }),

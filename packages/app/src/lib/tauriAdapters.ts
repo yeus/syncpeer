@@ -14,7 +14,7 @@ import type {
   FileDownloadSink,
 } from "@syncpeer/core/browser";
 import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
-  dispatchDocumentCommand } from "@syncpeer/core/filesystem";
+  changesSessionConfiguration, dispatchDocumentCommand } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
 import { createWorkerPasswordKdf } from "./passwordKdf.ts";
 import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
@@ -178,14 +178,17 @@ const tryForwardUiErrorToCli = async (
   }
 };
 
+export const shouldLogInvokeLifecycle = (command: string): boolean =>
+  command !== "syncpeer_tls_read" && command !== "syncpeer_tls_write" &&
+  command !== "syncpeer_replica_storage";
+
 const createLoggedInvoke = (
   invoke: InvokeFn,
   options: CreateTauriAdaptersOptions | undefined,
 ): InvokeFn => {
-  const noisyCommands = new Set(["syncpeer_tls_read", "syncpeer_tls_write"]);
   return async <T>(command: string, args?: Record<string, unknown>) => {
     const startedAt = Date.now();
-    const shouldLogLifecycle = !noisyCommands.has(command);
+    const shouldLogLifecycle = shouldLogInvokeLifecycle(command);
     if (shouldLogLifecycle) {
       logUi(options, "tauri.invoke.start", { command });
     }
@@ -261,6 +264,12 @@ export const createTauriAdapters = (
     return invoke<T>(command, args);
   };
   const platform = options?.runtimePlatform ?? detectRuntimePlatform();
+  let sessionConfigurationRevision = 0;
+  const sessionConfigurationListeners = new Set<() => void>();
+  const invalidateSessionConfiguration = () => {
+    sessionConfigurationRevision++;
+    for (const listener of sessionConfigurationListeners) listener();
+  };
   const desktopDocuments = (() => {
     let owner: Promise<ReturnType<typeof createDocumentFilesystem>> | undefined;
     return () => owner ??= (async () => {
@@ -288,6 +297,7 @@ export const createTauriAdapters = (
         },
         randomBytes: size => crypto.getRandomValues(new Uint8Array(size)),
         kdf: createWorkerPasswordKdf(),
+        onDiagnostic: (event, details) => logUi(options, event, details),
       });
       await documents.initialize();
       return documents;
@@ -298,7 +308,9 @@ export const createTauriAdapters = (
       const response = await invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
       return response.result;
     }
-    return await dispatchDocumentCommand(await desktopDocuments(), request) as T;
+    const documents = await desktopDocuments();
+    if (changesSessionConfiguration(request.operation, request.path)) invalidateSessionConfiguration();
+    return await dispatchDocumentCommand(documents, request) as T;
   };
 
   const hostAdapter: SyncpeerHostAdapter = {
@@ -496,6 +508,8 @@ export const createTauriAdapters = (
   };
 
   const platformAdapter: SyncpeerPlatformAdapter = {
+    sessionConfigurationRevision: () => sessionConfigurationRevision,
+    onSessionConfigurationChange: listener => { sessionConfigurationListeners.add(listener); },
     releaseLocalCopy: async (folderId, mode, confirmedText, sessions) => {
       if (platform === "android") {
         await invokeWithLogging("syncpeer_android_release_local_copy", {
@@ -506,6 +520,7 @@ export const createTauriAdapters = (
       const documents = await desktopDocuments();
       await documents.releaseLocalCopy(folderId, mode === "safe"
         ? { mode, sessions } : { mode, confirmedText });
+      invalidateSessionConfiguration();
     },
     startBackgroundSession: platform === "android" ? async (options: Omit<ConnectOptions, "sharedFolders">) => {
       let allowMetered = false;

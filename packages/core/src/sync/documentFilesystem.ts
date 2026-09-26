@@ -56,6 +56,7 @@ interface DocumentFilesystemOptions {
   availableBytes: () => Promise<number>;
   /** Defaults to the in-process scrypt derivation; platforms may inject a worker. */
   kdf?: PasswordKdf;
+  onDiagnostic?: (event: string, details?: Record<string, unknown>) => void;
 }
 
 interface DocumentHandle {
@@ -90,11 +91,14 @@ interface DocumentRuntime {
   readonly handles: Map<number, DocumentHandle>;
   readonly recoveryIssues: Map<string, string[]>;
   settingsFolder?: { id: string; replica: LocalFolderReplica; close: () => Promise<void> };
+  settingsRevision: number;
+  refreshedSettingsRevision: number;
   vault: Vault;
   registry: FolderRegistry | undefined;
   nextHandle: number;
   closed: boolean;
   queue: Promise<void>;
+  activeQueueOperation?: string;
   closeTask: Promise<void> | undefined;
 }
 
@@ -154,10 +158,11 @@ const removeReplicaPaths = async (
   }
 };
 
-const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>): Promise<T> => {
+const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation = "other"): Promise<T> => {
   const task = runtime.queue.then(() => {
     if (runtime.closed) throw new Error("Documents are closed.");
-    return fn();
+    runtime.activeQueueOperation = operation;
+    return fn().finally(() => { runtime.activeQueueOperation = undefined; });
   });
   runtime.queue = task.then(() => {}, () => {});
   return task;
@@ -168,6 +173,7 @@ const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
   const results = await Promise.allSettled(pending.map(handle => handle.writer?.close()));
   const settingsResult = await Promise.allSettled([runtime.settingsFolder?.close()]);
   runtime.settingsFolder = undefined;
+  runtime.refreshedSettingsRevision = -1;
   const registryResult = await Promise.allSettled([runtime.registry?.close()]);
   runtime.registry = undefined;
   // A failed controller/storage close must never retain unlocked folder keys.
@@ -219,11 +225,14 @@ const openPersonalSpaceFolder = async (runtime: DocumentRuntime): Promise<void> 
       withLock: bytes.withLock, checkHealth: bytes.checkHealth, archive: async () => {},
     });
     const replica = createReplicaController(createFolderReplica(
-      encrypted, runtime.options.deviceCounterId, sha256));
+      encrypted, runtime.options.deviceCounterId, sha256), {
+      onCommittedChange: () => { runtime.settingsRevision++; },
+    });
     await replica.scan();
     runtime.settingsFolder = { id: descriptor.id, replica, close: async () => {
       try { await bytes!.close(); } finally { crypto.folderKey.fill(0); }
     } };
+    runtime.refreshedSettingsRevision = -1;
     await reconcileSpaceDeviceMembership(runtime);
   } catch (error) {
     runtime.settingsFolder = undefined;
@@ -1084,11 +1093,16 @@ const createLifecycleActions = (runtime: DocumentRuntime) => ({
   initialize: () => runQueued(runtime, () => initializeFilesystem(runtime)),
   status: () => runQueued(runtime, async () => {
     if (runtime.vault.status().phase === "unlocked" && runtime.settingsFolder &&
+      runtime.settingsRevision !== runtime.refreshedSettingsRevision &&
       await runtime.vault.spaceDeviceMembership()) {
+      const revision = runtime.settingsRevision;
+      try { runtime.options.onDiagnostic?.("document.settings_refresh.started"); }
+      catch { /* Diagnostics must not interrupt storage. */ }
       await syncSharedFolderCredentials(runtime, await sharedSettingsContext(runtime));
+      runtime.refreshedSettingsRevision = revision;
     }
     return documentStatus(runtime);
-  }),
+  }, "status"),
   close: () => closeFilesystem(runtime),
 });
 
@@ -1295,7 +1309,7 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
     runQueued(runtime, () => runtime.vault.saveConnectionPasswords(passwords)),
   mergeConnectionPasswords: (passwords: Record<string, string>) =>
     runQueued(runtime, () => runtime.vault.mergeConnectionPasswords(passwords)),
-  profileSettings: () => runQueued(runtime, () => effectiveProfileSettings(runtime)),
+  profileSettings: () => runQueued(runtime, () => effectiveProfileSettings(runtime), "profileSettings"),
   saveProfileSettings: (settings: Parameters<Vault["saveProfileSettings"]>[0]) =>
     runQueued(runtime, () => saveEffectiveProfileSettings(runtime, settings)),
   personalSpaceChanges: () => runQueued(runtime, () => {
@@ -1304,7 +1318,7 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   }),
   sharedPersonalSpaceSettings: () => runQueued(runtime, async () => {
     return (await sharedSettingsContext(runtime)).result;
-  }),
+  }, "sharedPersonalSpaceSettings"),
   savePersonalSpaceSetting: (path: string[], value: unknown) => runQueued(runtime, async () => {
     const context = await sharedSettingsContext(runtime, true);
     if (context.result.conflicts.length) throw new Error("Resolve shared-settings conflicts before changing settings.");
@@ -1337,7 +1351,7 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   ownedDevices: () => runQueued(runtime, async () => {
     const membership = await reconcileSpaceDeviceMembership(runtime);
     return { localDeviceId: membership?.localDeviceId ?? null, devices: membership?.devices ?? [] };
-  }),
+  }, "ownedDevices"),
   revokeOwnedDevice: (deviceId: string) => runQueued(runtime, async () => {
     await runtime.vault.revokeOwnedDevice(deviceId);
     await reconcileSpaceDeviceMembership(runtime);
@@ -1376,49 +1390,62 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
     runQueued(runtime, () => registerFolderAction(runtime, folder)),
   attachDownloads: (id: string) => runQueued(runtime, () => attachDownloadsAction(runtime, id)),
   detachDownloads: (id: string) => runQueued(runtime, () => detachDownloadsAction(runtime, id)),
-  sessionSharedFolders: (remoteDeviceId: string) => runQueued(runtime, async () => {
-    if (!remoteDeviceId) return [];
-    requireUnlockedRegistry(runtime);
-    const personalSpaceFolder = await runtime.vault.personalSpaceFolder();
-    if (personalSpaceFolder && runtime.settingsFolder?.id !== personalSpaceFolder.id) {
-      throw new Error("Personal-space settings storage is unavailable.");
-    }
-    // A not-yet-enrolled vault has no space device membership even if its encrypted
-    // personal-space storage already exists. Explicit root favorites can still
-    // be shared with the authenticated ordinary Syncthing peer.
-    const context = await runtime.vault.spaceDeviceMembership()
-      ? await sharedSettingsContext(runtime) : null;
-    if (context) await syncSharedFolderCredentials(runtime, context);
-    const registry = requireUnlockedRegistry(runtime);
-    const settings = await effectiveProfileSettings(runtime);
-    const shared = context?.result.settings;
-    const owned = context && settingsFolderDevices(context.membership.devices)
-      .some(id => sameDeviceId(id, remoteDeviceId));
-    const selected = new Set(Object.entries(settings.folders)
-      .filter(([, folder]) => !folder.paused &&
-        folder.favorites.some(favorite => favorite.kind === "folder" && favorite.path === ""))
-      .filter(([folderId]) => !context || shared && resolveFolderShareDevices(
-        shared.folders[folderId]?.shareTargets ?? [{ kind: "personal-space" }],
-        context.membership.devices).some(id => sameDeviceId(id, remoteDeviceId)))
-      .map(([folderId]) => folderId));
-    const documents = await Promise.all(registry.getState().filter(folder => folder.downloads && selected.has(folder.id))
-      .map(async folder => {
-      const replica = registry.getReplica(folder.id);
-      if (!replica) throw new Error("Document folder is not open.");
-      const password = await runtime.vault.folderPassword(folder.id);
-      if (!password) throw new Error("Registered folder credentials are unavailable.");
-      return {
-        id: folder.id,
-        label: folder.label,
-        replica,
-        encryption: { mode: "encrypted" as const, password },
-      };
-    }));
-    return [...(personalSpaceFolder && owned ? [{ id: personalSpaceFolder.id,
-      label: "Syncpeer personal-space settings", replica: runtime.settingsFolder!.replica,
-      internal: true, encryption: { mode: "encrypted" as const,
-        password: personalSpaceFolder.password } }] : []), ...documents];
-  }),
+  sessionSharedFolders: (remoteDeviceId: string) => {
+    const queuedAt = Date.now();
+    const trace = (event: string, details?: Record<string, unknown>) => {
+      try { runtime.options.onDiagnostic?.(event, details); }
+      catch { /* Diagnostic observers must not interrupt folder preparation. */ }
+    };
+    trace("document.session_folders.queued", { activeOperation: runtime.activeQueueOperation ?? "none" });
+    return runQueued(runtime, async () => {
+      trace("document.session_folders.queued_done", { queuedMs: Date.now() - queuedAt });
+      if (!remoteDeviceId) return [];
+      requireUnlockedRegistry(runtime);
+      const personalSpaceFolder = await runtime.vault.personalSpaceFolder();
+      if (personalSpaceFolder && runtime.settingsFolder?.id !== personalSpaceFolder.id) {
+        throw new Error("Personal-space settings storage is unavailable.");
+      }
+      // A not-yet-enrolled vault has no space device membership even if its encrypted
+      // personal-space storage already exists. Explicit root favorites can still
+      // be shared with the authenticated ordinary Syncthing peer.
+      const membership = await runtime.vault.spaceDeviceMembership();
+      trace("document.session_folders.membership_done");
+      const context = membership ? await sharedSettingsContext(runtime) : null;
+      trace("document.session_folders.context_done");
+      if (context) await syncSharedFolderCredentials(runtime, context);
+      trace("document.session_folders.credentials_done");
+      const registry = requireUnlockedRegistry(runtime);
+      const settings = await effectiveProfileSettings(runtime);
+      trace("document.session_folders.settings_done");
+      const shared = context?.result.settings;
+      const owned = context && settingsFolderDevices(context.membership.devices)
+        .some(id => sameDeviceId(id, remoteDeviceId));
+      const selected = new Set(Object.entries(settings.folders)
+        .filter(([, folder]) => !folder.paused &&
+          folder.favorites.some(favorite => favorite.kind === "folder" && favorite.path === ""))
+        .filter(([folderId]) => !context || shared && resolveFolderShareDevices(
+          shared.folders[folderId]?.shareTargets ?? [{ kind: "personal-space" }],
+          context.membership.devices).some(id => sameDeviceId(id, remoteDeviceId)))
+        .map(([folderId]) => folderId));
+      const documents = await Promise.all(registry.getState().filter(folder => folder.downloads && selected.has(folder.id))
+        .map(async folder => {
+          const replica = registry.getReplica(folder.id);
+          if (!replica) throw new Error("Document folder is not open.");
+          const password = await runtime.vault.folderPassword(folder.id);
+          if (!password) throw new Error("Registered folder credentials are unavailable.");
+          return {
+            id: folder.id, label: folder.label, replica,
+            encryption: { mode: "encrypted" as const, password },
+          };
+        }));
+      const result = [...(personalSpaceFolder && owned ? [{ id: personalSpaceFolder.id,
+        label: "Syncpeer personal-space settings", replica: runtime.settingsFolder!.replica,
+        internal: true, encryption: { mode: "encrypted" as const,
+          password: personalSpaceFolder.password } }] : []), ...documents];
+      trace("document.session_folders.done", { folderCount: result.length });
+      return result;
+    }, "sessionSharedFolders");
+  },
   favoriteSyncState: (folderId: string) => runQueued(runtime, async () => {
     const { bytes, key } = favoriteStateTarget(runtime, folderId);
     return loadFavoriteSyncState(bytes, key);
@@ -1512,6 +1539,8 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     recoveryIssues: new Map(),
     vault: undefined as unknown as Vault,
     registry: undefined,
+    settingsRevision: 0,
+    refreshedSettingsRevision: -1,
     nextHandle: 0,
     closed: false,
     queue: Promise.resolve(),

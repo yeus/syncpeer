@@ -1,5 +1,19 @@
 import type { createDocumentFilesystem } from "./documentFilesystem.js";
 
+/** Changes that can invalidate a listener's prepared peer-specific folder view. */
+export const changesSessionConfiguration = (operation: unknown, path?: unknown): boolean =>
+  typeof operation === "string" && !(
+    ["savePersonalSpaceSetting", "resolvePersonalSpaceConflict"].includes(operation) &&
+    Array.isArray(path) && path.length === 3 && path[0] === "folders" &&
+    typeof path[1] === "string" && path[2] === "retention"
+  ) && [
+    "createVault", "unlock", "unlockRemembered", "lock", "restoreRecoveryBackup",
+    "register", "attachDownloads", "detachDownloads", "saveProfileSettings",
+    "savePersonalSpaceSetting", "resolvePersonalSpaceConflict", "appendPersonalSpaceChange",
+    "importPairingTransfer", "revokeOwnedDevice", "recoverOwnedDevice",
+    "saveConnectionPasswords", "mergeConnectionPasswords",
+  ].includes(operation);
+
 /** Validate the native/UI boundary before dispatching to the one document owner. */
 export async function dispatchDocumentCommand(documents: ReturnType<typeof createDocumentFilesystem>, input: unknown): Promise<unknown> {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid document command.");

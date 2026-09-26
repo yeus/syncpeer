@@ -29,6 +29,27 @@ import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 import org.json.JSONArray
 
+internal fun safeReleaseFailureReason(error: Throwable): String? {
+  val messages = generateSequence(error as Throwable?) { it.cause }.mapNotNull { it.message }.toList()
+  return when {
+    messages.any { it.contains("No peer connected to the Android background service for safe release") } ->
+      "No live peer session is available for safe release; the local copy was kept."
+    messages.any { it.contains("a connected holder's complete folder manifest differs from this device") } ->
+      "The connected holder's complete folder differs from this device; safe release was cancelled."
+    messages.any { it.contains("a connected holder could not provide every verified file block") } ->
+      "The connected holder could not provide every verified file block; safe release was cancelled."
+    messages.any { it.contains("a named holder is not connected with its authenticated identity") } ->
+      "A named copy holder is not connected with its approved identity; safe release was cancelled."
+    messages.any { it.contains("Safe release needs more online verified complete copies") } ->
+      "Safe release needs more online verified complete copies."
+    messages.any { it.contains("Folder or trusted settings changed during release verification") } ->
+      "The folder or trusted settings changed during verification; safe release was cancelled."
+    messages.any { it.contains("Close this folder's open documents before releasing its local copy") } ->
+      "Close this folder's open documents before releasing its local copy."
+    else -> null
+  }
+}
+
 class SyncpeerDocumentsProvider : DocumentsProvider() {
   @Volatile private var runtimeSummary = "Starting document access…"
   private var bound = false
@@ -177,7 +198,9 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
         val status = owner.backgroundSessionStatus()
         val phase = status.optString("phase", "unknown")
         val reason = status.optString("error").takeIf { it.isNotBlank() && it != "null" }
-        throw IllegalStateException("Background peer session is $phase${reason?.let { ": $it" } ?: ""}.", error)
+        val verification = if (request.optString("mode") == "safe") safeReleaseFailureReason(error) else null
+        throw IllegalStateException(verification ?: "Local copy release did not complete while the background peer " +
+          "session was $phase${reason?.let { ": $it" } ?: ""}; check the folder's current state.", error)
       }
     } else command(JSONObject(checkNotNull(arg)))
     return Bundle().apply { putString("result", JSONObject().put("result", result ?: JSONObject.NULL).toString()) }
@@ -254,6 +277,11 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       return owner.command(input).get().opt("result").takeUnless { it == JSONObject.NULL }
     }
     catch (error: Exception) {
+      if (context!!.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        android.util.Log.w("SyncpeerRuntime", "provider ${input.optString("operation")} failed: " +
+          generateSequence(error as Throwable?) { it.cause }.take(4)
+            .joinToString(">") { it.javaClass.simpleName })
+      }
       throw FileNotFoundException(privateStorageFailureMessage(error)
         ?: "Document operation failed. Check Folder settings in Syncpeer.")
     }

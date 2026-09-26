@@ -65,8 +65,23 @@ async function openFolder(peer: WebdriverIO.Browser, name: string) {
   await peer.$("[data-testid='tab-folders']").click();
   const row = peer.$(`//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(name)}]`);
   await row.waitForExist({ timeout: 30_000 });
-  await row.click();
-  await peer.$("#folder-upload-input").waitForExist({ timeout: 30_000 });
+  const action = row.$("./ancestor::li[1]//*[contains(@class,'item-main-hit-clickable')]");
+  await action.waitForExist({ timeout: 30_000,
+    timeoutMsg: "The shared folder is listed but cannot be opened with its approved credential." });
+  await action.click();
+  try { await peer.$("#folder-upload-input").waitForExist({ timeout: 30_000 }); }
+  catch (error) {
+    const state = await peer.execute(() => ({
+      status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "missing",
+      notice: document.querySelector("[data-testid='folder-root-empty-notice']")?.textContent?.trim() ?? "none",
+      folderView: document.querySelector("[data-testid='folder-view-status']")?.textContent?.trim() ?? "missing",
+      visibleAlerts: [...document.querySelectorAll("p[role='alert']")].map(value => value.textContent?.trim()),
+      visibleErrors: [...document.querySelectorAll("p.error, li.empty")].map(value => value.textContent?.trim()).filter(Boolean).slice(-4),
+      events: (window as typeof window & { __syntheticEvents?: string[] }).__syntheticEvents?.slice(-30) ?? [],
+      failures: (window as typeof window & { __syntheticFailures?: string[] }).__syntheticFailures ?? [],
+    }));
+    throw new Error(`The folder did not open after clicking its active row: ${JSON.stringify(state)}`, { cause: error });
+  }
 }
 
 async function uploadFile(peer: WebdriverIO.Browser, name: string, content: string) {
@@ -94,25 +109,35 @@ async function waitForFile(peer: WebdriverIO.Browser, name: string) {
 }
 
 async function acceptPendingApproval(peer: WebdriverIO.Browser) {
-  const message = await peer.getAlertText().catch(() => "");
-  if (!message) return;
-  assert.match(message, /Confirm that both devices display pairing code/);
-  await peer.acceptAlert();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const message = await peer.getAlertText().catch(() => "");
+    if (!message) return;
+    if (message === "Name this Syncpeer client (shown to remote devices):") {
+      await peer.sendAlertText("synthetic-packaged-peer");
+      await peer.acceptAlert();
+      continue;
+    }
+    assert.match(message, /Confirm that both devices display pairing code/);
+    await peer.acceptAlert();
+  }
 }
 
 async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
   await peer.execute(() => {
     const observed = window as typeof window & { __syntheticFolderCounts?: number[];
       __syntheticEvents?: string[]; __syntheticFailures?: string[]; __syntheticIndexes?: string[];
+      __syntheticReplicaStates?: string[];
       __syntheticSelectionEvents?: number; __syntheticNativeCalls?: Record<string, number>;
-      __syntheticHandshakeStages?: string[] };
+      __syntheticHandshakeStages?: string[]; __syntheticQueueStages?: string[] };
     observed.__syntheticFolderCounts = [];
     observed.__syntheticEvents = [];
     observed.__syntheticFailures = [];
     observed.__syntheticIndexes = [];
+    observed.__syntheticReplicaStates = [];
     observed.__syntheticSelectionEvents = 0;
     observed.__syntheticNativeCalls = {};
     observed.__syntheticHandshakeStages = [];
+    observed.__syntheticQueueStages = [];
     const summary = [...document.querySelectorAll("summary")]
       .find(value => value.textContent?.includes("View logs"));
     const list = summary?.parentElement?.querySelector("ul.list");
@@ -122,33 +147,56 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
         if (!(node instanceof Element) || !node.matches("li")) continue;
         for (const entry of node.querySelectorAll(".item-meta")) {
         const event = entry.textContent?.split(" | ").at(-1)?.trim();
+        if (event === "document.session_folders.queued") {
+          const details = node.querySelector("pre.log-details")?.textContent;
+          const stage = details ? JSON.parse(details) as {
+            operation?: string; activeOperation?: string; queuedMs?: number; elapsedMs?: number } : {};
+          observed.__syntheticQueueStages?.push(`${event}:${stage.operation ?? stage.activeOperation ?? "?"}:` +
+            `${stage.queuedMs ?? stage.elapsedMs ?? 0}`);
+          observed.__syntheticQueueStages?.splice(0, Math.max(0, observed.__syntheticQueueStages.length - 20));
+        }
         if (event?.startsWith("tauri.invoke.")) {
           const details = node.querySelector("pre.log-details")?.textContent;
           const command = details ? (JSON.parse(details) as { command?: string }).command : undefined;
-          if (command === "syncpeer_tls_accept" || command === "syncpeer_tls_listen") {
+          if (["syncpeer_tls_accept", "syncpeer_tls_listen", "syncpeer_replica_storage",
+            "syncpeer_profile_storage_root", "syncpeer_vault_secret"].includes(command ?? "")) {
             const key = `${event}:${command}`;
             observed.__syntheticNativeCalls![key] = (observed.__syntheticNativeCalls![key] ?? 0) + 1;
           }
         }
-        if (event && /^(client\.|core\.)/.test(event) &&
+        if (event && /^(client\.|core\.|document\.)/.test(event) &&
           !observed.__syntheticEvents?.includes(event)) observed.__syntheticEvents?.push(event);
-        if (event?.startsWith("core.bep.handshake.") || event === "core.bep.cluster_config.wait") {
+        if (event?.startsWith("core.bep.handshake.") || event?.startsWith("core.incoming.trace.") ||
+          event === "core.bep.cluster_config.wait") {
           const details = node.querySelector("pre.log-details")?.textContent;
           if (details) {
             const stage = JSON.parse(details) as { direction?: string; connectedHost?: string;
               connectedPort?: number };
-            const summary = `${event}:${stage.direction ?? "unknown"}:${stage.connectedHost ?? "?"}:${stage.connectedPort ?? "?"}`;
+            const summary = `${Date.now()}:${event}:${stage.direction ?? "unknown"}:` +
+              `${stage.connectedHost ?? "?"}:${stage.connectedPort ?? "?"}`;
             if (!observed.__syntheticHandshakeStages?.includes(summary)) {
               observed.__syntheticHandshakeStages?.push(summary);
             }
           }
         }
         if (event === "core.upload.request.failed" || event === "core.replica.receive.failed" ||
+          event === "core.replica.scan.failed" ||
           event === "core.socket.closed" || event === "core.incoming.failed") {
           const details = entry.closest("li")?.querySelector("pre.log-details")?.textContent;
           if (details) {
             const message = (JSON.parse(details) as { message?: string }).message;
             if (message && !observed.__syntheticFailures?.includes(message)) observed.__syntheticFailures?.push(message);
+          }
+        }
+        if (event === "core.replica.index.decision" || event === "core.replica.index.receive.done") {
+          const details = entry.closest("li")?.querySelector("pre.log-details")?.textContent;
+          if (details) {
+            const state = JSON.parse(details) as { internal?: boolean; hasReceiver?: boolean;
+              paused?: boolean; needsPassword?: boolean; fileCount?: number; changed?: boolean };
+            const summary = JSON.stringify({ event, internal: state.internal,
+              hasReceiver: state.hasReceiver, paused: state.paused,
+              needsPassword: state.needsPassword, fileCount: state.fileCount, changed: state.changed });
+            if (!observed.__syntheticReplicaStates?.includes(summary)) observed.__syntheticReplicaStates?.push(summary);
           }
         }
         if (event === "core.index.received" || event === "core.index.applied") {
@@ -215,19 +263,25 @@ async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
     __syntheticIndexes?: string[] }).__syntheticIndexes ?? []);
   const failures = await peer.execute(() => (window as typeof window & {
     __syntheticFailures?: string[] }).__syntheticFailures ?? []);
+  const replicaStates = await peer.execute(() => (window as typeof window & {
+    __syntheticReplicaStates?: string[] }).__syntheticReplicaStates ?? []);
+  const queueStages = await peer.execute(() => (window as typeof window & {
+    __syntheticQueueStages?: string[] }).__syntheticQueueStages ?? []);
   const logSummary = await peer.execute(() => [...document.querySelectorAll("summary")]
     .find(element => element.textContent?.includes("View logs"))?.textContent?.trim() ?? "missing");
   throw new Error(`The approved folder credential did not reach the joined desktop. ` +
     `Visible elsewhere: ${sawFolderElsewhere}; vault locked: ${vaultLocked}; ` +
     `settings conflict: ${hasSharedConflict}; settings alert: ${lastAlert || "none"}; ` +
     `${logSummary}; recent events: ${events.join(",")}; index summaries: ${indexes.join(",")}; ` +
-    `receive failures: ${failures.join(",")}.`);
+    `receive failures: ${failures.join(",")}; replica states: ${replicaStates.join(",")}; ` +
+    `queue stages: ${JSON.stringify(queueStages)}.`);
 }
 
 describe("Two isolated packaged desktop apps", () => {
   it("start with distinct protected device identities", async () => {
     const { owner, joiner } = peers();
     await Promise.all([owner, joiner].map(async peer => {
+      await peer.$("[data-testid='tab-devices']").waitForExist({ timeout: 60_000 });
       await peer.$("[data-testid='tab-devices']").click();
       await peer.$("[data-testid='current-device-id']").waitForExist({ timeout: 60_000 });
       await peer.waitUntil(async () => /^[A-Z2-7-]{40,}$/.test(
@@ -283,6 +337,11 @@ describe("Two isolated packaged desktop apps", () => {
     }));
     const memberships: string[][] = [];
     for (const peer of [owner, joiner]) {
+      await peer.waitUntil(async () => peer.execute(() => {
+        const heading = [...document.querySelectorAll("h2")]
+          .find(value => value.textContent?.trim() === "Devices with access to this space");
+        return (heading?.parentElement?.querySelectorAll("code").length ?? 0) >= 2;
+      }), { timeout: 30_000, timeoutMsg: "The signed trusted-device list did not finish refreshing." });
       const listed = await peer.execute(() => {
         const heading = [...document.querySelectorAll("h2")]
           .find(value => value.textContent?.trim() === "Devices with access to this space");
@@ -361,22 +420,31 @@ describe("Two isolated packaged desktop apps", () => {
     const acceptor = ownerAccepts ? owner : joiner;
     const dialer = ownerAccepts ? joiner : owner;
     await acceptor.$("[data-testid='expert-connection-control']").click();
-    await dialer.$("[data-testid='expert-connection-control']").click();
-    try { await Promise.all([owner, joiner].map(peer => peer.waitUntil(async () => {
-      try {
-        return (await peer.$("[data-testid='connection-status']").getText()).includes("Connected");
-      } catch (error) {
-        if (String(error).includes("unexpected alert open")) {
-          await acceptPendingApproval(peer);
-          return false;
+    const acceptorPort = ownerAccepts ? ownerPort : joinerPort;
+    try {
+      await acceptor.waitUntil(() => isListening(acceptorPort), {
+        timeout: 30_000, timeoutMsg: "The packaged acceptor did not open its configured LAN listener.",
+      });
+      await dialer.$("[data-testid='expert-connection-control']").click();
+      await Promise.all([owner, joiner].map(peer => peer.waitUntil(async () => {
+        try {
+          return (await peer.$("[data-testid='connection-status']").getText()).includes("Connected");
+        } catch (error) {
+          if (String(error).includes("unexpected alert open")) {
+            await acceptPendingApproval(peer);
+            return false;
+          }
+          throw error;
         }
-        throw error;
-      }
-    }, { timeout: 120_000, timeoutMsg: "Packaged desktop peers did not connect." }))); }
-    catch (error) {
+      }, { timeout: 120_000, timeoutMsg: "Packaged desktop peers did not connect." })));
+    } catch (error) {
       const phases = await Promise.all([owner, joiner].map(async peer => ({
         phase: await peer.$("[data-testid='connection-status']").getText().catch(() => "unavailable"),
         error: await peer.$("p.error").getText().catch(() => "none"),
+        control: await peer.$("[data-testid='expert-connection-control']").getText().catch(() => "unavailable"),
+        host: await peer.$("[data-testid='connection-host']").getValue().catch(() => "unavailable"),
+        port: await peer.$("[data-testid='connection-port']").getValue().catch(() => "unavailable"),
+        listenPort: await peer.$("[data-testid='connection-listen-port']").getValue().catch(() => "unavailable"),
         events: await peer.execute(() => (window as typeof window & {
           __syntheticEvents?: string[] }).__syntheticEvents ?? []),
         failures: await peer.execute(() => (window as typeof window & {
@@ -389,6 +457,8 @@ describe("Two isolated packaged desktop apps", () => {
           __syntheticSelectionEvents?: number }).__syntheticSelectionEvents ?? 0),
         nativeCalls: await peer.execute(() => (window as typeof window & {
           __syntheticNativeCalls?: Record<string, number> }).__syntheticNativeCalls ?? {}),
+        queueStages: await peer.execute(() => (window as typeof window & {
+          __syntheticQueueStages?: string[] }).__syntheticQueueStages ?? []),
       })));
       const listeners = await Promise.all([ownerPort, joinerPort, 22000].map(isListening));
       throw new Error(`Packaged desktop connection failed: ${JSON.stringify(phases)}; ` +
@@ -415,9 +485,16 @@ describe("Two isolated packaged desktop apps", () => {
     }
     for (const peer of [owner, joiner]) {
       await peer.$("[data-testid='expert-connection-control']").click();
+      await peer.waitUntil(async () =>
+        (await peer.$("[data-testid='expert-connection-control']").getText()).includes("Resume automatic connection") &&
+        !(await peer.$("[data-testid='connection-status']").getText()).includes("Connected"),
+      { timeout: 30_000, timeoutMsg: "The prior packaged session did not finish disconnecting." });
     }
     for (const peer of [owner, joiner]) {
       await peer.$("[data-testid='expert-connection-control']").click();
+      await peer.waitUntil(async () =>
+        (await peer.$("[data-testid='expert-connection-control']").getText()).includes("Pause automatic connection"),
+      { timeout: 30_000, timeoutMsg: "Automatic reconnection did not resume." });
     }
     await Promise.all([owner, joiner].map(peer => peer.waitUntil(async () =>
       (await peer.$("[data-testid='connection-status']").getText()).includes("Connected"),

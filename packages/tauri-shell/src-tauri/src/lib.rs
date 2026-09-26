@@ -660,6 +660,7 @@ type SharedTlsStore = Arc<Mutex<TlsSessionStore>>;
 struct TlsListenerState {
     stop: Arc<AtomicBool>,
     accepted: Mutex<mpsc::Receiver<Result<TlsAcceptResponse, String>>>,
+    wake_accept: mpsc::Sender<Result<TlsAcceptResponse, String>>,
 }
 
 #[derive(Default)]
@@ -790,6 +791,20 @@ impl ClientCertVerifier for AnyPresentedClientCertificate {
 
 fn tauri_log(message: &str) {
     eprintln!("[syncpeer-tauri] {message}");
+}
+
+fn trace_tls(event: &str, session_id: u64, bytes: usize) {
+    if std::env::var("SYNCPEER_TRACE_TLS").as_deref() == Ok("1") {
+        let entry = format!("timeMs={} pid={} session={} event={} bytes={}",
+            now_ms(), std::process::id(), session_id, event, bytes);
+        eprintln!("[syncpeer-tls] {entry}");
+        if let Ok(dir) = std::env::var("SYNCPEER_TRACE_TLS_DIR") {
+            let path = Path::new(&dir).join(format!("{}.log", std::process::id()));
+            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{entry}");
+            }
+        }
+    }
 }
 
 fn diagnostic_event(value: &str) -> &str {
@@ -1639,32 +1654,40 @@ fn read_tls_session(
     store: &SharedTlsStore,
     request: TlsReadRequest,
 ) -> Result<TlsReadResponse, String> {
-    let session = get_tls_session_from_store(store, request.session_id)?;
-    let (response, result) = mpsc::channel();
-    session
-        .commands
-        .send(TlsCommand::Read {
-            max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
-            response,
-        })
-        .map_err(|_| "TLS worker stopped".to_string())?;
-    result.recv().map_err(|_| "TLS worker stopped".to_string())?
+    trace_tls("read.queued", request.session_id, 0);
+    let result = (|| {
+        let session = get_tls_session_from_store(store, request.session_id)?;
+        let (response, result) = mpsc::channel();
+        session.commands.send(TlsCommand::Read {
+            max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024), response,
+        }).map_err(|_| "TLS worker stopped".to_string())?;
+        result.recv().map_err(|_| "TLS worker stopped".to_string())?
+    })();
+    let event = match &result {
+        Ok(response) if response.eof => "read.eof",
+        Ok(_) => "read.completed",
+        Err(_) => "read.failed",
+    };
+    trace_tls(event, request.session_id, result.as_ref().map_or(0, |response| response.bytes.len()));
+    result
 }
 
 fn write_tls_session(
     store: &SharedTlsStore,
     request: TlsWriteRequest,
 ) -> Result<(), String> {
-    let session = get_tls_session_from_store(store, request.session_id)?;
-    let (response, result) = mpsc::channel();
-    session
-        .commands
-        .send(TlsCommand::Write {
-            bytes: request.bytes,
-            response,
-        })
-        .map_err(|_| "TLS worker stopped".to_string())?;
-    result.recv().map_err(|_| "TLS worker stopped".to_string())?
+    trace_tls("write.queued", request.session_id, request.bytes.len());
+    let session_id = request.session_id;
+    let bytes = request.bytes.len();
+    let result = (|| {
+        let session = get_tls_session_from_store(store, request.session_id)?;
+        let (response, result) = mpsc::channel();
+        session.commands.send(TlsCommand::Write { bytes: request.bytes, response })
+            .map_err(|_| "TLS worker stopped".to_string())?;
+        result.recv().map_err(|_| "TLS worker stopped".to_string())?
+    })();
+    trace_tls(if result.is_ok() { "write.completed" } else { "write.failed" }, session_id, bytes);
+    result
 }
 
 fn close_tls_session(
@@ -1770,6 +1793,7 @@ fn open_tls_listener(
     let worker_stop = Arc::clone(&stop);
     start_local_announce_worker(announce_certificate, port, Arc::clone(&stop))?;
     let (sender, receiver) = mpsc::channel();
+    let wake_accept = sender.clone();
     thread::Builder::new().name("syncpeer-tls-listener".to_string()).spawn(move || {
         let config = Arc::new(config);
         while !worker_stop.load(Ordering::Acquire) {
@@ -1826,6 +1850,7 @@ fn open_tls_listener(
     guard.next_id = listener_id;
     guard.listeners.insert(listener_id, Arc::new(TlsListenerState {
         stop, accepted: Mutex::new(receiver),
+        wake_accept,
     }));
     Ok(TlsListenResponse { listener_id, port })
 }
@@ -1850,6 +1875,7 @@ fn close_tls_listener(store: &SharedTlsListenerStore,
         .listeners.remove(&request.listener_id);
     if let Some(listener) = listener {
         listener.stop.store(true, Ordering::Release);
+        let _ = listener.wake_accept.send(Err("TLS listener stopped.".to_string()));
     }
     Ok(())
 }
@@ -3179,6 +3205,7 @@ fn open_relay_listener(session_store: SharedTlsStore, listener_store: SharedTlsL
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let (sender, receiver) = mpsc::channel();
+    let wake_accept = sender.clone();
     let timeout_ms = request.handshake_timeout_ms;
     thread::Builder::new().name("syncpeer-relay-listener".into()).spawn(move || {
         let server_config = Arc::new(server_config);
@@ -3218,7 +3245,7 @@ fn open_relay_listener(session_store: SharedTlsStore, listener_store: SharedTlsL
     let mut guard = listener_store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?;
     let id = guard.next_id.saturating_add(1).max(1);
     guard.next_id = id;
-    guard.listeners.insert(id, Arc::new(TlsListenerState { stop, accepted: Mutex::new(receiver) }));
+    guard.listeners.insert(id, Arc::new(TlsListenerState { stop, accepted: Mutex::new(receiver), wake_accept }));
     Ok(TlsListenResponse { listener_id: id, port: 0 })
 }
 
@@ -5218,11 +5245,60 @@ mod tests {
         assert_eq!(read_tls_session(&sessions, TlsReadRequest {
             session_id: opened.session_id, max_bytes: Some(16),
         }).unwrap().bytes, b"server");
+        let client_sessions = sessions.clone();
+        let client_session_id = opened.session_id;
+        let client_read = thread::spawn(move || read_tls_session(&client_sessions, TlsReadRequest {
+            session_id: client_session_id, max_bytes: Some(16),
+        }));
+        let server_sessions = sessions.clone();
+        let server_session_id = accepted.session_id;
+        let server_read = thread::spawn(move || read_tls_session(&server_sessions, TlsReadRequest {
+            session_id: server_session_id, max_bytes: Some(16),
+        }));
+        thread::sleep(Duration::from_millis(20));
+        write_tls_session(&sessions, TlsWriteRequest {
+            session_id: opened.session_id, bytes: b"client-again".to_vec(),
+        }).unwrap();
+        write_tls_session(&sessions, TlsWriteRequest {
+            session_id: accepted.session_id, bytes: b"server-again".to_vec(),
+        }).unwrap();
+        assert_eq!(client_read.join().unwrap().unwrap().bytes, b"server-again");
+        assert_eq!(server_read.join().unwrap().unwrap().bytes, b"client-again");
         close_tls_listener(&listeners, TlsListenerCloseRequest {
             listener_id,
         }).unwrap();
         close_tls_session(&sessions, TlsCloseRequest { session_id: opened.session_id }).unwrap();
         close_tls_session(&sessions, TlsCloseRequest { session_id: accepted.session_id }).unwrap();
+    }
+
+    #[test]
+    fn native_tls_listener_close_wakes_pending_accept() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let sessions = Arc::new(Mutex::new(TlsSessionStore::default()));
+        let listeners = Arc::new(Mutex::new(TlsListenerStore::default()));
+        let listener = open_tls_listener(sessions, listeners.clone(), TlsListenRequest {
+            host: "127.0.0.1".into(), port: 0,
+            cert_pem: identity.serialize_pem().unwrap(),
+            key_pem: identity.serialize_private_key_pem(),
+            alpn_protocols: vec!["bep/1.0".into()], handshake_timeout_ms: Some(2_000),
+        }).unwrap();
+        let listener_id = listener.listener_id;
+        let state = listeners.lock().unwrap().listeners.get(&listener_id).unwrap().clone();
+        let accepting = listeners.clone();
+        let pending = thread::spawn(move || accept_tls_listener(&accepting, TlsAcceptRequest {
+            listener_id, timeout_ms: Some(2_000),
+        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while state.accepted.try_lock().is_ok() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.accepted.try_lock().is_err(), "The accept call did not start waiting.");
+        let started = std::time::Instant::now();
+        close_tls_listener(&listeners, TlsListenerCloseRequest { listener_id }).unwrap();
+        let result = pending.join().unwrap();
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500),
+            "Closing a listener must not wait for its accept timeout.");
     }
 
     #[test]

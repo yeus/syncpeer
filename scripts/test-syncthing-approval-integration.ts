@@ -13,10 +13,13 @@ const main = async (): Promise<void> => {
   let fixture: Awaited<ReturnType<typeof createLanFixture>> | null = null;
   try {
     const client = generateSyncthingIdentity(path.join(root, "client"));
+    const emulator = generateSyncthingIdentity(path.join(root, "emulator"));
     fixture = await createLanFixture({
       root: path.join(root, "server"),
       serverHost: "relay-only",
       mode: "relay",
+      untrustedDeviceId: emulator.deviceId,
+      untrustedDeviceAddress: "tcp://127.0.0.1:23456",
     });
 
     const headers = { "X-API-Key": fixture.apiKey };
@@ -34,6 +37,14 @@ const main = async (): Promise<void> => {
     assert.ok(options.listenAddresses?.includes(
       "dynamic+https://relays.syncthing.net/endpoint",
     ));
+
+    const emulatorResponse = await fetch(
+      fixture.syncGuiUrl + "/rest/config/devices/" + encodeURIComponent(emulator.deviceId),
+      { headers },
+    );
+    assert.equal(emulatorResponse.status, 200);
+    const emulatorDevice = await emulatorResponse.json() as { addresses?: string[] };
+    assert.deepEqual(emulatorDevice.addresses, ["tcp://127.0.0.1:23456"]);
 
     await fixture.approveDevice({ deviceId: client.deviceId });
 

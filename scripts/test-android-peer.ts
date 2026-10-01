@@ -6,41 +6,51 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { create, emulatorArguments, profile } from "./android-emulator.mjs";
 import {
   adb,
+  listDeviceSerials,
+  listDeviceTransports,
   run,
   stopEmulator,
   uninstallIfPresent,
   waitForBoot,
 } from "./test-android.mjs";
-import { createLanFixture } from "./lan-test/syncthing.ts";
+import { createLanFixture, freePort } from "./lan-test/syncthing.ts";
 
 const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
 const appApk = "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk";
 const editorApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk";
 const peerApiLevel = 29;
+type RunningEmulator = { child: ChildProcess; serial: string };
 
-const startEmulator = async (): Promise<ChildProcess> => {
+const startEmulator = async (): Promise<RunningEmulator> => {
   const selected = profile("compat");
   create(selected);
+  const knownSerials = listDeviceTransports();
   const child = spawn("emulator", emulatorArguments(selected, ["-no-snapshot"]), {
     stdio: "ignore",
   });
-  await waitForBoot(child, selected.avdName);
-  return child;
+  try {
+    const serial = await waitForBoot(child, selected.avdName, knownSerials);
+    process.env.ANDROID_SERIAL = serial;
+    return { child, serial };
+  } catch (error) {
+    child.kill("SIGTERM");
+    throw error;
+  }
 };
 
-const killEmulatorAbruptly = async (child: ChildProcess): Promise<void> => {
-  child.kill("SIGKILL");
+const killEmulatorAbruptly = async (emulator: RunningEmulator): Promise<void> => {
+  emulator.child.kill("SIGKILL");
   const deadline = Date.now() + 30_000;
-  while (child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
+  while (emulator.child.exitCode === null && emulator.child.signalCode === null && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  if (child.exitCode === null && child.signalCode === null) {
+  if (emulator.child.exitCode === null && emulator.child.signalCode === null) {
     throw new Error("Android emulator did not terminate after SIGKILL.");
   }
   const deviceDeadline = Date.now() + 30_000;
   while (Date.now() < deviceDeadline) {
-    if (!adb(["devices"]).split("\n").some((line) => /\sdevice(?:\s|$)/.test(line))) return;
+    if (!listDeviceSerials().includes(emulator.serial)) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("Abruptly terminated emulator remained visible to adb.");
@@ -111,8 +121,11 @@ const setPeerPaused = async (guiUrl: string, apiKey: string, paused: boolean): P
 
 const main = async (): Promise<void> => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-peer-"));
-  let emulator: ChildProcess | null = null;
+  const previousSerial = process.env.ANDROID_SERIAL;
+  let emulator: RunningEmulator | null = null;
   let fixture: Awaited<ReturnType<typeof createLanFixture>> | null = null;
+  let forwardedPort: number | null = null;
+  const outboundOnly = process.env.SYNCPEER_ANDROID_PEER_OUTBOUND_ONLY === "1";
   try {
     emulator = await startEmulator();
     uninstallIfPresent(editorPackage);
@@ -134,14 +147,21 @@ const main = async (): Promise<void> => {
     if (fs.readFileSync(runtimeProbePath, "utf8").trim() !== "supported") {
       throw new Error("Android document runtime is unavailable; real-peer acceptance cannot be skipped.");
     }
+    if (!outboundOnly) {
+      forwardedPort = await freePort();
+      run("adb", ["forward", `tcp:${forwardedPort}`, "tcp:22000"]);
+    }
     fixture = await createLanFixture({
       root: path.join(root, "host"),
       serverHost: "10.0.2.2",
       untrustedDeviceId: deviceId,
+      untrustedDeviceAddress: outboundOnly ? "tcp://127.0.0.1:9" : `tcp://127.0.0.1:${forwardedPort}`,
       mode: "direct",
+      publicNetwork: false,
       encryptedFolderType: "sendreceive",
       includeBlob: false,
     });
+    run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
     // The ordinary Android transfer suite covers 128 MiB. This fixture stays
     // smaller so it can prove multi-block journal recovery plus a full
     // DocumentsProvider hash within emulator time limits.
@@ -150,7 +170,7 @@ const main = async (): Promise<void> => {
       ...process.env,
       SYNCPEER_DEV_SERVER_DEVICE_ID: fixture.fixture.remoteDeviceId,
       SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
-      SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2",
+      SYNCPEER_ANDROID_DIRECT_HOST: "127.0.0.1",
       SYNCPEER_ANDROID_DIRECT_PORT: String(fixture.fixture.directPort),
       SYNCPEER_E2E_FOLDER_ID: fixture.fixture.encryptedFolderId,
       SYNCPEER_E2E_FOLDER_TITLE: fixture.fixture.encryptedFolderId,
@@ -186,17 +206,50 @@ const main = async (): Promise<void> => {
     );
     await killEmulatorAbruptly(emulator);
     emulator = await startEmulator();
+    if (forwardedPort !== null) run("adb", ["forward", `tcp:${forwardedPort}`, "tcp:22000"]);
+    run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
     runPhase("--verify-transfer-power-cut", env);
 
     await setPeerPaused(fixture.syncGuiUrl, fixture.apiKey, true);
     runPhase("--prepare-edit-power-cut", env);
     await killEmulatorAbruptly(emulator);
     emulator = await startEmulator();
+    if (forwardedPort !== null) run("adb", ["forward", `tcp:${forwardedPort}`, "tcp:22000"]);
+    run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
     await setPeerPaused(fixture.syncGuiUrl, fixture.apiKey, false);
     runPhase("--verify-edit-power-cut", env);
     console.log("Android real-peer, cross-app, and abrupt-termination acceptance passed.");
+  } catch (error) {
+    if (fixture) {
+      try {
+        const headers = { "X-API-Key": fixture.apiKey };
+        const [connections, folder] = await Promise.all([
+          fetch(`${fixture.syncGuiUrl}/rest/system/connections`, { headers })
+            .then(response => response.json()) as Promise<{ connections?: Record<string, { connected?: boolean }> }>,
+          fetch(`${fixture.syncGuiUrl}/rest/db/status?folder=${encodeURIComponent(fixture.fixture.encryptedFolderId)}`,
+            { headers }).then(response => response.json()) as Promise<{
+              localFiles?: number; globalFiles?: number; needFiles?: number; state?: string }>,
+        ]);
+        console.error("Synthetic Syncthing failure state:", JSON.stringify({
+          connectedPeers: Object.values(connections.connections ?? {}).filter(value => value.connected).length,
+          localFiles: folder.localFiles, globalFiles: folder.globalFiles,
+          needFiles: folder.needFiles, folderState: folder.state,
+        }));
+      } catch { console.error("Synthetic Syncthing failure state could not be read."); }
+    }
+    throw error;
   } finally {
-    if (emulator) await stopEmulator(emulator);
+    if (fixture) {
+      try { adb(["reverse", "--remove", `tcp:${fixture.fixture.directPort}`]); }
+      catch { /* The emulator may already have been abruptly terminated. */ }
+    }
+    if (forwardedPort !== null) {
+      try { adb(["forward", "--remove", `tcp:${forwardedPort}`]); }
+      catch { /* The emulator may already have been abruptly terminated. */ }
+    }
+    if (emulator) await stopEmulator(emulator.child, emulator.serial);
+    if (previousSerial === undefined) delete process.env.ANDROID_SERIAL;
+    else process.env.ANDROID_SERIAL = previousSerial;
     if (fixture) await fixture.stop();
     fs.rmSync(root, { recursive: true, force: true });
   }

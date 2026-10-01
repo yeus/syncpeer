@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
+import { patchManifest } from "./prepare-android-legacy-launcher.mjs";
 import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -21,6 +22,23 @@ test("Android release validation can use isolated emulator names", () => {
   assert.equal(profile("compat", "syncpeer-release").avdName, "syncpeer-release-api29");
   assert.equal(profile("modern", "syncpeer-release").avdName, "syncpeer-release-api36-play");
   assert.throws(() => profile("legacy", "../other"), /AVD prefix/);
+});
+
+test("Android builds keep the unsupported launcher separate from the Tauri activity", () => {
+  const source = '<manifest><application><activity android:name=".MainActivity">' +
+    '<intent-filter /></activity></application></manifest>';
+  const patched = patchManifest(source);
+  assert.match(patched, /MainActivity"[\s\S]*syncpeer_modern_activity/);
+  assert.match(patched, /UnsupportedAndroidActivity"[\s\S]*syncpeer_legacy_activity/);
+  assert.equal(patchManifest(patched), patched);
+  const scripts = json("packages/tauri-shell/package.json").scripts;
+  for (const name of ["prebuild:android:dev", "prebuild:android:e2e", "prebuild:android:prod"]) {
+    assert.match(scripts[name], /prepare-android-legacy-launcher/);
+  }
+  const legacy = fs.readFileSync("scripts/android-legacy-launcher/values/launcher.xml", "utf8");
+  const modern = fs.readFileSync("scripts/android-legacy-launcher/values-v26/launcher.xml", "utf8");
+  assert.match(legacy, /syncpeer_legacy_activity">true/);
+  assert.match(modern, /syncpeer_modern_activity">true/);
 });
 
 test("API 29 waits for the provisioned WebView to become current", () => {

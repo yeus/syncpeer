@@ -1,0 +1,4 @@
+<resources>
+    <bool name="syncpeer_modern_activity">true</bool>
+    <bool name="syncpeer_legacy_activity">false</bool>
+</resources>

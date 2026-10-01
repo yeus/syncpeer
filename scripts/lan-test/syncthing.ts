@@ -142,7 +142,7 @@ const escapeXml = (value: string): string => value
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&apos;");
 
-const freePort = async (): Promise<number> => {
+export const freePort = async (): Promise<number> => {
   const server = net.createServer();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -218,11 +218,12 @@ const replaceRepeatedTag = (xml: string, tag: string, values: string[]): string 
 const removeDefaultFolder = (xml: string): string =>
   xml.replace(/\s*<folder id="default"[\s\S]*?<\/folder>/, "");
 
-const addDevice = (xml: string, deviceId: string, name: string, untrusted = false): string => {
+const addDevice = (xml: string, deviceId: string, name: string, untrusted = false,
+  address = "dynamic"): string => {
   if (xml.includes('<device id="' + deviceId + '"')) return xml;
   const block = [
     '    <device id="' + escapeXml(deviceId) + '" name="' + escapeXml(name) + '" compression="metadata" introducer="false" skipIntroductionRemovals="false" introducedBy="">',
-    "        <address>dynamic</address>",
+    "        <address>" + escapeXml(address) + "</address>",
     "        <paused>false</paused>",
     "        <autoAcceptFolders>false</autoAcceptFolders>",
     "        <maxSendKbps>0</maxSendKbps>",
@@ -292,6 +293,7 @@ const configureHome = (home: string, args: {
   publicNetwork: boolean;
   trustedDeviceId?: string;
   untrustedDeviceId?: string;
+  untrustedDeviceAddress?: string;
   sharePath: string;
   encryptedSharePath: string;
   folderId: string;
@@ -314,7 +316,8 @@ const configureHome = (home: string, args: {
   if (args.trustedDeviceId) {
     xml = addDevice(xml, args.trustedDeviceId, "syncpeer-lan-client");
   }
-  if (args.untrustedDeviceId) xml = addDevice(xml, args.untrustedDeviceId, "syncpeer-lan-untrusted", true);
+  if (args.untrustedDeviceId) xml = addDevice(xml, args.untrustedDeviceId,
+    "syncpeer-lan-untrusted", true, args.untrustedDeviceAddress);
   xml = addFolder(xml, {
     id: args.folderId,
     folderPath: args.sharePath,
@@ -440,6 +443,7 @@ export const createLanFixture = async (args: {
   serverHost: string;
   trustedDeviceId?: string;
   untrustedDeviceId?: string;
+  untrustedDeviceAddress?: string;
   home?: string;
   mode: "direct" | "relay" | "quic";
   encryptedFolderType?: "sendonly" | "sendreceive";
@@ -488,6 +492,7 @@ export const createLanFixture = async (args: {
     publicNetwork: args.publicNetwork !== false,
     trustedDeviceId: args.trustedDeviceId,
     untrustedDeviceId,
+    untrustedDeviceAddress: args.untrustedDeviceAddress,
     sharePath,
     encryptedSharePath,
     folderId,

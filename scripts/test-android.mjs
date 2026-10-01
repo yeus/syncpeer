@@ -12,6 +12,8 @@ import {
 } from "./android-emulator.mjs";
 
 const editorPackage = "dev.syncpeer.synthetic.editor";
+const appApk = "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/" +
+  "universal/debug/app-universal-debug.apk";
 const editorApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/" +
   "editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk";
 const androidProject = "packages/tauri-shell/src-tauri/gen/android";
@@ -34,13 +36,28 @@ const wait = (milliseconds) => new Promise((resolve) => {
   setTimeout(resolve, milliseconds);
 });
 
-const deviceLines = () => adb(["devices"]).split("\n")
+const deviceLines = (detailed = false) => adb(detailed ? ["devices", "-l"] : ["devices"]).split("\n")
   .slice(1)
   .map((line) => line.trim())
   .filter(Boolean)
   .filter((line) => /^\S+\s+\S+/.test(line));
 
-const onlineDevices = () => deviceLines().filter((line) => /\sdevice(?:\s|$)/.test(line));
+export const listDeviceSerials = () => deviceLines().map((line) => line.split(/\s+/)[0]);
+export const listDeviceTransports = () => deviceLines(true).map((line) => {
+  const serial = line.split(/\s+/)[0];
+  const transport = line.match(/\btransport_id:(\d+)\b/)?.[1] ?? "unknown";
+  return `${serial}:${transport}`;
+});
+
+export const newEmulatorSerials = (lines, knownSerials) => {
+  const known = new Set(knownSerials);
+  return lines.flatMap((line) => {
+    const serial = line.trim().match(/^(emulator-\d+)\s+device(?:\s|$)/)?.[1];
+    if (!serial) return [];
+    const transport = line.match(/\btransport_id:(\d+)\b/)?.[1] ?? "unknown";
+    return known.has(`${serial}:${transport}`) ? [] : [serial];
+  });
+};
 
 const assertNoDevices = () => {
   const devices = deviceLines();
@@ -58,7 +75,7 @@ export const uninstallIfPresent = (packageName) => {
   run("adb", ["uninstall", packageName]);
 };
 
-export const waitForBoot = async (child, avdName) => {
+export const waitForBoot = async (child, avdName, knownSerials = []) => {
   const deadline = Date.now() + 180_000;
   let state = "not started";
   let launchError;
@@ -73,12 +90,17 @@ export const waitForBoot = async (child, avdName) => {
       throw new Error(`Android emulator ${avdName} exited before booting.`);
     }
     try {
-      const devices = onlineDevices();
-      if (devices.length === 1) {
-        state = adb(["shell", "getprop", "sys.boot_completed"], { timeout: 10_000 }).trim();
-        if (state === "1") return;
-      } else {
-        state = devices.length === 0 ? "no device" : `${devices.length} devices`;
+      const candidates = newEmulatorSerials(deviceLines(true), knownSerials);
+      state = candidates.length === 0 ? "target emulator not online" : "target emulator booting";
+      for (const serial of candidates) {
+        const name = adb(["-s", serial, "emu", "avd", "name"], { timeout: 10_000 })
+          .split(/\r?\n/)[0].trim();
+        if (name !== avdName) continue;
+        state = adb(["-s", serial, "shell", "getprop", "sys.boot_completed"], { timeout: 10_000 }).trim();
+        if (state !== "1") continue;
+        const packageManager = adb(["-s", serial, "shell", "pm", "path", "android"], { timeout: 10_000 }).trim();
+        if (packageManager.startsWith("package:")) return serial;
+        state = "package manager not ready";
       }
     } catch {
       state = "adb unavailable";
@@ -94,9 +116,10 @@ const waitForExit = async (child, timeout = 15_000) => {
   if (child.exitCode === null) child.kill("SIGTERM");
 };
 
-export const stopEmulator = async (child) => {
+export const stopEmulator = async (child, serial) => {
+  if (!/^emulator-\d+$/.test(serial)) throw new Error("A specific emulator serial is required for cleanup.");
   try {
-    adb(["emu", "kill"], { timeout: 10_000 });
+    adb(["-s", serial, "emu", "kill"], { timeout: 10_000 });
   } catch {
     // The emulator may already have exited after a failed test.
   }
@@ -104,7 +127,7 @@ export const stopEmulator = async (child) => {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
-      if (deviceLines().length === 0) return;
+      if (!listDeviceSerials().includes(serial)) return;
     } catch {
       return;
     }
@@ -149,28 +172,71 @@ const installWebViewFixture = async (fixture) => {
   throw new Error(`API 29 did not select the provisioned WebView ${fixture.version} within 30 seconds.`);
 };
 
-const runProfile = async (profileName, testArguments, prepareDevice, installEditor = false) => {
-  assertNoDevices();
+const legacyCrashFrames = (serial) => {
+  try {
+    const log = adb(["-s", serial, "logcat", "-d", "-s", "AndroidRuntime:E"], { timeout: 10_000 });
+    const crash = log.slice(log.lastIndexOf("Process: dev.syncpeer.app"));
+    if (crash === log) return { frames: [], missingTypes: [] };
+    const frames = crash.split("\n").flatMap(line => {
+      const exception = line.match(/\b(?:java|kotlin)\.[\w.$]*(?:Error|Exception)\b/);
+      const frame = line.match(/\bat ([\w.$]+)\(/);
+      return exception ? [exception[0]] : frame ? [frame[1]] : [];
+    }).slice(0, 25);
+    const missingTypes = [...new Set([...crash.matchAll(/L(?:java|javax|android|com|kotlin)\/[\w/$]+;/g)]
+      .map(match => match[0].slice(1, -1).replaceAll("/", ".")))].slice(0, 5);
+    return { frames, missingTypes };
+  } catch {
+    return { frames: [], missingTypes: [] };
+  }
+};
+
+const runProfile = async (profileName, testArguments, prepareDevice,
+  installEditor = false, allowOtherDevices = false) => {
+  if (!allowOtherDevices) assertNoDevices();
+  const knownTransports = listDeviceTransports();
   const selected = profile(profileName);
   create(selected);
   const child = spawn("emulator", emulatorArguments(selected), { stdio: "ignore" });
+  const previousSerial = process.env.ANDROID_SERIAL;
+  let serial;
   try {
-    await waitForBoot(child, selected.avdName);
+    serial = await waitForBoot(child, selected.avdName, knownTransports);
+    process.env.ANDROID_SERIAL = serial;
     uninstallIfPresent(editorPackage);
     uninstallIfPresent("dev.syncpeer.plugin.android.test");
     uninstallIfPresent("dev.syncpeer.app");
     await prepareDevice?.();
     run("npm", ["run", "android:install:e2e"]);
     if (installEditor) run("adb", ["install", "-r", editorApk]);
-    run(process.execPath, ["scripts/test-android-e2e.mjs", ...testArguments]);
+    try {
+      run(process.execPath, ["scripts/test-android-e2e.mjs", ...testArguments]);
+    } catch (error) {
+      if (profileName === "legacy") {
+        console.error("API 24 startup crash classes:", JSON.stringify(legacyCrashFrames(serial)));
+      }
+      throw error;
+    }
   } finally {
-    await stopEmulator(child);
+    if (serial) await stopEmulator(child, serial);
+    else child.kill("SIGTERM");
+    if (previousSerial === undefined) delete process.env.ANDROID_SERIAL;
+    else process.env.ANDROID_SERIAL = previousSerial;
   }
 };
 
 const main = async () => {
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-webview-"));
   try {
+    if (process.argv.includes("--legacy-smoke-only")) {
+      if (!fs.existsSync(appApk)) throw new Error("Build the Android E2E APK before the API 24 smoke.");
+      await runProfile("legacy", ["--expect-sdk", "24", "--legacy-smoke"], undefined, false, true);
+      return;
+    }
+    if (process.argv.includes("--compat-startup-only")) {
+      if (!fs.existsSync(appApk)) throw new Error("Build the Android E2E APK before the API 29 smoke.");
+      await runProfile("compat", ["--expect-sdk", "29", "--startup-smoke"], undefined, false, true);
+      return;
+    }
     run("npm", ["run", "build:android:e2e"]);
     run(path.join(androidProject, "gradlew"), [
       "-p", editorProject, "assembleDebug", "--no-daemon", "--console=plain",

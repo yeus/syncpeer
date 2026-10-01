@@ -1175,14 +1175,24 @@ const launchAndroidApp = async (forceStop = false) => {
 
 const runLegacyAndroidSmoke = async () => {
   if (androidSdkVersion() >= 26) throw new Error("Legacy smoke requires Android API below 26.");
-  const cdp = await launchAndroidApp(true);
+  runAdb(["shell", "am", "force-stop", packageName]);
+  runAdb(["shell", "monkey", "-p", packageName, "1"]);
+  await assertForeground();
+  const dumpPath = "/sdcard/syncpeer-legacy-smoke.xml";
+  let hierarchy;
   try {
-    await waitForUiCondition(cdp,
-      'document.body.innerText.includes("Android 8 or newer")',
-      "clear unsupported document-service message", 30_000);
-    await assertForeground();
-    console.log("API 24 installed and started with a clear Android 8+ document-service requirement.");
-  } finally { cdp.close(); }
+    runAdb(["shell", "uiautomator", "dump", dumpPath], 30_000);
+    hierarchy = runAdb(["shell", "cat", dumpPath]);
+  } finally {
+    runAdb(["shell", "rm", "-f", dumpPath]);
+  }
+  if (!hierarchy.includes("Android 8 or newer")) {
+    const visibleText = [...hierarchy.matchAll(/text="([^"]*)"/g)]
+      .map(match => match[1]).filter(text => /Syncpeer|Android/.test(text)).slice(0, 3);
+    throw new Error("API 24 did not show its clear unsupported-version message: " +
+      JSON.stringify(visibleText));
+  }
+  console.log("API 24 installed and started with a clear Android 8+ document-service requirement.");
 };
 
 const grantNotificationPermission = () => {
@@ -2196,7 +2206,13 @@ const main = async () => {
     throw new Error(`Expected exactly one adb device, found ${devices.length}`);
   }
 
-  const installedPath = runAdb(["shell", "pm", "path", packageName]).trim();
+  let installedPath = "";
+  const packageDeadline = Date.now() + 30_000;
+  while (!installedPath && Date.now() < packageDeadline) {
+    try { installedPath = runAdb(["shell", "pm", "path", packageName], 5_000).trim(); }
+    catch { /* Android's package manager can lag behind sys.boot_completed after a cold start. */ }
+    if (!installedPath) await wait(250);
+  }
   if (!installedPath) {
     throw new Error(
       `Android package ${packageName} is not installed; build and install the debug APK first.`,
@@ -2211,6 +2227,17 @@ const main = async () => {
 
   if (legacySmoke) {
     await runLegacyAndroidSmoke();
+    return;
+  }
+  if (hasArgument("--startup-smoke")) {
+    const cdp = await launchAndroidApp(true);
+    try {
+      const response = await tauriInvoke(cdp, "syncpeer_document_command", {
+        request: { operation: "status" },
+      });
+      if (!response.result?.vault) throw new Error("Android document runtime did not initialize.");
+      console.log(`API ${sdkVersion} started the normal Syncpeer UI and document runtime.`);
+    } finally { cdp.close(); }
     return;
   }
 

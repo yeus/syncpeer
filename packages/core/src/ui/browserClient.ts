@@ -220,6 +220,8 @@ export interface SyncpeerPlatformAdapter {
   revokeOwnedDevice?: (deviceId: string) => Promise<void>;
   /** Folders currently owned by the encrypted document store and safe to advertise over BEP. */
   sessionSharedFolders?: (remoteDeviceId: string) => Promise<SharedFolder[]>;
+  /** A separate runtime owns incoming sync sessions; this UI may only dial peers. */
+  incomingSessionOwnedByService?: boolean;
   /** Synchronous invalidation guards prepared listener state against vault and sharing changes. */
   sessionConfigurationRevision?: () => number;
   onSessionConfigurationChange?: (listener: () => void) => void;
@@ -643,7 +645,7 @@ export const createSyncpeerBrowserClient = (
 
   const ensureIncomingService = async (connectOptions: ConnectOptions,
     coreOptions: SyncpeerConnectOptions): Promise<typeof incomingService> => {
-    if (!coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
+    if (platformAdapter.incomingSessionOwnedByService || !coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
     coreAdapter.log?.("core.incoming.prepare.identity_start", {});
     const localDeviceId = await deviceIdFromCertificate(coreAdapter,
       certificateDerFromPem(coreOptions.certPem));
@@ -893,14 +895,21 @@ export const createSyncpeerBrowserClient = (
       await lifecycle.setForeground(true);
       return;
     }
+    // Android 12 and newer only allow a foreground service to start while the
+    // app is still treated as foreground.  Request the background session
+    // before closing the foreground one so session teardown cannot delay the
+    // start request out of that window.
+    const backgroundSession = activeResolvedConnectOptions && platformAdapter.startBackgroundSession
+      ? platformAdapter.startBackgroundSession(Object.fromEntries(
+          Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),
+        ) as Omit<ConnectOptions, "sharedFolders">)
+      : null;
+    // The start is awaited after teardown; keep an early rejection from
+    // surfacing as unhandled while the foreground session is still closing.
+    backgroundSession?.catch(() => undefined);
     await lifecycle.setForeground(false);
     await stopIncomingService();
-    if (activeResolvedConnectOptions && platformAdapter.startBackgroundSession) {
-      const backgroundOptions = Object.fromEntries(
-        Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),
-      ) as Omit<ConnectOptions, "sharedFolders">;
-      await platformAdapter.startBackgroundSession(backgroundOptions);
-    }
+    if (backgroundSession) await backgroundSession;
   };
 
   return {

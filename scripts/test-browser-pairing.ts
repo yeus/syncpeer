@@ -52,6 +52,30 @@ test("invalid invitation setup never leaks an incoming listener", async () => {
   }
 });
 
+test("a service-owned Android session does not start a competing UI listener", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-service-owned-listener-"));
+  const localIdentity = await identity(root, "local");
+  const remoteIdentity = await identity(root, "remote");
+  let listenCount = 0;
+  let connectCount = 0;
+  const client = createSyncpeerBrowserClient({ hostAdapter: { ...createNodeHostAdapter(),
+    listenTls: async () => { listenCount++; throw new Error("UI listener must stay disabled"); },
+    connectTls: async () => { connectCount++; throw new Error("Synthetic outbound stop"); },
+  }, platformAdapter: {
+    readDefaultIdentity: async () => localIdentity,
+    incomingSessionOwnedByService: true,
+  } });
+  try {
+    await assert.rejects(client.connectAndSync({ host: "127.0.0.1", port: 9,
+      remoteId: remoteIdentity.deviceId, discoveryMode: "direct", timeoutMs: 1000 }));
+    assert.equal(listenCount, 0);
+    assert.equal(connectCount, 1);
+  } finally {
+    await client.disconnect();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a reused browser listener advertises current folders and adopts current connection options", { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-listener-refresh-"));
   const adapter = createNodeHostAdapter();
@@ -211,6 +235,56 @@ test("browser clients pair over the production LAN TLS adapters and persist only
     assert.equal(saved.remember, false);
   } finally {
     await handle?.cancel().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("foreground handoff requests the background session before closing the active session", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-handoff-"));
+  const adapter = createNodeHostAdapter();
+  const events: string[] = [];
+  let port = 0;
+  const [ownerIdentity, joiningIdentity] = (await Promise.all([
+    identity(root, "one"), identity(root, "two"),
+  ])).sort((a, b) => b.deviceId.replaceAll("-", "").localeCompare(a.deviceId.replaceAll("-", "")));
+  const owner = createSyncpeerBrowserClient({ hostAdapter: { ...adapter,
+    connectTls: async () => { throw new Error("Synthetic outbound failure"); },
+    listenTls: async options => {
+      const listener = await adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 });
+      port = listener.port;
+      return listener;
+    },
+  }, platformAdapter: {
+    readDefaultIdentity: async () => ownerIdentity,
+    startBackgroundSession: async () => { events.push("background:start"); },
+  } });
+  const connected = Promise.withResolvers<void>();
+  const unsubscribeConnected = owner.subscribeLifecycle(state => {
+    if (state.phase === "connected") connected.resolve();
+  });
+  let unsubscribeOrdering = () => {};
+  let outgoing: SyncpeerSessionHandle | undefined;
+  try {
+    await assert.rejects(owner.connectAndSync({ host: "127.0.0.1", port: 1, listenPort: 22998,
+      remoteId: joiningIdentity.deviceId, deviceName: "synthetic-owner",
+      discoveryMode: "direct", timeoutMs: 1000 }));
+    outgoing = await createSyncpeerCoreClient(adapter).openSession({ ...joiningIdentity,
+      host: "127.0.0.1", port, expectedDeviceId: ownerIdentity.deviceId,
+      deviceName: "synthetic-joiner", discoveryMode: "direct", timeoutMs: 2000,
+    });
+    await connected.promise;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    unsubscribeConnected();
+    unsubscribeOrdering = owner.subscribeLifecycle(state => events.push(`state:${state.phase}`));
+    await owner.setForeground(false);
+    assert.ok(events.includes("background:start"), "The background session was not requested.");
+    assert.ok(events.indexOf("background:start") < events.indexOf("state:suspended"),
+      `The background session must start before foreground teardown: ${events.join(",")}`);
+  } finally {
+    unsubscribeConnected();
+    unsubscribeOrdering();
+    await outgoing?.close();
+    await owner.disconnect();
     await rm(root, { recursive: true, force: true });
   }
 });

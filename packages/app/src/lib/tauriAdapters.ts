@@ -748,7 +748,7 @@ export const createTauriAdapters = (
     show: async id => { await invokeWithLogging("syncpeer_document_command", { request: { operation: "show", id } }); },
   });
   const appPlatformAdapter = platform === "android"
-    ? { ...documents.platformAdapter, sessionSharedFolders: async () => [] }
+    ? { ...documents.platformAdapter, sessionSharedFolders: async () => [], incomingSessionOwnedByService: true }
     : documents.platformAdapter;
   return { hostAdapter, platformAdapter: appPlatformAdapter, documentCommand: documentRequest,
     connectDocumentFolder: documents.connectFolder,

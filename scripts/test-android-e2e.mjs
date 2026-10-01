@@ -605,6 +605,9 @@ const tapDocumentUiResource = async (resourceId, timeout = 30_000) => {
 
 const grantEditorFolder = async () => {
   runAdb(["shell", "am", "force-stop", editorPackage]);
+  // A stale tree preference from a revoked earlier grant would let
+  // waitForEditorGrant pass without a live persistable permission.
+  runAdb(["shell", "pm", "clear", editorPackage]);
   runAdb(["shell", "am", "start", "-n", `${editorPackage}/.GrantActivity`]);
   await tapDocumentUiText(targetFolderTitle, 60_000);
   await tapDocumentUiResource("android:id/button1");

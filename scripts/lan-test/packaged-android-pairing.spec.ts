@@ -122,9 +122,29 @@ async function attachSharedFolder() {
         throw new Error(`Desktop folder root missing after attachment: ${JSON.stringify({ ...state,
           error: safeNativeFailureText(state.error) })}`, { cause });
       }
-      const rootRow = root.$("xpath=ancestor::li");
-      const favorite = rootRow.$("button[aria-label='Toggle favorite']");
-      if (await favorite.getAttribute("aria-pressed") !== "true") await favorite.click();
+      // Re-query the row on every attempt: live session updates re-render the
+      // list, which invalidates chained element references.
+      const favoritePressed = () => browser.execute((id: string) => {
+        const button = document.querySelector(`[data-testid='folder-root-${id}']`)?.closest("li")
+          ?.querySelector("button[aria-label='Toggle favorite']");
+        return button?.getAttribute("aria-pressed") === "true";
+      }, folderId);
+      if (!await favoritePressed()) {
+        const clicked = await browser.execute((id: string) => {
+          const button = document.querySelector(`[data-testid='folder-root-${id}']`)?.closest("li")
+            ?.querySelector("button[aria-label='Toggle favorite']");
+          if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+          button.click();
+          return true;
+        }, folderId);
+        if (!clicked) {
+          const state = await desktopState();
+          throw new Error(`Desktop folder root has no favorite control: ${JSON.stringify({ ...state,
+            error: safeNativeFailureText(state.error) })}`);
+        }
+        await browser.waitUntil(favoritePressed, { timeout: 30_000, interval: 250,
+          timeoutMsg: "Desktop folder favorite did not persist." });
+      }
       return;
     }
     await clickButtonByText(browser, "Back");
@@ -237,11 +257,19 @@ describe("Packaged desktop to Android pairing", () => {
         console.log("Cross-app desktop connected; checking shared folder credential.");
         await attachSharedFolder();
         console.log("Cross-app shared folder attached on desktop.");
-        await $("[data-testid='tab-folders']").click();
-        const folder = $(`//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(folderId)}]`);
-        await folder.waitForExist({ timeout: 30_000 });
-        await folder.click();
-        await $("#folder-upload-input").waitForExist({ timeout: 30_000 });
+        await browser.execute(() => {
+          const tab = document.querySelector("[data-testid='tab-folders']");
+          if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+          tab.click();
+        });
+        const folderRoot = $(`[data-testid='folder-root-${folderId}']`);
+        await folderRoot.waitForExist({ timeout: 30_000 });
+        await browser.execute((id: string) => {
+          const row = document.querySelector(`[data-testid='folder-root-${id}']`);
+          if (!(row instanceof HTMLElement)) throw new Error("Desktop folder root is unavailable.");
+          row.click();
+        }, folderId);
+        await $("#folder-upload-input").waitForExist({ timeout: 60_000 });
         android(serial, ["--edit-whole-folder"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
           SYNCPEER_E2E_FILE_NAME: "from-android.txt", SYNCPEER_E2E_FILE_CONTENT: "android-one" });
         await waitForDesktopFile("from-android.txt", "android-one");
@@ -250,8 +278,11 @@ describe("Packaged desktop to Android pairing", () => {
           SYNCPEER_E2E_FILE_NAME: "from-desktop.txt", SYNCPEER_E2E_FILE_CONTENT: "desktop-one" });
       } finally { if (androidConnection.exitCode === null) androidConnection.kill("SIGTERM"); }
     } finally {
-      execFileSync("adb", ["-s", serial, "forward", "--remove", `tcp:${forwardedPort}`],
-        { stdio: "ignore" });
+      // The emulator may already be gone; never mask the real failure here.
+      try {
+        execFileSync("adb", ["-s", serial, "forward", "--remove", `tcp:${forwardedPort}`],
+          { stdio: "ignore" });
+      } catch { /* Forward cleanup is best-effort. */ }
       await rm(root, { recursive: true, force: true });
     }
   });

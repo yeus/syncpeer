@@ -3,7 +3,8 @@
   import { defaultFolderSettings, type PairingInvitation, type PersonalSpaceSettings,
     type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
-  import { formatProfileCreationError } from "./app/storageErrors.ts";
+  import { formatProfileCreationError, safeNativeFailureText } from "./app/storageErrors.ts";
+  import { createWorkerPasswordKdf } from "./lib/passwordKdf.ts";
   let { onBack, onCreate, onUnlock, onUnlockBiometric, onRotateMasterPassword, onMigrate, onRelease, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId,
     onImport, onStartPairing, onJoinPairing, onPairedDevice, peerId, peerFolders, biometric, command }: {
@@ -115,7 +116,8 @@
     busy = true; error = "";
     try {
       const kit = await createOwnedRecoveryKit(crypto.subtle,
-        size => crypto.getRandomValues(new Uint8Array(size)), kitPassword);
+        size => crypto.getRandomValues(new Uint8Array(size)), kitPassword,
+        createWorkerPasswordKdf());
       kitText = JSON.stringify(kit);
       kitSaved = false;
     } catch (failure) { error = failure instanceof Error ? failure.message : "Recovery kit could not be created."; }
@@ -268,7 +270,10 @@
   async function migrate(folderId: string, target: "encrypted" | "plaintext") {
     migrating = folderId; error = "";
     try { await onMigrate(folderId, target); await refresh(); }
-    catch { error = "Folder migration was not completed. Existing data was retained; check the password and available storage, then retry."; }
+    catch (failure) {
+      const reason = safeNativeFailureText(failure);
+      error = `Folder migration was not completed.${reason ? ` Reason: ${reason}.` : ""} Existing data was retained; check the password and available storage, then retry.`;
+    }
     finally { migrating = ""; }
   }
   async function releaseLocalCopy(folderId: string, mode: "safe" | "dangerous") {

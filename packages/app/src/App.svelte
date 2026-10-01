@@ -83,6 +83,15 @@
     ) => void;
     __syncpeerClearDownloadProgress?: () => void;
     __syncpeerDigestCachedFile?: (path: string) => Promise<string | null>;
+    __syncpeerFolderProbe?: (folderId: string) => {
+      page: string;
+      activeTab: string;
+      localRegistered: boolean;
+      sessionRegistered: boolean;
+      rootRegistered: boolean;
+      rootCount: number;
+      selectedFolder: boolean;
+    };
   };
 
   let app = $state(createInitialState());
@@ -467,6 +476,17 @@
         return (await platformAdapter.digestCachedFiles([{ folderId: matches[0].folderId, path }]))[0]?.hash ?? null;
       };
     }
+    if (import.meta.env.DEV) {
+      (window as SyncpeerTestWindow).__syncpeerFolderProbe = (folderId: string) => ({
+        page: app.currentPage,
+        activeTab: app.activeTab,
+        localRegistered: app.localFolders.some(folder => folder.id === folderId),
+        sessionRegistered: app.session.folders.some(folder => folder.id === folderId),
+        rootRegistered: currentRootFolders.some(folder => folder.id === folderId),
+        rootCount: currentRootFolders.length,
+        selectedFolder: Boolean(app.session.currentFolderId),
+      });
+    }
 
     return () => {
       if (import.meta.env.SYNCPEER_LAN_E2E === true) {
@@ -475,6 +495,7 @@
         delete testWindow.__syncpeerClearDownloadProgress;
         delete testWindow.__syncpeerDigestCachedFile;
       }
+      if (import.meta.env.DEV) delete (window as SyncpeerTestWindow).__syncpeerFolderProbe;
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);

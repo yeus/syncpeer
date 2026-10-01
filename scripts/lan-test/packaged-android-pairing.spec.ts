@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { $, browser } from "@wdio/globals";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
+import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.js";
+import { clickButtonByText, readSessionEventNames, setDirectConnectionFields } from "./ui-helpers.js";
 
 const folderId = "syncpeer-crossapp-folder"; // synthetic disposable emulator fixture
 const password = "synthetic-crossapp-folder-password";
@@ -57,30 +59,88 @@ async function uploadDesktopFile(name: string, content: string) {
 }
 
 async function attachSharedFolder() {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await $("[data-testid='tab-folders']").click();
-    await $("button=Folder settings · New folder").click();
+  const desktopState = async () => browser.execute((id: string) => {
+    const probe = (window as typeof window & { __syncpeerFolderProbe?: (folderId: string) => unknown })
+      .__syncpeerFolderProbe?.(id);
+    const settingsRow = [...document.querySelectorAll("li")].find(row =>
+      [...row.querySelectorAll("span")].some(span => span.textContent?.trim() === id));
+    return { probe, settingsRowVisible: Boolean(settingsRow),
+      attachControlVisible: [...settingsRow?.querySelectorAll("button") ?? []]
+        .some(button => button.textContent?.includes("Reattach encrypted")),
+      attachedControlVisible: [...settingsRow?.querySelectorAll("button") ?? []]
+        .some(button => button.textContent?.includes("Move to plaintext")),
+      rootView: !document.querySelector(".breadcrumbs .crumb-button"),
+      rootRowCount: document.querySelectorAll(".list .item-title").length,
+      visibleRoot: [...document.querySelectorAll(".list .item-title")]
+        .some(element => element.textContent?.trim() === id),
+      error: document.querySelector("p.error, p[role='alert']")?.textContent?.trim() ?? "",
+    };
+  }, folderId);
+  const deadline = Date.now() + 90_000;
+  for (let attempt = 0; attempt < 20 && Date.now() < deadline; attempt += 1) {
+    if (attempt % 5 === 0) console.log(`Cross-app folder credential check ${attempt + 1}/20.`);
+    await browser.execute(() => {
+      const tab = document.querySelector("[data-testid='tab-folders']");
+      if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+      tab.click();
+    });
+    await clickButtonByText(browser, "Folder settings · New folder");
     const row = $(`//li[./span[normalize-space()=${JSON.stringify(folderId)}]]`);
     if (await row.isExisting()) {
+      const received = await desktopState();
+      console.log("Desktop received folder registration:", JSON.stringify({ ...received,
+        error: safeNativeFailureText(received.error) }));
       const attach = row.$("button=Reattach encrypted local storage");
       if (await attach.isExisting()) {
-        await attach.click();
-        await attach.waitForExist({ reverse: true, timeout: 30_000 });
+        await clickButtonByText(browser, "Reattach encrypted local storage");
+        await browser.waitUntil(async () => {
+          const state = await desktopState();
+          return state.attachedControlVisible || Boolean(state.error);
+        }, { timeout: 60_000, interval: 500,
+          timeoutMsg: "Desktop did not finish attaching the encrypted folder." });
       }
-      await $("button=Back").click();
-      const root = $(`//li[.//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(folderId)}]]`);
-      await root.waitForExist({ timeout: 30_000 });
-      const favorite = root.$("button[aria-label='Toggle favorite']");
+      const attached = await desktopState();
+      console.log("Desktop attachment result in settings:", JSON.stringify({ ...attached,
+        error: safeNativeFailureText(attached.error) }));
+      if (attached.error) throw new Error(`Desktop folder attachment failed: ${safeNativeFailureText(attached.error)}`);
+      assert.ok(attached.attachedControlVisible, "Desktop did not attach the encrypted folder.");
+      await clickButtonByText(browser, "Back");
+      await $("[data-testid='tab-folders']").waitForExist({ timeout: 30_000 });
+      await browser.execute(() => {
+        const tab = document.querySelector("[data-testid='tab-folders']");
+        if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable after attachment.");
+        tab.click();
+      });
+      await browser.execute(() => {
+        const root = document.querySelector(".breadcrumbs .crumb-button");
+        if (root instanceof HTMLButtonElement && root.textContent?.includes("All Syncthing Folders")) root.click();
+      });
+      const root = $(`[data-testid='folder-root-${folderId}']`);
+      try { await root.waitForExist({ timeout: 120_000 }); }
+      catch (cause) {
+        const state = await desktopState();
+        throw new Error(`Desktop folder root missing after attachment: ${JSON.stringify({ ...state,
+          error: safeNativeFailureText(state.error) })}`, { cause });
+      }
+      const rootRow = root.$("xpath=ancestor::li");
+      const favorite = rootRow.$("button[aria-label='Toggle favorite']");
       if (await favorite.getAttribute("aria-pressed") !== "true") await favorite.click();
       return;
     }
-    await $("button=Back").click();
+    await clickButtonByText(browser, "Back");
     await browser.pause(2_000);
   }
-  throw new Error("The approved Android folder credential did not reach the packaged desktop.");
+  const events = await readSessionEventNames(browser).catch(() => []);
+  throw new Error(`The approved Android folder credential did not reach the packaged desktop. ` +
+    `Recent event names: ${events.slice(-25).join(",") || "unavailable"}.`);
 }
 
 describe("Packaged desktop to Android pairing", () => {
+  before(async () => {
+    const expected = process.env.SYNCPEER_LAN_EXPECT_DEV_URL;
+    if (expected) assert.equal(await browser.execute(() => location.origin), expected,
+      "The desktop test is not using the dedicated Syncpeer Vite dev server.");
+  });
   it("enrolls a fresh Android device in the desktop personal space", async () => {
     const serial = process.env.SYNCPEER_ANDROID_SERIAL;
     assert.ok(serial?.startsWith("emulator-"), "An explicit emulator serial is required.");
@@ -131,16 +191,24 @@ describe("Packaged desktop to Android pairing", () => {
         "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk"],
         { stdio: "inherit", timeout: 120_000 });
       android(serial, ["--grant-whole-folder-editor"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId });
+      console.log("Cross-app editor grant completed; configuring direct connection.");
       execFileSync("adb", ["-s", serial, "forward", `tcp:${forwardedPort}`, "tcp:22000"]);
       await browser.execute(() => { window.prompt = () => "synthetic-desktop-crossapp"; });
-      await $("[data-testid='tab-devices']").click();
-      const toggle = $("[data-testid='connection-settings-toggle']");
-      if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
-      await $("[data-testid='connection-discovery-mode']").selectByAttribute("value", "direct");
-      await $("[data-testid='connection-host']").setValue("127.0.0.1");
-      await $("[data-testid='connection-port']").setValue(String(forwardedPort));
-      await $("[data-testid='connection-listen-port']").setValue(String(listenPort));
-      await $("[data-testid='connection-remote-id']").setValue(androidId);
+      console.log("Cross-app opening desktop connection settings.");
+      await browser.execute(() => {
+        const tab = document.querySelector("[data-testid='tab-devices']");
+        if (!(tab instanceof HTMLButtonElement)) throw new Error("Device tab is unavailable.");
+        tab.click();
+      });
+      await browser.execute(() => {
+        const toggle = document.querySelector("[data-testid='connection-settings-toggle']");
+        if (!(toggle instanceof HTMLButtonElement)) throw new Error("Connection settings are unavailable.");
+        if (toggle.getAttribute("aria-expanded") !== "true") toggle.click();
+      });
+      console.log("Cross-app setting desktop direct endpoint.");
+      await setDirectConnectionFields(browser, { remoteId: androidId, host: "127.0.0.1",
+        remotePort: forwardedPort, listenPort });
+      console.log("Cross-app desktop direct endpoint configured.");
       const androidConnection = spawn(process.execPath,
         ["scripts/test-android-e2e.mjs", "--connect-whole-folder"], {
           cwd: process.cwd(), stdio: "inherit", env: { ...process.env, ANDROID_SERIAL: serial,
@@ -153,10 +221,22 @@ describe("Packaged desktop to Android pairing", () => {
           androidConnection.once("error", reject);
           androidConnection.once("exit", code => code === 0 ? resolve() : reject(new Error(`Android connection failed: ${code}`)));
         });
-        await browser.waitUntil(async () =>
-          (await $("[data-testid='connection-status']").getText()).includes("Connected"),
-        { timeout: 120_000, timeoutMsg: "The packaged desktop did not connect to Android." });
+        console.log("Cross-app Android background session connected; checking desktop status.");
+        try {
+          await browser.waitUntil(async () =>
+            (await $("[data-testid='connection-status']").getText()).includes("Connected"),
+          { timeout: 120_000, timeoutMsg: "The packaged desktop did not connect to Android." });
+        } catch (cause) {
+          const state = await browser.execute(() => ({
+            status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "missing",
+            errorCount: [...document.querySelectorAll("p.error, p[role='alert']")]
+              .filter(element => Boolean(element.textContent?.trim())).length,
+          })).catch(() => ({ status: "unavailable", errorCount: -1 }));
+          throw new Error(`Packaged desktop connection state: ${JSON.stringify(state)}`, { cause });
+        }
+        console.log("Cross-app desktop connected; checking shared folder credential.");
         await attachSharedFolder();
+        console.log("Cross-app shared folder attached on desktop.");
         await $("[data-testid='tab-folders']").click();
         const folder = $(`//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(folderId)}]`);
         await folder.waitForExist({ timeout: 30_000 });

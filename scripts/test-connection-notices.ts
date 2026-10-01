@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   folderRootEmptyNotice,
   localDiscoveryUnavailableNotice,
+  shouldRenderFolderRootList,
 } from "../packages/app/src/app/connectionNotices.ts";
 import { createTauriAdapters, reportUiError, shouldLogInvokeLifecycle } from "../packages/app/src/lib/tauriAdapters.ts";
 import { reportClientError } from "@syncpeer/core/browser";
@@ -14,6 +15,12 @@ test("explains an empty folder list on a healthy connection", () => {
   );
   assert.equal(folderRootEmptyNotice(false, 0), "Connect to browse folders.");
   assert.equal(folderRootEmptyNotice(true, 1), null);
+});
+
+test("renders attached local folder roots after the peer disconnects", () => {
+  assert.equal(shouldRenderFolderRootList(false, 1), true);
+  assert.equal(shouldRenderFolderRootList(false, 0), false);
+  assert.equal(shouldRenderFolderRootList(true, 0), true);
 });
 
 test("explains local discovery port contention without implying connection failure", () => {

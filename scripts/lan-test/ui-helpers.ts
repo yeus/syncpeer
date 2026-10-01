@@ -43,6 +43,22 @@ export const clickItemTitle = async (
   if (!clicked) throw new Error("Could not click folder item " + name + ".");
 };
 
+/** Exercise a button handler without WebKitWebDriver's offscreen coordinate click. */
+export const clickButtonByText = async (
+  browser: WebdriverIO.Browser,
+  label: string,
+): Promise<void> => {
+  const state = await browser.execute((text: string) => {
+    const button = [...document.querySelectorAll("button")]
+      .find(element => element.textContent?.trim() === text);
+    if (!(button instanceof HTMLButtonElement)) return "missing";
+    if (button.disabled) return "disabled";
+    button.click();
+    return "clicked";
+  }, label);
+  if (state !== "clicked") throw new Error(`Button ${label} is ${state}.`);
+};
+
 export const clickDownloadButton = async (
   browser: TauriBrowser,
   name: string,
@@ -65,12 +81,12 @@ export const clickDownloadButton = async (
 };
 
 export const selectDiscoveryMode = async (
-  browser: TauriBrowser,
+  browser: WebdriverIO.Browser,
   mode: "automatic" | "direct" | "lan" | "global",
 ): Promise<void> => {
   const selector = "[data-testid='connection-discovery-mode']";
   await browser.waitUntil(
-    async () => (await browser.$(selector).isExisting()),
+    async () => await browser.$(selector).isExisting(),
     { timeout: 5_000, timeoutMsg: "Connection mode selector is not mounted." },
   );
   await browser.execute((nextMode: string) => {
@@ -90,6 +106,28 @@ export const selectDiscoveryMode = async (
     async () => (await browser.$(selector).getValue()) === mode,
     { timeout: 5_000, timeoutMsg: "Connection mode did not update to " + mode + "." },
   );
+};
+
+export const setDirectConnectionFields = async (browser: WebdriverIO.Browser, settings: {
+  remoteId: string; host: string; remotePort: number; listenPort: number;
+}): Promise<void> => {
+  await selectDiscoveryMode(browser, "direct");
+  await browser.execute(({ remoteId, host, remotePort, listenPort }) => {
+    for (const [testId, value] of [
+      ["connection-remote-id", remoteId],
+      ["connection-host", host],
+      ["connection-port", String(remotePort)],
+      ["connection-listen-port", String(listenPort)],
+    ]) {
+      const field = document.querySelector(`[data-testid='${testId}']`) as HTMLInputElement | null;
+      if (!field) throw new Error(`Connection field ${testId} is unavailable.`);
+      field.value = value;
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+      field.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }, settings);
+  await browser.waitUntil(async () => await browser.$("[data-testid='connection-port']").getValue() ===
+    String(settings.remotePort), { timeout: 5_000, timeoutMsg: "Direct connection settings did not update." });
 };
 
 export const setUploadFile = async (
@@ -181,15 +219,24 @@ export const readCachedHash = async (
 export const readSessionEventNames = async (
   browser: TauriBrowser,
 ): Promise<string[]> => {
-  await $("[data-testid='tab-devices']").click();
+  await browser.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-devices']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Device tab is unavailable.");
+    tab.click();
+  });
+  await browser.pause(50);
   const events = await browser.execute(() =>
     [...document.querySelectorAll(".item-meta")]
       .map((element) => element.textContent?.trim() ?? "")
       .filter((text) => text.includes(" | "))
       .map((text) => text.split(" | ").at(-1) ?? "")
       .filter(Boolean)
-      .slice(0, 80),
+      .slice(-80),
   );
-  await $("[data-testid='tab-folders']").click();
+  await browser.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-folders']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+    tab.click();
+  });
   return events;
 };

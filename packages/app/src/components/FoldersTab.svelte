@@ -8,7 +8,7 @@
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
   import { activeDownloadForFile, type AppState } from "../app/state.ts";
-  import { folderRootEmptyNotice } from "../app/connectionNotices.ts";
+  import { folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -273,12 +273,11 @@
   });
 
   let rootEmptyNotice = $derived(
-    folderRootEmptyNotice(app.session.isConnected, app.session.folders.length),
+    folderRootEmptyNotice(app.session.isConnected, rootRows.length),
   );
 </script>
-
 <Panel title="Folders">
-  {#if !app.session.isConnected && app.session.folders.length === 0}
+  {#if !shouldRenderFolderRootList(app.session.isConnected, rootRows.length)}
     <p class="empty" data-testid="folder-root-empty-notice">{rootEmptyNotice}</p>
   {:else}
     <div class="status-row">

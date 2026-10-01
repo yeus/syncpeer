@@ -7,6 +7,11 @@ export const folderRootEmptyNotice = (
   return "Connected, but the remote device is not sharing any folders with this device. Share a folder with this device in the remote Syncthing settings.";
 };
 
+export const shouldRenderFolderRootList = (
+  isConnected: boolean,
+  rootFolderCount: number,
+) => isConnected || rootFolderCount > 0;
+
 export const localDiscoveryUnavailableNotice = (rawError: unknown): string | null => {
   const message = rawError instanceof Error ? rawError.message : String(rawError);
   const normalized = message.toLowerCase();

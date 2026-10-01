@@ -162,6 +162,12 @@
     return value.name;
   };
 
+  const itemTestId = (value: FileSystemItem) => {
+    if (value.kind === "root-folder") return `folder-root-${value.folderId}`;
+    if (value.kind === "folder-entry") return `folder-entry-${value.path}`;
+    return undefined;
+  };
+
   const canClickMain = (value: FileSystemItem) => {
     if (value.kind === "root-folder") return !value.locked || value.canBrowseLocally;
     return true;
@@ -326,7 +332,7 @@
   {#if canClickMain(item)}
     <div
       class="item-main-hit item-main-hit-clickable"
-      data-testid={item.kind === "folder-entry" ? `folder-entry-${item.path}` : undefined}
+      data-testid={itemTestId(item)}
       role="button"
       tabindex={0}
       onclick={(event) => handleMainClick(item, event)}
@@ -450,7 +456,7 @@
   {:else}
     <div
       class="item-main-hit"
-      data-testid={item.kind === "folder-entry" ? `folder-entry-${item.path}` : undefined}
+      data-testid={itemTestId(item)}
     >
     {#if progressPercent(item) > 0}
       <span

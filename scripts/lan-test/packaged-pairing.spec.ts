@@ -3,6 +3,7 @@ import net from "node:net";
 import { browser } from "@wdio/globals";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
+import { clickButtonByText, setDirectConnectionFields } from "./ui-helpers.js";
 
 const peers = () => browser as typeof browser & { owner: WebdriverIO.Browser; joiner: WebdriverIO.Browser };
 const folderName = "Synthetic desktop folder";
@@ -27,30 +28,28 @@ async function isListening(port: number): Promise<boolean> {
 async function configureConnection(peer: WebdriverIO.Browser, remoteId: string,
   remotePort: number, localPort: number) {
   await peer.$("[data-testid='tab-devices']").click();
-  const toggle = peer.$("[data-testid='connection-settings-toggle']");
-  if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
-  const expert = peer.$("[data-testid='expert-view']");
-  if (!await expert.isSelected()) await expert.click();
-  const status = peer.$("[data-testid='connection-status-toggle']");
-  if (await status.getAttribute("aria-expanded") !== "true") await status.click();
-  const control = peer.$("[data-testid='expert-connection-control']");
-  if ((await control.getText()).includes("Pause automatic connection")) await control.click();
-  await peer.$("[data-testid='connection-discovery-mode']").selectByAttribute("value", "direct");
-  await peer.$("[data-testid='connection-direct-quic']").waitForExist({ timeout: 5_000 });
-  await peer.execute(({ remoteId, remotePort, localPort }) => {
-    for (const [testId, value] of [
-      ["connection-remote-id", remoteId],
-      ["connection-host", "127.0.0.1"],
-      ["connection-port", String(remotePort)],
-      ["connection-listen-port", String(localPort)],
-    ]) {
-      const field = document.querySelector(`[data-testid='${testId}']`) as HTMLInputElement | null;
-      if (!field) throw new Error(`Connection field ${testId} is unavailable.`);
-      field.value = value;
-      field.dispatchEvent(new Event("input", { bubbles: true }));
-      field.dispatchEvent(new Event("change", { bubbles: true }));
+  for (const testId of ["connection-settings-toggle", "connection-status-toggle"]) {
+    if (testId === "connection-status-toggle") {
+      await peer.execute(() => {
+        const expert = document.querySelector("[data-testid='expert-view']");
+        if (!(expert instanceof HTMLInputElement)) throw new Error("Expert view is unavailable.");
+        if (!expert.checked) expert.click();
+      });
     }
-  }, { remoteId, remotePort, localPort });
+    await peer.execute(id => {
+      const button = document.querySelector(`[data-testid='${id}']`);
+      if (!(button instanceof HTMLButtonElement)) throw new Error(`Connection control ${id} is unavailable.`);
+      if (button.getAttribute("aria-expanded") !== "true") button.click();
+    }, testId);
+  }
+  await peer.$("[data-testid='expert-connection-control']").waitForExist({ timeout: 5_000 });
+  await peer.execute(() => {
+    const control = document.querySelector("[data-testid='expert-connection-control']");
+    if (!(control instanceof HTMLButtonElement)) throw new Error("Expert connection control is unavailable.");
+    if (control.textContent?.includes("Pause automatic connection")) control.click();
+  });
+  await setDirectConnectionFields(peer, { remoteId, host: "127.0.0.1", remotePort, listenPort: localPort });
+  await peer.$("[data-testid='connection-direct-quic']").waitForExist({ timeout: 5_000 });
   assert.equal(await peer.$("[data-testid='connection-remote-id']").getValue(), remoteId);
   assert.equal(await peer.$("[data-testid='connection-host']").getValue(), "127.0.0.1");
   assert.equal(await peer.$("[data-testid='connection-discovery-mode']").getValue(), "direct");
@@ -62,16 +61,24 @@ async function configureConnection(peer: WebdriverIO.Browser, remoteId: string,
 }
 
 async function openFolder(peer: WebdriverIO.Browser, name: string) {
-  await peer.$("[data-testid='tab-folders']").click();
-  const row = peer.$(`//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(name)}]`);
-  await row.waitForExist({ timeout: 30_000 });
-  const action = row.$("./ancestor::li[1]//*[contains(@class,'item-main-hit-clickable')]");
-  await action.waitForExist({ timeout: 30_000,
-    timeoutMsg: "The shared folder is listed but cannot be opened with its approved credential." });
-  await action.click();
-  try { await peer.$("#folder-upload-input").waitForExist({ timeout: 30_000 }); }
-  catch (error) {
-    const state = await peer.execute(() => ({
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await peer.$("[data-testid='tab-folders']").click();
+    const row = peer.$(`//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(name)}]`);
+    await row.waitForExist({ timeout: 30_000 });
+    const action = row.$("./ancestor::li[1]//*[contains(@class,'item-main-hit-clickable')]");
+    await action.waitForExist({ timeout: 30_000,
+      timeoutMsg: "The shared folder is listed but cannot be opened with its approved credential." });
+    await action.click();
+    try {
+      await peer.$("#folder-upload-input").waitForExist({ timeout: 10_000 });
+      return;
+    } catch (error) {
+      lastError = error;
+      await peer.pause(1_000);
+    }
+  }
+  const state = await peer.execute(() => ({
       status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "missing",
       notice: document.querySelector("[data-testid='folder-root-empty-notice']")?.textContent?.trim() ?? "none",
       folderView: document.querySelector("[data-testid='folder-view-status']")?.textContent?.trim() ?? "missing",
@@ -79,9 +86,8 @@ async function openFolder(peer: WebdriverIO.Browser, name: string) {
       visibleErrors: [...document.querySelectorAll("p.error, li.empty")].map(value => value.textContent?.trim()).filter(Boolean).slice(-4),
       events: (window as typeof window & { __syntheticEvents?: string[] }).__syntheticEvents?.slice(-30) ?? [],
       failures: (window as typeof window & { __syntheticFailures?: string[] }).__syntheticFailures ?? [],
-    }));
-    throw new Error(`The folder did not open after clicking its active row: ${JSON.stringify(state)}`, { cause: error });
-  }
+  }));
+  throw new Error(`The folder did not open after three attempts: ${JSON.stringify(state)}`, { cause: lastError });
 }
 
 async function uploadFile(peer: WebdriverIO.Browser, name: string, content: string) {
@@ -239,14 +245,27 @@ async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
     if (await row.isExisting()) {
       const attach = row.$("button=Reattach encrypted local storage");
       if (await attach.isExisting()) {
-        await attach.click();
+        await clickButtonByText(peer, "Reattach encrypted local storage");
         await attach.waitForExist({ reverse: true, timeout: 30_000 });
       }
       await peer.$("button=Back").click();
       const root = peer.$(`//li[.//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(folderName)}]]`);
       await root.waitForExist({ timeout: 30_000 });
       const favorite = root.$("button[aria-label='Toggle favorite']");
-      if (await favorite.getAttribute("aria-pressed") !== "true") await favorite.click();
+      if (await favorite.getAttribute("aria-pressed") !== "true") {
+        const selected = await peer.execute(name => {
+          const title = [...document.querySelectorAll(".item-title")]
+            .find(element => element.textContent?.trim() === name);
+          const button = title?.closest("li")?.querySelector("button[aria-label='Toggle favorite']");
+          if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+          button.click();
+          return true;
+        }, folderName);
+        assert.ok(selected, "The packaged peer could not favorite the shared folder.");
+        await peer.waitUntil(async () => (await favorite.getAttribute("aria-pressed")) === "true", {
+          timeout: 5_000, timeoutMsg: "The packaged shared folder was not favorited.",
+        });
+      }
       return;
     }
     lastAlert = await peer.$("p[role='alert']").getText().catch(() => "");
@@ -316,10 +335,22 @@ describe("Two isolated packaged desktop apps", () => {
     await joiner.$("//label[contains(., 'Pairing invitation')]/textarea").setValue(invitation);
     await joiner.$("//label[contains(., 'New local master password')]/input")
       .setValue("synthetic-joining-master-password");
-    await joiner.$("button=Join personal space").click();
-    const codes = await Promise.all([owner, joiner].map(async peer => {
-      await peer.waitUntil(async () => Boolean(await peer.getAlertText().catch(() => "")),
-        { timeout: 30_000, timeoutMsg: "Pairing confirmation was not displayed." });
+    await clickButtonByText(joiner, "Join personal space");
+    const codes = await Promise.all([owner, joiner].map(async (peer, index) => {
+      try {
+        await peer.waitUntil(async () => Boolean(await peer.getAlertText().catch(() => "")),
+          { timeout: 30_000, timeoutMsg: "Pairing confirmation was not displayed." });
+      } catch (cause) {
+        const state = await peer.execute(() => ({
+          alerts: [...document.querySelectorAll("p[role='alert'], p.error")]
+            .map(element => element.textContent?.trim()).filter(Boolean).slice(-3),
+          joinButtonPresent: [...document.querySelectorAll("button")]
+            .some(element => element.textContent?.trim() === "Join personal space"),
+          invitationPresent: Boolean(document.querySelector("textarea[readonly]")),
+        })).catch(() => ({ diagnosticsUnavailable: true }));
+        throw new Error(`Pairing confirmation missing on ${index === 0 ? "owner" : "joiner"}: ` +
+          JSON.stringify(state), { cause });
+      }
       const message = await peer.getAlertText();
       const code = message.match(/\b\d{6}\b/)?.[0];
       assert.ok(code, "Pairing confirmation must include a six-digit code.");
@@ -373,7 +404,7 @@ describe("Two isolated packaged desktop apps", () => {
     assert.equal(await owner.$("//label[contains(., 'New folder name')]/input").getValue(), folderName);
     const createFolder = owner.$("button=Create folder");
     await createFolder.waitForEnabled({ timeout: 10_000 });
-    await createFolder.click();
+    await clickButtonByText(owner, "Create folder");
     try {
       const folderExists = async () => (await owner.$("li > span").getText().catch(() => ""))
         .includes(folderName);

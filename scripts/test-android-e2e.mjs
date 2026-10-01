@@ -949,7 +949,17 @@ const waitForSessionNotificationText = async (text, timeout = 30_000) => {
   const knownStates = ["Preparing selected folders", "Waiting for a network connection",
     "Waiting for an unmetered network", "Waiting for normal power mode"];
   const state = knownStates.find(value => lastRecords.some(record => record.includes(value))) ?? "other";
-  throw new Error(`Expected the connected background-session notification; found ${count}, state=${state}.`);
+  const detail = lastRecords.flatMap(record => record.split("\n")
+    .filter(line => line.includes("android.text="))
+    .map(line => line.slice(line.indexOf("android.text=") + "android.text=".length).trim()))
+    .slice(0, 1)
+    .map(value => value
+      .replace(/[A-Z2-7]{7}(?:-[A-Z2-7]{7}){7}/g, "[device]")
+      .replace(/(?:\/[A-Za-z0-9_.-]+)+/g, "[path]")
+      .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "[address]")
+      .replaceAll(targetFolderPassword, "[folder credential]")
+      .slice(0, 180))[0] ?? "unavailable";
+  throw new Error(`Expected the connected background-session notification; found ${count}, state=${state}, detail=${detail}.`);
 };
 
 const clearTransferNotifications = async (cdp) => {
@@ -1384,7 +1394,7 @@ const openAndroidConnection = async (cdp) => {
     5_000,
   );
   await setAndroidAutomaticConnectionPaused(cdp, false);
-  const deadline = Date.now() + 10 * 60_000;
+  const deadline = Date.now() + connectionTimeoutMs;
   let lastError = "";
   while (Date.now() < deadline) {
     const state = await cdp.evaluate(`(() => {
@@ -1397,9 +1407,10 @@ const openAndroidConnection = async (cdp) => {
     if (state?.error) lastError = state.error;
     await wait(10_000);
   }
-  throw new Error(
-    `Timed out waiting for Android UI connection approval.${lastError ? ` Last error: ${lastError}` : ""}`,
-  );
+  const state = await readAndroidFolderState(cdp);
+  const events = await readAndroidSessionEvents(cdp);
+  throw new Error(`Timed out waiting for Android UI connection approval: ` +
+    JSON.stringify({ ...state, lastError, events }));
 };
 
 const runAndroidBackgroundSessionLifecycle = async (cdp) => {
@@ -1432,6 +1443,93 @@ const runAndroidBackgroundSessionLifecycle = async (cdp) => {
     foregroundCdp.close();
     throw error;
   }
+};
+
+const readAndroidFolderState = async (cdp) => {
+  const ui = await cdp.evaluate(`(() => ({
+    pageHeading: document.querySelector("h1")?.textContent?.trim() ?? "",
+    connection: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() ?? "",
+    folderOpen: document.querySelector(".crumb-current")?.textContent?.trim() !== "All Syncthing Folders",
+    visibleFileRows: document.querySelectorAll(".item-title").length,
+    passwordInputLength: document.querySelector(${JSON.stringify(`[data-testid="folder-password-${targetFolderId}"]`)})
+      ?.value?.length ?? -1,
+    forgetPasswordEnabled: [...document.querySelectorAll("button")]
+      .some(button => button.getAttribute("aria-label") === "Forget saved folder password" && !button.disabled),
+    alerts: [...document.querySelectorAll("p[role=alert], p.error")]
+      .map(element => element.textContent?.trim()).filter(Boolean).slice(-3),
+  }))()`).catch(() => ({ uiUnavailable: true }));
+  const status = await tauriInvoke(cdp, "syncpeer_document_command", {
+    request: { operation: "status" },
+  }).then(response => {
+    const folder = response.result?.folders?.find(item => item.id === targetFolderId);
+    return { registered: Boolean(folder), downloads: folder?.downloads ?? false };
+  }).catch(() => ({ statusUnavailable: true }));
+  return { ui, status };
+};
+
+const readAndroidSessionEvents = async (cdp) => {
+  try { await clickUiTestId(cdp, "tab-devices"); }
+  catch { return []; }
+  return cdp.evaluate(`(() => {
+    const summary = [...document.querySelectorAll("summary")]
+      .find(element => element.textContent?.includes("View logs"));
+    const list = summary?.parentElement?.querySelector("ul.list");
+    return [...(list?.querySelectorAll("li") ?? [])]
+      .map(row => {
+        const event = row.querySelector(".item-meta")?.textContent?.split("|").at(-1)?.trim();
+        if (!/^(core|client|document|session|cluster|untrusted)\\./.test(event ?? "")) return null;
+        if (!/^(core\\.cluster|client\\.shared_folders|cluster\\.folder|untrusted\\.folder)/.test(event)) return event;
+        let details = {};
+        try { details = JSON.parse(row.querySelector(".log-details")?.textContent ?? "{}"); }
+        catch { /* Only public flags and counts are included below. */ }
+        const safe = Object.fromEntries([
+          "count", "internalCount", "deviceCount", "localDevicePresentInFolder",
+          "remoteDevicePresentInFolder", "localTokenLengthFromPeer",
+          "remoteTokenLengthFromPeer", "localTokenLength", "tokenValid",
+          "needsPassword", "hasFolderCrypto", "stopReason", "sourceType", "echoedType",
+        ].filter(key => Object.hasOwn(details, key)).map(key => [key, details[key]]));
+        return Object.keys(safe).length ? { event, ...safe } : event;
+      })
+      .filter(Boolean)
+      .slice(0, 60);
+  })()`).catch(() => []);
+};
+
+const ensureAndroidFolderAttached = async (cdp) => {
+  const status = await tauriInvoke(cdp, "syncpeer_document_command", {
+    request: { operation: "status" },
+  });
+  if (status.result?.folders?.some(folder => folder.id === targetFolderId && folder.downloads)) return;
+  await openFolderSettings(cdp);
+  await waitForUiCondition(cdp, `([...document.querySelectorAll("li")]
+    .some(row => row.querySelector("span")?.textContent?.trim() === ${JSON.stringify(targetFolderTitle)}
+      && [...row.querySelectorAll("button")]
+        .some(button => button.textContent?.trim() === "Reattach encrypted local storage")))`,
+  "browse-only folder reattach control", 30_000);
+  const requested = await cdp.evaluate(`(() => {
+    const row = [...document.querySelectorAll("li")]
+      .find(element => element.querySelector("span")?.textContent?.trim() === ${JSON.stringify(targetFolderTitle)});
+    const button = [...(row?.querySelectorAll("button") ?? [])]
+      .find(element => element.textContent?.trim() === "Reattach encrypted local storage");
+    if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!requested) throw new Error("Android UI could not request encrypted local-folder reattachment.");
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const current = await tauriInvoke(cdp, "syncpeer_document_command", {
+      request: { operation: "status" },
+    });
+    if (current.result?.folders?.some(folder => folder.id === targetFolderId && folder.downloads)) {
+      await cdp.evaluate(`([...document.querySelectorAll("button")]
+        .find(button => button.textContent?.trim() === "Back"))?.click()`);
+      await clickUiTestId(cdp, "tab-folders");
+      return;
+    }
+    await wait(250);
+  }
+  throw new Error("Android encrypted local-folder reattachment did not complete.");
 };
 
 const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true) => {
@@ -1503,22 +1601,22 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
     if (inputVisible || editVisible) {
       await setUiValue(cdp, passwordInput, targetFolderPassword);
       await clickUiTestId(cdp, `unlock-folder-${targetFolderId}`);
-      await waitForUiCondition(
-        cdp,
-        `(async () => {
-          try {
-            const invoke = globalThis.__TAURI__?.core?.invoke ?? globalThis.__TAURI_INTERNALS__?.invoke;
-            const response = await invoke("syncpeer_document_command", {
-              request: { operation: "status" },
-            });
-            return response?.result?.folders?.some(
-              (folder) => folder.id === ${JSON.stringify(targetFolderId)} && folder.downloads === true,
-            ) === true;
-          } catch { return false; }
-        })()`,
-        "encrypted document folder attachment",
-        60_000,
-      );
+      try {
+        await waitForUiCondition(
+          cdp,
+          `document.querySelector(${JSON.stringify(`[data-testid="unlock-folder-${targetFolderId}"]`)})
+            ?.closest("li")?.querySelector("button[aria-label='Forget saved folder password']")
+            ?.disabled === false`,
+          "encrypted folder credential save",
+          30_000,
+        );
+        await ensureAndroidFolderAttached(cdp);
+      } catch (cause) {
+        const state = await readAndroidFolderState(cdp);
+        const events = await readAndroidSessionEvents(cdp);
+        throw new Error(`Encrypted document folder attachment failed: ` +
+          JSON.stringify({ ...state, events }), { cause });
+      }
     }
   }
   if (!await clickUiItem(cdp, targetFolderTitle)) {
@@ -1536,7 +1634,10 @@ const waitForAndroidFileRow = async (cdp, name, timeout = 90_000) => {
     if (atRoot) await clickUiItem(cdp, targetFolderTitle);
     await wait(250);
   }
-  throw new Error(`Timed out waiting for Android folder file: ${name}`);
+  const state = await readAndroidFolderState(cdp);
+  const events = await readAndroidSessionEvents(cdp);
+  throw new Error(`Timed out waiting for Android folder file: ${name}; ` +
+    `state=${JSON.stringify({ ...state, events })}`);
 };
 
 const startAndroidFileDownload = async (cdp, name) => {
@@ -2065,6 +2166,15 @@ const prepareWholeFolder = async () => {
     await favoriteWholeFolder(cdp, id);
     await documentCommand(cdp, { operation: "saveConnectionPasswords",
       passwords: { [`${remoteDeviceId}:${id}`]: password } });
+    const status = await documentCommand(cdp, { operation: "status" });
+    const settings = await documentCommand(cdp, { operation: "profileSettings" });
+    const credentials = await documentCommand(cdp, { operation: "connectionPasswords" });
+    const registered = status.folders.find(folder => folder.id === id);
+    console.log("Android outgoing folder state:", JSON.stringify({
+      registered: Boolean(registered), downloads: registered?.downloads === true,
+      rootFavorite: settings.folders[id]?.favorites?.some(item => item.kind === "folder" && item.path === "") === true,
+      peerCredential: Object.hasOwn(credentials, `${remoteDeviceId}:${id}`),
+    }));
     console.log(`Android favorite whole-folder replica prepared: ${id}.`);
   } finally { cdp.close(); }
 };
@@ -2111,9 +2221,12 @@ const runWholeFolderVerify = async () => {
 const runWholeFolderConnection = async () => {
   const cdp = await launchAndroidApp(true);
   try {
+    console.log("Android cross-app phase: opening the direct peer link.");
     if (!await openAndroidConnection(cdp)) throw new Error("Whole-folder peer did not connect.");
+    console.log("Android cross-app phase: direct peer link connected; handing off to background service.");
     runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
     await waitForSessionService(true, 30_000);
+    console.log("Android cross-app phase: background service running; checking connected notification.");
     await waitForSessionNotificationText("Peer session connected; selected sync is ready.", 120_000);
     console.log("Android direct whole-folder session is running in the background service.");
   } finally { cdp.close(); }

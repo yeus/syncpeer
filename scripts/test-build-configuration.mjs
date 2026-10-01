@@ -114,6 +114,16 @@ test("the combined Android workflow owns all three emulator profiles", () => {
   assert.match(runner, /editorProject, "assembleDebug"/);
 });
 
+test("the packaged desktop-to-Android gate requires an explicit disposable emulator", () => {
+  const runner = fs.readFileSync("scripts/test-tauri-deb.mjs", "utf8");
+  assert.match(runner, /SYNCPEER_ANDROID_SERIAL/);
+  assert.match(runner, /SYNCPEER_ANDROID_RESET_EMULATOR/);
+  assert.match(runner, /--cross-app-only/);
+  assert.match(runner, /ro\.kernel\.qemu/);
+  assert.match(runner, /packaged-android-pairing\.spec\.ts/);
+  assert.match(runner, /SYNCPEER_LAN_MOCHA_TIMEOUT: "900000"/);
+});
+
 test("Android network tests cannot silently select a saved external peer", () => {
   const runner = fs.readFileSync("scripts/test-android-e2e.mjs", "utf8");
   assert.doesNotMatch(runner, /\.tmp\/syncpeer-dev-client\/server-device-id/);

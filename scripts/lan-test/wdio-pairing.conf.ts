@@ -19,5 +19,9 @@ export const config = {
     joiner: { capabilities: { ...capability } } },
   framework: "mocha",
   reporters: ["spec"],
-  mochaOpts: { timeout: 300_000 },
+  mochaOpts: { timeout: 300_000,
+    ...(process.env.SYNCPEER_LAN_GREP
+      ? { grep: new RegExp(process.env.SYNCPEER_LAN_GREP) }
+      : {}),
+  },
 } satisfies Options.Testrunner & { capabilities: unknown };

@@ -1,6 +1,7 @@
 package dev.syncpeer.plugin.android
 
 import android.Manifest
+import android.app.Application
 import android.content.ContentUris
 import android.content.ContentValues
 import android.app.job.JobInfo
@@ -11,6 +12,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Bundle
 import android.os.PersistableBundle
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
@@ -296,18 +298,80 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
   private var multicastLock: WifiManager.MulticastLock? = null
   private var notificationCancellationPending = false
-
+  private val backgroundSessionHandoff = BackgroundSessionHandoff()
+  @Volatile private var backgroundActivityPaused = false
+  private var backgroundLifecycleRegistered = false
+  private val backgroundLifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+    override fun onActivityPaused(paused: Activity) {
+      if (paused !== activity) return
+      backgroundActivityPaused = true
+      try {
+        backgroundSessionHandoff.startPrepared(::startPreparedBackgroundSession)
+      } catch (error: Exception) {
+        if (activity.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+          android.util.Log.w("SyncpeerRuntime", "native background handoff failed: ${error.javaClass.simpleName}")
+        }
+      }
+    }
+    override fun onActivityDestroyed(destroyed: Activity) {
+      if (destroyed !== activity || !backgroundLifecycleRegistered) return
+      activity.application.unregisterActivityLifecycleCallbacks(this)
+      backgroundLifecycleRegistered = false
+      backgroundActivityPaused = false
+      backgroundSessionHandoff.clear()
+    }
+    override fun onActivityCreated(created: Activity, state: Bundle?) = Unit
+    override fun onActivityStarted(started: Activity) = Unit
+    override fun onActivityResumed(resumed: Activity) {
+      if (resumed === activity) backgroundActivityPaused = false
+    }
+    override fun onActivityStopped(stopped: Activity) = Unit
+    override fun onActivitySaveInstanceState(current: Activity, state: Bundle) = Unit
+  }
   override fun load(webView: WebView) {
     super.load(webView)
+    if (!backgroundLifecycleRegistered) {
+      activity.application.registerActivityLifecycleCallbacks(backgroundLifecycleCallbacks)
+      backgroundLifecycleRegistered = true
+    }
     if (activity.intent?.action == SyncpeerTransferConstants.ACTION_CANCEL) {
       handleTransferCancellation()
     }
   }
-
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     if (intent.action == SyncpeerTransferConstants.ACTION_CANCEL) {
       handleTransferCancellation()
+    }
+  }
+
+  private fun validateBackgroundSessionRequest(raw: String) {
+    val request = JSONObject(raw)
+    check(request.optString("operation") == "connect") { "Background session requires a connect request." }
+    check(raw.length <= 4096) { "Background session request is too large." }
+    check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      "Background synchronization requires Android 8 or newer."
+    }
+  }
+
+  private fun startPreparedBackgroundSession(raw: String) {
+    val intent = Intent(activity.applicationContext, DocumentRuntimeService::class.java)
+      .setAction(SyncpeerSessionConstants.ACTION_START)
+      .putExtra(SyncpeerSessionConstants.EXTRA_REQUEST, raw)
+    ContextCompat.startForegroundService(activity.applicationContext, intent)
+  }
+
+  @Command
+  fun prepareBackgroundSession(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(BackgroundSessionArgs::class.java)
+      validateBackgroundSessionRequest(args.request)
+      backgroundSessionHandoff.prepare(args.request)
+      val started = backgroundActivityPaused &&
+        backgroundSessionHandoff.startPrepared(::startPreparedBackgroundSession)
+      invoke.resolveObject(mapOf("prepared" to true, "started" to started))
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not prepare background synchronization.")
     }
   }
 
@@ -341,25 +405,18 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   fun startBackgroundSession(invoke: Invoke) {
     try {
       val args = invoke.parseArgs(BackgroundSessionArgs::class.java)
-      val request = JSONObject(args.request)
-      check(request.optString("operation") == "connect") { "Background session requires a connect request." }
-      check(args.request.length <= 4096) { "Background session request is too large." }
-      check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        "Background synchronization requires Android 8 or newer."
-      }
-      val intent = Intent(activity.applicationContext, DocumentRuntimeService::class.java)
-        .setAction(SyncpeerSessionConstants.ACTION_START)
-        .putExtra(SyncpeerSessionConstants.EXTRA_REQUEST, args.request)
-      ContextCompat.startForegroundService(activity.applicationContext, intent)
-      invoke.resolveObject(mapOf("started" to true))
+      validateBackgroundSessionRequest(args.request)
+      backgroundSessionHandoff.prepare(args.request)
+      val started = backgroundSessionHandoff.startPrepared(::startPreparedBackgroundSession)
+      invoke.resolveObject(mapOf("started" to started))
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not start background synchronization.")
     }
   }
-
   @Command
   fun stopBackgroundSession(invoke: Invoke) {
     try {
+      backgroundSessionHandoff.clear()
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
         invoke.resolveObject(mapOf("stopped" to true))
         return

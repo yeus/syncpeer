@@ -4093,6 +4093,25 @@ async fn syncpeer_android_start_transfer_service(
 }
 
 #[tauri::command]
+async fn syncpeer_android_prepare_background_session(
+    app: tauri::AppHandle,
+    request: serde_json::Value,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .prepare_background_session(&request)
+            .map_err(|error| format!("Could not prepare background synchronization: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Ok(())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_start_background_session(
     app: tauri::AppHandle,
     request: serde_json::Value,
@@ -5044,6 +5063,7 @@ pub fn run() {
             syncpeer_cache_suspend,
             syncpeer_android_open_with_chooser,
             syncpeer_android_start_transfer_service,
+            syncpeer_android_prepare_background_session,
             syncpeer_android_start_background_session,
             syncpeer_android_release_local_copy,
             syncpeer_android_biometric_status,

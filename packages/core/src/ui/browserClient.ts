@@ -200,6 +200,7 @@ export interface AndroidCalendarEventRecord {
 export interface SyncpeerPlatformAdapter {
   releaseLocalCopy?: (folderId: string, mode: "safe" | "dangerous", confirmedText: string,
     sessions: readonly Pick<SyncpeerSessionHandle, "remoteDeviceId" | "remoteFs" | "isClosed">[]) => Promise<void>;
+  prepareBackgroundSession?: (options: Omit<ConnectOptions, "sharedFolders">) => Promise<void>;
   startBackgroundSession?: (options: Omit<ConnectOptions, "sharedFolders">) => Promise<void>;
   stopBackgroundSession?: () => Promise<void>;
   acknowledgeCachedSync?: (folderId: string, path: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => Promise<boolean>;
@@ -577,6 +578,15 @@ export const createSyncpeerBrowserClient = (
   let cachedDefaultIdentity: SyncpeerIdentityRecord | null = null;
   let activeConnectOptions: ConnectOptions | null = null;
   let activeResolvedConnectOptions: ConnectOptions | null = null;
+  const backgroundSessionOptions = (connectOptions: ConnectOptions | null) => connectOptions
+    ? Object.fromEntries(Object.entries(connectOptions).filter(([key]) => key !== "sharedFolders")) as Omit<ConnectOptions, "sharedFolders">
+    : null;
+  const prepareBackgroundHandoff = async (connectOptions: ConnectOptions | null) => {
+    const backgroundOptions = backgroundSessionOptions(connectOptions);
+    if (backgroundOptions && platformAdapter.prepareBackgroundSession) {
+      await platformAdapter.prepareBackgroundSession(backgroundOptions);
+    }
+  };
   let focusedFolderId: string | null = null;
   let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
   let incomingServiceKey = "";
@@ -687,20 +697,29 @@ export const createSyncpeerBrowserClient = (
       onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
         if (!sameDeviceId(connectedRemoteDeviceId, remoteDeviceId) ||
           preferredPeerDirection(localDeviceId, connectedRemoteDeviceId) !== "incoming") return;
-        void lifecycle.adopt(connectOptions, session).then(adopted => {
-          if (!adopted) return;
-          activeResolvedConnectOptions = {
-            ...connectOptions,
-            host: coreOptions.host,
-            port: coreOptions.port,
-            cert: coreOptions.certPem,
-            key: coreOptions.keyPem,
-            remoteId: connectedRemoteDeviceId,
-          };
-          logClient(options.onLog, "client.session.incoming.ready", {
-            transportKind: session.transportKind, connectionScope: session.connectionScope,
+        const resolvedOptions: ConnectOptions = {
+          ...connectOptions,
+          host: coreOptions.host,
+          port: coreOptions.port,
+          cert: coreOptions.certPem,
+          key: coreOptions.keyPem,
+          remoteId: connectedRemoteDeviceId,
+        };
+        void prepareBackgroundHandoff(resolvedOptions)
+          .then(() => lifecycle.adopt(connectOptions, session))
+          .then(adopted => {
+            if (!adopted) return;
+            activeResolvedConnectOptions = resolvedOptions;
+            logClient(options.onLog, "client.session.incoming.ready", {
+              transportKind: session.transportKind, connectionScope: session.connectionScope,
+            });
+          })
+          .catch(error => {
+            void session.close().catch(() => undefined);
+            coreAdapter.log?.("core.background.prepare.failed", {
+              message: error instanceof Error ? error.message : String(error),
+            });
           });
-        });
       },
     };
     if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
@@ -845,6 +864,7 @@ export const createSyncpeerBrowserClient = (
       cert: certPem,
       key: keyPem,
     };
+    await prepareBackgroundHandoff(activeResolvedConnectOptions);
     logClient(options.onLog, "client.session.open.ready", {
       transportKind: session.transportKind,
       connectionScope: session.connectionScope,
@@ -893,25 +913,21 @@ export const createSyncpeerBrowserClient = (
     if (foreground) {
       await platformAdapter.stopBackgroundSession?.();
       await lifecycle.setForeground(true);
+      await prepareBackgroundHandoff(activeResolvedConnectOptions);
       return;
     }
-    // Android 12 and newer only allow a foreground service to start while the
-    // app is still treated as foreground.  Request the background session
-    // before closing the foreground one so session teardown cannot delay the
-    // start request out of that window.
-    const backgroundSession = activeResolvedConnectOptions && platformAdapter.startBackgroundSession
-      ? platformAdapter.startBackgroundSession(Object.fromEntries(
-          Object.entries(activeResolvedConnectOptions).filter(([key]) => key !== "sharedFolders"),
-        ) as Omit<ConnectOptions, "sharedFolders">)
+    // Android arms this request while the activity is foreground. Native
+    // activity lifecycle code can therefore start the foreground service at
+    // onPause, without depending on a delayed WebView visibility callback.
+    const backgroundOptions = backgroundSessionOptions(activeResolvedConnectOptions);
+    const backgroundSession = backgroundOptions && platformAdapter.startBackgroundSession
+      ? platformAdapter.startBackgroundSession(backgroundOptions)
       : null;
-    // The start is awaited after teardown; keep an early rejection from
-    // surfacing as unhandled while the foreground session is still closing.
     backgroundSession?.catch(() => undefined);
     await lifecycle.setForeground(false);
     await stopIncomingService();
     if (backgroundSession) await backgroundSession;
   };
-
   return {
     releaseLocalCopy: async (folderId: string, mode: "safe" | "dangerous", confirmedText = "") => {
       if (!platformAdapter.releaseLocalCopy) throw new Error("Local copy release is unavailable on this platform.");
@@ -942,6 +958,7 @@ export const createSyncpeerBrowserClient = (
       // Validate before opening a listener; port zero is resolved after binding.
       if (!relayAddress) advertisedPairingEndpoint(pairingOptions.advertisedHost, pairingOptions.port || 22000);
       const identity = await identityForPairing();
+      await platformAdapter.stopBackgroundSession?.();
       activeConnectOptions = null;
       activeResolvedConnectOptions = null;
       focusedFolderId = null;

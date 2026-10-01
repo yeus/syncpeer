@@ -256,6 +256,7 @@ test("foreground handoff requests the background session before closing the acti
     },
   }, platformAdapter: {
     readDefaultIdentity: async () => ownerIdentity,
+    prepareBackgroundSession: async () => { events.push("background:prepare"); },
     startBackgroundSession: async () => { events.push("background:start"); },
   } });
   const connected = Promise.withResolvers<void>();
@@ -277,7 +278,10 @@ test("foreground handoff requests the background session before closing the acti
     unsubscribeConnected();
     unsubscribeOrdering = owner.subscribeLifecycle(state => events.push(`state:${state.phase}`));
     await owner.setForeground(false);
+    assert.ok(events.includes("background:prepare"), "The background session was not armed while foreground.");
     assert.ok(events.includes("background:start"), "The background session was not requested.");
+    assert.ok(events.indexOf("background:prepare") < events.indexOf("background:start"),
+      `The background request must be armed before the handoff: ${events.join(",")}`);
     assert.ok(events.indexOf("background:start") < events.indexOf("state:suspended"),
       `The background session must start before foreground teardown: ${events.join(",")}`);
   } finally {

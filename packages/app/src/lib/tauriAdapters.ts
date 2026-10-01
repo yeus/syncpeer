@@ -507,6 +507,16 @@ export const createTauriAdapters = (
     log: (event, details) => logUi(options, event, details),
   };
 
+  const androidBackgroundSessionRequest = async (options: Omit<ConnectOptions, "sharedFolders">) => {
+    let allowMetered = false;
+    try {
+      const settings = await documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
+      allowMetered = settings.profile.allowMetered;
+    } catch {
+      // A locked vault keeps the safer default: background sessions wait for Wi-Fi.
+    }
+    return { operation: "connect", options: { ...options, allowMetered } };
+  };
   const platformAdapter: SyncpeerPlatformAdapter = {
     sessionConfigurationRevision: () => sessionConfigurationRevision,
     onSessionConfigurationChange: listener => { sessionConfigurationListeners.add(listener); },
@@ -522,16 +532,14 @@ export const createTauriAdapters = (
         ? { mode, sessions } : { mode, confirmedText });
       invalidateSessionConfiguration();
     },
+    prepareBackgroundSession: platform === "android" ? async (options: Omit<ConnectOptions, "sharedFolders">) => {
+      await invokeWithLogging("syncpeer_android_prepare_background_session", {
+        request: await androidBackgroundSessionRequest(options),
+      });
+    } : undefined,
     startBackgroundSession: platform === "android" ? async (options: Omit<ConnectOptions, "sharedFolders">) => {
-      let allowMetered = false;
-      try {
-        const settings = await documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
-        allowMetered = settings.profile.allowMetered;
-      } catch {
-        // A locked vault keeps the safer default: background sessions wait for Wi-Fi.
-      }
       await invokeWithLogging("syncpeer_android_start_background_session", {
-        request: { operation: "connect", options: { ...options, allowMetered } },
+        request: await androidBackgroundSessionRequest(options),
       });
     } : undefined,
     stopBackgroundSession: platform === "android" ? async () => {

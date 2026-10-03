@@ -14,7 +14,7 @@ import type {
   FileDownloadSink,
 } from "@syncpeer/core/browser";
 import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
-  changesSessionConfiguration, dispatchDocumentCommand } from "@syncpeer/core/filesystem";
+  dispatchDocumentCommandWithSessionConfiguration } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
 import { createWorkerPasswordKdf } from "./passwordKdf.ts";
 import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
@@ -309,10 +309,10 @@ export const createTauriAdapters = (
       return response.result;
     }
     const documents = await desktopDocuments();
-    if (changesSessionConfiguration(request.operation, request.path)) invalidateSessionConfiguration();
-    return await dispatchDocumentCommand(documents, request) as T;
+    return await dispatchDocumentCommandWithSessionConfiguration(
+      documents, request, invalidateSessionConfiguration,
+    ) as T;
   };
-
   const hostAdapter: SyncpeerHostAdapter = {
     kdf: createWorkerPasswordKdf(),
     connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal, alpnProtocols }) => {

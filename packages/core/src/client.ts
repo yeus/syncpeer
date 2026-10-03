@@ -1668,6 +1668,14 @@ class BepSession {
     const folderId = String(index.folder ?? "");
     const state = this.folders.get(folderId);
     if (!state) return;
+    // Index frames carry the sender's highest sequence for this folder. Track it
+    // so the UI sees a folder version change when a peer publishes an update;
+    // otherwise the version key stays fixed and a received file never appears in
+    // an already open directory.
+    const lastSequence = Number(index.last_sequence ?? 0);
+    if (Number.isFinite(lastSequence) && lastSequence > Number(state.remoteMaxSequence ?? 0)) {
+      state.remoteMaxSequence = String(lastSequence);
+    }
     // Syncthing may send the initial index before the UI opens this folder.
     // Keep that authoritative snapshot; an empty INDEX frame from the client
     // does not make Syncthing resend an unchanged index.

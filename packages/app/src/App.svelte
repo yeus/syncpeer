@@ -92,8 +92,8 @@
       rootCount: number;
       selectedFolder: boolean;
     };
+    __syncpeerReadCachedDocument?: (folderId: string, path: string) => Promise<number[] | null>;
   };
-
   let app = $state(createInitialState());
   let systemPrefersDark = $state(false);
   let contentElement = $state<HTMLElement | null>(null);
@@ -449,6 +449,12 @@
 
     if (import.meta.env.SYNCPEER_LAN_E2E === true) {
       const testWindow = window as SyncpeerTestWindow;
+      testWindow.__syncpeerReadCachedDocument = async (folderId, path) => {
+        const record = (await platformAdapter.listCachedFiles?.() ?? [])
+          .find(file => file.folderId === folderId && file.path === path);
+        if (!record?.localPath || !platformAdapter.readBinaryFile) return null;
+        return Array.from(await platformAdapter.readBinaryFile(record.localPath));
+      };
       testWindow.__syncpeerSetDownloadProgress = (
         folderId: string,
         path: string,
@@ -486,16 +492,26 @@
         rootCount: currentRootFolders.length,
         selectedFolder: Boolean(app.session.currentFolderId),
       });
+      (window as SyncpeerTestWindow).__syncpeerReadCachedDocument = async (folderId, path) => {
+        const record = (await platformAdapter.listCachedFiles?.() ?? [])
+          .find(file => file.folderId === folderId && file.path === path);
+        if (!record?.localPath || !platformAdapter.readBinaryFile) return null;
+        return Array.from(await platformAdapter.readBinaryFile(record.localPath));
+      };
     }
-
     return () => {
       if (import.meta.env.SYNCPEER_LAN_E2E === true) {
         const testWindow = window as SyncpeerTestWindow;
         delete testWindow.__syncpeerSetDownloadProgress;
         delete testWindow.__syncpeerClearDownloadProgress;
         delete testWindow.__syncpeerDigestCachedFile;
+        delete testWindow.__syncpeerReadCachedDocument;
       }
-      if (import.meta.env.DEV) delete (window as SyncpeerTestWindow).__syncpeerFolderProbe;
+      if (import.meta.env.DEV) {
+        const testWindow = window as SyncpeerTestWindow;
+        delete testWindow.__syncpeerFolderProbe;
+        delete testWindow.__syncpeerReadCachedDocument;
+      }
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);

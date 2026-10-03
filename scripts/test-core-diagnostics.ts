@@ -1493,4 +1493,65 @@ assert.deepEqual(
   ["flickr"],
 );
 
+let folderSequence = 1;
+const sequenceFolder = {
+  id: "sequence-folder",
+  label: "Sequence folder",
+  readOnly: false,
+  encrypted: false,
+  needsPassword: false,
+};
+const sequenceFs: RemoteFsLike = {
+  listFolders: async () => [sequenceFolder],
+  requestFolderIndex: async () => undefined,
+  setFocusedFolder: () => undefined,
+  waitForFolderIndex: async () => true,
+  readDir: async () => folderSequence === 1
+    ? [{ name: "before.txt", path: "before.txt", type: "file", size: 6, modifiedMs: 1 }]
+    : [
+        { name: "before.txt", path: "before.txt", type: "file", size: 6, modifiedMs: 1 },
+        { name: "from-android.txt", path: "from-android.txt", type: "file", size: 11, modifiedMs: 2 },
+      ],
+  readFileFully: async () => new Uint8Array(),
+  writeFileFully: async () => undefined,
+};
+const sequenceSyncState = () => ({
+  folderId: sequenceFolder.id,
+  remoteIndexId: "1",
+  remoteMaxSequence: String(folderSequence),
+  indexReceived: true,
+});
+const sequenceStore = createSyncpeerSessionStore({
+  transport: {
+    connectAndSync: async () => sequenceFs,
+    connectAndGetOverview: async () => ({
+      folders: [sequenceFolder],
+      device: null,
+      folderSyncStates: [sequenceSyncState()],
+      connectedVia: "fixture",
+      transportKind: "direct-tcp" as const,
+    }),
+    connectAndGetFolderVersions: async () => [sequenceSyncState()],
+  },
+});
+const sequenceOptions = {
+  host: "127.0.0.1",
+  port: 22000,
+  deviceName: "syncpeer-sequence-regression",
+  discoveryMode: "direct" as const,
+};
+await sequenceStore.actions.connect(sequenceOptions);
+await sequenceStore.actions.openFolder(sequenceFolder.id, sequenceOptions);
+assert.deepEqual(
+  sequenceStore.getState().entries.map((entry) => entry.name),
+  ["before.txt"],
+);
+folderSequence = 2;
+await sequenceStore.actions.refreshOverview(sequenceOptions);
+assert.deepEqual(
+  sequenceStore.getState().entries.map((entry) => entry.name),
+  ["before.txt", "from-android.txt"],
+  "A peer sequence advance must reload the open directory.",
+);
+
 console.log("Core diagnostics passed.");

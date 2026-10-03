@@ -291,6 +291,55 @@ test("an automatic reconnect rehydrates the session overview", async () => {
   assert.equal(store.getState().remoteFs, remoteFs);
 });
 
+test("a connected lifecycle never reports connected without a runtime session", async () => {
+  let timeMs = 0;
+  let onLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
+  const firstSync = deferred<SyncpeerSessionHandle["remoteFs"]>();
+  let syncCalls = 0;
+  const store = createSyncpeerSessionStore({
+    now: () => timeMs,
+    sleep: async (ms) => { timeMs += ms; },
+    transport: {
+      connectAndSync: async () => {
+        syncCalls += 1;
+        return syncCalls === 1 ? firstSync.promise : remoteFs;
+      },
+      connectAndGetOverview: async () => ({
+        folders: [],
+        device: null,
+        folderSyncStates: [],
+        connectedVia: "redacted-test-path",
+        transportKind: "direct-tcp",
+      }),
+      connectAndGetFolderVersions: async () => [],
+      subscribeLifecycle: (listener) => {
+        onLifecycle = listener;
+        return () => undefined;
+      },
+    },
+  });
+  const options = { host: "test.invalid", port: 22000, deviceName: "test" };
+
+  const opening = store.actions.connect(options).catch(() => undefined);
+  onLifecycle?.({
+    phase: "connected",
+    attempt: 0,
+    nextRetryAtMs: null,
+    closureReason: null,
+    upgradeStatus: "idle",
+  });
+  assert.notEqual(store.getState().phase, "connected",
+    "A connected lifecycle without a runtime session must not report connected.");
+  for (let index = 0; index < 50 && store.getState().remoteFs === null; index += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(store.getState().remoteFs, remoteFs,
+    "The store must recover the runtime session reported connected by the transport.");
+  assert.equal(store.getState().phase, "connected");
+  firstSync.resolve(remoteFs);
+  await opening;
+});
+
 test("concurrent connects share one validated opening", async () => {
   const pending = deferred<ReturnType<typeof session>>();
   let opens = 0;
@@ -331,6 +380,32 @@ test("changed connection options close the old session before opening", async ()
   await lifecycle.connect("first");
   await lifecycle.connect("second");
   assert.deepEqual(events, ["open:first", "close:first", "open:second"]);
+  await lifecycle.disconnect();
+});
+
+test("mutable session configuration key reopens the live session", async () => {
+  const first = session();
+  const second = session();
+  const opened = [first, second];
+  const events: string[] = [];
+  let revision = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => {
+      events.push(`open:${revision}`);
+      return opened.shift()!;
+    },
+    keyFor: (value) => `${value}:${revision}`,
+  });
+  const originalClose = first.close;
+  first.close = async () => {
+    events.push("close:first");
+    await originalClose();
+  };
+
+  await lifecycle.connect("peer");
+  revision += 1;
+  assert.equal(await lifecycle.ensureSession(), second);
+  assert.deepEqual(events, ["open:0", "close:first", "open:1"]);
   await lifecycle.disconnect();
 });
 

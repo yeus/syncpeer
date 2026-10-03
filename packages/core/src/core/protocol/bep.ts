@@ -143,6 +143,7 @@ export interface BepClusterConfig {
 export interface BepIndex {
   folder?: string;
   files?: BepFileInfo[];
+  last_sequence?: number;
 }
 
 export interface BepResponse {

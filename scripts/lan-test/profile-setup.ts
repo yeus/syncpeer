@@ -2,8 +2,15 @@ import assert from "node:assert/strict";
 import { clickButtonByText } from "./ui-helpers.js";
 
 export async function createFreshEncryptedProfile(peer: WebdriverIO.Browser) {
-  await peer.$("[data-testid='tab-folders']").click();
-  await peer.$("button=Folder settings · New folder").click();
+  // WebKitWebDriver can hit-test the surrounding area instead of the tab or
+  // offscreen button under Xvfb. Use DOM clicks for the same handlers.
+  await peer.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-folders']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+    tab.click();
+  });
+  await peer.$("button=Folder settings · New folder").waitForExist({ timeout: 30_000 });
+  await clickButtonByText(peer, "Folder settings · New folder");
   await peer.$("//label[contains(., 'Master password (at least 16 characters)')]/input")
     .setValue("synthetic-release-smoke-master-password");
   await peer.$("//label[contains(., 'Offline kit password')]/input")

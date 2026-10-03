@@ -4,7 +4,7 @@ import "./document-runtime-polyfills.js";
 import { installAndroidTimers } from "./document-runtime-polyfills.js";
 import { createPortRequest } from "./document-runtime-port.js";
 import { createDocumentFilesystem } from "../../core/src/sync/documentFilesystem.js";
-import { changesSessionConfiguration, dispatchDocumentCommand } from "../../core/src/sync/documentCommands.js";
+import { dispatchDocumentCommandWithSessionConfiguration } from "../../core/src/sync/documentCommands.js";
 import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js";
 import { deriveUntrustedFolderCrypto } from "../../core/src/core/model/untrusted.js";
 import { createEncryptedDownloadSink, loadEncryptedDiskMetadata, readEncryptedDiskRange } from "../../core/src/sync/encryptedFilesystem.js";
@@ -126,14 +126,11 @@ async function startDocuments(android: AndroidRuntime) {
   let sessionConfigurationRevision = 0;
   const sessionConfigurationListeners = new Set<() => void>();
   return {
-    command: (input: unknown) => {
-      if (changesSessionConfiguration((input as { operation?: unknown } | null)?.operation,
-        (input as { path?: unknown } | null)?.path)) {
+    command: (input: unknown) => dispatchDocumentCommandWithSessionConfiguration(
+      documents, input, () => {
         sessionConfigurationRevision++;
         for (const listener of sessionConfigurationListeners) listener();
-      }
-      return dispatchDocumentCommand(documents, input);
-    },
+      }),
     sessionConfigurationRevision: () => sessionConfigurationRevision,
     onSessionConfigurationChange: (listener: () => void) => { sessionConfigurationListeners.add(listener); },
     releaseLocalCopy: documents.releaseLocalCopy,
@@ -293,9 +290,22 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
       sharedFolderIds = sharedFolders.map(folder => folder.id);
       return session;
     },
-    keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName }),
+    keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName,
+      // Shared-folder credentials and the replica receiver are resolved from
+      // the document owner when the session opens. A later folder attach,
+      // favorite or credential change must invalidate the live session so it
+      // reopens with the current selection.
+      sessionConfigurationRevision: documents.sessionConfigurationRevision() }),
   });
-  documents.onSessionConfigurationChange(() => { void stopIncomingService(); });
+  documents.onSessionConfigurationChange(() => {
+    setTimeout(() => {
+      void (async () => {
+        await stopIncomingService();
+        if (!activeOptions) return;
+        await lifecycle.ensureSession(activeOptions);
+      })().catch(() => undefined);
+    }, 0);
+  });
   return {
     command: async (input: unknown) => {
       if (!input || typeof input !== "object" || Array.isArray(input)) {

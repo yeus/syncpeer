@@ -502,6 +502,7 @@ const serializeConnectionKey = (
   options: ConnectOptions,
   certPem: string,
   keyPem: string,
+  sessionConfigurationRevision = 0,
 ): string =>
   JSON.stringify({
     host: options.host,
@@ -517,6 +518,12 @@ const serializeConnectionKey = (
     quicOnly: options.quicOnly === true,
     folderPasswords: options.folderPasswords ?? {},
     sharedFolders: options.sharedFolders ?? [],
+    // The shared-folder set and credentials are resolved from the document
+    // owner at session-open time. Incrementing this revision when the owner
+    // changes (folder attach, favorite, credential) makes the live session
+    // stale so it reopens with the current selection instead of silently
+    // dropping a peer index for a folder it opened without.
+    sessionConfigurationRevision,
   });
 
 const toConnectionOverview = async (
@@ -878,12 +885,32 @@ export const createSyncpeerBrowserClient = (
       normalizeConnectOptions(connectOptions),
       connectOptions.cert ?? "default-cert",
       connectOptions.key ?? "default-key",
+      platformAdapter.sessionConfigurationRevision?.() ?? 0,
     ),
   });
   platformAdapter.onSessionConfigurationChange?.(() => {
-    void stopIncomingService().catch(error => coreAdapter.log?.("core.incoming.refresh.failed", {
-      message: error instanceof Error ? error.message : String(error),
-    }));
+    // Reopen the live session after the document owner's shared-folder set or
+    // credentials change so the peer sees the current selection. Defer past
+    // the triggering document command, then retire the prepared listener
+    // before reopening so the replacement cannot race the old bind.
+    setTimeout(() => {
+      void (async () => {
+        try { await stopIncomingService(); }
+        catch (error) {
+          coreAdapter.log?.("core.incoming.refresh.failed", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        const refreshOptions = activeConnectOptions ?? activeResolvedConnectOptions;
+        if (!refreshOptions) return;
+        try { await lifecycle.ensureSession(refreshOptions); }
+        catch (error) {
+          coreAdapter.log?.("core.session.refresh.failed", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })();
+    }, 0);
   });
 
   const ensureSession = (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> =>

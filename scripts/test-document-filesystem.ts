@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
-import { changesSessionConfiguration, deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
+import { changesSessionConfiguration, dispatchDocumentCommandWithSessionConfiguration,
+  deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { scryptPasswordKdf, type PasswordKdf } from "../packages/core/dist/kdf.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 import { createOwnedDeviceIdentity, createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
@@ -26,6 +27,34 @@ test("listener snapshots are invalidated by sharing changes, not ordinary docume
     ["folders", "photos", "devices", "owner"]]) {
     assert.equal(changesSessionConfiguration("savePersonalSpaceSetting", path), true);
   }
+});
+
+test("session configuration invalidates only after the document mutation succeeds", async () => {
+  let finishAttach!: () => void;
+  const attachFinished = new Promise<void>(resolve => { finishAttach = resolve; });
+  let attached = false;
+  const events: string[] = [];
+  const documents = {
+    attachDownloads: async (id: string) => {
+      assert.equal(id, "photos");
+      events.push("attach:start");
+      await attachFinished;
+      attached = true;
+      events.push("attach:done");
+    },
+  } as unknown as Parameters<typeof dispatchDocumentCommandWithSessionConfiguration>[0];
+
+  const pending = dispatchDocumentCommandWithSessionConfiguration(
+    documents, { operation: "attachDownloads", id: "photos" }, () => {
+      assert.equal(attached, true);
+      events.push("invalidate");
+    },
+  );
+  await Promise.resolve();
+  assert.deepEqual(events, ["attach:start"]);
+  finishAttach();
+  await pending;
+  assert.deepEqual(events, ["attach:start", "attach:done", "invalidate"]);
 });
 
 test("an ordinary Syncthing peer can receive an explicitly selected folder without a personal space", async () => {

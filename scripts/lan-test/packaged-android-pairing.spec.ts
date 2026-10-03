@@ -29,20 +29,40 @@ async function freePort(): Promise<number> {
   return address.port;
 }
 
+async function readDesktopDocumentContent(name: string): Promise<string | null> {
+  return browser.execute(async ({ folderId, path }) => {
+    const probe = (window as typeof window & { __syncpeerReadCachedDocument?:
+      (folderId: string, path: string) => Promise<number[] | null> }).__syncpeerReadCachedDocument;
+    if (!probe) throw new Error("The cached-document probe is unavailable.");
+    // Attached folders keep their files in the encrypted document owner, so read
+    // through the app adapter that holds the folder key instead of the raw cache.
+    const bytes = await probe(folderId, path);
+    return bytes ? new TextDecoder().decode(new Uint8Array(bytes)) : null;
+  }, { folderId, path: name }).catch(error =>
+    `error: ${error instanceof Error ? error.message : String(error)}`);
+}
+
 async function waitForDesktopFile(name: string, expected: string | null) {
-  await browser.waitUntil(async () => {
+  const deadline = Date.now() + 120_000;
+  let observation = "no poll completed";
+  while (Date.now() < deadline) {
     const entry = $(`//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(name)}]`);
-    if (!await entry.isExisting()) return expected === null;
-    if (expected === null) return false;
-    const bytes = await browser.execute(async request => {
-      const internals = (window as typeof window & { __TAURI_INTERNALS__?: {
-        invoke: (name: string, args: unknown) => Promise<number[]> } }).__TAURI_INTERNALS__;
-      if (!internals) throw new Error("The packaged native bridge is unavailable.");
-      return internals.invoke("syncpeer_read_cached_file", { request });
-    }, { folderId, path: name }).catch(() => null);
-    return bytes !== null && new TextDecoder().decode(new Uint8Array(bytes)) === expected;
-  }, { timeout: 120_000, interval: 500,
-    timeoutMsg: `Desktop did not converge ${name} to the expected synthetic state.` });
+    const exists = await entry.isExisting();
+    if (exists && expected === null) return;
+    if (exists) {
+      const observed = await readDesktopDocumentContent(name);
+      observation = `entry found; content=${JSON.stringify(observed?.slice(0, 120) ?? null)}`;
+      if (expected !== null && observed === expected) return;
+    } else {
+      const titles = await browser.execute(() =>
+        [...document.querySelectorAll(".item-title")].map(element => element.textContent?.trim() ?? ""))
+        .catch(() => []);
+      observation = `entry missing; rendered titles=${JSON.stringify(titles.slice(0, 20))}`;
+    }
+    await browser.pause(500);
+  }
+  throw new Error(`Desktop did not converge ${name} to the expected synthetic state. ` +
+    `Last observation: ${observation}`);
 }
 
 async function uploadDesktopFile(name: string, content: string) {
@@ -172,7 +192,7 @@ describe("Packaged desktop to Android pairing", () => {
       .setValue("10.0.2.2");
     const create = $("button=Create pairing invitation");
     await create.waitForEnabled({ timeout: 30_000 });
-    await create.click();
+    await clickButtonByText(browser, "Create pairing invitation");
     const invitationField = $("//label[contains(., 'Invitation')]/textarea[@readonly]");
     await invitationField.waitForExist({ timeout: 30_000 });
     const invitation = await invitationField.getValue();
@@ -194,7 +214,7 @@ describe("Packaged desktop to Android pairing", () => {
   it("syncs a whole favorite folder with Android's separate editor", async () => {
     const serial = process.env.SYNCPEER_ANDROID_SERIAL;
     assert.ok(serial?.startsWith("emulator-"));
-    await $("button=Back").click();
+    await clickButtonByText(browser, "Back");
     await $("[data-testid='tab-devices']").click();
     const ownerId = (await $("[data-testid='current-device-id']").getText()).trim();
     assert.ok(ownerId);
@@ -262,14 +282,28 @@ describe("Packaged desktop to Android pairing", () => {
           if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
           tab.click();
         });
-        const folderRoot = $(`[data-testid='folder-root-${folderId}']`);
-        await folderRoot.waitForExist({ timeout: 30_000 });
-        await browser.execute((id: string) => {
-          const row = document.querySelector(`[data-testid='folder-root-${id}']`);
-          if (!(row instanceof HTMLElement)) throw new Error("Desktop folder root is unavailable.");
-          row.click();
-        }, folderId);
-        await $("#folder-upload-input").waitForExist({ timeout: 60_000 });
+        // Attaching the folder invalidates and reopens the live session, which can
+        // rebuild the root list under us. Re-click the root while the same bounded
+        // window elapses; opening the folder must still succeed.
+        const navigationDeadline = Date.now() + 90_000;
+        for (;;) {
+          const folderRoot = $(`[data-testid='folder-root-${folderId}']`);
+          if (await folderRoot.isExisting()) {
+            await browser.execute((id: string) => {
+              const row = document.querySelector(`[data-testid='folder-root-${id}']`);
+              if (row instanceof HTMLElement) row.click();
+            }, folderId);
+            try {
+              await $("#folder-upload-input").waitForExist({ timeout: 15_000 });
+              break;
+            } catch { /* Retry while the refresh finishes. */ }
+          } else {
+            await browser.pause(1_000);
+          }
+          if (Date.now() > navigationDeadline) {
+            throw new Error("Desktop could not open the attached folder root.");
+          }
+        }
         android(serial, ["--edit-whole-folder"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
           SYNCPEER_E2E_FILE_NAME: "from-android.txt", SYNCPEER_E2E_FILE_CONTENT: "android-one" });
         await waitForDesktopFile("from-android.txt", "android-one");

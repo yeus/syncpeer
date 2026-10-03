@@ -380,6 +380,57 @@ test("the LAN listener routes an unapproved certificate only to explicit pairing
   }
 });
 
+test("a receiver advances the remote folder sequence when the peer publishes an index update", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-index-sequence-"));
+  let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
+  let outgoing: SyncpeerSessionHandle | undefined;
+  let incoming: SyncpeerSessionHandle | undefined;
+  try {
+    const [a, b] = await Promise.all([createTestPeerIdentity(root, "a"), createTestPeerIdentity(root, "b")]);
+    const sharedFolders = [{ id: "fixture-folder", encryption: { mode: "plaintext" as const } }];
+    const directoryA = path.join(root, "share-a");
+    const directoryB = path.join(root, "share-b");
+    await mkdir(directoryA);
+    await mkdir(directoryB);
+    await writeFile(path.join(directoryA, "before.txt"), "before");
+    await writeFile(path.join(directoryB, "other.txt"), "other");
+    const replicaA = await createNodeFolderReplica(directoryA, "1");
+    const replicaB = await createNodeFolderReplica(directoryB, "2");
+    let accept!: (session: SyncpeerSessionHandle) => void;
+    const accepted = new Promise<SyncpeerSessionHandle>(resolve => { accept = resolve; });
+    listener = await listenNodePeer({ ...a, host: "127.0.0.1", port: 0,
+      expectedDeviceId: b.deviceId, deviceName: "fixture-a",
+      sharedFolders: sharedFolders.map(folder => ({ ...folder, replica: replicaA })),
+      timeoutMs: 3000, replicaScanIntervalMs: 100, onSession: accept });
+    outgoing = await createNodeSyncpeerClient().openSession({ ...b,
+      host: "127.0.0.1", port: listener.port, expectedDeviceId: a.deviceId,
+      deviceName: "fixture-b", sharedFolders: sharedFolders.map(folder => ({ ...folder, replica: replicaB })),
+      discoveryMode: "direct", timeoutMs: 3000, replicaScanIntervalMs: 100 });
+    incoming = await accepted;
+    const remoteSequence = async () => Number((await outgoing!.remoteFs.listFolderSyncStates?.() ?? [])
+      .find(state => state.folderId === "fixture-folder")?.remoteMaxSequence ?? 0);
+    const before = await remoteSequence();
+    const updated = new TextEncoder().encode("changed");
+    const current = (await replicaA.scan()).find(file => file.name === "before.txt")!;
+    await replicaA.edit!({ method: "write", folderId: "fixture-folder", path: current.name,
+      expectedVersion: current.version!, modifiedMs: Date.now(),
+      source: { size: updated.length, readRange: async (offset, size) => updated.slice(offset, offset + size) } });
+    const deadline = Date.now() + 5000;
+    while (await readFile(path.join(directoryB, "before.txt"), "utf8").catch(() => null) !== "changed") {
+      assert.ok(Date.now() < deadline, "Receiver did not apply the peer index update");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const after = await remoteSequence();
+    assert.ok(after > before,
+      `The receiver must advance the remote folder sequence after an index update (before=${before}, after=${after}).`);
+  } finally {
+    await outgoing?.close();
+    await incoming?.close();
+    await listener?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 for (const mode of ["plaintext", "encrypted"] as const) {
 test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { timeout: 15000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-peers-"));

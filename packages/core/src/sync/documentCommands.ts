@@ -14,6 +14,21 @@ export const changesSessionConfiguration = (operation: unknown, path?: unknown):
     "saveConnectionPasswords", "mergeConnectionPasswords",
   ].includes(operation);
 
+/** Apply a document command, then invalidate prepared/live peer views only after the mutation succeeds. */
+export async function dispatchDocumentCommandWithSessionConfiguration(
+  documents: ReturnType<typeof createDocumentFilesystem>,
+  input: unknown,
+  onSessionConfigurationChange: () => void,
+): Promise<unknown> {
+  const command = input && typeof input === "object" && !Array.isArray(input)
+    ? input as { operation?: unknown; path?: unknown }
+    : null;
+  const invalidatesSession = changesSessionConfiguration(command?.operation, command?.path);
+  const result = await dispatchDocumentCommand(documents, input);
+  if (invalidatesSession) onSessionConfigurationChange();
+  return result;
+}
+
 /** Validate the native/UI boundary before dispatching to the one document owner. */
 export async function dispatchDocumentCommand(documents: ReturnType<typeof createDocumentFilesystem>, input: unknown): Promise<unknown> {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid document command.");

@@ -383,6 +383,9 @@ class DocumentRuntimeService : Service() {
       if (error != null) {
         sessionPhase = "error"
         sessionError = error.message ?: "Background session could not connect."
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+          Log.w("SyncpeerRuntime", "session connect failed")
+        }
         result.completeExceptionally(error)
         SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", sessionError!!)
       } else {

@@ -277,6 +277,7 @@ test("foreground handoff requests the background session before closing the acti
     await new Promise(resolve => setTimeout(resolve, 0));
     unsubscribeConnected();
     unsubscribeOrdering = owner.subscribeLifecycle(state => events.push(`state:${state.phase}`));
+    await owner.startTransfer("synthetic-foreground-transfer");
     await owner.setForeground(false);
     assert.ok(events.includes("background:prepare"), "The background session was not armed while foreground.");
     assert.ok(events.includes("background:start"), "The background session was not requested.");
@@ -284,6 +285,8 @@ test("foreground handoff requests the background session before closing the acti
       `The background request must be armed before the handoff: ${events.join(",")}`);
     assert.ok(events.indexOf("background:start") < events.indexOf("state:suspended"),
       `The background session must start before foreground teardown: ${events.join(",")}`);
+    assert.ok(events.includes("state:suspended"),
+      "A foreground transfer must not keep the WebView session alive across the handoff.");
   } finally {
     unsubscribeConnected();
     unsubscribeOrdering();

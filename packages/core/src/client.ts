@@ -1481,16 +1481,16 @@ class BepSession {
       const encrypted =
         Number(folder.type ?? 0) === 3 ||
         (announcedToken?.length ?? 0) > 0;
+      const folderPassword = this.folderPasswords.get(folderId);
       let folderCrypto: UntrustedFolderCrypto | undefined;
       let needsPassword = false;
       let passwordError: string | undefined;
       if (encrypted) {
-        const password = this.folderPasswords.get(folderId);
-        if (!password) {
+        if (!folderPassword) {
           needsPassword = true;
         } else {
           try {
-            const derived = await deriveUntrustedFolderCrypto(folderId, password, this.kdf);
+            const derived = await deriveUntrustedFolderCrypto(folderId, folderPassword, this.kdf);
             const tokenValid = await verifyUntrustedPasswordToken(
               derived,
               announcedToken,
@@ -1551,6 +1551,7 @@ class BepSession {
       if (encrypted) {
         this.log("untrusted.folder.state", {
           folderId,
+          hasFolderPassword: !!folderPassword,
           needsPassword,
           hasFolderCrypto: !!folderCrypto,
           passwordError: passwordError ?? null,

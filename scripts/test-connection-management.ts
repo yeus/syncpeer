@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createConnectionLifecycle,
   retryDelayMs,
+  waitForLifecyclePhase,
   type ConnectionLifecycleState,
 } from "../packages/core/dist/ui/connectionLifecycle.js";
 import { buildConnectionDetails, fromConnectionSettings, toConnectionSettings } from
@@ -51,6 +52,20 @@ const session = (sessionRemoteFs = remoteFs) => {
     finish,
   };
 };
+
+test("a lifecycle retry waiter unsubscribes if connect finishes during subscription", async () => {
+  let unsubscribeCalls = 0;
+  const lifecycle = {
+    getState: () => ({ phase: "waiting" }),
+    subscribe: (listener: (state: { phase: string }) => void) => {
+      listener({ phase: "connected" });
+      return () => { unsubscribeCalls += 1; };
+    },
+  } as never;
+
+  assert.equal(await waitForLifecyclePhase(lifecycle, "connected", 60_000), true);
+  assert.equal(unsubscribeCalls, 1);
+});
 
 test("legacy global discovery migrates to automatic", () => {
   const stored = fromConnectionSettings({

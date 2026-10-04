@@ -237,6 +237,16 @@ const main = async (): Promise<void> => {
         }));
       } catch { console.error("Synthetic Syncthing failure state could not be read."); }
     }
+    try {
+      const runtimeEvents = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"])
+        .split("\n")
+        .flatMap(line => {
+          const event = /SyncpeerRuntime.*?:\s+((?:core|document|session)\.[a-z0-9_.-]+)/i.exec(line)?.[1];
+          return event ? [event] : [];
+        })
+        .slice(-60);
+      console.error("Android runtime event names:", JSON.stringify(runtimeEvents));
+    } catch { console.error("Android runtime event names unavailable."); }
     throw error;
   } finally {
     if (fixture) {

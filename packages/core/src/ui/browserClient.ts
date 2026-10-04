@@ -801,7 +801,10 @@ export const createSyncpeerBrowserClient = (
     coreAdapter.log?.("core.session.open.folders_start", {});
     const sharedFolders = normalized.sharedFolders ??
       await platformAdapter.sessionSharedFolders?.(normalized.remoteId ?? "");
-    logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(sharedFolders ?? []));
+    logClient(options.onLog, "client.shared_folders.selected", {
+      ...sharedFolderCounts(sharedFolders ?? []),
+      folderPasswordCount: Object.keys(normalized.folderPasswords ?? {}).length,
+    });
     const coreOptions: SyncpeerConnectOptions = {
       host: normalized.host,
       port: normalized.port,
@@ -833,7 +836,10 @@ export const createSyncpeerBrowserClient = (
     ) === "incoming") {
       const deadline = Date.now() + (coreOptions.timeoutMs ?? 15000);
       while (!signal.aborted && Date.now() < deadline) {
-        const candidate = service.activeSessions().find(value =>
+        const active = lifecycle.getSession();
+        if (active && sameDeviceId(active.remoteDeviceId, normalized.remoteId) && !active.isClosed()) return active;
+        const services = [...new Set([incomingService, service])];
+        const candidate = services.flatMap(value => value?.activeSessions() ?? []).find(value =>
           sameDeviceId(value.remoteDeviceId, normalized.remoteId!) && !value.session.isClosed());
         if (candidate) return candidate.session;
         await new Promise(resolve => setTimeout(resolve, 50));
@@ -951,6 +957,13 @@ export const createSyncpeerBrowserClient = (
       ? platformAdapter.startBackgroundSession(backgroundOptions)
       : null;
     backgroundSession?.catch(() => undefined);
+    if (platformAdapter.startBackgroundSession) {
+      // The background service owns synchronization after the handoff. A paused
+      // foreground WebView cannot make progress on a transfer, and keeping its
+      // session alive would block the service from dialing a peer that allows
+      // one connection per device.
+      await lifecycle.setTransferActive(false);
+    }
     await lifecycle.setForeground(false);
     await stopIncomingService();
     if (backgroundSession) await backgroundSession;

@@ -54,10 +54,26 @@ async function waitForDesktopFile(name: string, expected: string | null) {
       observation = `entry found; content=${JSON.stringify(observed?.slice(0, 120) ?? null)}`;
       if (expected !== null && observed === expected) return;
     } else {
+      const view = await browser.execute((id: string) => ({
+        inFolder: Boolean(document.querySelector("#folder-upload-input")),
+        folderRootVisible: Boolean(document.querySelector(`[data-testid='folder-root-${id}']`)),
+      }), folderId).catch(() => ({ inFolder: false, folderRootVisible: false }));
+      // Attaching the folder invalidates and reopens the live session; a refresh
+      // can briefly rebuild the root list after the folder was opened. Re-open it
+      // while the same bounded convergence window elapses.
+      if (!view.inFolder && view.folderRootVisible) {
+        await browser.execute((id: string) => {
+          const row = document.querySelector(`[data-testid='folder-root-${id}']`);
+          if (row instanceof HTMLElement) row.click();
+        }, folderId).catch(() => undefined);
+      }
+      const cached = await readDesktopDocumentContent(name);
       const titles = await browser.execute(() =>
         [...document.querySelectorAll(".item-title")].map(element => element.textContent?.trim() ?? ""))
         .catch(() => []);
-      observation = `entry missing; rendered titles=${JSON.stringify(titles.slice(0, 20))}`;
+      observation = `entry missing; inFolder=${view.inFolder}; ` +
+        `cached=${JSON.stringify(cached?.slice(0, 120) ?? null)}; ` +
+        `rendered titles=${JSON.stringify(titles.slice(0, 20))}`;
     }
     await browser.pause(500);
   }
@@ -269,10 +285,44 @@ describe("Packaged desktop to Android pairing", () => {
         } catch (cause) {
           const state = await browser.execute(() => ({
             status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "missing",
-            errorCount: [...document.querySelectorAll("p.error, p[role='alert']")]
-              .filter(element => Boolean(element.textContent?.trim())).length,
-          })).catch(() => ({ status: "unavailable", errorCount: -1 }));
-          throw new Error(`Packaged desktop connection state: ${JSON.stringify(state)}`, { cause });
+            error: [...document.querySelectorAll("p.error, p[role='alert']")]
+              .map(element => element.textContent?.trim() ?? "")
+              .filter(Boolean)
+              .at(0) ?? "",
+          })).catch(() => ({ status: "unavailable", error: "" }));
+          const error = safeNativeFailureText(state.error)
+            ?.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[address]")
+            .replace(/:\d{2,5}\b/g, ":[port]")
+            .replaceAll(folderId, "[folder]") ?? "none";
+          const diagnostics = await browser.execute(() =>
+            [...document.querySelectorAll(".list li")].flatMap(row => {
+              const header = row.querySelector(".item-meta")?.textContent?.trim() ?? "";
+              const event = header.split(" | ").at(-1) ?? "";
+              if (!/session|incoming|connect|handshake|closed|failed|recovery|tauri\.invoke\.error/i.test(event)) return [];
+              const rawDetails = row.querySelector(".log-details")?.textContent ?? "";
+              try {
+                const details = JSON.parse(rawDetails) as { command?: unknown; message?: unknown; error?: unknown };
+                const command = typeof details.command === "string" ? details.command : "";
+                const messageEvents = ["core.incoming.failed", "core.background.prepare.failed",
+                  "core.incoming.prepare.failed", "core.incoming.refresh.failed", "core.session.refresh.failed",
+                  "core.socket.closed", "session.lifecycle_recovery.failed"];
+                const detail = details.message ?? details.error;
+                const message = messageEvents.includes(event) && typeof detail === "string" ? detail : "";
+                return [{ event, command, message }];
+              } catch { return [{ event, command: "", message: "" }]; }
+            }).slice(0, 40),
+          ).catch(() => readSessionEventNames(browser).catch(() => []));
+          const events = diagnostics.map(entry => {
+            if (typeof entry === "string") return entry;
+            const message = safeNativeFailureText(entry.message)
+              ?.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[address]")
+              .replace(/:\d{2,5}\b/g, ":[port]")
+              .replaceAll(folderId, "[folder]");
+            if (message) return `${entry.event}:${message}`;
+            return entry.command ? `${entry.event}:${entry.command}` : entry.event;
+          });
+          throw new Error(`Packaged desktop connection state: ${state.status}; error=${error}; ` +
+            `recent events=${events.join(",") || "unavailable"}`, { cause });
         }
         console.log("Cross-app desktop connected; checking shared folder credential.");
         await attachSharedFolder();

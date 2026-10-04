@@ -12,7 +12,8 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
   type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket,
   type SyncpeerSessionHandle } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
-import { createConnectionLifecycle, type ConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
+import { createConnectionLifecycle, waitForLifecyclePhase,
+  type ConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
@@ -36,7 +37,8 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
   });
   return {
     log: (event, details) => {
-      if (!["core.upload.request.failed", "core.replica.receive.failed"].includes(event)) return;
+      if (!event.startsWith("core.session.connect.") &&
+        !["core.upload.request.failed", "core.replica.receive.failed"].includes(event)) return;
       void request({ operation: "diagnostic", event,
         message: typeof details?.message === "string" ? details.message : "Unknown runtime failure." });
     },
@@ -306,6 +308,29 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
       })().catch(() => undefined);
     }, 0);
   });
+  const connectSession = async (options: ConnectOptions): Promise<SyncpeerSessionHandle> => {
+    try {
+      return await lifecycle.connect(options);
+    } catch (error) {
+      // The lifecycle keeps retrying after a failed opening, for example when
+      // the foreground app's session briefly overlaps the background handoff.
+      // The service needs the runtime-bound session rather than the first
+      // rejection, so wait for the lifecycle's own retry to connect.
+      const phase = lifecycle.getState().phase;
+      if (phase !== "waiting" && phase !== "reconnecting" && phase !== "connecting") {
+        adapter.log?.("core.session.connect.failed", { message: phase });
+        throw error;
+      }
+      adapter.log?.("core.session.connect.retrying", { message: phase });
+      const connected = await waitForLifecyclePhase(lifecycle, "connected", 60_000);
+      if (!connected) {
+        adapter.log?.("core.session.connect.failed", { message: lifecycle.getState().phase });
+        throw error;
+      }
+      adapter.log?.("core.session.connect.recovered", {});
+      return await lifecycle.ensureSession(options);
+    }
+  };
   return {
     command: async (input: unknown) => {
       if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -318,7 +343,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         }
         const options = request.options as ConnectOptions;
         activeOptions = options;
-        const session = await lifecycle.connect(options);
+        const session = await connectSession(options);
         // Remember newly advertised roots. Folders already attached to the
         // DocumentsProvider are supplied above as explicit full replicas;
         // unattached folders remain metadata-only until selected.

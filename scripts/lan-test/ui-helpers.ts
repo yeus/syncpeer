@@ -126,8 +126,16 @@ export const setDirectConnectionFields = async (browser: WebdriverIO.Browser, se
       field.dispatchEvent(new Event("change", { bubbles: true }));
     }
   }, settings);
-  await browser.waitUntil(async () => await browser.$("[data-testid='connection-port']").getValue() ===
-    String(settings.remotePort), { timeout: 5_000, timeoutMsg: "Direct connection settings did not update." });
+  await browser.waitUntil(async () => {
+    const values = await Promise.all([
+      browser.$("[data-testid='connection-remote-id']").getValue(),
+      browser.$("[data-testid='connection-host']").getValue(),
+      browser.$("[data-testid='connection-port']").getValue(),
+      browser.$("[data-testid='connection-listen-port']").getValue(),
+    ]);
+    return values[0] === settings.remoteId && values[1] === settings.host &&
+      values[2] === String(settings.remotePort) && values[3] === String(settings.listenPort);
+  }, { timeout: 5_000, timeoutMsg: "Direct connection settings did not update." });
 };
 
 export const setUploadFile = async (
@@ -231,7 +239,7 @@ export const readSessionEventNames = async (
       .filter((text) => text.includes(" | "))
       .map((text) => text.split(" | ").at(-1) ?? "")
       .filter(Boolean)
-      .slice(-80),
+      .slice(0, 80),
   );
   await browser.execute(() => {
     const tab = document.querySelector("[data-testid='tab-folders']");

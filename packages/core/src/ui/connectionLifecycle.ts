@@ -47,6 +47,30 @@ export const retryDelayMs = (
   return Math.round(base * (0.8 + Math.max(0, Math.min(1, random())) * 0.4));
 };
 
+export const waitForLifecyclePhase = <TOptions>(
+  lifecycle: Pick<ConnectionLifecycle<TOptions>, "getState" | "subscribe">,
+  phase: ConnectionLifecyclePhase,
+  timeoutMs: number,
+): Promise<boolean> => {
+  if (lifecycle.getState().phase === phase) return Promise.resolve(true);
+  return new Promise<boolean>(resolve => {
+    let unsubscribe = () => {};
+    let settled = false;
+    const finish = (reached: boolean) => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      clearTimeout(timer);
+      resolve(reached);
+    };
+    const timer = setTimeout(() => finish(lifecycle.getState().phase === phase), timeoutMs);
+    unsubscribe = lifecycle.subscribe(state => {
+      if (state.phase === phase) finish(true);
+    });
+    if (settled) unsubscribe();
+  });
+};
+
 export const createConnectionLifecycle = <TOptions>(deps: {
   open: (options: TOptions, signal: AbortSignal) => Promise<SyncpeerSessionHandle>;
   keyFor: (options: TOptions) => string;

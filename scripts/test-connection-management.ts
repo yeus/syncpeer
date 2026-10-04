@@ -204,6 +204,58 @@ test("an authenticated incoming session can satisfy the desired connection", asy
   await lifecycle.disconnect();
 });
 
+test("an opening keeps the same incoming session that was adopted before it resolved", async () => {
+  const opening = deferred<ReturnType<typeof session>>();
+  const incoming = session();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => {
+      opens += 1;
+      return opening.promise;
+    },
+    keyFor: value => value,
+  });
+
+  const connecting = lifecycle.connect("peer");
+  await Promise.resolve();
+  assert.equal(await lifecycle.adopt("peer", incoming), true);
+  opening.resolve(incoming);
+
+  assert.equal(await connecting, incoming);
+  assert.equal(lifecycle.getSession(), incoming);
+  assert.equal(incoming.isClosed(), false);
+  assert.equal(opens, 1, "The already-adopted incoming session should finish the opening.");
+  await lifecycle.disconnect();
+});
+
+test("an opening accepts the refreshed active session after its configuration key changes", async () => {
+  let revision = 0;
+  let rejectFirstOpening!: (error: Error) => void;
+  const firstOpening = new Promise<ReturnType<typeof session>>((_, reject) => {
+    rejectFirstOpening = reject;
+  });
+  const refreshed = session();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => {
+      opens += 1;
+      return opens === 1 ? firstOpening : refreshed;
+    },
+    keyFor: (value) => `${value}:${revision}`,
+  });
+
+  const connecting = lifecycle.connect("peer");
+  await Promise.resolve();
+  revision += 1;
+  const refreshing = lifecycle.ensureSession("peer");
+  rejectFirstOpening(new Error("The incoming listener refreshed."));
+
+  assert.equal(await refreshing, refreshed);
+  assert.equal(await connecting, refreshed);
+  assert.equal(lifecycle.getSession(), refreshed);
+  await lifecycle.disconnect();
+});
+
 test("manual disconnect aborts and cleans up a pending opening", async () => {
   const pending = deferred<ReturnType<typeof session>>();
   let openingSignal: AbortSignal | undefined;
@@ -276,6 +328,8 @@ test("an automatic reconnect rehydrates the session overview", async () => {
   const options = { host: "test.invalid", port: 22000, deviceName: "test" };
 
   await assert.rejects(store.actions.connect(options), /connection closed/);
+  assert.equal(store.getState().pending.connecting, false);
+  assert.equal(store.getState().remoteFs, null);
   onLifecycle?.({
     phase: "connected",
     attempt: 1,
@@ -289,6 +343,7 @@ test("an automatic reconnect rehydrates the session overview", async () => {
   }
   assert.equal(store.getState().phase, "connected");
   assert.equal(store.getState().remoteFs, remoteFs);
+  assert.equal(attempts, 2, "A later lifecycle reconnect should recover the missing runtime.");
 });
 
 test("a connected lifecycle never reports connected without a runtime session", async () => {
@@ -296,6 +351,7 @@ test("a connected lifecycle never reports connected without a runtime session", 
   let onLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
   const firstSync = deferred<SyncpeerSessionHandle["remoteFs"]>();
   let syncCalls = 0;
+  let overviewCalls = 0;
   const store = createSyncpeerSessionStore({
     now: () => timeMs,
     sleep: async (ms) => { timeMs += ms; },
@@ -304,13 +360,16 @@ test("a connected lifecycle never reports connected without a runtime session", 
         syncCalls += 1;
         return syncCalls === 1 ? firstSync.promise : remoteFs;
       },
-      connectAndGetOverview: async () => ({
-        folders: [],
-        device: null,
-        folderSyncStates: [],
-        connectedVia: "redacted-test-path",
-        transportKind: "direct-tcp",
-      }),
+      connectAndGetOverview: async () => {
+        overviewCalls += 1;
+        return {
+          folders: [],
+          device: null,
+          folderSyncStates: [],
+          connectedVia: "redacted-test-path",
+          transportKind: "direct-tcp",
+        };
+      },
       connectAndGetFolderVersions: async () => [],
       subscribeLifecycle: (listener) => {
         onLifecycle = listener;
@@ -321,6 +380,7 @@ test("a connected lifecycle never reports connected without a runtime session", 
   const options = { host: "test.invalid", port: 22000, deviceName: "test" };
 
   const opening = store.actions.connect(options).catch(() => undefined);
+  assert.equal(syncCalls, 1, "The initial runtime connection should be in flight.");
   onLifecycle?.({
     phase: "connected",
     attempt: 0,
@@ -330,14 +390,25 @@ test("a connected lifecycle never reports connected without a runtime session", 
   });
   assert.notEqual(store.getState().phase, "connected",
     "A connected lifecycle without a runtime session must not report connected.");
-  for (let index = 0; index < 50 && store.getState().remoteFs === null; index += 1) {
+  assert.equal(store.getState().phase, "connecting");
+  assert.equal(store.getState().pending.connecting, true,
+    "The lifecycle event must preserve the pending initial connection.");
+  assert.equal(store.getState().remoteFs, null);
+  for (let index = 0; index < 10; index += 1) {
     await Promise.resolve();
   }
-  assert.equal(store.getState().remoteFs, remoteFs,
-    "The store must recover the runtime session reported connected by the transport.");
-  assert.equal(store.getState().phase, "connected");
+  assert.equal(syncCalls, 1,
+    "A connected lifecycle during the initial connect must not start a duplicate recovery.");
+  assert.equal(overviewCalls, 0,
+    "The pending initial connection has not bound a runtime or requested its overview yet.");
   firstSync.resolve(remoteFs);
   await opening;
+  assert.equal(syncCalls, 1);
+  assert.ok(overviewCalls > 0,
+    "The original connection requests its overview after binding the runtime session.");
+  assert.equal(store.getState().remoteFs, remoteFs);
+  assert.equal(store.getState().phase, "connected");
+  assert.equal(store.getState().pending.connecting, false);
 });
 
 test("concurrent connects share one validated opening", async () => {
@@ -406,6 +477,71 @@ test("mutable session configuration key reopens the live session", async () => {
   revision += 1;
   assert.equal(await lifecycle.ensureSession(), second);
   assert.deepEqual(events, ["open:0", "close:first", "open:1"]);
+  await lifecycle.disconnect();
+});
+
+test("a configuration refresh aborts a pending opening with the old key", async () => {
+  let revision = 0;
+  let openingSignal: AbortSignal | undefined;
+  const refreshed = session();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async (_value, signal) => {
+      opens += 1;
+      if (opens > 1) return refreshed;
+      openingSignal = signal;
+      return new Promise((_, reject) => signal.addEventListener("abort",
+        () => reject(new Error("stale opening cancelled")), { once: true }));
+    },
+    keyFor: value => `${value}:${revision}`,
+  });
+  const connecting = lifecycle.connect("peer").catch(error => error);
+  try {
+    await Promise.resolve();
+    revision += 1;
+    const refreshing = lifecycle.ensureSession("peer").catch(error => error);
+    await Promise.resolve();
+
+    assert.equal(openingSignal?.aborted, true,
+      "A listener refresh must not wait for an opening that captured the old configuration.");
+    assert.equal(await refreshing, refreshed);
+    assert.equal(await connecting, refreshed);
+    assert.equal(lifecycle.getSession(), refreshed);
+    assert.equal(opens, 2);
+  } finally {
+    await lifecycle.disconnect();
+  }
+});
+
+test("a superseded session refresh joins the latest configuration opening", async () => {
+  let revision = 0;
+  let rejectStaleOpening!: (error: Error) => void;
+  const staleOpening = new Promise<ReturnType<typeof session>>((_, reject) => {
+    rejectStaleOpening = reject;
+  });
+  const first = session();
+  const refreshed = session();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => {
+      opens += 1;
+      if (opens === 1) return first;
+      if (opens === 2) return staleOpening;
+      return refreshed;
+    },
+    keyFor: (value) => `${value}:${revision}`,
+  });
+
+  await lifecycle.connect("peer");
+  revision = 1;
+  const staleRefresh = lifecycle.ensureSession("peer");
+  revision = 2;
+  const latestRefresh = lifecycle.ensureSession("peer");
+  rejectStaleOpening(new Error("The listener was superseded."));
+
+  assert.equal(await latestRefresh, refreshed);
+  assert.equal(await staleRefresh, refreshed);
+  assert.equal(lifecycle.getSession(), refreshed);
   await lifecycle.disconnect();
 });
 

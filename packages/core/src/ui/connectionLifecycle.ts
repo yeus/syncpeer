@@ -199,6 +199,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       }
       const session = await deps.open(options, controller.signal);
       if (controller.signal.aborted || openGeneration !== generation || !eligible()) {
+        if (active === session && activeKey === key && !session.isClosed() && eligible()) return session;
         await session.close().catch(() => undefined);
         throw new Error("Connection attempt was cancelled.");
       }
@@ -255,6 +256,31 @@ export const createConnectionLifecycle = <TOptions>(deps: {
     }
   };
 
+  const ensureSession = async (options?: TOptions): Promise<SyncpeerSessionHandle> => {
+    if (options) desired = options;
+    if (active && !active.isClosed() && desired && activeKey === deps.keyFor(desired)) return active;
+    if (!eligible()) throw new Error("Connection is suspended or offline.");
+    if (opening && desired && openingKey === deps.keyFor(desired)) return opening;
+    generation += 1;
+    const refreshGeneration = generation;
+    if (opening) {
+      const staleOpening = opening;
+      cancelOpening();
+      await staleOpening.catch(() => undefined);
+    }
+    const current = desired;
+    if (!current) throw new Error("No connection options are active.");
+    if (refreshGeneration !== generation) return ensureSession(current);
+    try {
+      return await openDesired(refreshGeneration);
+    } catch (error) {
+      if (active && !active.isClosed() && activeKey === deps.keyFor(current)) return active;
+      if (refreshGeneration !== generation && desired !== null &&
+        deps.keyFor(desired) === deps.keyFor(current)) return ensureSession(current);
+      throw error;
+    }
+  };
+
   return {
     connect: async (options) => {
       desired = options;
@@ -263,6 +289,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       if (active && !active.isClosed() && activeKey === key) return active;
       if (opening && openingKey === key) return opening;
       generation += 1;
+      const connectGeneration = generation;
       cancelOpening();
       if (!desired || deps.keyFor(desired) !== key) {
         throw new Error("Connection attempt was cancelled.");
@@ -270,7 +297,9 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       try {
         return await openDesired(generation);
       } catch (error) {
-        if (active && !active.isClosed() && activeKey === key) return active;
+        if (active && !active.isClosed() && activeKey === deps.keyFor(options)) return active;
+        if (connectGeneration !== generation && desired !== null &&
+          deps.keyFor(desired) === deps.keyFor(options)) return ensureSession(options);
         throw error;
       }
     },
@@ -305,23 +334,7 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       failureStreak = 0;
       update({ ...initialState() });
     },
-    ensureSession: async (options) => {
-      if (options) desired = options;
-      if (active && !active.isClosed() && desired && activeKey === deps.keyFor(desired)) return active;
-      if (!eligible()) throw new Error("Connection is suspended or offline.");
-      if (opening && desired && openingKey === deps.keyFor(desired)) return opening;
-      generation += 1;
-      if (opening) await opening.catch(() => undefined);
-      const current = desired;
-      if (!current) throw new Error("No connection options are active.");
-      const key = deps.keyFor(current);
-      try {
-        return await openDesired(generation);
-      } catch (error) {
-        if (active && !active.isClosed() && activeKey === key) return active;
-        throw error;
-      }
-    },
+    ensureSession,
     getSession: () => active,
     getState: () => ({ ...state }),
     subscribe: (listener) => {

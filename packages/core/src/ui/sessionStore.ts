@@ -588,14 +588,17 @@ const applyLifecycleState = (
   let recoveryOptions: ConnectOptions | null = null;
   ctx.setState((current) => {
     // A transport-level "connected" lifecycle is not a usable session until the
-    // runtime remoteFs is bound. This can happen while an opening is still in
-    // flight, for example after a session-configuration refresh. Claiming
-    // connected with no runtime session would freeze every refresh that gates
-    // on remoteFs, so recover instead of adopting the transport state.
+    // runtime remoteFs is bound. Keep an initial connect pending while it binds;
+    // only start recovery when no connect action is already doing that work.
     const missingRuntime = current.remoteFs === null;
     const lifecycleConnected = lifecycle.phase === "connected";
+    const pendingConnectionWithoutRuntime =
+      lifecycleConnected && missingRuntime && current.pending.connecting;
     const needsRecovery =
-      lifecycleConnected && missingRuntime && current.connectOptions !== null;
+      lifecycleConnected &&
+      missingRuntime &&
+      !current.pending.connecting &&
+      current.connectOptions !== null;
     if (needsRecovery) recoveryOptions = { ...current.connectOptions! };
     return {
       ...current,
@@ -612,7 +615,8 @@ const applyLifecycleState = (
         connecting:
           needsRecovery ||
           lifecycle.phase === "connecting" ||
-          lifecycle.phase === "reconnecting",
+          lifecycle.phase === "reconnecting" ||
+          pendingConnectionWithoutRuntime,
       },
     };
   });

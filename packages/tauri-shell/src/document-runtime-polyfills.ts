@@ -1,7 +1,7 @@
 import { TextEncoder as PolyfillTextEncoder, TextDecoder as PolyfillTextDecoder } from "@kayahr/text-encoding/no-encodings";
-import polyfillStructuredClone from "@ungap/structured-clone";
 import { AbortController as PolyfillAbortController, AbortSignal as PolyfillAbortSignal } from "abort-controller";
 import { fromByteArray, toByteArray } from "base64-js";
+import { installWebViewCompatibility } from "../../core/src/platform/browserCompatibility.js";
 import { createPortRequest, type RuntimePort } from "./document-runtime-port.js";
 
 type AndroidTimerRuntime = { getNamedPort: (name: string) => Promise<RuntimePort> };
@@ -30,15 +30,10 @@ if (typeof globalThis.TextEncoder !== "function") globalThis.TextEncoder = Polyf
 if (typeof globalThis.TextDecoder !== "function") globalThis.TextDecoder = PolyfillTextDecoder;
 if (typeof globalThis.btoa !== "function") globalThis.btoa = encodeBase64;
 if (typeof globalThis.atob !== "function") globalThis.atob = decodeBase64;
-if (typeof globalThis.structuredClone !== "function") {
-  globalThis.structuredClone = polyfillStructuredClone as typeof globalThis.structuredClone;
-}
 if (typeof globalThis.AbortController !== "function" || typeof globalThis.AbortSignal !== "function") {
   Object.assign(globalThis, { AbortController: PolyfillAbortController, AbortSignal: PolyfillAbortSignal });
 }
-if (!("throwIfAborted" in AbortSignal.prototype)) Object.defineProperty(AbortSignal.prototype, "throwIfAborted", {
-  value(this: AbortSignal) { if (this.aborted) throw new Error("Operation cancelled."); },
-});
+installWebViewCompatibility(globalThis);
 
 export const installAndroidTimers = async (android: AndroidTimerRuntime) => {
   if (typeof globalThis.setTimeout === "function" && typeof globalThis.clearTimeout === "function" &&

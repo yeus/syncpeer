@@ -7,6 +7,7 @@ import tauriConfig from "../tauri-shell/src-tauri/tauri.conf.json" with { type: 
 import corePackage from "../core/package.json" with { type: "json" };
 import { isUiE2eBuildMode } from "./buildMode.ts";
 import { resolvePackagedAppVersion } from "./buildInfo.ts";
+import { createBrowserBepSchemaPlugin } from "../../scripts/vite-plugins/browserBepSchema.mjs";
 
 const resolveBuildCommit = (): string => {
   const configured = [
@@ -35,7 +36,10 @@ const APP_VERSION = resolvePackagedAppVersion(tauriConfig);
 const CORE_VERSION = resolvePackagedAppVersion(corePackage);
 
 export default defineConfig(({ mode }) => ({
-  plugins: [svelte()],
+  plugins: [
+    svelte(),
+    createBrowserBepSchemaPlugin(),
+  ],
   define: {
     "import.meta.env.SYNCPEER_APP_VERSION": JSON.stringify(APP_VERSION),
     "import.meta.env.SYNCPEER_CORE_VERSION": JSON.stringify(CORE_VERSION),
@@ -61,11 +65,15 @@ export default defineConfig(({ mode }) => ({
         find: /^@syncpeer\/core\/kdf$/,
         replacement: fileURLToPath(new URL("../core/src/kdf.ts", import.meta.url)),
       },
+      {
+        find: /^@syncpeer\/core\/filesystem$/,
+        replacement: fileURLToPath(new URL("../core/src/filesystem.ts", import.meta.url)),
+      },
     ],
   },
   build: {
     outDir: "dist",
-    target: "es2022",
+    target: "chrome74",
     sourcemap: mode === "development",
     emptyOutDir: true,
   },

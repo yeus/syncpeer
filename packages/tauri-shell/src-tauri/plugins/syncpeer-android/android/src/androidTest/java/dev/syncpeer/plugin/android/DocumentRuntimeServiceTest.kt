@@ -300,9 +300,11 @@ class DocumentRuntimeServiceTest {
       assumeTrue(runtime.status().get(30, TimeUnit.SECONDS).phase == "locked")
       assertEquals("locked", runtime.forceWebViewForTesting().get(30, TimeUnit.SECONDS).phase)
       assertEquals(DocumentRuntimeKind.WEB_VIEW, runtime.runtimeKindForTesting())
-      assertTrue(runtime.evaluate(
-        "return structuredClone.toString();", "{}".toByteArray(),
-      ).get(30, TimeUnit.SECONDS).contains("[native code]"))
+      assertEquals("true,true,3,7", runtime.evaluate(
+        "const source = { bytes: new Uint8Array([3, 7]) }; const copy = structuredClone(source); " +
+          "return [copy !== source, copy.bytes !== source.bytes, copy.bytes[0], copy.bytes[1]].join(',');",
+        "{}".toByteArray(),
+      ).get(30, TimeUnit.SECONDS))
       val result = runtime.command(JSONObject().put("operation", "status")).get(30, TimeUnit.SECONDS)
       assertTrue(result.getJSONObject("result").has("vault"))
     } finally { context.unbindService(client.first) }

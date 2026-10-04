@@ -152,8 +152,29 @@ const captureWebViewFixture = (directory) => {
   const packageDetails = adb(["shell", "dumpsys", "package", "com.google.android.webview"]);
   const version = packageDetails.match(/versionName=([^\s]+)/)?.[1];
   if (!version) throw new Error("Could not determine the modern WebView version.");
-  console.log(`Using modern WebView ${version} for the API 29 compatibility emulator.`);
-  return { libraryApk, webViewApk, version };
+  const minimumSdk = readApkMinimumSdk(webViewApk);
+  console.log(`Captured modern WebView ${version} (minimum API ${minimumSdk}).`);
+  return { libraryApk, webViewApk, version, minimumSdk };
+};
+
+const readApkMinimumSdk = (apk) => {
+  const buildTools = process.env.ANDROID_HOME
+    ? path.join(process.env.ANDROID_HOME, "build-tools")
+    : "";
+  const aapt = buildTools && fs.existsSync(buildTools)
+    ? fs.readdirSync(buildTools)
+      .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))
+      .map(version => path.join(buildTools, version, "aapt"))
+      .find(fs.existsSync) ?? "aapt"
+    : "aapt";
+  const badging = execFileSync(aapt, ["dump", "badging", apk], {
+    encoding: "utf8",
+  });
+  const match = badging.match(/^sdkVersion:'(\d+)'/m);
+  if (!match) {
+    throw new Error("Could not read the Android WebView fixture's minimum SDK.");
+  }
+  return Number(match[1]);
 };
 
 export const webViewSelected = (state, version) => state.includes(
@@ -161,6 +182,14 @@ export const webViewSelected = (state, version) => state.includes(
 );
 
 const installWebViewFixture = async (fixture) => {
+  if (fixture.minimumSdk > 29) {
+    const installedWebView = adb(["shell", "pm", "path", "com.google.android.webview"]).trim();
+    if (!installedWebView.startsWith("package:")) {
+      throw new Error("API 29 has no compatible system WebView to use for its startup check.");
+    }
+    console.log(`API 29 keeps its supported system WebView; ${fixture.version} requires API ${fixture.minimumSdk}.`);
+    return;
+  }
   run("adb", ["install", "-r", "-d", fixture.libraryApk]);
   run("adb", ["install", "-r", "-d", fixture.webViewApk]);
   run("adb", ["shell", "cmd", "webviewupdate", "set-webview-implementation", "com.google.android.webview"]);

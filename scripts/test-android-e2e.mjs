@@ -1,8 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { build } from "vite";
+import { fileURLToPath } from "node:url";
+import { build, transformWithEsbuild } from "vite";
 import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
+import { createBrowserBepSchemaPlugin } from "./vite-plugins/browserBepSchema.mjs";
 
 const cliArguments = process.argv.slice(2);
 const hasArgument = (name) => cliArguments.includes(name);
@@ -304,12 +306,22 @@ const connectCdp = async () => {
     pending.set(id, { resolve, reject, timer });
     socket.send(JSON.stringify({ id, method, params }));
   });
+  const expressionCache = new Map();
   const client = {
     evaluate: async (expression, timeout = 30_000) => {
       let result;
       try {
+        let compatibleExpression = expressionCache.get(expression);
+        if (!compatibleExpression) {
+          compatibleExpression = (await transformWithEsbuild(
+            expression,
+            "android-cdp-expression.js",
+            { target: "chrome74" },
+          )).code;
+          expressionCache.set(expression, compatibleExpression);
+        }
         result = await command("Runtime.evaluate", {
-          expression,
+          expression: compatibleExpression,
           awaitPromise: true,
           returnByValue: true,
           userGesture: true,
@@ -341,8 +353,9 @@ const connectCdp = async () => {
   while (Date.now() < deadline) {
     try {
       const available = await client.evaluate(
-        'typeof globalThis.__TAURI_INTERNALS__?.invoke === "function" || ' +
-        'typeof globalThis.__TAURI__?.core?.invoke === "function"',
+        '(globalThis.__TAURI_INTERNALS__ && typeof globalThis.__TAURI_INTERNALS__.invoke === "function") || ' +
+        '(globalThis.__TAURI__ && globalThis.__TAURI__.core && ' +
+        'typeof globalThis.__TAURI__.core.invoke === "function")',
         5_000,
       );
       if (available) return client;
@@ -1452,8 +1465,12 @@ const readAndroidFolderState = async (cdp) => {
   const ui = await cdp.evaluate(`(() => ({
     pageHeading: document.querySelector("h1")?.textContent?.trim() ?? "",
     connection: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() ?? "",
-    folderOpen: document.querySelector(".crumb-current")?.textContent?.trim() !== "All Syncthing Folders",
+    currentCrumb: document.querySelector(".crumb-current")?.textContent?.trim() ?? "",
     visibleFileRows: document.querySelectorAll(".item-title").length,
+    visibleItemTitles: [...document.querySelectorAll(".item-title")]
+      .map(element => element.textContent?.trim()).filter(Boolean).slice(0, 20),
+    directoryStatus: document.querySelector(".directory-status-banner")?.textContent?.trim() ?? "",
+    directoryNotice: document.querySelector(".list .empty")?.textContent?.trim() ?? "",
     passwordInputLength: document.querySelector(${JSON.stringify(`[data-testid="folder-password-${targetFolderId}"]`)})
       ?.value?.length ?? -1,
     forgetPasswordEnabled: [...document.querySelectorAll("button")]
@@ -1481,11 +1498,13 @@ const readAndroidSessionEvents = async (cdp) => {
       .map(row => {
         const event = row.querySelector(".item-meta")?.textContent?.split("|").at(-1)?.trim();
         if (!/^(core|client|document|session|cluster|untrusted)\\./.test(event ?? "")) return null;
-        if (!/^(core\\.cluster|client\\.shared_folders|cluster\\.folder|untrusted\\.folder)/.test(event)) return event;
+        if (!/^(core\\.cluster|core\\.index|core\\.replica\\.index|core\\.untrusted\\.folder|client\\.shared_folders|cluster\\.folder|untrusted\\.folder)/.test(event)) return event;
         let details = {};
         try { details = JSON.parse(row.querySelector(".log-details")?.textContent ?? "{}"); }
         catch { /* Only public flags and counts are included below. */ }
         const safe = Object.fromEntries([
+          "fileCount", "encrypted", "hasFolderCrypto", "storedFiles", "processedFiles",
+          "decryptedStored", "decryptFailed", "folderPasswordCount", "hasFolderPassword",
           "count", "internalCount", "deviceCount", "localDevicePresentInFolder",
           "remoteDevicePresentInFolder", "localTokenLengthFromPeer",
           "remoteTokenLengthFromPeer", "localTokenLength", "tokenValid",
@@ -1953,11 +1972,23 @@ const runAndroidFilesystemChecks = async (cdp) => {
     await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=document-vault-phase]")', "document vault status from service");
     console.log("Android Settings reaches the service-owned document vault.");
   }
-  const built = await build({ configFile: false, publicDir: false, logLevel: "error", build: {
-    write: false, target: "esnext", minify: false,
-    lib: { entry: "scripts/android-filesystem-conformance.ts", formats: ["es"] },
-    rollupOptions: { output: { inlineDynamicImports: true } },
-  } });
+  const built = await build({
+    configFile: false,
+    publicDir: false,
+    logLevel: "error",
+    plugins: [createBrowserBepSchemaPlugin()],
+    resolve: { alias: [{
+      find: /^@syncpeer\/core\/filesystem$/,
+      replacement: fileURLToPath(new URL("../packages/core/src/filesystem.ts", import.meta.url)),
+    }] },
+    build: {
+      write: false,
+      target: "chrome74",
+      minify: false,
+      lib: { entry: "scripts/android-filesystem-conformance.ts", formats: ["es"] },
+      rollupOptions: { output: { inlineDynamicImports: true } },
+    },
+  });
   const output = (Array.isArray(built) ? built[0] : built).output;
   const code = output.find(item => item.type === "chunk" && item.isEntry)?.code;
   if (!code) throw new Error("Android filesystem conformance bundle is missing.");
@@ -1968,9 +1999,20 @@ const runAndroidFilesystemChecks = async (cdp) => {
     const url = `data:text/javascript;base64,${Buffer.from(code).toString("base64")}`;
     const result = await cdp.evaluate(`(async () => {
       const profileId = ${JSON.stringify(relativeRoot.split("/").at(-1))};
-      const secret = (operation, value) => globalThis.__TAURI_INTERNALS__.invoke("syncpeer_vault_secret", {
-        request: { profileId, operation, secret: value },
-      });
+      const secret = async (operation, value) => {
+        try {
+          return await globalThis.__TAURI_INTERNALS__.invoke("syncpeer_vault_secret", {
+            request: { profileId, operation, secret: value },
+          });
+        } catch (error) {
+          const details = error && typeof error === "object" ? {
+            name: error.name,
+            message: error.message,
+            code: error.code,
+          } : String(error);
+          throw new Error("Native vault " + operation + " failed: " + JSON.stringify(details));
+        }
+      };
       try {
         if (await secret("isDeviceUnlocked") !== true) throw new Error("Synthetic credential test requires an unlocked emulator.");
         await secret("save", "synthetic-test-master");
@@ -1986,7 +2028,14 @@ const runAndroidFilesystemChecks = async (cdp) => {
         ${JSON.stringify(`${appRoot}/${relativeRoot}`)}, {
           load: () => secret("load"), save: value => secret("save", value), remove: () => secret("remove"),
           isDeviceUnlocked: () => secret("isDeviceUnlocked"),
-        }).catch(error => { throw new Error(error.message ?? String(error)); }).finally(() => secret("remove"));
+        }).catch(error => {
+          const message = error && error.message;
+          throw new Error(typeof message === "string" ? message : JSON.stringify({
+            name: error && error.name,
+            message,
+            value: String(error),
+          }));
+        }).finally(() => secret("remove"));
     })()`, 90_000);
     if (!result?.encrypted || !result?.reopenVerified || !result?.cancellationPreservedOriginal || !result?.replicaLifecycleVerified) throw new Error("Incomplete Android filesystem conformance result.");
     console.log(`Android core/native encrypted filesystem passed: ${result.bytes} bytes, cancellation, reopen, replica receive and recoverable deletion verified.`);

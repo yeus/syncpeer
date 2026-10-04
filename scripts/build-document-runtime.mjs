@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { build } from "vite";
+import { build, transformWithEsbuild } from "vite";
 import { createRequire } from "node:module";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -26,5 +26,6 @@ if (outputs.length !== 1 || outputs[0].type !== "chunk") throw new Error("Docume
 await fs.mkdir(outDir, { recursive: true });
 // BEP schema loading is asynchronous. Script evaluation supports promises but
 // not ES modules, so wrap the bundled, import-free entry in an async function.
-await fs.writeFile(path.join(outDir, "syncpeer-documents.js"),
-  `globalThis.syncpeerCoreReady = (async () => {\n${outputs[0].code}\nreturn "ready";\n})();\nglobalThis.syncpeerCoreReady`);
+const bundled = `globalThis.syncpeerCoreReady = (async () => {\n${outputs[0].code}\nreturn "ready";\n})();\nglobalThis.syncpeerCoreReady`;
+const compatible = await transformWithEsbuild(bundled, "syncpeer-documents.js", { target: "chrome74" });
+await fs.writeFile(path.join(outDir, "syncpeer-documents.js"), compatible.code);

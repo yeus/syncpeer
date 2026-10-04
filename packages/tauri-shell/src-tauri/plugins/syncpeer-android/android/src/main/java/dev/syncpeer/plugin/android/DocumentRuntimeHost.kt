@@ -208,7 +208,7 @@ internal class WebViewDocumentRuntimeHost private constructor(
     private val origin = Uri.parse("https://syncpeer.invalid")
     private const val pageUrl = "https://syncpeer.invalid/runtime.html"
     private const val scriptUrl = "https://syncpeer.invalid/syncpeer-documents.js"
-    private const val html = """<!doctype html><meta charset="utf-8"><script src="/syncpeer-documents.js"></script>"""
+    private const val html = """<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><script src="/syncpeer-documents.js"></script>"""
 
     fun create(
       context: Context,
@@ -307,7 +307,7 @@ internal class WebViewDocumentRuntimeHost private constructor(
 
     private fun response(mime: String, data: java.io.InputStream) = WebResourceResponse(
       mime, "utf-8", 200, "OK",
-      mapOf("Content-Security-Policy" to "default-src 'none'; script-src 'self' 'unsafe-eval'"), data,
+      mapOf("Content-Security-Policy" to "default-src 'none'; script-src 'self' 'unsafe-eval'; img-src data:"), data,
     )
 
     private fun connect(

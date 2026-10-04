@@ -5,6 +5,8 @@ mod replica_storage;
 mod metadata_sqlite;
 mod native_cache_metadata;
 mod documents;
+mod discovery;
+use discovery::{DiscoveryFetchRequest, DiscoveryFetchResponse, DiscoveryCancelRequest, SharedDiscoveryRequests};
 #[cfg(target_os = "android")]
 mod document_storage;
 #[cfg(target_os = "android")]
@@ -520,23 +522,6 @@ struct TlsAcceptResponse {
 #[serde(rename_all = "camelCase")]
 struct TlsListenerCloseRequest {
     listener_id: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoveryFetchRequest {
-    url: String,
-    method: String,
-    headers: HashMap<String, String>,
-    pin_server_device_id: Option<String>,
-    allow_insecure_tls: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoveryFetchResponse {
-    status: u16,
-    body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2158,91 +2143,6 @@ fn parse_ip_from_relay_address(address: &[u8]) -> Option<String> {
     }
 }
 
-fn build_discovery_http_request(
-    url: &Url,
-    method: &str,
-    headers: &HashMap<String, String>,
-) -> String {
-    let mut path = url.path().to_string();
-    if path.is_empty() {
-        path.push('/');
-    }
-    if let Some(query) = url.query() {
-        path.push('?');
-        path.push_str(query);
-    }
-    let mut lines = vec![
-        format!("{method} {path} HTTP/1.1"),
-        format!("Host: {}", url.host_str().unwrap_or_default()),
-        "Accept: application/json".to_string(),
-        "Connection: close".to_string(),
-    ];
-    for (key, value) in headers {
-        lines.push(format!("{key}: {value}"));
-    }
-    lines.push(String::new());
-    lines.push(String::new());
-    lines.join("\r\n")
-}
-
-fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
-    let mut offset = 0usize;
-    let mut out = Vec::new();
-    while offset < body.len() {
-        let remaining = &body[offset..];
-        let Some(line_end) = remaining.windows(2).position(|window| window == b"\r\n") else {
-            break;
-        };
-        let size_line = std::str::from_utf8(&remaining[..line_end])
-            .map_err(|error| format!("Invalid chunk size line: {error}"))?;
-        let size_hex = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .map_err(|error| format!("Invalid chunk size '{size_hex}': {error}"))?;
-        offset += line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if offset + size > body.len() {
-            return Err("Chunk body exceeds response size".to_string());
-        }
-        out.extend_from_slice(&body[offset..offset + size]);
-        offset += size + 2;
-    }
-    Ok(out)
-}
-
-fn parse_http_response(raw: &[u8]) -> Result<DiscoveryFetchResponse, String> {
-    let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return Err("Malformed HTTP response from discovery server".to_string());
-    };
-    let header_text = std::str::from_utf8(&raw[..header_end])
-        .map_err(|error| format!("Invalid HTTP response headers: {error}"))?;
-    let mut lines = header_text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let mut status_parts = status_line.split_whitespace();
-    let _http_version = status_parts.next().unwrap_or("");
-    let status = status_parts
-        .next()
-        .ok_or_else(|| format!("Malformed HTTP status line: {status_line}"))?
-        .parse::<u16>()
-        .map_err(|error| format!("Malformed HTTP status code: {error}"))?;
-    let mut transfer_encoding = String::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim().eq_ignore_ascii_case("transfer-encoding") {
-                transfer_encoding = value.trim().to_ascii_lowercase();
-            }
-        }
-    }
-    let mut body = raw[header_end + 4..].to_vec();
-    if transfer_encoding.contains("chunked") {
-        body = decode_chunked_body(&body)?;
-    }
-    let body = String::from_utf8(body)
-        .map_err(|error| format!("Discovery response body is not valid UTF-8: {error}"))?;
-    Ok(DiscoveryFetchResponse { status, body })
-}
-
 fn normalize_local_discovery_address(address: &str, source_ip: &str) -> Option<String> {
     let trimmed = address.trim();
     if trimmed.is_empty() {
@@ -2653,130 +2553,6 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
     })
 }
 
-fn read_all_from_stream(
-    stream: &mut StreamOwned<ClientConnection, TcpStream>,
-) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut buf = [0u8; 8192];
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => bytes.extend_from_slice(&buf[..n]),
-            Err(error)
-                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
-            {
-                continue
-            }
-            Err(error) => return Err(format!("Discovery read failed: {error}")),
-        }
-    }
-    Ok(bytes)
-}
-
-fn perform_pinned_discovery_request(
-    request: &DiscoveryFetchRequest,
-) -> Result<DiscoveryFetchResponse, String> {
-    let url =
-        Url::parse(&request.url).map_err(|error| format!("Invalid discovery URL: {error}"))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| "Discovery URL missing host".to_string())?
-        .to_string();
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| "Discovery URL missing port".to_string())?;
-    let address = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&address)
-        .map_err(|error| format!("TCP connect to {address} failed: {error}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(15)))
-        .map_err(|error| format!("Could not set read timeout: {error}"))?;
-    let config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-        .with_no_client_auth();
-    let server_name = ServerName::try_from(host.clone())
-        .map_err(|error| format!("Invalid TLS host '{host}': {error}"))?;
-    let connection = ClientConnection::new(Arc::new(config), server_name)
-        .map_err(|error| format!("Could not create TLS client: {error}"))?;
-    let mut stream = StreamOwned::new(connection, tcp);
-    {
-        let (conn, sock) = (&mut stream.conn, &mut stream.sock);
-        conn.complete_io(sock)
-            .map_err(|error| format!("Pinned discovery TLS connect failed: {error}"))?;
-    }
-
-    if let Some(expected_server_id) = request.pin_server_device_id.as_ref() {
-        let peer_der = stream
-            .conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .map(|cert| cert.as_ref().to_vec())
-            .ok_or_else(|| "Discovery server certificate missing".to_string())?;
-        let got = canonical_device_id(&compute_device_id_from_der(&peer_der));
-        let want = canonical_device_id(expected_server_id);
-        if got != want {
-            return Err(format!(
-                "Discovery server certificate ID mismatch: expected {expected_server_id}, got {got}"
-            ));
-        }
-    }
-
-    let request_text = build_discovery_http_request(
-        &url,
-        if request.method.trim().is_empty() {
-            "GET"
-        } else {
-            &request.method
-        },
-        &request.headers,
-    );
-    stream
-        .write_all(request_text.as_bytes())
-        .map_err(|error| format!("Discovery write failed: {error}"))?;
-    stream
-        .flush()
-        .map_err(|error| format!("Discovery flush failed: {error}"))?;
-    let raw = read_all_from_stream(&mut stream)?;
-    parse_http_response(&raw)
-}
-
-fn perform_ca_validated_discovery_request(
-    request: &DiscoveryFetchRequest,
-) -> Result<DiscoveryFetchResponse, String> {
-    let method = if request.method.trim().is_empty() {
-        reqwest::Method::GET
-    } else {
-        reqwest::Method::from_bytes(request.method.trim().as_bytes()).map_err(|error| {
-            format!(
-                "Invalid discovery HTTP method '{}': {error}",
-                request.method
-            )
-        })?
-    };
-
-    let client = reqwest::blocking::Client::builder()
-        .use_rustls_tls()
-        .https_only(true)
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("Could not build discovery HTTP client: {error}"))?;
-
-    let mut builder = client.request(method, &request.url);
-    for (key, value) in &request.headers {
-        builder = builder.header(key, value);
-    }
-
-    let response = builder
-        .send()
-        .map_err(|error| format!("CA-validated discovery fetch failed: {error}"))?;
-    let status = response.status().as_u16();
-    let body = response
-        .text()
-        .map_err(|error| format!("Could not read discovery response body: {error}"))?;
-
-    Ok(DiscoveryFetchResponse { status, body })
-}
-
 fn tcp_connect_timeout(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1))
 }
@@ -2907,17 +2683,20 @@ async fn syncpeer_restore_identity_recovery(
 }
 
 #[tauri::command]
-async fn syncpeer_discovery_fetch(
-    request: DiscoveryFetchRequest,
-) -> Result<DiscoveryFetchResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if request.pin_server_device_id.is_some() || request.allow_insecure_tls {
-            return perform_pinned_discovery_request(&request);
-        }
-        perform_ca_validated_discovery_request(&request)
-    })
-    .await
-    .map_err(|error| format!("Discovery fetch task join error: {error}"))?
+fn syncpeer_discovery_prepare(store: tauri::State<'_, SharedDiscoveryRequests>) -> Result<u64, String> {
+    discovery::prepare(store.inner())
+}
+
+#[tauri::command]
+fn syncpeer_discovery_cancel(store: tauri::State<'_, SharedDiscoveryRequests>, request: DiscoveryCancelRequest)
+    -> Result<(), String> {
+    discovery::cancel(store.inner(), request.request_id)
+}
+
+#[tauri::command]
+async fn syncpeer_discovery_fetch(store: tauri::State<'_, SharedDiscoveryRequests>, request: DiscoveryFetchRequest)
+    -> Result<DiscoveryFetchResponse, String> {
+    discovery::fetch(store.inner(), request).await
 }
 
 #[tauri::command]
@@ -5013,6 +4792,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
+        .manage(Arc::new(Mutex::new(discovery::DiscoveryRequests::default())))
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .manage(Arc::new(Mutex::new(TlsListenerStore::default())))
         .manage(Arc::new(Mutex::new(QuicSessionStore::default())))
@@ -5032,6 +4812,8 @@ pub fn run() {
             syncpeer_get_default_device_id,
             syncpeer_regenerate_default_cli_identity,
             syncpeer_restore_identity_recovery,
+            syncpeer_discovery_prepare,
+            syncpeer_discovery_cancel,
             syncpeer_discovery_fetch,
             syncpeer_discovery_local,
             syncpeer_tls_open,
@@ -5120,6 +4902,59 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_discovery_announces_with_client_identity_and_preserves_retry_headers() {
+        let server_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let client_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let (certs, key) = relay_identity(&server_identity.serialize_pem().unwrap(),
+            &server_identity.serialize_private_key_pem()).unwrap();
+        let server_pin = compute_device_id_from_der(certs[0].as_ref());
+        let client_pem = client_identity.serialize_pem().unwrap();
+        let expected_client = relay_identity(&client_pem,
+            &client_identity.serialize_private_key_pem()).unwrap().0[0].as_ref().to_vec();
+        let config = ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+            .with_single_cert(certs, key).unwrap();
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (socket, _) = tcp.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let connection = ServerConnection::new(Arc::new(config)).unwrap();
+            let mut stream = StreamOwned::new(connection, socket);
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") { break; }
+            }
+            let text = String::from_utf8(request).unwrap();
+            assert!(text.starts_with("POST /v2/ HTTP/1.1"));
+            let length: usize = text.lines().find_map(|line| line.split_once(':').filter(|(name, _)|
+                name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value))
+                .unwrap().trim().parse().unwrap();
+            let mut body = vec![0; length]; stream.read_exact(&mut body).unwrap();
+            assert_eq!(body, br#"{"addresses":["relay://synthetic.invalid:22067"]}"#);
+            assert_eq!(stream.conn.peer_certificates().unwrap()[0].as_ref(), expected_client);
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nReannounce-After: 1800\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            stream.conn.send_close_notify();
+            stream.flush().unwrap();
+        });
+        let store = Arc::new(Mutex::new(discovery::DiscoveryRequests::default()));
+        let response = tauri::async_runtime::block_on(discovery::fetch(&store, DiscoveryFetchRequest {
+            request_id: discovery::prepare(&store).unwrap(),
+            url: format!("https://localhost:{port}/v2/"), method: "POST".into(),
+            headers: HashMap::from([("Content-Type".into(), "application/json".into())]),
+            body: Some(r#"{"addresses":["relay://synthetic.invalid:22067"]}"#.into()),
+            cert_pem: Some(client_pem),
+            key_pem: Some(client_identity.serialize_private_key_pem()),
+            pin_server_device_id: Some(server_pin), allow_insecure_tls: false,
+        })).unwrap();
+        assert_eq!(response.status, 204);
+        assert_eq!(response.headers.get("reannounce-after").unwrap(), "1800");
+        worker.join().unwrap();
+    }
 
     #[test]
     fn relay_listener_distinguishes_idle_reads_from_partial_frames() {

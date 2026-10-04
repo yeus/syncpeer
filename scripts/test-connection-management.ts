@@ -10,6 +10,7 @@ import { buildConnectionDetails, fromConnectionSettings, toConnectionSettings } 
   "../packages/core/dist/ui/connectionState.js";
 import { createSyncpeerSessionStore } from "../packages/core/dist/ui/sessionStore.js";
 import {
+  createSyncpeerCoreClient,
   candidateCooldownMs,
   candidatePreferenceScore,
   normalizeDiscoveredCandidates,
@@ -128,6 +129,45 @@ test("candidate preference and cooldown match Syncthing ordering", () => {
     candidatePreferenceScore(candidate("relay", "wan")),
   ], [500, 400, 300, 200, 0]);
   assert.deepEqual([1, 2, 3, 4, 5, 9].map(candidateCooldownMs), [5000, 10000, 20000, 40000, 60000, 60000]);
+});
+
+function cooldownFixture(runtime?: Parameters<typeof createSyncpeerCoreClient>[1]) {
+  let attempts = 0;
+  const client = createSyncpeerCoreClient({
+    connectTls: async () => { attempts++; throw new Error("Synthetic dial failure"); },
+    sha256: async () => new Uint8Array(32), randomBytes: async size => new Uint8Array(size),
+    discoveryFetch: async () => ({ ok: true, status: 200, text: async () => "",
+      json: async () => ({ addresses: ["tcp://synthetic.invalid:22000"] }) }),
+  }, runtime);
+  const options = { host: "", port: 22000, discoveryMode: "global" as const,
+    expectedDeviceId: "SYNTHETIC", certPem: "synthetic", keyPem: "synthetic",
+    deviceName: "synthetic", timeoutMs: 15000 };
+  return { client, options, attempts: () => attempts };
+}
+
+test("a reconnect waits for candidate cooldown instead of reporting an undialed failure", async () => {
+  let timeMs = 0;
+  const sleeps: number[] = [];
+  const f = cooldownFixture({ now: () => timeMs,
+    sleep: async ms => { sleeps.push(ms); timeMs += ms; } });
+  await assert.rejects(f.client.openSession(f.options), /Synthetic dial failure/);
+  await assert.rejects(f.client.openSession(f.options), /Synthetic dial failure/);
+  assert.equal(f.attempts(), 2);
+  assert.deepEqual(sleeps, [5000]);
+});
+
+test("aborting a candidate cooldown removes its pending timer", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const f = cooldownFixture();
+  await assert.rejects(f.client.openSession(f.options), /Synthetic dial failure/);
+  const stop = new AbortController();
+  const opening = f.client.openSession(f.options, stop.signal);
+  await new Promise(resolve => setImmediate(resolve));
+  stop.abort();
+  await assert.rejects(opening);
+  assert.equal(f.attempts(), 1);
+  t.mock.timers.runAll();
+  assert.equal(Date.now(), 0, "Cancelled cooldown must not leave a timer to advance the clock");
 });
 
 test("automatic candidates combine, normalize, deduplicate, and rank all sources", () => {

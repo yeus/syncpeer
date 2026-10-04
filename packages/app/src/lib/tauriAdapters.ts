@@ -4,8 +4,6 @@ import type {
   CachedFileStatus,
   FavoriteRecord,
   IdentityRecoveryExportResponse,
-  SyncpeerDiscoveryFetchInit,
-  SyncpeerDiscoveryResponse,
   SyncpeerHostAdapter,
   SyncpeerPlatformAdapter,
   SyncpeerTlsSocket,
@@ -13,6 +11,7 @@ import type {
   SyncpeerProfileSettings,
   FileDownloadSink,
 } from "@syncpeer/core/browser";
+import { createNativeDiscoveryFetch } from "@syncpeer/core/browser";
 import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
   dispatchDocumentCommandWithSessionConfiguration } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
@@ -63,11 +62,6 @@ interface CliNodeIdentityResponse {
   keyPath: string;
   certPem: string;
   keyPem: string;
-}
-
-interface DiscoveryFetchResponsePayload {
-  status: number;
-  body: string;
 }
 
 interface DiscoveryLocalRequestPayload {
@@ -202,6 +196,8 @@ const createLoggedInvoke = (
       }
       return result;
     } catch (error) {
+      if (command === "syncpeer_discovery_fetch" &&
+        /^(?:Error: )?Discovery request cancelled(?: or unavailable)?\.?$/.test(String(error))) throw error;
       console.error("[syncpeer-ui] tauri.invoke.error", { command });
       emitLog(options, "error", "tauri.invoke.error", { command });
       void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command });
@@ -210,18 +206,7 @@ const createLoggedInvoke = (
   };
 };
 
-const createDiscoveryResponseFromPayload = (
-  payload: DiscoveryFetchResponsePayload,
-): SyncpeerDiscoveryResponse => ({
-  ok: payload.status >= 200 && payload.status < 300,
-  status: payload.status,
-  async text(): Promise<string> {
-    return payload.body;
-  },
-  async json(): Promise<unknown> {
-    return JSON.parse(payload.body);
-  },
-});
+
 
 const createTlsSocket = (
   invoke: InvokeFn,
@@ -424,18 +409,10 @@ export const createTauriAdapters = (
       crypto.getRandomValues(output);
       return output;
     },
-    discoveryFetch: async (input: string | URL, init?: SyncpeerDiscoveryFetchInit): Promise<SyncpeerDiscoveryResponse> => {
-      const payload = await invokeWithLogging<DiscoveryFetchResponsePayload>("syncpeer_discovery_fetch", {
-        request: {
-          url: String(input),
-          method: init?.method ?? "GET",
-          headers: init?.headers ?? {},
-          pinServerDeviceId: init?.pinServerDeviceId ?? null,
-          allowInsecureTls: !!init?.allowInsecureTls,
-        },
-      });
-      return createDiscoveryResponseFromPayload(payload);
-    },
+    discoveryFetch: createNativeDiscoveryFetch(({ operation, ...request }) => invokeWithLogging({
+      discoveryPrepare: "syncpeer_discovery_prepare", discoveryFetch: "syncpeer_discovery_fetch",
+      discoveryCancel: "syncpeer_discovery_cancel",
+    }[operation], { request })),
     discoverLocalCandidates: async ({ expectedDeviceId, timeoutMs }) => {
       const previousDiscovery = localDiscoveryQueue;
       let releaseDiscovery = () => {};

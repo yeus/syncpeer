@@ -78,7 +78,7 @@ const main = async (): Promise<void> => {
     {
       name: "Standard Syncthing relay pairing and peer transport",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-relay-service.ts"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-relay-service.ts", "scripts/test-automatic-relay.ts", "scripts/test-native-discovery.ts", "scripts/test-relay-retry.ts", "scripts/test-relay-sync.ts"],
     },
     {
       name: "Durable folder replica indexes",

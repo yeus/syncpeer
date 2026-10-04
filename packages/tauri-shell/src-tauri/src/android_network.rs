@@ -12,6 +12,7 @@ use jni::{
 };
 
 struct AndroidNetwork {
+    discovery_store: SharedDiscoveryRequests,
     tls_store: SharedTlsStore,
     tls_listener_store: SharedTlsListenerStore,
     quic_store: SharedQuicStore,
@@ -83,6 +84,14 @@ fn execute(
                 network.tls_listener_store.clone(), input)?;
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode TLS listener response: {error}"))?)
+        }
+        "relayListen" => {
+            let input: RelayListenRequest = serde_json::from_value(request.clone())
+                .map_err(|error| format!("Invalid relay listen request: {error}"))?;
+            let response = open_relay_listener(network.tls_store.clone(),
+                network.tls_listener_store.clone(), input)?;
+            Ok(serde_json::to_value(response)
+                .map_err(|error| format!("Could not encode relay listener response: {error}"))?)
         }
         "tlsAccept" => {
             let input: TlsAcceptRequest = serde_json::from_value(request.clone())
@@ -177,17 +186,18 @@ fn execute(
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode discovery response: {error}"))?)
         }
+        "discoveryPrepare" => Ok(serde_json::json!(discovery::prepare(&network.discovery_store)?)),
+        "discoveryCancel" => {
+            let input: DiscoveryCancelRequest = serde_json::from_value(request.clone())
+                .map_err(|error| format!("Invalid discovery cancellation: {error}"))?;
+            discovery::cancel(&network.discovery_store, input.request_id)?;
+            Ok(serde_json::Value::Null)
+        }
         "discoveryFetch" => {
             let input: DiscoveryFetchRequest = serde_json::from_value(request.clone())
                 .map_err(|error| format!("Invalid discovery request: {error}"))?;
-            let result = if input.pin_server_device_id.is_some() || input.allow_insecure_tls {
-                perform_pinned_discovery_request(&input)
-            } else {
-                perform_ca_validated_discovery_request(&input)
-            };
-            let response = result?;
-            Ok(serde_json::to_value(response)
-                .map_err(|error| format!("Could not encode discovery response: {error}"))?)
+            let response = tauri::async_runtime::block_on(discovery::fetch(&network.discovery_store, input))?;
+            serde_json::to_value(response).map_err(|error| error.to_string())
         }
         _ => Err(format!("Unknown network operation: {operation}")),
     }
@@ -203,6 +213,7 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
             &object,
             "nativeHandle",
             Arc::new(AndroidNetwork {
+                discovery_store: Arc::new(Mutex::new(discovery::DiscoveryRequests::default())),
                 tls_store: Arc::new(Mutex::new(TlsSessionStore::default())),
                 tls_listener_store: Arc::new(Mutex::new(TlsListenerStore::default())),
                 quic_store: Arc::new(Mutex::new(QuicSessionStore::default())),
@@ -262,5 +273,7 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
     mut env: JNIEnv,
     object: JObject,
 ) {
-    let _ = unsafe { env.take_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") };
+    if let Ok(network) = unsafe { env.take_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") } {
+        discovery::cancel_all(&network.discovery_store);
+    }
 }

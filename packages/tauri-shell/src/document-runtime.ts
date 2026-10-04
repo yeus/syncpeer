@@ -1,6 +1,8 @@
 // JavaScriptEngine has no browser text codecs; install the standard UTF-8 shim
 // before loading core. Encryption and authenticated file layout stay in core.
 import "./document-runtime-polyfills.js";
+import { createNativeDiscoveryFetch } from "../../core/src/sync/nativeDiscovery.js";
+import { automaticRelayConfiguration } from "../../core/src/sync/automaticRelayPresence.js";
 import { installAndroidTimers } from "./document-runtime-polyfills.js";
 import { createPortRequest } from "./document-runtime-port.js";
 import { createDocumentFilesystem } from "../../core/src/sync/documentFilesystem.js";
@@ -35,6 +37,32 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
     write: async (bytes: Uint8Array) => { await request({ operation: transport === "quic" ? "quicWrite" : "tlsWrite", sessionId, bytes: [...bytes] }); },
     close: async () => { await request({ operation: transport === "quic" ? "quicClose" : "tlsClose", sessionId }); },
   });
+  const listener = (opened: { listenerId: number; port: number }) => {
+    let closed = false;
+    return {
+      port: Number(opened.port),
+      accept: async () => {
+        while (!closed) {
+          try {
+            const accepted = await request({ operation: "tlsAccept", listenerId: opened.listenerId,
+              timeoutMs: 60_000 }) as { sessionId: number; peerCertificateDer: number[];
+              remoteAddress: string; remotePort: number; alpn: string };
+            return { socket: socket(Number(accepted.sessionId), new Uint8Array(accepted.peerCertificateDer)),
+              remoteAddress: accepted.remoteAddress, remotePort: Number(accepted.remotePort), alpn: accepted.alpn };
+          } catch (error) {
+            if (!closed && /accept timed out/i.test(String(error))) continue;
+            throw error;
+          }
+        }
+        throw new Error("TLS listener closed.");
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await request({ operation: "tlsListenerClose", listenerId: opened.listenerId });
+      },
+    };
+  };
   return {
     log: (event, details) => {
       if (!event.startsWith("core.session.connect.") &&
@@ -54,30 +82,14 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
         alpnProtocols: [...alpnProtocols], handshakeTimeoutMs: handshakeTimeoutMs ?? null }) as {
         listenerId: number; port: number;
       };
-      let closed = false;
-      return {
-        port: Number(opened.port),
-        accept: async () => {
-          while (!closed) {
-            try {
-              const accepted = await request({ operation: "tlsAccept", listenerId: opened.listenerId,
-                timeoutMs: 60_000 }) as { sessionId: number; peerCertificateDer: number[];
-                remoteAddress: string; remotePort: number; alpn: string };
-              return { socket: socket(Number(accepted.sessionId), new Uint8Array(accepted.peerCertificateDer)),
-                remoteAddress: accepted.remoteAddress, remotePort: Number(accepted.remotePort), alpn: accepted.alpn };
-            } catch (error) {
-              if (!closed && /accept timed out/i.test(String(error))) continue;
-              throw error;
-            }
-          }
-          throw new Error("TLS listener closed.");
-        },
-        close: async () => {
-          if (closed) return;
-          closed = true;
-          await request({ operation: "tlsListenerClose", listenerId: opened.listenerId });
-        },
+      return listener(opened);
+    },
+    listenRelay: async ({ relayAddress, certPem, keyPem, alpnProtocols, handshakeTimeoutMs }) => {
+      const opened = await request({ operation: "relayListen", relayAddress, certPem, keyPem,
+        alpnProtocols: [...alpnProtocols], handshakeTimeoutMs: handshakeTimeoutMs ?? null }) as {
+        listenerId: number; port: number;
       };
+      return listener(opened);
     },
     connectQuic: async ({ host, port, certPem, keyPem, caPem, timeoutMs, keepaliveMs, idleTimeoutMs, signal }) => {
       const value = await request({ operation: "quicOpen", host, port, certPem, keyPem, caPem: caPem ?? null,
@@ -97,11 +109,7 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
     },
     sha256: async bytes => new Uint8Array(await request({ operation: "sha256", bytes: [...bytes] }) as number[]),
     randomBytes: async size => new Uint8Array(await request({ operation: "random", size }) as number[]),
-    discoveryFetch: async (input, init) => {
-      const response = await request({ operation: "discoveryFetch", url: String(input), method: init?.method ?? "GET", headers: init?.headers ?? {}, pinServerDeviceId: init?.pinServerDeviceId ?? null, allowInsecureTls: !!init?.allowInsecureTls }) as { status: number; body: string };
-      return { ok: response.status >= 200 && response.status < 300, status: response.status,
-        text: async () => response.body, json: async () => JSON.parse(response.body) };
-    },
+    discoveryFetch: createNativeDiscoveryFetch(request),
     discoverLocalCandidates: async ({ expectedDeviceId, timeoutMs }) => {
       const response = await request({ operation: "discoverLocal", expectedDeviceId: expectedDeviceId || null, timeoutMs: timeoutMs ?? null }) as { candidates: Array<{ address: string; protocol: string; host?: string; port?: number; deviceId?: string }> };
       return response.candidates.map(candidate => ({ ...candidate,
@@ -174,8 +182,9 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
       throw new Error("Incoming TCP port must be between 1 and 65535.");
     }
+    const automaticRelay = automaticRelayConfiguration(options);
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
-      coreOptions.certPem, coreOptions.keyPem, listenPort]);
+      coreOptions.certPem, coreOptions.keyPem, listenPort, automaticRelay]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
     const revision = documents.sessionConfigurationRevision();
     const saved = await documents.connectionPasswords().catch(() => ({}));
@@ -223,7 +232,7 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     await stopIncomingService();
     incomingService = await startIncomingPeerService(adapter, {
       host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
-      localDeviceId, approvedDeviceIds, ...sessionHandlers,
+      localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
       onError: error => adapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
       }),

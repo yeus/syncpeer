@@ -125,6 +125,7 @@ export interface SyncpeerRelayConnectResult {
 }
 
 export interface SyncpeerRelayListenOptions {
+  signal?: AbortSignal;
   relayAddress: string;
   certPem: string;
   keyPem: string;
@@ -135,6 +136,9 @@ export interface SyncpeerRelayListenOptions {
 export interface SyncpeerDiscoveryFetchInit {
   method?: string;
   headers?: Record<string, string>;
+  body?: string;
+  certPem?: string;
+  keyPem?: string;
   pinServerDeviceId?: string;
   allowInsecureTls?: boolean;
   signal?: AbortSignal;
@@ -143,6 +147,7 @@ export interface SyncpeerDiscoveryFetchInit {
 export interface SyncpeerDiscoveryResponse {
   ok: boolean;
   status: number;
+  headers?: Record<string, string>;
   text(): Promise<string>;
   json(): Promise<unknown>;
 }
@@ -591,10 +596,14 @@ function isTransientDiscoveryError(error: unknown): boolean {
   );
 }
 
-function waitMs(ms: number): Promise<void> {
+function waitMs(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfConnectionAborted(signal);
   if (ms <= 0) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); };
+    const abort = () => { cleanup(); reject(new Error("Connection attempt was cancelled.")); };
+    const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
   });
 }
 
@@ -628,7 +637,7 @@ function maybeConnectionHint(
   return "";
 }
 
-function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
+export function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
   const raw = (rawUrl ?? "").trim();
   const defaultUrl = "https://discovery.syncthing.net/v2/";
   const withScheme =
@@ -750,7 +759,7 @@ interface CandidateHealth {
 
 interface CandidateRuntime {
   now: () => number;
-  sleep: (ms: number) => Promise<void>;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 const candidateKey = (candidate: DiscoveredCandidate): string =>
@@ -800,7 +809,7 @@ const trackCandidateSession = (
   });
 };
 
-function extractDiscoveryAuth(url: URL): {
+export function extractDiscoveryAuth(url: URL): {
   pinServerDeviceId?: string;
   allowInsecureTls: boolean;
 } {
@@ -2814,6 +2823,31 @@ async function openQuicSession(
   );
 }
 
+/** Some standard relays reject a fresh join before their session worker is ready.
+ * Request a new invitation: its one-use join key cannot be retried. No application bytes have been sent. */
+export async function connectRelayWithRetry(adapter: SyncpeerHostAdapter, options: SyncpeerRelayConnectOptions) {
+  if (!adapter.connectRelay) throw new Error("Relay transport is not available in this host adapter");
+  const deadline = Date.now() + (options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 30000);
+  for (let attempt = 0; ; attempt++) {
+    throwIfConnectionAborted(options.signal);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Relay connection timeout budget exhausted");
+    try { return await adapter.connectRelay({ ...options, timeoutMs: remaining }); }
+    catch (error) {
+      if (attempt >= 2 || !/Relay join failed \(2\):/.test(String(error))) throw error;
+      throwIfConnectionAborted(options.signal);
+      adapter.log?.("core.relay.join.retry", { attempt: attempt + 1 });
+      await new Promise<void>((resolve, reject) => {
+        const done = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); resolve(); };
+        const abort = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", abort);
+          reject(new Error("Connection attempt was cancelled.")); };
+        const timer = setTimeout(done, Math.min(100 * 2 ** attempt, Math.max(0, deadline - Date.now())));
+        options.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+  }
+}
+
 async function openRelaySession(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
@@ -2831,7 +2865,7 @@ async function openRelaySession(
     relayAddress,
     expectedDeviceId: opts.expectedDeviceId,
   });
-  const relay = await adapter.connectRelay({
+  const relay = await connectRelayWithRetry(adapter, {
     relayAddress,
     expectedDeviceId: opts.expectedDeviceId,
     certPem: opts.certPem,
@@ -2965,10 +2999,7 @@ async function openSessionAttempt(
     );
   }
 
-  const viableCandidates = mergedCandidates.filter(
-    (candidate) => (candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) <= runtime.now(),
-  );
-  const ordered = normalizeDiscoveredCandidates(viableCandidates);
+  const ordered = normalizeDiscoveredCandidates(mergedCandidates);
 
   const directCandidates = opts.relayOnly ? [] : ordered.filter(
     (candidate) =>
@@ -2981,7 +3012,9 @@ async function openSessionAttempt(
 
   const relayCandidates = opts.quicOnly ? [] : ordered.filter(
     (candidate) => candidate.protocol === "relay",
-  );
+  ).sort((left, right) =>
+    (candidateHealth.get(candidateKey(left))?.cooldownUntilMs ?? 0) -
+    (candidateHealth.get(candidateKey(right))?.cooldownUntilMs ?? 0));
 
   adapter.log?.("core.discovery.candidates.ordered", {
     directCandidates,
@@ -3018,6 +3051,13 @@ async function openSessionAttempt(
   if (signal?.aborted) abortRace();
   else signal?.addEventListener("abort", abortRace, { once: true });
   const raceSignal = raceController.signal;
+  const waitForCandidate = async (candidate: DiscoveredCandidate) => {
+    const until = candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0;
+    const delayMs = Math.max(0, until - runtime.now());
+    if (delayMs >= connectDeadline - runtime.now()) throw new Error("Candidate cooldown exceeds connection budget");
+    if (delayMs > 0) await runtime.sleep(delayMs, raceSignal);
+    throwIfConnectionAborted(raceSignal);
+  };
   let winningSession: SyncpeerSessionHandle | null = null;
   const claimSession = async (session: SyncpeerSessionHandle) => {
     if (winningSession) {
@@ -3032,6 +3072,7 @@ async function openSessionAttempt(
   const openDirectCandidate = async (
     candidate: DiscoveredCandidate,
   ): Promise<SyncpeerSessionHandle> => {
+    await waitForCandidate(candidate);
     if (winningSession) throw new Error("Direct connection race cancelled");
     throwIfConnectionAborted(raceSignal);
     const remainingMs = Math.max(0, connectDeadline - runtime.now());
@@ -3087,6 +3128,8 @@ async function openSessionAttempt(
         if (winningSession) throw new Error("Relay connection race cancelled");
         const relayMaxAttempts = 2;
         for (const candidate of relayCandidates) {
+          if ((candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) >= connectDeadline) continue;
+          await waitForCandidate(candidate);
           for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
             if (winningSession) throw new Error("Relay connection race cancelled");
             const remainingMs = Math.max(0, connectDeadline - runtime.now());
@@ -3235,7 +3278,7 @@ export interface SyncpeerCoreClient {
 
 export function createSyncpeerCoreClient(
   adapter: SyncpeerHostAdapter,
-  runtimeInput?: { now?: () => number; sleep?: (ms: number) => Promise<void> },
+  runtimeInput?: { now?: () => number; sleep?: (ms: number, signal?: AbortSignal) => Promise<void> },
 ): SyncpeerCoreClient {
   const candidateHealth = new Map<string, CandidateHealth>();
   const runtime: CandidateRuntime = {

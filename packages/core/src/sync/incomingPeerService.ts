@@ -2,11 +2,14 @@ import { acceptSyncpeerSession, deviceIdFromCertificate, type SyncpeerAcceptedTl
   type SyncpeerHostAdapter, type SyncpeerSessionHandle } from "../client.js";
 import { createPeerSessionManager, type PeerSessionCandidate } from "./peerSessionManager.js";
 
+import { startAutomaticRelayPresence } from "./automaticRelayPresence.js";
+
 const canonicalId = (value: string) => value.replace(/[^A-Z2-7]/gi, "").toUpperCase();
 
 export interface IncomingPeerServiceOptions {
   mode?: "direct" | "relay" | "both";
   relayAddress?: string;
+  automaticRelay?: { poolUrl?: string; discoveryServer?: string };
   host: string;
   port?: number;
   certPem: string;
@@ -49,10 +52,17 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
   const relayOptions = { relayAddress: options.relayAddress!, certPem: options.certPem, keyPem: options.keyPem,
     alpnProtocols, handshakeTimeoutMs: options.handshakeTimeoutMs };
   try {
-    if (mode !== "relay") listeners.push({ kind: "direct", listener: await adapter.listenTls!({
-      host: options.host, port: options.port ?? 22000,
-      certPem: options.certPem, keyPem: options.keyPem, alpnProtocols,
-      handshakeTimeoutMs: options.handshakeTimeoutMs }) });
+    if (mode !== "relay") {
+      try {
+        listeners.push({ kind: "direct", listener: await adapter.listenTls!({
+          host: options.host, port: options.port ?? 22000,
+          certPem: options.certPem, keyPem: options.keyPem, alpnProtocols,
+          handshakeTimeoutMs: options.handshakeTimeoutMs }) });
+      } catch (error) {
+        if (!options.automaticRelay || !adapter.listenRelay) throw error;
+        options.onError?.(error);
+      }
+    }
     if (mode !== "direct") listeners.push({ kind: "relay", listener: await adapter.listenRelay!(relayOptions) });
   } catch (error) { await Promise.allSettled(listeners.map(value => value.listener.close())); throw error; }
   let stopping = false;
@@ -129,14 +139,18 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
     }
   };
   const acceptLoops = listeners.map(entry => acceptLoop(entry));
+  const automaticRelay = options.automaticRelay && adapter.listenRelay
+    ? startAutomaticRelayPresence(adapter, { ...relayOptions, ...options.automaticRelay }, handle)
+    : null;
 
-  return { port: mode === "relay" ? 0 : listeners[0].listener.port, activeSessions: manager.active,
+  return { port: listeners.find(entry => entry.kind === "direct")?.listener.port ?? 0, activeSessions: manager.active,
     updateSessionHandlers: handlers => { sessionHandlers = handlers; },
     admitOutgoing: (remoteDeviceId, connectionId, session) =>
       manager.admit({ remoteDeviceId, direction: "outgoing", connectionId, session }),
     close: async () => {
       stopping = true;
       retryStop.abort();
+      await automaticRelay?.close();
       await Promise.allSettled([...pendingSockets].map(socket => socket.close()));
       await Promise.allSettled(listeners.map(value => value.listener.close()));
       await Promise.allSettled(acceptLoops);

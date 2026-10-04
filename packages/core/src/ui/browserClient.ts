@@ -1,4 +1,4 @@
-import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate,
+import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificate, connectRelayWithRetry,
   type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerSessionHandle,
   type SyncpeerTlsSocket,
   withMetadataSession } from "../client.js";
@@ -29,6 +29,8 @@ import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds,
   type OwnedDeviceIdentity, type OwnedSpaceDevice } from "../sync/personalSpaceSharing.js";
 import { sameDeviceId } from "./helpers.js";
 
+import { automaticRelayConfiguration } from "../sync/automaticRelayPresence.js";
+
 export interface ConnectOptions {
   host: string;
   port: number;
@@ -36,6 +38,7 @@ export interface ConnectOptions {
   listenPort?: number;
   discoveryMode?: "automatic" | "global" | "lan" | "direct";
   discoveryServer?: string;
+  relayPoolUrl?: string;
   cert?: string;
   key?: string;
   remoteId?: string;
@@ -448,6 +451,7 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   listenPort: localListenPort(options.listenPort),
   discoveryMode: options.discoveryMode ?? "automatic",
   discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
+  relayPoolUrl: options.relayPoolUrl,
   cert: options.cert && options.cert.trim() !== "" ? options.cert.trim() : undefined,
   key: options.key && options.key.trim() !== "" ? options.key.trim() : undefined,
   remoteId: options.remoteId && options.remoteId.trim() !== "" ? options.remoteId.trim() : undefined,
@@ -510,6 +514,8 @@ const serializeConnectionKey = (
     listenPort: options.listenPort ?? 22000,
     discoveryMode: options.discoveryMode ?? "automatic",
     discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
+    relayPoolUrl: options.relayPoolUrl,
+    enableRelayFallback: options.enableRelayFallback !== false,
     remoteId: options.remoteId ?? "",
     deviceName: options.deviceName,
     certPem,
@@ -673,8 +679,9 @@ export const createSyncpeerBrowserClient = (
       localDeviceId, trustedDevices);
     if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
     const listenPort = localListenPort(connectOptions.listenPort);
+    const automaticRelay = automaticRelayConfiguration(connectOptions);
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
-      coreOptions.certPem, coreOptions.keyPem, listenPort]);
+      coreOptions.certPem, coreOptions.keyPem, listenPort, automaticRelay]);
     const remoteDeviceId = coreOptions.expectedDeviceId;
     const revision = platformAdapter.sessionConfigurationRevision?.();
     const prepared = new Map<string, SyncpeerConnectOptions>();
@@ -741,7 +748,7 @@ export const createSyncpeerBrowserClient = (
     coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
     incomingService = await startIncomingPeerService(coreAdapter, {
       host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
-      localDeviceId, approvedDeviceIds, ...sessionHandlers,
+      localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
       onError: error => coreAdapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
       }),
@@ -1065,7 +1072,7 @@ export const createSyncpeerBrowserClient = (
       let socket: SyncpeerTlsSocket;
       if (relayAddress) {
         if (!coreAdapter.connectRelay) throw new Error("This platform cannot join relay pairing connections.");
-        socket = (await coreAdapter.connectRelay({ relayAddress,
+        socket = (await connectRelayWithRetry(coreAdapter, { relayAddress,
           expectedDeviceId: pairingOptions.invitation.deviceId,
           certPem: identity.certPem, keyPem: identity.keyPem,
           alpnProtocols: ["syncpeer-pairing/1"] })).socket;

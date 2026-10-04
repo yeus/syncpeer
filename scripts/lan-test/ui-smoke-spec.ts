@@ -265,6 +265,11 @@ const unlockTargetFolder = async (): Promise<void> => {
   await clickTestId(`unlock-folder-${targetFolderId}`);
 };
 
+const fetchNativeDiscovery = () => tauriBrowser.tauri.execute(async (tauri, request) => {
+  const requestId = await tauri.core.invoke("syncpeer_discovery_prepare");
+  return tauri.core.invoke("syncpeer_discovery_fetch", { request: { ...request, requestId } });
+}, nativeDiscoveryRequest()) as Promise<{ status: number; body: string }>;
+
 describe("Syncpeer Tauri UI smoke", () => {
   it("renders the native identity and connection mode controls", async () => {
     await clickTestId("tab-devices");
@@ -457,10 +462,7 @@ describe("Syncpeer Tauri UI smoke", () => {
   });
 
   it("reaches the configured discovery server through Tauri", async () => {
-    const payload = await tauriBrowser.tauri.execute((tauri, request) =>
-      tauri.core.invoke("syncpeer_discovery_fetch", { request }),
-      nativeDiscoveryRequest(),
-    ) as { status: number; body: string };
+    const payload = await fetchNativeDiscovery();
     console.log("Native discovery response: " + payload.status + " " + payload.body.slice(0, 300));
     assert.equal(payload.status, 200);
   });
@@ -659,10 +661,7 @@ describe("Syncpeer Tauri UI smoke", () => {
   });
 
   it("opens the discovered relay through Tauri", async () => {
-    const discovery = await tauriBrowser.tauri.execute((tauri, request) =>
-      tauri.core.invoke("syncpeer_discovery_fetch", { request }),
-      nativeDiscoveryRequest(),
-    ) as { status: number; body: string };
+    const discovery = await fetchNativeDiscovery();
     assert.equal(discovery.status, 200);
     const relayAddresses = (JSON.parse(discovery.body) as { addresses?: string[] }).addresses
       ?.filter((address) => address.startsWith("relay://")) ?? [];

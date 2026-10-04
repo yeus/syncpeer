@@ -29,6 +29,24 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
+// Preparing and cancelling handles does no I/O; dispatch without waiting for socket workers.
+private fun dispatchNativeRequest(
+  name: String,
+  raw: String,
+  executor: Executor,
+  request: (String) -> String,
+  respond: (String) -> Unit,
+) {
+  val task = Runnable { respond(request(raw)) }
+  val control = name == "network" && runCatching {
+    when (JSONObject(raw).optString("operation")) {
+      "discoveryPrepare", "discoveryCancel" -> true
+      else -> false
+    }
+  }.getOrDefault(false)
+  if (control) task.run() else executor.execute(task)
+}
+
 internal interface DocumentRuntimeHost : AutoCloseable {
   val kind: DocumentRuntimeKind
   fun evaluate(code: String, input: ByteArray): CompletableFuture<String>
@@ -127,8 +145,10 @@ internal class SandboxDocumentRuntimeHost private constructor(
       request: (String) -> String,
     ): MessagePort {
       lateinit var port: MessagePort
-      port = isolate.createMessageChannel(name, executor) { message ->
-        port.postMessage(Message.createStringMessage(request(message.string)))
+      port = isolate.createMessageChannel(name, Executor { it.run() }) { message ->
+        dispatchNativeRequest(name, message.string, executor, request) { reply ->
+          port.postMessage(Message.createStringMessage(reply))
+        }
       }
       return port
     }
@@ -329,12 +349,13 @@ internal class WebViewDocumentRuntimeHost private constructor(
           if (parsed?.optBoolean("ready") == true) ready.complete(host) else host.receive(value)
         }
       }, mainHandler)
-      connectNativePort(nativePorts[1], mainHandler, storageExecutor, storageRequest)
-      connectNativePort(nativePorts[2], mainHandler, networkExecutor, networkRequest)
+      connectNativePort("storage", nativePorts[1], mainHandler, storageExecutor, storageRequest)
+      connectNativePort("network", nativePorts[2], mainHandler, networkExecutor, networkRequest)
       webView.postWebMessage(WebMessage("syncpeer-runtime", channels.map { it[1] }.toTypedArray()), origin)
     }
 
     private fun connectNativePort(
+      name: String,
       port: WebMessagePort,
       mainHandler: Handler,
       executor: Executor,
@@ -343,8 +364,7 @@ internal class WebViewDocumentRuntimeHost private constructor(
       port.setWebMessageCallback(object : WebMessagePort.WebMessageCallback() {
         override fun onMessage(source: WebMessagePort, message: WebMessage) {
           val value = message.data ?: return
-          executor.execute {
-            val reply = request(value)
+          dispatchNativeRequest(name, value, executor, request) { reply ->
             mainHandler.post { runCatching { port.postMessage(WebMessage(reply)) } }
           }
         }

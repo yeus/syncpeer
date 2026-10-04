@@ -401,6 +401,7 @@ function relayAddressHost(value: Buffer, fallback: string): string {
 function connectNodeTcp(host: string, port: number, signal?: AbortSignal): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host, port });
+    socket.setTimeout(10000, () => socket.destroy(new Error("Relay TCP connection timed out.")));
     const cleanup = () => signal?.removeEventListener("abort", onAbort);
     const onAbort = () => {
       socket.destroy();
@@ -411,7 +412,7 @@ function connectNodeTcp(host: string, port: number, signal?: AbortSignal): Promi
     };
     if (signal?.aborted) return onAbort();
     signal?.addEventListener("abort", onAbort, { once: true });
-    socket.once("connect", () => { cleanup(); resolve(socket); });
+    socket.once("connect", () => { socket.setTimeout(0); cleanup(); resolve(socket); });
     socket.once("error", (error) => { cleanup(); reject(error); });
   });
 }
@@ -430,7 +431,10 @@ function connectNodeRelayTls(
       key: options.keyPem,
       rejectUnauthorized: false,
     });
-    const cleanup = () => options.signal?.removeEventListener("abort", onAbort);
+    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener("abort", onAbort); };
+    const timer = setTimeout(() => {
+      secureSocket.destroy(new Error("Relay TLS handshake timed out."));
+    }, 10000);
     const onAbort = () => {
       secureSocket.destroy();
       cleanup();
@@ -455,7 +459,17 @@ function relayEndpoint(address: string) {
   return { host, port, expectedId: relayUrl.searchParams.get("id") };
 }
 
-async function openRelayControl(address: string, certPem: string, keyPem: string, signal?: AbortSignal) {
+function guardRelaySocket(socket: net.Socket, signal?: AbortSignal, timeoutMs = 10000) {
+  const cancel = () => socket.destroy(new Error("Connection attempt was cancelled."));
+  const release = () => { socket.setTimeout(0); signal?.removeEventListener("abort", cancel); };
+  socket.setTimeout(Math.max(1, timeoutMs), () => socket.destroy(new Error("Relay request timed out.")));
+  if (signal?.aborted) cancel();
+  else signal?.addEventListener("abort", cancel, { once: true });
+  socket.once("close", release);
+  return release;
+}
+
+async function openRelayControl(address: string, certPem: string, keyPem: string, signal?: AbortSignal, timeoutMs?: number) {
   const endpoint = relayEndpoint(address);
   const relaySocket = await connectNodeRelayTls(undefined, {
     host: endpoint.host,
@@ -465,13 +479,14 @@ async function openRelayControl(address: string, certPem: string, keyPem: string
     alpn: "bep-relay",
     signal,
   });
+  const release = guardRelaySocket(relaySocket, signal, timeoutMs);
   const relayPeer = relaySocket.getPeerCertificate(true);
   if (endpoint.expectedId && canonicalDeviceId(computeDeviceIdFromDer(relayPeer.raw)) !==
     canonicalDeviceId(endpoint.expectedId)) {
     relaySocket.destroy();
     throw new Error("Relay certificate ID mismatch");
   }
-  return { ...endpoint, socket: relaySocket, reader: new NodeSocketReader(relaySocket) };
+  return { ...endpoint, socket: relaySocket, reader: new NodeSocketReader(relaySocket), release };
 }
 
 function parseRelayInvitation(payload: Buffer, fallbackHost: string, fallbackPort: number) {
@@ -489,8 +504,9 @@ function parseRelayInvitation(payload: Buffer, fallbackHost: string, fallbackPor
     port: port || fallbackPort, serverSocket: serverSocket === 1 };
 }
 
-async function joinRelaySession(invitation: ReturnType<typeof parseRelayInvitation>, signal?: AbortSignal) {
+async function joinRelaySession(invitation: ReturnType<typeof parseRelayInvitation>, signal?: AbortSignal, timeoutMs?: number) {
   const sessionTcp = await connectNodeTcp(invitation.host, invitation.port, signal);
+  const release = guardRelaySocket(sessionTcp, signal, timeoutMs);
   const reader = new NodeSocketReader(sessionTcp);
   try {
     await new Promise<void>((resolve, reject) => sessionTcp.write(
@@ -504,6 +520,7 @@ async function joinRelaySession(invitation: ReturnType<typeof parseRelayInvitati
     reader.detachForTls();
     return sessionTcp;
   } catch (error) { reader.dispose(); sessionTcp.destroy(); throw error; }
+  finally { release(); }
 }
 
 async function wrapRelaySessionTls(sessionTcp: net.Socket, invitation: ReturnType<typeof parseRelayInvitation>,
@@ -523,7 +540,7 @@ async function wrapRelaySessionTls(sessionTcp: net.Socket, invitation: ReturnTyp
 }
 
 async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<SyncpeerRelayConnectResult> {
-  const relay = await openRelayControl(options.relayAddress, options.certPem, options.keyPem, options.signal);
+  const relay = await openRelayControl(options.relayAddress, options.certPem, options.keyPem, options.signal, options.timeoutMs);
   const { socket: relaySocket, reader: relayReader } = relay;
   try {
     await new Promise<void>((resolve, reject) => relaySocket.write(
@@ -543,7 +560,7 @@ async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<S
     }
     relayReader.dispose();
     relaySocket.destroy();
-    const sessionTcp = await joinRelaySession(session, options.signal);
+    const sessionTcp = await joinRelaySession(session, options.signal, options.timeoutMs);
     const bepSocket = await wrapRelaySessionTls(sessionTcp, session, options.certPem, options.keyPem,
       options.alpnProtocols ?? ["bep/1.0"], options.signal);
     return { socket: new NodeTlsSocket(bepSocket),
@@ -553,7 +570,7 @@ async function connectNodeRelay(options: SyncpeerRelayConnectOptions): Promise<S
 
 async function listenNodeRelay(options: SyncpeerRelayListenOptions): Promise<SyncpeerTlsListener> {
   type Accepted = Awaited<ReturnType<SyncpeerTlsListener["accept"]>>;
-  const relay = await openRelayControl(options.relayAddress, options.certPem, options.keyPem);
+  const relay = await openRelayControl(options.relayAddress, options.certPem, options.keyPem, options.signal);
   const accepted: Accepted[] = [];
   const waiters: Array<{ resolve: (value: Accepted) => void; reject: (error: Error) => void }> = [];
   const sockets = new Set<net.Socket>();
@@ -573,6 +590,7 @@ async function listenNodeRelay(options: SyncpeerRelayListenOptions): Promise<Syn
       throw new Error("Relay refused the permanent device registration");
     }
   } catch (error) { relay.reader.dispose(); relay.socket.destroy(); throw error; }
+  relay.release();
   const pingTimer = setInterval(() => {
     if (!closed) relay.socket.write(relayMessage(RELAY_MESSAGE_TYPE_PING, new Uint8Array()));
   }, 20000);
@@ -949,10 +967,12 @@ async function discoverNodeLocalCandidates(options: {
 function createDiscoveryResponse(
   status: number,
   body: ByteBuffer,
+  headers: Record<string, string> = {},
 ): SyncpeerDiscoveryResponse {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers,
     async text(): Promise<string> {
       return body.toString("utf8");
     },
@@ -1001,7 +1021,7 @@ function parseRawHttpResponse(raw: ByteBuffer): SyncpeerDiscoveryResponse {
   const body: ByteBuffer = (headers.get("transfer-encoding") ?? "").toLowerCase().includes("chunked")
     ? decodeChunkedBody(raw.slice(headerEnd + 4))
     : raw.slice(headerEnd + 4);
-  return createDiscoveryResponse(status, body);
+  return createDiscoveryResponse(status, body, Object.fromEntries(headers));
 }
 
 async function rawPinnedDiscoveryFetch(
@@ -1022,55 +1042,59 @@ async function rawPinnedDiscoveryFetch(
     port,
     servername: host,
     ALPNProtocols: ["http/1.1"],
+    cert: init?.certPem, key: init?.keyPem,
     rejectUnauthorized: false,
   });
+  socket.setTimeout(15000, () => socket.destroy(new Error("Discovery request timed out.")));
   const onAbort = () => socket.destroy(new Error("Discovery request cancelled."));
   if (init?.signal?.aborted) onAbort();
   else init?.signal?.addEventListener("abort", onAbort, { once: true });
 
-  await new Promise<void>((resolve, reject) => {
-    socket.once("secureConnect", () => resolve());
-    socket.once("error", reject);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("secureConnect", () => resolve());
+      socket.once("error", reject);
+    });
 
-  if (!allowInsecureTls && pinServerDeviceId) {
-    const peer = socket.getPeerCertificate(true);
-    if (!peer?.raw) {
-      socket.destroy();
-      throw new Error("Discovery server certificate missing");
+    if (!allowInsecureTls && pinServerDeviceId) {
+      const peer = socket.getPeerCertificate(true);
+      if (!peer?.raw) {
+        throw new Error("Discovery server certificate missing");
+      }
+      const got = canonicalDeviceId(computeDeviceIdFromDer(new Uint8Array(peer.raw)));
+      const want = canonicalDeviceId(pinServerDeviceId);
+      if (got !== want) {
+        throw new Error(`Discovery server certificate ID mismatch: expected ${pinServerDeviceId}, got ${got}`);
+      }
     }
-    const got = canonicalDeviceId(computeDeviceIdFromDer(new Uint8Array(peer.raw)));
-    const want = canonicalDeviceId(pinServerDeviceId);
-    if (got !== want) {
-      socket.destroy();
-      throw new Error(`Discovery server certificate ID mismatch: expected ${pinServerDeviceId}, got ${got}`);
-    }
+
+    const method = init?.method ?? "GET";
+    const pathWithQuery = `${url.pathname}${url.search}`;
+    const headerLines = Object.entries(init?.headers ?? {}).map(([key, value]) => `${key}: ${value}`);
+    const requestText = [
+      `${method} ${pathWithQuery} HTTP/1.1`,
+      `Host: ${url.host}`,
+      "Accept: application/json",
+      "Connection: close",
+      ...(init?.body !== undefined ? [`Content-Length: ${Buffer.byteLength(init.body)}`] : []),
+      ...headerLines,
+      "",
+      "",
+    ].join("\r\n");
+
+    socket.write(requestText + (init?.body ?? ""), "utf8");
+    const chunks: ByteBuffer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      socket.on("data", (chunk: ByteBuffer) => chunks.push(Buffer.from(chunk)));
+      socket.once("end", resolve);
+      socket.once("close", resolve);
+      socket.once("error", reject);
+    });
+    return parseRawHttpResponse(Buffer.concat(chunks));
+  } finally {
+    socket.destroy();
+    init?.signal?.removeEventListener("abort", onAbort);
   }
-
-  const method = init?.method ?? "GET";
-  const pathWithQuery = `${url.pathname}${url.search}`;
-  const headerLines = Object.entries(init?.headers ?? {}).map(([key, value]) => `${key}: ${value}`);
-  const requestText = [
-    `${method} ${pathWithQuery} HTTP/1.1`,
-    `Host: ${url.host}`,
-    "Accept: application/json",
-    "Connection: close",
-    ...headerLines,
-    "",
-    "",
-  ].join("\r\n");
-
-  socket.write(requestText, "utf8");
-  const chunks: ByteBuffer[] = [];
-  await new Promise<void>((resolve, reject) => {
-    socket.on("data", (chunk: ByteBuffer) => chunks.push(Buffer.from(chunk)));
-    socket.once("end", resolve);
-    socket.once("close", resolve);
-    socket.once("error", reject);
-  });
-  socket.destroy();
-  init?.signal?.removeEventListener("abort", onAbort);
-  return parseRawHttpResponse(Buffer.concat(chunks));
 }
 
 async function nodeDiscoveryFetch(
@@ -1086,7 +1110,9 @@ async function nodeDiscoveryFetch(
       url,
       {
         method: init?.method ?? "GET",
-        headers: init?.headers,
+        headers: { ...init?.headers, ...(init?.body !== undefined ? { "Content-Length": Buffer.byteLength(init.body) } : {}) },
+        cert: init?.certPem, key: init?.keyPem,
+        timeout: 15000,
         signal: init?.signal,
       },
       (response) => {
@@ -1097,13 +1123,15 @@ async function nodeDiscoveryFetch(
             createDiscoveryResponse(
               response.statusCode ?? 0,
               Buffer.concat(chunks),
+              Object.fromEntries(Object.entries(response.headers).map(([key, value]) => [key, String(value ?? "")])),
             ),
           );
         });
       },
     );
     request.on("error", reject);
-    request.end();
+    request.on("timeout", () => request.destroy(new Error("Discovery request timed out.")));
+    request.end(init?.body);
   });
 }
 

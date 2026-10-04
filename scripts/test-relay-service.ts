@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { randomBytes, X509Certificate } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import net from "node:net";
-import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { createNodeHostAdapter } from "../packages/core/dist/node.js";
@@ -11,48 +8,16 @@ import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserCli
 import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
-import { binaryPath, ensureSyncthingTools, generateSyncthingIdentity } from "./lan-test/syncthing.ts";
-
-const freePort = () => new Promise<number>((resolve, reject) => {
-  const server = net.createServer();
-  server.once("error", reject);
-  server.listen(0, "127.0.0.1", () => {
-    const address = server.address();
-    if (!address || typeof address === "string") return reject(new Error("No test port."));
-    server.close(() => resolve(address.port));
-  });
-});
-
-const waitForPort = async (port: number) => {
-  const deadline = Date.now() + 10000;
-  while (Date.now() < deadline) {
-    const open = await new Promise<boolean>(resolve => {
-      const socket = net.connect(port, "127.0.0.1", () => { socket.destroy(); resolve(true); });
-      socket.once("error", () => resolve(false));
-    });
-    if (open) return;
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-  throw new Error("Local relay did not start.");
-};
+import { generateSyncthingIdentity } from "./lan-test/syncthing.ts";
+import { startLocalRelay } from "./lan-test/relay.ts";
 
 test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay",
   { timeout: 30000 }, async () => {
-    ensureSyncthingTools();
-    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-relay-service-"));
-    await mkdir(path.join(root, "relay"));
-    const port = await freePort();
-    const relay = spawn(binaryPath("strelaysrv"), [
-      `-listen=127.0.0.1:${port}`, `-keys=${path.join(root, "relay")}`,
-      "-pools=", "-status-srv=", "-ping-interval=2s",
-    ], { stdio: "ignore" });
+    const relay = await startLocalRelay();
+    const { root, relayAddress } = relay;
     let listener: Awaited<ReturnType<NonNullable<ReturnType<typeof createNodeHostAdapter>["listenRelay"]>>> | undefined;
     let pairing: Awaited<ReturnType<ReturnType<typeof createSyncpeerBrowserClient>["startPairingInvitation"]>> | undefined;
     try {
-      await waitForPort(port);
-      const relayCert = await readFile(path.join(root, "relay", "cert.pem"), "utf8");
-      const relayId = computeDeviceId(new X509Certificate(relayCert).raw);
-      const relayAddress = `relay://127.0.0.1:${port}/?id=${relayId}`;
       const a = generateSyncthingIdentity(path.join(root, "a"));
       const b = generateSyncthingIdentity(path.join(root, "b"));
       const adapter = createNodeHostAdapter();
@@ -117,11 +82,6 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
       }
     } finally {
       await listener?.close().catch(() => undefined);
-      if (relay.exitCode === null) {
-        const exited = new Promise(resolve => relay.once("exit", resolve));
-        relay.kill("SIGTERM");
-        await exited;
-      }
-      await rm(root, { recursive: true, force: true });
+      await relay.close();
     }
   });

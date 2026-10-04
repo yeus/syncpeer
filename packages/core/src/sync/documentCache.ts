@@ -22,24 +22,30 @@ export function createDocumentCache(options: {
   }>;
   show: (id: string) => Promise<void>;
 }) {
-  const active = new Map<string, number>(), migrating = new Set<string>();
+  const active = new Map<string, number>(), migrating = new Map<string, Promise<void>>();
   type CacheStatus = { vault: { phase: string }; folders: FolderRegistration[] };
   const cacheStatus = () => options.request<CacheStatus>({ operation: "cacheRegistrations" });
   const registrations = async () => options.enabled() ? (await cacheStatus()).folders : [];
+  const waitForMigration = async (folderId: string) => {
+    while (migrating.has(folderId)) await migrating.get(folderId);
+  };
   const owner = async (folderId: string) => {
-    if (migrating.has(folderId)) throw new Error("This folder is being moved to encrypted document storage. Retry when migration finishes.");
-    if (!options.enabled()) return undefined;
-    const status = await cacheStatus();
-    // An uninitialized vault still needs to expose existing legacy files; lock never does.
-    if (status.vault.phase === "uninitialized") return undefined;
-    if (status.vault.phase !== "unlocked") {
-      throw new Error("Encrypted folder storage is locked. Unlock the vault before downloading.");
+    while (true) {
+      await waitForMigration(folderId);
+      if (!options.enabled()) return undefined;
+      const status = await cacheStatus();
+      if (migrating.has(folderId)) continue;
+      // An uninitialized vault still needs to expose existing legacy files; lock never does.
+      if (status.vault.phase === "uninitialized") return undefined;
+      if (status.vault.phase !== "unlocked") {
+        throw new Error("Encrypted folder storage is locked. Unlock the vault before downloading.");
+      }
+      return status.folders.find(folder => folder.id === folderId && folder.downloads);
     }
-    return status.folders.find(folder => folder.id === folderId && folder.downloads);
   };
   const documentId = (folder: FolderRegistration, path: string) => JSON.stringify([folder.storageId, path]);
-  const track = (folderId: string) => {
-    if (migrating.has(folderId)) throw new Error("Folder migration is in progress.");
+  const track = async (folderId: string) => {
+    while (migrating.has(folderId)) await migrating.get(folderId);
     active.set(folderId, (active.get(folderId) ?? 0) + 1);
     let released = false;
     return () => { if (!released) { released = true; active.set(folderId, active.get(folderId)! - 1); } };
@@ -194,7 +200,7 @@ export function createDocumentCache(options: {
   };
   const createFileDownloadSink: NonNullable<SyncpeerPlatformAdapter["createFileDownloadSink"]> = async args => {
     await folderQueue;
-    const release = track(args.folderId);
+    const release = await track(args.folderId);
     let destination: FileDownloadSink;
     try {
       const folder = await owner(args.folderId);
@@ -324,7 +330,7 @@ export function createDocumentCache(options: {
     },
     cacheFile: async (folderId, path, name, bytes, modifiedMs) => {
       await folderQueue;
-      const release = track(folderId);
+      const release = await track(folderId);
       try {
         if (!await owner(folderId)) {
           if (options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
@@ -377,8 +383,7 @@ export function createDocumentCache(options: {
   const connectFolder = async (folder: { id: string; label: string; password?: string }) => {
     if (!options.enabled()) throw new Error("Document storage is unavailable.");
     if (migrating.has(folder.id) || active.get(folder.id)) throw new Error("Wait for this folder’s transfers to finish before moving it.");
-    migrating.add(folder.id);
-    try {
+    const migration = Promise.resolve().then(async () => {
       let registered = (await registrations()).find(value => value.id === folder.id);
       await request({ operation: "register", ...folder });
       if (registered?.downloads) return;
@@ -421,18 +426,21 @@ export function createDocumentCache(options: {
         finally { await original.close(); }
       }
       await request({ operation: "attachDownloads", id: folder.id });
-    } finally { migrating.delete(folder.id); }
+    });
+    migrating.set(folder.id, migration);
+    try { await migration; }
+    finally { if (migrating.get(folder.id) === migration) migrating.delete(folder.id); }
   };
   const disconnectFolder = async (folderId: string) => {
     if (!options.enabled()) throw new Error("Document storage is unavailable.");
     if (migrating.has(folderId) || active.get(folderId)) throw new Error("Wait for this folder’s transfers to finish before moving it.");
     const registered = (await registrations()).find(value => value.id === folderId && value.downloads);
     if (!registered) throw new Error("Encrypted folder storage is not attached.");
-    if (!options.legacy.cacheFile || !options.legacy.listCachedFiles || !options.legacy.removeCachedFile) {
+    const cacheFile = options.legacy.cacheFile;
+    if (!cacheFile || !options.legacy.listCachedFiles || !options.legacy.removeCachedFile) {
       throw new Error("Plain local storage is unavailable; migration was not completed.");
     }
-    migrating.add(folderId);
-    try {
+    const migration = Promise.resolve().then(async () => {
       const encrypted = await request<CachedFileRecord[]>({ operation: "folderFiles", folderId });
       const staged: Array<{ file: CachedFileRecord; bytes: Uint8Array; hash: string }> = [];
       try {
@@ -441,7 +449,7 @@ export function createDocumentCache(options: {
           const bytes = await readSourceBytes(file.localPath.slice("syncpeer-document:".length));
           try {
             const hash = await digestReader({ size: bytes.length, readRange: async (offset, size) => bytes.slice(offset, offset + size) });
-            await options.legacy.cacheFile(folderId, file.path, file.name, bytes, file.modifiedMs ?? file.cachedAtMs);
+            await cacheFile(folderId, file.path, file.name, bytes, file.modifiedMs ?? file.cachedAtMs);
             staged.push({ file, bytes, hash });
           } finally { bytes.fill(0); }
         }
@@ -457,7 +465,10 @@ export function createDocumentCache(options: {
         }
         await request({ operation: "detachDownloads", id: folderId });
       } finally { staged.forEach(value => value.bytes.fill(0)); }
-    } finally { migrating.delete(folderId); }
+    });
+    migrating.set(folderId, migration);
+    try { await migration; }
+    finally { if (migrating.get(folderId) === migration) migrating.delete(folderId); }
   };
   let folderQueue = Promise.resolve();
   const observed = new Map<string, string>();

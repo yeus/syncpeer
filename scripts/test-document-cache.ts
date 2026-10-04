@@ -230,6 +230,44 @@ test("automatic folder discovery does not reattach a browse-only local copy", as
   assert.ok(!requests.includes("register") && !requests.includes("attachDownloads"));
 });
 
+test("opening a folder waits for encrypted attachment migration to finish", async () => {
+  let releaseAttach!: () => void;
+  let markAttachStarted!: () => void;
+  const attachStarted = new Promise<void>(resolve => { markAttachStarted = resolve; });
+  const attachReleased = new Promise<void>(resolve => { releaseAttach = resolve; });
+  let registered = false;
+  let attached = false;
+  let shown = false;
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      if (input.operation === "cacheRegistrations") return { vault: { phase: "unlocked" },
+        folders: registered ? [{ id: "photos", label: "Photos", storageId: "synthetic-storage",
+          downloads: attached }] : [] } as T;
+      if (input.operation === "register") { registered = true; return undefined as T; }
+      if (input.operation === "folderFiles") return [] as T;
+      if (input.operation === "attachDownloads") {
+        attached = true;
+        markAttachStarted();
+        await attachReleased;
+      }
+      return undefined as T;
+    },
+    legacy: {}, openLegacySource: async () => { throw new Error("No legacy files"); },
+    show: async id => { assert.equal(id, JSON.stringify(["synthetic-storage", "album"])); shown = true; },
+  });
+
+  const connecting = cache.connectFolder({ id: "photos", label: "Photos" });
+  await attachStarted;
+  const opening = cache.platformAdapter.openCachedDirectory!("photos", "album")
+    .then(() => null, error => error);
+  await Promise.resolve();
+  assert.equal(shown, false, "Opening waits for the owner migration to finish.");
+  releaseAttach();
+  await connecting;
+  assert.equal(await opening, null);
+  assert.equal(shown, true);
+});
+
 test("fresh-install startup uses default settings while keeping existing plaintext cache browsable", async t => {
   const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
   t.after(() => server.close());

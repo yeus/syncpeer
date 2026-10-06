@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:https";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { TLSSocket } from "node:tls";
 import { $, browser } from "@wdio/globals";
-import { createFreshEncryptedProfile } from "./profile-setup.js";
+import { computeDeviceId } from "../../packages/core/dist/core/transport/node.js";
 import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.js";
-import { clickButtonByText, readSessionEventNames, setDirectConnectionFields } from "./ui-helpers.js";
+import { createFreshEncryptedProfile } from "./profile-setup.js";
+import { startLocalRelay } from "./relay.js";
+import { generateSyncthingIdentity } from "./syncthing.js";
+import { clickButtonByText, readSessionEventNames, selectDiscoveryMode,
+  setDirectConnectionFields } from "./ui-helpers.js";
 
 const folderId = "syncpeer-crossapp-folder"; // synthetic disposable emulator fixture
 const password = "synthetic-crossapp-folder-password";
@@ -28,6 +35,55 @@ async function freePort(): Promise<number> {
   await new Promise<void>(resolve => server.close(() => resolve()));
   return address.port;
 }
+
+async function startRelayDiscovery(relayAddress: string, root: string) {
+  const identity = generateSyncthingIdentity(path.join(root, "discovery"));
+  const addresses = new Map<string, string[]>();
+  const server = createServer({
+    cert: await readFile(identity.certPath, "utf8"),
+    key: await readFile(identity.keyPath, "utf8"),
+    requestCert: true,
+    rejectUnauthorized: false,
+  }, async (request, response) => {
+    const url = new URL(request.url ?? "/", "https://synthetic.invalid");
+    if (url.pathname === "/endpoint") {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ relays: [{ url: relayAddress }] }));
+      return;
+    }
+    const certificate = (request.socket as TLSSocket).getPeerCertificate();
+    if (request.method === "POST") {
+      if (!certificate.raw) {
+        response.writeHead(403).end();
+        return;
+      }
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const deviceId = computeDeviceId(new X509Certificate(certificate.raw).raw).replaceAll("-", "");
+      const payload = JSON.parse(body) as { addresses?: string[] };
+      addresses.set(deviceId, payload.addresses ?? []);
+      response.writeHead(204, { "Reannounce-After": "1800" }).end();
+      return;
+    }
+    const deviceId = (url.searchParams.get("device") ?? "").replaceAll("-", "");
+    const found = addresses.get(deviceId);
+    response.setHeader("Content-Type", "application/json");
+    response.writeHead(found ? 200 : 404).end(JSON.stringify({ addresses: found ?? [] }));
+  });
+  await new Promise<void>((resolve, reject) =>
+    server.listen(0, "127.0.0.1", resolve).once("error", reject));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const base = `https://127.0.0.1:${address.port}`;
+  return {
+    port: address.port,
+    discoveryServer: `${base}/v2/?id=${identity.deviceId}`,
+    relayPoolUrl: `${base}/endpoint?id=${identity.deviceId}`,
+    announcements: () => Object.fromEntries([...addresses.entries()].map(([id, values]) => [id, [...values]])),
+    close: () => new Promise<void>(resolve => server.close(() => resolve())),
+  };
+}
+
 
 async function readDesktopDocumentContent(name: string): Promise<string | null> {
   return browser.execute(async ({ folderId, path }) => {
@@ -197,24 +253,29 @@ describe("Packaged desktop to Android pairing", () => {
     if (expected) assert.equal(await browser.execute(() => location.origin), expected,
       "The desktop test is not using the dedicated Syncpeer Vite dev server.");
   });
-  it("enrolls a fresh Android device in the desktop personal space", async () => {
+  it("enrolls a fresh Android device in the desktop personal space through a local relay", async () => {
     const serial = process.env.SYNCPEER_ANDROID_SERIAL;
     assert.ok(serial?.startsWith("emulator-"), "An explicit emulator serial is required.");
     assert.equal(execFileSync("adb", ["-s", serial, "shell", "getprop", "ro.kernel.qemu"],
       { encoding: "utf8" }).trim(), "1", "The selected Android target is not an emulator.");
-    await createFreshEncryptedProfile(browser);
-    await browser.execute(() => { window.confirm = () => true; });
-    await $("//label[contains(., 'LAN host/IP or relay:// URL')]/input")
-      .setValue("10.0.2.2");
-    const create = $("button=Create pairing invitation");
-    await create.waitForEnabled({ timeout: 30_000 });
-    await clickButtonByText(browser, "Create pairing invitation");
-    const invitationField = $("//label[contains(., 'Invitation')]/textarea[@readonly]");
-    await invitationField.waitForExist({ timeout: 30_000 });
-    const invitation = await invitationField.getValue();
-    assert.ok(invitation.includes("endpoint"));
+    const relay = await startLocalRelay();
+    const relayPort = Number(new URL(relay.relayAddress).port);
+    assert.ok(relayPort > 0);
     const root = await mkdtemp(path.join(tmpdir(), "syncpeer-crossapp-pairing-"));
     try {
+      execFileSync("adb", ["-s", serial, "reverse", `tcp:${relayPort}`, `tcp:${relayPort}`]);
+      await createFreshEncryptedProfile(browser);
+      await browser.execute(() => { window.confirm = () => true; });
+      await $("//label[contains(., 'LAN host/IP or relay:// URL')]/input")
+        .setValue(relay.relayAddress);
+      const create = $("button=Create pairing invitation");
+      await create.waitForEnabled({ timeout: 30_000 });
+      await clickButtonByText(browser, "Create pairing invitation");
+      const invitationField = $("//label[contains(., 'Invitation')]/textarea[@readonly]");
+      await invitationField.waitForExist({ timeout: 30_000 });
+      const invitation = await invitationField.getValue();
+      assert.ok(invitation.includes(relay.relayAddress),
+        "Packaged pairing invitation did not advertise the local relay.");
       const invitationPath = path.join(root, "invitation.json");
       await writeFile(invitationPath, invitation, { mode: 0o600 });
       execFileSync(process.execPath, ["scripts/test-android-e2e.mjs", "--pairing-join",
@@ -224,7 +285,14 @@ describe("Packaged desktop to Android pairing", () => {
       });
       await $("//*[contains(text(),'Device paired and approved.')]")
         .waitForExist({ timeout: 30_000 });
-    } finally { await rm(root, { recursive: true, force: true }); }
+    } finally {
+      try {
+        execFileSync("adb", ["-s", serial, "reverse", "--remove", `tcp:${relayPort}`],
+          { stdio: "ignore" });
+      } catch { /* Reverse cleanup is best-effort. */ }
+      await relay.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("syncs a whole favorite folder with Android's separate editor", async () => {
@@ -368,6 +436,172 @@ describe("Packaged desktop to Android pairing", () => {
           { stdio: "ignore" });
       } catch { /* Forward cleanup is best-effort. */ }
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("syncs the packaged desktop and Android app through a local relay", async () => {
+    const serial = process.env.SYNCPEER_ANDROID_SERIAL;
+    assert.ok(serial?.startsWith("emulator-"));
+    const relay = await startLocalRelay();
+    const discoveryRoot = await mkdtemp(path.join(tmpdir(), "syncpeer-relay-discovery-"));
+    const discovery = await startRelayDiscovery(relay.relayAddress, discoveryRoot);
+    const relayPort = Number(new URL(relay.relayAddress).port);
+    assert.ok(relayPort > 0);
+    try {
+      execFileSync("adb", ["-s", serial, "reverse", `tcp:${relayPort}`, `tcp:${relayPort}`]);
+      execFileSync("adb", ["-s", serial, "reverse", `tcp:${discovery.port}`,
+        `tcp:${discovery.port}`]);
+
+      if (!await $("[data-testid='tab-devices']").isExisting()) {
+        await clickButtonByText(browser, "Back");
+        await $("[data-testid='tab-devices']").waitForExist({ timeout: 30_000 });
+      }
+      await $("[data-testid='tab-devices']").click();
+      const ownerId = (await $("[data-testid='current-device-id']").getText()).trim();
+      assert.ok(ownerId);
+      const androidIdRoot = await mkdtemp(path.join(tmpdir(), "syncpeer-relay-android-id-"));
+      let androidId = "";
+      try {
+        const androidIdPath = path.join(androidIdRoot, "device-id");
+        android(serial, ["--write-device-id", androidIdPath]);
+        androidId = (await readFile(androidIdPath, "utf8")).trim();
+      } finally {
+        await rm(androidIdRoot, { recursive: true, force: true });
+      }
+      assert.ok(androidId);
+      android(serial, ["--prepare-whole-folder"], {
+        SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
+      });
+      android(serial, ["--write-document-folder"], {
+        SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
+        SYNCPEER_E2E_FOLDER_ID: folderId,
+        SYNCPEER_E2E_FOLDER_PASSWORD: password,
+        SYNCPEER_E2E_FILE_NAME: "relay-from-android.txt",
+        SYNCPEER_E2E_FILE_CONTENT: "relay-android",
+      });
+
+      await browser.execute(() => {
+        const settings = document.querySelector("[data-testid='connection-settings-toggle']");
+        if (!(settings instanceof HTMLButtonElement)) throw new Error("Connection settings are unavailable.");
+        if (settings.getAttribute("aria-expanded") !== "true") settings.click();
+        const expert = document.querySelector("[data-testid='expert-view']");
+        if (!(expert instanceof HTMLInputElement)) throw new Error("Expert connection controls are unavailable.");
+        if (!expert.checked) expert.click();
+        const details = document.querySelector("[data-testid='connection-status-toggle']");
+        if (!(details instanceof HTMLButtonElement)) throw new Error("Connection status details are unavailable.");
+        if (details.getAttribute("aria-expanded") !== "true") details.click();
+      });
+      const connectionControl = $("[data-testid='expert-connection-control']");
+      await connectionControl.waitForExist({ timeout: 5_000 });
+      if ((await connectionControl.getText()).includes("Pause automatic connection")) {
+        await connectionControl.click();
+        await browser.waitUntil(async () =>
+          !(await $("[data-testid='connection-status']").getText()).includes("Connected"),
+        { timeout: 30_000, interval: 250,
+          timeoutMsg: "Packaged desktop did not close the previous direct session before relay testing." });
+      }
+      const hookInstalled = await browser.execute((poolUrl: string) => {
+        const setter = (window as typeof window & {
+          __syncpeerSetRelayPoolUrl?: (url: string) => void;
+        }).__syncpeerSetRelayPoolUrl;
+        if (!setter) return false;
+        setter(poolUrl);
+        return true;
+      }, discovery.relayPoolUrl);
+      assert.equal(hookInstalled, true, "Packaged desktop relay-pool test hook is unavailable.");
+      await selectDiscoveryMode(browser, "global");
+      await browser.$("[data-testid='connection-discovery-server']").waitForExist({ timeout: 5_000 });
+      await browser.execute(({ remoteId, discoveryServer }) => {
+        for (const [testId, value] of [
+          ["connection-remote-id", remoteId],
+          ["connection-discovery-server", discoveryServer],
+        ]) {
+          const field = document.querySelector(`[data-testid='${testId}']`) as HTMLInputElement | null;
+          if (!field) throw new Error(`Connection field ${testId} is unavailable.`);
+          field.value = value;
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+          field.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        const relayFallback = document.querySelector(
+          "[data-testid='connection-relay-fallback']") as HTMLInputElement | null;
+        if (!relayFallback) throw new Error("Relay fallback control is unavailable.");
+        if (!relayFallback.checked) relayFallback.click();
+      }, { remoteId: androidId, discoveryServer: discovery.discoveryServer });
+      if ((await connectionControl.getText()).includes("Resume automatic connection")) {
+        await connectionControl.click();
+      }
+
+
+      const androidRelay = spawn(process.execPath,
+        ["scripts/test-android-e2e.mjs", "--connect-whole-folder"], {
+          cwd: process.cwd(), stdio: "inherit",
+          env: {
+            ...process.env,
+            ANDROID_SERIAL: serial,
+            SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
+            SYNCPEER_E2E_FOLDER_ID: folderId,
+            SYNCPEER_E2E_FOLDER_PASSWORD: password,
+            SYNCPEER_ANDROID_DISCOVERY_MODE: "global",
+            SYNCPEER_LAN_DISCOVERY_SERVER: discovery.discoveryServer,
+            SYNCPEER_LAN_RELAY_POOL_URL: discovery.relayPoolUrl,
+          },
+        });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          androidRelay.once("error", reject);
+          androidRelay.once("exit", code => code === 0
+            ? resolve()
+            : reject(new Error(`Android relay connection failed: ${code}`)));
+        });
+        try {
+          await browser.waitUntil(async () =>
+            (await $("[data-testid='connection-status']").getText()).includes("Connected"),
+          { timeout: 120_000, interval: 500,
+            timeoutMsg: "Packaged desktop did not connect to Android through the relay." });
+        } catch (cause) {
+          const status = await $("[data-testid='connection-status']").getText().catch(() => "unavailable");
+          const events = await readSessionEventNames(browser).catch(() => []);
+          throw new Error(`Packaged desktop relay connection failed: status=${status}; announcements=${JSON.stringify(discovery.announcements())}; events=${events.slice(0, 80).join(",") || "unavailable"}`,
+            { cause });
+        }
+        await browser.waitUntil(async () => (await browser.getPageSource()).includes("Path: relay"),
+          { timeout: 30_000, interval: 500,
+            timeoutMsg: "Packaged connection did not report relay transport." });
+
+        await attachSharedFolder();
+        console.log("Relay session delivered and attached the Android-created encrypted folder.");
+
+        await browser.execute(() => {
+          const tab = document.querySelector("[data-testid='tab-folders']");
+          if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+          tab.click();
+        });
+        await browser.waitUntil(async () => {
+          const root = $("[data-testid='folder-root-" + folderId + "']");
+          if (!await root.isExisting()) return false;
+          await browser.execute((id: string) => {
+            const row = document.querySelector(`[data-testid='folder-root-${id}']`);
+            if (row instanceof HTMLElement) row.click();
+          }, folderId);
+          return $("#folder-upload-input").isExisting();
+        }, { timeout: 90_000, interval: 1_000,
+          timeoutMsg: "Relay session did not reopen the attached folder root." });
+
+        await waitForDesktopFile("relay-from-android.txt", "relay-android");
+        console.log("Packaged relay session transferred an Android document into packaged desktop.");
+      } finally {
+        if (androidRelay.exitCode === null) androidRelay.kill("SIGTERM");
+      }
+    } finally {
+      for (const port of [relayPort, discovery.port]) {
+        try {
+          execFileSync("adb", ["-s", serial, "reverse", "--remove", `tcp:${port}`],
+            { stdio: "ignore" });
+        } catch { /* Reverse cleanup is best-effort. */ }
+      }
+      await discovery.close();
+      await relay.close();
+      await rm(discoveryRoot, { recursive: true, force: true });
     }
   });
 });

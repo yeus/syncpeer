@@ -93,6 +93,7 @@
       selectedFolder: boolean;
     };
     __syncpeerReadCachedDocument?: (folderId: string, path: string) => Promise<number[] | null>;
+    __syncpeerSetRelayPoolUrl?: (url: string) => void;
   };
   let app = $state(createInitialState());
   let systemPrefersDark = $state(false);
@@ -449,6 +450,9 @@
 
     if (import.meta.env.SYNCPEER_LAN_E2E === true) {
       const testWindow = window as SyncpeerTestWindow;
+      testWindow.__syncpeerSetRelayPoolUrl = (url: string) => {
+        app.connection.relayPoolUrl = url;
+      };
       testWindow.__syncpeerReadCachedDocument = async (folderId, path) => {
         const record = (await platformAdapter.listCachedFiles?.() ?? [])
           .find(file => file.folderId === folderId && file.path === path);
@@ -502,6 +506,7 @@
     return () => {
       if (import.meta.env.SYNCPEER_LAN_E2E === true) {
         const testWindow = window as SyncpeerTestWindow;
+        delete testWindow.__syncpeerSetRelayPoolUrl;
         delete testWindow.__syncpeerSetDownloadProgress;
         delete testWindow.__syncpeerClearDownloadProgress;
         delete testWindow.__syncpeerDigestCachedFile;

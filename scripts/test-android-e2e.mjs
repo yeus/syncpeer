@@ -31,6 +31,7 @@ const documentsProviderAuthority = process.env.SYNCPEER_ANDROID_DOCUMENTS_AUTHOR
   || `${packageName}.documents`;
 const serverDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim() || "";
 const discoveryServer = process.env.SYNCPEER_LAN_DISCOVERY_SERVER?.trim() || "";
+const relayPoolUrl = process.env.SYNCPEER_LAN_RELAY_POOL_URL?.trim() || "";
 // Global mode is relay-only in E2E builds; local TCP fixtures opt into automatic.
 const discoveryMode = process.env.SYNCPEER_ANDROID_DISCOVERY_MODE?.trim() || "global";
 if (!["automatic", "global", "direct"].includes(discoveryMode)) {
@@ -1395,6 +1396,15 @@ const openAndroidConnection = async (cdp) => {
       30_000,
     );
   }
+  if (relayPoolUrl) {
+    const configured = await cdp.evaluate(`(() => {
+      const setter = window.__syncpeerSetRelayPoolUrl;
+      if (typeof setter !== "function") return false;
+      setter(${JSON.stringify(relayPoolUrl)});
+      return true;
+    })()`);
+    if (!configured) throw new Error("Android E2E relay-pool override is unavailable.");
+  }
   await setUiValue(cdp, "connection-saved-device", "");
   await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
   await setUiValue(cdp, "connection-timeout", String(connectionTimeoutMs));
@@ -2201,6 +2211,12 @@ const documentCommand = async (cdp, request) => {
   }
 };
 
+const freshDocumentCommand = async (request) => {
+  const cdp = await connectCdp();
+  try { return await documentCommand(cdp, request); }
+  finally { cdp.close(); }
+};
+
 const waitForAndroidDeviceId = async (cdp) => {
   const deviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id", {}, 60_000);
   if (typeof deviceId !== "string" || !deviceId.trim()) {
@@ -2341,24 +2357,64 @@ const folderTestConfig = () => {
 
 const prepareWholeFolder = async () => {
   const { id, password, remoteDeviceId } = folderTestConfig();
+  const launcher = await launchAndroidApp(true);
+  launcher.close();
+  await freshDocumentCommand({ operation: "register", id, label: id, password });
+  await freshDocumentCommand({ operation: "attachDownloads", id });
+  const settings = await freshDocumentCommand({ operation: "profileSettings" });
+  await freshDocumentCommand({ operation: "saveProfileSettings", settings: {
+    ...settings,
+    folders: { ...settings.folders, [id]: {
+      ...settings.folders[id],
+      favorites: [{ key: `folder:${id}:`, folderId: id, path: "", name: id, kind: "folder" }],
+      exclusions: settings.folders[id]?.exclusions ?? [],
+      ignorePatterns: settings.folders[id]?.ignorePatterns ?? [],
+      paused: false,
+    } },
+  } });
+  await freshDocumentCommand({ operation: "saveConnectionPasswords",
+    passwords: { [`${remoteDeviceId}:${id}`]: password } });
+  const status = await freshDocumentCommand({ operation: "status" });
+  const verifiedSettings = await freshDocumentCommand({ operation: "profileSettings" });
+  const credentials = await freshDocumentCommand({ operation: "connectionPasswords" });
+  const registered = status.folders.find(folder => folder.id === id);
+  console.log("Android outgoing folder state:", JSON.stringify({
+    registered: Boolean(registered), downloads: registered?.downloads === true,
+    rootFavorite: verifiedSettings.folders[id]?.favorites?.some(item =>
+      item.kind === "folder" && item.path === "") === true,
+    peerCredential: Object.hasOwn(credentials, `${remoteDeviceId}:${id}`),
+  }));
+  console.log(`Android favorite whole-folder replica prepared: ${id}.`);
+};
+
+const runDocumentFolderWrite = async () => {
+  const { id } = folderTestConfig();
+  const name = process.env.SYNCPEER_E2E_FILE_NAME?.trim() || "direct.txt";
+  const content = process.env.SYNCPEER_E2E_FILE_CONTENT ?? "created-by-syncpeer";
   const cdp = await launchAndroidApp(true);
   try {
-    await documentCommand(cdp, { operation: "register", id, label: id, password });
-    await documentCommand(cdp, { operation: "attachDownloads", id });
-    await favoriteWholeFolder(cdp, id);
-    await documentCommand(cdp, { operation: "saveConnectionPasswords",
-      passwords: { [`${remoteDeviceId}:${id}`]: password } });
     const status = await documentCommand(cdp, { operation: "status" });
-    const settings = await documentCommand(cdp, { operation: "profileSettings" });
-    const credentials = await documentCommand(cdp, { operation: "connectionPasswords" });
-    const registered = status.folders.find(folder => folder.id === id);
-    console.log("Android outgoing folder state:", JSON.stringify({
-      registered: Boolean(registered), downloads: registered?.downloads === true,
-      rootFavorite: settings.folders[id]?.favorites?.some(item => item.kind === "folder" && item.path === "") === true,
-      peerCredential: Object.hasOwn(credentials, `${remoteDeviceId}:${id}`),
-    }));
-    console.log(`Android favorite whole-folder replica prepared: ${id}.`);
-  } finally { cdp.close(); }
+    const folder = status.folders.find(value => value.id === id && value.downloads);
+    if (!folder?.storageId) throw new Error(`Android document folder is not attached: ${id}`);
+    const rootId = JSON.stringify([folder.storageId, ""]);
+    let entry;
+    try {
+      entry = await documentCommand(cdp, { operation: "stat", id: JSON.stringify([folder.storageId, name]) });
+    } catch {
+      entry = await documentCommand(cdp, { operation: "create", id: rootId, name, directory: false });
+    }
+    const handle = await documentCommand(cdp, { operation: "open", id: entry.id, mode: "rwt" });
+    try {
+      await documentCommand(cdp, { operation: "write", handle, offset: 0,
+        bytes: Array.from(new TextEncoder().encode(content)) });
+      await documentCommand(cdp, { operation: "flush", handle });
+    } finally {
+      await documentCommand(cdp, { operation: "release", handle }).catch(() => undefined);
+    }
+    console.log(`Packaged Android document runtime wrote whole-folder file: ${name}.`);
+  } finally {
+    cdp.close();
+  }
 };
 
 const runWholeFolderEdit = async () => {
@@ -2595,6 +2651,10 @@ const main = async () => {
   }
   if (hasArgument("--verify-offline-editor")) {
     verifyOfflineEditorAfterColdStart();
+    return;
+  }
+  if (hasArgument("--write-document-folder")) {
+    await runDocumentFolderWrite();
     return;
   }
   if (hasArgument("--edit-whole-folder")) {

@@ -35,7 +35,6 @@ async function freePort(): Promise<number> {
   await new Promise<void>(resolve => server.close(() => resolve()));
   return address.port;
 }
-
 async function startRelayDiscovery(relayAddress: string, root: string) {
   const identity = generateSyncthingIdentity(path.join(root, "discovery"));
   const addresses = new Map<string, string[]>();
@@ -137,17 +136,36 @@ async function waitForDesktopFile(name: string, expected: string | null) {
     `Last observation: ${observation}`);
 }
 
-async function uploadDesktopFile(name: string, content: string) {
-  await browser.execute(({ name, content }) => {
-    const input = document.getElementById("folder-upload-input") as HTMLInputElement | null;
-    if (!input) throw new Error("The folder upload input is unavailable.");
-    const transfer = new DataTransfer();
-    transfer.items.add(new File([content], name));
-    input.files = transfer.files;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  }, { name, content });
-  await $(`//*[contains(@class,'hint') and normalize-space()=${JSON.stringify(`Uploaded ${name}.`)}]`)
-    .waitForExist({ timeout: 120_000 });
+
+async function createDesktopEncryptedFolder(label: string): Promise<string> {
+  await browser.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-folders']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+    tab.click();
+  });
+  await clickButtonByText(browser, "Folder settings · New folder");
+  await $("//label[contains(., 'New folder name')]/input").setValue(label);
+  const create = $("button=Create folder");
+  await create.waitForEnabled({ timeout: 30_000 });
+  await clickButtonByText(browser, "Create folder");
+  await browser.waitUntil(async () => browser.execute((expected: string) =>
+    [...document.querySelectorAll("li > span")].some(span => span.textContent?.trim() === expected), label),
+  { timeout: 60_000, interval: 500,
+    timeoutMsg: "Desktop-created encrypted folder did not appear in Folder settings." });
+  await clickButtonByText(browser, "Back");
+  await $("[data-testid='tab-folders']").click();
+  let folderId = "";
+  await browser.waitUntil(async () => {
+    folderId = await browser.execute((expected: string) => {
+      const row = [...document.querySelectorAll("[data-testid^='folder-root-']")]
+        .find(element => element.querySelector(".item-title")?.textContent?.trim() === expected);
+      const testId = row?.getAttribute("data-testid") ?? "";
+      return testId.startsWith("folder-root-") ? testId.slice("folder-root-".length) : "";
+    }, label);
+    return Boolean(folderId);
+  }, { timeout: 60_000, interval: 500,
+    timeoutMsg: "Desktop-created encrypted folder did not appear in the root view." });
+  return folderId;
 }
 
 async function attachSharedFolder() {
@@ -295,142 +313,74 @@ describe("Packaged desktop to Android pairing", () => {
     }
   });
 
-  it("syncs a whole favorite folder with Android's separate editor", async () => {
+  it("honors the Android listener port and propagates a desktop-created credential", async () => {
     const serial = process.env.SYNCPEER_ANDROID_SERIAL;
     assert.ok(serial?.startsWith("emulator-"));
     await clickButtonByText(browser, "Back");
     await $("[data-testid='tab-devices']").click();
     const ownerId = (await $("[data-testid='current-device-id']").getText()).trim();
     assert.ok(ownerId);
-    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-crossapp-folder-"));
+
+    const desktopFolderLabel = "desktop-originated-credential";
+    const desktopFolderId = await createDesktopEncryptedFolder(desktopFolderLabel);
+    await $("[data-testid='tab-devices']").click();
+
+    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-crossapp-listener-"));
     const forwardedPort = await freePort();
     const listenPort = await freePort();
+    const androidListenPort = 22999;
     try {
       const androidIdPath = path.join(root, "android-id");
       android(serial, ["--write-device-id", androidIdPath]);
       const androidId = (await readFile(androidIdPath, "utf8")).trim();
       assert.ok(androidId);
-      android(serial, ["--prepare-whole-folder"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId });
-      execFileSync("adb", ["-s", serial, "install", "-r",
-        "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk"],
-        { stdio: "inherit", timeout: 120_000 });
-      android(serial, ["--grant-whole-folder-editor"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId });
-      console.log("Cross-app editor grant completed; configuring direct connection.");
-      execFileSync("adb", ["-s", serial, "forward", `tcp:${forwardedPort}`, "tcp:22000"]);
+      execFileSync("adb", ["-s", serial, "forward", `tcp:${forwardedPort}`,
+        `tcp:${androidListenPort}`]);
       await browser.execute(() => { window.prompt = () => "synthetic-desktop-crossapp"; });
-      console.log("Cross-app opening desktop connection settings.");
-      await browser.execute(() => {
-        const tab = document.querySelector("[data-testid='tab-devices']");
-        if (!(tab instanceof HTMLButtonElement)) throw new Error("Device tab is unavailable.");
-        tab.click();
-      });
       await browser.execute(() => {
         const toggle = document.querySelector("[data-testid='connection-settings-toggle']");
         if (!(toggle instanceof HTMLButtonElement)) throw new Error("Connection settings are unavailable.");
         if (toggle.getAttribute("aria-expanded") !== "true") toggle.click();
       });
-      console.log("Cross-app setting desktop direct endpoint.");
       await setDirectConnectionFields(browser, { remoteId: androidId, host: "127.0.0.1",
         remotePort: forwardedPort, listenPort });
-      console.log("Cross-app desktop direct endpoint configured.");
+
       const androidConnection = spawn(process.execPath,
         ["scripts/test-android-e2e.mjs", "--connect-whole-folder"], {
           cwd: process.cwd(), stdio: "inherit", env: { ...process.env, ANDROID_SERIAL: serial,
-            SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId, SYNCPEER_E2E_FOLDER_ID: folderId,
-            SYNCPEER_E2E_FOLDER_PASSWORD: password, SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
-            SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2", SYNCPEER_ANDROID_DIRECT_PORT: String(listenPort) },
+            SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
+            SYNCPEER_E2E_FOLDER_ID: desktopFolderId,
+            SYNCPEER_E2E_FOLDER_PASSWORD: "",
+            SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
+            SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2",
+            SYNCPEER_ANDROID_DIRECT_PORT: String(listenPort),
+            SYNCPEER_ANDROID_LISTEN_PORT: String(androidListenPort) },
         });
-      try {
-        await new Promise<void>((resolve, reject) => {
-          androidConnection.once("error", reject);
-          androidConnection.once("exit", code => code === 0 ? resolve() : reject(new Error(`Android connection failed: ${code}`)));
-        });
-        console.log("Cross-app Android background session connected; checking desktop status.");
-        try {
-          await browser.waitUntil(async () =>
-            (await $("[data-testid='connection-status']").getText()).includes("Connected"),
-          { timeout: 120_000, timeoutMsg: "The packaged desktop did not connect to Android." });
-        } catch (cause) {
-          const state = await browser.execute(() => ({
-            status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "missing",
-            error: [...document.querySelectorAll("p.error, p[role='alert']")]
-              .map(element => element.textContent?.trim() ?? "")
-              .filter(Boolean)
-              .at(0) ?? "",
-          })).catch(() => ({ status: "unavailable", error: "" }));
-          const error = safeNativeFailureText(state.error)
-            ?.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[address]")
-            .replace(/:\d{2,5}\b/g, ":[port]")
-            .replaceAll(folderId, "[folder]") ?? "none";
-          const diagnostics = await browser.execute(() =>
-            [...document.querySelectorAll(".list li")].flatMap(row => {
-              const header = row.querySelector(".item-meta")?.textContent?.trim() ?? "";
-              const event = header.split(" | ").at(-1) ?? "";
-              if (!/session|incoming|connect|handshake|closed|failed|recovery|tauri\.invoke\.error/i.test(event)) return [];
-              const rawDetails = row.querySelector(".log-details")?.textContent ?? "";
-              try {
-                const details = JSON.parse(rawDetails) as { command?: unknown; message?: unknown; error?: unknown };
-                const command = typeof details.command === "string" ? details.command : "";
-                const messageEvents = ["core.incoming.failed", "core.background.prepare.failed",
-                  "core.incoming.prepare.failed", "core.incoming.refresh.failed", "core.session.refresh.failed",
-                  "core.socket.closed", "session.lifecycle_recovery.failed"];
-                const detail = details.message ?? details.error;
-                const message = messageEvents.includes(event) && typeof detail === "string" ? detail : "";
-                return [{ event, command, message }];
-              } catch { return [{ event, command: "", message: "" }]; }
-            }).slice(0, 40),
-          ).catch(() => readSessionEventNames(browser).catch(() => []));
-          const events = diagnostics.map(entry => {
-            if (typeof entry === "string") return entry;
-            const message = safeNativeFailureText(entry.message)
-              ?.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[address]")
-              .replace(/:\d{2,5}\b/g, ":[port]")
-              .replaceAll(folderId, "[folder]");
-            if (message) return `${entry.event}:${message}`;
-            return entry.command ? `${entry.event}:${entry.command}` : entry.event;
-          });
-          throw new Error(`Packaged desktop connection state: ${state.status}; error=${error}; ` +
-            `recent events=${events.join(",") || "unavailable"}`, { cause });
-        }
-        console.log("Cross-app desktop connected; checking shared folder credential.");
-        await attachSharedFolder();
-        console.log("Cross-app shared folder attached on desktop.");
-        await browser.execute(() => {
-          const tab = document.querySelector("[data-testid='tab-folders']");
-          if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
-          tab.click();
-        });
-        // Attaching the folder invalidates and reopens the live session, which can
-        // rebuild the root list under us. Re-click the root while the same bounded
-        // window elapses; opening the folder must still succeed.
-        const navigationDeadline = Date.now() + 90_000;
-        for (;;) {
-          const folderRoot = $(`[data-testid='folder-root-${folderId}']`);
-          if (await folderRoot.isExisting()) {
-            await browser.execute((id: string) => {
-              const row = document.querySelector(`[data-testid='folder-root-${id}']`);
-              if (row instanceof HTMLElement) row.click();
-            }, folderId);
-            try {
-              await $("#folder-upload-input").waitForExist({ timeout: 15_000 });
-              break;
-            } catch { /* Retry while the refresh finishes. */ }
-          } else {
-            await browser.pause(1_000);
-          }
-          if (Date.now() > navigationDeadline) {
-            throw new Error("Desktop could not open the attached folder root.");
-          }
-        }
-        android(serial, ["--edit-whole-folder"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
-          SYNCPEER_E2E_FILE_NAME: "from-android.txt", SYNCPEER_E2E_FILE_CONTENT: "android-one" });
-        await waitForDesktopFile("from-android.txt", "android-one");
-        await uploadDesktopFile("from-desktop.txt", "desktop-one");
-        android(serial, ["--verify-whole-folder"], { SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
-          SYNCPEER_E2E_FILE_NAME: "from-desktop.txt", SYNCPEER_E2E_FILE_CONTENT: "desktop-one" });
-      } finally { if (androidConnection.exitCode === null) androidConnection.kill("SIGTERM"); }
+      await new Promise<void>((resolve, reject) => {
+        androidConnection.once("error", reject);
+        androidConnection.once("exit", code => code === 0
+          ? resolve()
+          : reject(new Error(`Android connection failed: ${code}`)));
+      });
+
+      const listeners = execFileSync("adb", ["-s", serial, "shell", "ss", "-ltn"], {
+        encoding: "utf8", timeout: 30_000,
+      });
+      assert.match(listeners, new RegExp(`:${androidListenPort}\\b`),
+        "Packaged Android did not listen on its configured non-default incoming port.");
+      console.log(`Packaged Android listener honored configured port ${androidListenPort}.`);
+
+      android(serial, ["--verify-received-folder"], {
+        SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
+        SYNCPEER_E2E_FOLDER_ID: desktopFolderId,
+        SYNCPEER_E2E_FOLDER_TITLE: desktopFolderLabel,
+        SYNCPEER_E2E_FOLDER_PASSWORD: "",
+        SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
+        SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2",
+        SYNCPEER_ANDROID_DIRECT_PORT: String(listenPort),
+        SYNCPEER_ANDROID_LISTEN_PORT: String(androidListenPort),
+      });
     } finally {
-      // The emulator may already be gone; never mask the real failure here.
       try {
         execFileSync("adb", ["-s", serial, "forward", "--remove", `tcp:${forwardedPort}`],
           { stdio: "ignore" });
@@ -438,6 +388,7 @@ describe("Packaged desktop to Android pairing", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
 
   it("syncs the packaged desktop and Android app through a local relay", async () => {
     const serial = process.env.SYNCPEER_ANDROID_SERIAL;

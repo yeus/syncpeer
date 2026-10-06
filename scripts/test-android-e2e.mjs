@@ -39,6 +39,7 @@ if (!["automatic", "global", "direct"].includes(discoveryMode)) {
 }
 const directHost = process.env.SYNCPEER_ANDROID_DIRECT_HOST?.trim() || "10.0.2.2";
 const directPort = process.env.SYNCPEER_ANDROID_DIRECT_PORT?.trim() || "22000";
+const androidListenPort = process.env.SYNCPEER_ANDROID_LISTEN_PORT?.trim() || "22000";
 const connectionTimeoutMs = Number(process.env.SYNCPEER_LAN_TIMEOUT_MS || 120_000);
 const downloadTimeoutMs = Number(process.env.SYNCPEER_ANDROID_DOWNLOAD_TIMEOUT_MS || 240_000);
 const targetFolderId = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-lan";
@@ -1202,7 +1203,6 @@ const launchAndroidApp = async (forceStop = false) => {
   await assertForeground();
   return connectCdp();
 };
-
 const runLegacyAndroidSmoke = async () => {
   if (androidSdkVersion() >= 26) throw new Error("Legacy smoke requires Android API below 26.");
   runAdb(["shell", "am", "force-stop", packageName]);
@@ -1408,6 +1408,7 @@ const openAndroidConnection = async (cdp) => {
   await setUiValue(cdp, "connection-saved-device", "");
   await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
   await setUiValue(cdp, "connection-timeout", String(connectionTimeoutMs));
+  await setUiValue(cdp, "connection-listen-port", androidListenPort);
   if (discoveryMode === "direct") {
     await setUiValue(cdp, "connection-host", directHost);
     await setUiValue(cdp, "connection-port", directPort);
@@ -2178,6 +2179,24 @@ const runPairingJoin = async (inputPath) => {
   if (!invitation) throw new Error("Pairing invitation file is empty.");
   const cdp = await launchAndroidApp(true);
   try {
+    const requestedDirection = process.env.SYNCPEER_PAIRING_JOIN_DIRECTION?.trim();
+    if (requestedDirection) {
+      if (!["incoming", "outgoing"].includes(requestedDirection)) {
+        throw new Error("SYNCPEER_PAIRING_JOIN_DIRECTION must be incoming or outgoing.");
+      }
+      const remoteDeviceId = JSON.parse(invitation).deviceId;
+      const canonical = value => String(value).replace(/[^A-Z2-7]/gi, "").toUpperCase();
+      const direction = localDeviceId => canonical(localDeviceId).localeCompare(canonical(remoteDeviceId)) < 0
+        ? "outgoing" : "incoming";
+      let localDeviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+      for (let attempt = 0; direction(localDeviceId) !== requestedDirection && attempt < 32; attempt += 1) {
+        localDeviceId = await tauriInvoke(cdp, "syncpeer_regenerate_default_cli_identity");
+      }
+      if (direction(localDeviceId) !== requestedDirection) {
+        throw new Error(`Could not generate an Android identity with preferred ${requestedDirection} direction.`);
+      }
+      console.log(`Android pairing identity selected preferred ${requestedDirection} direction.`);
+    }
     await openFolderSettings(cdp);
     await cdp.evaluate("window.confirm = () => true");
     const heading = "Join an existing personal space";
@@ -2215,6 +2234,16 @@ const freshDocumentCommand = async (request) => {
   const cdp = await connectCdp();
   try { return await documentCommand(cdp, request); }
   finally { cdp.close(); }
+};
+
+const expectDocumentCommandFailure = async (cdp, request, label) => {
+  try {
+    await documentCommand(cdp, request);
+  } catch (error) {
+    if (/CDP|WebView debug|WebView CDP/i.test(String(error))) throw error;
+    return;
+  }
+  throw new Error(`Android recovery unexpectedly accepted ${label}.`);
 };
 
 const waitForAndroidDeviceId = async (cdp) => {
@@ -2345,7 +2374,6 @@ const favoriteWholeFolder = async (cdp, id) => {
     } },
   } });
 };
-
 const folderTestConfig = () => {
   const id = process.env.SYNCPEER_E2E_FOLDER_ID?.trim() || "syncpeer-direct-folder";
   const password = process.env.SYNCPEER_E2E_FOLDER_PASSWORD?.trim() ||
@@ -2353,6 +2381,44 @@ const folderTestConfig = () => {
   const remoteDeviceId = process.env.SYNCPEER_DEV_SERVER_DEVICE_ID?.trim();
   if (!remoteDeviceId) throw new Error("SYNCPEER_DEV_SERVER_DEVICE_ID is required.");
   return { id, password, remoteDeviceId };
+};
+
+const verifyReceivedFolderCredential = async () => {
+  const { id } = folderTestConfig();
+  const label = process.env.SYNCPEER_E2E_FOLDER_TITLE?.trim() || id;
+  const launcher = await launchAndroidApp(true);
+  launcher.close();
+  const deadline = Date.now() + 120_000;
+  let attached = false;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    try {
+      await freshDocumentCommand({ operation: "attachDownloads", id });
+      attached = true;
+      break;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (lastError !== "Folder is not registered.") throw error;
+      await wait(500);
+    }
+  }
+  if (!attached) {
+    const shared = await freshDocumentCommand({ operation: "sharedPersonalSpaceSettings" }).catch(() => null);
+    throw new Error(`Desktop-originated encrypted folder credential did not auto-register on Android: ${JSON.stringify({
+      sharedFolderIds: Object.keys(shared?.settings?.folders ?? {}), lastError,
+    })}`);
+  }
+  const wrongPasswordCdp = await connectCdp();
+  try {
+    await expectDocumentCommandFailure(wrongPasswordCdp, { operation: "register", id, label,
+      password: "synthetic-wrong-desktop-folder-password" }, "wrong desktop-originated folder password");
+  } finally { wrongPasswordCdp.close(); }
+  const attachedFolder = (await freshDocumentCommand({ operation: "status" })).folders
+    .find(folder => folder.id === id);
+  if (!attachedFolder?.downloads) {
+    throw new Error("Android could not attach the desktop-originated encrypted folder with its shared credential.");
+  }
+  console.log("Desktop-originated encrypted folder credential auto-registered on packaged Android and attached successfully.");
 };
 
 const prepareWholeFolder = async () => {
@@ -2637,6 +2703,10 @@ const main = async () => {
   if (hasArgument("--pairing-join")) {
     if (!pairingInvitationPath) throw new Error("--pairing-invitation is required.");
     await runPairingJoin(pairingInvitationPath);
+    return;
+  }
+  if (hasArgument("--verify-received-folder")) {
+    await verifyReceivedFolderCredential();
     return;
   }
   if (hasArgument("--prepare-whole-folder")) {

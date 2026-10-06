@@ -132,8 +132,9 @@ class DocumentRuntimeService : Service() {
         return JSON.stringify({result: result === undefined ? null : result});
       """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8)).thenApply { value ->
         val reply = JSONObject(value)
-        val state = reply.optJSONObject("result")?.optJSONObject("vault")
-        if (state != null) vaultSummary = when (state.getString("phase")) {
+        val phase = reply.optJSONObject("result")?.optJSONObject("vault")
+          ?.optString("phase")?.takeIf { it.isNotBlank() }
+        if (phase != null) vaultSummary = when (phase) {
           "unlocked" -> "Downloaded files available offline."
           "locked" -> "Open Syncpeer to unlock folder storage."
           else -> "Preparing folder storage."

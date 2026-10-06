@@ -70,6 +70,56 @@ explicit device-scoped map for core. Switching source devices while a folder is
 open must invalidate or reload the current directory with the new password
 context.
 
+
+## Personal Space And Trust Boundaries
+
+Owned-device trust is a separate layer from ordinary Syncthing peer approval.
+
+The personal-space implementation belongs in core and must preserve these
+properties across desktop and Android shells:
+
+- pairing uses explicit short-lived invitations and matching confirmation codes,
+- membership changes are signed and hash-chained,
+- stable owned-device slots can rotate transport certificates without silently
+  creating a new trusted device,
+- revoked devices are excluded from future personal-space share targets,
+- the hidden settings replica is never advertised as an ordinary external
+  folder,
+- approved encrypted-folder credentials propagate only through authenticated
+  personal-space changes,
+- conflicting local credentials fail closed rather than being overwritten.
+
+The personal-space backup and offline recovery kit deliberately serve different
+roles. The backup must not contain the private recovery signing key or ordinary
+device identity keys.
+
+## Storage And Encryption Boundaries
+
+Do not describe all Syncpeer storage as having one encryption model.
+
+- App-owned private state and Syncpeer-managed encrypted replicas follow the
+  private vault/encrypted-replica policy.
+- Remembered unlock material belongs in OS-protected secret storage.
+- Android replica roots live in app-owned no-backup storage and are exposed to
+  system editors through controlled document-provider boundaries.
+- A normal user-selected Syncthing folder remains a normal plaintext filesystem
+  folder unless the user explicitly uses an encrypted Syncpeer-managed replica.
+- Unknown or unsupported private-storage formats fail closed and require an
+  explicit reset; never infer that deleting data is safe.
+
+## Connectivity Model
+
+Connectivity policy belongs in core; native shells only provide the socket,
+discovery, and relay adapters.
+
+A normal connection may combine direct configured addresses, LAN discovery,
+official Syncthing global discovery, direct TCP, and standard Syncthing relay
+fallback. Relay-only operation must remain possible when direct connectivity is
+unavailable.
+
+Public discovery and relay infrastructure is external infrastructure. Tests that
+contact it must be explicitly opted into; normal synthetic/local suites must not
+contact public services accidentally.
 ## Testing Priorities
 
 Test core behavior before shell behavior.
@@ -169,24 +219,48 @@ The resulting bundle is copied to `dist/Syncpeer_<version>_<arch>.flatpak`.
 
 GitHub Actions builds and publishes AppImage, Flatpak, and the signed Android
 APK only when a version tag is pushed. The tag must exactly match the Tauri
-version. Prepare a release from a clean working tree with:
+version.
+
+Release preparation must start from a clean committed tree. The preferred
+sequence is:
 
 ```bash
-npm run release
+node scripts/release.mjs --check
+node scripts/release.mjs 0.6.0-rc.1 --dry-run
+node scripts/release.mjs 0.6.0-rc.1
 ```
 
-The command displays the current version and latest local version-like tag, asks
-for the new semantic version, updates and stages the project metadata and
-lockfiles, creates the release commit, and creates the matching annotated tag
-locally. It does not push automatically and unrelated files are not staged.
-At the end it prints one command that pushes the release commit and tag.
+The first command verifies that npm, Tauri, Cargo manifests and lockfiles all
+agree on the current version. The dry run validates the requested semantic
+version and tag availability without modifying the tree.
+
+The real release command asks for explicit confirmation, updates all release
+metadata and lockfiles, verifies consistency again, stages only release
+metadata, creates the release commit, and creates the matching annotated tag.
+It does **not** push automatically. At the end it prints the exact branch/tag
+push command.
+
+`npm run release` invokes the same script interactively when no version is
+provided.
 
 Older bare tags such as `0.3` are historical development tags; they do not
 trigger the release workflow, which listens for tags beginning with `v`.
 
-Tags with a pre-release suffix, such as `v0.4.0-rc.1`, are published as GitHub
-pre-releases. Android release signing uses the configured GitHub Actions
+Tags with a pre-release suffix, such as `v0.6.0-rc.1`, are published as
+GitHub pre-releases. Android release signing uses the configured GitHub Actions
 secrets; the keystore must remain the same across releases.
+
+### Release-candidate boundary
+
+An RC is cut only after every feasible automated acceptance gate for the
+intended scope is green: focused tests, umbrella suites, emulator coverage,
+packaged acceptance and explicitly opted-in external infrastructure checks.
+
+The RC phase is for evidence that materially requires the real world: physical
+devices, ordinary user workflows, real NAT/firewall combinations, installation
+and upgrade behavior, true lifecycle/power-loss conditions, interoperability
+and usability. Problems found during RC validation should receive an automated
+regression where practical before the stable release.
 
 To synchronize Android signing secrets from the host's Linux Secret Service to
 GitHub Actions:
@@ -244,15 +318,17 @@ Run the complete Android validation workflow with one command:
 npm run test:android
 ```
 
-It builds the x86_64 APK once, runs the focused modern transfer-service smoke
-test on Android 14+ (API 36), copies that image's Google-signed WebView pair to
-the API-29 emulator, then runs the Android 10 compatibility suite. The command
-starts and stops both emulators and cleans them up if a phase fails. Optional
-WebView capabilities that are absent from the image are reported as unsupported
-by the app and tested as such; the combined runner does not depend on a separate
-remote development server. No Play Store account or manual update is needed.
-Use these lower-level commands when debugging one profile manually:
+It builds the Android E2E APK and runs the repository's compatibility matrix:
+API 24 installation/startup coverage, API 29 compatibility/provider and
+lifecycle checks, and API 36 service/transfer coverage. The workflow also
+exercises the real-peer Android gates used for encrypted replicas and abrupt
+runtime/process recovery where supported. It starts and stops repository-managed
+emulators and cleans them up if a phase fails.
 
+Optional WebView capabilities that are absent from an image are reported as
+unsupported by the app and tested as such; the combined runner does not depend
+on a separate remote development server. No Play Store account or manual update
+is needed. Use these lower-level commands when debugging one profile manually:
 ```bash
 npm run android:emulator:compat
 npm run test:android:compat
@@ -294,6 +370,68 @@ SYNCPEER_DIAGNOSTICS_KEEP=1 \
   npm run test:headless
 ```
 
+
+### Packaged release acceptance
+
+The packaged Linux/Android acceptance harness runs against a built `.deb` and,
+when an Android emulator is supplied, the packaged Android APK:
+
+```bash
+npm run test:tauri:deb -- path/to/Syncpeer_<version>_amd64.deb
+```
+
+The desktop gate covers fresh protected-profile startup, isolated identities,
+owned-device pairing with matching confirmation codes, and bidirectional
+whole-folder synchronization.
+
+With `SYNCPEER_ANDROID_SERIAL` configured, the same runner also exercises
+packaged Android recovery and desktop-to-Android cross-app behavior. The
+`--cross-app-only` option runs only the Android recovery/cross-app phase.
+
+### Live public-network acceptance
+
+Public Syncthing discovery and relay infrastructure is deliberately excluded
+from default local tests. Run the opt-in acceptance check explicitly:
+
+```bash
+SYNCPEER_RUN_EXTERNAL_CHECKS=1 npm run test:public-network
+```
+
+This test creates ephemeral identities, disables local discovery candidates,
+uses official Syncthing global discovery and the live relay pool, requires a
+relay-only session, and verifies bidirectional encrypted convergence. It must
+never reuse real user/device identities from logs.
+
+
+### Generated screenshots
+
+Syncpeer uses the packaged Tauri acceptance flow to generate representative
+README/release screenshots:
+
+```bash
+npm run screenshots
+```
+
+The command rebuilds the repository's LAN-E2E `.deb`, runs the real packaged
+desktop pairing/synchronization acceptance flow, and captures three stable
+states:
+
+- signed personal-space membership,
+- encrypted-folder creation,
+- converged bidirectional folder contents.
+
+Generated PNGs live under `.screenshots/`. That directory is gitignored and
+must never be committed.
+
+`.github/workflows/screenshots.yml` runs the same command for pushes, pull
+requests and manual CI runs, then uploads `screenshot-previews` as a
+seven-day GitHub Actions artifact. These preview artifacts are intentionally
+temporary.
+
+Tagged releases run the screenshot capture again and publish the PNGs as GitHub
+Release assets. Release assets are the durable copy: they remain available
+until the corresponding GitHub Release is deleted. The README embeds those
+release assets rather than repository files or temporary Actions artifacts.
 The two suites are the supported test entry points. The long-running server
 and client commands below are operational harness controls, not additional
 test suites.
@@ -370,68 +508,6 @@ under `.tmp/syncpeer-dev-client/` and prints its own persistent device ID while
 attempting a normal Syncthing connection. The server terminal then shows the
 pending ID. Compare it with the client output and enter `y` to approve it as a
 trusted fixture client. Enter `u` only for a receive-encrypted test identity.
-
-### Packaged release acceptance
-
-The packaged Linux/Android acceptance harness runs against a built `.deb` and,
-when an Android emulator is supplied, the packaged Android APK:
-
-```bash
-npm run test:tauri:deb -- path/to/Syncpeer_<version>_amd64.deb
-```
-
-The desktop gate covers fresh protected-profile startup, isolated identities,
-owned-device pairing with matching confirmation codes, and bidirectional
-whole-folder synchronization.
-
-With `SYNCPEER_ANDROID_SERIAL` configured, the same runner also exercises
-packaged Android recovery and desktop-to-Android cross-app behavior. The
-`--cross-app-only` option runs only the Android recovery/cross-app phase.
-
-### Live public-network acceptance
-
-Public Syncthing discovery and relay infrastructure is deliberately excluded
-from default local tests. Run the opt-in acceptance check explicitly:
-
-```bash
-SYNCPEER_RUN_EXTERNAL_CHECKS=1 npm run test:public-network
-```
-
-This test creates ephemeral identities, disables local discovery candidates,
-uses official Syncthing global discovery and the live relay pool, requires a
-relay-only session, and verifies bidirectional encrypted convergence. It must
-never reuse real user/device identities from logs.
-
-
-### Generated screenshots
-
-Syncpeer uses the packaged Tauri acceptance flow to generate representative
-README/release screenshots:
-
-```bash
-npm run screenshots
-```
-
-The command rebuilds the repository's LAN-E2E `.deb`, runs the real packaged
-desktop pairing/synchronization acceptance flow, and captures three stable
-states:
-
-- signed personal-space membership,
-- encrypted-folder creation,
-- converged bidirectional folder contents.
-
-Generated PNGs live under `.screenshots/`. That directory is gitignored and
-must never be committed.
-
-`.github/workflows/screenshots.yml` runs the same command for pushes, pull
-requests and manual CI runs, then uploads `screenshot-previews` as a
-seven-day GitHub Actions artifact. These preview artifacts are intentionally
-temporary.
-
-Tagged releases run the screenshot capture again and publish the PNGs as GitHub
-Release assets. Release assets are the durable copy: they remain available
-until the corresponding GitHub Release is deleted. The README embeds those
-release assets rather than repository files or temporary Actions artifacts.
 Unknown devices are never accepted automatically.
 
 After approval, the client reconnects, browses the fixture, downloads and

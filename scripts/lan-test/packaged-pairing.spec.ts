@@ -335,29 +335,35 @@ describe("Two isolated packaged desktop apps", () => {
     await joiner.$("//label[contains(., 'Pairing invitation')]/textarea").setValue(invitation);
     await joiner.$("//label[contains(., 'New local master password')]/input")
       .setValue("synthetic-joining-master-password");
+    const confirmationPeers = [
+      { peer: owner, label: "owner" },
+      { peer: joiner, label: "joiner" },
+    ];
+    await Promise.all(confirmationPeers.map(({ peer }) => peer.execute(() => {
+      const observed = window as typeof window & { __syntheticPairingConfirmations?: string[] };
+      observed.__syntheticPairingConfirmations = [];
+      window.confirm = (message?: string) => {
+        observed.__syntheticPairingConfirmations?.push(String(message ?? ""));
+        return true;
+      };
+    })));
     await clickButtonByText(joiner, "Join personal space");
-    const codes = await Promise.all([owner, joiner].map(async (peer, index) => {
-      try {
-        await peer.waitUntil(async () => Boolean(await peer.getAlertText().catch(() => "")),
-          { timeout: 30_000, timeoutMsg: "Pairing confirmation was not displayed." });
-      } catch (cause) {
-        const state = await peer.execute(() => ({
-          alerts: [...document.querySelectorAll("p[role='alert'], p.error")]
-            .map(element => element.textContent?.trim()).filter(Boolean).slice(-3),
-          joinButtonPresent: [...document.querySelectorAll("button")]
-            .some(element => element.textContent?.trim() === "Join personal space"),
-          invitationPresent: Boolean(document.querySelector("textarea[readonly]")),
-        })).catch(() => ({ diagnosticsUnavailable: true }));
-        throw new Error(`Pairing confirmation missing on ${index === 0 ? "owner" : "joiner"}: ` +
-          JSON.stringify(state), { cause });
-      }
-      const message = await peer.getAlertText();
-      const code = message.match(/\b\d{6}\b/)?.[0];
-      assert.ok(code, "Pairing confirmation must include a six-digit code.");
-      return code;
-    }));
-    assert.equal(codes[0], codes[1]);
-    await Promise.all([owner.acceptAlert(), joiner.acceptAlert()]);
+    const codes = new Map<string, string>();
+    for (const { peer, label } of confirmationPeers) {
+      await peer.waitUntil(async () => {
+        const messages = await peer.execute(() =>
+          (window as typeof window & { __syntheticPairingConfirmations?: string[] })
+            .__syntheticPairingConfirmations ?? []);
+        return messages.some(message => /\b\d{6}\b/.test(message));
+      }, { timeout: 30_000, timeoutMsg: `Pairing confirmation callback was not invoked on ${label}.` });
+      const messages = await peer.execute(() =>
+        (window as typeof window & { __syntheticPairingConfirmations?: string[] })
+          .__syntheticPairingConfirmations ?? []);
+      const code = messages.map(message => message.match(/\b\d{6}\b/)?.[0]).find(Boolean);
+      assert.ok(code, `Pairing confirmation on ${label} must include a six-digit code.`);
+      codes.set(label, code);
+    }
+    assert.equal(codes.get("owner"), codes.get("joiner"));
     await owner.$("//*[contains(text(),'Device paired and approved.')]")
       .waitForExist({ timeout: 120_000 });
     await joiner.$("//*[contains(text(),'Personal space joined and device approved.')]")
@@ -501,14 +507,28 @@ describe("Two isolated packaged desktop apps", () => {
       assert.ok(selections.includes(1),
         `The packaged peer did not select its encrypted settings replica: ${JSON.stringify(selections)}.`);
     }
+    await joiner.waitUntil(async () => {
+      const states = await joiner.execute(() => (window as typeof window & {
+        __syntheticReplicaStates?: string[] }).__syntheticReplicaStates ?? []);
+      return states.some(value => {
+        const state = JSON.parse(value) as { event?: string; internal?: boolean; changed?: boolean };
+        return state.event === "core.replica.index.receive.done" && state.internal === true && state.changed === true;
+      });
+    }, { timeout: 20_000,
+      timeoutMsg: "The packaged personal-space settings replica did not finish receiving within the BEP request budget." });
     try { await attachAndFavoriteSharedFolder(joiner); }
     catch (error) {
       const ownerEvents = await owner.execute(() => {
         const observed = window as typeof window & {
-          __syntheticEvents?: string[]; __syntheticFailures?: string[]; __syntheticIndexes?: string[] };
-        return { __syntheticEvents: observed.__syntheticEvents,
+          __syntheticEvents?: string[];
+          __syntheticFailures?: string[];
+          __syntheticIndexes?: string[];
+        };
+        return {
+          __syntheticEvents: observed.__syntheticEvents,
           __syntheticFailures: observed.__syntheticFailures,
-          __syntheticIndexes: observed.__syntheticIndexes };
+          __syntheticIndexes: observed.__syntheticIndexes,
+        };
       });
       throw new Error(`${String(error)}; owner events: ${ownerEvents.__syntheticEvents?.join(",")}; ` +
         `upload failures: ${ownerEvents.__syntheticFailures?.join(",")}; ` +

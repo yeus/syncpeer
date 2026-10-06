@@ -23,3 +23,9 @@ takes priority over satisfying a lint rule by adding manual declarations.
   source, and notes synchronized with the resulting behavior.
 - Do not mark a requirement implemented or verified beyond the available
   evidence. Record partial coverage and remaining limitations explicitly.
+
+## Release candidates
+
+- Follow the release-candidate policy in `development_instructions.md`.
+- In particular, do not prepare or publish an RC while a feasible automated/local acceptance gate for that release is still failing or unverified.
+- Treat the RC period as the phase for physical-device and real-world validation before the stable release.

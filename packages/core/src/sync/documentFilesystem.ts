@@ -93,6 +93,7 @@ interface DocumentRuntime {
   settingsFolder?: { id: string; replica: LocalFolderReplica; close: () => Promise<void> };
   settingsRevision: number;
   refreshedSettingsRevision: number;
+  settingsRefreshQueued: boolean;
   vault: Vault;
   registry: FolderRegistry | undefined;
   nextHandle: number;
@@ -226,7 +227,10 @@ const openPersonalSpaceFolder = async (runtime: DocumentRuntime): Promise<void> 
     });
     const replica = createReplicaController(createFolderReplica(
       encrypted, runtime.options.deviceCounterId, sha256), {
-      onCommittedChange: () => { runtime.settingsRevision++; },
+      onCommittedChange: source => {
+        runtime.settingsRevision++;
+        if (source === "received") queueSharedSettingsRefresh(runtime);
+      },
     });
     await replica.scan();
     runtime.settingsFolder = { id: descriptor.id, replica, close: async () => {
@@ -1092,15 +1096,7 @@ const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
 const createLifecycleActions = (runtime: DocumentRuntime) => ({
   initialize: () => runQueued(runtime, () => initializeFilesystem(runtime)),
   status: () => runQueued(runtime, async () => {
-    if (runtime.vault.status().phase === "unlocked" && runtime.settingsFolder &&
-      runtime.settingsRevision !== runtime.refreshedSettingsRevision &&
-      await runtime.vault.spaceDeviceMembership()) {
-      const revision = runtime.settingsRevision;
-      try { runtime.options.onDiagnostic?.("document.settings_refresh.started"); }
-      catch { /* Diagnostics must not interrupt storage. */ }
-      await syncSharedFolderCredentials(runtime, await sharedSettingsContext(runtime));
-      runtime.refreshedSettingsRevision = revision;
-    }
+    await refreshSharedFolderCredentialsIfChanged(runtime);
     return documentStatus(runtime);
   }, "status"),
   close: () => closeFilesystem(runtime),
@@ -1131,6 +1127,40 @@ const syncSharedFolderCredentials = async (runtime: DocumentRuntime,
     if (existing !== null && runtime.registry?.getState().some(value => value.id === id)) continue;
     await registerFolderAction(runtime, { id, ...folder.credential }, false);
   }
+};
+
+const refreshSharedFolderCredentialsIfChanged = async (runtime: DocumentRuntime) => {
+  if (runtime.closed || runtime.vault.status().phase !== "unlocked" || !runtime.settingsFolder ||
+    runtime.settingsRevision === runtime.refreshedSettingsRevision) return false;
+  const revision = runtime.settingsRevision;
+  if (!await runtime.vault.spaceDeviceMembership()) return false;
+  try { runtime.options.onDiagnostic?.("document.settings_refresh.started"); }
+  catch { /* Diagnostics must not interrupt storage. */ }
+  await syncSharedFolderCredentials(runtime, await sharedSettingsContext(runtime));
+  runtime.refreshedSettingsRevision = revision;
+  return true;
+};
+
+const queueSharedSettingsRefresh = (runtime: DocumentRuntime) => {
+  if (runtime.settingsRefreshQueued || runtime.closed) return;
+  runtime.settingsRefreshQueued = true;
+  queueMicrotask(() => {
+    if (runtime.closed || runtime.vault.status().phase !== "unlocked") {
+      runtime.settingsRefreshQueued = false;
+      return;
+    }
+    void runQueued(runtime, () => refreshSharedFolderCredentialsIfChanged(runtime), "settingsRefresh").then(refreshed => {
+      runtime.settingsRefreshQueued = false;
+      if (refreshed && runtime.settingsRevision !== runtime.refreshedSettingsRevision) {
+        queueSharedSettingsRefresh(runtime);
+      }
+    }).catch(error => {
+      runtime.settingsRefreshQueued = false;
+      try { runtime.options.onDiagnostic?.("document.settings_refresh.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      }); } catch { /* Diagnostics must not interrupt storage. */ }
+    });
+  });
 };
 
 const publishSharedFolderCredential = async (runtime: DocumentRuntime, id: string, label: string) => {
@@ -1541,6 +1571,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     registry: undefined,
     settingsRevision: 0,
     refreshedSettingsRevision: -1,
+    settingsRefreshQueued: false,
     nextHandle: 0,
     closed: false,
     queue: Promise.resolve(),

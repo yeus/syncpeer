@@ -106,6 +106,9 @@ test("status refreshes shared credentials only when the settings replica changes
     value: { label: "Photos", password: "synthetic-shared-folder-password" } });
   assert.deepEqual((await documents.status()).folders.map(folder => folder.id), ["photos"]);
   assert.equal(events.filter(event => event === "document.settings_refresh.started").length, 2);
+  await documents.attachDownloads("photos");
+  assert.equal((await documents.status()).folders.find(folder => folder.id === "photos")?.downloads, true,
+    "The refreshed signed credential must unlock the registered folder.");
   await documents.close();
 });
 

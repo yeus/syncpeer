@@ -204,6 +204,8 @@ test("browser clients exchange a new approved folder credential through their se
       } });
       await target.rememberFolder({ id: "new-folder", label: "New folder" });
       await source.register({ id: "new-folder", label: "New folder", password: "synthetic-folder-password" });
+      assert.equal((await source.sharedPersonalSpaceSettings()).settings?.folders["new-folder"]?.credential?.password,
+        "synthetic-folder-password", "Source did not publish the signed folder credential before connection.");
       const [ownerPort, joinerPort] = await Promise.all([freeLocalPort(), freeLocalPort()]);
       const options = { host: "127.0.0.1", discoveryMode: "direct" as const,
         timeoutMs: 3000 };
@@ -216,10 +218,19 @@ test("browser clients exchange a new approved folder credential through their se
       assert.ok(selectedFolders.length >= 2 && selectedFolders.every(value => value.internalCount === 1),
         "Both browser-client sessions must select the hidden settings replica.");
       const deadline = Date.now() + 7000;
-      while (!(await target.status()).folders.some(folder => folder.id === "new-folder")) {
-        assert.ok(Date.now() < deadline, "Browser-client settings session did not carry the new folder credential");
-        await new Promise(resolve => setTimeout(resolve, 50));
+      let attached = false;
+      while (!attached && Date.now() < deadline) {
+        try {
+          await target.attachDownloads("new-folder");
+          attached = true;
+        } catch (error) {
+          assert.match(error instanceof Error ? error.message : String(error), /^Folder is not registered\.$/);
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
       }
+      assert.equal(attached, true,
+        "Browser-client settings session did not materialize the new folder credential");
+      assert.ok((await target.status()).folders.some(folder => folder.id === "new-folder" && folder.downloads));
     } finally {
       await owner?.disconnect(); await joiner?.disconnect();
       await source.close(); await target.close(); await rm(root, { recursive: true, force: true });

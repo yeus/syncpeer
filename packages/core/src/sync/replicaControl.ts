@@ -9,7 +9,7 @@ export interface ReplicaState {
 export function createReplicaController(replica: LocalFolderReplica, settings?: {
   paused?: boolean;
   savePaused?: (paused: boolean) => Promise<void>;
-  onCommittedChange?: () => void;
+  onCommittedChange?: (source: "local" | "received") => void;
 }) {
   let paused = settings?.paused ?? false;
   let stopped = false;
@@ -71,12 +71,12 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
     readBlock: ((...args) => run("syncing", () => replica.readBlock(...args))) as LocalFolderReplica["readBlock"],
     ...(replica.receive ? { receive: ((...args) => run("syncing", async () => {
       const changed = await replica.receive!(...args);
-      if (changed) settings?.onCommittedChange?.();
+      if (changed) settings?.onCommittedChange?.("received");
       return changed;
     })) as NonNullable<LocalFolderReplica["receive"]> } : {}),
     ...(replica.edit ? { edit: ((...args) => run("syncing", async () => {
       const result = await replica.edit!(...args);
-      settings?.onCommittedChange?.();
+      settings?.onCommittedChange?.("local");
       return result;
     })) as NonNullable<LocalFolderReplica["edit"]> } : {}),
     isPaused: () => paused || stopped,

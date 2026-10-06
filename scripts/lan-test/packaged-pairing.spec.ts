@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir } from "node:fs/promises";
 import net from "node:net";
+import path from "node:path";
 import { browser } from "@wdio/globals";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
@@ -7,6 +9,14 @@ import { clickButtonByText, setDirectConnectionFields } from "./ui-helpers.js";
 
 const peers = () => browser as typeof browser & { owner: WebdriverIO.Browser; joiner: WebdriverIO.Browser };
 const folderName = "Synthetic desktop folder";
+
+const screenshotDir = process.env.SYNCPEER_SCREENSHOT_DIR?.trim();
+
+async function captureScreenshot(peer: WebdriverIO.Browser, name: string) {
+  if (!screenshotDir) return;
+  await mkdir(screenshotDir, { recursive: true });
+  await peer.saveScreenshot(path.join(screenshotDir, `syncpeer-${name}.png`));
+}
 
 async function freePort(): Promise<number> {
   const server = net.createServer();
@@ -389,6 +399,7 @@ describe("Two isolated packaged desktop apps", () => {
       memberships.push(listed.map(value => value.replaceAll("-", "")).sort());
     }
     assert.deepEqual(memberships[0], memberships[1], "Both packaged devices must agree on the signed membership.");
+    await captureScreenshot(owner, "personal-space");
   });
 
   it("replicates a whole favorite folder in both directions", async () => {
@@ -401,8 +412,11 @@ describe("Two isolated packaged desktop apps", () => {
       await back.click();
       await peer.$("[data-testid='tab-devices']").click();
     }
-    const [ownerId, joinerId] = await Promise.all([owner, joiner]
-      .map(peer => peer.$("[data-testid='current-device-id']").getText()));
+    const [ownerId, joinerId] = await Promise.all([owner, joiner].map(async peer => {
+      const deviceId = peer.$("[data-testid='current-device-id']");
+      await deviceId.waitForExist({ timeout: 60_000 });
+      return deviceId.getText();
+    }));
     await owner.$("[data-testid='tab-folders']").click();
     await owner.$("button=Folder settings · New folder").click();
     console.log("Packaged folder test: creating owner folder.");
@@ -422,6 +436,7 @@ describe("Two isolated packaged desktop apps", () => {
         await owner.pause(1_000);
       }
       assert.ok(await folderExists(), "The newly created folder is absent from Folder settings.");
+      await captureScreenshot(owner, "encrypted-folder");
     } catch (error) {
       const issue = await owner.$("p[role='alert']").getText().catch(() => "none");
       const state = await owner.execute(() => ({
@@ -556,6 +571,7 @@ describe("Two isolated packaged desktop apps", () => {
     await waitForFile(joiner, "from-owner.txt");
     await uploadFile(joiner, "from-joiner.txt", "joiner-one");
     await waitForFile(owner, "from-joiner.txt");
+    await captureScreenshot(owner, "sync");
   });
 
   it("reconnects through official global discovery and the public relay network", async function () {

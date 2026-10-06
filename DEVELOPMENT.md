@@ -370,6 +370,68 @@ under `.tmp/syncpeer-dev-client/` and prints its own persistent device ID while
 attempting a normal Syncthing connection. The server terminal then shows the
 pending ID. Compare it with the client output and enter `y` to approve it as a
 trusted fixture client. Enter `u` only for a receive-encrypted test identity.
+
+### Packaged release acceptance
+
+The packaged Linux/Android acceptance harness runs against a built `.deb` and,
+when an Android emulator is supplied, the packaged Android APK:
+
+```bash
+npm run test:tauri:deb -- path/to/Syncpeer_<version>_amd64.deb
+```
+
+The desktop gate covers fresh protected-profile startup, isolated identities,
+owned-device pairing with matching confirmation codes, and bidirectional
+whole-folder synchronization.
+
+With `SYNCPEER_ANDROID_SERIAL` configured, the same runner also exercises
+packaged Android recovery and desktop-to-Android cross-app behavior. The
+`--cross-app-only` option runs only the Android recovery/cross-app phase.
+
+### Live public-network acceptance
+
+Public Syncthing discovery and relay infrastructure is deliberately excluded
+from default local tests. Run the opt-in acceptance check explicitly:
+
+```bash
+SYNCPEER_RUN_EXTERNAL_CHECKS=1 npm run test:public-network
+```
+
+This test creates ephemeral identities, disables local discovery candidates,
+uses official Syncthing global discovery and the live relay pool, requires a
+relay-only session, and verifies bidirectional encrypted convergence. It must
+never reuse real user/device identities from logs.
+
+
+### Generated screenshots
+
+Syncpeer uses the packaged Tauri acceptance flow to generate representative
+README/release screenshots:
+
+```bash
+npm run screenshots
+```
+
+The command rebuilds the repository's LAN-E2E `.deb`, runs the real packaged
+desktop pairing/synchronization acceptance flow, and captures three stable
+states:
+
+- signed personal-space membership,
+- encrypted-folder creation,
+- converged bidirectional folder contents.
+
+Generated PNGs live under `.screenshots/`. That directory is gitignored and
+must never be committed.
+
+`.github/workflows/screenshots.yml` runs the same command for pushes, pull
+requests and manual CI runs, then uploads `screenshot-previews` as a
+seven-day GitHub Actions artifact. These preview artifacts are intentionally
+temporary.
+
+Tagged releases run the screenshot capture again and publish the PNGs as GitHub
+Release assets. Release assets are the durable copy: they remain available
+until the corresponding GitHub Release is deleted. The README embeds those
+release assets rather than repository files or temporary Actions artifacts.
 Unknown devices are never accepted automatically.
 
 After approval, the client reconnects, browses the fixture, downloads and

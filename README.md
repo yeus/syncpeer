@@ -30,7 +30,22 @@ It is intentionally built in TypeScript to make protocol-level sync tooling more
 - Releases page: <https://github.com/yeus/syncpeer/releases>
 - Latest release page: <https://github.com/yeus/syncpeer/releases/latest>
 
-## Quick start (users)
+## Screenshots
+
+The screenshots below are generated automatically from the packaged Tauri
+acceptance flow. They are **not stored in this repository**. On ordinary
+push/PR CI runs they are uploaded only as seven-day GitHub Actions preview
+artifacts. On a tagged release, the same PNGs are attached to that GitHub
+Release and remain available for as long as the release itself exists.
+<p align="center">
+  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.0-rc.1/syncpeer-personal-space.png" width="32%" alt="Syncpeer personal-space trusted-device membership">
+  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.0-rc.1/syncpeer-encrypted-folder.png" width="32%" alt="Syncpeer encrypted folder setup">
+  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.0-rc.1/syncpeer-sync.png" width="32%" alt="Syncpeer bidirectional synchronized folder">
+</p>
+
+## Quick start for developers
+
+Install dependencies and build:
 
 ```bash
 npm install

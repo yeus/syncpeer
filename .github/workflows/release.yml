@@ -212,9 +212,64 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  screenshots:
+    name: Capture release screenshots
+    needs: validate-tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tauri and WebDriver dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            curl \
+            dbus-x11 \
+            file \
+            gnome-keyring \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            libgtk-3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            webkit2gtk-driver \
+            wget \
+            xauth \
+            xvfb
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Capture screenshots
+        run: npm run screenshots
+
+      - name: Upload release screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-screenshots
+          path: .screenshots/*.png
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub release
-    needs: [validate-tag, appimage, flatpak, android]
+    needs: [validate-tag, appimage, flatpak, android, screenshots]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -240,6 +295,9 @@ jobs:
           test -s "$appimage"
           test -s "$flatpak"
           test -s "$apk"
+          test -s "release-assets/syncpeer-personal-space.png"
+          test -s "release-assets/syncpeer-encrypted-folder.png"
+          test -s "release-assets/syncpeer-sync.png"
           (
             cd release-assets
             sha256sum \

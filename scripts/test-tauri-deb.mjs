@@ -14,6 +14,7 @@ const artifact = path.resolve(artifactArg);
 assert.ok((await stat(artifact)).isFile(), "The .deb artifact must be a file.");
 const serial = process.env.SYNCPEER_ANDROID_SERIAL?.trim();
 const crossAppOnly = process.argv.includes("--cross-app-only");
+const skipAndroidRecovery = process.argv.includes("--skip-android-recovery");
 if (crossAppOnly) assert.ok(serial, "--cross-app-only requires SYNCPEER_ANDROID_SERIAL.");
 if (serial) {
   assert.match(serial, /^emulator-\d+$/, "The Android target must be an explicit emulator serial.");
@@ -55,18 +56,51 @@ try {
     if (target.error) throw target.error;
     assert.equal(target.status, 0, "The selected Android emulator is unavailable.");
     assert.equal(target.stdout.trim(), "1", "The selected Android target is not an emulator.");
+    let androidReady = false;
+    const androidReadyDeadline = Date.now() + 120_000;
+    while (Date.now() < androidReadyDeadline) {
+      const boot = spawnSync("adb", ["-s", serial, "shell", "getprop", "sys.boot_completed"],
+        { encoding: "utf8", timeout: 30_000 });
+      const packages = spawnSync("adb", ["-s", serial, "shell", "pm", "path", "android"],
+        { encoding: "utf8", timeout: 30_000 });
+      if (boot.status === 0 && boot.stdout.trim() === "1" &&
+        packages.status === 0 && packages.stdout.trim().startsWith("package:")) {
+        androidReady = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+    }
+    assert.equal(androidReady, true, "Android framework/package manager did not become ready.");
     const apk = path.resolve("packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/" +
       "universal/debug/app-universal-debug.apk");
     assert.ok((await stat(apk)).isFile(), "Build the Android E2E APK before the cross-app gate.");
-    const installed = spawnSync("adb", ["-s", serial, "install", "-r", apk],
+    // The gate is explicitly allowed to reset this disposable emulator. Remove
+    // the prior APK before installing so repeated runs do not need space for both
+    // package versions at once.
+    spawnSync("adb", ["-s", serial, "uninstall", "dev.syncpeer.app"],
+      { stdio: "ignore", timeout: 120_000 });
+    const installed = spawnSync("adb", ["-s", serial, "install", apk],
       { stdio: "inherit", timeout: 120_000 });
     if (installed.error) throw installed.error;
     assert.equal(installed.status, 0, "Android fixture install failed.");
-    const cleared = spawnSync("adb", ["-s", serial, "shell", "pm", "clear", "dev.syncpeer.app"],
-      { encoding: "utf8", timeout: 120_000 });
-    if (cleared.error) throw cleared.error;
-    assert.equal(cleared.status, 0, "Android fixture reset failed.");
-    assert.equal(cleared.stdout.trim(), "Success", "Android fixture did not clear its private data.");
+    const clearAndroid = () => {
+      const cleared = spawnSync("adb", ["-s", serial, "shell", "pm", "clear", "dev.syncpeer.app"],
+        { encoding: "utf8", timeout: 120_000 });
+      if (cleared.error) throw cleared.error;
+      assert.equal(cleared.status, 0, "Android fixture reset failed.");
+      assert.equal(cleared.stdout.trim(), "Success", "Android fixture did not clear its private data.");
+    };
+    if (!skipAndroidRecovery) {
+      clearAndroid();
+      const recovery = spawnSync(process.execPath,
+        ["scripts/test-android-e2e.mjs", "--recovery-acceptance"], {
+          cwd: process.cwd(), stdio: "inherit", timeout: 300_000,
+          env: { ...process.env, ANDROID_SERIAL: serial },
+        });
+      if (recovery.error) throw recovery.error;
+      assert.equal(recovery.status, 0, "Android packaged recovery acceptance failed.");
+    }
+    clearAndroid();
     const crossApp = await runWithPrivateSecretService("xvfb-run", ["-a", process.execPath,
       "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
       "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {

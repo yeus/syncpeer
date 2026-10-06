@@ -1192,7 +1192,10 @@ const waitForPackageStopped = async (timeout = 10_000) => {
 };
 
 const launchAndroidApp = async (forceStop = false) => {
-  if (forceStop) runAdb(["shell", "am", "force-stop", packageName]);
+  if (forceStop) {
+    runAdb(["shell", "am", "force-stop", packageName]);
+    await waitForPackageStopped();
+  }
   runAdb(["shell", "monkey", "-p", packageName, "1"]);
   await wait(1_000);
   await assertForeground();
@@ -2182,8 +2185,135 @@ const runPairingJoin = async (inputPath) => {
 };
 
 const documentCommand = async (cdp, request) => {
-  const response = await tauriInvoke(cdp, "syncpeer_document_command", { request }, 60_000);
-  return response.result;
+  let active = cdp;
+  let temporary = false;
+  try {
+    await cdp.evaluate("true", 5_000);
+  } catch {
+    active = await connectCdp();
+    temporary = true;
+  }
+  try {
+    const response = await tauriInvoke(active, "syncpeer_document_command", { request }, 60_000);
+    return response.result;
+  } finally {
+    if (temporary) active.close();
+  }
+};
+
+const waitForAndroidDeviceId = async (cdp) => {
+  const deviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id", {}, 60_000);
+  if (typeof deviceId !== "string" || !deviceId.trim()) {
+    throw new Error("Android native identity command returned no device ID.");
+  }
+  return deviceId.trim();
+};
+const runRecoveryAcceptance = async () => {
+  const recoveryPassword = "synthetic-android-backup-password";
+  const replacementPassword = "synthetic-android-replacement-password";
+  const kitPassword = "synthetic-android-offline-kit-password";
+  const kit = await createOwnedRecoveryKit(crypto.subtle,
+    size => crypto.getRandomValues(new Uint8Array(size)), kitPassword);
+
+  const command = async (request) => {
+    const cdp = await connectCdp();
+    try { return await documentCommand(cdp, request); }
+    finally { cdp.close(); }
+  };
+  const expectFailure = async (request, label) => {
+    try {
+      await command(request);
+    } catch (error) {
+      if (/CDP|WebView debug|WebView CDP/i.test(String(error))) throw error;
+      return;
+    }
+    throw new Error(`Android recovery unexpectedly accepted ${label}.`);
+  };
+  const launchAndReadDeviceId = async () => {
+    const cdp = await launchAndroidApp(true);
+    try { return await waitForAndroidDeviceId(cdp); }
+    finally { cdp.close(); }
+  };
+
+  const originalSyncthingId = await launchAndReadDeviceId();
+  const initial = await command({ operation: "status" });
+  if (initial.vault.phase !== "uninitialized") {
+    throw new Error("Android recovery acceptance requires a fresh local profile.");
+  }
+  await command({ operation: "createVault",
+    password: "synthetic-android-owner-password", remember: true,
+    localDeviceId: originalSyncthingId, recoveryKey: kit.publicKey });
+  const backup = await command({ operation: "exportRecoveryBackup", password: recoveryPassword });
+  const membership = await command({ operation: "ownedDevices" });
+  const original = membership.devices.find(device => device.syncthingId === originalSyncthingId);
+  if (!original || original.state !== "active") {
+    throw new Error("Android recovery owner was not active before backup export.");
+  }
+  if (JSON.stringify(backup).includes(kit.ciphertext.join(","))) {
+    throw new Error("Android recovery backup unexpectedly contains the offline kit ciphertext.");
+  }
+
+  runAdb(["shell", "pm", "clear", packageName], 120_000);
+  grantNotificationPermission();
+  const replacementSyncthingId = await launchAndReadDeviceId();
+  if (!replacementSyncthingId || replacementSyncthingId === originalSyncthingId) {
+    throw new Error("Android recovery did not create a distinct replacement device identity.");
+  }
+
+  await expectFailure({ operation: "restoreRecoveryBackup", backup,
+    recoveryPassword: "wrong-backup-password", password: replacementPassword }, "wrong backup password");
+  if ((await command({ operation: "status" })).vault.phase !== "uninitialized") {
+    throw new Error("Wrong Android recovery password occupied the fresh profile.");
+  }
+  const tampered = structuredClone(backup);
+  tampered.vault.ciphertext[0] ^= 1;
+  await expectFailure({ operation: "restoreRecoveryBackup", backup: tampered,
+    recoveryPassword, password: replacementPassword }, "corrupt backup");
+  if ((await command({ operation: "status" })).vault.phase !== "uninitialized") {
+    throw new Error("Corrupt Android recovery backup occupied the fresh profile.");
+  }
+
+  await command({ operation: "restoreRecoveryBackup", backup,
+    recoveryPassword, password: replacementPassword });
+  const restoredMembership = await command({ operation: "ownedDevices" });
+  if (restoredMembership.localDeviceId !== null ||
+    !restoredMembership.devices.some(device => device.syncthingId === originalSyncthingId &&
+      device.state === "active")) {
+    throw new Error("Restored Android backup did not preserve the prior trusted-device roster.");
+  }
+
+  const wrongKit = await createOwnedRecoveryKit(crypto.subtle,
+    size => crypto.getRandomValues(new Uint8Array(size)), "synthetic-wrong-kit-password");
+  await expectFailure({ operation: "recoverOwnedDevice",
+    localDeviceId: replacementSyncthingId, kit: wrongKit, password: "synthetic-wrong-kit-password" },
+  "mismatched offline kit");
+  await expectFailure({ operation: "recoverOwnedDevice",
+    localDeviceId: replacementSyncthingId, kit, password: "wrong-kit-password" },
+  "wrong offline-kit password");
+  await command({ operation: "recoverOwnedDevice",
+    localDeviceId: replacementSyncthingId, kit, password: kitPassword });
+
+  const recovered = await command({ operation: "ownedDevices" });
+  const oldDevice = recovered.devices.find(device => device.syncthingId === originalSyncthingId);
+  const replacement = recovered.devices.find(device => device.syncthingId === replacementSyncthingId);
+  if (!recovered.localDeviceId || oldDevice?.state !== "revoked" || replacement?.state !== "active") {
+    throw new Error("Android recovery did not revoke the lost device and activate its replacement.");
+  }
+
+  const coldStart = await launchAndroidApp(true);
+  coldStart.close();
+  const status = await command({ operation: "status" });
+  if (status.vault.phase === "locked") {
+    await command({ operation: "unlock", password: replacementPassword });
+  }
+  const persisted = await command({ operation: "ownedDevices" });
+  const persistedOldDevice = persisted.devices.find(device => device.syncthingId === originalSyncthingId);
+  const persistedReplacement = persisted.devices.find(device => device.syncthingId === replacementSyncthingId);
+  if (!persisted.localDeviceId || persistedOldDevice?.state !== "revoked" ||
+    persistedReplacement?.state !== "active") {
+    throw new Error("Android recovery membership did not survive a cold app restart.");
+  }
+  console.log("Android packaged recovery acceptance passed: rejection, kit enforcement, replacement enrollment, revocation, and restart persistence.");
 };
 
 const favoriteWholeFolder = async (cdp, id) => {
@@ -2434,6 +2564,11 @@ const main = async () => {
       cdp.close();
     }
     fs.writeFileSync(runtimeProbePath, supported ? "supported\n" : "unsupported\n", { mode: 0o600 });
+    return;
+  }
+
+  if (hasArgument("--recovery-acceptance")) {
+    await runRecoveryAcceptance();
     return;
   }
 

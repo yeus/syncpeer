@@ -11,7 +11,7 @@ const capability = {
 
 export const config = {
   runner: "local",
-  specs: [path.resolve("scripts/lan-test/packaged-pairing.spec.ts")],
+  specs: [path.resolve(process.env.SYNCPEER_LAN_SPEC ?? "scripts/lan-test/packaged-pairing.spec.ts")],
   maxInstances: 1,
   logLevel: "error",
   services: [["tauri", { driverProvider: "external", autoInstallTauriDriver: true }]],

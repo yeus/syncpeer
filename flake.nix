@@ -393,6 +393,8 @@ EOF
             adwaita-icon-theme
             hicolor-icon-theme
             dconf
+            dbus
+            gnome-keyring
             cairo
             pango
             gdk-pixbuf

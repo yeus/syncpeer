@@ -41,7 +41,8 @@ export async function createFreshEncryptedProfile(peer: WebdriverIO.Browser) {
     throw new Error(`Packaged offline-kit creation did not complete after click ${clickMs} ms: ` +
       JSON.stringify(state), { cause });
   }
-  const kit = JSON.parse(await peer.$("textarea[readonly]").getValue()) as { publicKey?: unknown };
+  const encodedKit = await peer.$("textarea[readonly]").getValue();
+  const kit = JSON.parse(encodedKit) as { publicKey?: unknown };
   assert.ok(kit.publicKey, "The synthetic recovery kit needs a public key.");
   const saved = await peer.execute(() => {
     const input = [...document.querySelectorAll("label")]
@@ -58,4 +59,5 @@ export async function createFreshEncryptedProfile(peer: WebdriverIO.Browser) {
     const issue = await peer.$("p[role='alert']").getText().catch(() => "No profile error was shown.");
     throw new Error(`Packaged fresh-profile setup failed: ${issue}`, { cause: error });
   }
+  return encodedKit;
 }

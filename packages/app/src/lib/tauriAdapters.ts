@@ -335,7 +335,7 @@ export const createTauriAdapters = (
         request: { relayAddress, certPem, keyPem, alpnProtocols: [...alpnProtocols],
           handshakeTimeoutMs: handshakeTimeoutMs ?? null },
       });
-      return createNativeTlsListener(invokeWithLogging, opened);
+      return createNativeTlsListener(invokeWithLogging, opened, relayAddress);
     },
     connectQuic: async ({
       host,
@@ -751,7 +751,7 @@ export const createTauriAdapters = (
     } : undefined };
 };
 
-const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse) => {
+const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse, relayAddress?: string) => {
   let closed = false;
   return {
     port: opened.port,
@@ -761,9 +761,12 @@ const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse) =>
           const accepted = await invoke<TlsAcceptResponse>("syncpeer_tls_accept", {
             request: { listenerId: opened.listenerId, timeoutMs: 60_000 },
           });
-          return { socket: createTlsSocket(invoke, Number(accepted.sessionId),
+          const socket = { socket: createTlsSocket(invoke, Number(accepted.sessionId),
             new Uint8Array(accepted.peerCertificateDer)), remoteAddress: accepted.remoteAddress,
           remotePort: accepted.remotePort, alpn: accepted.alpn };
+          return relayAddress ? { ...socket,
+            connectedVia: `${relayAddress} -> ${accepted.remoteAddress}:${accepted.remotePort}`,
+            transportKind: "relay" as const, connectionScope: "wan" as const } : socket;
         } catch (error) {
           if (!closed && /accept timed out/i.test(String(error))) continue;
           throw error;
@@ -778,7 +781,6 @@ const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse) =>
     },
   };
 };
-
 export const reportUiError = (
   event: string,
   error: unknown,

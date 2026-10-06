@@ -34,6 +34,9 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
       assert.equal(computeDeviceId(await incoming.socket.peerCertificateDer()), b.deviceId);
       assert.equal(computeDeviceId(await connected.socket.peerCertificateDer()), a.deviceId);
       assert.equal(incoming.alpn, "bep/1.0");
+      assert.match(incoming.connectedVia ?? "", /^relay:\/\//);
+      assert.equal(incoming.transportKind, "relay");
+      assert.equal(incoming.connectionScope, "wan");
       await connected.socket.write(Uint8Array.of(1, 2, 3));
       assert.deepEqual((await incoming.socket.read()).slice(0, 3), Uint8Array.of(1, 2, 3));
       await Promise.all([incoming.socket.close(), connected.socket.close()]);

@@ -1,6 +1,6 @@
 import { extractDiscoveryAuth, normalizeDiscoveryServerUrl, type SyncpeerHostAdapter,
   type SyncpeerRelayListenOptions, type SyncpeerTlsListener } from "../client.js";
-import { normalizeDiscoveryServer } from "../ui/discoveryServer.js";
+import { discoveryAnnouncementServers } from "../ui/discoveryServer.js";
 
 const wait = (delayMs: number, signal: AbortSignal) => new Promise<void>(resolve => {
   if (signal.aborted) { resolve(); return; }
@@ -17,24 +17,29 @@ const responseDelay = (headers: Record<string, string> | undefined, name: string
   return Number.isFinite(delay) && delay > 0 ? Math.min(delay, 2_147_483_647) : fallback;
 };
 
+const relayPort = (address: string): number => Number(new URL(address).port || 22067);
+
 const poolAddresses = (payload: unknown) => {
   if (!payload || typeof payload !== "object" || !("relays" in payload) || !Array.isArray(payload.relays)) {
     throw new Error("Relay pool response has no relay list.");
   }
-  return [...new Set(payload.relays.flatMap((entry: unknown) => {
+  const addresses = [...new Set(payload.relays.flatMap((entry: unknown) => {
     if (!entry || typeof entry !== "object" || !("url" in entry) || typeof entry.url !== "string") return [];
     try {
       const url = new URL(entry.url);
       return url.protocol === "relay:" && url.hostname && !url.username && !url.password && !url.hash &&
         url.searchParams.get("id") ? [url.toString()] : [];
     } catch { return []; }
-  }))].slice(0, 32);
+  }))];
+  return [
+    ...addresses.filter(address => relayPort(address) === 443),
+    ...addresses.filter(address => relayPort(address) !== 443),
+  ].slice(0, 32);
 };
-
-async function announce(adapter: SyncpeerHostAdapter, options: SyncpeerRelayListenOptions & {
-  discoveryServer?: string;
-}, relayAddress: string, signal: AbortSignal) {
-  const url = normalizeDiscoveryServerUrl(normalizeDiscoveryServer(options.discoveryServer));
+async function announce(adapter: SyncpeerHostAdapter,
+  options: Pick<SyncpeerRelayListenOptions, "certPem" | "keyPem">,
+  discoveryServer: string, relayAddress: string, signal: AbortSignal) {
+  const url = normalizeDiscoveryServerUrl(discoveryServer);
   const auth = extractDiscoveryAuth(url);
   url.searchParams.delete("device");
   while (!signal.aborted) {
@@ -66,13 +71,19 @@ async function register(adapter: SyncpeerHostAdapter,
     throw new Error("Relay pool request failed.");
   }
   const addresses = poolAddresses(await response.json());
-  const offset = addresses.length ? (await adapter.randomBytes(1))[0]! % addresses.length : 0;
-  for (let i = 0; i < addresses.length && !signal.aborted; i++) {
-    const relayAddress = addresses[(offset + i) % addresses.length]!;
-    try {
-      const listener = await adapter.listenRelay!({ ...options, relayAddress, signal });
-      return { listener, relayAddress };
-    } catch { /* Try the next validated candidate; a pool entry can be unavailable. */ }
+  const groups = [
+    addresses.filter(address => relayPort(address) === 443),
+    addresses.filter(address => relayPort(address) !== 443),
+  ];
+  for (const group of groups) {
+    const offset = group.length ? (await adapter.randomBytes(1))[0]! % group.length : 0;
+    for (let i = 0; i < group.length && !signal.aborted; i++) {
+      const relayAddress = group[(offset + i) % group.length]!;
+      try {
+        const listener = await adapter.listenRelay!({ ...options, relayAddress, signal });
+        return { listener, relayAddress };
+      } catch { /* Try the next validated candidate; a pool entry can be unavailable. */ }
+    }
   }
   throw new Error("Relay registration unavailable.");
 }
@@ -86,7 +97,7 @@ export function startAutomaticRelayPresence(adapter: SyncpeerHostAdapter,
   const run = async () => {
     let failures = 0;
     while (!stop.signal.aborted) {
-      let announced: Promise<void> | undefined;
+      let announced: Promise<void[]> | undefined;
       let registeredAt: number | undefined;
       const registration = new AbortController();
       const cancel = () => registration.abort();
@@ -97,7 +108,8 @@ export function startAutomaticRelayPresence(adapter: SyncpeerHostAdapter,
         if (!stop.signal.aborted) {
           registeredAt = Date.now();
           adapter.log?.("core.relay.registered", {});
-          announced = announce(adapter, { ...options, relayAddress: ready.relayAddress }, ready.relayAddress, registration.signal);
+          announced = Promise.all(discoveryAnnouncementServers(options.discoveryServer).map(discoveryServer =>
+            announce(adapter, options, discoveryServer, ready.relayAddress, registration.signal)));
           while (!stop.signal.aborted) onAccept(await listener.accept());
         }
       } catch {

@@ -48,10 +48,10 @@ import {
   formatAppBuildInfo,
 } from "../packages/core/src/appInfo.ts";
 import {
+  discoveryAnnouncementServers,
   getDefaultDiscoveryServer,
   normalizeDiscoveryServer,
 } from "../packages/core/src/ui/discoveryServer.ts";
-
 assert.equal(isTransportFailure(new Error("TLS flush failed: Broken pipe")), true);
 assert.equal(isTransportFailure(new Error("Request timeout for file at offset 0")), true);
 assert.equal(isTransportFailure(new Error("No such file")), false);
@@ -106,12 +106,23 @@ assert.equal(
 );
 
 const defaultDiscoveryServer = getDefaultDiscoveryServer();
-assert.ok(new URL(defaultDiscoveryServer).searchParams.get("id"));
+assert.equal(defaultDiscoveryServer, "https://discovery-lookup.syncthing.net/v2/?noannounce");
 assert.equal(
   normalizeDiscoveryServer("https://discovery.syncthing.net/v2/"),
   defaultDiscoveryServer,
 );
-
+assert.equal(
+  normalizeDiscoveryServer("https://discovery-lookup.syncthing.net/"),
+  defaultDiscoveryServer,
+);
+assert.deepEqual(discoveryAnnouncementServers(undefined), [
+  "https://discovery-announce-v4.syncthing.net/v2/?nolookup",
+  "https://discovery-announce-v6.syncthing.net/v2/?nolookup",
+]);
+assert.deepEqual(
+  discoveryAnnouncementServers("https://discovery.example.test/v2/?id=PINNED"),
+  ["https://discovery.example.test/v2/?id=PINNED"],
+);
 let decoratedProgress: unknown = null;
 withSessionTransportProgress(
   {

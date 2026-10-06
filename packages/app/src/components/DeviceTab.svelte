@@ -374,12 +374,10 @@
           </label>
         {:else if app.connection.discoveryMode === "global"}
           <div class="hint">
-            Global discovery ignores manual host/port. The official Syncthing
-            discovery server pin is applied automatically when you use
-            discovery.syncthing.net.
+            Global discovery ignores manual host/port. Syncpeer uses Syncthing's
+            current official lookup and announcement services automatically.
           </div>
         {/if}
-
         {#if app.connection.discoveryMode === "direct"}
           <label class="checkbox-row">
             <input

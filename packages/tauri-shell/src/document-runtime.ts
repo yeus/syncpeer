@@ -37,7 +37,7 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
     write: async (bytes: Uint8Array) => { await request({ operation: transport === "quic" ? "quicWrite" : "tlsWrite", sessionId, bytes: [...bytes] }); },
     close: async () => { await request({ operation: transport === "quic" ? "quicClose" : "tlsClose", sessionId }); },
   });
-  const listener = (opened: { listenerId: number; port: number }) => {
+  const listener = (opened: { listenerId: number; port: number }, relayAddress?: string) => {
     let closed = false;
     return {
       port: Number(opened.port),
@@ -47,8 +47,11 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
             const accepted = await request({ operation: "tlsAccept", listenerId: opened.listenerId,
               timeoutMs: 60_000 }) as { sessionId: number; peerCertificateDer: number[];
               remoteAddress: string; remotePort: number; alpn: string };
-            return { socket: socket(Number(accepted.sessionId), new Uint8Array(accepted.peerCertificateDer)),
+            const result = { socket: socket(Number(accepted.sessionId), new Uint8Array(accepted.peerCertificateDer)),
               remoteAddress: accepted.remoteAddress, remotePort: Number(accepted.remotePort), alpn: accepted.alpn };
+            return relayAddress ? { ...result,
+              connectedVia: `${relayAddress} -> ${accepted.remoteAddress}:${accepted.remotePort}`,
+              transportKind: "relay" as const, connectionScope: "wan" as const } : result;
           } catch (error) {
             if (!closed && /accept timed out/i.test(String(error))) continue;
             throw error;
@@ -89,7 +92,7 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
         alpnProtocols: [...alpnProtocols], handshakeTimeoutMs: handshakeTimeoutMs ?? null }) as {
         listenerId: number; port: number;
       };
-      return listener(opened);
+      return listener(opened, relayAddress);
     },
     connectQuic: async ({ host, port, certPem, keyPem, caPem, timeoutMs, keepaliveMs, idleTimeoutMs, signal }) => {
       const value = await request({ operation: "quicOpen", host, port, certPem, keyPem, caPem: caPem ?? null,

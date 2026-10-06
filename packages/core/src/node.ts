@@ -609,7 +609,9 @@ async function listenNodeRelay(options: SyncpeerRelayListenOptions): Promise<Syn
           throw new Error("Relay invitation identity does not match the peer certificate");
         }
         const value = { socket: new NodeTlsSocket(secure), remoteAddress: relay.host,
-          remotePort: invitation.port, alpn: secure.alpnProtocol || "" };
+          remotePort: invitation.port, alpn: secure.alpnProtocol || "",
+          connectedVia: `relay://${relay.host}:${relay.port} -> ${invitation.host}:${invitation.port}`,
+          transportKind: "relay" as const, connectionScope: "wan" as const };
         const waiter = waiters.shift();
         if (waiter) waiter.resolve(value);
         else accepted.push(value);

@@ -100,8 +100,10 @@ export interface SyncpeerAcceptedTlsSocket {
   remoteAddress: string;
   remotePort: number;
   alpn: string;
+  connectedVia?: string;
+  transportKind?: "direct-tcp" | "relay";
+  connectionScope?: ConnectionScope;
 }
-
 export interface SyncpeerTlsListener {
   port: number;
   accept: () => Promise<SyncpeerAcceptedTlsSocket>;
@@ -639,7 +641,7 @@ function maybeConnectionHint(
 
 export function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
   const raw = (rawUrl ?? "").trim();
-  const defaultUrl = "https://discovery.syncthing.net/v2/";
+  const defaultUrl = "https://discovery-lookup.syncthing.net/v2/?noannounce";
   const withScheme =
     raw === "" ? defaultUrl : raw.includes("://") ? raw : `https://${raw}`;
   const base = new URL(withScheme);
@@ -2725,6 +2727,7 @@ export async function acceptSyncpeerSession(
   adapter: SyncpeerHostAdapter,
   socket: SyncpeerTlsSocket,
   options: SyncpeerConnectOptions & { expectedDeviceId: string },
+  transport: Pick<SyncpeerAcceptedTlsSocket, "connectedVia" | "transportKind" | "connectionScope"> = {},
 ): Promise<SyncpeerSessionHandle> {
   if (!options.expectedDeviceId.trim()) {
     await socket.close();
@@ -2733,7 +2736,9 @@ export async function acceptSyncpeerSession(
   const timer = setTimeout(() => void socket.close().catch(() => undefined), options.timeoutMs ?? 10000);
   try {
     return await openBepSessionOnSocketUncancelled(adapter, socket, options,
-      options.host, options.port, "incoming-tcp", "direct-tcp", connectionScopeForHost(options.host), true);
+      options.host, options.port, transport.connectedVia ?? "incoming-tcp",
+      transport.transportKind ?? "direct-tcp",
+      transport.connectionScope ?? connectionScopeForHost(options.host), true);
   } catch (error) {
     await socket.close().catch(() => undefined);
     throw error;
@@ -2741,7 +2746,6 @@ export async function acceptSyncpeerSession(
     clearTimeout(timer);
   }
 }
-
 async function openDirectSession(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,

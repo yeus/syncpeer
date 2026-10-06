@@ -101,7 +101,7 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
       adapter.log?.("core.incoming.trace.options_ready", {});
       adapter.log?.("core.incoming.trace.handshake_start", {});
       const session = await acceptSyncpeerSession(adapter, accepted.socket,
-        { ...sessionOptions, ...endpoint, expectedDeviceId: approvedDeviceId });
+        { ...sessionOptions, ...endpoint, expectedDeviceId: approvedDeviceId }, accepted);
       const connectionId = `${endpoint.host}:${endpoint.port}`;
       if (await manager.admit({ remoteDeviceId, direction: "incoming", connectionId, session })) {
         handlers.onSession(session, remoteDeviceId);

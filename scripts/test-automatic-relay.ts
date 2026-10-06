@@ -129,6 +129,26 @@ test("a failed relay does not close the direct listener and selection tries anot
   } finally { await service.close(); }
 });
 
+test("relay selection prefers port 443 before applying the candidate cap", async () => {
+  const f = fixture();
+  const fetch = f.adapter.discoveryFetch;
+  f.adapter.discoveryFetch = async (input, init) => {
+    const response = await fetch(input, init);
+    if (init?.method === "POST") return response;
+    const relays = Array.from({ length: 40 }, (_, index) => ({
+      url: `relay://127.0.0.${(index % 200) + 1}:22067/?id=SYNTHETIC-${index}`,
+    }));
+    relays.push({ url: "relay://127.0.0.250:443/?id=SYNTHETIC-HTTPS" });
+    return { ...response, json: async () => ({ relays }) };
+  };
+  const service = await startIncomingPeerService(f.adapter, f.options);
+  try {
+    await until(() => f.requests.some(request => request.init?.method === "POST"));
+    assert.match(f.registrations[0] ?? "", /:443\//,
+      "Firewall-friendly port 443 relays must survive the 32-candidate cap and be attempted first");
+  } finally { await service.close(); }
+});
+
 test("without automatic relay configuration, direct mode never contacts the pool", async () => {
   const f = fixture();
   const options = { ...f.options, automaticRelay: undefined };

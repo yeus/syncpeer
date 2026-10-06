@@ -537,4 +537,68 @@ describe("Two isolated packaged desktop apps", () => {
     await uploadFile(joiner, "from-joiner.txt", "joiner-one");
     await waitForFile(owner, "from-joiner.txt");
   });
+
+  it("reconnects through official global discovery and the public relay network", async function () {
+    if (process.env.SYNCPEER_RUN_EXTERNAL_CHECKS !== "1") this.skip();
+    const { owner, joiner } = peers();
+
+    for (const peer of [owner, joiner]) {
+      await peer.$("[data-testid='tab-devices']").click();
+      await peer.execute(() => {
+        for (const testId of ["connection-settings-toggle", "connection-status-toggle"]) {
+          const button = document.querySelector(`[data-testid='${testId}']`);
+          if (!(button instanceof HTMLButtonElement)) throw new Error(`Connection control ${testId} is unavailable.`);
+          if (button.getAttribute("aria-expanded") !== "true") button.click();
+        }
+        const expert = document.querySelector("[data-testid='expert-view']");
+        if (!(expert instanceof HTMLInputElement)) throw new Error("Expert view is unavailable.");
+        if (!expert.checked) expert.click();
+      });
+      const control = peer.$("[data-testid='expert-connection-control']");
+      await control.waitForExist({ timeout: 5_000 });
+      if ((await control.getText()).includes("Pause automatic connection")) {
+        await control.click();
+        await peer.waitUntil(async () =>
+          !(await peer.$("[data-testid='connection-status']").getText()).includes("Connected"),
+        { timeout: 30_000, interval: 250,
+          timeoutMsg: "Packaged desktop did not close its direct session before public-network testing." });
+      }
+
+      await peer.$("[data-testid='connection-discovery-mode']").selectByAttribute("value", "global");
+      await peer.$("[data-testid='connection-discovery-server']")
+        .setValue("https://discovery-lookup.syncthing.net/v2/?noannounce");
+      await peer.execute(() => {
+        const relayFallback = document.querySelector(
+          "[data-testid='connection-relay-fallback']") as HTMLInputElement | null;
+        if (!relayFallback) throw new Error("Relay fallback control is unavailable.");
+        if (!relayFallback.checked) relayFallback.click();
+      });
+      await peer.pause(750);
+      assert.equal(await peer.$("[data-testid='connection-discovery-mode']").getValue(), "global");
+      assert.equal(await peer.$("[data-testid='connection-discovery-server']").getValue(),
+        "https://discovery-lookup.syncthing.net/v2/?noannounce");
+    }
+
+    await Promise.all([owner, joiner].map(async peer => {
+      const control = peer.$("[data-testid='expert-connection-control']");
+      if ((await control.getText()).includes("Resume automatic connection")) await control.click();
+    }));
+    await Promise.all([owner, joiner].map(peer => peer.waitUntil(async () =>
+      (await peer.$("[data-testid='connection-status']").getText()).includes("Connected"),
+    { timeout: 420_000, interval: 1_000,
+      timeoutMsg: "Packaged desktops did not reconnect through public discovery/relay." })));
+
+    for (const peer of [owner, joiner]) {
+      await peer.waitUntil(async () =>
+        (await peer.$("[data-testid='connection-details']").getText()).includes("Path: relay://"),
+      { timeout: 30_000, interval: 500,
+        timeoutMsg: "Packaged public-network session was not reported as relay transport." });
+    }
+
+    await openFolder(owner, folderName);
+    await uploadFile(owner, "public-relay-owner.txt", "public-relay-owner");
+    await openFolder(joiner, folderName);
+    await waitForFile(joiner, "public-relay-owner.txt");
+    console.log("Packaged public-network gate passed: official discovery + public relay + encrypted file convergence.");
+  });
 });

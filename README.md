@@ -179,9 +179,9 @@ push/PR CI runs they are uploaded only as seven-day GitHub Actions preview
 artifacts. On a tagged release, the same PNGs are attached to that GitHub
 Release and remain available for as long as the release itself exists.
 <p align="center">
-  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.0-rc.1/syncpeer-personal-space.png" width="32%" alt="Syncpeer personal-space trusted-device membership">
-  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.0-rc.1/syncpeer-encrypted-folder.png" width="32%" alt="Syncpeer encrypted folder setup">
-  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.0-rc.1/syncpeer-sync.png" width="32%" alt="Syncpeer bidirectional synchronized folder">
+  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-personal-space.png" width="32%" alt="Syncpeer personal-space trusted-device membership">
+  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-encrypted-folder.png" width="32%" alt="Syncpeer encrypted folder setup">
+  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-sync.png" width="32%" alt="Syncpeer bidirectional synchronized folder">
 </p>
 
 ## Quick start for developers

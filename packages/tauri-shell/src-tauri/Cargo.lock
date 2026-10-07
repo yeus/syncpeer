@@ -5194,7 +5194,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-syncpeer-android"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5306,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-shell"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cap-std",
  "data-encoding",

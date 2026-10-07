@@ -92,6 +92,16 @@ test("Android release setup uses tools available on standard runners", () => {
   assert.doesNotMatch(script, /\brg\b/);
 });
 
+test("Android CI lets the project install its pinned SDK packages", () => {
+  for (const file of [".github/workflows/android-build.yml", ".github/workflows/release.yml"]) {
+    const workflow = fs.readFileSync(file, "utf8");
+    const setup = workflow.match(/uses: android-actions\/setup-android@v3\n([\s\S]*?)(?=\n\s+- name:)/);
+    assert.ok(setup, `${file} must configure the Android SDK action.`);
+    assert.match(setup[1], /with:\n\s+packages: ""/,
+      `${file} must skip the action's default SDK package install.`);
+  }
+});
+
 test("Android compatibility testing has one explicit API 29 owner", () => {
   const flake = fs.readFileSync("flake.nix", "utf8");
   const scripts = json("package.json").scripts;

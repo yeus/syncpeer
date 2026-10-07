@@ -21,6 +21,8 @@ const run = (command, args, options = {}) => {
 await rm(screenshotsDir, { recursive: true, force: true });
 await mkdir(screenshotsDir, { recursive: true });
 
+run("npm", ["run", "icons:ensure", "-w", "@syncpeer/tauri-shell"]);
+
 run("npx", [
   "tauri", "build",
   "--bundles", "deb",

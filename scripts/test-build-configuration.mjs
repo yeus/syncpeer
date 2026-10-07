@@ -79,6 +79,14 @@ test("Tauri builds use the dependency-aware application build", () => {
   }
 });
 
+test("packaged screenshot capture ensures ignored Tauri icons before building", () => {
+  const script = fs.readFileSync("scripts/capture-screenshots.mjs", "utf8");
+  assert.match(
+    script,
+    /run\("npm", \["run", "icons:ensure", "-w", "@syncpeer\/tauri-shell"\]\);[\s\S]*?run\("npx", \[[\s\S]*?"tauri", "build"/,
+  );
+});
+
 test("Android release setup uses tools available on standard runners", () => {
   const script = fs.readFileSync("scripts/build-android-prod-with-secrets.sh", "utf8");
   assert.doesNotMatch(script, /\brg\b/);

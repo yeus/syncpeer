@@ -243,6 +243,31 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
   });
 }
 
+async function captureReconnectDiagnostics(owner: WebdriverIO.Browser, joiner: WebdriverIO.Browser,
+  ports: readonly number[]) {
+  const peers = await Promise.all([owner, joiner].map(peer => peer.execute(() => {
+    const observed = window as typeof window & { __syntheticEvents?: string[];
+      __syntheticFailures?: string[]; __syntheticHandshakeStages?: string[] };
+    const error = document.querySelector("p.error")?.textContent?.trim() ?? "";
+    const control = document.querySelector("[data-testid='expert-connection-control']")?.textContent ?? "";
+    const categorize = (message: string) => /ECONNREFUSED|connection refused/i.test(message) ? "connection-refused"
+      : /timed out|timeout/i.test(message) ? "timeout"
+        : /listener|address already in use/i.test(message) ? "listener"
+          : /vault|locked/i.test(message) ? "vault" : message ? "other" : "none";
+    return {
+      status: document.querySelector("[data-testid='connection-status']")?.textContent?.trim() ?? "missing",
+      control: control.includes("Pause automatic connection") ? "resumed" : "paused-or-missing",
+      appError: categorize(error),
+      events: observed.__syntheticEvents?.slice(-12) ?? [],
+      failures: observed.__syntheticFailures?.map(categorize).slice(-8) ?? [],
+      handshakeStages: observed.__syntheticHandshakeStages?.map(stage => stage.split(":").slice(1, 3).join(":"))
+        .slice(-8) ?? [],
+    };
+  }).catch(() => ({ status: "webdriver-unavailable" }))));
+  const listeners = await Promise.all(ports.map(isListening));
+  return { peers, listeners: ports.map((port, index) => ({ port, listening: listeners[index] })) };
+}
+
 async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
   let lastAlert = "";
   let sawFolderElsewhere = false;
@@ -549,6 +574,7 @@ describe("Two isolated packaged desktop apps", () => {
         `upload failures: ${ownerEvents.__syntheticFailures?.join(",")}; ` +
         `owner indexes: ${ownerEvents.__syntheticIndexes?.join(",")}.`, { cause: error });
     }
+    console.log("Packaged folder test: disconnecting before the listener refresh.");
     for (const peer of [owner, joiner]) {
       await peer.$("[data-testid='expert-connection-control']").click();
       await peer.waitUntil(async () =>
@@ -562,9 +588,17 @@ describe("Two isolated packaged desktop apps", () => {
         (await peer.$("[data-testid='expert-connection-control']").getText()).includes("Pause automatic connection"),
       { timeout: 30_000, timeoutMsg: "Automatic reconnection did not resume." });
     }
-    await Promise.all([owner, joiner].map(peer => peer.waitUntil(async () =>
-      (await peer.$("[data-testid='connection-status']").getText()).includes("Connected"),
-    { timeout: 120_000, timeoutMsg: "Paired desktops did not reconnect after enabling the shared folder." })));
+    console.log("Packaged folder test: waiting for peers after the listener refresh.");
+    try {
+      await Promise.all([owner, joiner].map(peer => peer.waitUntil(async () =>
+        (await peer.$("[data-testid='connection-status']").getText()).includes("Connected"),
+      { timeout: 120_000, timeoutMsg: "Paired desktops did not reconnect after enabling the shared folder." })));
+    } catch (error) {
+      const diagnostics = await captureReconnectDiagnostics(owner, joiner, [ownerPort, joinerPort]);
+      throw new Error(`Packaged peers did not reconnect after the listener refresh: ${JSON.stringify(diagnostics)}.`,
+        { cause: error });
+    }
+    console.log("Packaged folder test: peers reconnected after the listener refresh.");
     await openFolder(owner, folderName);
     await uploadFile(owner, "from-owner.txt", "owner-one");
     await openFolder(joiner, folderName);

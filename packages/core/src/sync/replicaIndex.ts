@@ -36,6 +36,8 @@ export type LocalReplicaEdit = {
 } & ({ method: "write";
   /** Immutable plaintext snapshot; core reads bounded ranges and verifies publication. */
   source: { size: number; readRange: (offset: number, size: number) => Promise<Uint8Array> };
+  /** Preverified source block plan; avoids rereading immutable content only to hash it again. */
+  blocks?: readonly BepBlockInfo[];
 } | { method: "mkdir" | "delete" });
 
 export interface LocalFolderReplica {
@@ -102,6 +104,13 @@ export const hashReplicaEntry = async (
   }
   return blocks;
 };
+
+export const hasReplicaBlockLayout = (
+  blocks: readonly { offset: number; size: number }[],
+  size: number,
+) => Number.isSafeInteger(size) && size >= 0 && blocks.length === Math.ceil(size / 131072) &&
+  blocks.every((block, index) => block.offset === index * 131072 &&
+    block.size === Math.min(131072, size - block.offset));
 
 /** Core owns block boundaries, causal versions and tombstones; storage supplies bytes. */
 export async function scanReplicaIndex(

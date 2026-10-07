@@ -82,3 +82,25 @@ test("the Tauri document bridge forwards complete download identity", async () =
       sourceDeviceId: "device", contentId: "blocks:test" });
   } finally { native.__TAURI__ = previous; }
 });
+
+test("the Android document bridge keeps batched writes within the existing block command", async () => {
+  const native = globalThis as typeof globalThis & { __TAURI__?: unknown };
+  const previous = native.__TAURI__;
+  const calls: Array<{ command: string; request: Record<string, unknown> }> = [];
+  native.__TAURI__ = { core: { invoke: async (command: string, args: { request: Record<string, unknown> }) => {
+    calls.push({ command, request: args.request });
+    return { result: (args.request.bytes as number[]).length };
+  } } };
+  try {
+    const adapter = createTauriAdapters({ runtimePlatform: "android" });
+    const result = await adapter.documentCommand!({ operation: "writeBatch", handle: 9,
+      writes: [{ offset: 10, bytes: [1, 2, 3] }, { offset: 30, bytes: [4, 5, 6, 7] }] });
+    assert.equal(result, 7);
+    assert.deepEqual(calls, [
+      { command: "syncpeer_document_command",
+        request: { operation: "write", handle: 9, offset: 10, bytes: [1, 2, 3] } },
+      { command: "syncpeer_document_command",
+        request: { operation: "write", handle: 9, offset: 30, bytes: [4, 5, 6, 7] } },
+    ]);
+  } finally { native.__TAURI__ = previous; }
+});

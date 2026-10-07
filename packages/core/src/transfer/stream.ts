@@ -10,10 +10,14 @@ export interface FileDownloadMetadata {
   sizeBytes: number;
   encrypted: boolean;
   contentId?: string;
+  /** Authenticated plaintext block plan when the remote index provides one. */
+  blocks?: readonly RangeDigest[];
 }
 
 export interface FileDownloadSink extends CachedRangeStorage {
   begin: (metadata: FileDownloadMetadata) => Promise<void> | void;
+  /** Commit verifies metadata.blocks against durable plaintext before publication. */
+  commitVerifiesBlocks?: boolean;
   write: (offset: number, bytes: Uint8Array) => Promise<void> | void;
   commit: () => Promise<void> | void;
   abort: (error: unknown) => Promise<void> | void;

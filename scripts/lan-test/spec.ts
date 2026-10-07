@@ -325,15 +325,22 @@ describe("Syncpeer LAN integration", () => {
     this.timeout(420_000);
     await runPhase("direct", async () => {
       const startedAtMs = Date.now();
+      const logStage = (stage: string) =>
+        console.log(`Large transfer ${stage} at ${Date.now() - startedAtMs} ms.`);
       const churn = request<{ ticks: number }>("POST", "/v1/action", {
         action: "churn",
         details: { durationMs: 12_000 },
       });
+      logStage("opening the folder view");
       await openFolders();
+      logStage("opening the folder view completed");
+      logStage("clicking Download");
       await clickDownloadButton(lanBrowser, "blob.bin");
+      logStage("Download clicked; waiting for completion");
       try {
         await waitForText(lanBrowser, "Downloaded blob.bin", 300_000);
       } catch (error) {
+        logStage("completion wait failed; reading app state");
         const state = await lanBrowser.execute(() => ({
           issue: document.querySelector("p.error")?.textContent ?? "",
           transfer: document.querySelector("[data-testid='transfer-float']")?.textContent?.trim() ?? "",
@@ -341,16 +348,16 @@ describe("Syncpeer LAN integration", () => {
         throw new Error(`Large transfer did not show completion (reason: ${safeNativeFailureText(state.issue) ?? "none"}; transfer: ${safeNativeFailureText(state.transfer) ?? "none"}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 20).join(", ")}).`,
           { cause: error });
       }
-      console.log(`Large transfer completion notice appeared after ${Date.now() - startedAtMs} ms.`);
+      logStage("completion notice appeared");
       const result = await churn;
-      console.log(`Large transfer metadata churn finished after ${Date.now() - startedAtMs} ms.`);
+      logStage("metadata churn finished");
       assert.ok(result.ticks >= 4);
       const cachedHash = await readCachedHash(lanBrowser, "blob.bin");
-      console.log(`Large transfer cached digest finished after ${Date.now() - startedAtMs} ms.`);
+      logStage("cached digest finished");
       assert.equal(cachedHash,
         currentFixture.expectedFiles.find(file => file.path === "blob.bin")?.sha256,
         "A completed large transfer must match the peer's published SHA-256");
-      console.log(`Large encrypted transfer verified in ${Date.now() - startedAtMs} ms.`);
+      logStage("encrypted transfer verified");
     });
   });
 

@@ -1043,9 +1043,10 @@ export class RemoteFs {
     signal?: AbortSignal,
   ): Promise<FileDownloadResult> {
     throwIfAborted(signal);
-    await sink.begin({ sourceDeviceId: this.remoteDevice?.id, folderId, path, sizeBytes: totalBytes, encrypted, contentId });
     const blocks: RangeDigest[] = plan.flatMap((item) => item.hash?.length === 32
       ? [{ offset: item.offset, size: item.size, hash: item.hash }] : []);
+    await sink.begin({ sourceDeviceId: this.remoteDevice?.id, folderId, path, sizeBytes: totalBytes, encrypted, contentId,
+      ...(blocks.length === plan.length ? { blocks } : {}) });
     const resumed = blocks.length === plan.length && sink.digestPartialRanges && sink.resumeStorage
       ? await prepareCachedBlocks(blocks, totalBytes, sink.resumeStorage, signal) : [];
     const reusable = blocks.length === plan.length && sink.digestPartialRanges
@@ -1150,7 +1151,7 @@ export class RemoteFs {
       );
     }
     throwIfAborted(signal);
-    if (blocks.length === plan.length && sink.digestPartialRanges) {
+    if (blocks.length === plan.length && sink.digestPartialRanges && !sink.commitVerifiesBlocks) {
       for (let start = 0; start < blocks.length; start += 256) {
         throwIfAborted(signal);
         const batch = blocks.slice(start, start + 256);

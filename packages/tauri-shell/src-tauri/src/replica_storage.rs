@@ -1158,6 +1158,82 @@ pub async fn syncpeer_replica_storage(
     .map_err(|error| format!("Folder storage worker failed: {error}"))?
 }
 
+fn raw_request<'a>(request: &'a tauri::ipc::Request<'a>) -> Result<&'a [u8], String> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(bytes),
+        _ => Err("Binary folder storage requires a raw IPC body".into()),
+    }
+}
+
+fn raw_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| "Invalid binary folder storage request".to_string())?;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn raw_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "Invalid binary folder storage request".to_string())?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+#[tauri::command]
+pub async fn syncpeer_replica_storage_read_binary(
+    state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let body = raw_request(&request)?;
+    let root_id = raw_u64(body, 0)?;
+    let offset = raw_u64(body, 8)?;
+    let size = raw_u32(body, 16)? as usize;
+    let path_len = raw_u32(body, 20)? as usize;
+    if size == 0 || size > 131072 || path_len > 4096 || body.len() != 24 + path_len {
+        return Err("Invalid binary folder read request".into());
+    }
+    let path = std::str::from_utf8(&body[24..])
+        .map_err(|_| "Invalid binary folder path".to_string())?
+        .to_string();
+    let state = Arc::clone(state.inner());
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let roots = state
+            .lock()
+            .map_err(|_| "Folder handle store unavailable".to_string())?;
+        roots
+            .read(root_id, &path, offset, size)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Folder storage worker failed: {error}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub async fn syncpeer_replica_storage_write_binary(
+    state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let body = raw_request(&request)?;
+    if body.len() < 16 || body.len() > 16 + 131072 {
+        return Err("Invalid binary folder write request".into());
+    }
+    let writer_id = raw_u64(body, 0)?;
+    let offset = raw_u64(body, 8)?;
+    let payload = body[16..].to_vec();
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut roots = state
+            .lock()
+            .map_err(|_| "Folder handle store unavailable".to_string())?;
+        roots
+            .write(writer_id, offset, &payload)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Folder storage worker failed: {error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

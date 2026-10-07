@@ -18,7 +18,8 @@ import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform }
 import { createWorkerPasswordKdf } from "./passwordKdf.ts";
 import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
 
-type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+type InvokeArgs = Record<string, unknown> | number[] | ArrayBuffer | Uint8Array;
+type InvokeFn = <T>(command: string, args?: InvokeArgs) => Promise<T>;
 
 interface TauriV2Global {
   core?: {
@@ -174,36 +175,61 @@ const tryForwardUiErrorToCli = async (
 
 export const shouldLogInvokeLifecycle = (command: string): boolean =>
   command !== "syncpeer_tls_read" && command !== "syncpeer_tls_write" &&
-  command !== "syncpeer_replica_storage";
+  command !== "syncpeer_replica_storage" &&
+  command !== "syncpeer_replica_storage_read_binary" &&
+  command !== "syncpeer_replica_storage_write_binary";
 
 const createLoggedInvoke = (
   invoke: InvokeFn,
   options: CreateTauriAdaptersOptions | undefined,
-): InvokeFn => {
-  return async <T>(command: string, args?: Record<string, unknown>) => {
-    const startedAt = Date.now();
-    const shouldLogLifecycle = shouldLogInvokeLifecycle(command);
+): InvokeFn => async <T>(command: string, args?: InvokeArgs) => {
+  const startedAt = Date.now();
+  const shouldLogLifecycle = shouldLogInvokeLifecycle(command);
+  if (shouldLogLifecycle) logUi(options, "tauri.invoke.start", { command });
+  try {
+    const result = await invoke<T>(command, args);
     if (shouldLogLifecycle) {
-      logUi(options, "tauri.invoke.start", { command });
+      logUi(options, "tauri.invoke.success", { command, durationMs: Date.now() - startedAt });
     }
-    try {
-      const result = await invoke<T>(command, args);
-      if (shouldLogLifecycle) {
-        logUi(options, "tauri.invoke.success", {
-          command,
-          durationMs: Date.now() - startedAt,
-        });
-      }
-      return result;
-    } catch (error) {
-      if (command === "syncpeer_discovery_fetch" &&
-        /^(?:Error: )?Discovery request cancelled(?: or unavailable)?\.?$/.test(String(error))) throw error;
-      console.error("[syncpeer-ui] tauri.invoke.error", { command });
-      emitLog(options, "error", "tauri.invoke.error", { command });
-      void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command });
-      throw error;
-    }
-  };
+    return result;
+  } catch (error) {
+    if (command === "syncpeer_discovery_fetch" &&
+      /^(?:Error: )?Discovery request cancelled(?: or unavailable)?\.?$/.test(String(error))) throw error;
+    console.error("[syncpeer-ui] tauri.invoke.error", { command });
+    emitLog(options, "error", "tauri.invoke.error", { command });
+    void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command });
+    throw error;
+  }
+};
+
+const setU64 = (view: DataView, offset: number, value: number) => {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("Invalid native storage integer.");
+  view.setUint32(offset, value >>> 0, true);
+  view.setUint32(offset + 4, Math.floor(value / 0x1_0000_0000), true);
+};
+
+const nativeReadRequest = (rootId: number, path: string, offset: number, size: number): Uint8Array => {
+  const encodedPath = new TextEncoder().encode(path);
+  if (encodedPath.length > 4096) throw new Error("Native storage path is too long.");
+  const body = new Uint8Array(24 + encodedPath.length), view = new DataView(body.buffer);
+  setU64(view, 0, rootId); setU64(view, 8, offset);
+  view.setUint32(16, size, true); view.setUint32(20, encodedPath.length, true);
+  body.set(encodedPath, 24);
+  return body;
+};
+
+const nativeWriteRequest = (writerId: number, offset: number, bytes: Uint8Array): Uint8Array => {
+  const body = new Uint8Array(16 + bytes.length), view = new DataView(body.buffer);
+  setU64(view, 0, writerId); setU64(view, 8, offset); body.set(bytes, 16);
+  return body;
+};
+
+const rawBytes = (value: unknown, size: number): Uint8Array => {
+  const bytes = value instanceof ArrayBuffer ? new Uint8Array(value)
+    : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    : null;
+  if (!bytes || bytes.length !== size) throw new Error("Invalid binary native storage response.");
+  return bytes;
 };
 
 
@@ -242,13 +268,21 @@ export const createTauriAdapters = (
   let invoke: InvokeFn | null = null;
   let multicastLockPrepared = false;
   let localDiscoveryQueue = Promise.resolve();
-  const invokeWithLogging: InvokeFn = <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
-    if (!invoke) {
-      invoke = createLoggedInvoke(resolveInvoke(), options);
-    }
+  const invokeWithLogging: InvokeFn = <T>(command: string, args?: InvokeArgs): Promise<T> => {
+    if (!invoke) invoke = createLoggedInvoke(resolveInvoke(), options);
     return invoke<T>(command, args);
   };
   const platform = options?.runtimePlatform ?? detectRuntimePlatform();
+  const nativeStorage = (rootPath: string) => createNativeFilesystem(
+    request => invokeWithLogging("syncpeer_replica_storage", { request }), rootPath, {
+      read: async ({ rootId, path, offset, size }) => rawBytes(
+        await invokeWithLogging<ArrayBuffer>("syncpeer_replica_storage_read_binary",
+          nativeReadRequest(rootId, path, offset, size)), size),
+      write: async ({ writerId, offset, bytes }) => {
+        await invokeWithLogging("syncpeer_replica_storage_write_binary",
+          nativeWriteRequest(writerId, offset, bytes));
+      },
+    });
   let sessionConfigurationRevision = 0;
   const sessionConfigurationListeners = new Set<() => void>();
   const invalidateSessionConfiguration = () => {
@@ -260,8 +294,7 @@ export const createTauriAdapters = (
     return () => owner ??= (async () => {
       const root = async (storageId: string) => invokeWithLogging<string>("syncpeer_profile_storage_root",
         { request: { profileId: "documents", storageId } });
-      const storage = async (storageId: string) => createNativeFilesystem(
-        request => invokeWithLogging("syncpeer_replica_storage", { request }), await root(storageId));
+      const storage = async (storageId: string) => nativeStorage(await root(storageId));
       const deviceId = await invokeWithLogging<string>("syncpeer_get_default_device_id");
       let counter = 0xcbf29ce484222325n;
       for (const byte of new TextEncoder().encode(deviceId)) {
@@ -290,6 +323,30 @@ export const createTauriAdapters = (
   })();
   const documentRequest = async <T>(request: Record<string, unknown>) => {
     if (platform === "android") {
+      if (request.operation === "writeBatch") {
+        const writes = request.writes, handle = request.handle;
+        if (!Array.isArray(writes) || writes.length < 1 || writes.length > 8 ||
+          typeof handle !== "number" || !Number.isSafeInteger(handle) ||
+          writes.some(write => !write || typeof write !== "object" ||
+            typeof write.offset !== "number" || !Number.isSafeInteger(write.offset) || write.offset < 0 ||
+            !Array.isArray(write.bytes) || write.bytes.length > 131072)) {
+          throw new Error("Invalid Android document write batch.");
+        }
+        let done = 0;
+        for (const write of writes) {
+          const { offset, bytes } = write;
+          if (!Number.isSafeInteger(offset + bytes.length) ||
+            bytes.some((byte: unknown) => typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+            throw new Error("Invalid Android document write batch.");
+          }
+          const response = await invokeWithLogging<{ result: number }>("syncpeer_document_command", {
+            request: { operation: "write", handle, offset, bytes },
+          });
+          if (response.result !== bytes.length) throw new Error("Android document write was incomplete.");
+          done += bytes.length;
+        }
+        return done as T;
+      }
       const response = await invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
       return response.result;
     }
@@ -719,7 +776,7 @@ export const createTauriAdapters = (
         throw new Error("This folder uses external storage. Its existing plaintext files were left unchanged; import them through the file picker explicitly.");
       }
       const separator = file.localPath.lastIndexOf("/"), name = file.localPath.slice(separator + 1);
-      const bytes = await createNativeFilesystem(request => invokeWithLogging("syncpeer_replica_storage", { request }), file.localPath.slice(0, separator));
+      const bytes = await nativeStorage(file.localPath.slice(0, separator));
       try {
         const original = await bytes.stat(name);
         if (!original || original.type !== "file") throw new Error("Cached file is unavailable.");

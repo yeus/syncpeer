@@ -3,6 +3,7 @@ import { hashReplicaEntry, readReplicaBlock, scanReplicaIndex, type LocalReplica
 import { receiveReplicaFiles, type ReplicaDestination } from "./replicaReceive.js";
 import { advanceVersionVector, compareConcurrentVersionCounters } from "../core/protocol/versionVector.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
+import { validateBlockPlan } from "../transfer/blockReuse.js";
 
 export interface ReplicaStorage extends ReplicaDestination {
   loadIndex: () => Promise<ReplicaIndex | null>;
@@ -47,9 +48,14 @@ export function createFolderReplica(
         case "write": {
           if (old && !old.deleted && old.type === 1) throw new Error("Cannot replace a directory with a file.");
           info.size = edit.source.size;
-          info.blocks = await hashReplicaEntry({ path: edit.path, type: "file", size: edit.source.size,
-            modifiedMs: edit.modifiedMs, revision: "local-edit" },
-          { readRange: (_path, offset, size) => edit.source.readRange(offset, size) }, hash);
+          if (edit.blocks) {
+            validateBlockPlan(edit.blocks, edit.source.size);
+            info.blocks = edit.blocks.map(block => ({ ...block, hash: block.hash.slice() }));
+          } else {
+            info.blocks = await hashReplicaEntry({ path: edit.path, type: "file", size: edit.source.size,
+              modifiedMs: edit.modifiedMs, revision: "local-edit" },
+            { readRange: (_path, offset, size) => edit.source.readRange(offset, size) }, hash);
+          }
           break;
         }
         case "mkdir":

@@ -20,6 +20,11 @@ export type NativeFilesystemRequest =
   | { operation: "copy"; rootId: number; source: string; target: string }
   | { operation: "flush"; rootId: number; paths: string[] };
 
+
+export interface NativeFilesystemBinaryIo {
+  read: (request: { rootId: number; path: string; offset: number; size: number }) => Promise<Uint8Array>;
+  write: (request: { writerId: number; offset: number; bytes: Uint8Array }) => Promise<void>;
+}
 const unsigned = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
 const handle = (value: unknown): number => {
@@ -42,6 +47,7 @@ const nativeEntry = (value: unknown, parent: string): ReplicaEntry => {
 export async function createNativeFilesystem(
   request: (request: NativeFilesystemRequest) => Promise<unknown>,
   rootPath: string,
+  binary?: NativeFilesystemBinaryIo,
 ) {
   // Core declares private metadata; native storage packs the opaque bytes into SQLite.
   // File content, scratch data, and archived versions continue to use file storage.
@@ -62,6 +68,10 @@ export async function createNativeFilesystem(
   const run = (command: NativeFilesystemRequest) => {
     if (closing) return Promise.reject(new Error("Native filesystem is closed."));
     return track(Promise.resolve().then(() => request(command)));
+  };
+  const runBinary = <T>(operation: () => Promise<T>) => {
+    if (closing) return Promise.reject(new Error("Native filesystem is closed."));
+    return track(Promise.resolve().then(operation));
   };
   const close = () => {
     closing = true;
@@ -131,6 +141,11 @@ export async function createNativeFilesystem(
       if (!unsigned(offset) || !unsigned(size) || size > 131072 || !unsigned(offset + size)) throw new Error("Invalid native read range.");
       if (closing) throw new Error("Native filesystem is closed.");
       if (!size) return new Uint8Array();
+      if (binary) {
+        const bytes = await runBinary(() => binary.read({ rootId, path, offset, size }));
+        if (!(bytes instanceof Uint8Array) || bytes.length !== size) throw new Error("Invalid native file bytes.");
+        return bytes;
+      }
       const bytes = await run({ operation: "read", rootId, path, offset, size });
       if (!Array.isArray(bytes) || bytes.length !== size || bytes.some(value => !unsigned(value) || value > 255)) throw new Error("Invalid native file bytes.");
       return new Uint8Array(bytes);
@@ -144,7 +159,8 @@ export async function createNativeFilesystem(
         write: async (offset: number, bytes: Uint8Array) => {
           if (ended) throw new Error("Native file writer is closed.");
           if (!unsigned(offset) || bytes.length > 131072 || offset > size || bytes.length > size - offset) throw new Error("Invalid native write range.");
-          await run({ operation: "write", writerId, offset, bytes: Array.from(bytes) });
+          if (binary) await runBinary(() => binary.write({ writerId, offset, bytes }));
+          else await run({ operation: "write", writerId, offset, bytes: Array.from(bytes) });
         },
         commit: async () => {
           if (ended) throw new Error("Native file writer is closed.");

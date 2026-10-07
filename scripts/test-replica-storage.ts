@@ -47,6 +47,50 @@ test("replica receive passes full metadata to the shared streaming encrypted sin
   } finally { metadata.fileKey.fill(0); folder.folderKey.fill(0); }
 });
 
+test("preverified local block plans avoid the extra source hashing pass", async () => {
+  const source = Uint8Array.from({ length: 131075 }, (_, index) => index % 251);
+  const blocks = [0, 131072].map(offset => ({
+    offset,
+    size: Math.min(131072, source.length - offset),
+    hash: sha256(source.slice(offset, offset + 131072)),
+  }));
+  let index: ReplicaIndex | null = null;
+  let published: Uint8Array | undefined;
+  let sourceReads = 0;
+  const replica = createFolderReplica({
+    withLock: async operation => operation(),
+    listEntries: async () => published
+      ? [{ path: "file", type: "file", size: published.length, modifiedMs: 1000, revision: "published" }]
+      : [],
+    readRange: async () => assert.fail("No existing file"),
+    loadIndex: async () => index,
+    saveIndex: async value => { index = structuredClone(value); },
+    flushChanges: async () => {},
+    archive: async () => assert.fail("No replacement expected"),
+    makeDirectory: async () => assert.fail("No directory expected"),
+    remove: async () => assert.fail("No deletion expected"),
+    createSink: async info => {
+      const bytes = new Uint8Array(Number(info.size));
+      return {
+        begin: async () => {},
+        write: async (offset: number, chunk: Uint8Array) => { bytes.set(chunk, offset); },
+        commit: async () => { published = bytes; },
+        abort: async error => { throw error; },
+      };
+    },
+  }, "1", sha256);
+  await replica.edit!({
+    method: "write", folderId: "fixture-folder", path: "file", expectedVersion: null, modifiedMs: 1000,
+    blocks,
+    source: { size: source.length, readRange: async (offset, size) => {
+      sourceReads++;
+      return source.slice(offset, offset + size);
+    } },
+  });
+  assert.equal(sourceReads, blocks.length, "Each source block should be read exactly once during publication");
+  assert.deepEqual(published, source);
+});
+
 test("shared replica owner locks mutations, publishes durable indexes and verifies served bytes", async () => {
   let index: ReplicaIndex | null = null;
   let locked = false;

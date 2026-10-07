@@ -4803,6 +4803,8 @@ pub fn run() {
             vault_secret::syncpeer_vault_secret,
             local_reset::syncpeer_reset_local_data,
             replica_storage::syncpeer_replica_storage,
+            replica_storage::syncpeer_replica_storage_read_binary,
+            replica_storage::syncpeer_replica_storage_write_binary,
             documents::syncpeer_document_command,
             syncpeer_read_text_file,
             syncpeer_read_binary_file,

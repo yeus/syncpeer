@@ -135,8 +135,13 @@ export function createDocumentCache(options: {
   };
   const sink = (folderId: string, path: string, modifiedMs = 0, expectedLocalHash?: string | null): FileDownloadSink => {
     let handle: number | undefined;
+    let aborting = false;
     let metadata: Parameters<FileDownloadSink["begin"]>[0] | undefined;
     let completedRanges: Array<{ offset: number; size: number }> = [];
+    const pendingWrites: Array<{ offset: number; bytes: Uint8Array; resolve: () => void;
+      reject: (error: unknown) => void }> = [];
+    let pendingFlushTimer: ReturnType<typeof setTimeout> | undefined;
+    let flushingWrites: Promise<void> | undefined;
     const rememberRange = (offset: number, size: number) => {
       const ranges = [...completedRanges.map(range => ({ offset: range.offset, end: range.offset + range.size })),
         { offset, end: offset + size }].sort((left, right) => left.offset - right.offset);
@@ -147,6 +152,60 @@ export function createDocumentCache(options: {
         } else result.push({ offset: range.offset, size: range.end - range.offset });
         return result;
       }, []);
+    };
+    const scheduleFlush = () => {
+      if (pendingFlushTimer !== undefined) return;
+      pendingFlushTimer = setTimeout(() => {
+        pendingFlushTimer = undefined;
+        void flushPendingWrites().catch(() => {});
+      }, 4);
+    };
+    const flushPendingWrites = async (): Promise<void> => {
+      if (flushingWrites) {
+        await flushingWrites.catch(() => {});
+        if (pendingWrites.length) await flushPendingWrites();
+        return;
+      }
+      if (pendingFlushTimer !== undefined) {
+        clearTimeout(pendingFlushTimer);
+        pendingFlushTimer = undefined;
+      }
+      const batch = pendingWrites.splice(0, 8);
+      if (!batch.length) return;
+      const task = (async () => {
+        try {
+          if (handle === undefined) throw new Error("Download has not started.");
+          await request({ operation: "writeBatch", handle, writes: batch.map(({ offset, bytes }) => ({
+            offset, bytes: Array.from(bytes),
+          })) });
+          batch.forEach(write => { rememberRange(write.offset, write.bytes.length); write.resolve(); });
+        } catch (error) {
+          batch.forEach(write => write.reject(error));
+          throw error;
+        } finally {
+          batch.forEach(write => write.bytes.fill(0));
+        }
+      })();
+      flushingWrites = task;
+      try { await task; }
+      finally {
+        if (flushingWrites === task) flushingWrites = undefined;
+        if (pendingWrites.length >= 8) void flushPendingWrites().catch(() => {});
+        else if (pendingWrites.length) scheduleFlush();
+      }
+    };
+    const enqueueWrite = (offset: number, bytes: Uint8Array) => new Promise<void>((resolve, reject) => {
+      pendingWrites.push({ offset, bytes: bytes.slice(), resolve, reject });
+      if (pendingWrites.length >= 8) void flushPendingWrites().catch(() => {});
+      else scheduleFlush();
+    });
+    const cancelPendingWrites = (error: unknown) => {
+      if (pendingFlushTimer !== undefined) clearTimeout(pendingFlushTimer);
+      pendingFlushTimer = undefined;
+      for (const write of pendingWrites.splice(0)) {
+        write.bytes.fill(0);
+        write.reject(error);
+      }
     };
     const digestRanges = async (source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) => {
       const result: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
@@ -159,9 +218,11 @@ export function createDocumentCache(options: {
       return result;
     };
     return {
+      commitVerifiesBlocks: true,
       digestCachedRanges: ranges => digestRanges("cached", ranges),
-      digestPartialRanges: ranges => digestRanges("partial", ranges),
+      digestPartialRanges: async ranges => { await flushPendingWrites(); return digestRanges("partial", ranges); },
       copyCachedRanges: async ranges => {
+        await flushPendingWrites();
         for (let offset = 0; offset < ranges.length; offset += 256) {
           await request({ operation: "copyRanges", handle, ranges: ranges.slice(offset, offset + 256) });
         }
@@ -172,28 +233,40 @@ export function createDocumentCache(options: {
           return;
         }
         handle = await request<number>({ operation: "beginDownload", folderId, path, size: value.sizeBytes, modifiedMs,
-          expectedLocalHash, encrypted: value.encrypted, sourceDeviceId: value.sourceDeviceId, contentId: value.contentId });
+          expectedLocalHash, encrypted: value.encrypted, sourceDeviceId: value.sourceDeviceId, contentId: value.contentId,
+          ...(value.blocks ? { blocks: value.blocks.map(block => ({
+            offset: block.offset, size: block.size, hash: Array.from(block.hash),
+          })) } : {}) });
         completedRanges = await request<Array<{ offset: number; size: number }>>({ operation: "downloadRanges", handle });
         metadata = value;
       },
       write: async (offset, bytes) => {
-        if (handle === undefined) throw new Error("Download has not started.");
-        for (let done = 0; done < bytes.length; done += 131072) {
-          const chunk = bytes.subarray(done, done + 131072);
-          await request({ operation: "write", handle, offset: offset + done, bytes: Array.from(chunk) });
-          rememberRange(offset + done, chunk.length);
+        if (handle === undefined || aborting) throw new Error("Download is not writable.");
+        for (let done = 0; done < bytes.length;) {
+          const batch: Promise<void>[] = [];
+          for (let count = 0; count < 8 && done < bytes.length; count += 1) {
+            const chunk = bytes.subarray(done, done + 131072);
+            batch.push(enqueueWrite(offset + done, chunk));
+            done += chunk.length;
+          }
+          await Promise.all(batch);
         }
       },
       hasRange: (offset, size) => completedRanges.some(range => offset >= range.offset && offset + size <= range.offset + range.size),
-      digestFile: () => request<string>({ operation: "digest", handle }),
+      digestFile: async () => { await flushPendingWrites(); return request<string>({ operation: "digest", handle }); },
       commit: async () => {
         if (handle === undefined) throw new Error("Download has not started.");
+        await flushPendingWrites();
         await request({ operation: "finishDownload", handle }); handle = undefined;
       },
-      abort: async () => {
+      abort: async error => {
+        aborting = true;
+        cancelPendingWrites(error ?? new Error("Download aborted."));
+        if (flushingWrites) await flushingWrites.catch(() => {});
         if (handle !== undefined) { await request({ operation: "release", handle, abort: true }); handle = undefined; }
       },
       suspend: async () => {
+        await flushPendingWrites();
         if (handle !== undefined) { await request({ operation: "suspendDownload", handle }); handle = undefined; }
       },
     };

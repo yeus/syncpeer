@@ -74,6 +74,34 @@ test("native filesystem adapter maps directory entries and bounded reads without
   assert.equal(requests.filter(request => request.operation === "release").length, 1);
 });
 
+test("native filesystem adapter keeps bulk bytes on the binary path", async () => {
+  const requests: string[] = [];
+  const binaryReads: Array<{ rootId: number; path: string; offset: number; size: number }> = [];
+  const binaryWrites: Array<{ writerId: number; offset: number; bytes: Uint8Array }> = [];
+  const fs = await createNativeFilesystem(async request => {
+    requests.push(request.operation);
+    if (request.operation === "register") return 7;
+    if (request.operation === "begin") return 11;
+    return null;
+  }, "/synthetic-root", {
+    read: async request => {
+      binaryReads.push(request);
+      return Uint8Array.of(1, 2, 3);
+    },
+    write: async request => { binaryWrites.push({ ...request, bytes: request.bytes.slice() }); },
+  });
+  assert.deepEqual(await fs.readRange("file", 4, 3), Uint8Array.of(1, 2, 3));
+  const sink = await fs.createSink("file", 3);
+  await sink.write(0, Uint8Array.of(4, 5, 6));
+  await sink.commit();
+  assert.deepEqual(binaryReads, [{ rootId: 7, path: "file", offset: 4, size: 3 }]);
+  assert.deepEqual(binaryWrites, [{ writerId: 11, offset: 0, bytes: Uint8Array.of(4, 5, 6) }]);
+  assert.equal(requests.includes("read"), false);
+  assert.equal(requests.includes("write"), false);
+  assert.deepEqual(requests, ["register", "begin", "commit"]);
+  await fs.close();
+});
+
 test("native root closure waits for accepted I/O and rejects new work", async () => {
   const events: string[] = [];
   let finish!: () => void;

@@ -52,6 +52,21 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return { offset: value.offset as number, size: value.size as number };
     });
   };
+  const blocks = () => {
+    if (command.blocks === undefined) return undefined;
+    if (!Array.isArray(command.blocks)) throw new Error("Invalid download blocks.");
+    return command.blocks.map(value => {
+      if (!value || typeof value !== "object") throw new Error("Invalid download block.");
+      const block = value as Record<string, unknown>;
+      if (typeof block.offset !== "number" || !Number.isSafeInteger(block.offset) || block.offset < 0 ||
+        typeof block.size !== "number" || !Number.isSafeInteger(block.size) || block.size < 0 ||
+        !Array.isArray(block.hash) || block.hash.length !== 32 ||
+        block.hash.some(byte => typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+        throw new Error("Invalid download block.");
+      }
+      return { offset: block.offset, size: block.size, hash: new Uint8Array(block.hash) };
+    });
+  };
   switch (command.operation) {
     case "status": case "cacheRegistrations": return documents.status();
     case "connectionPasswords": return documents.connectionPasswords();
@@ -201,6 +216,7 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
         encrypted: command.encrypted,
         ...(command.sourceDeviceId === undefined ? {} : { sourceDeviceId: text("sourceDeviceId") }),
         ...(command.contentId === undefined ? {} : { contentId: text("contentId") }),
+        ...(command.blocks === undefined ? {} : { blocks: blocks() }),
       });
     }
     case "downloadRanges": return documents.downloadRanges(integer("handle"));
@@ -248,6 +264,35 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       const bytes = new Uint8Array(value);
       try { await documents.write(integer("handle"), integer("offset"), bytes); return bytes.length; }
       finally { bytes.fill(0); value.fill(0); }
+    }
+    case "writeBatch": {
+      const values = command.writes;
+      if (!Array.isArray(values) || values.length < 1 || values.length > 8) {
+        throw new Error("Invalid document write batch.");
+      }
+      let total = 0;
+      for (const value of values) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid document write batch.");
+        const write = value as Record<string, unknown>;
+        if (!Number.isSafeInteger(write.offset) || Number(write.offset) < 0 ||
+          !Array.isArray(write.bytes) || write.bytes.length > 131072) throw new Error("Invalid document write batch.");
+        for (const byte of write.bytes) {
+          if (!Number.isInteger(byte) || byte < 0 || byte > 255) throw new Error("Invalid document write batch.");
+        }
+        total += write.bytes.length;
+        if (total > 8 * 131072 || !Number.isSafeInteger(Number(write.offset) + write.bytes.length)) {
+          throw new Error("Invalid document write batch.");
+        }
+      }
+      const writes = values.map(value => {
+        const write = value as { offset: number; bytes: number[] };
+        return { offset: write.offset, bytes: new Uint8Array(write.bytes) };
+      });
+      try { await documents.writeBatch(integer("handle"), writes); return total; }
+      finally {
+        writes.forEach(write => write.bytes.fill(0));
+        values.forEach(value => ((value as { bytes: number[] }).bytes).fill(0));
+      }
     }
     case "flush": return documents.flush(integer("handle"));
     case "release": {

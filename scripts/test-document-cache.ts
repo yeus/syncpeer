@@ -567,3 +567,73 @@ test("encrypted downloads resume verified ranges after a document runtime restar
   await changed.abort(new Error("Synthetic cleanup"));
   await documents.close();
 });
+
+test("encrypted downloads batch bounded document writes and recover the acknowledged batch", async t => {
+  const { openStorage } = memoryDocumentStorage();
+  let secret: string | null = null;
+  const opened: Array<Awaited<ReturnType<typeof createDocumentFilesystem>>> = [];
+  const openDocuments = async () => {
+    const documents = createDocumentFilesystem({ profileId: "batched-download-fixture", deviceCounterId: "42",
+      openStorage, availableBytes: async () => 1024 * 1024 * 1024,
+      profile: await openStorage("profile"), randomBytes, rememberedSecret: {
+        isDeviceUnlocked: async () => true, load: async () => secret,
+        save: async value => { secret = value; }, remove: async () => { secret = null; },
+      } });
+    await documents.initialize();
+    if ((await documents.status()).vault.phase === "uninitialized") {
+      await documents.createVault("synthetic-master-password", true);
+    }
+    opened.push(documents);
+    return documents;
+  };
+  t.after(() => Promise.all(opened.map(documents => documents.close())));
+  const operations: string[] = [];
+  const writeBatchSizes: number[] = [];
+  const createCache = (documents: Awaited<ReturnType<typeof openDocuments>>) => createDocumentCache({
+    enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      operations.push(String(input.operation));
+      if (input.operation === "writeBatch") {
+        writeBatchSizes.push(Array.isArray(input.writes) ? input.writes.length :
+          Array.isArray(input.chunks) ? input.chunks.length : 0);
+      }
+      return await dispatchDocumentCommand(documents, input) as T;
+    },
+    legacy: { listCachedFiles: async () => [] },
+    openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+
+  let documents = await openDocuments(), cache = createCache(documents);
+  await cache.connectFolder({ id: "batch", label: "Batch", password: "synthetic-folder-password" });
+  const size = 1024 * 1024;
+  const expected = Uint8Array.from({ length: size }, (_, index) => index % 251);
+  const metadata = { sourceDeviceId: "synthetic-peer", folderId: "batch", path: "batch.bin",
+    sizeBytes: size, encrypted: false, contentId: "blocks:synthetic-batch" };
+  const first = await cache.platformAdapter.createFileDownloadSink!({ folderId: "batch", path: "batch.bin",
+    name: "batch.bin", modifiedMs: 1000 });
+  await first.begin(metadata);
+  operations.length = 0;
+  const blockSize = 131072;
+  await Promise.all(Array.from({ length: 8 }, (_, index) => {
+    const block = 7 - index;
+    return first.write(block * blockSize, expected.subarray(block * blockSize, (block + 1) * blockSize));
+  }));
+  assert.deepEqual(operations.filter(operation => operation === "writeBatch"), ["writeBatch"],
+    "Eight concurrent download blocks should cross the document command boundary once.");
+  assert.deepEqual(writeBatchSizes, [8], "The batch should preserve each block's independent offset.");
+  assert.equal(operations.includes("write"), false,
+    "Download writes keep the existing 128 KiB block limit inside the batch.");
+  await first.suspend!();
+  await documents.close();
+
+  documents = await openDocuments();
+  cache = createCache(documents);
+  const resumed = await cache.platformAdapter.createFileDownloadSink!({ folderId: "batch", path: "batch.bin",
+    name: "batch.bin", modifiedMs: 1000 });
+  await resumed.begin(metadata);
+  assert.equal(resumed.hasRange!(0, size), true, "The acknowledged batch must survive a runtime restart.");
+  await resumed.commit();
+  const stored = (await cache.platformAdapter.listCachedFiles!()).find(file => file.path === "batch.bin");
+  assert.ok(stored?.localPath);
+  assert.deepEqual(await cache.platformAdapter.readBinaryFile!(stored.localPath), expected);
+});

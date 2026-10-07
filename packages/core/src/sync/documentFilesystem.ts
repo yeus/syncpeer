@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
+import { validateBlockPlan, type RangeDigest } from "../transfer/blockReuse.js";
 import { deriveUntrustedFolderCrypto, encryptUntrustedFilename } from "../core/model/untrusted.js";
 import type { PasswordKdf } from "../core/model/passwordKdf.js";
 import { createCredentialVault, type RememberedUnlockSecretStore } from "./credentialVault.js";
@@ -72,8 +73,8 @@ interface DownloadMetadata {
   encrypted: boolean;
   sourceDeviceId?: string;
   contentId?: string;
+  blocks?: readonly RangeDigest[];
 }
-
 interface CacheCandidate {
   key: string;
   sizeBytes: number;
@@ -441,6 +442,34 @@ const writeToHandle = async (
   if (value.download && bytes.length) {
     value.download.ranges = value.writer.downloadRanges();
   }
+};
+
+const writeBatchToHandle = async (
+  runtime: DocumentRuntime,
+  id: number,
+  input: readonly { offset: number; bytes: Uint8Array }[],
+): Promise<void> => {
+  const value = requireHandle(runtime, id);
+  if (!value.writer) throw new Error("Document is read only.");
+  if (!Array.isArray(input) || input.length > 8 || input.some(write =>
+    !Number.isSafeInteger(write.offset) || write.offset < 0 || write.bytes.length > 131072 ||
+    !Number.isSafeInteger(write.offset + write.bytes.length)) ||
+    input.reduce((total, write) => total + write.bytes.length, 0) > 8 * 131072) {
+    throw new Error("Invalid document write batch.");
+  }
+  let appendOffset = value.append ? await value.writer.size() : 0;
+  const writes = input.map(write => {
+    const offset = value.append ? appendOffset : write.offset;
+    if (value.append) appendOffset += write.bytes.length;
+    return { offset, bytes: write.bytes };
+  });
+  if (writes.some(write => value.download && write.offset + write.bytes.length > value.download.size)) {
+    throw new Error("Download write exceeds expected size.");
+  }
+  if (writes.every(write => !write.bytes.length)) return;
+  await value.writer.writeBatch(writes);
+  value.dirty = true;
+  if (value.download) value.download.ranges = value.writer.downloadRanges();
 };
 
 const touchCachedFile = async (
@@ -847,6 +876,7 @@ const beginDownloadAction = async (
   metadata: DownloadMetadata,
 ): Promise<number> => {
   assertDownloadRequest(runtime, size, modifiedMs, path);
+  if (metadata.blocks) validateBlockPlan(metadata.blocks, size);
   const folder = runtime.registry?.getState().find(folder => folder.id === folderId);
   if (!folder) throw new Error("Document folder is unavailable.");
   const documentId = JSON.stringify([folder.storageId, path]);
@@ -857,7 +887,8 @@ const beginDownloadAction = async (
     replica: file.replica, folderKey: runtime.folderKeys.get(folder.storageId)!, randomBytes: runtime.options.randomBytes,
     download: { folderId, path, sizeBytes: size, modifiedMs, encrypted: metadata.encrypted,
       ...(metadata.sourceDeviceId ? { sourceDeviceId: metadata.sourceDeviceId } : {}),
-      ...(metadata.contentId ? { contentId: metadata.contentId } : {}) } });
+      ...(metadata.contentId ? { contentId: metadata.contentId } : {}),
+      ...(metadata.blocks ? { blocks: metadata.blocks } : {}) } });
   const reader = await openExistingReader(file.replica, path, writer);
   const id = ++runtime.nextHandle;
   runtime.handles.set(id, { documentId, writer, reader, dirty: true,
@@ -885,8 +916,9 @@ const finishDownloadAction = async (runtime: DocumentRuntime, id: number): Promi
     (download.ranges.length !== 1 || download.ranges[0].offset !== 0 || download.ranges[0].end !== download.size))) {
     throw new Error("Download is incomplete.");
   }
-  const hash = [...await value.writer.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
-  await value.writer.flush(false, download.modifiedMs);
+  const digest = await value.writer.flush(false, download.modifiedMs);
+  if (!(digest instanceof Uint8Array) || digest.length !== 32) throw new Error("Download digest is unavailable.");
+  const hash = [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
   const file = resolveDocument(runtime, value.documentId);
   await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: runtime.folderKeys.get(file.folder.storageId)!,
     randomBytes: runtime.options.randomBytes, baseline: { hash, sizeBytes: download.size, modifiedMs: download.modifiedMs } });
@@ -1546,6 +1578,8 @@ const createHandleActions = (runtime: DocumentRuntime) => ({
     return (value.writer ?? value.reader!).readRange(offset, size);
   }),
   write: (id: number, offset: number, bytes: Uint8Array) => runQueued(runtime, () => writeToHandle(runtime, id, offset, bytes)),
+  writeBatch: (id: number, writes: readonly { offset: number; bytes: Uint8Array }[]) =>
+    runQueued(runtime, () => writeBatchToHandle(runtime, id, writes)),
   flush: (id: number) => runQueued(runtime, () => flushHandleAction(runtime, id)),
   release: (id: number, abort = false) => runQueued(runtime, () => releaseHandleAction(runtime, id, abort)),
 });

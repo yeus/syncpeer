@@ -1,12 +1,13 @@
 //! SQLCipher-backed private records shared by the desktop bridge and Android service JNI.
 //! Document payload encryption remains in TypeScript; the database also encrypts local metadata.
-use rusqlite::{backup::Backup, params, Connection, OptionalExtension};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use rusqlite::{backup::Backup, params, Connection, OptionalExtension};
 #[cfg(test)]
 use sha2::Digest;
+use sha2::Sha256;
 use std::{
-    fs, io::{self, Write},
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -40,7 +41,8 @@ fn check_metadata_key(base: &Path, key: &[u8; 32]) -> io::Result<()> {
         return Err(error("metadata root symlink is forbidden"));
     }
     fs::create_dir_all(base)?;
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
     }
@@ -51,11 +53,18 @@ fn check_metadata_key(base: &Path, key: &[u8; 32]) -> io::Result<()> {
     if !marker.exists() {
         let folders = base.join("folders");
         if folders.is_dir() && fs::read_dir(folders)?.next().is_some() {
-            return Err(error("metadata key check is missing; restore or reset local storage"));
+            return Err(error(
+                "metadata key check is missing; restore or reset local storage",
+            ));
         }
-        match fs::OpenOptions::new().write(true).create_new(true).open(&marker) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
             Ok(mut file) => {
-                #[cfg(unix)] {
+                #[cfg(unix)]
+                {
                     use std::os::unix::fs::PermissionsExt;
                     file.set_permissions(fs::Permissions::from_mode(0o600))?;
                 }
@@ -258,7 +267,9 @@ impl MetadataDatabase {
                 .map_err(error)?
                 .run_to_completion(128, Duration::from_millis(10), None)
                 .map_err(error)?;
-            let check: String = output.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(error)?;
+            let check: String = output
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(error)?;
             if check != "ok" {
                 return Err(error("encrypted backup integrity validation failed"));
             }
@@ -314,11 +325,16 @@ mod tests {
         let marker = b"synthetic-private-record";
         let db = MetadataDatabase::open(&state, &root, "fixture", &key).unwrap();
         let plain_path_hash = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
-        assert_ne!(db.directory.file_name().unwrap().to_string_lossy(), plain_path_hash);
+        assert_ne!(
+            db.directory.file_name().unwrap().to_string_lossy(),
+            plain_path_hash
+        );
         db.put("private", "secret", marker, 0).unwrap();
         let wal = db.directory.join("metadata.sqlite3-wal");
         let wal_contents = fs::read(&wal).unwrap();
-        assert!(!wal_contents.windows(marker.len()).any(|window| window == marker));
+        assert!(!wal_contents
+            .windows(marker.len())
+            .any(|window| window == marker));
         let backup = temp.path().join("backup.sqlite3");
         db.backup(&backup).unwrap();
         let database = db.directory.join("metadata.sqlite3");
@@ -326,18 +342,29 @@ mod tests {
         for path in [&database, &backup] {
             let contents = fs::read(path).unwrap();
             assert!(!contents.starts_with(b"SQLite format 3"));
-            assert!(!contents.windows(marker.len()).any(|window| window == marker));
+            assert!(!contents
+                .windows(marker.len())
+                .any(|window| window == marker));
         }
         let backup_connection = Connection::open(&backup).unwrap();
         key_connection(&backup_connection, &key).unwrap();
-        let backed_up: Vec<u8> = backup_connection.query_row(
-            "SELECT value FROM records WHERE namespace = 'private' AND id = 'secret'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let backed_up: Vec<u8> = backup_connection
+            .query_row(
+                "SELECT value FROM records WHERE namespace = 'private' AND id = 'secret'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(backed_up, marker);
         assert!(MetadataDatabase::open(&state, &root, "fixture", &[8u8; 32]).is_err());
-        assert_eq!(MetadataDatabase::open(&state, &root, "fixture", &key)
-            .unwrap().get("private", "secret").unwrap().unwrap(), marker);
+        assert_eq!(
+            MetadataDatabase::open(&state, &root, "fixture", &key)
+                .unwrap()
+                .get("private", "secret")
+                .unwrap()
+                .unwrap(),
+            marker
+        );
         fs::remove_file(state.join("key-check")).unwrap();
         assert!(MetadataDatabase::open(&state, &root, "fixture", &key).is_err());
     }

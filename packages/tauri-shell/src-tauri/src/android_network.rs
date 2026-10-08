@@ -80,16 +80,22 @@ fn execute(
         "tlsListen" => {
             let input: TlsListenRequest = serde_json::from_value(request.clone())
                 .map_err(|error| format!("Invalid TLS listen request: {error}"))?;
-            let response = open_tls_listener(network.tls_store.clone(),
-                network.tls_listener_store.clone(), input)?;
+            let response = open_tls_listener(
+                network.tls_store.clone(),
+                network.tls_listener_store.clone(),
+                input,
+            )?;
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode TLS listener response: {error}"))?)
         }
         "relayListen" => {
             let input: RelayListenRequest = serde_json::from_value(request.clone())
                 .map_err(|error| format!("Invalid relay listen request: {error}"))?;
-            let response = open_relay_listener(network.tls_store.clone(),
-                network.tls_listener_store.clone(), input)?;
+            let response = open_relay_listener(
+                network.tls_store.clone(),
+                network.tls_listener_store.clone(),
+                input,
+            )?;
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode relay listener response: {error}"))?)
         }
@@ -186,7 +192,9 @@ fn execute(
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode discovery response: {error}"))?)
         }
-        "discoveryPrepare" => Ok(serde_json::json!(discovery::prepare(&network.discovery_store)?)),
+        "discoveryPrepare" => Ok(serde_json::json!(discovery::prepare(
+            &network.discovery_store
+        )?)),
         "discoveryCancel" => {
             let input: DiscoveryCancelRequest = serde_json::from_value(request.clone())
                 .map_err(|error| format!("Invalid discovery cancellation: {error}"))?;
@@ -196,7 +204,8 @@ fn execute(
         "discoveryFetch" => {
             let input: DiscoveryFetchRequest = serde_json::from_value(request.clone())
                 .map_err(|error| format!("Invalid discovery request: {error}"))?;
-            let response = tauri::async_runtime::block_on(discovery::fetch(&network.discovery_store, input))?;
+            let response =
+                tauri::async_runtime::block_on(discovery::fetch(&network.discovery_store, input))?;
             serde_json::to_value(response).map_err(|error| error.to_string())
         }
         _ => Err(format!("Unknown network operation: {operation}")),
@@ -273,7 +282,9 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
     mut env: JNIEnv,
     object: JObject,
 ) {
-    if let Ok(network) = unsafe { env.take_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") } {
+    if let Ok(network) =
+        unsafe { env.take_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") }
+    {
         discovery::cancel_all(&network.discovery_store);
     }
 }

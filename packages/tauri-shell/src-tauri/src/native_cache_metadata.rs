@@ -35,15 +35,21 @@ impl NativeCacheMetadata {
             .map_err(|error| format!("Could not parse {}: {error}", legacy.display()))?;
         if let Some(stored) = stored {
             if stored != decoded {
-                return Err(format!("Encrypted metadata conflicts with {}", legacy.display()));
+                return Err(format!(
+                    "Encrypted metadata conflicts with {}",
+                    legacy.display()
+                ));
             }
             fs::remove_file(legacy)
                 .map_err(|error| format!("Could not remove {}: {error}", legacy.display()))?;
             return Ok(Some(stored));
         }
-        self.database.put("private", name, &plaintext, 0)
+        self.database
+            .put("private", name, &plaintext, 0)
             .map_err(|error| error.to_string())?;
-        let verified = self.database.get("private", name)
+        let verified = self
+            .database
+            .get("private", name)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Encrypted metadata read-back failed".to_string())?;
         if verified != plaintext {
@@ -56,9 +62,14 @@ impl NativeCacheMetadata {
 
     pub fn save<T: Serialize>(&self, name: &str, value: &T) -> Result<(), String> {
         let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-        self.database.put("private", name, &bytes, 0)
+        self.database
+            .put("private", name, &bytes, 0)
             .map_err(|error| error.to_string())?;
-        if self.database.get("private", name).map_err(|error| error.to_string())?.as_deref()
+        if self
+            .database
+            .get("private", name)
+            .map_err(|error| error.to_string())?
+            .as_deref()
             != Some(bytes.as_slice())
         {
             return Err("Encrypted metadata read-back changed the saved value".into());
@@ -67,9 +78,11 @@ impl NativeCacheMetadata {
     }
 
     pub fn list<T: DeserializeOwned>(&self, prefix: &str) -> Result<Vec<(String, T)>, String> {
-        self.names(prefix)?.into_iter()
+        self.names(prefix)?
+            .into_iter()
             .map(|name| {
-                let value = self.load(&name)?
+                let value = self
+                    .load(&name)?
                     .ok_or_else(|| "Encrypted metadata entry disappeared".to_string())?;
                 Ok((name, value))
             })
@@ -77,7 +90,10 @@ impl NativeCacheMetadata {
     }
 
     pub fn names(&self, prefix: &str) -> Result<Vec<String>, String> {
-        Ok(self.database.entries().map_err(|error| error.to_string())?
+        Ok(self
+            .database
+            .entries()
+            .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|entry| entry.name.starts_with(prefix))
             .map(|entry| entry.name)
@@ -85,7 +101,9 @@ impl NativeCacheMetadata {
     }
 
     pub fn remove(&self, name: &str) -> Result<(), String> {
-        self.database.remove(name).map_err(|error| error.to_string())
+        self.database
+            .remove(name)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -119,14 +137,24 @@ mod tests {
             .unwrap()
             .flat_map(|entry| fs::read_dir(entry.unwrap().path()).unwrap())
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("metadata.sqlite3"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("metadata.sqlite3")
+            })
             .map(|entry| fs::read(entry.path()).unwrap())
             .collect::<Vec<_>>();
         assert!(!encrypted.is_empty());
-        assert!(encrypted.iter().all(|bytes| !bytes.windows(marker.len()).any(|part| part == marker.as_bytes())));
+        assert!(encrypted.iter().all(|bytes| !bytes
+            .windows(marker.len())
+            .any(|part| part == marker.as_bytes())));
 
         let reopened = NativeCacheMetadata::open(&metadata, &cache, &[7; 32]).unwrap();
-        assert_eq!(reopened.load::<Fixture>("index").unwrap().unwrap(), migrated);
+        assert_eq!(
+            reopened.load::<Fixture>("index").unwrap().unwrap(),
+            migrated
+        );
     }
 
     #[test]
@@ -137,12 +165,23 @@ mod tests {
         let legacy = temp.path().join("partial.json");
         fs::write(&legacy, b"not-json").unwrap();
         let store = NativeCacheMetadata::open(&metadata, &cache, &[7; 32]).unwrap();
-        assert!(store.load_or_migrate::<Fixture>("partial/one", &legacy).is_err());
+        assert!(store
+            .load_or_migrate::<Fixture>("partial/one", &legacy)
+            .is_err());
         assert!(legacy.exists());
 
-        store.save("partial/one", &Fixture { private_name: "stored".into() }).unwrap();
+        store
+            .save(
+                "partial/one",
+                &Fixture {
+                    private_name: "stored".into(),
+                },
+            )
+            .unwrap();
         fs::write(&legacy, br#"{"private_name":"different"}"#).unwrap();
-        assert!(store.load_or_migrate::<Fixture>("partial/one", &legacy).is_err());
+        assert!(store
+            .load_or_migrate::<Fixture>("partial/one", &legacy)
+            .is_err());
         assert!(legacy.exists());
     }
 }

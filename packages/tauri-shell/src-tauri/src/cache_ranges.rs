@@ -15,7 +15,11 @@ pub struct RangeDigest {
     pub hash: Vec<u8>,
 }
 
-fn consume_range(source: &mut (impl Read + Seek), range: &CacheRange, mut consume: impl FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+fn consume_range(
+    source: &mut (impl Read + Seek),
+    range: &CacheRange,
+    mut consume: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     source.seek(SeekFrom::Start(range.offset))?;
     let mut buffer = vec![0; 256 * 1024];
     let mut remaining = range.size;
@@ -28,13 +32,23 @@ fn consume_range(source: &mut (impl Read + Seek), range: &CacheRange, mut consum
     Ok(())
 }
 
-pub fn digest_range(source: &mut (impl Read + Seek), range: &CacheRange) -> std::io::Result<Vec<u8>> {
+pub fn digest_range(
+    source: &mut (impl Read + Seek),
+    range: &CacheRange,
+) -> std::io::Result<Vec<u8>> {
     let mut hash = Sha256::new();
-    consume_range(source, range, |bytes| { hash.update(bytes); Ok(()) })?;
+    consume_range(source, range, |bytes| {
+        hash.update(bytes);
+        Ok(())
+    })?;
     Ok(hash.finalize().to_vec())
 }
 
-pub fn copy_range(source: &mut (impl Read + Seek), target: &mut (impl Write + Seek), range: &CacheRange) -> std::io::Result<()> {
+pub fn copy_range(
+    source: &mut (impl Read + Seek),
+    target: &mut (impl Write + Seek),
+    range: &CacheRange,
+) -> std::io::Result<()> {
     target.seek(SeekFrom::Start(range.offset))?;
     consume_range(source, range, |bytes| target.write_all(bytes))
 }

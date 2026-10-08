@@ -66,7 +66,9 @@ pub async fn syncpeer_reset_local_data(
             app_owned_path(path, identifier)?;
         }
         crate::vault_secret::ensure_local_reset_credentials_available()?;
-        let result = paths.iter().try_for_each(|path| clear_app_directory(path, identifier))
+        let result = paths
+            .iter()
+            .try_for_each(|path| clear_app_directory(path, identifier))
             .and_then(|_| crate::vault_secret::remove_local_reset_credentials());
         let closing = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -116,5 +118,4 @@ mod tests {
             b"synthetic-external-data"
         );
     }
-
 }

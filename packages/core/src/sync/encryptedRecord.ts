@@ -6,6 +6,7 @@ import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 /** Private records use the same Syncthing file encoding as file contents. */
 export async function writeEncryptedRecord(args: Pick<Parameters<typeof writeEncryptedDiskFile>[0], "folderKey" | "randomBytes" | "createSink" | "signal"> & {
   name: string; bytes: Uint8Array;
+  writeFile?: (path: string, bytes: Uint8Array) => Promise<void>;
 }) {
   assertReplicaPath(args.name);
   if (!isInternalReplicaPath(args.name)) throw new Error("Encrypted record must be private.");
@@ -15,12 +16,30 @@ export async function writeEncryptedRecord(args: Pick<Parameters<typeof writeEnc
     const chunk = args.bytes.subarray(offset, offset + 131072);
     blocks.push({ offset, size: chunk.length, hash: sha256(chunk) });
   }
-  return writeEncryptedDiskFile({ ...args,
+  const common = {
+    folderKey: args.folderKey, randomBytes: args.randomBytes, signal: args.signal,
     fileInfo: { name: args.name, type: 0, size: args.bytes.length, block_size: 131072, blocks },
-    source: { size: args.bytes.length, readRange: async (offset, size) => args.bytes.slice(offset, offset + size) },
-  });
+    source: { size: args.bytes.length, readRange: async (offset: number, size: number) => args.bytes.slice(offset, offset + size) },
+  };
+  if (!args.writeFile || args.bytes.length > 1024 * 1024) {
+    return writeEncryptedDiskFile({ ...common, createSink: args.createSink });
+  }
+  let encoded: Uint8Array | undefined;
+  try {
+    const encrypted = await writeEncryptedDiskFile({ ...common, createSink: async (_info, size) => {
+      if (size > 2 * 1024 * 1024) throw new Error("Encrypted record exceeds the native whole-file limit.");
+      encoded = new Uint8Array(size);
+      return {
+        write: async (offset: number, bytes: Uint8Array) => { encoded!.set(bytes, offset); },
+        commit: async () => {},
+        abort: async () => { encoded?.fill(0); },
+      };
+    } });
+    if (!encoded) throw new Error("Encrypted record was not produced.");
+    await args.writeFile(args.name, encoded);
+    return encrypted;
+  } finally { encoded?.fill(0); }
 }
-
 /** Caller must clear the returned plaintext once decoded. */
 export async function readEncryptedRecord(source: EncryptedFileSource, folderKey: Uint8Array, name: string, signal?: AbortSignal) {
   assertReplicaPath(name);

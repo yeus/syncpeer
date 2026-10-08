@@ -53,13 +53,19 @@ export const readExactEncryptedRange = async (source: EncryptedFileSource, offse
   return bytes;
 };
 
-export const writeCiphertextRange = async (sink: Pick<FileDownloadSink, "write">, offset: number, bytes: Uint8Array, check: () => void) => {
-  for (let start = 0; start < bytes.length; start += 131072) {
+export const writeCiphertextRange = async (
+  sink: Pick<FileDownloadSink, "write" | "maxWriteSize">,
+  offset: number,
+  bytes: Uint8Array,
+  check: () => void,
+) => {
+  const chunkSize = Number.isSafeInteger(sink.maxWriteSize) && (sink.maxWriteSize ?? 0) > 0
+    ? Math.min(sink.maxWriteSize!, 1024 * 1024) : 131072;
+  for (let start = 0; start < bytes.length; start += chunkSize) {
     check();
-    await sink.write(offset + start, bytes.subarray(start, start + 131072));
+    await sink.write(offset + start, bytes.subarray(start, start + chunkSize));
   }
 };
-
 /** Parse a received file without keys. Authentication remains pending until unlock. */
 export async function loadCiphertextDiskMetadata(source: EncryptedFileSource, encryptedName: string, signal?: AbortSignal) {
   if (!Number.isSafeInteger(source.size) || source.size < 4) throw new Error("Encrypted trailer is missing.");

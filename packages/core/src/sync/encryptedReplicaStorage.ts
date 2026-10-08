@@ -9,12 +9,18 @@ import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 
 export interface ReplicaByteStorage extends ReplicaSource {
   stat: (path: string) => Promise<ReplicaEntry | null>;
-  createSink: (path: string, size: number) => Promise<Pick<FileDownloadSink, "write" | "commit" | "abort">>;
+  createSink: (path: string, size: number) => Promise<Pick<FileDownloadSink, "write" | "commit" | "abort" | "maxWriteSize">>;
+  /** Fast paths for bounded private records; native adapters keep atomic per-file replacement semantics. */
+  readFile?: (path: string, maxSize: number) => Promise<Uint8Array>;
+  writeFile?: (path: string, bytes: Uint8Array) => Promise<void>;
+  readFiles?: (paths: readonly string[], maxTotalSize: number) => Promise<Uint8Array[]>;
+  writeFiles?: (files: readonly { path: string; bytes: Uint8Array }[]) => Promise<void>;
   makeDirectory: (path: string) => Promise<void>;
   remove: (path: string, directory: boolean) => Promise<void>;
+  /** Delete a validated set of regular files with one durability barrier when supported. */
+  removeFiles?: (paths: readonly string[]) => Promise<void>;
   flushChanges: (paths: string[]) => Promise<void>;
 }
-
 /** Encryption and replica semantics stay in core; adapters own byte mechanics. */
 export function createEncryptedReplicaStorage(bytes: ReplicaByteStorage, options: {
   folderKey: Uint8Array;
@@ -65,7 +71,7 @@ export function createEncryptedReplicaStorage(bytes: ReplicaByteStorage, options
     saveIndex: async index => {
       await options.checkHealth();
       await saveEncryptedReplicaIndex({ index, folderKey: options.folderKey, randomBytes: options.randomBytes,
-        createSink: (_info, size) => bytes.createSink(indexPath, size) });
+        createSink: (_info, size) => bytes.createSink(indexPath, size), writeFile: bytes.writeFile });
       await bytes.flushChanges([indexPath]);
     },
     listEntries: async () => {

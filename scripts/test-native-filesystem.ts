@@ -78,6 +78,11 @@ test("native filesystem adapter keeps bulk bytes on the binary path", async () =
   const requests: string[] = [];
   const binaryReads: Array<{ rootId: number; path: string; offset: number; size: number }> = [];
   const binaryWrites: Array<{ writerId: number; offset: number; bytes: Uint8Array }> = [];
+  const wholeReads: Array<{ rootId: number; path: string; maxSize: number }> = [];
+  const wholeWrites: Array<{ rootId: number; path: string; bytes: Uint8Array }> = [];
+  const wholeReadBatches: Array<{ rootId: number; paths: readonly string[]; maxTotalSize: number }> = [];
+  const wholeWriteBatches: Array<{ rootId: number; files: readonly { path: string; bytes: Uint8Array }[] }> = [];
+  let malformedReadBatch = false;
   const fs = await createNativeFilesystem(async request => {
     requests.push(request.operation);
     if (request.operation === "register") return 7;
@@ -89,6 +94,16 @@ test("native filesystem adapter keeps bulk bytes on the binary path", async () =
       return Uint8Array.of(1, 2, 3);
     },
     write: async request => { binaryWrites.push({ ...request, bytes: request.bytes.slice() }); },
+    readFile: async request => { wholeReads.push(request); return Uint8Array.of(7, 8, 9); },
+    writeFile: async request => { wholeWrites.push({ ...request, bytes: request.bytes.slice() }); },
+    readFiles: async request => {
+      wholeReadBatches.push({ ...request, paths: [...request.paths] });
+      if (malformedReadBatch) return [];
+      return request.paths.map((_, index) => Uint8Array.of(index + 12));
+    },
+    writeFiles: async request => {
+      wholeWriteBatches.push({ ...request, files: request.files.map(file => ({ ...file, bytes: file.bytes.slice() })) });
+    },
   });
   assert.deepEqual(await fs.readRange("file", 4, 3), Uint8Array.of(1, 2, 3));
   const sink = await fs.createSink("file", 3);
@@ -96,9 +111,36 @@ test("native filesystem adapter keeps bulk bytes on the binary path", async () =
   await sink.commit();
   assert.deepEqual(binaryReads, [{ rootId: 7, path: "file", offset: 4, size: 3 }]);
   assert.deepEqual(binaryWrites, [{ writerId: 11, offset: 0, bytes: Uint8Array.of(4, 5, 6) }]);
+  assert.deepEqual(await fs.readFile("record", 16), Uint8Array.of(7, 8, 9));
+  await fs.writeFile("record", Uint8Array.of(10, 11));
+  assert.deepEqual(wholeReads, [{ rootId: 7, path: "record", maxSize: 16 }]);
+  assert.deepEqual(wholeWrites, [{ rootId: 7, path: "record", bytes: Uint8Array.of(10, 11) }]);
+  assert.deepEqual(await fs.readFiles(["record-a", "record-b"], 16), [Uint8Array.of(12), Uint8Array.of(13)]);
+  await fs.writeFiles([{ path: "record-a", bytes: Uint8Array.of(14) }, { path: "record-b", bytes: Uint8Array.of(15) }]);
+  assert.deepEqual(wholeReadBatches, [{ rootId: 7, paths: ["record-a", "record-b"], maxTotalSize: 16 }]);
+  assert.deepEqual(wholeWriteBatches, [{ rootId: 7,
+    files: [{ path: "record-a", bytes: Uint8Array.of(14) }, { path: "record-b", bytes: Uint8Array.of(15) }] }]);
+  malformedReadBatch = true;
+  await assert.rejects(fs.readFiles(["record-a", "record-b"], 16), /response/i);
+  malformedReadBatch = false;
+  await assert.rejects(fs.readFiles(["record"], 0), /limit/i);
   assert.equal(requests.includes("read"), false);
   assert.equal(requests.includes("write"), false);
   assert.deepEqual(requests, ["register", "begin", "commit"]);
+  await fs.close();
+});
+test("native filesystem batches regular-file cleanup into one bridge request", async () => {
+  const requests: NativeFilesystemRequest[] = [];
+  const fs = await createNativeFilesystem(async request => {
+    requests.push(request);
+    return request.operation === "register" ? 7 : null;
+  }, "/synthetic-root");
+  await fs.removeFiles([".syncpeer-draft-test/head", ".syncpeer-draft-test/chunk-0"]);
+  const removal = requests.find(request => request.operation === "removeFiles");
+  assert.deepEqual(removal, { operation: "removeFiles", rootId: 7,
+    paths: [".syncpeer-draft-test/head", ".syncpeer-draft-test/chunk-0"] });
+  await assert.rejects(fs.removeFiles([]), /removal batch/i);
+  await assert.rejects(fs.removeFiles(["same", "same"]), /duplicate/i);
   await fs.close();
 });
 

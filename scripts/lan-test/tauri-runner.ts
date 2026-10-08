@@ -3,15 +3,16 @@ import { execFileSync, spawn } from "node:child_process";
 
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
+const releaseMode = (): boolean => process.env.SYNCPEER_LAN_RELEASE === "1";
+
 export const lanAppBinary = (): string =>
-  path.resolve("packages", "tauri-shell", "src-tauri", "target", "debug", "tauri-shell");
+  path.resolve("packages", "tauri-shell", "src-tauri", "target", releaseMode() ? "release" : "debug", "tauri-shell");
 
 export const buildLanApp = (): void => {
-  execFileSync(npmCommand, ["run", "build:lan", "-w", "@syncpeer/tauri-shell"], {
+  execFileSync(npmCommand, ["run", releaseMode() ? "build:lan:release" : "build:lan", "-w", "@syncpeer/tauri-shell"], {
     stdio: "inherit",
   });
 };
-
 const runChild = (command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> =>
   new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: "inherit", env });

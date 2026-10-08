@@ -11,6 +11,7 @@
     "dev": "npm run icons:ensure && tauri dev",
     "build": "npm run icons:ensure && tauri build --no-bundle",
     "build:lan": "npm run icons:ensure && tauri build --debug --no-bundle --config src-tauri/tauri.lan-e2e.conf.json",
+    "build:lan:release": "npm run icons:ensure && tauri build --no-bundle --config src-tauri/tauri.lan-e2e.conf.json",
     "build:bundle": "npm run icons:ensure && tauri build",
     "build:bundle:appimage": "bash ../../scripts/build-appimage.sh",
     "build:bundle:appimage:internal": "tauri build --bundles appimage",

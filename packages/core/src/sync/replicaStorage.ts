@@ -74,7 +74,7 @@ export function createFolderReplica(
         (_path, offset, size) => {
           if (edit.method !== "write") throw new Error("Metadata edit must not request file contents.");
           return edit.source.readRange(offset, size);
-        }, hash);
+        }, hash, edit.method === "write");
       return (await storage.loadIndex())!.files[edit.path].info;
     }),
     scan: () => storage.withLock(async () => Object.values((await scan()).files).map(entry => entry.info)),

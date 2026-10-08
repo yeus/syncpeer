@@ -155,11 +155,10 @@ export interface CachedFileRecord {
   sizeBytes: number;
   cachedAtMs: number;
   modifiedMs?: number;
-  syncBaseline?: { hash: string; sizeBytes: number; modifiedMs: number };
+  syncBaseline?: { hash: string; sizeBytes: number; modifiedMs: number; versionKey?: string };
   /** Writable providers cannot safely infer a remote baseline from local timestamps. */
   syncBaselineRequired?: boolean;
 }
-
 export interface DocumentVersionRecord {
   id: string;
   modifiedMs: number;

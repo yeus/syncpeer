@@ -10,6 +10,11 @@ import type { ReplicaByteStorage } from "./encryptedReplicaStorage.js";
 import { hasReplicaBlockLayout, type LocalFolderReplica, type ReplicaEntry } from "./replicaIndex.js";
 import { createReplicaFileSource } from "./replicaFileSource.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
+
+const LEGACY_DRAFT_CHUNK_SIZE = 128 * 1024;
+const DRAFT_CHUNK_SIZE = 1024 * 1024;
+const MAX_DRAFT_RECORD_BATCH_FILES = 8;
+const MAX_DRAFT_RECORD_BATCH_BYTES = 2 * 1024 * 1024;
 type DraftStorage = ReplicaByteStorage & {
   listDirectory: (path: string) => Promise<ReplicaEntry[]>;
   copy: (source: string, target: string) => Promise<void>;
@@ -20,22 +25,62 @@ type DownloadDraft = Omit<FileDownloadMetadata, "blocks"> & {
 };
 type DownloadDraftInput = Omit<DownloadDraft, "ranges"> & { blocks?: readonly RangeDigest[] };
 type DraftHead = { format: 1; path: string; baseSize: number; size: number; dirty: boolean;
-  version: BepVersionVector | null; recover?: boolean; download?: DownloadDraft };
+  version: BepVersionVector | null; chunkSize?: number; recover?: boolean; download?: DownloadDraft };
 type DraftOptions = {
   folderId: string; folderKey: Uint8Array; replica: LocalFolderReplica;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
 };
+const decodeRecord = async (encoded: Uint8Array, key: Uint8Array, name: string) =>
+  readEncryptedRecord({ size: encoded.length,
+    readRange: async (offset, size) => encoded.slice(offset, offset + size) }, key, name);
 
 async function readRecord(bytes: DraftStorage, name: string, key: Uint8Array) {
+  if (bytes.readFile) {
+    const encoded = await bytes.readFile(name, 2 * 1024 * 1024);
+    try { return await decodeRecord(encoded, key, name); }
+    finally { encoded.fill(0); }
+  }
   const info = await bytes.stat(name);
   if (!info || info.type !== "file") throw new Error("Document draft record is missing.");
   return readEncryptedRecord({ size: info.size, readRange: (offset, size) => bytes.readRange(name, offset, size) }, key, name);
 }
 
+async function readRecords(bytes: DraftStorage, names: readonly string[], key: Uint8Array, chunkSize: number) {
+  if (!bytes.readFiles || names.length < 2 || chunkSize !== LEGACY_DRAFT_CHUNK_SIZE) {
+    return Promise.all(names.map(name => readRecord(bytes, name, key)));
+  }
+  const result: Uint8Array[] = [];
+  try {
+    for (let start = 0; start < names.length; start += MAX_DRAFT_RECORD_BATCH_FILES) {
+      const batchNames = names.slice(start, start + MAX_DRAFT_RECORD_BATCH_FILES);
+      const encoded = await bytes.readFiles(batchNames, MAX_DRAFT_RECORD_BATCH_BYTES);
+      try {
+        if (encoded.length !== batchNames.length) throw new Error("Native draft read batch was incomplete.");
+        for (let index = 0; index < batchNames.length; index++) {
+          result.push(await decodeRecord(encoded[index]!, key, batchNames[index]!));
+        }
+      } finally { encoded.forEach(value => value.fill(0)); }
+    }
+    return result;
+  } catch (error) {
+    result.forEach(value => value.fill(0));
+    throw error;
+  }
+}
+
+async function encodeRecord(bytes: DraftStorage, name: string, data: Uint8Array, options: DraftOptions) {
+  let encoded: Uint8Array | undefined;
+  await writeEncryptedRecord({ name, bytes: data, folderKey: options.folderKey, randomBytes: options.randomBytes,
+    createSink: (_info, size) => bytes.createSink(name, size),
+    writeFile: async (_path, value) => { encoded = value.slice(); } });
+  if (!encoded) throw new Error("Encrypted draft record was not produced.");
+  return encoded;
+}
+
 async function writeRecord(bytes: DraftStorage, name: string, data: Uint8Array, options: DraftOptions,
   flush = true) {
   await writeEncryptedRecord({ name, bytes: data, folderKey: options.folderKey, randomBytes: options.randomBytes,
-    createSink: (_info, size) => bytes.createSink(name, size) });
+    createSink: (_info, size) => bytes.createSink(name, size), writeFile: bytes.writeFile });
   if (flush) await bytes.flushChanges([name]);
 }
 
@@ -65,7 +110,9 @@ const validDownload = (download: DownloadDraft | undefined) => !download || (
 async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, options: DraftOptions,
   expectedDownloadBlocks?: readonly RangeDigest[]) {
   assertReplicaPath(head.path);
+  const chunkSize = head.chunkSize ?? LEGACY_DRAFT_CHUNK_SIZE;
   if (head.format !== 1 || isInternalReplicaPath(head.path) || typeof head.dirty !== "boolean" ||
+    (chunkSize !== LEGACY_DRAFT_CHUNK_SIZE && chunkSize !== DRAFT_CHUNK_SIZE) ||
     ![head.baseSize, head.size].every(size => Number.isSafeInteger(size) && size >= 0) || !validDownload(head.download) ||
     (head.download && (head.download.folderId !== options.folderId || head.download.path !== head.path ||
       head.baseSize !== 0 || head.size > head.download.sizeBytes))) {
@@ -98,10 +145,10 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
   const chunk = async (index: number) => {
     if (chunks.has(index)) {
       const data = await readRecord(bytes, `${prefix}/chunk-${index}`, options.folderKey);
-      if (data.length !== 131072) { data.fill(0); throw new Error("Invalid document draft block."); }
+      if (data.length !== chunkSize) { data.fill(0); throw new Error("Invalid document draft block."); }
       return data;
     }
-    const data = new Uint8Array(131072), offset = index * 131072;
+    const data = new Uint8Array(chunkSize), offset = index * chunkSize;
     if (source && metadata && offset < head.baseSize) {
       const original = await readEncryptedDiskRange(source, metadata, offset, Math.min(data.length, head.baseSize - offset));
       try { data.set(original); } finally { original.fill(0); }
@@ -112,20 +159,39 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     ensureOpen();
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(size) || size < 0 || size > 16 * 1024 * 1024) throw new Error("Invalid document range.");
     const output = new Uint8Array(Math.max(0, Math.min(size, head.size - offset)));
+    const segments: Array<{ index: number; start: number; count: number; target: number }> = [];
+    for (let done = 0; done < output.length;) {
+      const position = offset + done, start = position % chunkSize,
+        count = Math.min(output.length - done, chunkSize - start);
+      segments.push({ index: Math.floor(position / chunkSize), start, count, target: done });
+      done += count;
+    }
+    const batched = new Map<number, Uint8Array>();
     try {
-      for (let done = 0; done < output.length;) {
-        const position = offset + done, start = position % 131072, count = Math.min(output.length - done, 131072 - start);
-        const data = await chunk(Math.floor(position / 131072));
-        try { output.set(data.subarray(start, start + count), done); } finally { data.fill(0); }
-        done += count;
+      const indexes = [...new Set(segments.map(segment => segment.index).filter(index => chunks.has(index)))];
+      if (bytes.readFiles && indexes.length > 1) {
+        const values = await readRecords(bytes, indexes.map(index => `${prefix}/chunk-${index}`),
+          options.folderKey, chunkSize);
+        for (let position = 0; position < indexes.length; position++) {
+          const data = values[position]!;
+          if (data.length !== chunkSize) { data.fill(0); throw new Error("Invalid document draft block."); }
+          batched.set(indexes[position]!, data);
+        }
+      }
+      for (const segment of segments) {
+        const cached = batched.get(segment.index);
+        const data = cached ?? await chunk(segment.index);
+        try { output.set(data.subarray(segment.start, segment.start + segment.count), segment.target); }
+        finally { if (!cached) data.fill(0); }
       }
       return output;
     } catch (error) { output.fill(0); throw error; }
+    finally { for (const data of batched.values()) data.fill(0); }
   };
   const digest = async () => {
     const hash = sha256.create();
-    for (let offset = 0; offset < head.size; offset += 131072) {
-      const data = await readRange(offset, Math.min(131072, head.size - offset));
+    for (let offset = 0; offset < head.size; offset += chunkSize) {
+      const data = await readRange(offset, Math.min(chunkSize, head.size - offset));
       try { hash.update(data); } finally { data.fill(0); }
     }
     return hash.digest();
@@ -199,11 +265,16 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     const publicationReadRange = async (offset: number, size: number) => {
       const data = await readRange(offset, size);
       if (expectedByOffset) {
-        const expected = expectedByOffset.get(offset);
-        if (!expected || expected.size !== size || data.length !== size ||
-            !equalHash(sha256(data), expected.hash)) {
-          data.fill(0);
-          throw new Error("Downloaded document block changed before publication.");
+        let cursor = offset, consumed = 0;
+        while (consumed < data.length) {
+          const expected = expectedByOffset.get(cursor);
+          if (!expected || expected.size > data.length - consumed ||
+              !equalHash(sha256(data.subarray(consumed, consumed + expected.size)), expected.hash)) {
+            data.fill(0);
+            throw new Error("Downloaded document block changed before publication.");
+          }
+          cursor += expected.size;
+          consumed += expected.size;
         }
       }
       addToWholeHash(offset, data);
@@ -252,15 +323,19 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     closed = true;
     metadata?.fileKey.fill(0);
     // No recursive delete and no externally supplied path. Unexpected entries fail closed.
-    for (const entry of await bytes.listDirectory(prefix)) {
+    const entries = await bytes.listDirectory(prefix);
+    for (const entry of entries) {
       if (entry.type !== "file" || !/^(head|base|chunk-\d+)$/.test(entry.path.slice(prefix.length + 1))) {
         throw new Error("Unexpected draft entry.");
       }
-      await bytes.remove(entry.path, false);
+    }
+    const paths = entries.map(entry => entry.path);
+    if (paths.length) {
+      if (bytes.removeFiles) await bytes.removeFiles(paths);
+      else for (const path of paths) await bytes.remove(path, false);
     }
     await bytes.remove(prefix, true);
   };
-
   const writeBatch = async (writes: readonly { offset: number; bytes: Uint8Array }[]) => {
     ensureOpen();
     if (!Array.isArray(writes) || writes.length > 8 || writes.some(write =>
@@ -276,30 +351,84 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
       await saveHead();
       nextHead = head;
     }
+
+    const grouped = new Map<number, Array<{ start: number; bytes: Uint8Array }>>();
     for (const { offset, bytes: input } of writes) {
       if (!input.length) continue;
       for (let done = 0; done < input.length;) {
-        const position = offset + done, index = Math.floor(position / 131072), start = position % 131072;
-        const count = Math.min(input.length - done, 131072 - start);
-        const downloadBlockSize = nextHead.download
-          ? Math.min(131072, nextHead.download.sizeBytes - index * 131072)
-          : 0;
-        const data = nextHead.download && start === 0 && count === downloadBlockSize
-          ? new Uint8Array(131072)
-          : await chunk(index);
-        try {
-          data.set(input.subarray(done, done + count), start);
-          const name = `${prefix}/chunk-${index}`;
-          await writeRecord(bytes, name, data, options, false);
-          chunks.add(index);
-          changed.add(name);
-        } finally { data.fill(0); }
+        const position = offset + done;
+        const index = Math.floor(position / chunkSize);
+        const start = position % chunkSize;
+        const count = Math.min(input.length - done, chunkSize - start);
+        const parts = grouped.get(index) ?? [];
+        parts.push({ start, bytes: input.subarray(done, done + count) });
+        grouped.set(index, parts);
         done += count;
       }
-      nextHead = { ...nextHead, size: Math.max(nextHead.size, offset + input.length),
-        ...(nextHead.download ? { download: { ...nextHead.download,
-          ranges: mergeRange(nextHead.download.ranges, offset, offset + input.length) } } : {}) };
+      nextHead = {
+        ...nextHead,
+        size: Math.max(nextHead.size, offset + input.length),
+        ...(nextHead.download ? {
+          download: {
+            ...nextHead.download,
+            ranges: mergeRange(nextHead.download.ranges, offset, offset + input.length),
+          },
+        } : {}),
+      };
     }
+
+    const encodedRecords: Array<{ path: string; bytes: Uint8Array; index: number }> = [];
+    try {
+      for (const [index, parts] of [...grouped].sort((left, right) => left[0] - right[0])) {
+        const logicalSize = nextHead.download
+          ? Math.max(0, Math.min(chunkSize, nextHead.download.sizeBytes - index * chunkSize))
+          : chunkSize;
+        const sorted = [...parts].sort((left, right) => left.start - right.start);
+        let covered = 0;
+        for (const part of sorted) {
+          if (part.start > covered) break;
+          covered = Math.max(covered, part.start + part.bytes.length);
+        }
+        const replacesWholeDownloadChunk = !!nextHead.download && covered >= logicalSize;
+        const data = replacesWholeDownloadChunk ? new Uint8Array(chunkSize) : await chunk(index);
+        try {
+          for (const part of parts) data.set(part.bytes, part.start);
+          const name = `${prefix}/chunk-${index}`;
+          if (bytes.writeFiles) encodedRecords.push({ path: name, bytes: await encodeRecord(bytes, name, data, options), index });
+          else await writeRecord(bytes, name, data, options, false);
+          if (!bytes.writeFiles) {
+            chunks.add(index);
+            changed.add(name);
+          }
+        } finally { data.fill(0); }
+      }
+      if (encodedRecords.length) {
+        const batches: Array<typeof encodedRecords> = [];
+        let batch: typeof encodedRecords = [];
+        let batchSize = 0;
+        for (const record of encodedRecords) {
+          if (record.bytes.length > MAX_DRAFT_RECORD_BATCH_BYTES) {
+            throw new Error("Encrypted draft record exceeds the native batch limit.");
+          }
+          if (batch.length && (batch.length === MAX_DRAFT_RECORD_BATCH_FILES ||
+            batchSize + record.bytes.length > MAX_DRAFT_RECORD_BATCH_BYTES)) {
+            batches.push(batch);
+            batch = [];
+            batchSize = 0;
+          }
+          batch.push(record);
+          batchSize += record.bytes.length;
+        }
+        if (batch.length) batches.push(batch);
+        for (const records of batches) {
+          await bytes.writeFiles!(records);
+          for (const record of records) {
+            chunks.add(record.index);
+            changed.add(record.path);
+          }
+        }
+      }
+    } finally { encodedRecords.forEach(record => record.bytes.fill(0)); }
     if (!changed.size) return;
     await bytes.flushChanges([...changed]);
     head = nextHead;
@@ -344,6 +473,7 @@ export async function openDocumentDraft(bytes: DraftStorage, options: DraftOptio
     size: baseSize,
     dirty: options.truncate,
     version: current?.version ?? null,
+    chunkSize: download ? DRAFT_CHUNK_SIZE : LEGACY_DRAFT_CHUNK_SIZE,
     recover: options.recover ?? true,
     ...(download ? { download } : {}),
   };
@@ -355,6 +485,7 @@ export async function openDocumentDraft(bytes: DraftStorage, options: DraftOptio
   }
   return useDraft(bytes, prefix, head, options, options.download?.blocks);
 }
+
 export async function openDocumentDownloadDraft(bytes: DraftStorage, options: DraftOptions & {
   path: string; download: DownloadDraftInput;
 }) {

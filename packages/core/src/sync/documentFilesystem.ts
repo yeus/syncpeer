@@ -16,6 +16,7 @@ import { openDocumentDraft, openDocumentDownloadDraft, recoverDocumentDrafts } f
 import { loadEncryptedDiskMetadata, readEncryptedDiskRange } from "./encryptedFilesystem.js";
 import type { createNativeFilesystem } from "./nativeFilesystem.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
+import { versionVectorKey } from "../core/protocol/versionVector.js";
 import type { CachedFileRecord } from "../ui/browserClient.js";
 import { cachedFileKey, sameDeviceId } from "../ui/helpers.js";
 import { deleteDocumentBaseline, loadDocumentBaseline, saveDocumentBaseline } from "./documentBaseline.js";
@@ -916,15 +917,18 @@ const finishDownloadAction = async (runtime: DocumentRuntime, id: number): Promi
     (download.ranges.length !== 1 || download.ranges[0].offset !== 0 || download.ranges[0].end !== download.size))) {
     throw new Error("Download is incomplete.");
   }
+  const file = resolveDocument(runtime, value.documentId);
   const digest = await value.writer.flush(false, download.modifiedMs);
   if (!(digest instanceof Uint8Array) || digest.length !== 32) throw new Error("Download digest is unavailable.");
   const hash = [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
-  const file = resolveDocument(runtime, value.documentId);
+  const published = (await file.replica.scan()).find(info => info.name === file.path && !info.deleted);
+  if (!published) throw new Error("Downloaded document was not published.");
   await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: runtime.folderKeys.get(file.folder.storageId)!,
-    randomBytes: runtime.options.randomBytes, baseline: { hash, sizeBytes: download.size, modifiedMs: download.modifiedMs } });
-  await value.writer.close(); runtime.handles.delete(id);
+    randomBytes: runtime.options.randomBytes, baseline: { hash, sizeBytes: download.size, modifiedMs: download.modifiedMs,
+      versionKey: versionVectorKey(published.version ?? {}) } });
+  await value.writer.close();
+  runtime.handles.delete(id);
 };
-
 const setSyncBaselineAction = async (
   runtime: DocumentRuntime,
   id: string,
@@ -1098,14 +1102,15 @@ const collectCacheCandidates = async (
     const baseline = await loadDocumentBaseline(bytes, key, info.name);
     const selected = classifyFavoritePath({ folderId: folder.id, path: info.name, kind: "file" },
       folderSettings.favorites, folderSettings.exclusions, folderSettings.ignorePatterns);
-    const unchanged = baseline !== undefined && baseline.sizeBytes === Number(info.size ?? 0) &&
-      await hashReplicaFile(replica, info.name) === baseline.hash;
+    const sameSize = baseline !== undefined && baseline.sizeBytes === Number(info.size ?? 0);
+    const unchanged = sameSize && (baseline!.versionKey !== undefined
+      ? baseline!.versionKey === versionVectorKey(info.version ?? {})
+      : await hashReplicaFile(replica, info.name) === baseline!.hash);
     candidates.push({ key: cachedFileKey(folder.id, info.name), folder, path: info.name,
       sizeBytes: Number(info.size ?? 0), lastAccessedMs: access[info.name] ??
         Number(info.modified_s ?? 0) * 1000, protected: selected.status === "favorite" || !unchanged });
   }
 };
-
 const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
   if (runtime.vault.status().phase !== "unlocked" || !runtime.registry) {
     throw new Error("Document vault is locked.");

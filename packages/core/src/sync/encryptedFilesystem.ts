@@ -77,7 +77,8 @@ export async function createEncryptedDownloadSink(args: {
   };
   const flushBlock = async () => {
     if (!equalHash(sha256(buffer), file.blocks[blockIndex].hash)) throw new Error("Source block digest mismatch.");
-    await writeCiphertextRange(storage, Number(encrypted.blocks![blockIndex].offset), await encryptUntrustedBlock(fileKey, buffer, args.randomBytes), check);
+    const encryptedBlock = await encryptUntrustedBlock(fileKey, buffer, args.randomBytes);
+    await writeCiphertextRange(storage, Number(encrypted.blocks![blockIndex].offset), encryptedBlock, check);
     buffer.fill(0); buffer = new Uint8Array(); buffered = 0; blockIndex++;
   };
   const enqueue = (operation: () => Promise<void>) => {
@@ -138,7 +139,6 @@ export async function createEncryptedDownloadSink(args: {
   };
   return { sink, encrypted };
 }
-
 /** Read an existing source through the same streaming writer used by downloads. */
 export async function writeEncryptedDiskFile(args: Parameters<typeof createEncryptedDownloadSink>[0] & {
   source: EncryptedFileSource;

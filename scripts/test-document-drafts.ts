@@ -50,6 +50,63 @@ test("large document writes are linear, durable before publication, and recover 
   folderKey.fill(0);
 });
 
+test("native draft record reads split large ranges into bounded batches", async () => {
+  const fixture = memoryReplicaStorage();
+  const readBatchSizes: number[] = [];
+  const bytes = { ...fixture.storage, readFiles: async (paths: readonly string[], maxTotalSize: number) => {
+    assert.ok(paths.length <= 8, "Native read batches contain at most eight records");
+    const records = paths.map(path => {
+      const record = fixture.files.get(path);
+      if (!record || record.type !== "file") throw new Error("Synthetic draft record is missing.");
+      return record.bytes.slice();
+    });
+    assert.ok(records.reduce((total, record) => total + record.length, 0) <= maxTotalSize,
+      "Native read batches stay within their byte limit");
+    readBatchSizes.push(paths.length);
+    return records;
+  } };
+  const { folderKey } = await deriveUntrustedFolderCrypto("fixture-folder", "synthetic-password");
+  const draft = await openDocumentDraft(bytes, { folderId: "fixture-folder", path: "large-read.bin", folderKey,
+    randomBytes, replica: { scan: async () => [] } as never, truncate: true });
+  const chunkSize = 128 * 1024, expected = new Uint8Array(chunkSize * 10);
+  for (let index = 0; index < 10; index++) {
+    const chunk = new Uint8Array(chunkSize).fill(index + 1);
+    expected.set(chunk, index * chunkSize);
+    await draft.write(index * chunkSize, chunk);
+  }
+  assert.deepEqual(await draft.readRange(0, expected.length), expected);
+  assert.deepEqual(readBatchSizes, [8, 2]);
+  await draft.discard();
+  folderKey.fill(0);
+});
+
+test("native draft record writes split on the encoded byte limit", async () => {
+  const fixture = memoryReplicaStorage();
+  const writeBatchSizes: number[] = [];
+  const bytes = { ...fixture.storage, writeFiles: async (files: readonly { path: string; bytes: Uint8Array }[]) => {
+    const totalSize = files.reduce((total, file) => total + file.bytes.length, 0);
+    assert.ok(files.length <= 8, "Native write batches contain at most eight records");
+    assert.ok(totalSize <= 2 * 1024 * 1024, "Native write batches stay within their byte limit");
+    writeBatchSizes.push(totalSize);
+    for (const file of files) {
+      const sink = await fixture.storage.createSink(file.path, file.bytes.length);
+      await sink.write(0, file.bytes);
+      await sink.commit();
+    }
+  } };
+  const { folderKey } = await deriveUntrustedFolderCrypto("fixture-folder", "synthetic-password");
+  const chunkSize = 1024 * 1024, path = "wide-download.bin";
+  const draft = await openDocumentDownloadDraft(bytes, { folderId: "fixture-folder", path, folderKey,
+    randomBytes, replica: { scan: async () => [] } as never,
+    download: { folderId: "fixture-folder", path, sizeBytes: chunkSize * 3, modifiedMs: 1, encrypted: true } });
+  const part = new Uint8Array(128 * 1024).fill(7);
+  await draft.writeBatch([0, chunkSize, chunkSize * 2].map(offset => ({ offset, bytes: part })));
+  assert.equal(writeBatchSizes.length, 3);
+  assert.ok(writeBatchSizes.every(size => size <= 2 * 1024 * 1024));
+  await draft.discard();
+  folderKey.fill(0);
+});
+
 test("a resumed download replaces a damaged full journal block", async () => {
   const fixture = memoryReplicaStorage();
   const bytes = { ...fixture.storage, copy: async (source: string, target: string) => {

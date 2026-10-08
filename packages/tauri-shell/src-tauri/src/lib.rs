@@ -1,24 +1,28 @@
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 mod cache_ranges;
-mod replica_storage;
+mod discovery;
+mod documents;
 mod metadata_sqlite;
 mod native_cache_metadata;
-mod documents;
-mod discovery;
-use discovery::{DiscoveryFetchRequest, DiscoveryFetchResponse, DiscoveryCancelRequest, SharedDiscoveryRequests};
-#[cfg(target_os = "android")]
-mod document_storage;
+mod replica_storage;
+use discovery::{
+    DiscoveryCancelRequest, DiscoveryFetchRequest, DiscoveryFetchResponse, SharedDiscoveryRequests,
+};
 #[cfg(target_os = "android")]
 mod android_network;
-mod vault_secret;
+#[cfg(target_os = "android")]
+mod document_storage;
 mod local_reset;
-use cache_ranges::{CacheRange, RangeDigest, digest_range, copy_range};
+mod vault_secret;
+use cache_ranges::{copy_range, digest_range, CacheRange, RangeDigest};
 use native_cache_metadata::NativeCacheMetadata;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, DistinguishedName, ServerConfig,
-    ServerConnection, SignatureScheme, StreamOwned};
 use prost::Message;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, DistinguishedName, ServerConfig,
+    ServerConnection, SignatureScheme, StreamOwned,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,14 +32,17 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
-#[cfg(target_os = "android")]
-use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_opener::OpenerExt;
+#[cfg(target_os = "android")]
+use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
 use url::Url;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::parse_x509_certificate;
@@ -149,7 +156,10 @@ struct CacheRangesRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum CacheRangeSource { Cached, Partial }
+enum CacheRangeSource {
+    Cached,
+    Partial,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -708,8 +718,12 @@ impl ServerCertVerifier for NoCertificateVerification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -718,12 +732,18 @@ impl ServerCertVerifier for NoCertificateVerification {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -744,7 +764,9 @@ impl ClientCertVerifier for AnyPresentedClientCertificate {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
         if end_entity.is_empty() {
-            return Err(rustls::Error::General("Client certificate is required".to_string()));
+            return Err(rustls::Error::General(
+                "Client certificate is required".to_string(),
+            ));
         }
         Ok(ClientCertVerified::assertion())
     }
@@ -755,8 +777,12 @@ impl ClientCertVerifier for AnyPresentedClientCertificate {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -765,12 +791,18 @@ impl ClientCertVerifier for AnyPresentedClientCertificate {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -780,8 +812,14 @@ fn tauri_log(message: &str) {
 
 fn trace_tls(event: &str, session_id: u64, bytes: usize) {
     if std::env::var("SYNCPEER_TRACE_TLS").as_deref() == Ok("1") {
-        let entry = format!("timeMs={} pid={} session={} event={} bytes={}",
-            now_ms(), std::process::id(), session_id, event, bytes);
+        let entry = format!(
+            "timeMs={} pid={} session={} event={} bytes={}",
+            now_ms(),
+            std::process::id(),
+            session_id,
+            event,
+            bytes
+        );
         eprintln!("[syncpeer-tls] {entry}");
         if let Ok(dir) = std::env::var("SYNCPEER_TRACE_TLS_DIR") {
             let path = Path::new(&dir).join(format!("{}.log", std::process::id()));
@@ -793,8 +831,13 @@ fn trace_tls(event: &str, session_id: u64, bytes: usize) {
 }
 
 fn diagnostic_event(value: &str) -> &str {
-    if value.len() <= 128 && value.contains('.') && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase) &&
-        value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')) {
+    if value.len() <= 128
+        && value.contains('.')
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+    {
         value
     } else {
         "invalid"
@@ -1105,49 +1148,87 @@ fn app_storage_marker_is_current(path: &Path) -> Result<bool, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(value) => value,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(describe_storage_failure("Private storage marker could not be inspected", error)),
+        Err(error) => {
+            return Err(describe_storage_failure(
+                "Private storage marker could not be inspected",
+                error,
+            ))
+        }
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(private_storage_unrecognized("the storage format marker is not a regular file"));
+        return Err(private_storage_unrecognized(
+            "the storage format marker is not a regular file",
+        ));
     }
-    let marker: serde_json::Value = serde_json::from_slice(&fs::read(path)
-        .map_err(|error| describe_storage_failure("Private storage marker could not be read", error))?)
-        .map_err(|_| private_storage_unrecognized("the storage format marker is invalid"))?;
-    Ok(marker.get("owner").and_then(serde_json::Value::as_str) == Some("syncpeer") &&
-        marker.get("version").and_then(serde_json::Value::as_u64) == Some(APP_STORAGE_FORMAT_VERSION))
+    let marker: serde_json::Value = serde_json::from_slice(&fs::read(path).map_err(|error| {
+        describe_storage_failure("Private storage marker could not be read", error)
+    })?)
+    .map_err(|_| private_storage_unrecognized("the storage format marker is invalid"))?;
+    Ok(
+        marker.get("owner").and_then(serde_json::Value::as_str) == Some("syncpeer")
+            && marker.get("version").and_then(serde_json::Value::as_u64)
+                == Some(APP_STORAGE_FORMAT_VERSION),
+    )
 }
 
 fn secure_app_data_root(root: &Path) -> Result<(), String> {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
-            .map_err(|error| describe_storage_failure("Private storage permissions could not be secured", error))?;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            describe_storage_failure("Private storage permissions could not be secured", error)
+        })?;
     }
     Ok(())
 }
 
 fn prepare_app_data_root(root: &Path) -> Result<(), String> {
     match fs::symlink_metadata(root) {
-        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() =>
-            return Err(private_storage_unrecognized("the private storage root is not a regular directory")),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(private_storage_unrecognized(
+                "the private storage root is not a regular directory",
+            ))
+        }
         Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir_all(root)
-            .map_err(|error| describe_storage_failure("Private storage could not be created", error))?,
-        Err(error) => return Err(describe_storage_failure("Private storage could not be inspected", error)),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(root).map_err(|error| {
+                describe_storage_failure("Private storage could not be created", error)
+            })?
+        }
+        Err(error) => {
+            return Err(describe_storage_failure(
+                "Private storage could not be inspected",
+                error,
+            ))
+        }
     }
     let marker = root.join(APP_STORAGE_FORMAT_FILE);
-    if app_storage_marker_is_current(&marker)? { return secure_app_data_root(root); }
-    if marker.exists() || fs::read_dir(root)
-        .map_err(|error| describe_storage_failure("Private storage could not be inspected", error))?
-        .next().transpose()
-        .map_err(|error| describe_storage_failure("Private storage could not be inspected", error))?
-        .is_some() {
-        return Err(private_storage_unrecognized("existing data has no supported storage format marker"));
+    if app_storage_marker_is_current(&marker)? {
+        return secure_app_data_root(root);
     }
-    write_json(&marker, &serde_json::json!({
-        "owner": "syncpeer",
-        "version": APP_STORAGE_FORMAT_VERSION,
-    }))?;
+    if marker.exists()
+        || fs::read_dir(root)
+            .map_err(|error| {
+                describe_storage_failure("Private storage could not be inspected", error)
+            })?
+            .next()
+            .transpose()
+            .map_err(|error| {
+                describe_storage_failure("Private storage could not be inspected", error)
+            })?
+            .is_some()
+    {
+        return Err(private_storage_unrecognized(
+            "existing data has no supported storage format marker",
+        ));
+    }
+    write_json(
+        &marker,
+        &serde_json::json!({
+            "owner": "syncpeer",
+            "version": APP_STORAGE_FORMAT_VERSION,
+        }),
+    )?;
     secure_app_data_root(root)
 }
 
@@ -1191,16 +1272,11 @@ const CACHE_PARTIAL_METADATA_PREFIX: &str = "partial/";
 fn native_cache_metadata(app: &tauri::AppHandle) -> Result<NativeCacheMetadata, String> {
     let metadata_root = app_data_root(app)?.join("native-cache-metadata");
     #[cfg(target_os = "linux")]
-    let mut key = vault_secret::load_or_create_protected_key(
-        "native-cache-metadata",
-        &metadata_root,
-    )?;
+    let mut key =
+        vault_secret::load_or_create_protected_key("native-cache-metadata", &metadata_root)?;
     #[cfg(target_os = "android")]
-    let mut key = vault_secret::load_or_create_protected_key(
-        app,
-        "native-cache-metadata",
-        &metadata_root,
-    )?;
+    let mut key =
+        vault_secret::load_or_create_protected_key(app, "native-cache-metadata", &metadata_root)?;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     return Err("Protected native cache metadata is unavailable on this platform.".into());
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1222,36 +1298,55 @@ fn write_cache_index(app: &tauri::AppHandle, index: &CacheIndex) -> Result<(), S
 }
 
 fn partial_metadata_id(transfer_id: &str) -> Result<String, String> {
-    if transfer_id.is_empty() || transfer_id.len() > 128 ||
-        !transfer_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+    if transfer_id.is_empty()
+        || transfer_id.len() > 128
+        || !transfer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
         return Err("Invalid cache transfer identity.".into());
     }
     Ok(format!("{CACHE_PARTIAL_METADATA_PREFIX}{transfer_id}"))
 }
 
-fn read_partial_metadata(app: &tauri::AppHandle, partial_root: &Path) -> Result<Vec<CachePartialMetadata>, String> {
+fn read_partial_metadata(
+    app: &tauri::AppHandle,
+    partial_root: &Path,
+) -> Result<Vec<CachePartialMetadata>, String> {
     let store = native_cache_metadata(app)?;
     if partial_root.exists() {
         for entry in fs::read_dir(partial_root).map_err(|error| error.to_string())? {
             let path = entry.map_err(|error| error.to_string())?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") { continue; }
-            let transfer_id = path.file_stem().and_then(|value| value.to_str())
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let transfer_id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
                 .ok_or_else(|| "Invalid legacy partial metadata filename.".to_string())?;
-            let decoded = serde_json::from_slice::<CachePartialMetadata>(&fs::read(&path)
-                .map_err(|error| format!("Could not read {}: {error}", path.display()))?)
-                .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+            let decoded = serde_json::from_slice::<CachePartialMetadata>(
+                &fs::read(&path)
+                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?,
+            )
+            .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
             if decoded.transfer_id != transfer_id {
                 return Err("Legacy partial metadata identity mismatch.".into());
             }
-            store.load_or_migrate::<CachePartialMetadata>(&partial_metadata_id(transfer_id)?, &path)?
-                .ok_or_else(|| "Legacy partial metadata disappeared during migration.".to_string())?;
+            store
+                .load_or_migrate::<CachePartialMetadata>(&partial_metadata_id(transfer_id)?, &path)?
+                .ok_or_else(|| {
+                    "Legacy partial metadata disappeared during migration.".to_string()
+                })?;
         }
     }
-    store.list::<CachePartialMetadata>(CACHE_PARTIAL_METADATA_PREFIX)?
+    store
+        .list::<CachePartialMetadata>(CACHE_PARTIAL_METADATA_PREFIX)?
         .into_iter()
         .map(|(name, metadata)| {
             let expected = partial_metadata_id(&metadata.transfer_id)?;
-            if name != expected { return Err("Encrypted partial metadata identity mismatch.".into()); }
+            if name != expected {
+                return Err("Encrypted partial metadata identity mismatch.".into());
+            }
             Ok(metadata)
         })
         .collect()
@@ -1274,30 +1369,49 @@ async fn syncpeer_profile_storage_root(
     app: tauri::AppHandle,
     request: ProfileStorageRootRequest,
 ) -> Result<String, String> {
-    let valid_profile = !request.profile_id.is_empty() && request.profile_id.len() <= 128 &&
-        request.profile_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
-    let valid_storage = request.storage_id == "profile" ||
-        (request.storage_id.len() == 32 && request.storage_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    if !valid_profile || !valid_storage { return Err("Invalid encrypted profile storage identity.".into()); }
-    let root = app_data_root(&app)?.join("profiles").join(request.profile_id).join(request.storage_id);
-    fs::create_dir_all(&root).map_err(|error| describe_storage_failure(
-        "Encrypted profile storage could not be created", error,
-    ))?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-            .map_err(|error| describe_storage_failure(
-                "Encrypted profile storage permissions could not be secured", error,
-            ))?;
+    let valid_profile = !request.profile_id.is_empty()
+        && request.profile_id.len() <= 128
+        && request
+            .profile_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    let valid_storage = request.storage_id == "profile"
+        || (request.storage_id.len() == 32
+            && request
+                .storage_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()));
+    if !valid_profile || !valid_storage {
+        return Err("Invalid encrypted profile storage identity.".into());
     }
-    root.to_str().map(str::to_owned).ok_or_else(|| "Encrypted profile storage path is unavailable.".into())
+    let root = app_data_root(&app)?
+        .join("profiles")
+        .join(request.profile_id)
+        .join(request.storage_id);
+    fs::create_dir_all(&root).map_err(|error| {
+        describe_storage_failure("Encrypted profile storage could not be created", error)
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            describe_storage_failure(
+                "Encrypted profile storage permissions could not be secured",
+                error,
+            )
+        })?;
+    }
+    root.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Encrypted profile storage path is unavailable.".into())
 }
 
 #[tauri::command]
 async fn syncpeer_profile_available_bytes(app: tauri::AppHandle) -> Result<u64, String> {
     let root = app_data_root(&app)?;
     fs::create_dir_all(&root).map_err(|error| format!("Could not create app storage: {error}"))?;
-    fs2::available_space(root).map_err(|error| format!("Could not inspect available app storage: {error}"))
+    fs2::available_space(root)
+        .map_err(|error| format!("Could not inspect available app storage: {error}"))
 }
 
 fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
@@ -1311,13 +1425,23 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T,
 }
 
 fn create_json_temporary(path: &Path) -> Result<(PathBuf, fs::File), String> {
-    let parent = path.parent().ok_or_else(|| "JSON path has no parent.".to_string())?;
-    let name = path.file_name().ok_or_else(|| "JSON path has no file name.".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "JSON path has no parent.".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "JSON path has no file name.".to_string())?;
     for attempt in 0..100 {
-        let candidate = parent.join(format!(".{}.{}.{}.tmp", name.to_string_lossy(), std::process::id(), attempt));
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            attempt
+        ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
@@ -1485,10 +1609,7 @@ where
     }
 }
 
-fn write_tls_bytes(
-    stream: &mut dyn TlsIo,
-    bytes: &[u8],
-) -> Result<(), String> {
+fn write_tls_bytes(stream: &mut dyn TlsIo, bytes: &[u8]) -> Result<(), String> {
     let deadline = std::time::Instant::now() + tls_write_timeout();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -1518,17 +1639,11 @@ fn write_tls_bytes(
     }
 }
 
-fn run_tls_session(
-    mut stream: Box<dyn TlsIo>,
-    commands: mpsc::Receiver<TlsCommand>,
-) {
+fn run_tls_session(mut stream: Box<dyn TlsIo>, commands: mpsc::Receiver<TlsCommand>) {
     if stream.prepare_nonblocking().is_err() {
         return;
     }
-    let mut pending_read: Option<(
-        Vec<u8>,
-        mpsc::Sender<Result<TlsReadResponse, String>>,
-    )> = None;
+    let mut pending_read: Option<(Vec<u8>, mpsc::Sender<Result<TlsReadResponse, String>>)> = None;
     loop {
         if pending_read.is_none() {
             match commands.recv_timeout(Duration::from_millis(10)) {
@@ -1560,7 +1675,19 @@ fn run_tls_session(
                 return;
             }
             Ok(read) => {
-                buffer.truncate(read);
+                let mut filled = read;
+                while filled < buffer.len() {
+                    match stream.read(&mut buffer[filled..]) {
+                        Ok(0) => break,
+                        Ok(read) => filled += read,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                        Err(error) => {
+                            let _ = response.send(Err(format!("TLS read failed: {error}")));
+                            return;
+                        }
+                    }
+                }
+                buffer.truncate(filled);
                 let result = TlsReadResponse {
                     bytes: std::mem::take(buffer),
                     eof: false,
@@ -1578,17 +1705,16 @@ fn run_tls_session(
         }
     }
 }
-
 fn handle_tls_command(
     command: TlsCommand,
     stream: &mut dyn TlsIo,
-    pending_read: &mut Option<(
-        Vec<u8>,
-        mpsc::Sender<Result<TlsReadResponse, String>>,
-    )>,
+    pending_read: &mut Option<(Vec<u8>, mpsc::Sender<Result<TlsReadResponse, String>>)>,
 ) -> bool {
     match command {
-        TlsCommand::Read { max_bytes, response } => {
+        TlsCommand::Read {
+            max_bytes,
+            response,
+        } => {
             if pending_read.is_some() {
                 let _ = response.send(Err("Concurrent TLS read is not supported".to_string()));
             } else {
@@ -1643,42 +1769,61 @@ fn read_tls_session(
     let result = (|| {
         let session = get_tls_session_from_store(store, request.session_id)?;
         let (response, result) = mpsc::channel();
-        session.commands.send(TlsCommand::Read {
-            max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024), response,
-        }).map_err(|_| "TLS worker stopped".to_string())?;
-        result.recv().map_err(|_| "TLS worker stopped".to_string())?
+        session
+            .commands
+            .send(TlsCommand::Read {
+                max_bytes: request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
+                response,
+            })
+            .map_err(|_| "TLS worker stopped".to_string())?;
+        result
+            .recv()
+            .map_err(|_| "TLS worker stopped".to_string())?
     })();
     let event = match &result {
         Ok(response) if response.eof => "read.eof",
         Ok(_) => "read.completed",
         Err(_) => "read.failed",
     };
-    trace_tls(event, request.session_id, result.as_ref().map_or(0, |response| response.bytes.len()));
+    trace_tls(
+        event,
+        request.session_id,
+        result.as_ref().map_or(0, |response| response.bytes.len()),
+    );
     result
 }
 
-fn write_tls_session(
-    store: &SharedTlsStore,
-    request: TlsWriteRequest,
-) -> Result<(), String> {
+fn write_tls_session(store: &SharedTlsStore, request: TlsWriteRequest) -> Result<(), String> {
     trace_tls("write.queued", request.session_id, request.bytes.len());
     let session_id = request.session_id;
     let bytes = request.bytes.len();
     let result = (|| {
         let session = get_tls_session_from_store(store, request.session_id)?;
         let (response, result) = mpsc::channel();
-        session.commands.send(TlsCommand::Write { bytes: request.bytes, response })
+        session
+            .commands
+            .send(TlsCommand::Write {
+                bytes: request.bytes,
+                response,
+            })
             .map_err(|_| "TLS worker stopped".to_string())?;
-        result.recv().map_err(|_| "TLS worker stopped".to_string())?
+        result
+            .recv()
+            .map_err(|_| "TLS worker stopped".to_string())?
     })();
-    trace_tls(if result.is_ok() { "write.completed" } else { "write.failed" }, session_id, bytes);
+    trace_tls(
+        if result.is_ok() {
+            "write.completed"
+        } else {
+            "write.failed"
+        },
+        session_id,
+        bytes,
+    );
     result
 }
 
-fn close_tls_session(
-    store: &SharedTlsStore,
-    request: TlsCloseRequest,
-) -> Result<(), String> {
+fn close_tls_session(store: &SharedTlsStore, request: TlsCloseRequest) -> Result<(), String> {
     let removed = {
         let mut guard = store
             .lock()
@@ -1691,7 +1836,9 @@ fn close_tls_session(
             .commands
             .send(TlsCommand::Close { response })
             .map_err(|_| "TLS worker stopped".to_string())?;
-        result.recv().map_err(|_| "TLS worker stopped".to_string())?;
+        result
+            .recv()
+            .map_err(|_| "TLS worker stopped".to_string())?;
     }
     Ok(())
 }
@@ -1714,32 +1861,49 @@ fn local_announce_packet(cert_der: &[u8], port: u16, instance_id: i64) -> Vec<u8
         instance_id,
     };
     let mut packet = LOCAL_DISCOVERY_MAGIC.to_be_bytes().to_vec();
-    announce.encode(&mut packet).expect("encoding into a byte vector cannot fail");
+    announce
+        .encode(&mut packet)
+        .expect("encoding into a byte vector cannot fail");
     packet
 }
 
-fn start_local_announce_worker(cert_der: Vec<u8>, port: u16,
-    stop: Arc<AtomicBool>) -> Result<(), String> {
-    thread::Builder::new().name("syncpeer-local-announce".to_string()).spawn(move || {
-        let packet = local_announce_packet(&cert_der, port,
-            now_ms().try_into().unwrap_or(i64::MAX));
-        let udp4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok();
-        if let Some(socket) = &udp4 { let _ = socket.set_broadcast(true); }
-        let udp6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok();
-        while !stop.load(Ordering::Acquire) {
+fn start_local_announce_worker(
+    cert_der: Vec<u8>,
+    port: u16,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("syncpeer-local-announce".to_string())
+        .spawn(move || {
+            let packet =
+                local_announce_packet(&cert_der, port, now_ms().try_into().unwrap_or(i64::MAX));
+            let udp4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok();
             if let Some(socket) = &udp4 {
-                let _ = socket.send_to(&packet, (Ipv4Addr::BROADCAST, LOCAL_DISCOVERY_PORT));
+                let _ = socket.set_broadcast(true);
             }
-            if let Some(socket) = &udp6 {
-                let _ = socket.send_to(&packet,
-                    (Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), LOCAL_DISCOVERY_PORT));
+            let udp6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok();
+            while !stop.load(Ordering::Acquire) {
+                if let Some(socket) = &udp4 {
+                    let _ = socket.send_to(&packet, (Ipv4Addr::BROADCAST, LOCAL_DISCOVERY_PORT));
+                }
+                if let Some(socket) = &udp6 {
+                    let _ = socket.send_to(
+                        &packet,
+                        (
+                            Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0),
+                            LOCAL_DISCOVERY_PORT,
+                        ),
+                    );
+                }
+                for _ in 0..100 {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
-            for _ in 0..100 {
-                if stop.load(Ordering::Acquire) { return; }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }).map_err(|error| format!("Could not start local discovery announcer: {error}"))?;
+        })
+        .map_err(|error| format!("Could not start local discovery announcer: {error}"))?;
     Ok(())
 }
 
@@ -1748,8 +1912,13 @@ fn open_tls_listener(
     listener_store: SharedTlsListenerStore,
     request: TlsListenRequest,
 ) -> Result<TlsListenResponse, String> {
-    if request.alpn_protocols.is_empty() || request.alpn_protocols.len() > 8 ||
-        request.alpn_protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
+    if request.alpn_protocols.is_empty()
+        || request.alpn_protocols.len() > 8
+        || request
+            .alpn_protocols
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 255)
+    {
         return Err("TLS listener requires valid ALPN protocols.".to_string());
     }
     let cert_chain = rustls_pemfile::certs(&mut request.cert_pem.as_bytes())
@@ -1766,101 +1935,159 @@ fn open_tls_listener(
         .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
         .with_single_cert(cert_chain, private_key)
         .map_err(|error| format!("Invalid listener cert/key pair: {error}"))?;
-    config.alpn_protocols = request.alpn_protocols.iter().map(|value| value.as_bytes().to_vec()).collect();
-    let listener = TcpListener::bind((request.host.as_str(), request.port))
-        .map_err(|error| format!("Syncpeer could not listen on {}:{}: {error}", request.host, request.port))?;
-    let port = listener.local_addr()
-        .map_err(|error| format!("TLS listener address unavailable: {error}"))?.port();
-    listener.set_nonblocking(true)
+    config.alpn_protocols = request
+        .alpn_protocols
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect();
+    let listener = TcpListener::bind((request.host.as_str(), request.port)).map_err(|error| {
+        format!(
+            "Syncpeer could not listen on {}:{}: {error}",
+            request.host, request.port
+        )
+    })?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("TLS listener address unavailable: {error}"))?
+        .port();
+    listener
+        .set_nonblocking(true)
         .map_err(|error| format!("Could not prepare TLS listener: {error}"))?;
-    let timeout = Duration::from_millis(request.handshake_timeout_ms.unwrap_or(10_000).clamp(1, 60_000));
+    let timeout = Duration::from_millis(
+        request
+            .handshake_timeout_ms
+            .unwrap_or(10_000)
+            .clamp(1, 60_000),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     start_local_announce_worker(announce_certificate, port, Arc::clone(&stop))?;
     let (sender, receiver) = mpsc::channel();
     let wake_accept = sender.clone();
-    thread::Builder::new().name("syncpeer-tls-listener".to_string()).spawn(move || {
-        let config = Arc::new(config);
-        while !worker_stop.load(Ordering::Acquire) {
-            let (tcp, remote) = match listener.accept() {
-                Ok(value) => value,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(format!("TLS listener accept failed: {error}")));
-                    return;
-                }
-            };
-            let result: Result<TlsAcceptResponse, String> = (|| {
-                tcp.set_read_timeout(Some(timeout))
-                    .map_err(|error| format!("Could not set accepted TLS read timeout: {error}"))?;
-                tcp.set_write_timeout(Some(timeout))
-                    .map_err(|error| format!("Could not set accepted TLS write timeout: {error}"))?;
-                let connection = ServerConnection::new(Arc::clone(&config))
-                    .map_err(|error| format!("Could not create accepted TLS connection: {error}"))?;
-                let mut stream = StreamOwned::new(connection, tcp);
-                {
-                    let (conn, sock) = (&mut stream.conn, &mut stream.sock);
-                    conn.complete_io(sock)
-                        .map_err(|error| format!("Incoming TLS handshake failed: {error}"))?;
-                }
-                let peer_certificate_der = stream.conn.peer_certificates()
-                    .and_then(|certs| certs.first()).map(|cert| cert.as_ref().to_vec())
-                    .ok_or_else(|| "Incoming TLS peer certificate missing.".to_string())?;
-                let alpn = stream.conn.alpn_protocol()
-                    .map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default();
-                let session_id = store_tls_session(&session_store, stream)?;
-                Ok(TlsAcceptResponse { session_id, peer_certificate_der,
-                    remote_address: remote.ip().to_string(), remote_port: remote.port(), alpn })
-            })();
-            // A rejected peer is not a listener failure. Only successful handshakes
-            // enter the accept queue; socket-local errors must not stop JS acceptance.
-            match result {
-                Ok(accepted) => {
-                    let session_id = accepted.session_id;
-                    if worker_stop.load(Ordering::Acquire) || sender.send(Ok(accepted)).is_err() {
-                        let _ = close_tls_session(&session_store, TlsCloseRequest { session_id });
+    thread::Builder::new()
+        .name("syncpeer-tls-listener".to_string())
+        .spawn(move || {
+            let config = Arc::new(config);
+            while !worker_stop.load(Ordering::Acquire) {
+                let (tcp, remote) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(format!("TLS listener accept failed: {error}")));
                         return;
                     }
+                };
+                let result: Result<TlsAcceptResponse, String> = (|| {
+                    tcp.set_read_timeout(Some(timeout)).map_err(|error| {
+                        format!("Could not set accepted TLS read timeout: {error}")
+                    })?;
+                    tcp.set_write_timeout(Some(timeout)).map_err(|error| {
+                        format!("Could not set accepted TLS write timeout: {error}")
+                    })?;
+                    let connection =
+                        ServerConnection::new(Arc::clone(&config)).map_err(|error| {
+                            format!("Could not create accepted TLS connection: {error}")
+                        })?;
+                    let mut stream = StreamOwned::new(connection, tcp);
+                    {
+                        let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+                        conn.complete_io(sock)
+                            .map_err(|error| format!("Incoming TLS handshake failed: {error}"))?;
+                    }
+                    let peer_certificate_der = stream
+                        .conn
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .map(|cert| cert.as_ref().to_vec())
+                        .ok_or_else(|| "Incoming TLS peer certificate missing.".to_string())?;
+                    let alpn = stream
+                        .conn
+                        .alpn_protocol()
+                        .map(|value| String::from_utf8_lossy(value).to_string())
+                        .unwrap_or_default();
+                    let session_id = store_tls_session(&session_store, stream)?;
+                    Ok(TlsAcceptResponse {
+                        session_id,
+                        peer_certificate_der,
+                        remote_address: remote.ip().to_string(),
+                        remote_port: remote.port(),
+                        alpn,
+                    })
+                })();
+                // A rejected peer is not a listener failure. Only successful handshakes
+                // enter the accept queue; socket-local errors must not stop JS acceptance.
+                match result {
+                    Ok(accepted) => {
+                        let session_id = accepted.session_id;
+                        if worker_stop.load(Ordering::Acquire) || sender.send(Ok(accepted)).is_err()
+                        {
+                            let _ =
+                                close_tls_session(&session_store, TlsCloseRequest { session_id });
+                            return;
+                        }
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
-        }
-    }).map_err(|error| format!("Could not start TLS listener worker: {error}"))?;
-    let mut guard = listener_store.lock()
+        })
+        .map_err(|error| format!("Could not start TLS listener worker: {error}"))?;
+    let mut guard = listener_store
+        .lock()
         .map_err(|_| "TLS listener store lock poisoned".to_string())?;
     let listener_id = guard.next_id.saturating_add(1).max(1);
     guard.next_id = listener_id;
-    guard.listeners.insert(listener_id, Arc::new(TlsListenerState {
-        stop, accepted: Mutex::new(receiver),
-        wake_accept,
-    }));
+    guard.listeners.insert(
+        listener_id,
+        Arc::new(TlsListenerState {
+            stop,
+            accepted: Mutex::new(receiver),
+            wake_accept,
+        }),
+    );
     Ok(TlsListenResponse { listener_id, port })
 }
 
-fn accept_tls_listener(store: &SharedTlsListenerStore,
-    request: TlsAcceptRequest) -> Result<TlsAcceptResponse, String> {
-    let listener = store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?
-        .listeners.get(&request.listener_id).cloned()
+fn accept_tls_listener(
+    store: &SharedTlsListenerStore,
+    request: TlsAcceptRequest,
+) -> Result<TlsAcceptResponse, String> {
+    let listener = store
+        .lock()
+        .map_err(|_| "TLS listener store lock poisoned".to_string())?
+        .listeners
+        .get(&request.listener_id)
+        .cloned()
         .ok_or_else(|| format!("Unknown TLS listener: {}", request.listener_id))?;
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(30_000).clamp(1, 60_000));
-    let result = listener.accepted.lock().map_err(|_| "TLS listener accept lock poisoned".to_string())?
-        .recv_timeout(timeout).map_err(|error| match error {
+    let result = listener
+        .accepted
+        .lock()
+        .map_err(|_| "TLS listener accept lock poisoned".to_string())?
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
             mpsc::RecvTimeoutError::Timeout => "TLS listener accept timed out.".to_string(),
             mpsc::RecvTimeoutError::Disconnected => "TLS listener stopped.".to_string(),
         })?;
     result
 }
 
-fn close_tls_listener(store: &SharedTlsListenerStore,
-    request: TlsListenerCloseRequest) -> Result<(), String> {
-    let listener = store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?
-        .listeners.remove(&request.listener_id);
+fn close_tls_listener(
+    store: &SharedTlsListenerStore,
+    request: TlsListenerCloseRequest,
+) -> Result<(), String> {
+    let listener = store
+        .lock()
+        .map_err(|_| "TLS listener store lock poisoned".to_string())?
+        .listeners
+        .remove(&request.listener_id);
     if let Some(listener) = listener {
         listener.stop.store(true, Ordering::Release);
-        let _ = listener.wake_accept.send(Err("TLS listener stopped.".to_string()));
+        let _ = listener
+            .wake_accept
+            .send(Err("TLS listener stopped.".to_string()));
     }
     Ok(())
 }
@@ -1892,30 +2119,46 @@ fn create_protected_identity(app: &tauri::AppHandle) -> Result<CliNodeIdentityRe
     let key_pem = cert.serialize_private_key_pem();
     validate_identity_key_pair(&cert_pem, &key_pem)?;
 
-    let stored = serde_json::to_string(&IdentityRecoveryPayload { version: 1,
-        device_id: device_id_from_cert_pem(&cert_pem)?, cert_pem: cert_pem.clone(), key_pem: key_pem.clone() })
-        .map_err(|_| "Could not encode protected identity.".to_string())?;
+    let stored = serde_json::to_string(&IdentityRecoveryPayload {
+        version: 1,
+        device_id: device_id_from_cert_pem(&cert_pem)?,
+        cert_pem: cert_pem.clone(),
+        key_pem: key_pem.clone(),
+    })
+    .map_err(|_| "Could not encode protected identity.".to_string())?;
     vault_secret::identity_record(app, "save", Some(stored.clone()))?;
     if vault_secret::identity_record(app, "load", None)?.as_deref() != Some(&stored) {
         return Err("Protected device identity could not be verified.".into());
     }
     Ok(CliNodeIdentityResponse {
-        cert_path: String::new(), key_path: String::new(),
+        cert_path: String::new(),
+        key_path: String::new(),
         cert_pem,
         key_pem,
     })
 }
 
-fn load_protected_identity(app: &tauri::AppHandle) -> Result<Option<CliNodeIdentityResponse>, String> {
-    let Some(stored) = vault_secret::identity_record(app, "load", None)? else { return Ok(None); };
-    let value: IdentityRecoveryPayload = serde_json::from_str(&stored)
-        .map_err(|_| "Protected device identity is invalid; local reset is required.".to_string())?;
-    if value.version != 1 || device_id_from_cert_pem(&value.cert_pem)? != value.device_id ||
-        validate_identity_key_pair(&value.cert_pem, &value.key_pem).is_err() {
+fn load_protected_identity(
+    app: &tauri::AppHandle,
+) -> Result<Option<CliNodeIdentityResponse>, String> {
+    let Some(stored) = vault_secret::identity_record(app, "load", None)? else {
+        return Ok(None);
+    };
+    let value: IdentityRecoveryPayload = serde_json::from_str(&stored).map_err(|_| {
+        "Protected device identity is invalid; local reset is required.".to_string()
+    })?;
+    if value.version != 1
+        || device_id_from_cert_pem(&value.cert_pem)? != value.device_id
+        || validate_identity_key_pair(&value.cert_pem, &value.key_pem).is_err()
+    {
         return Err("Protected device identity is invalid; local reset is required.".into());
     }
-    Ok(Some(CliNodeIdentityResponse { cert_path: String::new(), key_path: String::new(),
-        cert_pem: value.cert_pem, key_pem: value.key_pem }))
+    Ok(Some(CliNodeIdentityResponse {
+        cert_path: String::new(),
+        key_path: String::new(),
+        cert_pem: value.cert_pem,
+        key_pem: value.key_pem,
+    }))
 }
 
 fn normalize_device_id(value: &str) -> String {
@@ -2040,26 +2283,38 @@ fn relay_write_message<W: Write>(
     Ok(())
 }
 
-fn relay_read_exact<R: Read>(reader: &mut R, output: &mut [u8], allow_idle: bool)
-    -> Result<bool, String> {
+fn relay_read_exact<R: Read>(
+    reader: &mut R,
+    output: &mut [u8],
+    allow_idle: bool,
+) -> Result<bool, String> {
     let mut offset = 0;
     while offset < output.len() {
         match reader.read(&mut output[offset..]) {
             Ok(0) => return Err("Relay connection closed".to_string()),
             Ok(count) => offset += count,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if allow_idle && offset == 0 &&
-                matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => return Ok(false),
+            Err(error)
+                if allow_idle
+                    && offset == 0
+                    && matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+            {
+                return Ok(false)
+            }
             Err(error) => return Err(format!("Relay read failed: {error}")),
         }
     }
     Ok(true)
 }
 
-fn relay_read_message_inner<R: Read>(reader: &mut R, allow_idle: bool)
-    -> Result<Option<(u32, Vec<u8>)>, String> {
+fn relay_read_message_inner<R: Read>(
+    reader: &mut R,
+    allow_idle: bool,
+) -> Result<Option<(u32, Vec<u8>)>, String> {
     let mut header = [0u8; 12];
-    if !relay_read_exact(reader, &mut header, allow_idle)? { return Ok(None); }
+    if !relay_read_exact(reader, &mut header, allow_idle)? {
+        return Ok(None);
+    }
     let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if magic != RELAY_MAGIC {
         return Err(format!("Unexpected relay magic 0x{magic:08X}"));
@@ -2077,8 +2332,7 @@ fn relay_read_message_inner<R: Read>(reader: &mut R, allow_idle: bool)
 }
 
 fn relay_read_message<R: Read>(reader: &mut R) -> Result<(u32, Vec<u8>), String> {
-    relay_read_message_inner(reader, false)?
-        .ok_or_else(|| "Relay message missing".to_string())
+    relay_read_message_inner(reader, false)?.ok_or_else(|| "Relay message missing".to_string())
 }
 
 fn relay_read_message_poll<R: Read>(reader: &mut R) -> Result<Option<(u32, Vec<u8>)>, String> {
@@ -2101,23 +2355,39 @@ struct RelayInvitation {
     server_socket: bool,
 }
 
-fn parse_relay_invitation(payload: &[u8], fallback_host: &str,
-    fallback_port: u16) -> Result<RelayInvitation, String> {
+fn parse_relay_invitation(
+    payload: &[u8],
+    fallback_host: &str,
+    fallback_port: u16,
+) -> Result<RelayInvitation, String> {
     let mut offset = 0;
     let from = xdr_read_opaque(payload, &mut offset)?;
     let key = xdr_read_opaque(payload, &mut offset)?;
     let address = xdr_read_opaque(payload, &mut offset)?;
     let port = xdr_read_u32(payload, &mut offset)?;
     let role = xdr_read_u32(payload, &mut offset)?;
-    if offset != payload.len() || from.len() != 32 || key.is_empty() || key.len() > 32 ||
-        port > u16::MAX as u32 || role > 1 {
+    if offset != payload.len()
+        || from.len() != 32
+        || key.is_empty()
+        || key.len() > 32
+        || port > u16::MAX as u32
+        || role > 1
+    {
         return Err("Invalid relay session invitation".to_string());
     }
     let mut id = [0u8; 32];
     id.copy_from_slice(&from);
-    Ok(RelayInvitation { from: id, key,
+    Ok(RelayInvitation {
+        from: id,
+        key,
         host: parse_ip_from_relay_address(&address).unwrap_or_else(|| fallback_host.to_string()),
-        port: if port == 0 { fallback_port } else { port as u16 }, server_socket: role == 1 })
+        port: if port == 0 {
+            fallback_port
+        } else {
+            port as u16
+        },
+        server_socket: role == 1,
+    })
 }
 
 fn parse_ip_from_relay_address(address: &[u8]) -> Option<String> {
@@ -2171,7 +2441,10 @@ fn normalize_local_discovery_address(address: &str, source_ip: &str) -> Option<S
     Some(format!("{scheme}://{formatted_host}:{port}"))
 }
 
-fn parse_local_discovery_candidate(address: &str, device_id: Option<&str>) -> Option<DiscoveryLocalCandidate> {
+fn parse_local_discovery_candidate(
+    address: &str,
+    device_id: Option<&str>,
+) -> Option<DiscoveryLocalCandidate> {
     let trimmed = address.trim();
     if trimmed.is_empty() {
         return None;
@@ -2236,7 +2509,10 @@ fn send_syncpeer_probe(udp4: Option<&UdpSocket>, udp6: Option<&UdpSocket>, reque
     if let Some(socket) = udp6 {
         let _ = socket.send_to(
             &packet,
-            (Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), SYNCPEER_DISCOVERY_PORT),
+            (
+                Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0),
+                SYNCPEER_DISCOVERY_PORT,
+            ),
         );
     }
 }
@@ -2252,11 +2528,10 @@ fn parse_syncpeer_packet(packet: &[u8]) -> Option<(u8, &[u8])> {
     Some((packet[4], &packet[5..]))
 }
 
-fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<DiscoveryLocalResponse, String> {
-    let timeout_ms = request
-        .timeout_ms
-        .unwrap_or(1200)
-        .clamp(100, 30_000);
+fn discover_local_candidates(
+    request: &DiscoveryLocalRequest,
+) -> Result<DiscoveryLocalResponse, String> {
+    let timeout_ms = request.timeout_ms.unwrap_or(1200).clamp(100, 30_000);
     let expected = request
         .expected_device_id
         .as_deref()
@@ -2407,7 +2682,9 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
                     announcements_accepted += 1;
                     let source_ip = source.ip().to_string();
                     for address in announce.addresses {
-                        let Some(normalized) = normalize_local_discovery_address(&address, &source_ip) else {
+                        let Some(normalized) =
+                            normalize_local_discovery_address(&address, &source_ip)
+                        else {
                             continue;
                         };
                         if let Some(candidate) =
@@ -2418,7 +2695,8 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
                     }
                 }
                 Err(error) => {
-                    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut {
+                    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut
+                    {
                         // continue scanning until timeout window expires
                     } else {
                         return Err(format!("Local discovery UDP read failed: {error}"));
@@ -2502,7 +2780,8 @@ fn discover_local_candidates(request: &DiscoveryLocalRequest) -> Result<Discover
                     candidates.insert(candidate.address.clone(), candidate);
                 }
                 Err(error) => {
-                    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut {
+                    if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut
+                    {
                         // continue scanning until timeout window expires
                     } else {
                         return Err(format!("SyncPeer discovery UDP read failed: {error}"));
@@ -2557,10 +2836,7 @@ fn tcp_connect_timeout(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1))
 }
 
-fn connect_tcp_with_timeout(
-    address: &str,
-    timeout_ms: Option<u64>,
-) -> Result<TcpStream, String> {
+fn connect_tcp_with_timeout(address: &str, timeout_ms: Option<u64>) -> Result<TcpStream, String> {
     let timeout = tcp_connect_timeout(timeout_ms);
     let mut resolved = false;
     let mut last_error = None;
@@ -2600,7 +2876,9 @@ async fn syncpeer_read_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<CliNodeIdentityResponse, String> {
     let _ = app_data_root(&app)?;
-    if let Some(identity) = load_protected_identity(&app)? { return Ok(identity); }
+    if let Some(identity) = load_protected_identity(&app)? {
+        return Ok(identity);
+    }
     create_protected_identity(&app)
 }
 
@@ -2631,9 +2909,7 @@ async fn syncpeer_get_default_device_id(app: tauri::AppHandle) -> Result<String,
 }
 
 #[tauri::command]
-async fn syncpeer_regenerate_default_cli_identity(
-    app: tauri::AppHandle,
-) -> Result<String, String> {
+async fn syncpeer_regenerate_default_cli_identity(app: tauri::AppHandle) -> Result<String, String> {
     let _ = app_data_root(&app)?;
     let identity = create_protected_identity(&app)?;
     device_id_from_cert_pem(&identity.cert_pem)
@@ -2676,26 +2952,33 @@ async fn syncpeer_restore_identity_recovery(
     vault_secret::identity_record(&app, "save", Some(stored))?;
 
     Ok(CliNodeIdentityResponse {
-        cert_path: String::new(), key_path: String::new(),
+        cert_path: String::new(),
+        key_path: String::new(),
         cert_pem: payload.cert_pem,
         key_pem: payload.key_pem,
     })
 }
 
 #[tauri::command]
-fn syncpeer_discovery_prepare(store: tauri::State<'_, SharedDiscoveryRequests>) -> Result<u64, String> {
+fn syncpeer_discovery_prepare(
+    store: tauri::State<'_, SharedDiscoveryRequests>,
+) -> Result<u64, String> {
     discovery::prepare(store.inner())
 }
 
 #[tauri::command]
-fn syncpeer_discovery_cancel(store: tauri::State<'_, SharedDiscoveryRequests>, request: DiscoveryCancelRequest)
-    -> Result<(), String> {
+fn syncpeer_discovery_cancel(
+    store: tauri::State<'_, SharedDiscoveryRequests>,
+    request: DiscoveryCancelRequest,
+) -> Result<(), String> {
     discovery::cancel(store.inner(), request.request_id)
 }
 
 #[tauri::command]
-async fn syncpeer_discovery_fetch(store: tauri::State<'_, SharedDiscoveryRequests>, request: DiscoveryFetchRequest)
-    -> Result<DiscoveryFetchResponse, String> {
+async fn syncpeer_discovery_fetch(
+    store: tauri::State<'_, SharedDiscoveryRequests>,
+    request: DiscoveryFetchRequest,
+) -> Result<DiscoveryFetchResponse, String> {
     discovery::fetch(store.inner(), request).await
 }
 
@@ -2704,8 +2987,8 @@ async fn syncpeer_discovery_local(
     request: DiscoveryLocalRequest,
 ) -> Result<DiscoveryLocalResponse, String> {
     tauri::async_runtime::spawn_blocking(move || discover_local_candidates(&request))
-    .await
-    .map_err(|error| format!("Local discovery task join error: {error}"))?
+        .await
+        .map_err(|error| format!("Local discovery task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -2715,8 +2998,8 @@ async fn syncpeer_tls_open(
 ) -> Result<TlsOpenResponse, String> {
     let shared_store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || open_tls_session(shared_store, request))
-    .await
-    .map_err(|error| format!("TLS open task join error: {error}"))?
+        .await
+        .map_err(|error| format!("TLS open task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -2727,8 +3010,11 @@ async fn syncpeer_tls_listen(
 ) -> Result<TlsListenResponse, String> {
     let session_store = sessions.inner().clone();
     let listener_store = listeners.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || open_tls_listener(session_store, listener_store, request))
-        .await.map_err(|error| format!("TLS listen task join error: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        open_tls_listener(session_store, listener_store, request)
+    })
+    .await
+    .map_err(|error| format!("TLS listen task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -2738,7 +3024,8 @@ async fn syncpeer_tls_accept(
 ) -> Result<TlsAcceptResponse, String> {
     let listener_store = listeners.inner().clone();
     tauri::async_runtime::spawn_blocking(move || accept_tls_listener(&listener_store, request))
-        .await.map_err(|error| format!("TLS accept task join error: {error}"))?
+        .await
+        .map_err(|error| format!("TLS accept task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -2753,85 +3040,95 @@ fn open_tls_session(
     shared_store: SharedTlsStore,
     request: TlsOpenRequest,
 ) -> Result<TlsOpenResponse, String> {
-        let address = format!("{}:{}", request.host, request.port);
-        let tls_host = resolve_tls_hostname(&request.host);
-        tauri_log(&format!(
-            "tls.open.start {} {}",
-            mask_pem_summary("cert", &request.cert_pem),
-            mask_pem_summary("key", &request.key_pem)
-        ));
+    let address = format!("{}:{}", request.host, request.port);
+    let tls_host = resolve_tls_hostname(&request.host);
+    tauri_log(&format!(
+        "tls.open.start {} {}",
+        mask_pem_summary("cert", &request.cert_pem),
+        mask_pem_summary("key", &request.key_pem)
+    ));
 
-        let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
-        let cert_chain = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Invalid client certificate PEM: {error}"))?;
-        if cert_chain.is_empty() {
-            return Err("Client certificate PEM did not contain any certificate".to_string());
-        }
-        tauri_log(&format!(
-            "tls.open.cert_parsed certChainLen={}",
-            cert_chain.len()
-        ));
-
-        let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|error| format!("Invalid client private key PEM: {error}"))?
-            .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
-        tauri_log("tls.open.key_parsed");
-
-        let mut config = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_client_auth_cert(cert_chain, private_key)
-            .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
-        let alpn_protocols = if request.alpn_protocols.is_empty() {
-            vec!["bep/1.0".to_string()]
-        } else {
-            request.alpn_protocols.clone()
-        };
-        if alpn_protocols.len() > 8 || alpn_protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
-            return Err("Invalid TLS ALPN protocols".to_string());
-        }
-        config.alpn_protocols = alpn_protocols.iter().map(|value| value.as_bytes().to_vec()).collect();
-        let config = Arc::new(config);
-
-        tauri_log("tls.open.tcp_connect.start");
-        let tcp = connect_tcp_with_timeout(&address, request.timeout_ms)?;
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("Could not set TLS write timeout: {error}"))?;
-        tauri_log("tls.open.tcp_connect.done");
-
-        let server_name = ServerName::try_from(tls_host.clone())
-            .map_err(|error| format!("Invalid TLS host '{}': {error}", tls_host))?;
-        let connection = ClientConnection::new(config, server_name)
-            .map_err(|error| format!("Could not create TLS client: {error}"))?;
-        let mut stream = StreamOwned::new(connection, tcp);
-        tauri_log("tls.open.handshake.start");
-        {
-            let (conn, sock) = (&mut stream.conn, &mut stream.sock);
-            conn.complete_io(sock)
-                .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
-        }
-        tauri_log("tls.open.handshake.done");
-        let peer_certificate_der = stream
-            .conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .map(|cert| cert.as_ref().to_vec())
-            .ok_or_else(|| "Peer certificate missing".to_string())?;
-        verify_hostname_against_cert(&peer_certificate_der, &tls_host)?;
-        tauri_log(&format!("tls.open.peer_cert peerCertBytes={}", peer_certificate_der.len()));
-
-        let next_id = store_tls_session(&shared_store, stream)?;
-        tauri_log(&format!("tls.open.ready sessionId={}", next_id));
-        Ok(TlsOpenResponse {
-            session_id: next_id,
-            peer_certificate_der,
-            connected_via: None,
-        })
+    let mut cert_reader = std::io::BufReader::new(request.cert_pem.as_bytes());
+    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Invalid client certificate PEM: {error}"))?;
+    if cert_chain.is_empty() {
+        return Err("Client certificate PEM did not contain any certificate".to_string());
     }
+    tauri_log(&format!(
+        "tls.open.cert_parsed certChainLen={}",
+        cert_chain.len()
+    ));
+
+    let mut key_reader = std::io::BufReader::new(request.key_pem.as_bytes());
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|error| format!("Invalid client private key PEM: {error}"))?
+        .ok_or_else(|| "Client key PEM did not contain a private key".to_string())?;
+    tauri_log("tls.open.key_parsed");
+
+    let mut config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_client_auth_cert(cert_chain, private_key)
+        .map_err(|error| format!("Invalid client cert/key pair: {error}"))?;
+    let alpn_protocols = if request.alpn_protocols.is_empty() {
+        vec!["bep/1.0".to_string()]
+    } else {
+        request.alpn_protocols.clone()
+    };
+    if alpn_protocols.len() > 8
+        || alpn_protocols
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 255)
+    {
+        return Err("Invalid TLS ALPN protocols".to_string());
+    }
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect();
+    let config = Arc::new(config);
+
+    tauri_log("tls.open.tcp_connect.start");
+    let tcp = connect_tcp_with_timeout(&address, request.timeout_ms)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("Could not set TLS read timeout: {error}"))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("Could not set TLS write timeout: {error}"))?;
+    tauri_log("tls.open.tcp_connect.done");
+
+    let server_name = ServerName::try_from(tls_host.clone())
+        .map_err(|error| format!("Invalid TLS host '{}': {error}", tls_host))?;
+    let connection = ClientConnection::new(config, server_name)
+        .map_err(|error| format!("Could not create TLS client: {error}"))?;
+    let mut stream = StreamOwned::new(connection, tcp);
+    tauri_log("tls.open.handshake.start");
+    {
+        let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+        conn.complete_io(sock)
+            .map_err(|error| format!("TLS connect to {address} failed: {error}"))?;
+    }
+    tauri_log("tls.open.handshake.done");
+    let peer_certificate_der = stream
+        .conn
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| cert.as_ref().to_vec())
+        .ok_or_else(|| "Peer certificate missing".to_string())?;
+    verify_hostname_against_cert(&peer_certificate_der, &tls_host)?;
+    tauri_log(&format!(
+        "tls.open.peer_cert peerCertBytes={}",
+        peer_certificate_der.len()
+    ));
+
+    let next_id = store_tls_session(&shared_store, stream)?;
+    tauri_log(&format!("tls.open.ready sessionId={}", next_id));
+    Ok(TlsOpenResponse {
+        session_id: next_id,
+        peer_certificate_der,
+        connected_via: None,
+    })
+}
 
 #[tauri::command]
 async fn syncpeer_relay_open(
@@ -2846,30 +3143,46 @@ async fn syncpeer_relay_open(
 
 fn relay_endpoint(address: &str) -> Result<(String, u16, Option<String>), String> {
     let url = Url::parse(address).map_err(|error| format!("Invalid relay address: {error}"))?;
-    if url.scheme() != "relay" { return Err("Relay address must use relay:// scheme".to_string()); }
-    let host = url.host_str().ok_or_else(|| "Relay address is missing host".to_string())?.to_string();
+    if url.scheme() != "relay" {
+        return Err("Relay address must use relay:// scheme".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Relay address is missing host".to_string())?
+        .to_string();
     let port = url.port().unwrap_or(22067);
-    let expected_id = url.query_pairs().find(|(key, _)| key == "id").map(|(_, value)| value.to_string());
+    let expected_id = url
+        .query_pairs()
+        .find(|(key, _)| key == "id")
+        .map(|(_, value)| value.to_string());
     Ok((host, port, expected_id))
 }
 
-fn relay_identity(cert_pem: &str, key_pem: &str)
-    -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+fn relay_identity(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let certificates = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Invalid relay client certificate PEM: {error}"))?;
-    if certificates.is_empty() { return Err("Relay client certificate is missing".to_string()); }
+    if certificates.is_empty() {
+        return Err("Relay client certificate is missing".to_string());
+    }
     let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .map_err(|error| format!("Invalid relay client key PEM: {error}"))?
         .ok_or_else(|| "Relay client private key is missing".to_string())?;
     Ok((certificates, key))
 }
 
-fn open_relay_control(address: &str, certs: &[CertificateDer<'static>],
-    key: &PrivateKeyDer<'static>, timeout_ms: Option<u64>)
-    -> Result<(StreamOwned<ClientConnection, TcpStream>, String, u16), String> {
+fn open_relay_control(
+    address: &str,
+    certs: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+    timeout_ms: Option<u64>,
+) -> Result<(StreamOwned<ClientConnection, TcpStream>, String, u16), String> {
     let (host, port, expected_id) = relay_endpoint(address)?;
-    let mut config = ClientConfig::builder().dangerous()
+    let mut config = ClientConfig::builder()
+        .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
         .with_client_auth_cert(certs.to_vec(), key.clone_key())
         .map_err(|error| format!("Invalid relay client cert/key pair: {error}"))?;
@@ -2885,36 +3198,62 @@ fn open_relay_control(address: &str, certs: &[CertificateDer<'static>],
     let connection = ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| format!("Could not create relay TLS client: {error}"))?;
     let mut stream = StreamOwned::new(connection, tcp);
-    { let (conn, sock) = (&mut stream.conn, &mut stream.sock);
-      conn.complete_io(sock).map_err(|error| format!("Relay TLS handshake failed: {error}"))?; }
+    {
+        let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+        conn.complete_io(sock)
+            .map_err(|error| format!("Relay TLS handshake failed: {error}"))?;
+    }
     if let Some(expected) = expected_id {
-        let der = stream.conn.peer_certificates().and_then(|certs| certs.first())
+        let der = stream
+            .conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
             .ok_or_else(|| "Relay certificate missing".to_string())?;
-        if canonical_device_id(&compute_device_id_from_der(der.as_ref())) != canonical_device_id(&expected) {
+        if canonical_device_id(&compute_device_id_from_der(der.as_ref()))
+            != canonical_device_id(&expected)
+        {
             return Err("Relay certificate ID mismatch".to_string());
         }
     }
     Ok((stream, host, port))
 }
 
-fn join_relay_session(invitation: &RelayInvitation, timeout_ms: Option<u64>) -> Result<TcpStream, String> {
-    let mut socket = connect_tcp_with_timeout(&format!("{}:{}", invitation.host, invitation.port), timeout_ms)?;
+fn join_relay_session(
+    invitation: &RelayInvitation,
+    timeout_ms: Option<u64>,
+) -> Result<TcpStream, String> {
+    let mut socket = connect_tcp_with_timeout(
+        &format!("{}:{}", invitation.host, invitation.port),
+        timeout_ms,
+    )?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(10_000).clamp(1, 60_000));
-    socket.set_read_timeout(Some(timeout)).map_err(|error| format!("Relay session read timeout: {error}"))?;
-    socket.set_write_timeout(Some(timeout)).map_err(|error| format!("Relay session write timeout: {error}"))?;
-    relay_write_message(&mut socket, RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST,
-        &xdr_write_opaque(&invitation.key))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| format!("Relay session read timeout: {error}"))?;
+    socket
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("Relay session write timeout: {error}"))?;
+    relay_write_message(
+        &mut socket,
+        RELAY_MESSAGE_TYPE_JOIN_SESSION_REQUEST,
+        &xdr_write_opaque(&invitation.key),
+    )?;
     let (kind, payload) = relay_read_message(&mut socket)?;
-    if kind != RELAY_MESSAGE_TYPE_RESPONSE { return Err("Unexpected relay session response".to_string()); }
+    if kind != RELAY_MESSAGE_TYPE_RESPONSE {
+        return Err("Unexpected relay session response".to_string());
+    }
     let (code, message) = relay_parse_response(&payload)?;
-    if code != 0 { return Err(format!("Relay join failed ({code}): {message}")); }
+    if code != 0 {
+        return Err(format!("Relay join failed ({code}): {message}"));
+    }
     Ok(socket)
 }
 
-fn relay_peer_certificate(cert: Option<&CertificateDer<'_>>,
-    invitation: &RelayInvitation) -> Result<Vec<u8>, String> {
-    let cert = cert
-        .ok_or_else(|| "Relay peer certificate missing".to_string())?;
+fn relay_peer_certificate(
+    cert: Option<&CertificateDer<'_>>,
+    invitation: &RelayInvitation,
+) -> Result<Vec<u8>, String> {
+    let cert = cert.ok_or_else(|| "Relay peer certificate missing".to_string())?;
     let der = cert.as_ref().to_vec();
     if Sha256::digest(&der).as_slice() != invitation.from {
         return Err("Relay invitation peer certificate mismatch".to_string());
@@ -2922,18 +3261,34 @@ fn relay_peer_certificate(cert: Option<&CertificateDer<'_>>,
     Ok(der)
 }
 
-fn accept_relay_session(store: &SharedTlsStore, invitation: &RelayInvitation,
-    server_config: Arc<ServerConfig>, client_config: Arc<ClientConfig>,
-    timeout_ms: Option<u64>) -> Result<TlsAcceptResponse, String> {
+fn accept_relay_session(
+    store: &SharedTlsStore,
+    invitation: &RelayInvitation,
+    server_config: Arc<ServerConfig>,
+    client_config: Arc<ClientConfig>,
+    timeout_ms: Option<u64>,
+) -> Result<TlsAcceptResponse, String> {
     let socket = join_relay_session(invitation, timeout_ms)?;
     let (session_id, peer_certificate_der, alpn) = if invitation.server_socket {
         let connection = ServerConnection::new(server_config)
             .map_err(|error| format!("Relay server TLS setup failed: {error}"))?;
         let mut stream = StreamOwned::new(connection, socket);
-        { let (conn, sock) = (&mut stream.conn, &mut stream.sock);
-          conn.complete_io(sock).map_err(|error| format!("Relay peer TLS handshake failed: {error}"))?; }
-        let peer = relay_peer_certificate(stream.conn.peer_certificates().and_then(|certs| certs.first()), invitation)?;
-        let alpn = stream.conn.alpn_protocol().map(|value| String::from_utf8_lossy(value).to_string())
+        {
+            let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+            conn.complete_io(sock)
+                .map_err(|error| format!("Relay peer TLS handshake failed: {error}"))?;
+        }
+        let peer = relay_peer_certificate(
+            stream
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first()),
+            invitation,
+        )?;
+        let alpn = stream
+            .conn
+            .alpn_protocol()
+            .map(|value| String::from_utf8_lossy(value).to_string())
             .unwrap_or_default();
         (store_tls_session(store, stream)?, peer, alpn)
     } else {
@@ -2943,21 +3298,46 @@ fn accept_relay_session(store: &SharedTlsStore, invitation: &RelayInvitation,
         let connection = ClientConnection::new(client_config, name)
             .map_err(|error| format!("Relay client TLS setup failed: {error}"))?;
         let mut stream = StreamOwned::new(connection, socket);
-        { let (conn, sock) = (&mut stream.conn, &mut stream.sock);
-          conn.complete_io(sock).map_err(|error| format!("Relay peer TLS handshake failed: {error}"))?; }
-        let peer = relay_peer_certificate(stream.conn.peer_certificates().and_then(|certs| certs.first()), invitation)?;
-        let alpn = stream.conn.alpn_protocol().map(|value| String::from_utf8_lossy(value).to_string())
+        {
+            let (conn, sock) = (&mut stream.conn, &mut stream.sock);
+            conn.complete_io(sock)
+                .map_err(|error| format!("Relay peer TLS handshake failed: {error}"))?;
+        }
+        let peer = relay_peer_certificate(
+            stream
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first()),
+            invitation,
+        )?;
+        let alpn = stream
+            .conn
+            .alpn_protocol()
+            .map(|value| String::from_utf8_lossy(value).to_string())
             .unwrap_or_default();
         (store_tls_session(store, stream)?, peer, alpn)
     };
-    Ok(TlsAcceptResponse { session_id, peer_certificate_der, alpn,
-        remote_address: invitation.host.clone(), remote_port: invitation.port })
+    Ok(TlsAcceptResponse {
+        session_id,
+        peer_certificate_der,
+        alpn,
+        remote_address: invitation.host.clone(),
+        remote_port: invitation.port,
+    })
 }
 
-fn open_relay_listener(session_store: SharedTlsStore, listener_store: SharedTlsListenerStore,
-    request: RelayListenRequest) -> Result<TlsListenResponse, String> {
-    if request.alpn_protocols.is_empty() || request.alpn_protocols.len() > 8 ||
-        request.alpn_protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
+fn open_relay_listener(
+    session_store: SharedTlsStore,
+    listener_store: SharedTlsListenerStore,
+    request: RelayListenRequest,
+) -> Result<TlsListenResponse, String> {
+    if request.alpn_protocols.is_empty()
+        || request.alpn_protocols.len() > 8
+        || request
+            .alpn_protocols
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 255)
+    {
         return Err("Relay listener requires valid ALPN protocols".to_string());
     }
     let (certs, key) = relay_identity(&request.cert_pem, &request.key_pem)?;
@@ -2965,149 +3345,219 @@ fn open_relay_listener(session_store: SharedTlsStore, listener_store: SharedTlsL
         .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
         .with_single_cert(certs.clone(), key.clone_key())
         .map_err(|error| format!("Invalid relay listener certificate: {error}"))?;
-    let mut client_config = ClientConfig::builder().dangerous()
+    let mut client_config = ClientConfig::builder()
+        .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
         .with_client_auth_cert(certs.clone(), key.clone_key())
         .map_err(|error| format!("Invalid relay listener certificate: {error}"))?;
-    let protocols: Vec<Vec<u8>> = request.alpn_protocols.iter().map(|value| value.as_bytes().to_vec()).collect();
+    let protocols: Vec<Vec<u8>> = request
+        .alpn_protocols
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect();
     server_config.alpn_protocols = protocols.clone();
     client_config.alpn_protocols = protocols;
-    let (mut control, host, port) = open_relay_control(&request.relay_address, &certs, &key,
-        request.handshake_timeout_ms)?;
+    let (mut control, host, port) = open_relay_control(
+        &request.relay_address,
+        &certs,
+        &key,
+        request.handshake_timeout_ms,
+    )?;
     relay_write_message(&mut control, RELAY_MESSAGE_TYPE_JOIN_RELAY_REQUEST, &[])?;
     let (kind, payload) = relay_read_message(&mut control)?;
-    if kind != RELAY_MESSAGE_TYPE_RESPONSE { return Err("Unexpected relay registration response".to_string()); }
+    if kind != RELAY_MESSAGE_TYPE_RESPONSE {
+        return Err("Unexpected relay registration response".to_string());
+    }
     let (code, message) = relay_parse_response(&payload)?;
-    if code != 0 { return Err(format!("Relay registration failed ({code}): {message}")); }
-    control.sock.set_read_timeout(Some(Duration::from_secs(2)))
+    if code != 0 {
+        return Err(format!("Relay registration failed ({code}): {message}"));
+    }
+    control
+        .sock
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| format!("Could not set relay listener timeout: {error}"))?;
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let (sender, receiver) = mpsc::channel();
     let wake_accept = sender.clone();
     let timeout_ms = request.handshake_timeout_ms;
-    thread::Builder::new().name("syncpeer-relay-listener".into()).spawn(move || {
-        let server_config = Arc::new(server_config);
-        let client_config = Arc::new(client_config);
-        let mut last_ping = std::time::Instant::now();
-        while !worker_stop.load(Ordering::Acquire) {
-            if last_ping.elapsed() >= Duration::from_secs(15) {
-                if let Err(error) = relay_write_message(&mut control, RELAY_MESSAGE_TYPE_PING, &[]) {
-                    let _ = sender.send(Err(error)); return;
+    thread::Builder::new()
+        .name("syncpeer-relay-listener".into())
+        .spawn(move || {
+            let server_config = Arc::new(server_config);
+            let client_config = Arc::new(client_config);
+            let mut last_ping = std::time::Instant::now();
+            while !worker_stop.load(Ordering::Acquire) {
+                if last_ping.elapsed() >= Duration::from_secs(15) {
+                    if let Err(error) =
+                        relay_write_message(&mut control, RELAY_MESSAGE_TYPE_PING, &[])
+                    {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                    last_ping = std::time::Instant::now();
                 }
-                last_ping = std::time::Instant::now();
-            }
-            let (kind, payload) = match relay_read_message_poll(&mut control) {
-                Ok(Some(message)) => message,
-                Ok(None) => continue,
-                Err(error) => { let _ = sender.send(Err(error)); return; }
-            };
-            if kind == RELAY_MESSAGE_TYPE_PING {
-                if let Err(error) = relay_write_message(&mut control, RELAY_MESSAGE_TYPE_PONG, &[]) {
-                    let _ = sender.send(Err(error)); return;
+                let (kind, payload) = match relay_read_message_poll(&mut control) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                };
+                if kind == RELAY_MESSAGE_TYPE_PING {
+                    if let Err(error) =
+                        relay_write_message(&mut control, RELAY_MESSAGE_TYPE_PONG, &[])
+                    {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if kind == RELAY_MESSAGE_TYPE_PONG { continue; }
-            if kind != RELAY_MESSAGE_TYPE_SESSION_INVITATION { continue; }
-            let Ok(invitation) = parse_relay_invitation(&payload, &host, port) else { continue; };
-            let result = accept_relay_session(&session_store, &invitation, Arc::clone(&server_config),
-                Arc::clone(&client_config), timeout_ms);
-            if let Ok(accepted) = result {
-                let id = accepted.session_id;
-                if worker_stop.load(Ordering::Acquire) || sender.send(Ok(accepted)).is_err() {
-                    let _ = close_tls_session(&session_store, TlsCloseRequest { session_id: id }); return;
+                if kind == RELAY_MESSAGE_TYPE_PONG {
+                    continue;
+                }
+                if kind != RELAY_MESSAGE_TYPE_SESSION_INVITATION {
+                    continue;
+                }
+                let Ok(invitation) = parse_relay_invitation(&payload, &host, port) else {
+                    continue;
+                };
+                let result = accept_relay_session(
+                    &session_store,
+                    &invitation,
+                    Arc::clone(&server_config),
+                    Arc::clone(&client_config),
+                    timeout_ms,
+                );
+                if let Ok(accepted) = result {
+                    let id = accepted.session_id;
+                    if worker_stop.load(Ordering::Acquire) || sender.send(Ok(accepted)).is_err() {
+                        let _ =
+                            close_tls_session(&session_store, TlsCloseRequest { session_id: id });
+                        return;
+                    }
                 }
             }
-        }
-    }).map_err(|error| format!("Could not start relay listener: {error}"))?;
-    let mut guard = listener_store.lock().map_err(|_| "TLS listener store lock poisoned".to_string())?;
+        })
+        .map_err(|error| format!("Could not start relay listener: {error}"))?;
+    let mut guard = listener_store
+        .lock()
+        .map_err(|_| "TLS listener store lock poisoned".to_string())?;
     let id = guard.next_id.saturating_add(1).max(1);
     guard.next_id = id;
-    guard.listeners.insert(id, Arc::new(TlsListenerState { stop, accepted: Mutex::new(receiver), wake_accept }));
-    Ok(TlsListenResponse { listener_id: id, port: 0 })
+    guard.listeners.insert(
+        id,
+        Arc::new(TlsListenerState {
+            stop,
+            accepted: Mutex::new(receiver),
+            wake_accept,
+        }),
+    );
+    Ok(TlsListenResponse {
+        listener_id: id,
+        port: 0,
+    })
 }
 
 #[tauri::command]
-async fn syncpeer_relay_listen(sessions: tauri::State<'_, SharedTlsStore>,
-    listeners: tauri::State<'_, SharedTlsListenerStore>, request: RelayListenRequest)
-    -> Result<TlsListenResponse, String> {
+async fn syncpeer_relay_listen(
+    sessions: tauri::State<'_, SharedTlsStore>,
+    listeners: tauri::State<'_, SharedTlsListenerStore>,
+    request: RelayListenRequest,
+) -> Result<TlsListenResponse, String> {
     let session_store = sessions.inner().clone();
     let listener_store = listeners.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || open_relay_listener(session_store, listener_store, request))
-        .await.map_err(|error| format!("Relay listen task join error: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        open_relay_listener(session_store, listener_store, request)
+    })
+    .await
+    .map_err(|error| format!("Relay listen task join error: {error}"))?
 }
 
 fn open_relay_session(
     shared_store: SharedTlsStore,
     request: RelayOpenRequest,
 ) -> Result<TlsOpenResponse, String> {
-        tauri_log("relay.open.start");
-        let (cert_chain, private_key) = relay_identity(&request.cert_pem, &request.key_pem)?;
-        let (mut relay_stream, relay_host, relay_port) = open_relay_control(
-            &request.relay_address, &cert_chain, &private_key, request.timeout_ms)?;
+    tauri_log("relay.open.start");
+    let (cert_chain, private_key) = relay_identity(&request.cert_pem, &request.key_pem)?;
+    let (mut relay_stream, relay_host, relay_port) = open_relay_control(
+        &request.relay_address,
+        &cert_chain,
+        &private_key,
+        request.timeout_ms,
+    )?;
 
-        let target_device_id = decode_device_id_bytes(&request.expected_device_id)?;
-        relay_write_message(
-            &mut relay_stream,
-            RELAY_MESSAGE_TYPE_CONNECT_REQUEST,
-            &xdr_write_opaque(&target_device_id),
-        )?;
-        let (message_type, payload) = relay_read_message(&mut relay_stream)?;
-        if message_type == RELAY_MESSAGE_TYPE_RESPONSE {
-            let (code, message) = relay_parse_response(&payload)?;
-            return Err(format!(
-                "Relay connect request failed (code {code}): {}",
-                if message.is_empty() {
-                    "no message".to_string()
-                } else {
-                    message
-                }
-            ));
-        }
-        if message_type != RELAY_MESSAGE_TYPE_SESSION_INVITATION {
-            return Err(format!(
-                "Unexpected relay response type {message_type}, expected SessionInvitation"
-            ));
-        }
+    let target_device_id = decode_device_id_bytes(&request.expected_device_id)?;
+    relay_write_message(
+        &mut relay_stream,
+        RELAY_MESSAGE_TYPE_CONNECT_REQUEST,
+        &xdr_write_opaque(&target_device_id),
+    )?;
+    let (message_type, payload) = relay_read_message(&mut relay_stream)?;
+    if message_type == RELAY_MESSAGE_TYPE_RESPONSE {
+        let (code, message) = relay_parse_response(&payload)?;
+        return Err(format!(
+            "Relay connect request failed (code {code}): {}",
+            if message.is_empty() {
+                "no message".to_string()
+            } else {
+                message
+            }
+        ));
+    }
+    if message_type != RELAY_MESSAGE_TYPE_SESSION_INVITATION {
+        return Err(format!(
+            "Unexpected relay response type {message_type}, expected SessionInvitation"
+        ));
+    }
 
-        let invitation = parse_relay_invitation(&payload, &relay_host, relay_port)?;
-        if invitation.from.as_slice() != target_device_id {
-            return Err("Relay invitation came from an unexpected device".to_string());
-        }
-        let mut client_config = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_client_auth_cert(cert_chain.clone(), private_key.clone_key())
-            .map_err(|error| format!("Invalid BEP client cert/key pair: {error}"))?;
-        let protocols: Vec<Vec<u8>> = request
-            .alpn_protocols
-            .unwrap_or_else(|| vec!["bep/1.0".to_string()])
-            .into_iter()
-            .map(|protocol| protocol.into_bytes())
-            .collect();
-        if protocols.is_empty() || protocols.len() > 8 ||
-            protocols.iter().any(|value| value.is_empty() || value.len() > 255) {
-            return Err("Relay session requires valid ALPN protocols".to_string());
-        }
-        client_config.alpn_protocols = protocols.clone();
-        let mut server_config = ServerConfig::builder()
-            .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
-            .with_single_cert(cert_chain, private_key)
-            .map_err(|error| format!("Invalid BEP server cert/key pair: {error}"))?;
-        server_config.alpn_protocols = protocols;
-        let accepted = accept_relay_session(&shared_store, &invitation,
-            Arc::new(server_config), Arc::new(client_config), request.timeout_ms)?;
-        Ok(TlsOpenResponse {
-            session_id: accepted.session_id,
-            peer_certificate_der: accepted.peer_certificate_der,
-            connected_via: Some(format!(
-                "relay://{}:{} -> {}",
-                relay_host,
-                relay_port,
-                format!("{}:{}", invitation.host, invitation.port)
-            )),
-        })
+    let invitation = parse_relay_invitation(&payload, &relay_host, relay_port)?;
+    if invitation.from.as_slice() != target_device_id {
+        return Err("Relay invitation came from an unexpected device".to_string());
+    }
+    let mut client_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_client_auth_cert(cert_chain.clone(), private_key.clone_key())
+        .map_err(|error| format!("Invalid BEP client cert/key pair: {error}"))?;
+    let protocols: Vec<Vec<u8>> = request
+        .alpn_protocols
+        .unwrap_or_else(|| vec!["bep/1.0".to_string()])
+        .into_iter()
+        .map(|protocol| protocol.into_bytes())
+        .collect();
+    if protocols.is_empty()
+        || protocols.len() > 8
+        || protocols
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 255)
+    {
+        return Err("Relay session requires valid ALPN protocols".to_string());
+    }
+    client_config.alpn_protocols = protocols.clone();
+    let mut server_config = ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|error| format!("Invalid BEP server cert/key pair: {error}"))?;
+    server_config.alpn_protocols = protocols;
+    let accepted = accept_relay_session(
+        &shared_store,
+        &invitation,
+        Arc::new(server_config),
+        Arc::new(client_config),
+        request.timeout_ms,
+    )?;
+    Ok(TlsOpenResponse {
+        session_id: accepted.session_id,
+        peer_certificate_der: accepted.peer_certificate_der,
+        connected_via: Some(format!(
+            "relay://{}:{} -> {}",
+            relay_host,
+            relay_port,
+            format!("{}:{}", invitation.host, invitation.port)
+        )),
+    })
 }
 
 #[tauri::command]
@@ -3148,7 +3598,8 @@ async fn open_quic_session(
     )));
     let idle_timeout = quinn::IdleTimeout::try_from(Duration::from_millis(
         request.idle_timeout_ms.unwrap_or(30_000),
-    )).map_err(|error| format!("Invalid QUIC idle timeout: {error}"))?;
+    ))
+    .map_err(|error| format!("Invalid QUIC idle timeout: {error}"))?;
     transport.max_idle_timeout(Some(idle_timeout));
     client_config.transport_config(Arc::new(transport));
 
@@ -3166,18 +3617,26 @@ async fn open_quic_session(
         .map_err(|error| format!("Could not create QUIC endpoint: {error}"))?;
     endpoint.set_default_client_config(client_config);
     let server_name = resolve_tls_hostname(&request.host);
-    let connecting = endpoint.connect(remote, &server_name)
+    let connecting = endpoint
+        .connect(remote, &server_name)
         .map_err(|error| format!("Could not start QUIC connection: {error}"))?;
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(15_000));
     let connection = tokio::time::timeout(timeout, connecting)
         .await
         .map_err(|_| "QUIC connection timed out".to_string())?
         .map_err(|error| format!("QUIC connection failed: {error}"))?;
-    let peer_certificate_der = connection.peer_identity()
+    let peer_certificate_der = connection
+        .peer_identity()
         .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
-        .and_then(|certificates| certificates.first().map(|certificate| certificate.as_ref().to_vec()))
+        .and_then(|certificates| {
+            certificates
+                .first()
+                .map(|certificate| certificate.as_ref().to_vec())
+        })
         .ok_or_else(|| "QUIC peer did not provide a certificate".to_string())?;
-    let (send, receive) = connection.open_bi().await
+    let (send, receive) = connection
+        .open_bi()
+        .await
         .map_err(|error| format!("Could not open QUIC BEP stream: {error}"))?;
     let session = Arc::new(QuicSession {
         _endpoint: endpoint,
@@ -3186,7 +3645,8 @@ async fn open_quic_session(
         receive: tokio::sync::Mutex::new(receive),
     });
     let session_id = {
-        let mut guard = store.lock()
+        let mut guard = store
+            .lock()
             .map_err(|_| "QUIC session store lock poisoned".to_string())?;
         let next_id = guard.next_id.saturating_add(1).max(1);
         guard.next_id = next_id;
@@ -3204,7 +3664,8 @@ fn get_quic_session_from_store(
     store: &SharedQuicStore,
     session_id: u64,
 ) -> Result<Arc<QuicSession>, String> {
-    store.lock()
+    store
+        .lock()
         .map_err(|_| "QUIC session store lock poisoned".to_string())?
         .sessions
         .get(&session_id)
@@ -3218,13 +3679,22 @@ async fn read_quic_session(
 ) -> Result<TlsReadResponse, String> {
     let session = get_quic_session_from_store(store, request.session_id)?;
     let mut receive = session.receive.lock().await;
-    let chunk = receive.read_chunk(
-        request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
-        true,
-    ).await.map_err(|error| format!("QUIC read failed: {error}"))?;
+    let chunk = receive
+        .read_chunk(
+            request.max_bytes.unwrap_or(64 * 1024).clamp(1, 1024 * 1024),
+            true,
+        )
+        .await
+        .map_err(|error| format!("QUIC read failed: {error}"))?;
     Ok(match chunk {
-        Some(chunk) => TlsReadResponse { bytes: chunk.bytes.to_vec(), eof: false },
-        None => TlsReadResponse { bytes: Vec::new(), eof: true },
+        Some(chunk) => TlsReadResponse {
+            bytes: chunk.bytes.to_vec(),
+            eof: false,
+        },
+        None => TlsReadResponse {
+            bytes: Vec::new(),
+            eof: true,
+        },
     })
 }
 
@@ -3233,16 +3703,19 @@ async fn write_quic_session(
     request: TlsWriteRequest,
 ) -> Result<(), String> {
     let session = get_quic_session_from_store(store, request.session_id)?;
-    let result = session.send.lock().await.write_all(&request.bytes).await
+    let result = session
+        .send
+        .lock()
+        .await
+        .write_all(&request.bytes)
+        .await
         .map_err(|error| format!("QUIC write failed: {error}"));
     result
 }
 
-fn close_quic_session(
-    store: &SharedQuicStore,
-    request: TlsCloseRequest,
-) -> Result<(), String> {
-    let session = store.lock()
+fn close_quic_session(store: &SharedQuicStore, request: TlsCloseRequest) -> Result<(), String> {
+    let session = store
+        .lock()
         .map_err(|_| "QUIC session store lock poisoned".to_string())?
         .sessions
         .remove(&request.session_id);
@@ -3252,12 +3725,86 @@ fn close_quic_session(
     Ok(())
 }
 
+fn raw_socket_body<'a>(request: &'a tauri::ipc::Request<'a>) -> Result<&'a [u8], String> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(bytes),
+        _ => Err("Binary socket IPC requires a raw request body".into()),
+    }
+}
+
+fn raw_socket_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| "Invalid binary socket request".to_string())?;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn raw_socket_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "Invalid binary socket request".to_string())?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn binary_socket_read_request(request: &tauri::ipc::Request<'_>) -> Result<TlsReadRequest, String> {
+    let body = raw_socket_body(request)?;
+    if body.len() != 12 {
+        return Err("Invalid binary socket read request".into());
+    }
+    let max_bytes = raw_socket_u32(body, 8)? as usize;
+    if max_bytes == 0 || max_bytes > 1024 * 1024 {
+        return Err("Invalid binary socket read size".into());
+    }
+    Ok(TlsReadRequest {
+        session_id: raw_socket_u64(body, 0)?,
+        max_bytes: Some(max_bytes),
+    })
+}
+
+fn binary_socket_write_request(
+    request: &tauri::ipc::Request<'_>,
+) -> Result<TlsWriteRequest, String> {
+    let body = raw_socket_body(request)?;
+    if body.len() < 8 || body.len() > 8 + 64 * 1024 * 1024 {
+        return Err("Invalid binary socket write request".into());
+    }
+    Ok(TlsWriteRequest {
+        session_id: raw_socket_u64(body, 0)?,
+        bytes: body[8..].to_vec(),
+    })
+}
+
+fn binary_socket_read_response(response: TlsReadResponse) -> Result<tauri::ipc::Response, String> {
+    if response.eof {
+        return Err("Connection closed".into());
+    }
+    Ok(tauri::ipc::Response::new(response.bytes))
+}
+
 #[tauri::command]
 async fn syncpeer_quic_read(
     store: tauri::State<'_, SharedQuicStore>,
     request: TlsReadRequest,
 ) -> Result<TlsReadResponse, String> {
     read_quic_session(store.inner(), request).await
+}
+
+#[tauri::command]
+async fn syncpeer_quic_read_binary(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    binary_socket_read_response(
+        read_quic_session(store.inner(), binary_socket_read_request(&request)?).await?,
+    )
+}
+
+#[tauri::command]
+async fn syncpeer_quic_write_binary(
+    store: tauri::State<'_, SharedQuicStore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    write_quic_session(store.inner(), binary_socket_write_request(&request)?).await
 }
 
 #[tauri::command]
@@ -3277,14 +3824,40 @@ async fn syncpeer_quic_close(
 }
 
 #[tauri::command]
+async fn syncpeer_tls_read_binary(
+    store: tauri::State<'_, SharedTlsStore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let request = binary_socket_read_request(&request)?;
+    let shared_store = store.inner().clone();
+    let response =
+        tauri::async_runtime::spawn_blocking(move || read_tls_session(&shared_store, request))
+            .await
+            .map_err(|error| format!("TLS read task join error: {error}"))??;
+    binary_socket_read_response(response)
+}
+
+#[tauri::command]
+async fn syncpeer_tls_write_binary(
+    store: tauri::State<'_, SharedTlsStore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let request = binary_socket_write_request(&request)?;
+    let shared_store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || write_tls_session(&shared_store, request))
+        .await
+        .map_err(|error| format!("TLS write task join error: {error}"))?
+}
+
+#[tauri::command]
 async fn syncpeer_tls_read(
     store: tauri::State<'_, SharedTlsStore>,
     request: TlsReadRequest,
 ) -> Result<TlsReadResponse, String> {
     let shared_store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || read_tls_session(&shared_store, request))
-    .await
-    .map_err(|error| format!("TLS read task join error: {error}"))?
+        .await
+        .map_err(|error| format!("TLS read task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -3294,8 +3867,8 @@ async fn syncpeer_tls_write(
 ) -> Result<(), String> {
     let shared_store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || write_tls_session(&shared_store, request))
-    .await
-    .map_err(|error| format!("TLS write task join error: {error}"))?
+        .await
+        .map_err(|error| format!("TLS write task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -3311,7 +3884,10 @@ async fn syncpeer_tls_close(
 
 #[tauri::command]
 async fn syncpeer_log_ui_error(entry: UiErrorLogRequest) -> Result<(), String> {
-    tauri_log(&format!("ui.error event={}", diagnostic_event(&entry.event)));
+    tauri_log(&format!(
+        "ui.error event={}",
+        diagnostic_event(&entry.event)
+    ));
     Ok(())
 }
 
@@ -3434,7 +4010,10 @@ fn partial_matches_download(
     normalized_path: &str,
     requested_name: &str,
 ) -> bool {
-    request.content_id.as_deref().is_some_and(|value| !value.starts_with("unhashed:"))
+    request
+        .content_id
+        .as_deref()
+        .is_some_and(|value| !value.starts_with("unhashed:"))
         && metadata.folder_id == request.folder_id.trim()
         && metadata.path == normalized_path
         && metadata.expected_size == request.size_bytes
@@ -3466,7 +4045,9 @@ async fn syncpeer_cache_begin_file(
         .cloned()
         .collect::<HashSet<_>>();
     let cached_index = read_cache_index(&app)?;
-    let cached_record = cached_index.files.iter()
+    let cached_record = cached_index
+        .files
+        .iter()
         .find(|entry| entry.key == cache_key(&request.folder_id, &normalized_path));
     let cached_path = cached_record.and_then(|entry| entry.local_path.as_ref());
     let cached_source = match cached_path.map(fs::File::open) {
@@ -3494,8 +4075,15 @@ async fn syncpeer_cache_begin_file(
             continue;
         }
         let partial_path = partial_root.join(format!("{}.part", metadata.transfer_id));
-        if !partial_path.exists() { continue; }
-        if resume.as_ref().map(|current| current.created_at_ms).unwrap_or(0) < metadata.created_at_ms {
+        if !partial_path.exists() {
+            continue;
+        }
+        if resume
+            .as_ref()
+            .map(|current| current.created_at_ms)
+            .unwrap_or(0)
+            < metadata.created_at_ms
+        {
             resume = Some(metadata);
         }
     }
@@ -3503,8 +4091,16 @@ async fn syncpeer_cache_begin_file(
         let transfer_id = metadata.transfer_id.clone();
         let temp_path = partial_root.join(format!("{transfer_id}.part"));
         let metadata_id = partial_metadata_id(&transfer_id)?;
-        let file = fs::OpenOptions::new().read(true).write(true).open(&temp_path)
-            .map_err(|error| format!("Could not resume partial cached file {}: {error}", temp_path.display()))?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                format!(
+                    "Could not resume partial cached file {}: {error}",
+                    temp_path.display()
+                )
+            })?;
         (transfer_id, temp_path, metadata_id, file)
     } else {
         let transfer_id = {
@@ -3516,8 +4112,17 @@ async fn syncpeer_cache_begin_file(
         };
         let temp_path = partial_root.join(format!("{transfer_id}.part"));
         let metadata_id = partial_metadata_id(&transfer_id)?;
-        let file = fs::OpenOptions::new().read(true).write(true).create_new(true).open(&temp_path)
-            .map_err(|error| format!("Could not create partial cached file {}: {error}", temp_path.display()))?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                format!(
+                    "Could not create partial cached file {}: {error}",
+                    temp_path.display()
+                )
+            })?;
         (transfer_id, temp_path, metadata_id, file)
     };
     let metadata = CachePartialMetadata {
@@ -3588,22 +4193,40 @@ async fn syncpeer_cache_digest_ranges(
         CacheRangeSource::Cached => writer.cached_source,
         CacheRangeSource::Partial => Some(writer.file),
     };
-    let Some(source) = source else { return Ok(vec![]); };
+    let Some(source) = source else {
+        return Ok(vec![]);
+    };
     let mut file = source.lock().map_err(|_| "Cache source lock poisoned")?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     let mut digests = Vec::new();
     for range in request.ranges {
-        if range.offset > size || range.size > size - range.offset { continue; }
+        if range.offset > size || range.size > size - range.offset {
+            continue;
+        }
         let hash = digest_range(&mut *file, &range).map_err(|e| e.to_string())?;
-        digests.push(RangeDigest { offset: range.offset, size: range.size, hash });
+        digests.push(RangeDigest {
+            offset: range.offset,
+            size: range.size,
+            hash,
+        });
     }
     Ok(digests)
 }
 
-fn cache_range_writer(store: &SharedCacheWriterStore, request: &CacheRangesRequest) -> Result<CacheWriter, String> {
-    if request.ranges.len() > 256 { return Err("Too many requested ranges".into()); }
-    let writer = store.lock().map_err(|_| "Cache writer lock poisoned")?
-        .writers.get(&request.transfer_id).cloned().ok_or("Unknown cache transfer")?;
+fn cache_range_writer(
+    store: &SharedCacheWriterStore,
+    request: &CacheRangesRequest,
+) -> Result<CacheWriter, String> {
+    if request.ranges.len() > 256 {
+        return Err("Too many requested ranges".into());
+    }
+    let writer = store
+        .lock()
+        .map_err(|_| "Cache writer lock poisoned")?
+        .writers
+        .get(&request.transfer_id)
+        .cloned()
+        .ok_or("Unknown cache transfer")?;
     for range in &request.ranges {
         if range.offset > writer.expected_size || range.size > writer.expected_size - range.offset {
             return Err("Cache range is outside destination".into());
@@ -3618,7 +4241,9 @@ async fn syncpeer_cache_copy_ranges(
     store: tauri::State<'_, SharedCacheWriterStore>,
     request: CacheRangesRequest,
 ) -> Result<(), String> {
-    if !matches!(request.source, CacheRangeSource::Cached) { return Err("Copy source must be cached".into()); }
+    if !matches!(request.source, CacheRangeSource::Cached) {
+        return Err("Copy source must be cached".into());
+    }
     let writer = cache_range_writer(&store, &request)?;
     if writer.cached_source.is_none() && writer.cached_saf_source.is_some() {
         #[cfg(target_os = "android")]
@@ -3629,8 +4254,7 @@ async fn syncpeer_cache_copy_ranges(
                 .iter()
                 .map(|range| (range.offset, range.size))
                 .collect::<Vec<_>>();
-            _app
-                .syncpeer_android()
+            _app.syncpeer_android()
                 .copy_saf_ranges_to_path(
                     tree_uri,
                     relative_path,
@@ -3647,10 +4271,15 @@ async fn syncpeer_cache_copy_ranges(
     }
     let source = writer.cached_source.ok_or("Cached source unavailable")?;
     let mut source = source.lock().map_err(|_| "Cache source lock poisoned")?;
-    let mut target = writer.file.lock().map_err(|_| "Cache destination lock poisoned")?;
+    let mut target = writer
+        .file
+        .lock()
+        .map_err(|_| "Cache destination lock poisoned")?;
     let size = source.metadata().map_err(|e| e.to_string())?.len();
     for range in request.ranges {
-        if range.offset > size || range.size > size - range.offset { return Err("Cached source truncated".into()); }
+        if range.offset > size || range.size > size - range.offset {
+            return Err("Cached source truncated".into());
+        }
         copy_range(&mut *source, &mut *target, &range).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -3725,42 +4354,42 @@ async fn syncpeer_cache_commit(
         .map_err(|_| "Cached file is too large for this platform.".to_string())?;
     let local_rel = cache_relative_path(&writer.folder_id, &writer.path, &writer.name);
     let key = cache_key(&writer.folder_id, &writer.path);
-    let (local_path, saf_relative_path) = if let Some(tree_uri) = configured_android_saf_tree_uri(&app)? {
-        #[cfg(target_os = "android")]
-        {
-            let relative_path = relative_path_for_saf(&local_rel);
-            android_write_to_saf_tree_from_path(
-                &app,
-                &tree_uri,
-                &relative_path,
-                &writer.temp_path,
-                None,
-            )?;
-            fs::remove_file(&writer.temp_path).map_err(|error| {
-                format!("Could not remove partial cached file: {error}")
+    let (local_path, saf_relative_path) =
+        if let Some(tree_uri) = configured_android_saf_tree_uri(&app)? {
+            #[cfg(target_os = "android")]
+            {
+                let relative_path = relative_path_for_saf(&local_rel);
+                android_write_to_saf_tree_from_path(
+                    &app,
+                    &tree_uri,
+                    &relative_path,
+                    &writer.temp_path,
+                    None,
+                )?;
+                fs::remove_file(&writer.temp_path)
+                    .map_err(|error| format!("Could not remove partial cached file: {error}"))?;
+                (None, Some(relative_path))
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let _ = tree_uri;
+                return Err("Android SAF storage is unavailable on this platform.".to_string());
+            }
+        } else {
+            let cache_root = app_cache_files_root(&app)?;
+            let local_abs_path = cache_root.join(&local_rel);
+            if let Some(parent) = local_abs_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+            }
+            fs::rename(&writer.temp_path, &local_abs_path).map_err(|error| {
+                format!(
+                    "Could not finalize cached file {}: {error}",
+                    local_abs_path.display()
+                )
             })?;
-            (None, Some(relative_path))
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = tree_uri;
-            return Err("Android SAF storage is unavailable on this platform.".to_string());
-        }
-    } else {
-        let cache_root = app_cache_files_root(&app)?;
-        let local_abs_path = cache_root.join(&local_rel);
-        if let Some(parent) = local_abs_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
-        }
-        fs::rename(&writer.temp_path, &local_abs_path).map_err(|error| {
-            format!(
-                "Could not finalize cached file {}: {error}",
-                local_abs_path.display()
-            )
-        })?;
-        (Some(local_abs_path.to_string_lossy().to_string()), None)
-    };
+            (Some(local_abs_path.to_string_lossy().to_string()), None)
+        };
 
     let mut index = read_cache_index(&app)?;
     index.files.retain(|entry| entry.key != key);
@@ -3800,9 +4429,8 @@ async fn syncpeer_cache_abort(
     };
     if let Some(writer) = writer {
         if writer.temp_path.exists() {
-            fs::remove_file(&writer.temp_path).map_err(|error| {
-                format!("Could not remove partial cached file: {error}")
-            })?;
+            fs::remove_file(&writer.temp_path)
+                .map_err(|error| format!("Could not remove partial cached file: {error}"))?;
         }
         native_cache_metadata(&app)?.remove(&writer.metadata_id)?;
     }
@@ -3820,7 +4448,9 @@ async fn syncpeer_cache_suspend(
             .map_err(|_| "Cache writer store lock poisoned".to_string())?;
         guard.writers.remove(&request.transfer_id)
     };
-    let Some(writer) = writer else { return Ok(()); };
+    let Some(writer) = writer else {
+        return Ok(());
+    };
     writer
         .file
         .lock()
@@ -3952,7 +4582,9 @@ async fn syncpeer_android_biometric_set_enabled(
     app: tauri::AppHandle,
     request: AndroidBiometricRequest,
 ) -> Result<serde_json::Value, String> {
-    let enabled = request.enabled.ok_or_else(|| "Biometric setting is required.".to_string())?;
+    let enabled = request
+        .enabled
+        .ok_or_else(|| "Biometric setting is required.".to_string())?;
     #[cfg(target_os = "android")]
     {
         return app
@@ -4259,13 +4891,10 @@ async fn syncpeer_android_delete_calendar_event(
 }
 
 #[tauri::command]
-async fn syncpeer_android_enable_multicast_lock(
-    app: tauri::AppHandle,
-) -> Result<bool, String> {
+async fn syncpeer_android_enable_multicast_lock(app: tauri::AppHandle) -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
-        app
-            .syncpeer_android()
+        app.syncpeer_android()
             .enable_multicast_lock()
             .map_err(|error| format!("Could not enable multicast lock: {error}"))?;
         return Ok(true);
@@ -4426,7 +5055,10 @@ async fn syncpeer_get_cached_statuses(
                             path: normalized,
                             available: true,
                             local_path: None,
-                            cached_at_ms: folder_records.iter().map(|entry| entry.cached_at_ms).max(),
+                            cached_at_ms: folder_records
+                                .iter()
+                                .map(|entry| entry.cached_at_ms)
+                                .max(),
                         };
                     }
                 }
@@ -4474,8 +5106,12 @@ fn digest_android_cached_file(
     app: &tauri::AppHandle,
     record: &CachedFileRecord,
 ) -> Result<Option<Vec<u8>>, String> {
-    let Some(tree_uri) = configured_android_saf_tree_uri(app)? else { return Ok(None); };
-    let Some(relative_path) = record.saf_relative_path.as_deref() else { return Ok(None); };
+    let Some(tree_uri) = configured_android_saf_tree_uri(app)? else {
+        return Ok(None);
+    };
+    let Some(relative_path) = record.saf_relative_path.as_deref() else {
+        return Ok(None);
+    };
     let value = app
         .syncpeer_android()
         .digest_saf_file(&tree_uri, relative_path)
@@ -4486,12 +5122,17 @@ fn digest_android_cached_file(
 }
 
 fn digest_local_cached_file(record: &CachedFileRecord) -> Result<Option<Vec<u8>>, String> {
-    let Some(local_path) = record.local_path.as_deref() else { return Ok(None); };
+    let Some(local_path) = record.local_path.as_deref() else {
+        return Ok(None);
+    };
     let path = PathBuf::from(local_path);
-    if !path.exists() { return Ok(None); }
+    if !path.exists() {
+        return Ok(None);
+    }
     let mut file = fs::File::open(&path)
         .map_err(|error| format!("Could not open cached file {}: {error}", path.display()))?;
-    let size = file.metadata()
+    let size = file
+        .metadata()
         .map_err(|error| format!("Could not stat cached file {}: {error}", path.display()))?
         .len();
     digest_range(&mut file, &CacheRange { offset: 0, size })
@@ -4504,26 +5145,38 @@ fn digest_cached_files(
     requests: Vec<CachedFileDigestRequest>,
 ) -> Result<Vec<CachedFileDigest>, String> {
     let index = read_cache_index(app)?;
-    requests.into_iter().map(|request| {
-        let folder_id = request.folder_id.trim().to_string();
-        let path = normalize_path(&request.path);
-        let key = cache_key(&folder_id, &path);
-        let record = index.files.iter().find(|entry| entry.key == key);
-        let hash = match record {
-            Some(record) => {
-                let local_hash = digest_local_cached_file(record)?;
-                if local_hash.is_some() { local_hash }
-                else {
-                    #[cfg(target_os = "android")]
-                    { digest_android_cached_file(app, record)? }
-                    #[cfg(not(target_os = "android"))]
-                    { None }
+    requests
+        .into_iter()
+        .map(|request| {
+            let folder_id = request.folder_id.trim().to_string();
+            let path = normalize_path(&request.path);
+            let key = cache_key(&folder_id, &path);
+            let record = index.files.iter().find(|entry| entry.key == key);
+            let hash = match record {
+                Some(record) => {
+                    let local_hash = digest_local_cached_file(record)?;
+                    if local_hash.is_some() {
+                        local_hash
+                    } else {
+                        #[cfg(target_os = "android")]
+                        {
+                            digest_android_cached_file(app, record)?
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            None
+                        }
+                    }
                 }
-            }
-            None => None,
-        };
-        Ok(CachedFileDigest { folder_id, path, hash })
-    }).collect()
+                None => None,
+            };
+            Ok(CachedFileDigest {
+                folder_id,
+                path,
+                hash,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -4541,8 +5194,12 @@ fn read_android_cached_file(
     app: &tauri::AppHandle,
     record: &CachedFileRecord,
 ) -> Result<Option<Vec<u8>>, String> {
-    let Some(tree_uri) = configured_android_saf_tree_uri(app)? else { return Ok(None); };
-    let Some(relative_path) = record.saf_relative_path.as_deref() else { return Ok(None); };
+    let Some(tree_uri) = configured_android_saf_tree_uri(app)? else {
+        return Ok(None);
+    };
+    let Some(relative_path) = record.saf_relative_path.as_deref() else {
+        return Ok(None);
+    };
     let value = app
         .syncpeer_android()
         .read_saf_file(&tree_uri, relative_path)
@@ -4560,13 +5217,17 @@ fn read_cached_file(
     let path = normalize_path(&request.path);
     let key = cache_key(folder_id, &path);
     let index = read_cache_index(app)?;
-    let record = index.files.iter().find(|entry| entry.key == key)
+    let record = index
+        .files
+        .iter()
+        .find(|entry| entry.key == key)
         .ok_or_else(|| format!("Cached file is unavailable: {path}"))?;
     if let Some(local_path) = record.local_path.as_deref() {
         let path = PathBuf::from(local_path);
         if path.exists() {
-            return fs::read(&path)
-                .map_err(|error| format!("Could not read cached file {}: {error}", path.display()));
+            return fs::read(&path).map_err(|error| {
+                format!("Could not read cached file {}: {error}", path.display())
+            });
         }
     }
     #[cfg(target_os = "android")]
@@ -4792,12 +5453,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
-        .manage(Arc::new(Mutex::new(discovery::DiscoveryRequests::default())))
+        .manage(Arc::new(
+            Mutex::new(discovery::DiscoveryRequests::default()),
+        ))
         .manage(Arc::new(Mutex::new(TlsSessionStore::default())))
         .manage(Arc::new(Mutex::new(TlsListenerStore::default())))
         .manage(Arc::new(Mutex::new(QuicSessionStore::default())))
         .manage(Arc::new(Mutex::new(CacheWriterStore::default())))
-        .manage(Arc::new(Mutex::new(replica_storage::ReplicaRoots::default())))
+        .manage(Arc::new(Mutex::new(
+            replica_storage::ReplicaRoots::default(),
+        )))
         .manage(Arc::new(Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
             vault_secret::syncpeer_vault_secret,
@@ -4805,6 +5470,10 @@ pub fn run() {
             replica_storage::syncpeer_replica_storage,
             replica_storage::syncpeer_replica_storage_read_binary,
             replica_storage::syncpeer_replica_storage_write_binary,
+            replica_storage::syncpeer_replica_storage_read_file_binary,
+            replica_storage::syncpeer_replica_storage_write_file_binary,
+            replica_storage::syncpeer_replica_storage_read_files_binary,
+            replica_storage::syncpeer_replica_storage_write_files_binary,
             documents::syncpeer_document_command,
             syncpeer_read_text_file,
             syncpeer_read_binary_file,
@@ -4827,9 +5496,13 @@ pub fn run() {
             syncpeer_relay_listen,
             syncpeer_tls_read,
             syncpeer_tls_write,
+            syncpeer_tls_read_binary,
+            syncpeer_tls_write_binary,
             syncpeer_tls_close,
             syncpeer_quic_read,
             syncpeer_quic_write,
+            syncpeer_quic_read_binary,
+            syncpeer_quic_write_binary,
             syncpeer_quic_close,
             syncpeer_log_ui_error,
             syncpeer_list_favorites,
@@ -4909,50 +5582,84 @@ mod tests {
     fn pinned_discovery_announces_with_client_identity_and_preserves_retry_headers() {
         let server_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let client_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let (certs, key) = relay_identity(&server_identity.serialize_pem().unwrap(),
-            &server_identity.serialize_private_key_pem()).unwrap();
+        let (certs, key) = relay_identity(
+            &server_identity.serialize_pem().unwrap(),
+            &server_identity.serialize_private_key_pem(),
+        )
+        .unwrap();
         let server_pin = compute_device_id_from_der(certs[0].as_ref());
         let client_pem = client_identity.serialize_pem().unwrap();
-        let expected_client = relay_identity(&client_pem,
-            &client_identity.serialize_private_key_pem()).unwrap().0[0].as_ref().to_vec();
+        let expected_client =
+            relay_identity(&client_pem, &client_identity.serialize_private_key_pem())
+                .unwrap()
+                .0[0]
+                .as_ref()
+                .to_vec();
         let config = ServerConfig::builder()
             .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
-            .with_single_cert(certs, key).unwrap();
+            .with_single_cert(certs, key)
+            .unwrap();
         let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = tcp.local_addr().unwrap().port();
         let worker = thread::spawn(move || {
             let (socket, _) = tcp.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let connection = ServerConnection::new(Arc::new(config)).unwrap();
             let mut stream = StreamOwned::new(connection, socket);
             let mut request = Vec::new();
             loop {
                 let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
-                if request.ends_with(b"\r\n\r\n") { break; }
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
             }
             let text = String::from_utf8(request).unwrap();
             assert!(text.starts_with("POST /v2/ HTTP/1.1"));
-            let length: usize = text.lines().find_map(|line| line.split_once(':').filter(|(name, _)|
-                name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value))
-                .unwrap().trim().parse().unwrap();
-            let mut body = vec![0; length]; stream.read_exact(&mut body).unwrap();
-            assert_eq!(body, br#"{"addresses":["relay://synthetic.invalid:22067"]}"#);
-            assert_eq!(stream.conn.peer_certificates().unwrap()[0].as_ref(), expected_client);
+            let length: usize = text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value)
+                })
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(
+                body,
+                br#"{"addresses":["relay://synthetic.invalid:22067"]}"#
+            );
+            assert_eq!(
+                stream.conn.peer_certificates().unwrap()[0].as_ref(),
+                expected_client
+            );
             stream.write_all(b"HTTP/1.1 204 No Content\r\nReannounce-After: 1800\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             stream.conn.send_close_notify();
             stream.flush().unwrap();
         });
         let store = Arc::new(Mutex::new(discovery::DiscoveryRequests::default()));
-        let response = tauri::async_runtime::block_on(discovery::fetch(&store, DiscoveryFetchRequest {
-            request_id: discovery::prepare(&store).unwrap(),
-            url: format!("https://localhost:{port}/v2/"), method: "POST".into(),
-            headers: HashMap::from([("Content-Type".into(), "application/json".into())]),
-            body: Some(r#"{"addresses":["relay://synthetic.invalid:22067"]}"#.into()),
-            cert_pem: Some(client_pem),
-            key_pem: Some(client_identity.serialize_private_key_pem()),
-            pin_server_device_id: Some(server_pin), allow_insecure_tls: false,
-        })).unwrap();
+        let response = tauri::async_runtime::block_on(discovery::fetch(
+            &store,
+            DiscoveryFetchRequest {
+                request_id: discovery::prepare(&store).unwrap(),
+                url: format!("https://localhost:{port}/v2/"),
+                method: "POST".into(),
+                headers: HashMap::from([("Content-Type".into(), "application/json".into())]),
+                body: Some(r#"{"addresses":["relay://synthetic.invalid:22067"]}"#.into()),
+                cert_pem: Some(client_pem),
+                key_pem: Some(client_identity.serialize_private_key_pem()),
+                pin_server_device_id: Some(server_pin),
+                allow_insecure_tls: false,
+            },
+        ))
+        .unwrap();
         assert_eq!(response.status, 204);
         assert_eq!(response.headers.get("reannounce-after").unwrap(), "1800");
         worker.join().unwrap();
@@ -4960,11 +5667,17 @@ mod tests {
 
     #[test]
     fn relay_listener_distinguishes_idle_reads_from_partial_frames() {
-        struct TimedReader { bytes: Vec<u8>, offset: usize }
+        struct TimedReader {
+            bytes: Vec<u8>,
+            offset: usize,
+        }
         impl Read for TimedReader {
             fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
                 if self.offset == self.bytes.len() {
-                    return Err(std::io::Error::new(ErrorKind::TimedOut, "synthetic timeout"));
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "synthetic timeout",
+                    ));
                 }
                 let count = out.len().min(self.bytes.len() - self.offset);
                 out[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
@@ -4972,10 +5685,17 @@ mod tests {
                 Ok(count)
             }
         }
-        assert!(relay_read_message_poll(&mut TimedReader { bytes: vec![], offset: 0 })
-            .unwrap().is_none());
-        assert!(relay_read_message_poll(&mut TimedReader { bytes: vec![0x7e], offset: 0 })
-            .is_err());
+        assert!(relay_read_message_poll(&mut TimedReader {
+            bytes: vec![],
+            offset: 0
+        })
+        .unwrap()
+        .is_none());
+        assert!(relay_read_message_poll(&mut TimedReader {
+            bytes: vec![0x7e],
+            offset: 0
+        })
+        .is_err());
     }
 
     #[test]
@@ -5003,24 +5723,40 @@ mod tests {
         for server_socket in [false, true] {
             let local = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
             let peer = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-            let (local_certs, local_key) = relay_identity(&local.serialize_pem().unwrap(),
-                &local.serialize_private_key_pem()).unwrap();
-            let (peer_certs, peer_key) = relay_identity(&peer.serialize_pem().unwrap(),
-                &peer.serialize_private_key_pem()).unwrap();
+            let (local_certs, local_key) = relay_identity(
+                &local.serialize_pem().unwrap(),
+                &local.serialize_private_key_pem(),
+            )
+            .unwrap();
+            let (peer_certs, peer_key) = relay_identity(
+                &peer.serialize_pem().unwrap(),
+                &peer.serialize_private_key_pem(),
+            )
+            .unwrap();
             let peer_der = peer_certs[0].as_ref().to_vec();
             let mut server_config = ServerConfig::builder()
                 .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
-                .with_single_cert(local_certs, local_key.clone_key()).unwrap();
+                .with_single_cert(local_certs, local_key.clone_key())
+                .unwrap();
             server_config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
-            let mut client_config = ClientConfig::builder().dangerous()
+            let mut client_config = ClientConfig::builder()
+                .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-                .with_client_auth_cert(vec![CertificateDer::from(local.serialize_der().unwrap())],
-                    local_key).unwrap();
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(local.serialize_der().unwrap())],
+                    local_key,
+                )
+                .unwrap();
             client_config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
-            let invitation = RelayInvitation { from: Sha256::digest(&peer_der).into(),
-                key: vec![11; 32], host: "127.0.0.1".into(), port, server_socket };
+            let invitation = RelayInvitation {
+                from: Sha256::digest(&peer_der).into(),
+                key: vec![11; 32],
+                host: "127.0.0.1".into(),
+                port,
+                server_socket,
+            };
             let remote = thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
                 let (kind, _) = relay_read_message(&mut socket).unwrap();
@@ -5029,18 +5765,26 @@ mod tests {
                 payload.extend(xdr_write_opaque(b""));
                 relay_write_message(&mut socket, RELAY_MESSAGE_TYPE_RESPONSE, &payload).unwrap();
                 if server_socket {
-                    let mut config = ClientConfig::builder().dangerous()
+                    let mut config = ClientConfig::builder()
+                        .dangerous()
                         .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-                        .with_client_auth_cert(peer_certs, peer_key).unwrap();
+                        .with_client_auth_cert(peer_certs, peer_key)
+                        .unwrap();
                     config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
-                    let conn = ClientConnection::new(Arc::new(config),
-                        ServerName::try_from("localhost".to_string()).unwrap()).unwrap();
+                    let conn = ClientConnection::new(
+                        Arc::new(config),
+                        ServerName::try_from("localhost".to_string()).unwrap(),
+                    )
+                    .unwrap();
                     let mut stream = StreamOwned::new(conn, socket);
                     stream.conn.complete_io(&mut stream.sock).unwrap();
                 } else {
                     let mut config = ServerConfig::builder()
-                        .with_client_cert_verifier(Arc::new(AnyPresentedClientCertificate::default()))
-                        .with_single_cert(peer_certs, peer_key).unwrap();
+                        .with_client_cert_verifier(Arc::new(
+                            AnyPresentedClientCertificate::default(),
+                        ))
+                        .with_single_cert(peer_certs, peer_key)
+                        .unwrap();
                     config.alpn_protocols = vec![b"syncpeer-pairing/1".to_vec()];
                     let conn = ServerConnection::new(Arc::new(config)).unwrap();
                     let mut stream = StreamOwned::new(conn, socket);
@@ -5048,12 +5792,24 @@ mod tests {
                 }
             });
             let sessions = Arc::new(Mutex::new(TlsSessionStore::default()));
-            let accepted = accept_relay_session(&sessions, &invitation,
-                Arc::new(server_config), Arc::new(client_config), Some(2_000)).unwrap();
+            let accepted = accept_relay_session(
+                &sessions,
+                &invitation,
+                Arc::new(server_config),
+                Arc::new(client_config),
+                Some(2_000),
+            )
+            .unwrap();
             assert_eq!(accepted.peer_certificate_der, peer_der);
             assert_eq!(accepted.alpn, "syncpeer-pairing/1");
             remote.join().unwrap();
-            close_tls_session(&sessions, TlsCloseRequest { session_id: accepted.session_id }).unwrap();
+            close_tls_session(
+                &sessions,
+                TlsCloseRequest {
+                    session_id: accepted.session_id,
+                },
+            )
+            .unwrap();
         }
     }
 
@@ -5063,13 +5819,19 @@ mod tests {
         let client_identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let sessions = Arc::new(Mutex::new(TlsSessionStore::default()));
         let listeners = Arc::new(Mutex::new(TlsListenerStore::default()));
-        let listener = open_tls_listener(sessions.clone(), listeners.clone(), TlsListenRequest {
-            host: "127.0.0.1".into(), port: 0,
-            cert_pem: server_identity.serialize_pem().unwrap(),
-            key_pem: server_identity.serialize_private_key_pem(),
-            alpn_protocols: vec!["bep/1.0".into(), "syncpeer-pairing/1".into()],
-            handshake_timeout_ms: Some(2_000),
-        }).unwrap();
+        let listener = open_tls_listener(
+            sessions.clone(),
+            listeners.clone(),
+            TlsListenRequest {
+                host: "127.0.0.1".into(),
+                port: 0,
+                cert_pem: server_identity.serialize_pem().unwrap(),
+                key_pem: server_identity.serialize_private_key_pem(),
+                alpn_protocols: vec!["bep/1.0".into(), "syncpeer-pairing/1".into()],
+                handshake_timeout_ms: Some(2_000),
+            },
+        )
+        .unwrap();
         let listener_id = listener.listener_id;
         let listener_port = listener.port;
         // A failed peer handshake must not poison the next accept operation.
@@ -5077,55 +5839,127 @@ mod tests {
         invalid.write_all(b"not a TLS handshake").unwrap();
         drop(invalid);
         let client_sessions = sessions.clone();
-        let client = thread::spawn(move || open_tls_session(client_sessions, TlsOpenRequest {
-            host: "localhost".into(), port: listener_port,
-            cert_pem: client_identity.serialize_pem().unwrap(),
-            key_pem: client_identity.serialize_private_key_pem(),
-            ca_pem: None, timeout_ms: Some(2_000),
-            alpn_protocols: vec!["syncpeer-pairing/1".into()],
-        }));
-        let accepted = accept_tls_listener(&listeners, TlsAcceptRequest {
-            listener_id, timeout_ms: Some(3_000),
-        }).unwrap();
+        let client = thread::spawn(move || {
+            open_tls_session(
+                client_sessions,
+                TlsOpenRequest {
+                    host: "localhost".into(),
+                    port: listener_port,
+                    cert_pem: client_identity.serialize_pem().unwrap(),
+                    key_pem: client_identity.serialize_private_key_pem(),
+                    ca_pem: None,
+                    timeout_ms: Some(2_000),
+                    alpn_protocols: vec!["syncpeer-pairing/1".into()],
+                },
+            )
+        });
+        let accepted = accept_tls_listener(
+            &listeners,
+            TlsAcceptRequest {
+                listener_id,
+                timeout_ms: Some(3_000),
+            },
+        )
+        .unwrap();
         let opened = client.join().unwrap().unwrap();
         assert_eq!(accepted.alpn, "syncpeer-pairing/1");
         assert!(!accepted.peer_certificate_der.is_empty());
-        write_tls_session(&sessions, TlsWriteRequest {
-            session_id: opened.session_id, bytes: b"client".to_vec(),
-        }).unwrap();
-        assert_eq!(read_tls_session(&sessions, TlsReadRequest {
-            session_id: accepted.session_id, max_bytes: Some(16),
-        }).unwrap().bytes, b"client");
-        write_tls_session(&sessions, TlsWriteRequest {
-            session_id: accepted.session_id, bytes: b"server".to_vec(),
-        }).unwrap();
-        assert_eq!(read_tls_session(&sessions, TlsReadRequest {
-            session_id: opened.session_id, max_bytes: Some(16),
-        }).unwrap().bytes, b"server");
+        write_tls_session(
+            &sessions,
+            TlsWriteRequest {
+                session_id: opened.session_id,
+                bytes: b"client".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_tls_session(
+                &sessions,
+                TlsReadRequest {
+                    session_id: accepted.session_id,
+                    max_bytes: Some(16),
+                }
+            )
+            .unwrap()
+            .bytes,
+            b"client"
+        );
+        write_tls_session(
+            &sessions,
+            TlsWriteRequest {
+                session_id: accepted.session_id,
+                bytes: b"server".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_tls_session(
+                &sessions,
+                TlsReadRequest {
+                    session_id: opened.session_id,
+                    max_bytes: Some(16),
+                }
+            )
+            .unwrap()
+            .bytes,
+            b"server"
+        );
         let client_sessions = sessions.clone();
         let client_session_id = opened.session_id;
-        let client_read = thread::spawn(move || read_tls_session(&client_sessions, TlsReadRequest {
-            session_id: client_session_id, max_bytes: Some(16),
-        }));
+        let client_read = thread::spawn(move || {
+            read_tls_session(
+                &client_sessions,
+                TlsReadRequest {
+                    session_id: client_session_id,
+                    max_bytes: Some(16),
+                },
+            )
+        });
         let server_sessions = sessions.clone();
         let server_session_id = accepted.session_id;
-        let server_read = thread::spawn(move || read_tls_session(&server_sessions, TlsReadRequest {
-            session_id: server_session_id, max_bytes: Some(16),
-        }));
+        let server_read = thread::spawn(move || {
+            read_tls_session(
+                &server_sessions,
+                TlsReadRequest {
+                    session_id: server_session_id,
+                    max_bytes: Some(16),
+                },
+            )
+        });
         thread::sleep(Duration::from_millis(20));
-        write_tls_session(&sessions, TlsWriteRequest {
-            session_id: opened.session_id, bytes: b"client-again".to_vec(),
-        }).unwrap();
-        write_tls_session(&sessions, TlsWriteRequest {
-            session_id: accepted.session_id, bytes: b"server-again".to_vec(),
-        }).unwrap();
+        write_tls_session(
+            &sessions,
+            TlsWriteRequest {
+                session_id: opened.session_id,
+                bytes: b"client-again".to_vec(),
+            },
+        )
+        .unwrap();
+        write_tls_session(
+            &sessions,
+            TlsWriteRequest {
+                session_id: accepted.session_id,
+                bytes: b"server-again".to_vec(),
+            },
+        )
+        .unwrap();
         assert_eq!(client_read.join().unwrap().unwrap().bytes, b"server-again");
         assert_eq!(server_read.join().unwrap().unwrap().bytes, b"client-again");
-        close_tls_listener(&listeners, TlsListenerCloseRequest {
-            listener_id,
-        }).unwrap();
-        close_tls_session(&sessions, TlsCloseRequest { session_id: opened.session_id }).unwrap();
-        close_tls_session(&sessions, TlsCloseRequest { session_id: accepted.session_id }).unwrap();
+        close_tls_listener(&listeners, TlsListenerCloseRequest { listener_id }).unwrap();
+        close_tls_session(
+            &sessions,
+            TlsCloseRequest {
+                session_id: opened.session_id,
+            },
+        )
+        .unwrap();
+        close_tls_session(
+            &sessions,
+            TlsCloseRequest {
+                session_id: accepted.session_id,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5133,29 +5967,53 @@ mod tests {
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let sessions = Arc::new(Mutex::new(TlsSessionStore::default()));
         let listeners = Arc::new(Mutex::new(TlsListenerStore::default()));
-        let listener = open_tls_listener(sessions, listeners.clone(), TlsListenRequest {
-            host: "127.0.0.1".into(), port: 0,
-            cert_pem: identity.serialize_pem().unwrap(),
-            key_pem: identity.serialize_private_key_pem(),
-            alpn_protocols: vec!["bep/1.0".into()], handshake_timeout_ms: Some(2_000),
-        }).unwrap();
+        let listener = open_tls_listener(
+            sessions,
+            listeners.clone(),
+            TlsListenRequest {
+                host: "127.0.0.1".into(),
+                port: 0,
+                cert_pem: identity.serialize_pem().unwrap(),
+                key_pem: identity.serialize_private_key_pem(),
+                alpn_protocols: vec!["bep/1.0".into()],
+                handshake_timeout_ms: Some(2_000),
+            },
+        )
+        .unwrap();
         let listener_id = listener.listener_id;
-        let state = listeners.lock().unwrap().listeners.get(&listener_id).unwrap().clone();
+        let state = listeners
+            .lock()
+            .unwrap()
+            .listeners
+            .get(&listener_id)
+            .unwrap()
+            .clone();
         let accepting = listeners.clone();
-        let pending = thread::spawn(move || accept_tls_listener(&accepting, TlsAcceptRequest {
-            listener_id, timeout_ms: Some(2_000),
-        }));
+        let pending = thread::spawn(move || {
+            accept_tls_listener(
+                &accepting,
+                TlsAcceptRequest {
+                    listener_id,
+                    timeout_ms: Some(2_000),
+                },
+            )
+        });
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while state.accepted.try_lock().is_ok() && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(state.accepted.try_lock().is_err(), "The accept call did not start waiting.");
+        assert!(
+            state.accepted.try_lock().is_err(),
+            "The accept call did not start waiting."
+        );
         let started = std::time::Instant::now();
         close_tls_listener(&listeners, TlsListenerCloseRequest { listener_id }).unwrap();
         let result = pending.join().unwrap();
         assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_millis(500),
-            "Closing a listener must not wait for its accept timeout.");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "Closing a listener must not wait for its accept timeout."
+        );
     }
 
     #[test]
@@ -5175,7 +6033,10 @@ mod tests {
             "Encrypted profile storage could not be created",
             std::io::Error::other("permission denied"),
         );
-        assert_eq!(error, "Encrypted profile storage could not be created: permission denied");
+        assert_eq!(
+            error,
+            "Encrypted profile storage could not be created: permission denied"
+        );
     }
 
     #[test]
@@ -5202,7 +6063,8 @@ mod tests {
         fs::write(
             root.path().join(APP_STORAGE_FORMAT_FILE),
             r#"{"owner":"syncpeer","version":999}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let error = prepare_app_data_root(root.path()).unwrap_err();
         assert!(error.starts_with(PRIVATE_STORAGE_UNRECOGNIZED));
     }
@@ -5225,15 +6087,25 @@ mod tests {
     #[test]
     fn partial_recovery_requires_the_same_source_and_encryption_identity() {
         let request = CacheBeginFileRequest {
-            folder_id: "fixture-folder".into(), path: "file".into(), name: "file".into(),
-            size_bytes: 6, modified_ms: None, content_id: Some("blocks:test".into()),
-            source_device_id: Some("device".into()), encrypted: true,
+            folder_id: "fixture-folder".into(),
+            path: "file".into(),
+            name: "file".into(),
+            size_bytes: 6,
+            modified_ms: None,
+            content_id: Some("blocks:test".into()),
+            source_device_id: Some("device".into()),
+            encrypted: true,
         };
         let mut saved = CachePartialMetadata {
-            transfer_id: "partial".into(), folder_id: "fixture-folder".into(),
-            path: "file".into(), name: "file".into(), expected_size: 6,
-            modified_ms: None, content_id: request.content_id.clone(),
-            source_device_id: request.source_device_id.clone(), encrypted: true,
+            transfer_id: "partial".into(),
+            folder_id: "fixture-folder".into(),
+            path: "file".into(),
+            name: "file".into(),
+            expected_size: 6,
+            modified_ms: None,
+            content_id: request.content_id.clone(),
+            source_device_id: request.source_device_id.clone(),
+            encrypted: true,
             created_at_ms: 1,
         };
         assert!(partial_matches_download(&saved, &request, "file", "file"));
@@ -5281,11 +6153,8 @@ mod tests {
 
     #[test]
     fn local_discovery_normalizes_and_parses_quic_addresses() {
-        let address = normalize_local_discovery_address(
-            "quic4://0.0.0.0:22000",
-            "192.0.2.10",
-        )
-        .expect("QUIC address should normalize");
+        let address = normalize_local_discovery_address("quic4://0.0.0.0:22000", "192.0.2.10")
+            .expect("QUIC address should normalize");
         assert_eq!(address, "quic4://192.0.2.10:22000");
 
         let candidate = parse_local_discovery_candidate(&address, Some("DEVICE"))
@@ -5299,10 +6168,26 @@ mod tests {
     #[test]
     fn linux_webview_fallback_requires_a_missing_driver_and_no_override() {
         let missing_driver = Path::new("/definitely-missing-syncpeer-gbm-driver");
-        assert!(linux_webview_needs_dmabuf_fallback(missing_driver, false, false));
-        assert!(!linux_webview_needs_dmabuf_fallback(missing_driver, true, false));
-        assert!(!linux_webview_needs_dmabuf_fallback(Path::new("/"), false, false));
-        assert!(linux_webview_needs_dmabuf_fallback(Path::new("/"), false, true));
+        assert!(linux_webview_needs_dmabuf_fallback(
+            missing_driver,
+            false,
+            false
+        ));
+        assert!(!linux_webview_needs_dmabuf_fallback(
+            missing_driver,
+            true,
+            false
+        ));
+        assert!(!linux_webview_needs_dmabuf_fallback(
+            Path::new("/"),
+            false,
+            false
+        ));
+        assert!(linux_webview_needs_dmabuf_fallback(
+            Path::new("/"),
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -5322,7 +6207,10 @@ mod tests {
         fs::write(&stale, b"synthetic stale metadata").unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o666)).unwrap();
         write_json(&path, &serde_json::json!({ "safe": true })).unwrap();
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -5336,9 +6224,15 @@ mod tests {
     fn restored_identity_rejects_a_key_from_another_certificate() {
         let first = rcgen::generate_simple_self_signed(vec!["first.local".into()]).unwrap();
         let second = rcgen::generate_simple_self_signed(vec!["second.local".into()]).unwrap();
-        assert!(validate_identity_key_pair(&first.serialize_pem().unwrap(),
-            &first.serialize_private_key_pem()).is_ok());
-        assert!(validate_identity_key_pair(&first.serialize_pem().unwrap(),
-            &second.serialize_private_key_pem()).is_err());
+        assert!(validate_identity_key_pair(
+            &first.serialize_pem().unwrap(),
+            &first.serialize_private_key_pem()
+        )
+        .is_ok());
+        assert!(validate_identity_key_pair(
+            &first.serialize_pem().unwrap(),
+            &second.serialize_private_key_pem()
+        )
+        .is_err());
     }
 }

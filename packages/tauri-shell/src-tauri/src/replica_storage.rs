@@ -1,12 +1,11 @@
 use crate::metadata_sqlite::MetadataDatabase;
 use cap_std::fs::{Dir, File, Metadata, OpenOptions};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
-
 #[derive(Default)]
 pub struct ReplicaRoots {
     next: u64,
@@ -25,7 +24,9 @@ impl Drop for ReplicaRoots {
         for id in self.roots.keys().copied().collect::<Vec<_>>() {
             let _ = self.release(id);
         }
-        if let Some(key) = self.metadata_key.as_mut() { key.fill(0); }
+        if let Some(key) = self.metadata_key.as_mut() {
+            key.fill(0);
+        }
     }
 }
 
@@ -274,7 +275,9 @@ impl ReplicaRoots {
             &self.metadata_root,
             path,
             &file_identity(&root.dir_metadata()?)?,
-            self.metadata_key.as_ref().ok_or_else(|| invalid("Protected metadata key is unavailable"))?,
+            self.metadata_key
+                .as_ref()
+                .ok_or_else(|| invalid("Protected metadata key is unavailable"))?,
         )?;
         let expected = db.get("marker", "identity")?;
         let mut marker = marker_identity(&root)?;
@@ -693,7 +696,7 @@ impl ReplicaRoots {
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| invalid("Invalid write range"))?;
-        if bytes.len() > 131072 || end > writer.size {
+        if bytes.len() > 1024 * 1024 || end > writer.size {
             return Err(invalid("Write range exceeds file bounds"));
         }
         let file = writer
@@ -834,6 +837,36 @@ impl ReplicaRoots {
             root.remove_file(path)?;
         }
         flush_parents(root, path)
+    }
+
+    fn remove_files(&self, id: u64, paths: &[String]) -> io::Result<()> {
+        if paths.is_empty() || paths.len() > 4096 {
+            return Err(invalid("Invalid removal batch"));
+        }
+        let root = self.root(id)?;
+        let mut seen = HashSet::with_capacity(paths.len());
+        let mut parent_representatives: HashMap<PathBuf, &str> = HashMap::new();
+        for path in paths {
+            if path.is_empty() || !seen.insert(path.as_str()) {
+                return Err(invalid("Invalid removal batch path"));
+            }
+            check_relative(root, path)?;
+            if self.is_metadata(id, path) {
+                return Err(invalid("Metadata records cannot be batch-removed"));
+            }
+            let parent = Path::new(path)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+            parent_representatives.entry(parent).or_insert(path);
+        }
+        for path in paths {
+            root.remove_file(path)?;
+        }
+        for representative in parent_representatives.values() {
+            flush_parents(root, representative)?;
+        }
+        Ok(())
     }
 
     fn flush(&self, id: u64, paths: &[String]) -> io::Result<()> {
@@ -991,8 +1024,11 @@ pub enum ReplicaStorageRequest {
         root_id: u64,
         paths: Vec<String>,
     },
+    RemoveFiles {
+        root_id: u64,
+        paths: Vec<String>,
+    },
 }
-
 pub fn dispatch(
     roots: &mut ReplicaRoots,
     request: ReplicaStorageRequest,
@@ -1109,10 +1145,15 @@ pub fn dispatch(
             roots.flush(root_id, &paths).map_err(|e| e.to_string())?;
             serde_json::Value::Null
         }
+        ReplicaStorageRequest::RemoveFiles { root_id, paths } => {
+            roots
+                .remove_files(root_id, &paths)
+                .map_err(|e| e.to_string())?;
+            serde_json::Value::Null
+        }
     };
     Ok(result)
 }
-
 #[tauri::command]
 pub async fn syncpeer_replica_storage(
     app: tauri::AppHandle,
@@ -1157,7 +1198,6 @@ pub async fn syncpeer_replica_storage(
     .await
     .map_err(|error| format!("Folder storage worker failed: {error}"))?
 }
-
 fn raw_request<'a>(request: &'a tauri::ipc::Request<'a>) -> Result<&'a [u8], String> {
     match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => Ok(bytes),
@@ -1215,7 +1255,7 @@ pub async fn syncpeer_replica_storage_write_binary(
     request: tauri::ipc::Request<'_>,
 ) -> Result<(), String> {
     let body = raw_request(&request)?;
-    if body.len() < 16 || body.len() > 16 + 131072 {
+    if body.len() < 16 || body.len() > 16 + 1024 * 1024 {
         return Err("Invalid binary folder write request".into());
     }
     let writer_id = raw_u64(body, 0)?;
@@ -1234,6 +1274,261 @@ pub async fn syncpeer_replica_storage_write_binary(
     .map_err(|error| format!("Folder storage worker failed: {error}"))?
 }
 
+#[tauri::command]
+pub async fn syncpeer_replica_storage_read_file_binary(
+    state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let body = raw_request(&request)?;
+    let root_id = raw_u64(body, 0)?;
+    let max_size = raw_u32(body, 8)? as usize;
+    let path_len = raw_u32(body, 12)? as usize;
+    if max_size > 2 * 1024 * 1024 || path_len > 4096 || body.len() != 16 + path_len {
+        return Err("Invalid binary whole-file read request".into());
+    }
+    let path = std::str::from_utf8(&body[16..])
+        .map_err(|_| "Invalid binary folder path".to_string())?
+        .to_string();
+    let state = Arc::clone(state.inner());
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let roots = state
+            .lock()
+            .map_err(|_| "Folder handle store unavailable".to_string())?;
+        let entry = roots
+            .stat(root_id, &path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Folder entry unavailable".to_string())?;
+        if entry.kind != "file" {
+            return Err("Folder entry is not a regular file".into());
+        }
+        let size =
+            usize::try_from(entry.size).map_err(|_| "Folder entry is too large".to_string())?;
+        if size > max_size {
+            return Err("Folder entry exceeds whole-file read limit".into());
+        }
+        let mut result = Vec::with_capacity(size);
+        let mut offset = 0usize;
+        while offset < size {
+            let count = (size - offset).min(131072);
+            result.extend_from_slice(
+                &roots
+                    .read(root_id, &path, offset as u64, count)
+                    .map_err(|error| error.to_string())?,
+            );
+            offset += count;
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("Folder storage worker failed: {error}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub async fn syncpeer_replica_storage_write_file_binary(
+    state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let body = raw_request(&request)?;
+    if body.len() < 12 {
+        return Err("Invalid binary whole-file write request".into());
+    }
+    let root_id = raw_u64(body, 0)?;
+    let path_len = raw_u32(body, 8)? as usize;
+    if path_len > 4096 || body.len() < 12 + path_len || body.len() - 12 - path_len > 2 * 1024 * 1024
+    {
+        return Err("Invalid binary whole-file write request".into());
+    }
+    let path = std::str::from_utf8(&body[12..12 + path_len])
+        .map_err(|_| "Invalid binary folder path".to_string())?
+        .to_string();
+    let payload = body[12 + path_len..].to_vec();
+    let size = payload.len();
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut roots = state
+            .lock()
+            .map_err(|_| "Folder handle store unavailable".to_string())?;
+        let writer = roots
+            .begin(root_id, &path, size as u64)
+            .map_err(|error| error.to_string())?;
+        let result = (|| -> io::Result<()> {
+            for (index, chunk) in payload.chunks(131072).enumerate() {
+                roots.write(writer, (index * 131072) as u64, chunk)?;
+            }
+            roots.commit(writer, None, false)
+        })();
+        if let Err(error) = result {
+            let cleanup = roots.abort(writer);
+            return Err(match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup_error) => format!("{error}; cleanup failed: {cleanup_error}"),
+            });
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Folder storage worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn syncpeer_replica_storage_read_files_binary(
+    state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let body = raw_request(&request)?;
+    if body.len() < 16 {
+        return Err("Invalid binary whole-file read batch".into());
+    }
+    let root_id = raw_u64(body, 0)?;
+    let max_total_size = raw_u32(body, 8)? as usize;
+    let count = raw_u32(body, 12)? as usize;
+    if count == 0 || count > 8 || max_total_size > 2 * 1024 * 1024 {
+        return Err("Invalid binary whole-file read batch".into());
+    }
+    let mut cursor = 16usize;
+    let mut paths = Vec::with_capacity(count);
+    for _ in 0..count {
+        let path_len = raw_u32(body, cursor)? as usize;
+        cursor = cursor
+            .checked_add(4)
+            .ok_or_else(|| "Invalid binary read batch".to_string())?;
+        if path_len > 4096
+            || cursor.checked_add(path_len).is_none()
+            || cursor + path_len > body.len()
+        {
+            return Err("Invalid binary whole-file read batch".into());
+        }
+        let path = std::str::from_utf8(&body[cursor..cursor + path_len])
+            .map_err(|_| "Invalid binary folder path".to_string())?
+            .to_string();
+        paths.push(path);
+        cursor += path_len;
+    }
+    if cursor != body.len() {
+        return Err("Invalid binary whole-file read batch".into());
+    }
+    let state = Arc::clone(state.inner());
+    let response = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let roots = state
+            .lock()
+            .map_err(|_| "Folder handle store unavailable".to_string())?;
+        let mut output = Vec::with_capacity(4 + count * 4 + max_total_size);
+        output.extend_from_slice(&(count as u32).to_le_bytes());
+        let mut total = 0usize;
+        for path in paths {
+            let entry = roots
+                .stat(root_id, &path)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Folder entry unavailable".to_string())?;
+            if entry.kind != "file" {
+                return Err("Folder entry is not a regular file".into());
+            }
+            let size =
+                usize::try_from(entry.size).map_err(|_| "Folder entry is too large".to_string())?;
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| "Folder read batch is too large".to_string())?;
+            if total > max_total_size || size > u32::MAX as usize {
+                return Err("Folder read batch exceeds its limit".into());
+            }
+            output.extend_from_slice(&(size as u32).to_le_bytes());
+            let mut offset = 0usize;
+            while offset < size {
+                let chunk_size = (size - offset).min(131072);
+                output.extend_from_slice(
+                    &roots
+                        .read(root_id, &path, offset as u64, chunk_size)
+                        .map_err(|error| error.to_string())?,
+                );
+                offset += chunk_size;
+            }
+        }
+        Ok(output)
+    })
+    .await
+    .map_err(|error| format!("Folder storage worker failed: {error}"))??;
+    Ok(tauri::ipc::Response::new(response))
+}
+
+#[tauri::command]
+pub async fn syncpeer_replica_storage_write_files_binary(
+    state: tauri::State<'_, Arc<Mutex<ReplicaRoots>>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let body = raw_request(&request)?;
+    if body.len() < 12 {
+        return Err("Invalid binary whole-file write batch".into());
+    }
+    let root_id = raw_u64(body, 0)?;
+    let count = raw_u32(body, 8)? as usize;
+    if count == 0 || count > 8 {
+        return Err("Invalid binary whole-file write batch".into());
+    }
+    let mut cursor = 12usize;
+    let mut total = 0usize;
+    let mut files = Vec::with_capacity(count);
+    for _ in 0..count {
+        let path_len = raw_u32(body, cursor)? as usize;
+        let size = raw_u32(body, cursor + 4)? as usize;
+        cursor = cursor
+            .checked_add(8)
+            .ok_or_else(|| "Invalid binary write batch".to_string())?;
+        if path_len > 4096
+            || size > 2 * 1024 * 1024
+            || cursor
+                .checked_add(path_len)
+                .and_then(|value| value.checked_add(size))
+                .is_none()
+            || cursor + path_len + size > body.len()
+        {
+            return Err("Invalid binary whole-file write batch".into());
+        }
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| "Folder write batch is too large".to_string())?;
+        if total > 2 * 1024 * 1024 {
+            return Err("Folder write batch exceeds its limit".into());
+        }
+        let path = std::str::from_utf8(&body[cursor..cursor + path_len])
+            .map_err(|_| "Invalid binary folder path".to_string())?
+            .to_string();
+        cursor += path_len;
+        let payload = body[cursor..cursor + size].to_vec();
+        cursor += size;
+        files.push((path, payload));
+    }
+    if cursor != body.len() {
+        return Err("Invalid binary whole-file write batch".into());
+    }
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut roots = state
+            .lock()
+            .map_err(|_| "Folder handle store unavailable".to_string())?;
+        for (path, payload) in files {
+            let writer = roots
+                .begin(root_id, &path, payload.len() as u64)
+                .map_err(|error| error.to_string())?;
+            let result = (|| -> io::Result<()> {
+                for (index, chunk) in payload.chunks(1024 * 1024).enumerate() {
+                    roots.write(writer, (index * 1024 * 1024) as u64, chunk)?;
+                }
+                roots.commit(writer, None, false)
+            })();
+            if let Err(error) = result {
+                let cleanup = roots.abort(writer);
+                return Err(match cleanup {
+                    Ok(()) => error.to_string(),
+                    Err(cleanup_error) => format!("{error}; cleanup failed: {cleanup_error}"),
+                });
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Folder storage worker failed: {error}"))?
+}
 #[cfg(test)]
 mod tests {
     use super::*;

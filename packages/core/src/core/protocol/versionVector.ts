@@ -15,6 +15,10 @@ const canonicalCounters = (vector: BepVersionVector) => {
   }).sort((a, b) => numericIdOrder(a.id, b.id));
 };
 
+/** Stable local identity for a validated version vector. */
+export const versionVectorKey = (vector: BepVersionVector): string =>
+  canonicalCounters(vector).map(counter => `${counter.id}:${counter.value}`).join(",");
+
 /** Syncthing's concurrent ordering follows the first unequal numeric device counter. */
 export const compareConcurrentVersionCounters = (left: BepVersionVector, right: BepVersionVector): number => {
   const a = new Map(canonicalCounters(left).map(counter => [counter.id, BigInt(counter.value)]));

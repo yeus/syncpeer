@@ -18,6 +18,8 @@ export interface FileDownloadSink extends CachedRangeStorage {
   begin: (metadata: FileDownloadMetadata) => Promise<void> | void;
   /** Commit verifies metadata.blocks against durable plaintext before publication. */
   commitVerifiesBlocks?: boolean;
+  /** Maximum contiguous write accepted by the backing sink. */
+  maxWriteSize?: number;
   write: (offset: number, bytes: Uint8Array) => Promise<void> | void;
   commit: () => Promise<void> | void;
   abort: (error: unknown) => Promise<void> | void;

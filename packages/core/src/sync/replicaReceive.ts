@@ -37,6 +37,7 @@ export async function receiveReplicaFiles(
   storage: ReplicaDestination,
   request: ReplicaBlockReader,
   hash: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>,
+  coalesceReadRanges = false,
 ): Promise<boolean> {
   const index: ReplicaIndex = { ...previous, files: Object.assign(Object.create(null), previous.files) };
   let changed = false;
@@ -66,7 +67,8 @@ export async function receiveReplicaFiles(
         files: new Map([[info.name, { indexFile: info }]]),
       }]]), (_folder, _name, offset, size, options) => source === "remote"
         ? request(sourceInfo.name, offset, size, options?.hash) : storage.readRange(sourceInfo.name, offset, size),
-      async () => {}, () => {}, undefined, undefined, undefined, undefined, hash);
+      async () => {}, () => {}, undefined, undefined, undefined, undefined, hash,
+      undefined, undefined, new Set(), coalesceReadRanges);
       try {
         await view.readFileToSink(folderId, info.name, { ...sink, commit: async () => {
           await checkLocal();

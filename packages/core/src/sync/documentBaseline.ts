@@ -9,10 +9,12 @@ const nameFor = async (path: string, key: Uint8Array) => ".syncpeer-baseline-" +
   bytesToHex(sha256(new TextEncoder().encode(await encryptUntrustedFilename(key, path))));
 const validate = (value: NonNullable<CachedFileRecord["syncBaseline"]>) => {
   if (!value || !/^[a-f0-9]{64}$/.test(value.hash) || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 0 ||
-    !Number.isSafeInteger(value.modifiedMs) || value.modifiedMs < 0) throw new Error("Invalid document sync baseline.");
-  return { hash: value.hash, sizeBytes: value.sizeBytes, modifiedMs: value.modifiedMs };
+    !Number.isSafeInteger(value.modifiedMs) || value.modifiedMs < 0 ||
+    (value.versionKey !== undefined && (typeof value.versionKey !== "string" || value.versionKey.length > 4096 ||
+      !/^(?:\d+:\d+(?:,\d+:\d+)*)?$/.test(value.versionKey)))) throw new Error("Invalid document sync baseline.");
+  return { hash: value.hash, sizeBytes: value.sizeBytes, modifiedMs: value.modifiedMs,
+    ...(value.versionKey === undefined ? {} : { versionKey: value.versionKey }) };
 };
-
 export async function loadDocumentBaseline(bytes: ReplicaByteStorage, folderKey: Uint8Array, path: string) {
   const name = await nameFor(path, folderKey), entry = await bytes.stat(name);
   if (!entry) return undefined;
@@ -37,7 +39,7 @@ export async function saveDocumentBaseline(bytes: ReplicaByteStorage, options: {
   const name = await nameFor(options.path, options.folderKey), data = new TextEncoder().encode(JSON.stringify(validate(options.baseline)));
   try {
     await writeEncryptedRecord({ name, bytes: data, folderKey: options.folderKey, randomBytes: options.randomBytes,
-      createSink: (_info, size) => bytes.createSink(name, size) });
+      createSink: (_info, size) => bytes.createSink(name, size), writeFile: bytes.writeFile });
     await bytes.flushChanges([name]);
   } finally { data.fill(0); }
 }

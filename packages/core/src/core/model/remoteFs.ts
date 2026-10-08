@@ -11,6 +11,7 @@ import type {
   FileUploadSource,
 } from "../../transfer/stream.js";
 
+const DOWNLOAD_BLOCK_CONCURRENCY = 6;
 export interface FolderInfo {
   id: string;
   label: string;
@@ -313,6 +314,7 @@ export class RemoteFs {
   private setFocusedFolderId: (folderId: string | null) => void;
   private hashBytes?: (bytes: Uint8Array) => Promise<Uint8Array> | Uint8Array;
   private internalFolderIds: ReadonlySet<string>;
+  private coalesceReadRanges: boolean;
 
   constructor(
     folders: Map<string, FolderState>,
@@ -352,6 +354,7 @@ export class RemoteFs {
       options?: FileUploadOptions,
     ) => Promise<void>,
     internalFolderIds: ReadonlySet<string> = new Set(),
+    coalesceReadRanges = false,
   ) {
     this.folders = folders;
     this.requestBlock = requestBlock;
@@ -365,8 +368,8 @@ export class RemoteFs {
     this.setFocusedFolderId = setFocusedFolderId;
     this.hashBytes = hashBytes;
     this.internalFolderIds = internalFolderIds;
+    this.coalesceReadRanges = coalesceReadRanges;
   }
-
   getRemoteDeviceInfo(): RemoteDeviceInfo | undefined {
     return this.remoteDevice;
   }
@@ -579,8 +582,9 @@ export class RemoteFs {
     try {
       if (plaintext.length < original.size) throw new Error("Encrypted block was shorter than expected.");
       const bytes = plaintext.subarray(0, original.size);
+      const digest = await (this.hashBytes ?? sha256)(bytes);
       verifyBlockDigests([{ offset: Number(original.offset), size: original.size, hash: original.hash }],
-        [{ offset: Number(original.offset), size: original.size, hash: await (this.hashBytes ?? sha256)(bytes) }]);
+        [{ offset: Number(original.offset), size: original.size, hash: digest }]);
       return bytes.slice();
     } finally { plaintext.fill(0); }
   }
@@ -809,7 +813,7 @@ export class RemoteFs {
         false,
         `unhashed:${entry.modifiedMs}:${entry.size}`,
         plan,
-        6,
+        DOWNLOAD_BLOCK_CONCURRENCY,
         (next) => requestWithTemporaryFallback(next.offset, next.size, { signal }),
         sink,
         onProgress,
@@ -831,7 +835,7 @@ export class RemoteFs {
       false,
       fingerprintForBlocks(entry.blocks, totalBytes),
       plan,
-      6,
+      DOWNLOAD_BLOCK_CONCURRENCY,
       (next) => requestWithTemporaryFallback(next.offset, next.size, {
         hash: next.block.hash,
         blockNo: next.blockNo,
@@ -840,9 +844,13 @@ export class RemoteFs {
       sink,
       onProgress,
       signal,
+      this.coalesceReadRanges && this.hashBytes ? items => {
+        const first = items[0];
+        return requestWithTemporaryFallback(first.offset,
+          items.reduce((total, item) => total + item.size, 0), { signal });
+      } : undefined,
     );
   }
-
   async writeFileFully(
     folderId: string,
     path: string,
@@ -975,7 +983,7 @@ export class RemoteFs {
       true,
       fingerprintForBlocks(entry.blocks, entry.size),
       plan,
-      6,
+      DOWNLOAD_BLOCK_CONCURRENCY,
       next => this.readEncryptedBlock(folder.id, resolvedFile!, next.blockNo, signal),
       sink,
       onProgress,
@@ -1041,6 +1049,7 @@ export class RemoteFs {
     sink: FileDownloadSink,
     onProgress?: (progress: FileDownloadProgress) => void,
     signal?: AbortSignal,
+    requestRange?: (items: readonly T[]) => Promise<Uint8Array>,
   ): Promise<FileDownloadResult> {
     throwIfAborted(signal);
     const blocks: RangeDigest[] = plan.flatMap((item) => item.hash?.length === 32
@@ -1076,48 +1085,72 @@ export class RemoteFs {
       pendingBytes = 0;
       await sink.write(first.offset, combined);
     };
+    const maxRangeBytes = 1024 * 1024;
+    const groups: Array<{ startIndex: number; items: T[]; size: number }> = [];
+    for (let index = 0; index < remainingPlan.length;) {
+      const startIndex = index;
+      const items = [remainingPlan[index]];
+      let size = remainingPlan[index].size;
+      index += 1;
+      if (requestRange) {
+        while (index < remainingPlan.length && size + remainingPlan[index].size <= maxRangeBytes) {
+          const previous = remainingPlan[index - 1];
+          const next = remainingPlan[index];
+          if (previous.offset + previous.size !== next.offset) break;
+          items.push(next);
+          size += next.size;
+          index += 1;
+        }
+      }
+      groups.push({ startIndex, items, size });
+    }
+
     const inFlight = new Map<number, Promise<
-      { index: number; bytes: Uint8Array; error?: never } |
-      { index: number; bytes?: never; error: unknown }
+      { groupIndex: number; bytes: Uint8Array; error?: never } |
+      { groupIndex: number; bytes?: never; error: unknown }
     >>();
     const completed = new Map<number, Uint8Array>();
-    let nextRequestIndex = 0;
+    let nextRequestGroup = 0;
     let nextWriteIndex = 0;
-    const startRequest = (index: number) => {
-      const pendingRequest = request(remainingPlan[index]).then(
-        (bytes) => ({ index, bytes }),
-        (error: unknown) => ({ index, error }),
+    const startRequest = (groupIndex: number) => {
+      const group = groups[groupIndex];
+      const operation = requestRange && group.items.length > 1
+        ? requestRange(group.items)
+        : request(group.items[0]);
+      const pendingRequest = operation.then(
+        (bytes) => ({ groupIndex, bytes }),
+        (error: unknown) => ({ groupIndex, error }),
       );
-      inFlight.set(index, pendingRequest);
+      inFlight.set(groupIndex, pendingRequest);
     };
-    while (nextRequestIndex < Math.min(remainingPlan.length, Math.max(1, concurrency))) {
-      startRequest(nextRequestIndex);
-      nextRequestIndex += 1;
+    while (nextRequestGroup < Math.min(groups.length, Math.max(1, concurrency))) {
+      startRequest(nextRequestGroup++);
     }
     while (inFlight.size > 0) {
       throwIfAborted(signal);
       const result = await Promise.race(inFlight.values());
-      inFlight.delete(result.index);
+      inFlight.delete(result.groupIndex);
       if ("error" in result) throw result.error;
-      const item = remainingPlan[result.index];
-      if (result.bytes.length === 0) {
-        throw new Error(`Unexpected empty block while reading ${path} at offset ${item.offset}`);
-      }
-      if (result.bytes.length !== item.size) {
+      const group = groups[result.groupIndex];
+      if (result.bytes.length !== group.size) {
         throw new Error(
-          `Downloaded block for ${path} at offset ${item.offset}: ` +
-          `expected ${item.size} bytes, received ${result.bytes.length}`,
+          `Downloaded range for ${path} at offset ${group.items[0].offset}: ` +
+          `expected ${group.size} bytes, received ${result.bytes.length}`,
         );
       }
-      if (item.hash?.length === 32 && this.hashBytes) {
-        verifyBlockDigests([{ ...item, hash: item.hash }], [{ ...item, hash: await this.hashBytes(result.bytes) }]);
+      let groupOffset = 0;
+      for (let itemIndex = 0; itemIndex < group.items.length; itemIndex += 1) {
+        const item = group.items[itemIndex];
+        const bytes = result.bytes.slice(groupOffset, groupOffset + item.size);
+        groupOffset += item.size;
+        if (item.hash?.length === 32 && this.hashBytes) {
+          verifyBlockDigests([{ ...item, hash: item.hash }],
+            [{ ...item, hash: await this.hashBytes(bytes) }]);
+        }
+        networkBytes += item.networkSize ?? bytes.length;
+        completed.set(group.startIndex + itemIndex, bytes);
       }
-      networkBytes += item.networkSize ?? result.bytes.length;
-      completed.set(result.index, result.bytes);
-      if (nextRequestIndex < remainingPlan.length) {
-        startRequest(nextRequestIndex);
-        nextRequestIndex += 1;
-      }
+      if (nextRequestGroup < groups.length) startRequest(nextRequestGroup++);
       while (completed.has(nextWriteIndex)) {
         throwIfAborted(signal);
         const chunk = completed.get(nextWriteIndex)!;
@@ -1127,9 +1160,7 @@ export class RemoteFs {
         const contiguous = previous
           ? previous.offset + previous.bytes.length === next.offset
           : true;
-        if (!contiguous || pendingBytes + chunk.length > 1024 * 1024) {
-          await flushPending();
-        }
+        if (!contiguous || pendingBytes + chunk.length > 1024 * 1024) await flushPending();
         pending.push({ offset: next.offset, bytes: chunk });
         pendingBytes += chunk.length;
         downloaded += chunk.length;
@@ -1168,7 +1199,6 @@ export class RemoteFs {
       resumedBytes,
     };
   }
-
   close(): void {
     this.closeConnection?.();
   }

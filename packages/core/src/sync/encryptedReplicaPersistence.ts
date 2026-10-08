@@ -6,13 +6,13 @@ import type { ReplicaIndex } from "./replicaIndex.js";
 /** Private record: never include this file in the replicated namespace. */
 export async function saveEncryptedReplicaIndex(args: Pick<Parameters<typeof writeEncryptedDiskFile>[0], "folderKey" | "randomBytes" | "createSink" | "signal"> & {
   index: ReplicaIndex;
+  writeFile?: (path: string, bytes: Uint8Array) => Promise<void>;
 }) {
   const bytes = encodeReplicaIndex(args.index);
   try {
     return await writeEncryptedRecord({ ...args, name: ".syncpeer-replica-index", bytes });
   } finally { bytes.fill(0); }
 }
-
 /** Read from a stable storage snapshot; authentication failure must not become an empty index. */
 export async function loadEncryptedReplicaIndex(source: EncryptedFileSource, folderKey: Uint8Array, signal?: AbortSignal) {
   const bytes = await readEncryptedRecord(source, folderKey, ".syncpeer-replica-index", signal);

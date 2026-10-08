@@ -17,13 +17,17 @@ export type NativeFilesystemRequest =
   | { operation: "abort"; writerId: number }
   | { operation: "makeDirectory"; rootId: number; path: string }
   | { operation: "remove"; rootId: number; path: string; directory: boolean }
+  | { operation: "removeFiles"; rootId: number; paths: string[] }
   | { operation: "copy"; rootId: number; source: string; target: string }
   | { operation: "flush"; rootId: number; paths: string[] };
-
 
 export interface NativeFilesystemBinaryIo {
   read: (request: { rootId: number; path: string; offset: number; size: number }) => Promise<Uint8Array>;
   write: (request: { writerId: number; offset: number; bytes: Uint8Array }) => Promise<void>;
+  readFile?: (request: { rootId: number; path: string; maxSize: number }) => Promise<Uint8Array>;
+  writeFile?: (request: { rootId: number; path: string; bytes: Uint8Array }) => Promise<void>;
+  readFiles?: (request: { rootId: number; paths: readonly string[]; maxTotalSize: number }) => Promise<Uint8Array[]>;
+  writeFiles?: (request: { rootId: number; files: readonly { path: string; bytes: Uint8Array }[] }) => Promise<void>;
 }
 const unsigned = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
@@ -150,15 +154,17 @@ export async function createNativeFilesystem(
       if (!Array.isArray(bytes) || bytes.length !== size || bytes.some(value => !unsigned(value) || value > 255)) throw new Error("Invalid native file bytes.");
       return new Uint8Array(bytes);
     },
-    createSink: async (path: string, size: number, modifiedMs?: number): Promise<Pick<FileDownloadSink, "write" | "commit" | "abort">> => {
+    createSink: async (path: string, size: number, modifiedMs?: number): Promise<Pick<FileDownloadSink, "write" | "commit" | "abort" | "maxWriteSize">> => {
       assertReplicaPath(path);
       if (!unsigned(size) || (modifiedMs !== undefined && !unsigned(modifiedMs))) throw new Error("Invalid native file metadata.");
       const writerId = handle(await run({ operation: "begin", rootId, path, size }));
       let ended = false;
       return {
+        ...(binary ? { maxWriteSize: 1024 * 1024 } : {}),
         write: async (offset: number, bytes: Uint8Array) => {
           if (ended) throw new Error("Native file writer is closed.");
-          if (!unsigned(offset) || bytes.length > 131072 || offset > size || bytes.length > size - offset) throw new Error("Invalid native write range.");
+          const maxWriteSize = binary ? 1024 * 1024 : 131072;
+          if (!unsigned(offset) || bytes.length > maxWriteSize || offset > size || bytes.length > size - offset) throw new Error("Invalid native write range.");
           if (binary) await runBinary(() => binary.write({ writerId, offset, bytes }));
           else await run({ operation: "write", writerId, offset, bytes: Array.from(bytes) });
         },
@@ -175,8 +181,50 @@ export async function createNativeFilesystem(
         },
       };
     },
+    ...(binary?.readFile ? { readFile: async (path: string, maxSize: number) => {
+      assertReplicaPath(path);
+      if (!Number.isSafeInteger(maxSize) || maxSize < 0 || maxSize > 2 * 1024 * 1024) throw new Error("Invalid native file read limit.");
+      return runBinary(() => binary.readFile!({ rootId, path, maxSize }));
+    } } : {}),
+    ...(binary?.writeFile ? { writeFile: async (path: string, bytes: Uint8Array) => {
+      assertReplicaPath(path);
+      if (bytes.length > 2 * 1024 * 1024) throw new Error("Native whole-file write is too large.");
+      await runBinary(() => binary.writeFile!({ rootId, path, bytes }));
+    } } : {}),
+    ...(binary?.readFiles ? { readFiles: async (paths: readonly string[], maxTotalSize: number) => {
+      if (!Array.isArray(paths) || paths.length < 1 || paths.length > 8 ||
+        !Number.isSafeInteger(maxTotalSize) || maxTotalSize < 0 || maxTotalSize > 2 * 1024 * 1024) {
+        throw new Error("Invalid native whole-file read batch.");
+      }
+      paths.forEach(assertReplicaPath);
+      const result = await runBinary(() => binary.readFiles!({ rootId, paths, maxTotalSize }));
+      if (!Array.isArray(result) || result.length !== paths.length || result.some(value => !(value instanceof Uint8Array))) {
+        throw new Error("Invalid native whole-file read batch response.");
+      }
+      if (result.reduce((total, value) => total + value.length, 0) > maxTotalSize) {
+        throw new Error("Native whole-file read batch exceeded its limit.");
+      }
+      return result;
+    } } : {}),
+    ...(binary?.writeFiles ? { writeFiles: async (files: readonly { path: string; bytes: Uint8Array }[]) => {
+      if (!Array.isArray(files) || files.length < 1 || files.length > 8 ||
+        files.reduce((total, file) => total + file.bytes.length, 0) > 2 * 1024 * 1024) {
+        throw new Error("Invalid native whole-file write batch.");
+      }
+      for (const file of files) {
+        assertReplicaPath(file.path);
+        if (file.bytes.length > 2 * 1024 * 1024) throw new Error("Native whole-file write is too large.");
+      }
+      await runBinary(() => binary.writeFiles!({ rootId, files }));
+    } } : {}),
     makeDirectory: async (path: string) => { assertReplicaPath(path); await run({ operation: "makeDirectory", rootId, path }); },
     remove: async (path: string, directory: boolean) => { assertReplicaPath(path); await run({ operation: "remove", rootId, path, directory }); },
+    removeFiles: async (paths: readonly string[]) => {
+      if (!Array.isArray(paths) || paths.length === 0 || paths.length > 4096) throw new Error("Invalid native removal batch.");
+      const batch = paths.map(path => { assertReplicaPath(path); return path; });
+      if (new Set(batch).size !== batch.length) throw new Error("Duplicate native removal path.");
+      await run({ operation: "removeFiles", rootId, paths: batch });
+    },
     copy: async (source: string, target: string) => {
       assertReplicaPath(source); assertReplicaPath(target);
       await run({ operation: "copy", rootId, source, target });

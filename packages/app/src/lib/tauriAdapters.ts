@@ -42,11 +42,6 @@ interface RelayOpenResponse {
   connectedVia: string;
 }
 
-interface TlsReadResponse {
-  bytes: number[];
-  eof?: boolean;
-}
-
 interface TlsListenResponse {
   listenerId: number;
   port: number;
@@ -174,11 +169,9 @@ const tryForwardUiErrorToCli = async (
 };
 
 export const shouldLogInvokeLifecycle = (command: string): boolean =>
-  command !== "syncpeer_tls_read" && command !== "syncpeer_tls_write" &&
+  !/^(?:syncpeer_tls|syncpeer_quic)_(?:read|write)(?:_binary)?$/.test(command) &&
   command !== "syncpeer_replica_storage" &&
-  command !== "syncpeer_replica_storage_read_binary" &&
-  command !== "syncpeer_replica_storage_write_binary";
-
+  !/^syncpeer_replica_storage_(?:read|write|read_file|write_file|read_files|write_files)_binary$/.test(command);
 const createLoggedInvoke = (
   invoke: InvokeFn,
   options: CreateTauriAdaptersOptions | undefined,
@@ -223,15 +216,101 @@ const nativeWriteRequest = (writerId: number, offset: number, bytes: Uint8Array)
   setU64(view, 0, writerId); setU64(view, 8, offset); body.set(bytes, 16);
   return body;
 };
+const nativeReadFileRequest = (rootId: number, path: string, maxSize: number): Uint8Array => {
+  const encodedPath = new TextEncoder().encode(path);
+  if (encodedPath.length > 4096) throw new Error("Native storage path is too long.");
+  const body = new Uint8Array(16 + encodedPath.length), view = new DataView(body.buffer);
+  setU64(view, 0, rootId); view.setUint32(8, maxSize, true); view.setUint32(12, encodedPath.length, true);
+  body.set(encodedPath, 16);
+  return body;
+};
 
-const rawBytes = (value: unknown, size: number): Uint8Array => {
+const nativeWriteFileRequest = (rootId: number, path: string, bytes: Uint8Array): Uint8Array => {
+  const encodedPath = new TextEncoder().encode(path);
+  if (encodedPath.length > 4096) throw new Error("Native storage path is too long.");
+  const body = new Uint8Array(12 + encodedPath.length + bytes.length), view = new DataView(body.buffer);
+  setU64(view, 0, rootId); view.setUint32(8, encodedPath.length, true);
+  body.set(encodedPath, 12); body.set(bytes, 12 + encodedPath.length);
+  return body;
+};
+const nativeReadFilesRequest = (rootId: number, paths: readonly string[], maxTotalSize: number): Uint8Array => {
+  const encoded = paths.map(path => new TextEncoder().encode(path));
+  if (encoded.some(path => path.length > 4096)) throw new Error("Native storage path is too long.");
+  const body = new Uint8Array(16 + encoded.reduce((total, path) => total + 4 + path.length, 0));
+  const view = new DataView(body.buffer);
+  setU64(view, 0, rootId); view.setUint32(8, maxTotalSize, true); view.setUint32(12, encoded.length, true);
+  let cursor = 16;
+  for (const path of encoded) {
+    view.setUint32(cursor, path.length, true); cursor += 4;
+    body.set(path, cursor); cursor += path.length;
+  }
+  return body;
+};
+
+const nativeWriteFilesRequest = (rootId: number, files: readonly { path: string; bytes: Uint8Array }[]): Uint8Array => {
+  const encoded = files.map(file => ({ ...file, pathBytes: new TextEncoder().encode(file.path) }));
+  if (encoded.some(file => file.pathBytes.length > 4096)) throw new Error("Native storage path is too long.");
+  const body = new Uint8Array(12 + encoded.reduce((total, file) => total + 8 + file.pathBytes.length + file.bytes.length, 0));
+  const view = new DataView(body.buffer);
+  setU64(view, 0, rootId); view.setUint32(8, encoded.length, true);
+  let cursor = 12;
+  for (const file of encoded) {
+    view.setUint32(cursor, file.pathBytes.length, true); view.setUint32(cursor + 4, file.bytes.length, true); cursor += 8;
+    body.set(file.pathBytes, cursor); cursor += file.pathBytes.length;
+    body.set(file.bytes, cursor); cursor += file.bytes.length;
+  }
+  return body;
+};
+
+const decodeNativeReadFiles = (value: unknown, expectedCount: number, maxTotalSize: number): Uint8Array[] => {
+  const body = rawByteView(value);
+  if (body.length < 4) throw new Error("Invalid native whole-file read batch response.");
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const count = view.getUint32(0, true);
+  if (count !== expectedCount) throw new Error("Invalid native whole-file read batch response.");
+  const result: Uint8Array[] = [];
+  let cursor = 4, total = 0;
+  for (let index = 0; index < count; index++) {
+    if (cursor + 4 > body.length) throw new Error("Invalid native whole-file read batch response.");
+    const size = view.getUint32(cursor, true); cursor += 4;
+    if (cursor + size > body.length) throw new Error("Invalid native whole-file read batch response.");
+    total += size;
+    if (total > maxTotalSize) throw new Error("Native whole-file read batch exceeded its limit.");
+    result.push(body.slice(cursor, cursor + size)); cursor += size;
+  }
+  if (cursor !== body.length) throw new Error("Invalid native whole-file read batch response.");
+  return result;
+};
+
+const rawByteView = (value: unknown): Uint8Array => {
   const bytes = value instanceof ArrayBuffer ? new Uint8Array(value)
     : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
     : null;
-  if (!bytes || bytes.length !== size) throw new Error("Invalid binary native storage response.");
+  if (!bytes) throw new Error("Invalid binary IPC response.");
   return bytes;
 };
 
+const rawBytes = (value: unknown, size: number): Uint8Array => {
+  const bytes = rawByteView(value);
+  if (bytes.length !== size) throw new Error("Invalid binary native storage response.");
+  return bytes;
+};
+
+const socketReadRequest = (sessionId: number, maxBytes?: number): Uint8Array => {
+  const requested = Number.isFinite(maxBytes) ? Math.floor(Number(maxBytes)) : 1024 * 1024;
+  if (!Number.isSafeInteger(requested) || requested < 1 || requested > 1024 * 1024) {
+    throw new Error("Invalid socket read size.");
+  }
+  const body = new Uint8Array(12), view = new DataView(body.buffer);
+  setU64(view, 0, sessionId); view.setUint32(8, requested, true);
+  return body;
+};
+
+const socketWriteRequest = (sessionId: number, bytes: Uint8Array): Uint8Array => {
+  const body = new Uint8Array(8 + bytes.length), view = new DataView(body.buffer);
+  setU64(view, 0, sessionId); body.set(bytes, 8);
+  return body;
+};
 
 
 const createTlsSocket = (
@@ -241,19 +320,10 @@ const createTlsSocket = (
   commandPrefix = "syncpeer_tls",
 ): SyncpeerTlsSocket => ({
   peerCertificateDer: async () => peerCertificateDer,
-  read: async (maxBytes?: number) => {
-    const response = await invoke<TlsReadResponse>(`${commandPrefix}_read`, {
-      request: { sessionId, maxBytes: Number.isFinite(maxBytes) ? maxBytes : null },
-    });
-    if (response.eof) {
-      throw new Error("Connection closed");
-    }
-    return new Uint8Array(response.bytes);
-  },
+  read: async (maxBytes?: number) => rawByteView(await invoke<ArrayBuffer>(
+    `${commandPrefix}_read_binary`, socketReadRequest(sessionId, maxBytes))),
   write: async (bytes: Uint8Array) => {
-    await invoke<void>(`${commandPrefix}_write`, {
-      request: { sessionId, bytes: Array.from(bytes) },
-    });
+    await invoke<void>(`${commandPrefix}_write_binary`, socketWriteRequest(sessionId, bytes));
   },
   close: async () => {
     await invoke<void>(`${commandPrefix}_close`, {
@@ -261,7 +331,6 @@ const createTlsSocket = (
     });
   },
 });
-
 export const createTauriAdapters = (
   options?: CreateTauriAdaptersOptions,
 ) => {
@@ -281,6 +350,21 @@ export const createTauriAdapters = (
       write: async ({ writerId, offset, bytes }) => {
         await invokeWithLogging("syncpeer_replica_storage_write_binary",
           nativeWriteRequest(writerId, offset, bytes));
+      },
+      readFile: async ({ rootId, path, maxSize }) => {
+        const bytes = rawByteView(await invokeWithLogging<ArrayBuffer>("syncpeer_replica_storage_read_file_binary",
+          nativeReadFileRequest(rootId, path, maxSize)));
+        if (bytes.length > maxSize) throw new Error("Native whole-file read exceeded its limit.");
+        return bytes;
+      },
+      writeFile: async ({ rootId, path, bytes }) => {
+        await invokeWithLogging("syncpeer_replica_storage_write_file_binary", nativeWriteFileRequest(rootId, path, bytes));
+      },
+      readFiles: async ({ rootId, paths, maxTotalSize }) => decodeNativeReadFiles(
+        await invokeWithLogging<ArrayBuffer>("syncpeer_replica_storage_read_files_binary",
+          nativeReadFilesRequest(rootId, paths, maxTotalSize)), paths.length, maxTotalSize),
+      writeFiles: async ({ rootId, files }) => {
+        await invokeWithLogging("syncpeer_replica_storage_write_files_binary", nativeWriteFilesRequest(rootId, files));
       },
     });
   let sessionConfigurationRevision = 0;

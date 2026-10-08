@@ -159,7 +159,7 @@ const downloadByName = async (name: string): Promise<void> => {
     await waitForText(lanBrowser, "Downloaded " + name, 90_000);
   } catch (error) {
     const issue = await lanBrowser.execute(() => document.querySelector("p.error")?.textContent ?? "");
-    throw new Error(`Download did not complete (${appErrorCategory(issue)}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 16).join(", ")}).`,
+    throw new Error(`Download did not complete (${appErrorCategory(issue)}; reason: ${safeNativeFailureText(issue) ?? "none"}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 16).join(", ")}).`,
       { cause: error });
   }
 };

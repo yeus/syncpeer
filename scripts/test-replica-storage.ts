@@ -56,7 +56,7 @@ test("preverified local block plans avoid the extra source hashing pass", async 
   }));
   let index: ReplicaIndex | null = null;
   let published: Uint8Array | undefined;
-  let sourceReads = 0;
+  const sourceReads: Array<{ offset: number; size: number }> = [];
   const replica = createFolderReplica({
     withLock: async operation => operation(),
     listEntries: async () => published
@@ -83,11 +83,12 @@ test("preverified local block plans avoid the extra source hashing pass", async 
     method: "write", folderId: "fixture-folder", path: "file", expectedVersion: null, modifiedMs: 1000,
     blocks,
     source: { size: source.length, readRange: async (offset, size) => {
-      sourceReads++;
+      sourceReads.push({ offset, size });
       return source.slice(offset, offset + size);
     } },
   });
-  assert.equal(sourceReads, blocks.length, "Each source block should be read exactly once during publication");
+  assert.deepEqual(sourceReads, [{ offset: 0, size: source.length }],
+    "Contiguous preverified blocks should publish through one coalesced source read");
   assert.deepEqual(published, source);
 });
 

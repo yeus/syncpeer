@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { SyncpeerSessionStore } from "@syncpeer/core/browser";
 import type { AppActions } from "../packages/app/src/app/actions.ts";
+import { createPageActions } from "../packages/app/src/app/pageActions.ts";
 import {
   createNavigableAppActions,
   routeEquals,
@@ -71,6 +73,8 @@ const createBaseActions = (
     return delayedLocation ?? Promise.resolve();
   };
   return {
+    ...createPageActions({ state, sessionStore: {} as SyncpeerSessionStore,
+      discoverLocalDevices: async () => {}, connect: async () => {} }),
     switchTab: (tab) => {
       state.activeTab = tab;
     },
@@ -83,8 +87,6 @@ const createBaseActions = (
     openAboutPage: () => {
       state.currentPage = "about";
     },
-    openFolderSettings: () => { state.currentPage = "folder-settings"; },
-    closeFolderSettings: () => { state.currentPage = "main"; },
     closeAboutPage: () => {
       state.currentPage = "main";
     },
@@ -157,6 +159,7 @@ test("serializes and validates the navigation route in the URL fragment", () => 
   assert.equal(routeToHash({ ...route, path: "/nested/deeper/" }), hash);
   const versionRoute: AppRoute = { ...route, page: "versions", path: "nested", versionPath: "nested/file.txt" };
   assert.equal(routeFromHash(routeToHash(versionRoute))?.versionPath, "nested/file.txt");
+  assert.equal(routeFromHash("#v=1&page=folder-settings&tab=folders")?.page, "general-settings");
 });
 
 test("records a route after synchronous session updates", async () => {
@@ -215,7 +218,7 @@ test("folder settings have a URL and Back restores the previous folder without a
   const { actions, history, location } = createActions(state);
   const stop = actions.startNavigation();
   await actions.openFolderRoot("photos");
-  actions.openFolderSettings();
+  actions.openFolderSettings("photos");
   assert.equal(routeFromHash(location.hash)?.page, "folder-settings");
   assert.equal(state.activeTab, "folders");
   history.back();
@@ -223,6 +226,81 @@ test("folder settings have a URL and Back restores the previous folder without a
   assert.equal(state.currentPage, "main");
   assert.equal(state.session.currentFolderId, "photos");
   stop();
+});
+
+test("folder settings select a root-row folder without changing the browsing location", async () => {
+  const state = createInitialState(null);
+  const { actions, location, history } = createActions(state);
+  actions.startNavigation();
+  await actions.openFolderRoot("photos");
+  state.session.currentPath = "holiday";
+  actions.syncNavigationRoute();
+  actions.openFolderSettings("documents");
+  assert.equal(state.folderSettingsId, "documents");
+  assert.equal(state.session.currentFolderId, "photos");
+  assert.equal(state.session.currentPath, "holiday");
+  assert.equal(routeFromHash(location.hash)?.folderId, "documents");
+  assert.equal(routeFromHash(location.hash)?.path, "");
+  actions.closeFolderSettings();
+  await flush();
+  assert.equal(state.currentPage, "main");
+  assert.equal(state.session.currentFolderId, "photos");
+  assert.equal(state.session.currentPath, "holiday");
+  assert.equal(history.state !== null, true);
+});
+
+test("a folder-settings deep link opens settings without browsing or contacting that folder", async () => {
+  const state = createInitialState(null);
+  const { actions } = createActions(state, "#v=1&page=folder-settings&tab=folders&folder=documents");
+  actions.startNavigation();
+  await actions.restoreNavigationRoute();
+  assert.equal(state.currentPage, "folder-settings");
+  assert.equal(state.folderSettingsId, "documents");
+  assert.equal(state.session.currentFolderId, "");
+});
+
+test("general settings and folder creation have distinct routes and restore on Back", async () => {
+  const state = createInitialState(null);
+  const { actions, location } = createActions(state);
+  actions.startNavigation();
+  actions.openNewFolder();
+  assert.equal(routeFromHash(location.hash)?.page, "new-folder");
+  actions.openGeneralSettings();
+  assert.equal(routeFromHash(location.hash)?.page, "general-settings");
+  actions.closeGeneralSettings();
+  await flush();
+  assert.equal(state.currentPage, "new-folder");
+  actions.closeNewFolder();
+  await flush();
+  assert.equal(state.currentPage, "main");
+});
+
+test("general settings and creation deep links do not carry a browsing folder", async () => {
+  for (const page of ["general-settings", "new-folder"]) {
+    const state = createInitialState(null);
+    const { actions, location } = createActions(state, `#v=1&page=${page}&tab=devices&folder=photos&path=holiday`);
+    actions.startNavigation();
+    await actions.restoreNavigationRoute();
+    assert.equal(state.currentPage, page);
+    assert.equal(state.session.currentFolderId, "");
+    assert.equal(routeFromHash(location.hash)?.folderId, "");
+  }
+});
+
+test("Back from a folder conflict to general settings preserves the existing browsing location", async () => {
+  const state = createInitialState(null);
+  const { actions } = createActions(state);
+  actions.startNavigation();
+  await actions.openFolderRoot("photos");
+  state.session.currentPath = "holiday";
+  actions.syncNavigationRoute();
+  actions.openGeneralSettings();
+  actions.openFolderSettings("documents");
+  actions.closeFolderSettings();
+  await flush();
+  assert.equal(state.currentPage, "general-settings");
+  assert.equal(state.session.currentFolderId, "photos");
+  assert.equal(state.session.currentPath, "holiday");
 });
 
 test("restores a deep URL route and gives the URL precedence over persisted state", async () => {

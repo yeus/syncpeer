@@ -1618,7 +1618,7 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
   await waitForUiText(cdp, targetFolderTitle, 90_000);
   if (targetFolderPassword && attachDocuments) {
     const passwordInput = `folder-password-${targetFolderId}`;
-    const editButton = `edit-folder-password-${targetFolderId}`;
+    const editButton = `folder-settings-${targetFolderId}`;
     const inputVisible = await cdp.evaluate(
       `document.querySelector(${JSON.stringify(`[data-testid="${passwordInput}"]`)}) !== null`,
     );
@@ -1641,12 +1641,17 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
         await waitForUiCondition(
           cdp,
           `document.querySelector(${JSON.stringify(`[data-testid="unlock-folder-${targetFolderId}"]`)})
-            ?.closest("li")?.querySelector("button[aria-label='Forget saved folder password']")
+            ?.closest("section")?.querySelector("button[aria-label='Forget saved folder password']")
             ?.disabled === false`,
           "encrypted folder credential save",
           30_000,
         );
         await ensureAndroidFolderAttached(cdp);
+        await cdp.evaluate(`(() => {
+          const back = [...document.querySelectorAll("button")].find(button => button.textContent?.trim() === "Back");
+          back?.click();
+        })()`);
+        await waitForUiCondition(cdp, 'document.querySelector("[data-testid=tab-folders]") !== null', "folder browser after unlock");
       } catch (cause) {
         const state = await readAndroidFolderState(cdp);
         const events = await readAndroidSessionEvents(cdp);
@@ -2080,20 +2085,32 @@ const runModernAndroidServiceSmoke = async () => {
   }
 };
 
-const openFolderSettings = async (cdp) => {
+const openFolderSettings = async (cdp, folderId = targetFolderId) => {
+  if (await cdp.evaluate(`document.querySelector('[data-testid="folder-settings-page"]')
+    ?.getAttribute('data-folder-id') === ${JSON.stringify(folderId)}`)) return;
   await waitForUiCondition(cdp,
     'document.querySelector("[data-testid=tab-folders]") !== null', "folder tab");
   await clickUiTestId(cdp, "tab-folders");
-  const opened = await cdp.evaluate(`(() => {
-    const button = [...document.querySelectorAll("button")]
-      .find(element => element.textContent?.trim() === "Folder settings · New folder");
-    if (!(button instanceof HTMLButtonElement)) return false;
-    button.click();
-    return true;
-  })()`);
-  if (!opened) throw new Error("Android UI could not open Folder settings.");
+  await cdp.evaluate(`document.querySelector("button.crumb-button")?.click()`);
   await waitForUiCondition(cdp,
-    'document.querySelector("h1")?.textContent?.trim() === "Folders"', "Folder settings page");
+    `document.querySelector(${JSON.stringify(`[data-testid="folder-settings-${folderId}"]`)}) !== null`,
+    "selected folder settings menu", 30_000);
+  await clickUiTestId(cdp, `folder-settings-${folderId}`);
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=folder-settings-page]") !== null', "folder settings page");
+};
+
+const openGeneralSettings = async (cdp) => {
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=tab-devices]") !== null', "devices tab");
+  await clickUiTestId(cdp, "tab-devices");
+  await cdp.evaluate(`(() => {
+    const toggle = document.querySelector("[data-testid=connection-settings-toggle]");
+    if (toggle?.getAttribute("aria-expanded") !== "true") toggle?.click();
+  })()`);
+  await clickUiTestId(cdp, "general-settings");
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=general-settings-page]") !== null', "general settings page");
 };
 
 const pairingSectionControl = (heading, selector) => `(() => {
@@ -2154,7 +2171,7 @@ const runPairingInvitation = async (outputPath) => {
         localDeviceId: deviceId, recoveryKey: kit.publicKey,
       } }, 60_000);
     }
-    await openFolderSettings(cdp);
+    await openGeneralSettings(cdp);
     await cdp.evaluate("window.confirm = () => true");
     const heading = "Pair another Syncpeer device";
     await waitForUiCondition(cdp,
@@ -2197,7 +2214,7 @@ const runPairingJoin = async (inputPath) => {
       }
       console.log(`Android pairing identity selected preferred ${requestedDirection} direction.`);
     }
-    await openFolderSettings(cdp);
+    await openGeneralSettings(cdp);
     await cdp.evaluate("window.confirm = () => true");
     const heading = "Join an existing personal space";
     await waitForUiCondition(cdp,
@@ -2571,7 +2588,7 @@ const runWholeFolderSafeReleaseUi = async () => {
   try {
     await configureSafeReleasePolicy(cdp, id);
     if (!await openAndroidConnection(cdp)) throw new Error("Safe release needs a connected peer.");
-    await openFolderSettings(cdp);
+    await openFolderSettings(cdp, id);
     await cdp.evaluate("window.confirm = () => true");
     await waitForUiCondition(cdp, `(() => {
       const button = [...document.querySelectorAll("button")]

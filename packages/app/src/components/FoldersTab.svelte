@@ -31,6 +31,7 @@
     onGoToRootView: () => void;
     onGoToBreadcrumb: (segment: BreadcrumbSegment) => void;
     onOpenFolderRoot: (folderId: string) => void;
+    onOpenFolderSettings: (folderId: string) => void;
     onOpenDirectory: (path: string) => void;
     onSetDirectoryPage: (page: number) => void;
     onSetDirectoryPageSize: (size: number) => void;
@@ -46,15 +47,9 @@
     onCancelDownload: (folderId?: string, path?: string) => void;
     onCancelTransfers: () => void;
     onToggleFavorite: (folderId: string, path: string, name: string, kind: "folder" | "file") => void;
-    onSetPasswordVisible: (folderId: string, visible: boolean) => void;
-    onUpdateFolderPasswordDraft: (folderId: string, password: string) => void;
-    onSaveFolderPassword: (folderId: string) => void;
-    onClearFolderPassword: (folderId: string) => void;
     isFolderLocked: (folderId: string) => boolean;
     folderLockLabel: (folderId: string) => string;
     folderState: (folderId: string) => FolderInfo | undefined;
-    isPasswordInputVisible: (folderId: string) => boolean;
-    activeFolderPasswords: Record<string, string>;
     downloadButtonLabel: (folderId: string, path: string) => string;
     entries: FileEntry[];
     directoryPage: number;
@@ -77,6 +72,7 @@
     onGoToRootView,
     onGoToBreadcrumb,
     onOpenFolderRoot,
+    onOpenFolderSettings,
     onOpenDirectory,
     onSetDirectoryPage,
     onSetDirectoryPageSize,
@@ -92,15 +88,9 @@
     onCancelDownload,
     onCancelTransfers,
     onToggleFavorite,
-    onSetPasswordVisible,
-    onUpdateFolderPasswordDraft,
-    onSaveFolderPassword,
-    onClearFolderPassword,
     isFolderLocked,
     folderLockLabel,
     folderState,
-    isPasswordInputVisible,
-    activeFolderPasswords,
     downloadButtonLabel,
     entries,
     directoryPage,
@@ -175,9 +165,6 @@
         encrypted: Boolean(folderState(folder.id)?.encrypted),
         lockLabel: folderLockLabel(folder.id),
         passwordError: folderState(folder.id)?.passwordError ?? "",
-        passwordInputVisible: isPasswordInputVisible(folder.id),
-        passwordDraft: app.passwords.drafts[folder.id] ?? "",
-        passwordSaved: activeFolderPasswords[folder.id] ?? "",
         locked: isFolderLocked(folder.id),
         canBrowseLocally: app.localFolders.some(local => local.id === folder.id),
         isFavorite: favoriteKeys.has(`folder:${folder.id}:`),
@@ -394,12 +381,9 @@
               isRemovingCachedFile={app.favorites.isRemovingCachedFile}
               isClearingCache={app.favorites.isClearingCache}
               {onOpenFolderRoot}
+              {onOpenFolderSettings}
               onOpenCachedDirectory={onOpenCachedDirectory}
               onToggleFavorite={onToggleFavorite}
-              onSetPasswordVisible={onSetPasswordVisible}
-              onUpdateFolderPasswordDraft={onUpdateFolderPasswordDraft}
-              onSaveFolderPassword={onSaveFolderPassword}
-              onClearFolderPassword={onClearFolderPassword}
             />
           {/each}
         {/if}

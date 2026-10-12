@@ -7,6 +7,7 @@ import { createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpace
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 import { createServer } from "vite";
 import { createInitialSessionState } from "../packages/core/dist/ui/sessionPolicies.js";
+import { folderPasswordScopedKey } from "../packages/core/dist/browser.js";
 import type { CachedFileRecord } from "../packages/core/src/ui/browserClient.ts";
 import type * as AppActions from "../packages/app/src/app/actions.ts";
 import type * as AppState from "../packages/app/src/app/state.ts";
@@ -40,6 +41,35 @@ test("password actions publish changes only after secure storage succeeds", asyn
   await actions.clearFolderPassword("photos");
   assert.deepEqual(state.passwords.saved, { photos: "synthetic-new" });
   assert.equal(sessionUpdates, 1);
+});
+
+test("saving an unchanged folder password preserves it and an explicit blank draft clears it", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createDeviceActions } = await server.ssrLoadModule("/packages/app/src/app/deviceActions.ts") as typeof DeviceActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.passwords.saved = { photos: "synthetic-saved-password" };
+  let stored: Record<string, string> | undefined;
+  const actions = createDeviceActions({ state, client: {} as never,
+    sessionStore: { actions: { setFolderPasswords: async () => {} } } as never,
+    refreshOverview: async () => {}, refreshActiveView: async () => {}, refreshCurrentDeviceId: async () => {},
+    savePasswords: async value => { stored = value; },
+  });
+  await actions.saveFolderPassword("photos");
+  assert.deepEqual(state.passwords.saved, { photos: "synthetic-saved-password" });
+  assert.deepEqual(stored, { photos: "synthetic-saved-password" });
+  state.passwords.drafts = { photos: "" };
+  await actions.saveFolderPassword("photos");
+  assert.deepEqual(state.passwords.saved, {});
+  assert.deepEqual(stored, {});
+  state.connection.remoteId = "A".repeat(52);
+  const scopedKey = folderPasswordScopedKey(state.connection.remoteId, "photos");
+  state.passwords.saved = { [scopedKey]: "synthetic-scoped-password" };
+  state.passwords.drafts = {};
+  await actions.saveFolderPassword("photos");
+  assert.deepEqual(state.passwords.saved, { [scopedKey]: "synthetic-scoped-password" });
+  assert.deepEqual(stored, { [scopedKey]: "synthetic-scoped-password" });
 });
 
 test("local folders can be browsed offline and with a locked remote connection", async t => {

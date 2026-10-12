@@ -222,7 +222,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       persisted?.activeTab === "pim"
         ? persisted.activeTab
         : ("favorites" as const),
-    currentPage: "main" as "main" | "diagnostics" | "about" | "folder-settings" | "versions",
+    currentPage: "main" as "main" | "diagnostics" | "about" | "general-settings" | "new-folder" | "folder-settings" | "versions",
+    folderSettingsId: "",
     connection: {
       host: initialConnection.host,
       port: initialConnection.port,
@@ -348,7 +349,6 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       secureStorage: false,
       saved: {} as Record<string, string>,
       drafts: {} as Record<string, string>,
-      visible: {} as Record<string, boolean>,
     },
     offline: {
       snapshots: {} as Record<string, OfflineFolderSnapshot>,
@@ -651,15 +651,6 @@ export const folderLockLabel = (state: AppState, folderId: string) => {
   if (!folder?.encrypted) return "";
   if (folder.passwordError) return "password error";
   return folder.needsPassword ? "locked" : "unlocked";
-};
-
-export const isFolderPasswordInputVisible = (state: AppState, folderId: string) => {
-  if (state.passwords.visible[folderId]) return true;
-  const folder = folderState(state, folderId);
-  if (!folder?.encrypted) return false;
-  if (folderIsLocked(state, folderId)) return true;
-  if (folder.passwordError) return true;
-  return !activeFolderPasswords(state)[folderId];
 };
 
 export const advertisedDevices = (state: AppState) =>

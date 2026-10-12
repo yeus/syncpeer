@@ -13,7 +13,7 @@ import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 import { startLocalRelay } from "./relay.js";
 import { generateSyncthingIdentity } from "./syncthing.js";
-import { clickButtonByText, readSessionEventNames, selectDiscoveryMode,
+import { clickButtonByText, openFolderSettings, readSessionEventNames, selectDiscoveryMode,
   setDirectConnectionFields } from "./ui-helpers.js";
 
 const folderId = "syncpeer-crossapp-folder"; // synthetic disposable emulator fixture
@@ -143,16 +143,15 @@ async function createDesktopEncryptedFolder(label: string): Promise<string> {
     if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
     tab.click();
   });
-  await clickButtonByText(browser, "Folder settings · New folder");
+  await clickButtonByText(browser, "New folder");
   await $("//label[contains(., 'New folder name')]/input").setValue(label);
   const create = $("button=Create folder");
   await create.waitForEnabled({ timeout: 30_000 });
   await clickButtonByText(browser, "Create folder");
   await browser.waitUntil(async () => browser.execute((expected: string) =>
-    [...document.querySelectorAll("li > span")].some(span => span.textContent?.trim() === expected), label),
+    [...document.querySelectorAll(".item-title")].some(span => span.textContent?.trim() === expected), label),
   { timeout: 60_000, interval: 500,
-    timeoutMsg: "Desktop-created encrypted folder did not appear in Folder settings." });
-  await clickButtonByText(browser, "Back");
+    timeoutMsg: "Desktop-created encrypted folder did not appear in the folder list." });
   await $("[data-testid='tab-folders']").click();
   let folderId = "";
   await browser.waitUntil(async () => {
@@ -194,7 +193,7 @@ async function attachSharedFolder() {
       if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
       tab.click();
     });
-    await clickButtonByText(browser, "Folder settings · New folder");
+    await openFolderSettings(browser, folderId);
     const row = $(`//li[./span[normalize-space()=${JSON.stringify(folderId)}]]`);
     if (await row.isExisting()) {
       const received = await desktopState();

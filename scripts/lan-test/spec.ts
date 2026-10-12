@@ -9,6 +9,8 @@ import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.
 import { coordinatorRequest } from "./coordinator.ts";
 import type { LanFixture } from "./protocol.ts";
 import {
+  openGeneralSettings,
+  openFolderSettings,
   clickDownloadButton,
   clickItemTitle,
   connectUntilApproved,
@@ -85,8 +87,7 @@ const appErrorCategory = (issue: string): string =>
     : /transport|connection|socket/i.test(issue) ? "transport"
     : issue ? "other app error" : "no app error shown";
 const createFreshProfile = async (): Promise<void> => {
-  await clickTestId("tab-folders");
-  await $("button=Folder settings · New folder").click();
+  await openGeneralSettings(browser);
   const master = $("//label[contains(., 'Master password (at least 16 characters)')]/input");
   await master.waitForExist();
   await master.setValue("synthetic-desktop-master-password");
@@ -475,10 +476,11 @@ describe("Syncpeer LAN integration", () => {
       await waitForText(lanBrowser, currentFixture.encryptedFolderId, 90_000);
       const passwordInput = $("[data-testid='folder-password-" + currentFixture.encryptedFolderId + "']");
       if (!(await passwordInput.isExisting())) {
-        await clickTestId("edit-folder-password-" + currentFixture.encryptedFolderId);
+        await openFolderSettings(browser, currentFixture.encryptedFolderId);
       }
       await setValue(`folder-password-${currentFixture.encryptedFolderId}`, currentFixture.encryptedPassword);
       await clickTestId(`unlock-folder-${currentFixture.encryptedFolderId}`);
+      await $("button=Back").click();
       await waitForText(lanBrowser, "unlocked", 90_000);
       await clickItemTitle(lanBrowser, currentFixture.encryptedFolderId);
       await waitForText(lanBrowser, "secret.txt", 90_000);

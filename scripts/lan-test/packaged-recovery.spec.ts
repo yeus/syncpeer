@@ -1,13 +1,7 @@
 import assert from "node:assert/strict";
 import { browser } from "@wdio/globals";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
-import { clickButtonByText } from "./ui-helpers.js";
-
-async function openSettings(peer: WebdriverIO.Browser) {
-  await peer.$("[data-testid='tab-folders']").waitForExist({ timeout: 60_000 });
-  await clickButtonByText(peer, "Folders");
-  await clickButtonByText(peer, "Folder settings · New folder");
-}
+import { clickButtonByText, openGeneralSettings } from "./ui-helpers.js";
 
 async function importBackup(peer: WebdriverIO.Browser, backup: string, password: string) {
   await peer.$("//label[contains(., 'Or paste encrypted backup')]/textarea").setValue(backup);
@@ -87,7 +81,7 @@ describe("Packaged desktop offline recovery", () => {
     assert.equal(JSON.parse(backup).format, 1);
     assert.equal(backup.includes("synthetic-release-smoke-master-password"), false);
     assert.equal(backup.includes(JSON.parse(kit).publicKey), false);
-    await openSettings(joiner);
+    await openGeneralSettings(joiner);
   });
 
   it("rejects a wrong password and corrupt backup without occupying the new profile", async () => {
@@ -126,7 +120,7 @@ describe("Packaged desktop offline recovery", () => {
     ]);
     // Remount the UI and wait for its asynchronous refresh before checking persisted membership.
     await clickButtonByText(joiner, "Back");
-    await openSettings(joiner);
+    await openGeneralSettings(joiner);
     await joiner.waitUntil(async () => (await membershipRows(joiner)).length === 2, {
       timeout: 30_000,
       timeoutMsg: "Recovered device membership did not reload after remount.",

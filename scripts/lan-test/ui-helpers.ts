@@ -6,6 +6,49 @@ import type { BrowserExtension } from "@wdio/native-types";
 
 export type TauriBrowser = WdioBrowser & BrowserExtension;
 
+/** Open space/device controls through the existing general Settings section. */
+export async function openGeneralSettings(peer: WebdriverIO.Browser) {
+  await peer.$("[data-testid='tab-devices']").waitForExist({ timeout: 30_000 });
+  await peer.execute(() => {
+    (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
+  });
+  await peer.$("[data-testid='connection-settings-toggle']").waitForExist({ timeout: 30_000 });
+  await peer.execute(() => {
+    const toggle = document.querySelector("[data-testid='connection-settings-toggle']") as HTMLButtonElement;
+    if (toggle.getAttribute("aria-expanded") !== "true") toggle.click();
+  });
+  const settings = peer.$("[data-testid='general-settings']");
+  await settings.waitForExist({ timeout: 30_000 });
+  await peer.execute(() => {
+    (document.querySelector("[data-testid='general-settings']") as HTMLButtonElement).click();
+  });
+  await peer.$("[data-testid='general-settings-page']").waitForExist({ timeout: 30_000 });
+}
+
+/** Choose an actual folder row, then open its settings without browsing it. */
+export async function openFolderSettings(peer: WebdriverIO.Browser, folder: string) {
+  await peer.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-folders']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
+    tab.click();
+  });
+  await peer.$(".breadcrumbs").waitForExist({ timeout: 30_000 });
+  await peer.execute(() => {
+    const root = document.querySelector("button.crumb-button");
+    if (root instanceof HTMLButtonElement) root.click();
+  });
+  await peer.waitUntil(async () => peer.execute((selected: string) => {
+    const rows = [...document.querySelectorAll("[data-testid^='folder-root-']")];
+    const row = rows.find(element => element.getAttribute("data-testid") === `folder-root-${selected}`
+      || element.querySelector(".item-title")?.textContent?.trim() === selected);
+    const settings = row?.closest("li")?.querySelector("button[aria-label='Folder settings']");
+    if (!(settings instanceof HTMLButtonElement)) return false;
+    settings.click();
+    return true;
+  }, folder), { timeout: 30_000, timeoutMsg: "The selected folder's settings menu is unavailable." });
+  await peer.$("[data-testid='folder-settings-page']").waitForExist({ timeout: 30_000 });
+}
+
 export const waitForText = async (
   browser: TauriBrowser,
   text: string,

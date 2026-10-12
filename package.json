@@ -9,6 +9,7 @@
   "scripts": {
     "test": "npm run test:headless",
     "test:headless": "node --experimental-strip-types scripts/test-diagnostics.ts",
+    "test:settings-ui": "xvfb-run -a node scripts/test-settings-ui.mjs",
     "test:e2e": "node --experimental-strip-types scripts/test-e2e.ts",
     "test:public-network": "npm run build:core && node --import tsx scripts/test-public-network.ts",
     "test:tauri:deb": "npm run security:scan && node scripts/test-tauri-deb.mjs",

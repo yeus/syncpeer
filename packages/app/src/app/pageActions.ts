@@ -80,7 +80,15 @@ const closeAboutPage = () => {
     closeDiagnosticsPage,
     openAboutPage,
     closeAboutPage,
-    openFolderSettings: () => { state.currentPage = "folder-settings"; },
+    openGeneralSettings: () => { state.currentPage = "general-settings"; },
+    closeGeneralSettings: () => { state.currentPage = "main"; },
+    openNewFolder: () => { state.currentPage = "new-folder"; },
+    closeNewFolder: () => { state.currentPage = "main"; },
+    openFolderSettings: (folderId: string) => {
+      state.ui.recentError = "";
+      state.folderSettingsId = folderId;
+      state.currentPage = "folder-settings";
+    },
     closeFolderSettings: () => { state.currentPage = "main"; },
     closeVersions: () => { state.currentPage = "main"; },
   };

@@ -6,6 +6,8 @@ import { browser } from "@wdio/globals";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 import {
+  openGeneralSettings,
+  openFolderSettings,
   clickButtonByText,
   setDirectConnectionFields,
   setUploadBytes,
@@ -608,7 +610,7 @@ async function captureReconnectDiagnostics(
 
 async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
   await peer.$("[data-testid='tab-folders']").click();
-  await peer.$("button=Folder settings · New folder").click();
+  await openFolderSettings(peer, folderName);
   const row = peer.$(
     `//li[./span[normalize-space()=${JSON.stringify(folderName)}]]`,
   );
@@ -769,8 +771,7 @@ describe("Two isolated packaged desktop apps", () => {
   it("pairs with one matching confirmation code", async () => {
     const { owner, joiner } = peers();
     await createFreshEncryptedProfile(owner);
-    await joiner.$("[data-testid='tab-folders']").click();
-    await joiner.$("button=Folder settings · New folder").click();
+    await openGeneralSettings(joiner);
     await owner
       .$("//label[contains(., 'LAN host/IP or relay:// URL')]/input")
       .setValue("127.0.0.1");
@@ -958,7 +959,7 @@ describe("Two isolated packaged desktop apps", () => {
       }),
     );
     await owner.$("[data-testid='tab-folders']").click();
-    await owner.$("button=Folder settings · New folder").click();
+    await owner.$("button=New folder").click();
     console.log("Packaged folder test: creating owner folder.");
     await owner
       .$("//label[contains(., 'New folder name')]/input")
@@ -974,28 +975,15 @@ describe("Two isolated packaged desktop apps", () => {
       const folderExists = async () =>
         (
           await owner
-            .$("li > span")
+            .$(".item-title")
             .getText()
             .catch(() => "")
         ).includes(folderName);
-      for (
-        let attempt = 0;
-        attempt < 30 && !(await folderExists());
-        attempt += 1
-      ) {
-        if (
-          !(await owner
-            .$("//label[contains(., 'New folder name')]/input")
-            .isExisting())
-        ) {
-          await owner.$("[data-testid='tab-folders']").click();
-          await owner.$("button=Folder settings · New folder").click();
-        }
-        await owner.pause(1_000);
-      }
+      await owner.waitUntil(folderExists, { timeout: 30_000, interval: 1_000,
+        timeoutMsg: "The newly created folder did not return to the folder list." });
       assert.ok(
         await folderExists(),
-        "The newly created folder is absent from Folder settings.",
+        "The newly created folder is absent from the folder list.",
       );
       await captureScreenshot(owner, "encrypted-folder");
     } catch (error) {

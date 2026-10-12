@@ -54,13 +54,6 @@ const updateFolderPasswordDraft = (folderId: string, password: string) => {
   };
 };
 
-const setFolderPasswordInputVisible = (folderId: string, visible: boolean) => {
-  state.passwords.visible = {
-    ...state.passwords.visible,
-    [folderId]: visible,
-  };
-};
-
 const changeFolderPassword = async (folderId: string, password: string) => {
   const scopedKey = folderPasswordScopedKey(
     activeFolderPasswordScopeDeviceId(state),
@@ -76,7 +69,6 @@ const changeFolderPassword = async (folderId: string, password: string) => {
     await args.savePasswords?.(next);
     state.passwords.saved = next;
     if (!password) state.passwords.drafts = { ...state.passwords.drafts, [folderId]: "" };
-    setFolderPasswordInputVisible(folderId, !password);
     await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
     if (state.session.isConnected) {
       await refreshOverview();
@@ -303,8 +295,8 @@ const restoreIdentityRecovery = async () => {
 
   return {
     updateFolderPasswordDraft,
-    setFolderPasswordInputVisible,
-    saveFolderPassword: (folderId: string) => changeFolderPassword(folderId, (state.passwords.drafts[folderId] ?? "").trim()),
+    saveFolderPassword: (folderId: string) => changeFolderPassword(folderId,
+      (state.passwords.drafts[folderId] ?? activeFolderPasswords(state)[folderId] ?? "").trim()),
     clearFolderPassword: (folderId: string) => changeFolderPassword(folderId, ""),
     addSavedDevice,
     editSavedDeviceName,

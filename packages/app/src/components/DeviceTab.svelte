@@ -20,6 +20,7 @@
     onClearOfflineFolderState: () => void;
     onOpenDiagnosticsPage: () => void;
     onOpenAboutPage: () => void;
+    onOpenGeneralSettings?: () => void;
     onCopyCurrentDeviceId: () => void;
     onCopySessionLogs: () => void;
     onEditLocalDeviceName: () => void;
@@ -48,6 +49,7 @@
     onClearOfflineFolderState,
     onOpenDiagnosticsPage,
     onOpenAboutPage,
+    onOpenGeneralSettings,
     onCopyCurrentDeviceId,
     onCopySessionLogs,
     onEditLocalDeviceName,
@@ -277,6 +279,9 @@
 
   {#if app.ui.isSettingsExpanded}
     <div class="settings-block">
+      {#if onOpenGeneralSettings}
+        <button data-testid="general-settings" onclick={onOpenGeneralSettings}>Personal space and device settings</button>
+      {/if}
       <div class="appearance-settings" data-testid="appearance-settings">
         <h3>Appearance</h3>
         <div class="appearance-grid">

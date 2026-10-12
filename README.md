@@ -96,6 +96,14 @@ This trust layer is intentionally separate from ordinary Syncthing peer approval
 
 The personal space includes a hidden encrypted settings replica.
 
+Manage your personal space through **Devices → Settings → Personal space and device settings**.
+This is where pairing, trusted devices, the local master password, and backup/recovery live.
+The app currently supports one personal space per profile. The **This device** section holds local
+synchronization defaults and biometric unlock settings.
+
+Open a folder's settings icon in the folder list to manage its password, retention policy,
+local storage, sync pause, ignore patterns, and exclusions. **New folder** is a separate creation action.
+
 It carries authenticated changes for data that should follow the owner across devices, including:
 
 - shared folder policy,

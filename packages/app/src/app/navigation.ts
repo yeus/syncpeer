@@ -35,6 +35,10 @@ type NavigationActions = Pick<
   | "closeAboutPage"
   | "openFolderSettings"
   | "closeFolderSettings"
+  | "openGeneralSettings"
+  | "closeGeneralSettings"
+  | "openNewFolder"
+  | "closeNewFolder"
   | "openFolderRoot"
   | "openDirectory"
   | "goToBreadcrumb"
@@ -44,7 +48,7 @@ type NavigationActions = Pick<
   | "closeVersions"
 >;
 
-const pages: AppRoute["page"][] = ["main", "diagnostics", "about", "folder-settings", "versions"];
+const pages: AppRoute["page"][] = ["main", "diagnostics", "about", "general-settings", "new-folder", "folder-settings", "versions"];
 const tabs: AppRoute["tab"][] = ["favorites", "folders", "devices", "pim"];
 
 const isPage = (value: string): value is AppRoute["page"] =>
@@ -53,14 +57,22 @@ const isPage = (value: string): value is AppRoute["page"] =>
 const isTab = (value: string): value is AppRoute["tab"] =>
   tabs.includes(value as AppRoute["tab"]);
 
-export const routeFromState = (state: AppState): AppRoute => ({
-  page: state.currentPage,
-  tab: state.activeTab,
-  folderId: state.session.currentFolderId.trim(),
-  path: normalizePath(state.session.currentPath),
-  ...(state.currentPage === "versions" && state.versions.path
-    ? { versionPath: normalizePath(state.versions.path) } : {}),
-});
+export const routeFromState = (state: AppState): AppRoute => {
+  const route = {
+    page: state.currentPage,
+    tab: state.activeTab,
+    folderId: state.session.currentFolderId.trim(),
+    path: normalizePath(state.session.currentPath),
+    ...(state.currentPage === "versions" && state.versions.path
+      ? { versionPath: normalizePath(state.versions.path) } : {}),
+  };
+  switch (state.currentPage) {
+    case "folder-settings": return { ...route, folderId: state.folderSettingsId.trim(), path: "" };
+    case "general-settings":
+    case "new-folder": return { ...route, folderId: "", path: "" };
+    default: return route;
+  }
+};
 
 export const routeEquals = (left: AppRoute, right: AppRoute): boolean =>
   left.page === right.page &&
@@ -87,7 +99,11 @@ export const routeFromHash = (hash: string): AppRoute | null => {
   const page = params.get("page") ?? "main";
   const tab = params.get("tab") ?? "favorites";
   if (params.get("v") !== ROUTE_VERSION || !isPage(page) || !isTab(tab)) return null;
-  const folderId = params.get("folder")?.trim() ?? "";
+  const folderId = page === "general-settings" || page === "new-folder" ? "" : params.get("folder")?.trim() ?? "";
+  if (page === "folder-settings" && !folderId) {
+    // Older links opened the combined profile/folder settings screen.
+    return { page: "general-settings", tab, folderId: "", path: "" };
+  }
   return {
     page,
     tab,
@@ -121,6 +137,7 @@ const routeFromNavigationState = (value: unknown): AppRoute | null =>
 const applyPageAndTab = (state: AppState, route: AppRoute): void => {
   state.currentPage = route.page;
   state.activeTab = route.tab;
+  if (route.page === "folder-settings") state.folderSettingsId = route.folderId;
   if (route.page === "versions" && route.versionPath) {
     state.versions.folderId = route.folderId;
     state.versions.path = route.versionPath;
@@ -249,18 +266,25 @@ const createRouteOperations = (
     runtime.restoring = true;
     applyPageAndTab(runtime.state, route);
     try {
-      if (!route.folderId) await runtime.actions.goToRootView();
-      else {
-        await runtime.actions.openLocation(
-          route.folderId,
-          route.path,
-          "navigation.restore.failed",
-          route,
-        );
-        if (route.page === "versions" && route.versionPath) {
-          await runtime.actions.openVersions(route.folderId, route.versionPath,
-            route.versionPath.split("/").at(-1) ?? route.versionPath);
-        }
+      switch (route.page) {
+        // Settings and creation preserve browsing state without making directory requests.
+        case "folder-settings":
+        case "general-settings":
+        case "new-folder": break;
+        default:
+          if (!route.folderId) await runtime.actions.goToRootView();
+          else {
+            await runtime.actions.openLocation(
+              route.folderId,
+              route.path,
+              "navigation.restore.failed",
+              route,
+            );
+            if (route.page === "versions" && route.versionPath) {
+              await runtime.actions.openVersions(route.folderId, route.versionPath,
+                route.versionPath.split("/").at(-1) ?? route.versionPath);
+            }
+          }
       }
     } finally {
       if (runtime.restoreToken === token) runtime.restoring = false;
@@ -351,6 +375,10 @@ export const createNavigableAppActions = (args: {
     openAboutPage: recordAction(args.actions.openAboutPage),
     openFolderSettings: recordAction(args.actions.openFolderSettings),
     closeFolderSettings: () => routeOperations.goBackFromPage(args.actions.closeFolderSettings),
+    openGeneralSettings: recordAction(args.actions.openGeneralSettings),
+    closeGeneralSettings: () => routeOperations.goBackFromPage(args.actions.closeGeneralSettings),
+    openNewFolder: recordAction(args.actions.openNewFolder),
+    closeNewFolder: () => routeOperations.goBackFromPage(args.actions.closeNewFolder),
     openFolderRoot: recordAction(args.actions.openFolderRoot),
     openDirectory: recordAction(args.actions.openDirectory),
     goToBreadcrumb: recordAction(args.actions.goToBreadcrumb),

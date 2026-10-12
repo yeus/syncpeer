@@ -13,12 +13,11 @@
   import FileText from "lucide-svelte/icons/file-text";
   import FileVideo from "lucide-svelte/icons/file-video";
   import Folder from "lucide-svelte/icons/folder";
-  import KeyRound from "lucide-svelte/icons/key-round";
+  import Settings from "lucide-svelte/icons/settings";
   import Star from "lucide-svelte/icons/star";
   import Trash2 from "lucide-svelte/icons/trash-2";
   import History from "lucide-svelte/icons/history";
   import RefreshCw from "lucide-svelte/icons/refresh-cw";
-  import Unlock from "lucide-svelte/icons/unlock";
   import Upload from "lucide-svelte/icons/upload";
   import X from "lucide-svelte/icons/x";
   import ListRow from "./ListRow.svelte";
@@ -32,9 +31,6 @@
     encrypted: boolean;
     lockLabel: string;
     passwordError: string;
-    passwordInputVisible: boolean;
-    passwordDraft: string;
-    passwordSaved: string;
     locked: boolean;
     canBrowseLocally?: boolean;
     isFavorite: boolean;
@@ -121,10 +117,7 @@
     onCancelDownload?: (folderId?: string, path?: string) => void;
     onOpenOrDownloadFile?: (folderId: string, path: string, name: string) => void;
     onOpenVersions?: (folderId: string, path: string, name: string) => void;
-    onSetPasswordVisible?: (folderId: string, visible: boolean) => void;
-    onUpdateFolderPasswordDraft?: (folderId: string, password: string) => void;
-    onSaveFolderPassword?: (folderId: string) => void;
-    onClearFolderPassword?: (folderId: string) => void;
+    onOpenFolderSettings?: (folderId: string) => void;
   }
 
   let {
@@ -149,10 +142,7 @@
     onCancelDownload = () => {},
     onOpenOrDownloadFile = () => {},
     onOpenVersions = () => {},
-    onSetPasswordVisible = () => {},
-    onUpdateFolderPasswordDraft = () => {},
-    onSaveFolderPassword = () => {},
-    onClearFolderPassword = () => {},
+    onOpenFolderSettings,
   }: Props = $props();
 
   const rowTitle = (value: FileSystemItem) => {
@@ -395,24 +385,6 @@
           {#if item.passwordError}
             <div class="item-meta">{item.passwordError}</div>
           {/if}
-          {#if item.passwordInputVisible}
-            <label class="inline-input">
-              <span>Folder Password</span>
-              <input
-                data-testid={`folder-password-${item.folderId}`}
-                type="password"
-                value={item.passwordDraft || item.passwordSaved}
-                oninput={(event) =>
-                  onUpdateFolderPasswordDraft(
-                    item.folderId,
-                    event.currentTarget instanceof HTMLInputElement
-                      ? event.currentTarget.value
-                      : "",
-                  )}
-                placeholder="Syncthing folder encryption password"
-              />
-            </label>
-          {/if}
         {/if}
       {:else if item.kind === "folder-entry"}
         {#if item.entryType === "directory"}
@@ -510,24 +482,6 @@
         {#if item.passwordError}
           <div class="item-meta">{item.passwordError}</div>
         {/if}
-        {#if item.passwordInputVisible}
-          <label class="inline-input">
-            <span>Folder Password</span>
-            <input
-              data-testid={`folder-password-${item.folderId}`}
-              type="password"
-              value={item.passwordDraft || item.passwordSaved}
-              oninput={(event) =>
-                onUpdateFolderPasswordDraft(
-                  item.folderId,
-                  event.currentTarget instanceof HTMLInputElement
-                    ? event.currentTarget.value
-                    : "",
-                )}
-              placeholder="Syncthing folder encryption password"
-            />
-          </label>
-        {/if}
       {/if}
     {:else if item.kind === "folder-entry"}
       {#if item.entryType === "directory"}
@@ -572,32 +526,10 @@
 
   <div slot="actions" class="actions-col">
     {#if item.kind === "root-folder"}
-      {#if item.encrypted}
-        {#if !item.passwordInputVisible}
-          <button
-            class="row-action"
-            data-testid={`edit-folder-password-${item.folderId}`}
-            onclick={() => onSetPasswordVisible(item.folderId, true)}
-            aria-label="Edit folder password"
-          >
-            <KeyRound size={16} />
-          </button>
-        {/if}
-        <button
-          class="row-action"
-          data-testid={`unlock-folder-${item.folderId}`}
-          onclick={() => onSaveFolderPassword(item.folderId)}
-          aria-label="Unlock folder"
-        >
-          <Unlock size={16} />
-        </button>
-        <button
-          class="row-action"
-          onclick={() => onClearFolderPassword(item.folderId)}
-          disabled={!item.passwordSaved}
-          aria-label="Forget saved folder password"
-        >
-          <Trash2 size={16} />
+      {#if onOpenFolderSettings}
+        <button class="row-action" data-testid={`folder-settings-${item.folderId}`}
+          onclick={() => onOpenFolderSettings?.(item.folderId)} aria-label="Folder settings" title="Folder settings">
+          <Settings size={16} />
         </button>
       {/if}
       {#if item.hasCachedRoot}
@@ -790,8 +722,7 @@
   }
 
   .item-title-row,
-  .item-meta,
-  .inline-input {
+  .item-meta {
     position: relative;
   }
 
@@ -842,11 +773,6 @@
     height: 100%;
     object-fit: cover;
     border-radius: calc(var(--radius-xs) - 1px);
-  }
-
-  .inline-input {
-    margin-top: 0.35rem;
-    max-width: 24rem;
   }
 
   .actions-col {

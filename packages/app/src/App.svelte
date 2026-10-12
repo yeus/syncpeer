@@ -7,6 +7,7 @@
     createSyncpeerSessionStore,
     cachedFileKey,
     folderPasswordScopedKey,
+    type SyncpeerProfileSettings,
   } from "@syncpeer/core/browser";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
   import AppHeader from "./components/AppHeader.svelte";
@@ -48,7 +49,6 @@
     folderIsLocked,
     folderLockLabel,
     folderState,
-    isFolderPasswordInputVisible,
     isLanDiscoveredDevice,
     isSavedDeviceAwaitingRemoteApproval,
     isSavedDeviceConnected,
@@ -65,6 +65,8 @@
   } from "./app/state.ts";
   import AboutPage from "./AboutPage.svelte";
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
+  import GeneralSettingsPage from "./GeneralSettingsPage.svelte";
+  import NewFolderPage from "./NewFolderPage.svelte";
   import VersionsPage from "./VersionsPage.svelte";
   import { applyTheme } from "./app/theme.ts";
   import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
@@ -245,6 +247,14 @@
     app.localFolders = (await syncDocumentFolders(knownFolders, {})).map(folder => ({ ...folder, readOnly: false }));
     app.localFolders = (await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)))
       .map(folder => ({ ...folder, readOnly: false }));
+  }
+
+  function applyProfileSettings(settings: SyncpeerProfileSettings) {
+    app.favorites.exclusions = Object.values(settings.folders).flatMap(folder => folder.exclusions);
+    app.favorites.ignorePatternsByFolder = Object.fromEntries(Object.entries(settings.folders)
+      .map(([folderId, folder]) => [folderId, [...folder.ignorePatterns]]));
+    app.favorites.pausedFolderIds = new Set(Object.entries(settings.folders)
+      .filter(([, folder]) => folder.paused).map(([folderId]) => folderId));
   }
 
   async function unlockWithBiometric() {
@@ -432,7 +442,7 @@
       await actions.restoreNavigationRoute(false);
       await actions.onAppForeground();
       await actions.restoreNavigationRoute(true);
-    })().catch(() => { app.ui.recentError = "Unlock folder storage in Folder settings to restore saved passwords."; });
+    })().catch(() => { app.ui.recentError = "Unlock your personal space in Settings to restore saved passwords."; });
 
     const handleOnline = () => {
       void actions.onNetworkOnline();
@@ -709,6 +719,7 @@
           onClearOfflineFolderState={actions.clearOfflineFolderState}
           onOpenDiagnosticsPage={actions.openDiagnosticsPage}
           onOpenAboutPage={actions.openAboutPage}
+          onOpenGeneralSettings={folderCredentials ? actions.openGeneralSettings : undefined}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
           onCopySessionLogs={actions.copySessionLogs}
           onEditLocalDeviceName={actions.editLocalDeviceName}
@@ -746,7 +757,6 @@
           onOpenCachedDirectory={actions.openCachedDirectory}
           onRemoveCachedFile={actions.removeCachedFile}
           onOpenOrDownloadFile={actions.openOrDownloadFile}
-          onOpenVersions={actions.openVersions}
           onDownloadFile={actions.downloadFile}
           onCancelDownload={transferRuntime.cancelDownload}
           onRemoveFavorite={actions.removeFavorite}
@@ -760,7 +770,7 @@
 
       {#if app.activeTab === "folders"}
         {#if appInfo.runtimeSurface === "android-ui" || appInfo.runtimeSurface === "desktop-ui"}
-          <button onclick={actions.openFolderSettings}>Folder settings · New folder</button>
+          <button data-testid="new-folder" onclick={actions.openNewFolder}>New folder</button>
         {/if}
         <FoldersTab
           {app}
@@ -770,6 +780,8 @@
           onGoToRootView={actions.goToRootView}
           onGoToBreadcrumb={actions.goToBreadcrumb}
           onOpenFolderRoot={actions.openFolderRoot}
+          onOpenFolderSettings={actions.openFolderSettings}
+          onOpenVersions={actions.openVersions}
           onOpenDirectory={actions.openDirectory}
           onSetDirectoryPage={actions.setDirectoryPage}
           onSetDirectoryPageSize={actions.setDirectoryPageSize}
@@ -786,15 +798,9 @@
           onCancelDownload={transferRuntime.cancelDownload}
           onCancelTransfers={transferRuntime.cancelAll}
           onToggleFavorite={actions.toggleFavorite}
-          onSetPasswordVisible={actions.setFolderPasswordInputVisible}
-          onUpdateFolderPasswordDraft={actions.updateFolderPasswordDraft}
-          onSaveFolderPassword={actions.saveFolderPassword}
-          onClearFolderPassword={actions.clearFolderPassword}
           isFolderLocked={(folderId) => folderIsLocked(app, folderId)}
           folderLockLabel={(folderId) => folderLockLabel(app, folderId)}
           folderState={(folderId) => folderState(app, folderId)}
-          isPasswordInputVisible={(folderId) => isFolderPasswordInputVisible(app, folderId)}
-          activeFolderPasswords={activePasswords}
           downloadButtonLabel={(folderId, path) => downloadButtonLabel(app, folderId, path)}
           entries={currentDirectoryEntries}
           directoryPage={currentDirectoryPage}
@@ -872,10 +878,10 @@
     onRunCategory={diagnosticsActions.runDiagnosticsCategory}
     onRunAll={diagnosticsActions.runAllDiagnostics}
   />
-{:else if app.currentPage === "folder-settings"}
-  <FolderSettingsPage onBack={actions.closeFolderSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
-    command={documentCommand} onImport={importPeerFolder}
-    onRelease={(folderId, mode, confirmedText) => client.releaseLocalCopy(folderId, mode, confirmedText)}
+{:else if app.currentPage === "general-settings"}
+  <GeneralSettingsPage onBack={actions.closeGeneralSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
+    onOpenFolderSettings={actions.openFolderSettings}
+    command={documentCommand}
     onStartPairing={advertisedHost => client.startPairingInvitation({ advertisedHost, port: 0,
       confirm: code => window.confirm(`Confirm that both devices display pairing code ${code}.`) })}
     onJoinPairing={(invitation, password, remember) => client.joinPairingInvitation({ invitation, password, remember,
@@ -887,22 +893,35 @@
       app.devices.newSavedDeviceCustomName = "Paired Syncpeer device";
       actions.addSavedDevice();
     }}
-    peerId={app.session.isConnected ? app.session.remoteDevice?.id ?? "" : ""} peerFolders={app.session.folders}
-    onSettingsSaved={settings => {
-      app.favorites.exclusions = Object.values(settings.folders).flatMap(folder => folder.exclusions);
-      app.favorites.ignorePatternsByFolder = Object.fromEntries(Object.entries(settings.folders)
-        .map(([folderId, folder]) => [folderId, [...folder.ignorePatterns]]));
-      app.favorites.pausedFolderIds = new Set(Object.entries(settings.folders)
-        .filter(([, folder]) => folder.paused).map(([folderId]) => folderId));
-    }}
-    onRotateMasterPassword={rotateMasterPassword} onMigrate={migrateDocumentFolder} biometric={biometric} onCreate={async label => {
-    const id = crypto.randomUUID();
-    await connectDocumentFolder({ id, label });
-    app.favorites.items = await client.upsertFavorite({ key: `folder:${id}:`, folderId: id,
-      path: "", name: label, kind: "folder" });
-    app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false }));
-    await actions.starredSync();
-  }} />
+    onSettingsSaved={applyProfileSettings}
+    onRotateMasterPassword={rotateMasterPassword} {biometric} />
+{:else if app.currentPage === "folder-settings"}
+  {@const selectedFolder = folderState(app, app.folderSettingsId)
+    ?? app.localFolders.find(folder => folder.id === app.folderSettingsId)}
+  {#key app.folderSettingsId}
+    <FolderSettingsPage folderId={app.folderSettingsId} folderLabel={selectedFolder?.label ?? app.folderSettingsId}
+      encrypted={Boolean(selectedFolder?.encrypted)} managedStorage={Boolean(folderCredentials)}
+      passwordDraft={app.passwords.drafts[app.folderSettingsId] ?? activePasswords[app.folderSettingsId] ?? ""}
+      passwordSaved={activePasswords[app.folderSettingsId] ?? ""} passwordError={selectedFolder?.passwordError ?? ""}
+      actionError={app.ui.recentError ?? ""}
+      onBack={actions.closeFolderSettings} onOpenGeneralSettings={actions.openGeneralSettings}
+      onUpdatePassword={actions.updateFolderPasswordDraft} onSavePassword={actions.saveFolderPassword}
+      onClearPassword={actions.clearFolderPassword}
+      command={documentCommand} onImport={importPeerFolder}
+      peerId={app.session.isConnected ? app.session.remoteDevice?.id ?? "" : ""}
+      onRelease={(folderId, mode, confirmedText) => client.releaseLocalCopy(folderId, mode, confirmedText)}
+      onSettingsSaved={applyProfileSettings} onMigrate={migrateDocumentFolder} />
+  {/key}
+{:else if app.currentPage === "new-folder"}
+  <NewFolderPage onBack={actions.closeNewFolder} onOpenGeneralSettings={actions.openGeneralSettings}
+    command={documentCommand} onCreate={async label => {
+      const id = crypto.randomUUID();
+      await connectDocumentFolder({ id, label });
+      app.favorites.items = await client.upsertFavorite({ key: `folder:${id}:`, folderId: id,
+        path: "", name: label, kind: "folder" });
+      app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false }));
+      await actions.starredSync();
+    }} />
 {:else if app.currentPage === "versions"}
   <VersionsPage name={app.versions.name} items={app.versions.items} loading={app.versions.loading}
     restoringId={app.versions.restoringId} error={app.versions.error}

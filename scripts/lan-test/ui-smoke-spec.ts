@@ -9,6 +9,8 @@ import {
 } from "./fixture-data.ts";
 import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
 import {
+  openFolderSettings,
+  clickButtonByText,
   clickDownloadButton,
   clickItemTitle,
   connectUntilApproved,
@@ -254,15 +256,16 @@ const returnToFolderRoot = async (): Promise<void> => {
 
 const unlockTargetFolder = async (): Promise<void> => {
   if (!targetFolderPassword) return;
-  const editButton = $(`[data-testid='edit-folder-password-${targetFolderId}']`);
+  const editButton = $(`[data-testid='folder-settings-${targetFolderId}']`);
   const passwordInput = $(`[data-testid='folder-password-${targetFolderId}']`);
   if (!(await passwordInput.isExisting()) && !(await editButton.isExisting())) return;
   if (await editButton.isExisting()) {
-    await editButton.click();
+    await openFolderSettings(browser, targetFolderId);
     await passwordInput.waitForExist({ timeout: 5_000 });
   }
   await setValue(`folder-password-${targetFolderId}`, targetFolderPassword);
   await clickTestId(`unlock-folder-${targetFolderId}`);
+  await clickButtonByText(browser, "Back");
 };
 
 const fetchNativeDiscovery = () => tauriBrowser.tauri.execute(async (tauri, request) => {

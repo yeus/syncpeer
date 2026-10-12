@@ -15,6 +15,7 @@
     "test:tauri:dev:android": "node scripts/test-tauri-dev-android.mjs",
     "security:scan": "node scripts/scan-sensitive-identifiers.mjs",
     "security:export-dependabot": "node scripts/export-dependabot-alerts.mjs",
+    "security:test-dependencies": "node --test scripts/test-security-dependencies.mjs",
     "ci:logs": "node scripts/download-ci-logs.mjs",
     "release": "node scripts/release.mjs",
     "screenshots": "node scripts/capture-screenshots.mjs",
@@ -59,6 +60,18 @@
     "icons:ensure:android": "node scripts/ensure-tauri-icons.mjs --android",
     "build:dev": "npm run build && npm run dev",
     "dev": "npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log"
+  },
+  "overrides": {
+    "@wdio/utils": {
+      "@puppeteer/browsers": "^3.2.4"
+    },
+    "@wdio/mocha-framework": {
+      "mocha": {
+        ".": "^11.8.0",
+        "serialize-javascript": "^7.1.2",
+        "diff": "^8.0.3"
+      }
+    }
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

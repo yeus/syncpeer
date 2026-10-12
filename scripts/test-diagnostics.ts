@@ -62,6 +62,7 @@ const main = async (): Promise<void> => {
       args: [
         "--test",
         "scripts/test-build-configuration.mjs",
+        "scripts/test-security-dependencies.mjs",
         "scripts/test-download-ci-logs.mjs",
       ],
     },

@@ -17,6 +17,19 @@ export const waitForText = async (
   );
 };
 
+/**
+ * The Devices tab renders an "Unavailable" placeholder until the native
+ * identity resolves, so wait for the real device ID instead of reading once.
+ */
+export const readCurrentDeviceId = async (browser: TauriBrowser): Promise<string> => {
+  const element = $("[data-testid='current-device-id']");
+  await browser.waitUntil(
+    async () => /^[A-Z2-7-]{40,}$/.test(await element.getText()),
+    { timeout: 60_000, timeoutMsg: "The Tauri device identity never became available." },
+  );
+  return element.getText();
+};
+
 export const setValue = async (testId: string, value: string): Promise<void> => {
   const element = $("[data-testid='" + testId + "']");
   await element.click();
@@ -138,14 +151,11 @@ export const setDirectConnectionFields = async (browser: WebdriverIO.Browser, se
   }, { timeout: 5_000, timeoutMsg: "Direct connection settings did not update." });
 };
 
-export const setUploadFile = async (
-  browser: TauriBrowser,
-  filePath: string,
+export const setUploadBytes = async (
+  browser: Pick<TauriBrowser, "execute">,
+  name: string,
+  bytes: Uint8Array,
 ): Promise<void> => {
-  const file = {
-    name: path.basename(filePath),
-    bytes: Array.from(fs.readFileSync(filePath)),
-  };
   await browser.execute((payload: { name: string; bytes: number[] }) => {
     const input = document.getElementById("folder-upload-input") as HTMLInputElement | null;
     if (!input) throw new Error("The folder upload input is not mounted.");
@@ -153,9 +163,15 @@ export const setUploadFile = async (
     transfer.items.add(new File([new Uint8Array(payload.bytes)], payload.name));
     input.files = transfer.files;
     input.dispatchEvent(new Event("change", { bubbles: true }));
-  }, file);
+  }, { name, bytes: Array.from(bytes) });
 };
 
+export const setUploadFile = async (
+  browser: TauriBrowser,
+  filePath: string,
+): Promise<void> => {
+  await setUploadBytes(browser, path.basename(filePath), fs.readFileSync(filePath));
+};
 export const connectUntilApproved = async (
   browser: TauriBrowser,
   timeout = 10 * 60_000,

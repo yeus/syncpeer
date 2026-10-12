@@ -92,6 +92,23 @@
       rootCount: number;
       selectedFolder: boolean;
     };
+    __syncpeerStateProbe?: () => {
+      currentFolderId: string;
+      currentPath: string;
+      isConnected: boolean;
+      isRefreshing: boolean;
+      uploadMessage: string;
+      uploadProgressActive: boolean;
+      logs: Array<{ event: string; message: string }>;
+    };
+    __syncpeerStoreStateProbe?: () => {
+      currentFolderId: string;
+      currentPath: string;
+      phase: string;
+      hasRemoteFs: boolean;
+      directoryStatus: string;
+      requestEpoch: number;
+    };
     __syncpeerReadCachedDocument?: (folderId: string, path: string) => Promise<number[] | null>;
     __syncpeerSetRelayPoolUrl?: (url: string) => void;
   };
@@ -485,6 +502,26 @@
         if (matches.length !== 1 || !platformAdapter.digestCachedFiles) return null;
         return (await platformAdapter.digestCachedFiles([{ folderId: matches[0].folderId, path }]))[0]?.hash ?? null;
       };
+      testWindow.__syncpeerStateProbe = () => ({
+        currentFolderId: app.session.currentFolderId,
+        currentPath: app.session.currentPath,
+        isConnected: app.session.isConnected,
+        isRefreshing: app.session.isRefreshing,
+        uploadMessage: app.ui.uploadMessage,
+        uploadProgressActive: app.ui.uploadProgressActive,
+        logs: app.logs.items.slice(0, 20).map(({ event, message }) => ({ event, message })),
+      });
+      testWindow.__syncpeerStoreStateProbe = () => {
+        const state = sessionStore.getState();
+        return {
+          currentFolderId: state.currentFolderId,
+          currentPath: state.currentPath,
+          phase: state.phase,
+          hasRemoteFs: state.remoteFs !== null,
+          directoryStatus: state.directory.status,
+          requestEpoch: state.requestEpoch,
+        };
+      };
     }
     if (import.meta.env.DEV) {
       (window as SyncpeerTestWindow).__syncpeerFolderProbe = (folderId: string) => ({
@@ -511,6 +548,8 @@
         delete testWindow.__syncpeerClearDownloadProgress;
         delete testWindow.__syncpeerDigestCachedFile;
         delete testWindow.__syncpeerReadCachedDocument;
+        delete testWindow.__syncpeerStateProbe;
+        delete testWindow.__syncpeerStoreStateProbe;
       }
       if (import.meta.env.DEV) {
         const testWindow = window as SyncpeerTestWindow;

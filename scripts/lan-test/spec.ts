@@ -13,6 +13,7 @@ import {
   clickItemTitle,
   connectUntilApproved,
   readCachedHash,
+  readCurrentDeviceId,
   readSessionEventNames,
   selectDiscoveryMode,
   setUploadFile,
@@ -196,7 +197,7 @@ describe("Syncpeer LAN integration", () => {
   it("registers the real Tauri identity", async () => {
     await clickTestId("tab-devices");
     await waitForText(lanBrowser, "This Device", 60_000);
-    const deviceId = await $("[data-testid='current-device-id']").getText();
+    const deviceId = await readCurrentDeviceId(lanBrowser);
     assert.match(deviceId, /^[A-Z2-7-]{40,}$/);
     if (process.env.SYNCPEER_LAN_MANUAL_IDS !== "1") {
       await request("POST", "/v1/register", { profile: "trusted", deviceId });
@@ -384,7 +385,7 @@ describe("Syncpeer LAN integration", () => {
       if (!currentFixture) {
         await clickTestId("tab-devices");
         await waitForText(lanBrowser, "This Device", 60_000);
-        const deviceId = await $("[data-testid='current-device-id']").getText();
+        const deviceId = await readCurrentDeviceId(lanBrowser);
         await request("POST", "/v1/register", { profile: "trusted", deviceId });
         currentFixture = await fixture();
       }

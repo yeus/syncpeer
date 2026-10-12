@@ -1,6 +1,6 @@
 {
   "name": "@syncpeer/tauri-shell",
-  "version": "0.6.1-rc.1",
+  "version": "0.6.1-rc.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -35,7 +35,7 @@
   },
   "dependencies": {
     "@kayahr/text-encoding": "^2.2.0",
-    "@syncpeer/app": "0.6.1-rc.1",
+    "@syncpeer/app": "0.6.1-rc.2",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@ungap/structured-clone": "^1.4.0",

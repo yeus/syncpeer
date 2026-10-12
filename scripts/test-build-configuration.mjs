@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
 import { patchManifest } from "./prepare-android-legacy-launcher.mjs";
@@ -99,6 +100,41 @@ test("Android CI lets the project install its pinned SDK packages", () => {
     assert.ok(setup, `${file} must configure the Android SDK action.`);
     assert.match(setup[1], /with:\n\s+packages: ""/,
       `${file} must skip the action's default SDK package install.`);
+  }
+});
+
+test("Android CI isolates the pinned NDK from runner image upgrades", () => {
+  for (const file of [".github/workflows/android-build.yml", ".github/workflows/release.yml"]) {
+    const workflow = fs.readFileSync(file, "utf8");
+    assert.match(workflow, /sdk_root="\$RUNNER_TEMP\/syncpeer-android-sdk"/,
+      `${file} must use an isolated Android SDK root.`);
+    assert.match(workflow, /sdkmanager --sdk_root="\$sdk_root"/,
+      `${file} must install packages into the isolated SDK root.`);
+    assert.match(workflow, /echo "ANDROID_HOME=\$sdk_root"/);
+    assert.match(workflow, /echo "ANDROID_SDK_ROOT=\$sdk_root"/);
+    assert.match(workflow, /echo "ANDROID_NDK_HOME=\$sdk_root\/ndk\/\$\{ANDROID_NDK_VERSION\}"/);
+    assert.match(workflow, /echo "ANDROID_NDK_ROOT=\$sdk_root\/ndk\/\$\{ANDROID_NDK_VERSION\}"/);
+    assert.match(workflow, /find "\$ANDROID_SDK_ROOT\/ndk".*wc -l.*-eq 1/,
+      `${file} must reject accidental extra NDK versions in the isolated SDK.`);
+  }
+});
+
+
+test("Android license acceptance tolerates producer SIGPIPE but preserves SDK failures", () => {
+  for (const file of [".github/workflows/android-build.yml", ".github/workflows/release.yml"]) {
+    const workflow = fs.readFileSync(file, "utf8");
+    const acceptance = workflow.split("\n").find(line => line.includes("yes | sdkmanager"));
+    assert.ok(acceptance, `${file} must accept licenses for the isolated SDK.`);
+    for (const sdkStatus of [0, 42]) {
+      const result = spawnSync("bash", ["-c", `
+        set -euo pipefail
+        sdk_root=synthetic-sdk
+        sdkmanager() { head -n 1 >/dev/null; return ${sdkStatus}; }
+        ${acceptance.trim()}
+      `], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.status, sdkStatus,
+        `${file} must report sdkmanager's status, independently of yes exiting on SIGPIPE.`);
+    }
   }
 });
 

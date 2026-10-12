@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
@@ -117,6 +119,38 @@ test("Android CI isolates the pinned NDK from runner image upgrades", () => {
     assert.match(workflow, /find "\$ANDROID_SDK_ROOT\/ndk".*wc -l.*-eq 1/,
       `${file} must reject accidental extra NDK versions in the isolated SDK.`);
   }
+});
+
+test("Android CI configures OpenSSL's NDK ranlib alias", (t) => {
+  for (const file of [".github/workflows/android-build.yml", ".github/workflows/release.yml"]) {
+    const workflow = fs.readFileSync(file, "utf8");
+    const verifyIndex = workflow.indexOf("- name: Verify pinned Android NDK");
+    const configureIndex = workflow.indexOf("run: bash scripts/prepare-android-ndk-ranlib.sh");
+    const buildStep = file.endsWith("release.yml")
+      ? "- name: Build signed Android APK"
+      : "- name: Build Android release APK";
+    const buildIndex = workflow.indexOf(buildStep);
+    assert.ok(verifyIndex >= 0 && configureIndex > verifyIndex && buildIndex > configureIndex,
+      `${file} must configure the ranlib alias after NDK verification and before the Android build.`);
+  }
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-ndk-ranlib-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const ndkBin = path.join(tempRoot, "toolchains/llvm/prebuilt/linux-x86_64/bin");
+  const githubPath = path.join(tempRoot, "github-path");
+  fs.mkdirSync(ndkBin, { recursive: true });
+  fs.writeFileSync(path.join(ndkBin, "llvm-ranlib"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  fs.writeFileSync(githubPath, "");
+
+  const result = spawnSync("bash", ["scripts/prepare-android-ndk-ranlib.sh"], {
+    encoding: "utf8",
+    env: { ...process.env, ANDROID_NDK_HOME: tempRoot, GITHUB_PATH: githubPath },
+    timeout: 5000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const alias = path.join(ndkBin, "aarch64-linux-android-ranlib");
+  assert.equal(fs.realpathSync(alias), path.join(ndkBin, "llvm-ranlib"));
+  assert.equal(fs.readFileSync(githubPath, "utf8"), `${ndkBin}\n`);
 });
 
 

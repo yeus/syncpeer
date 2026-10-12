@@ -183,6 +183,9 @@ jobs:
           test "$ANDROID_NDK_HOME" = "$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
           test "$(find "$ANDROID_SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1
 
+      - name: Configure NDK ranlib for OpenSSL
+        run: bash scripts/prepare-android-ndk-ranlib.sh
+
       - name: Install npm dependencies
         run: npm ci
 

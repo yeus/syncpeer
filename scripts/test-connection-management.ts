@@ -311,6 +311,35 @@ test("an opening accepts the refreshed active session after its configuration ke
   await lifecycle.disconnect();
 });
 
+test("a stale opening cannot close the incoming session adopted for the current revision", async () => {
+  let revision = 0;
+  const opening = deferred<ReturnType<typeof session>>();
+  const incoming = session();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => {
+      opens += 1;
+      if (opens > 1) throw new Error("The adopted session should satisfy the opening.");
+      return opening.promise;
+    },
+    keyFor: value => `${value}:${revision}`,
+    sleep: () => new Promise(() => {}),
+  });
+  const connecting = lifecycle.connect("peer");
+  await Promise.resolve();
+  revision += 1;
+  assert.equal(await lifecycle.adopt("peer", incoming), true);
+  opening.resolve(incoming);
+  try {
+    assert.equal(await connecting, incoming);
+    assert.equal(incoming.isClosed(), false);
+    assert.equal(lifecycle.getSession(), incoming);
+    assert.equal(opens, 1);
+  } finally {
+    await lifecycle.disconnect();
+  }
+});
+
 test("manual disconnect aborts and cleans up a pending opening", async () => {
   const pending = deferred<ReturnType<typeof session>>();
   let openingSignal: AbortSignal | undefined;
@@ -400,6 +429,121 @@ test("an automatic reconnect rehydrates the session overview", async () => {
   assert.equal(store.getState().remoteFs, remoteFs);
   assert.equal(attempts, 2, "A later lifecycle reconnect should recover the missing runtime.");
 });
+
+test("a transport reconnect refreshes the overview while the recovering remoteFs stays bound", async () => {
+  let onLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
+  let overviewVersion = 0;
+  let overviewCalls = 0;
+  const store = createSyncpeerSessionStore({
+    transport: {
+      connectAndSync: async () => remoteFs,
+      connectAndGetOverview: async () => {
+        overviewCalls += 1;
+        return {
+          folders: [{ id: overviewVersion ? "new-folder" : "old-folder",
+            label: overviewVersion ? "New folder" : "Old folder", readOnly: false }],
+          device: null,
+          folderSyncStates: [],
+          connectedVia: "redacted-test-path",
+          transportKind: "direct-tcp" as const,
+        };
+      },
+      connectAndGetFolderVersions: async () => [],
+      subscribeLifecycle: listener => {
+        onLifecycle = listener;
+        return () => undefined;
+      },
+    },
+  });
+  const options = { host: "test.invalid", port: 22000, deviceName: "test" };
+
+  await store.actions.connect(options);
+  assert.deepEqual(store.getState().folders.map(folder => folder.id), ["old-folder"]);
+  const callsBeforeReconnect = overviewCalls;
+  overviewVersion = 1;
+  onLifecycle?.({
+    phase: "reconnecting",
+    attempt: 1,
+    nextRetryAtMs: null,
+    closureReason: "configuration changed",
+    upgradeStatus: "idle",
+  });
+  onLifecycle?.({
+    phase: "connected",
+    attempt: 0,
+    nextRetryAtMs: null,
+    closureReason: null,
+    upgradeStatus: "idle",
+  });
+  for (let index = 0; index < 20 &&
+    store.getState().folders[0]?.id !== "new-folder"; index += 1) {
+    await Promise.resolve();
+  }
+  assert.ok(overviewCalls > callsBeforeReconnect,
+    "A replacement transport session must refresh the existing UI overview.");
+  assert.deepEqual(store.getState().folders.map(folder => folder.id), ["new-folder"]);});
+
+
+test("a reconnect does not drop an open folder for a transient partial overview", async () => {
+  let onLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
+  let reconnecting = false;
+  let reconnectOverviewCalls = 0;
+  let timeMs = 0;
+  const folder = { id: "shared", label: "Shared", readOnly: false };
+  const otherFolder = { id: "other", label: "Other", readOnly: false };
+  const sessionRemoteFs = {
+    listFolders: async () => [folder],
+    requestFolderIndex: async () => undefined,
+    setFocusedFolder: () => undefined,
+    waitForFolderIndex: async () => true,
+    readDir: async () => [{ name: "ready.txt", path: "ready.txt", type: "file" as const,
+      size: 1, modifiedMs: 1 }],
+    readFileFully: async () => new Uint8Array(),
+    writeFileFully: async () => undefined,
+    writeFileStream: async () => undefined,
+  } as SyncpeerSessionHandle["remoteFs"];
+  const overview = (folders: typeof folder[]) => ({
+    folders,
+    device: null,
+    folderSyncStates: [{ folderId: "shared", remoteIndexId: "1", remoteMaxSequence: "1", indexReceived: true }],
+    connectedVia: "redacted-test-path",
+    transportKind: "direct-tcp" as const,
+  });
+  const store = createSyncpeerSessionStore({
+    now: () => timeMs,
+    sleep: async (ms) => { timeMs += ms; },
+    transport: {
+      connectAndSync: async () => sessionRemoteFs,
+      connectAndGetOverview: async () => {
+        if (!reconnecting) return overview([folder]);
+        reconnectOverviewCalls += 1;
+        return overview(reconnectOverviewCalls === 1 ? [otherFolder] : [folder]);
+      },
+      connectAndGetFolderVersions: async () =>
+        [{ folderId: "shared", remoteIndexId: "1", remoteMaxSequence: "1", indexReceived: true }],
+      subscribeLifecycle: listener => {
+        onLifecycle = listener;
+        return () => undefined;
+      },
+    },
+  });
+  const options = { host: "test.invalid", port: 22000, deviceName: "test" };
+
+  await store.actions.connect(options);
+  await store.actions.openFolder("shared", options);
+  assert.equal(store.getState().directory.folderId, "shared");
+  reconnecting = true;
+  onLifecycle?.({ phase: "reconnecting", attempt: 1, nextRetryAtMs: null,
+    closureReason: "configuration changed", upgradeStatus: "idle" });
+  onLifecycle?.({ phase: "connected", attempt: 0, nextRetryAtMs: null,
+    closureReason: null, upgradeStatus: "idle" });
+  for (let index = 0; index < 30 && reconnectOverviewCalls < 2; index += 1) await Promise.resolve();
+
+  assert.ok(reconnectOverviewCalls >= 2, "Reconnect refresh should retry a transiently missing selected folder.");
+  assert.equal(store.getState().directory.folderId, "shared",
+    "A transient partial overview must not kick the user back to the folder root.");
+});
+
 
 test("a connected lifecycle never reports connected without a runtime session", async () => {
   let timeMs = 0;

@@ -131,3 +131,63 @@ test("concurrent operations retain busy status until all finish", async () => {
   release(); await active;
   assert.equal(controller.getState().phase, "idle");
 });
+
+
+test("each completed receive notifies without waiting for another pending receive", async () => {
+  const first = Promise.withResolvers<void>();
+  const second = Promise.withResolvers<void>();
+  let receiveCall = 0;
+  const committed: string[] = [];
+  const controller = createReplicaController({
+    scan: async () => [],
+    readBlock: async () => new Uint8Array(),
+    receive: async () => {
+      receiveCall += 1;
+      await (receiveCall === 1 ? first.promise : second.promise);
+      return true;
+    },
+  }, { onCommittedChange: source => committed.push(source) });
+
+  const receiveOne = controller.receive!("fixture-folder", [], async () => new Uint8Array());
+  const receiveTwo = controller.receive!("fixture-folder", [], async () => new Uint8Array());
+  first.resolve();
+  await receiveOne;
+  assert.deepEqual(committed, ["received"], "A completed storage commit must become observable immediately.");
+  second.resolve();
+  await receiveTwo;
+  assert.deepEqual(committed, ["received", "received"], "Each completed storage commit must notify consumers.");
+});
+
+test("committed changes remain observable while an independent scan is pending", async () => {
+  const scan = Promise.withResolvers<[]>();
+  const committed: string[] = [];
+  const controller = createReplicaController({
+    scan: () => scan.promise,
+    readBlock: async () => new Uint8Array(),
+    receive: async () => true,
+  }, { onCommittedChange: source => committed.push(source) });
+  const scanning = controller.scan();
+  try {
+    await controller.receive!("settings", [], async () => new Uint8Array());
+    assert.deepEqual([...committed], ["received"],
+      "Refreshing committed settings must not depend on all unrelated replica work becoming idle.");
+  } finally {
+    scan.resolve([]);
+    await scanning;
+  }
+});
+
+test("a commit observer failure does not fail completed storage work", async () => {
+  const controller = createReplicaController({
+    scan: async () => [],
+    readBlock: async () => new Uint8Array(),
+    receive: async () => true,
+    edit: async edit => ({ name: edit.path, size: 0 }),
+  }, { onCommittedChange: () => { throw new Error("synthetic observer failure"); } });
+  assert.equal(await controller.receive!("settings", [], async () => new Uint8Array()), true);
+  assert.deepEqual(await controller.edit!({ method: "write", folderId: "settings",
+    path: "fixture", modifiedMs: 0, expectedVersion: null,
+    source: { size: 0, readRange: async () => new Uint8Array() } }), { name: "fixture", size: 0 });
+  assert.equal(controller.getState().phase, "idle");
+  assert.equal(controller.getState().error, undefined);
+});

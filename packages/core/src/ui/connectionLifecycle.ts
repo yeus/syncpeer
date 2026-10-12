@@ -223,7 +223,11 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       }
       const session = await deps.open(options, controller.signal);
       if (controller.signal.aborted || openGeneration !== generation || !eligible()) {
-        if (active === session && activeKey === key && !session.isClosed() && eligible()) return session;
+        // Adoption transfers ownership to the current lifecycle generation.
+        // A stale opening must compare that session with the desired revision,
+        // rather than close it because its captured revision is older.
+        if (active === session && desired && activeKey === deps.keyFor(desired) &&
+          !session.isClosed() && eligible()) return session;
         await session.close().catch(() => undefined);
         throw new Error("Connection attempt was cancelled.");
       }

@@ -306,13 +306,6 @@ const socketReadRequest = (sessionId: number, maxBytes?: number): Uint8Array => 
   return body;
 };
 
-const socketWriteRequest = (sessionId: number, bytes: Uint8Array): Uint8Array => {
-  const body = new Uint8Array(8 + bytes.length), view = new DataView(body.buffer);
-  setU64(view, 0, sessionId); body.set(bytes, 8);
-  return body;
-};
-
-
 const createTlsSocket = (
   invoke: InvokeFn,
   sessionId: number,
@@ -323,7 +316,9 @@ const createTlsSocket = (
   read: async (maxBytes?: number) => rawByteView(await invoke<ArrayBuffer>(
     `${commandPrefix}_read_binary`, socketReadRequest(sessionId, maxBytes))),
   write: async (bytes: Uint8Array) => {
-    await invoke<void>(`${commandPrefix}_write_binary`, socketWriteRequest(sessionId, bytes));
+    await invoke<void>(`${commandPrefix}_write`, {
+      request: { sessionId, bytes: Array.from(bytes) },
+    });
   },
   close: async () => {
     await invoke<void>(`${commandPrefix}_close`, {
@@ -400,6 +395,7 @@ export const createTauriAdapters = (
         randomBytes: size => crypto.getRandomValues(new Uint8Array(size)),
         kdf: createWorkerPasswordKdf(),
         onDiagnostic: (event, details) => logUi(options, event, details),
+        onSessionConfigurationChange: invalidateSessionConfiguration,
       });
       await documents.initialize();
       return documents;

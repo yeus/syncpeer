@@ -8,7 +8,8 @@ const MAX_PAIRING_MESSAGE_BYTES = 64 * 1024;
 type PairingMessage =
   | { format: 1; kind: "request"; request: PairingRequest }
   | { format: 1; kind: "confirmation"; accepted: boolean }
-  | { format: 1; kind: "transfer"; transfer: PairingTransfer };
+  | { format: 1; kind: "transfer"; transfer: PairingTransfer }
+  | { format: 1; kind: "complete" };
 
 const createMessageReader = (socket: SyncpeerTlsSocket) => {
   let buffered = new Uint8Array();
@@ -73,6 +74,9 @@ export async function acceptPairingTransfer(options: {
   const transfer = await sealPairingTransfer(options.subtle, session, options.randomBytes,
     await options.createTransfer(request.device));
   await writeMessage(options.socket, { format: 1, kind: "transfer", transfer });
+  if (options.invitation.invitation.transferAck === true && request.transferAck === true) {
+    requireKind(await read(), "complete");
+  }
   return { remoteDeviceId: request.deviceId, confirmationCode: session.confirmationCode };
 }
 
@@ -96,6 +100,9 @@ export async function joinPersonalSpace(options: {
   const remoteAccepted = requireKind(await read(), "confirmation").accepted;
   if (!accepted || !remoteAccepted) throw new Error("Pairing confirmation was rejected.");
   const transfer = requireKind(await read(), "transfer").transfer;
-  return { transfer: await openPairingTransfer(options.subtle, session, transfer),
-    deviceIdentity: created.deviceIdentity, confirmationCode: session.confirmationCode };
+  const opened = await openPairingTransfer(options.subtle, session, transfer);
+  if (options.invitation.transferAck === true && created.request.transferAck === true) {
+    await writeMessage(options.socket, { format: 1, kind: "complete" });
+  }
+  return { transfer: opened, deviceIdentity: created.deviceIdentity, confirmationCode: session.confirmationCode };
 }

@@ -12,7 +12,6 @@ import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } fro
   "../packages/core/dist/sync/credentialVaultStorage.js";
 import { defaultFolderSettings, defaultProfileSettings } from "../packages/core/dist/sync/profileSettings.js";
 import { purgePrivateReplicaContents } from "../packages/core/dist/sync/replicaPurge.js";
-
 test("listener snapshots are invalidated by sharing changes, not ordinary document edits", () => {
   for (const operation of ["lock", "unlock", "saveProfileSettings", "savePersonalSpaceSetting",
     "revokeOwnedDevice", "register", "attachDownloads", "saveConnectionPasswords"]) {
@@ -87,10 +86,12 @@ test("an ordinary Syncthing peer can receive an explicitly selected folder witho
 test("status refreshes shared credentials only when the settings replica changes", async () => {
   const { openStorage } = memoryDocumentStorage();
   const events: string[] = [];
+  let sessionInvalidations = 0;
   const documents = createDocumentFilesystem({ profileId: "settings-refresh-fixture", deviceCounterId: "46",
     openStorage, profile: await openStorage("profile"), randomBytes,
     availableBytes: async () => 1024 * 1024 * 1024,
-    onDiagnostic: event => events.push(event) });
+    onDiagnostic: event => events.push(event),
+    onSessionConfigurationChange: () => { sessionInvalidations += 1; } });
   await documents.initialize();
   const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
   await documents.createVault("synthetic-master-password", false, "DEVICE", kit.publicKey);
@@ -101,17 +102,21 @@ test("status refreshes shared credentials only when the settings replica changes
   await documents.status();
   await documents.status();
   assert.equal(events.filter(event => event === "document.settings_refresh.started").length, 1);
+  assert.equal(sessionInvalidations, 0, "A no-op settings refresh must not invalidate the peer view.");
   await documents.appendPersonalSpaceChange({ id: "new-credential", deviceId,
     path: ["folders", "photos", "credential"], parents: [],
     value: { label: "Photos", password: "synthetic-shared-folder-password" } });
   assert.deepEqual((await documents.status()).folders.map(folder => folder.id), ["photos"]);
   assert.equal(events.filter(event => event === "document.settings_refresh.started").length, 2);
+  assert.equal(sessionInvalidations, 1,
+    "A received shared credential must invalidate the prepared/live peer view exactly once.");
+  await documents.status();
+  assert.equal(sessionInvalidations, 1, "An unchanged settings revision must not invalidate again.");
   await documents.attachDownloads("photos");
   assert.equal((await documents.status()).folders.find(folder => folder.id === "photos")?.downloads, true,
     "The refreshed signed credential must unlock the registered folder.");
   await documents.close();
 });
-
 test("local-only purge keeps the replica marker and never emits BEP tombstones", async () => {
   const { openStorage, roots } = memoryDocumentStorage();
   const storage = await openStorage("synthetic-root");
@@ -596,12 +601,25 @@ test("legacy folder registrations migrate only after encrypted read-back and sta
 
 test("backup commands restore portable credentials without device-local roots or documents", async () => {
   const { dispatchDocumentCommand } = await import("../packages/core/dist/sync/documentCommands.js");
-  const makeDocuments = async () => {
-    const { openStorage } = memoryDocumentStorage();
+  const makeDocuments = async (options?: {
+    onSessionConfigurationChange?: () => void;
+    onDiagnostic?: (event: string) => void;
+    beforeLock?: () => Promise<void>;
+  }) => {
+    const fixture = memoryDocumentStorage();
+    const openStorage = async (id: string) => {
+      const bytes = await fixture.openStorage(id);
+      return { ...bytes, withLock: async <T>(operation: () => Promise<T>) => {
+        await options?.beforeLock?.();
+        return bytes.withLock(operation);
+      } };
+    };
     return createDocumentFilesystem({ profileId: "backup-fixture", deviceCounterId: "42", openStorage,
       profile: await openStorage("profile"), randomBytes, availableBytes: async () => 1024 * 1024 * 1024,
       rememberedSecret: { isDeviceUnlocked: async () => true, load: async () => null,
-        save: async () => {}, remove: async () => {} } });
+        save: async () => {}, remove: async () => {} },
+      onSessionConfigurationChange: options?.onSessionConfigurationChange,
+      onDiagnostic: options?.onDiagnostic });
   };
   const source = await makeDocuments();
   await source.initialize();
@@ -648,7 +666,14 @@ test("backup commands restore portable credentials without device-local roots or
   assert.deepEqual(await target.connectionPasswords(), { photos: "synthetic-folder-password" });
   await target.register({ id: "photos", label: "Recovered photos", password: "synthetic-folder-password" });
   assert.deepEqual(await target.cachedFiles(), []);
-  const paired = await makeDocuments();
+  let pairedSessionInvalidations = 0;
+  let beforePairedLock = async () => {};
+  let pairedDiagnostic: (event: string) => void = () => {};
+  const paired = await makeDocuments({
+    onSessionConfigurationChange: () => { pairedSessionInvalidations += 1; },
+    onDiagnostic: event => pairedDiagnostic(event),
+    beforeLock: () => beforePairedLock(),
+  });
   await paired.initialize();
   await dispatchDocumentCommand(paired, { operation: "importPairingTransfer", transfer: pairingTransfer,
     identity: pairedIdentity, password: "paired-device-master", remember: false });
@@ -663,6 +688,51 @@ test("backup commands restore portable credentials without device-local roots or
     await sourceSettings.replica!.scan(), sourceSettings.replica!.readBlock), true);
   assert.deepEqual((await paired.status()).folders.map(folder => folder.id), ["photos"],
     "The approved peer imports the signed credential after encrypted settings replica exchange.");
+  assert.equal(pairedSessionInvalidations, 1,
+    "A received credential must invalidate the prepared/live peer view when hydration changes the effective folder set.");
+  await paired.sessionSharedFolders("SOURCE");
+  const sourceProfile = await source.profileSettings();
+  sourceProfile.folders.photos = { ...defaultFolderSettings(), favorites: [{
+    key: "folder:photos:", folderId: "photos", path: "", name: "Photos", kind: "folder",
+  }] };
+  await source.saveProfileSettings(sourceProfile);
+  assert.equal(await pairedSettings.replica?.receive?.(pairedSettings.id,
+    await sourceSettings.replica!.scan(), sourceSettings.replica!.readBlock), true);
+  await paired.status();
+  assert.equal(pairedSessionInvalidations, 1,
+    "Another device's received favorite selection must not rebuild this device's live peer session.");
+  await source.savePersonalSpaceSetting(["folders", "photos", "shareTargets"],
+    [{ kind: "device", syncthingId: "PAIRED" }]);
+  assert.equal(await pairedSettings.replica?.receive?.(pairedSettings.id,
+    await sourceSettings.replica!.scan(), sourceSettings.replica!.readBlock), true);
+  await paired.status();
+  assert.equal(pairedSessionInvalidations, 2,
+    "A received share-target change must invalidate this device's prepared/live peer view.");
+  await source.savePersonalSpaceSetting(["folders", "photos", "shareTargets"],
+    [{ kind: "personal-space" }]);
+  const firstUpdate = await sourceSettings.replica!.scan();
+  await source.savePersonalSpaceSetting(["folders", "photos", "shareTargets"],
+    [{ kind: "device", syncthingId: "SOURCE" }]);
+  const secondUpdate = await sourceSettings.replica!.scan();
+  const refreshBlocked = Promise.withResolvers<void>();
+  const releaseRefresh = Promise.withResolvers<void>();
+  pairedDiagnostic = event => {
+    if (event !== "document.settings_refresh.started") return;
+    pairedDiagnostic = () => {};
+    beforePairedLock = async () => {
+      beforePairedLock = async () => {};
+      refreshBlocked.resolve();
+      await releaseRefresh.promise;
+    };
+  };
+  await pairedSettings.replica!.receive!(pairedSettings.id, firstUpdate, sourceSettings.replica!.readBlock);
+  await refreshBlocked.promise;
+  try {
+    await pairedSettings.replica!.receive!(pairedSettings.id, secondUpdate, sourceSettings.replica!.readBlock);
+  } finally { releaseRefresh.resolve(); }
+  await paired.status();
+  assert.equal(pairedSessionInvalidations, 3,
+    "A received revision during refresh must not consume the new configuration key without invalidating the session.");
   await assert.rejects(paired.register({ id: "photos", label: "Photos", password: "wrong-password" }),
     /password changes/i);
   await assert.rejects(dispatchDocumentCommand(target, { operation: "restoreRecoveryBackup", backup,

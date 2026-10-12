@@ -59,6 +59,7 @@ interface DocumentFilesystemOptions {
   /** Defaults to the in-process scrypt derivation; platforms may inject a worker. */
   kdf?: PasswordKdf;
   onDiagnostic?: (event: string, details?: Record<string, unknown>) => void;
+  onSessionConfigurationChange?: () => void;
 }
 
 interface DocumentHandle {
@@ -95,6 +96,8 @@ interface DocumentRuntime {
   settingsFolder?: { id: string; replica: LocalFolderReplica; close: () => Promise<void> };
   settingsRevision: number;
   refreshedSettingsRevision: number;
+  pendingReceivedSettingsRevision: number;
+  sharedSessionConfigurationKey?: string;
   settingsRefreshQueued: boolean;
   vault: Vault;
   registry: FolderRegistry | undefined;
@@ -176,6 +179,8 @@ const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
   const results = await Promise.allSettled(pending.map(handle => handle.writer?.close()));
   const settingsResult = await Promise.allSettled([runtime.settingsFolder?.close()]);
   runtime.settingsFolder = undefined;
+  runtime.pendingReceivedSettingsRevision = -1;
+  runtime.sharedSessionConfigurationKey = undefined;
   runtime.refreshedSettingsRevision = -1;
   const registryResult = await Promise.allSettled([runtime.registry?.close()]);
   runtime.registry = undefined;
@@ -231,13 +236,18 @@ const openPersonalSpaceFolder = async (runtime: DocumentRuntime): Promise<void> 
       encrypted, runtime.options.deviceCounterId, sha256), {
       onCommittedChange: source => {
         runtime.settingsRevision++;
-        if (source === "received") queueSharedSettingsRefresh(runtime);
+        if (source === "received") {
+          runtime.pendingReceivedSettingsRevision = runtime.settingsRevision;
+          queueSharedSettingsRefresh(runtime);
+        }
       },
     });
     await replica.scan();
     runtime.settingsFolder = { id: descriptor.id, replica, close: async () => {
       try { await bytes!.close(); } finally { crypto.folderKey.fill(0); }
     } };
+    runtime.pendingReceivedSettingsRevision = -1;
+    runtime.sharedSessionConfigurationKey = undefined;
     runtime.refreshedSettingsRevision = -1;
     await reconcileSpaceDeviceMembership(runtime);
   } catch (error) {
@@ -1152,9 +1162,40 @@ const sharedSettingsContext = async (runtime: DocumentRuntime, requireActive = f
   return { membership, journal, changes, result };
 };
 
+const sharedSessionConfigurationKey = (
+  context: Awaited<ReturnType<typeof sharedSettingsContext>>,
+) => {
+  const devices = context.membership.devices.map(device => ({
+    id: device.id,
+    syncthingId: device.syncthingId,
+    state: device.state,
+    retiredSyncthingIds: [...device.retiredSyncthingIds ?? []].sort(),
+  })).sort((left, right) => left.id.localeCompare(right.id));
+  const settings = context.result.settings;
+  if (!settings) return JSON.stringify({
+    localDeviceId: context.membership.localDeviceId,
+    devices,
+    folders: null,
+  });
+  const localDeviceId = context.membership.localDeviceId;
+  const folders = Object.entries(settings.folders)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([id, folder]) => ({
+      id,
+      shareTargets: folder.shareTargets
+        .map(target => target.kind === "personal-space"
+          ? "personal-space"
+          : `device:${target.syncthingId}`)
+        .sort(),
+      localSelection: localDeviceId ? folder.devices[localDeviceId] ?? null : null,
+    }));
+  return JSON.stringify({ localDeviceId, devices, folders });
+};
+
 const syncSharedFolderCredentials = async (runtime: DocumentRuntime,
   context: Awaited<ReturnType<typeof sharedSettingsContext>>) => {
-  if (!context.result.settings) return;
+  if (!context.result.settings) return false;
+  let changed = false;
   for (const [id, folder] of Object.entries(context.result.settings.folders)) {
     if (!folder.credential) continue;
     const existing = await runtime.vault.folderPassword(id);
@@ -1163,7 +1204,9 @@ const syncSharedFolderCredentials = async (runtime: DocumentRuntime,
     }
     if (existing !== null && runtime.registry?.getState().some(value => value.id === id)) continue;
     await registerFolderAction(runtime, { id, ...folder.credential }, false);
+    changed = true;
   }
+  return changed;
 };
 
 const refreshSharedFolderCredentialsIfChanged = async (runtime: DocumentRuntime) => {
@@ -1173,8 +1216,27 @@ const refreshSharedFolderCredentialsIfChanged = async (runtime: DocumentRuntime)
   if (!await runtime.vault.spaceDeviceMembership()) return false;
   try { runtime.options.onDiagnostic?.("document.settings_refresh.started"); }
   catch { /* Diagnostics must not interrupt storage. */ }
-  await syncSharedFolderCredentials(runtime, await sharedSettingsContext(runtime));
+  const context = await sharedSettingsContext(runtime);
+  try { runtime.options.onDiagnostic?.("document.settings_refresh.context_ready"); }
+  catch { /* Diagnostics must not interrupt storage. */ }
+  const changed = await syncSharedFolderCredentials(runtime, context);
+  try { runtime.options.onDiagnostic?.("document.settings_refresh.credentials_ready", { changed }); }
+  catch { /* Diagnostics must not interrupt storage. */ }
+  const receivedRevisionReady = runtime.pendingReceivedSettingsRevision >= 0 &&
+    runtime.pendingReceivedSettingsRevision <= revision;
+  const nextSessionConfigurationKey = sharedSessionConfigurationKey(context);
+  // Materialization can already include a receive newer than the revision
+  // captured above. Notify for its effective change before storing the key;
+  // only clearing the pending receive must wait for that revision's refresh.
+  const receivedSessionChange = runtime.pendingReceivedSettingsRevision >= 0 &&
+    runtime.sharedSessionConfigurationKey !== undefined &&
+    runtime.sharedSessionConfigurationKey !== nextSessionConfigurationKey;
+  runtime.sharedSessionConfigurationKey = nextSessionConfigurationKey;
   runtime.refreshedSettingsRevision = revision;
+  if (changed || receivedSessionChange) runtime.options.onSessionConfigurationChange?.();
+  if (receivedRevisionReady) runtime.pendingReceivedSettingsRevision = -1;
+  try { runtime.options.onDiagnostic?.("document.settings_refresh.completed", { receivedSessionChange }); }
+  catch { /* Diagnostics must not interrupt storage. */ }
   return true;
 };
 
@@ -1186,9 +1248,9 @@ const queueSharedSettingsRefresh = (runtime: DocumentRuntime) => {
       runtime.settingsRefreshQueued = false;
       return;
     }
-    void runQueued(runtime, () => refreshSharedFolderCredentialsIfChanged(runtime), "settingsRefresh").then(refreshed => {
+    void runQueued(runtime, () => refreshSharedFolderCredentialsIfChanged(runtime), "settingsRefresh").then(() => {
       runtime.settingsRefreshQueued = false;
-      if (refreshed && runtime.settingsRevision !== runtime.refreshedSettingsRevision) {
+      if (runtime.settingsRevision !== runtime.refreshedSettingsRevision) {
         queueSharedSettingsRefresh(runtime);
       }
     }).catch(error => {
@@ -1479,7 +1541,10 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
       trace("document.session_folders.membership_done");
       const context = membership ? await sharedSettingsContext(runtime) : null;
       trace("document.session_folders.context_done");
-      if (context) await syncSharedFolderCredentials(runtime, context);
+      if (context) {
+        await syncSharedFolderCredentials(runtime, context);
+        runtime.sharedSessionConfigurationKey = sharedSessionConfigurationKey(context);
+      }
       trace("document.session_folders.credentials_done");
       const registry = requireUnlockedRegistry(runtime);
       const settings = await effectiveProfileSettings(runtime);
@@ -1610,6 +1675,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     registry: undefined,
     settingsRevision: 0,
     refreshedSettingsRevision: -1,
+    pendingReceivedSettingsRevision: -1,
     settingsRefreshQueued: false,
     nextHandle: 0,
     closed: false,

@@ -603,7 +603,8 @@ export const createSyncpeerBrowserClient = (
   let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
   let incomingServiceKey = "";
   let incomingServiceClosing = Promise.resolve();
-
+  let incomingServiceUpdate: Promise<unknown> = Promise.resolve();
+  let sessionConfigurationRefresh = Promise.resolve();
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
     if (cachedDefaultIdentity) return cachedDefaultIdentity;
     if (!platformAdapter.readDefaultIdentity) {
@@ -738,22 +739,28 @@ export const createSyncpeerBrowserClient = (
     if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
       throw new Error("Incoming peer folder preparation changed before the listener started.");
     }
-    if (incomingService && incomingServiceKey === key) {
-      incomingService.updateSessionHandlers(sessionHandlers);
+    // Serialize listener replacement. Overlapping session opens must not bind
+    // the same listen port twice or rebind before the previous listener closes.
+    const update = incomingServiceUpdate.then(async () => {
+      if (incomingService && incomingServiceKey === key) {
+        incomingService.updateSessionHandlers(sessionHandlers);
+        return incomingService;
+      }
+      coreAdapter.log?.("core.incoming.prepare.previous_close_start", {});
+      await stopIncomingService();
+      coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
+      incomingService = await startIncomingPeerService(coreAdapter, {
+        host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+        localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
+        onError: error => coreAdapter.log?.("core.incoming.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      });
+      incomingServiceKey = key;
       return incomingService;
-    }
-    coreAdapter.log?.("core.incoming.prepare.previous_close_start", {});
-    await stopIncomingService();
-    coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
-    incomingService = await startIncomingPeerService(coreAdapter, {
-      host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
-      localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
-      onError: error => coreAdapter.log?.("core.incoming.failed", {
-        message: error instanceof Error ? error.message : String(error),
-      }),
     });
-    incomingServiceKey = key;
-    return incomingService;
+    incomingServiceUpdate = update.catch(() => undefined);
+    return update;
   };
 
   const openSession = async (
@@ -901,30 +908,24 @@ export const createSyncpeerBrowserClient = (
     ),
   });
   platformAdapter.onSessionConfigurationChange?.(() => {
-    // Reopen the live session after the document owner's shared-folder set or
-    // credentials change so the peer sees the current selection. Defer past
-    // the triggering document command, then retire the prepared listener
-    // before reopening so the replacement cannot race the old bind.
-    setTimeout(() => {
-      void (async () => {
-        try { await stopIncomingService(); }
-        catch (error) {
-          coreAdapter.log?.("core.incoming.refresh.failed", {
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-        const refreshOptions = activeConnectOptions ?? activeResolvedConnectOptions;
-        if (!refreshOptions) return;
-        try { await lifecycle.ensureSession(refreshOptions); }
-        catch (error) {
-          coreAdapter.log?.("core.session.refresh.failed", {
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      })();
-    }, 0);
+    const requestedRevision = platformAdapter.sessionConfigurationRevision?.();
+    sessionConfigurationRefresh = sessionConfigurationRefresh.then(async () => {
+      if (requestedRevision !== platformAdapter.sessionConfigurationRevision?.()) return;
+      const currentOptions = activeConnectOptions ?? activeResolvedConnectOptions;
+      if (!currentOptions) return;
+      try {
+        // The lifecycle key includes the session-configuration revision. Reusing
+        // the current options therefore retires the stale session while keeping
+        // the incoming listener alive; ensureIncomingService updates its
+        // prepared folder handlers before the replacement handshake.
+        await lifecycle.ensureSession(currentOptions);
+      } catch (error) {
+        coreAdapter.log?.("core.session.refresh.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
   });
-
   const ensureSession = (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> =>
     lifecycle.ensureSession(connectOptions);
 
@@ -1022,16 +1023,22 @@ export const createSyncpeerBrowserClient = (
         onSession: session => { void session.close(); },
         onPairingSocket: async (accepted, remoteDeviceId) => {
           if (settled) throw new Error("Pairing invitation is unavailable or already used.");
+          logClient(options.onLog, "client.pairing.accept.socket", {});
           try {
             const invitationRecord = await invitationReady.promise;
+            logClient(options.onLog, "client.pairing.accept.transfer_start", {});
             const result = await acceptPairingTransfer({ subtle: crypto.subtle, socket: accepted.socket,
               invitation: invitationRecord, verifiedRemoteId: remoteDeviceId,
               createTransfer: joiningDevice => platformAdapter.exportPairingTransfer!(identity.deviceId, joiningDevice),
               randomBytes: coreAdapter.randomBytes,
               confirm: pairingOptions.confirm });
+            logClient(options.onLog, "client.pairing.accept.transfer_done", {});
             settled = true; completion.resolve({ remoteDeviceId: result.remoteDeviceId });
             setTimeout(() => { void stopIncomingService(); }, 0);
           } catch (error) {
+            logClient(options.onLog, "client.pairing.accept.failed", {
+              message: error instanceof Error ? error.message : String(error),
+            });
             settled = true; completion.reject(error); throw error;
           }
         },
@@ -1065,6 +1072,7 @@ export const createSyncpeerBrowserClient = (
     },
     joinPairingInvitation: async pairingOptions => {
       if (!platformAdapter.importPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
+      logClient(options.onLog, "client.pairing.join.started", {});
       const identity = await identityForPairing();
       const relayAddress = pairingOptions.invitation.endpoint.startsWith("relay://")
         ? relayPairingEndpoint(pairingOptions.invitation.endpoint) : null;
@@ -1079,19 +1087,32 @@ export const createSyncpeerBrowserClient = (
         socket = await coreAdapter.connectTls({ ...pairingEndpoint(pairingOptions.invitation.endpoint),
           certPem: identity.certPem, keyPem: identity.keyPem, alpnProtocols: ["syncpeer-pairing/1"] });
       }
+      logClient(options.onLog, "client.pairing.join.connected", {});
       try {
         const verifiedRemoteId = await deviceIdFromCertificate(coreAdapter, await socket.peerCertificateDer());
+        logClient(options.onLog, "client.pairing.join.transfer_start", {});
         const joined = await joinPersonalSpace({ subtle: crypto.subtle, socket,
           invitation: pairingOptions.invitation, localDeviceId: identity.deviceId,
           verifiedRemoteId, randomBytes: coreAdapter.randomBytes, confirm: pairingOptions.confirm });
+        logClient(options.onLog, "client.pairing.join.transfer_done", {});
+        logClient(options.onLog, "client.pairing.join.import_start", {});
         await platformAdapter.importPairingTransfer(joined.transfer, joined.deviceIdentity, pairingOptions.password,
           pairingOptions.remember);
+        logClient(options.onLog, "client.pairing.join.import_done", {});
         return { remoteDeviceId: verifiedRemoteId };
+      } catch (error) {
+        logClient(options.onLog, "client.pairing.join.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
       } finally { await socket.close().catch(() => undefined); }
     },
     connectAndSync: async (connectOptions: ConnectOptions): Promise<RemoteFsLike> => {
-      await lifecycle.connect(connectOptions);
+      // The lifecycle retains these desired options while opening or retrying.
+      // Configuration changes during that work must refresh the same request,
+      // rather than substitute the resolved incoming handoff's PEM/options.
       activeConnectOptions = connectOptions;
+      await lifecycle.connect(connectOptions);
       return remoteFsLike;
     },
     connectAndGetOverview: async (

@@ -129,21 +129,23 @@ async function startDocuments(android: AndroidRuntime) {
   const native = (input: object) => request({ method: "storage", input });
   const openStorage = async (id: string) => createNativeFilesystem(native, String(await request({ method: "root", idValue: id })));
   const secret = (operation: string, value?: string) => request({ method: "secret", operation, secret: value });
+  let sessionConfigurationRevision = 0;
+  const sessionConfigurationListeners = new Set<() => void>();
+  const invalidateSessionConfiguration = () => {
+    sessionConfigurationRevision++;
+    for (const listener of sessionConfigurationListeners) listener();
+  };
   const documents = createDocumentFilesystem({ profileId: "documents", profile: await openStorage("profile"), openStorage,
     deviceCounterId: String(await request({ method: "counter" })),
     randomBytes: async size => new Uint8Array(await request({ method: "random", size }) as number[]),
     availableBytes: async () => Number(await request({ method: "availableBytes" })),
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
-      remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true } });
+      remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true },
+    onSessionConfigurationChange: invalidateSessionConfiguration });
   await documents.initialize();
-  let sessionConfigurationRevision = 0;
-  const sessionConfigurationListeners = new Set<() => void>();
   return {
     command: (input: unknown) => dispatchDocumentCommandWithSessionConfiguration(
-      documents, input, () => {
-        sessionConfigurationRevision++;
-        for (const listener of sessionConfigurationListeners) listener();
-      }),
+      documents, input, invalidateSessionConfiguration),
     sessionConfigurationRevision: () => sessionConfigurationRevision,
     onSessionConfigurationChange: (listener: () => void) => { sessionConfigurationListeners.add(listener); },
     releaseLocalCopy: documents.releaseLocalCopy,

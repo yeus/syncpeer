@@ -20,6 +20,10 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
   const active = new Map<symbol, "scanning" | "syncing">();
   const listeners = new Set<(state: ReplicaState) => void>();
   const drained = new Set<() => void>();
+  const committed = (source: "local" | "received") => {
+    try { settings?.onCommittedChange?.(source); }
+    catch { /* A notification failure must not change already-committed storage work. */ }
+  };
   const getState = (): ReplicaState => ({
     phase: stopped ? (active.size || transition ? "closing" : "closed") : transition && transitionTarget === false ? "resuming" : paused ? (active.size || transition ? "pausing" : "paused") :
       active.size ? ([...active.values()].includes("syncing") ? "syncing" : "scanning") :
@@ -47,7 +51,10 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
       throw failure;
     } finally {
       active.delete(token);
-      if (!active.size) { for (const resolve of drained) resolve(); drained.clear(); }
+      if (!active.size) {
+        for (const resolve of drained) resolve();
+        drained.clear();
+      }
       notify();
     }
   };
@@ -71,12 +78,12 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
     readBlock: ((...args) => run("syncing", () => replica.readBlock(...args))) as LocalFolderReplica["readBlock"],
     ...(replica.receive ? { receive: ((...args) => run("syncing", async () => {
       const changed = await replica.receive!(...args);
-      if (changed) settings?.onCommittedChange?.("received");
+      if (changed) committed("received");
       return changed;
     })) as NonNullable<LocalFolderReplica["receive"]> } : {}),
     ...(replica.edit ? { edit: ((...args) => run("syncing", async () => {
       const result = await replica.edit!(...args);
-      settings?.onCommittedChange?.("local");
+      committed("local");
       return result;
     })) as NonNullable<LocalFolderReplica["edit"]> } : {}),
     isPaused: () => paused || stopped,

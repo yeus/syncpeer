@@ -1,4 +1,4 @@
-import type { ConnectOptions } from "./browserClient.js";
+import type { ConnectOptions, ConnectionOverview } from "./browserClient.js";
 import type { ConnectionLifecycleState } from "./connectionLifecycle.js";
 import {
   applyOverviewToState,
@@ -42,13 +42,18 @@ type TraceEmitter = (
 interface SessionActionContext {
   readonly deps: SessionRuntimeDeps;
   readonly now: () => number;
+  readonly sleep: (ms: number) => Promise<void>;
   readonly emitTrace: TraceEmitter;
   readonly getState: () => SessionState;
   readonly setState: (updater: (current: SessionState) => SessionState) => void;
   readonly isConnected: () => boolean;
   readonly resolveOptions: (options?: ConnectOptions) => ConnectOptions;
-  readonly waitForFoldersToPopulate: ReturnType<typeof makeWaitForFoldersToPopulateFlow>;
-  readonly waitForFolderIndexToArrive: ReturnType<typeof makeWaitForFolderIndexToArriveFlow>;
+  readonly waitForFoldersToPopulate: ReturnType<
+    typeof makeWaitForFoldersToPopulateFlow
+  >;
+  readonly waitForFolderIndexToArrive: ReturnType<
+    typeof makeWaitForFolderIndexToArriveFlow
+  >;
   readonly readDirWithRetry: ReturnType<typeof makeReadDirWithRetryFlow>;
   reloadCurrentDirectory: (options?: ConnectOptions) => Promise<void>;
 }
@@ -84,22 +89,31 @@ const sameStringRecord = (
 };
 
 const directoryIsLocked = (state: SessionState): boolean => {
-  const folder = state.folders.find((entry) => entry.id === state.directory.folderId);
+  const folder = state.folders.find(
+    (entry) => entry.id === state.directory.folderId,
+  );
   return Boolean(folder?.encrypted && folder.needsPassword);
 };
 
-const beginConnect = (ctx: SessionActionContext, options: ConnectOptions, nextEpoch: number): void => {
+const beginConnect = (
+  ctx: SessionActionContext,
+  options: ConnectOptions,
+  nextEpoch: number,
+): void => {
   ctx.setState((current) => ({
     ...current,
     phase: "connecting",
     directory: current.directory.folderId
       ? {
-          ...directoryToLoading(current, current.directory.requestSeq + 1).directory,
+          ...directoryToLoading(current, current.directory.requestSeq + 1)
+            .directory,
           versionKey: "",
         }
       : current.directory,
     entries: current.directory.folderId ? [] : current.entries,
-    currentFolderVersionKey: current.directory.folderId ? "" : current.currentFolderVersionKey,
+    currentFolderVersionKey: current.directory.folderId
+      ? ""
+      : current.currentFolderVersionKey,
     pending: {
       ...current.pending,
       connecting: true,
@@ -117,7 +131,9 @@ const applyConnectResult = (
   nextEpoch: number,
   options: ConnectOptions,
   remoteFs: SessionState["remoteFs"],
-  overview: Awaited<ReturnType<SessionRuntimeDeps["transport"]["connectAndGetOverview"]>>,
+  overview: Awaited<
+    ReturnType<SessionRuntimeDeps["transport"]["connectAndGetOverview"]>
+  >,
 ): void => {
   ctx.setState((current) => {
     if (current.requestEpoch !== nextEpoch) return current;
@@ -175,7 +191,11 @@ const reloadConnectedDirectory = async (
   }
 };
 
-const failConnect = (ctx: SessionActionContext, nextEpoch: number, error: unknown): void => {
+const failConnect = (
+  ctx: SessionActionContext,
+  nextEpoch: number,
+  error: unknown,
+): void => {
   const message = resolveErrorMessage(error);
   ctx.setState((current) =>
     current.requestEpoch !== nextEpoch
@@ -198,12 +218,15 @@ const failConnect = (ctx: SessionActionContext, nextEpoch: number, error: unknow
 const connectAction = async (
   ctx: SessionActionContext,
   options: ConnectOptions,
+  preserveSelectedFolder = false,
 ): Promise<void> => {
   const nextEpoch = ctx.getState().requestEpoch + 1;
   beginConnect(ctx, options, nextEpoch);
   try {
     const remoteFs = await ctx.deps.transport.connectAndSync(options);
-    const overview = await ctx.deps.transport.connectAndGetOverview(options);
+    const overview = preserveSelectedFolder
+      ? await readReconnectOverview(ctx, options, nextEpoch)
+      : await ctx.deps.transport.connectAndGetOverview(options);
     applyConnectResult(ctx, nextEpoch, options, remoteFs, overview);
     if (ctx.getState().requestEpoch !== nextEpoch) return;
     await pollFoldersPopulated(ctx, nextEpoch, options);
@@ -214,7 +237,10 @@ const connectAction = async (
   }
 };
 
-const beginDisconnect = (ctx: SessionActionContext, disconnectEpoch: number): void => {
+const beginDisconnect = (
+  ctx: SessionActionContext,
+  disconnectEpoch: number,
+): void => {
   ctx.setState((current) => ({
     ...current,
     phase: "stopping",
@@ -233,7 +259,10 @@ const beginDisconnect = (ctx: SessionActionContext, disconnectEpoch: number): vo
   }));
 };
 
-const finishDisconnect = (ctx: SessionActionContext, disconnectEpoch: number): void => {
+const finishDisconnect = (
+  ctx: SessionActionContext,
+  disconnectEpoch: number,
+): void => {
   ctx.setState((current) =>
     current.requestEpoch !== disconnectEpoch
       ? current
@@ -269,10 +298,10 @@ const beginRefresh = (ctx: SessionActionContext): void => {
   ctx.setState((current) => ({
     ...current,
     phase: "refreshing",
-    directory: (
-      current.directory.folderId && current.directory.status === "ready"
-        ? directoryToStale(current)
-        : current
+    directory: (current.directory.folderId &&
+    current.directory.status === "ready"
+      ? directoryToStale(current)
+      : current
     ).directory,
     pending: { ...current.pending, refreshingOverview: true },
   }));
@@ -281,12 +310,15 @@ const beginRefresh = (ctx: SessionActionContext): void => {
 const applyRefreshedOverview = (
   ctx: SessionActionContext,
   targetEpoch: number,
-  overview: Awaited<ReturnType<SessionRuntimeDeps["transport"]["connectAndGetOverview"]>>,
+  overview: Awaited<
+    ReturnType<SessionRuntimeDeps["transport"]["connectAndGetOverview"]>
+  >,
   resolved: ConnectOptions,
 ): boolean => {
   let shouldReloadDirectory = false;
   ctx.setState((current) => {
-    if (current.requestEpoch !== targetEpoch || current.remoteFs === null) return current;
+    if (current.requestEpoch !== targetEpoch || current.remoteFs === null)
+      return current;
     const applied = applyOverviewToState(current, overview, resolved);
     const nextState = ensureCurrentFolderStillExists({
       ...applied.nextState,
@@ -302,19 +334,23 @@ const applyRefreshedOverview = (
       nextVersionKey !== "" &&
       nextVersionKey !== nextState.directory.versionKey;
     const staleNeedsReload =
-      hasSelectedFolder &&
-      nextState.directory.status === "stale";
+      hasSelectedFolder && nextState.directory.status === "stale";
     shouldReloadDirectory =
-      versionChanged ||
-      staleNeedsReload ||
-      directoryIsLocked(nextState);
+      versionChanged || staleNeedsReload || directoryIsLocked(nextState);
     if (!versionChanged) return nextState;
-    return directoryToStaleKeepingVersion(nextState, nextState.directory.versionKey);
+    return directoryToStaleKeepingVersion(
+      nextState,
+      nextState.directory.versionKey,
+    );
   });
   return shouldReloadDirectory;
 };
 
-const failRefresh = (ctx: SessionActionContext, targetEpoch: number, error: unknown): void => {
+const failRefresh = (
+  ctx: SessionActionContext,
+  targetEpoch: number,
+  error: unknown,
+): void => {
   const message = resolveErrorMessage(error);
   ctx.setState((current) =>
     current.requestEpoch !== targetEpoch
@@ -328,19 +364,58 @@ const failRefresh = (ctx: SessionActionContext, targetEpoch: number, error: unkn
   );
 };
 
+const readReconnectOverview = async (
+  ctx: SessionActionContext,
+  resolved: ConnectOptions,
+  targetEpoch: number,
+): Promise<ConnectionOverview> => {
+  let overview = await ctx.deps.transport.connectAndGetOverview(resolved);
+  const selectedFolderAvailable = () => {
+    const selectedFolderId = ctx.getState().directory.folderId;
+    return (
+      !selectedFolderId ||
+      overview.folders.some((folder) => folder.id === selectedFolderId)
+    );
+  };
+  if (selectedFolderAvailable()) return overview;
+  const deadline = ctx.now() + 4000;
+  while (
+    ctx.now() < deadline &&
+    ctx.getState().requestEpoch === targetEpoch &&
+    ctx.getState().remoteFs
+  ) {
+    await ctx.sleep(200);
+    overview = await ctx.deps.transport.connectAndGetOverview(resolved);
+    if (selectedFolderAvailable()) break;
+  }
+  return overview;
+};
 const refreshOverviewAction = async (
   ctx: SessionActionContext,
   options?: ConnectOptions,
+  preserveSelectedFolder = false,
 ): Promise<void> => {
   const resolved = ctx.resolveOptions(options);
   if (!ctx.getState().remoteFs) return;
   const targetEpoch = ctx.getState().requestEpoch;
   beginRefresh(ctx);
   try {
-    const overview = await ctx.deps.transport.connectAndGetOverview(resolved);
-    const shouldReloadDirectory = applyRefreshedOverview(ctx, targetEpoch, overview, resolved);
-    if (ctx.getState().requestEpoch !== targetEpoch || !ctx.getState().remoteFs) return;
-    if (shouldReloadDirectory && ctx.getState().directory.folderId && !directoryIsLocked(ctx.getState())) {
+    const overview = preserveSelectedFolder
+      ? await readReconnectOverview(ctx, resolved, targetEpoch)
+      : await ctx.deps.transport.connectAndGetOverview(resolved);
+    const shouldReloadDirectory = applyRefreshedOverview(
+      ctx,
+      targetEpoch,
+      overview,
+      resolved,
+    );
+    if (ctx.getState().requestEpoch !== targetEpoch || !ctx.getState().remoteFs)
+      return;
+    if (
+      shouldReloadDirectory &&
+      ctx.getState().directory.folderId &&
+      !directoryIsLocked(ctx.getState())
+    ) {
       await ctx.reloadCurrentDirectory(resolved);
     }
   } catch (error) {
@@ -429,7 +504,9 @@ const waitForFolderIndex = (
     isConnected: ctx.isConnected,
     onFolderSyncStates: (states) => {
       ctx.setState((next) =>
-        next.requestEpoch === targetEpoch ? { ...next, folderSyncStates: states } : next,
+        next.requestEpoch === targetEpoch
+          ? { ...next, folderSyncStates: states }
+          : next,
       );
     },
   });
@@ -440,7 +517,9 @@ const readDirectoryForFolder = async (
   folderId: string,
   readPath: string,
 ) => {
-  const latestFolder = ctx.getState().folders.find((entry) => entry.id === folderId);
+  const latestFolder = ctx
+    .getState()
+    .folders.find((entry) => entry.id === folderId);
   return ctx.readDirWithRetry({
     fs: remoteFs,
     folderId,
@@ -453,7 +532,10 @@ const readDirectoryForFolder = async (
   });
 };
 
-const reportMissingFolderIndex = (ctx: SessionActionContext, folderId: string): never => {
+const reportMissingFolderIndex = (
+  ctx: SessionActionContext,
+  folderId: string,
+): never => {
   ctx.emitTrace(
     "warning",
     "session.flow.folder_index.not_received",
@@ -495,7 +577,8 @@ const failDirectoryLoad = (
 ): void => {
   const message = resolveErrorMessage(error);
   ctx.setState((next) =>
-    next.requestEpoch === targetEpoch && next.directory.requestSeq === requestSeq
+    next.requestEpoch === targetEpoch &&
+    next.directory.requestSeq === requestSeq
       ? directoryToError(next, message)
       : next,
   );
@@ -520,10 +603,27 @@ const reloadCurrentDirectoryAction = async (
   const requestSeq = current.directory.requestSeq + 1;
   ctx.setState((next) => directoryToLoading(next, requestSeq));
   try {
-    const indexResult = await waitForFolderIndex(ctx, folderId, resolved, targetEpoch);
+    const indexResult = await waitForFolderIndex(
+      ctx,
+      folderId,
+      resolved,
+      targetEpoch,
+    );
     if (!indexResult.received) reportMissingFolderIndex(ctx, folderId);
-    const readResult = await readDirectoryForFolder(ctx, current.remoteFs, folderId, readPath);
-    applyDirectoryRead(ctx, targetEpoch, requestSeq, folderId, readPath, readResult.entries);
+    const readResult = await readDirectoryForFolder(
+      ctx,
+      current.remoteFs,
+      folderId,
+      readPath,
+    );
+    applyDirectoryRead(
+      ctx,
+      targetEpoch,
+      requestSeq,
+      folderId,
+      readPath,
+      readResult.entries,
+    );
   } catch (error) {
     failDirectoryLoad(ctx, targetEpoch, requestSeq, error);
     throw error;
@@ -545,7 +645,10 @@ const applyFolderPasswords = (
     return {
       ...current,
       connectOptions: nextConnectOptions,
-      directory: (current.directory.folderId ? directoryToStale(current) : current).directory,
+      directory: (current.directory.folderId
+        ? directoryToStale(current)
+        : current
+      ).directory,
     };
   });
 };
@@ -556,20 +659,26 @@ const setFolderPasswordsAction = async (
 ): Promise<void> => {
   const state = ctx.getState();
   if (!state.connectOptions) return;
-  if (sameStringRecord(state.connectOptions.folderPasswords, folderPasswords)) return;
+  if (sameStringRecord(state.connectOptions.folderPasswords, folderPasswords))
+    return;
   applyFolderPasswords(ctx, folderPasswords);
 };
 
-const createSessionActions = (ctx: SessionActionContext): SessionRuntimeActions => ({
+const createSessionActions = (
+  ctx: SessionActionContext,
+): SessionRuntimeActions => ({
   connect: (options) => connectAction(ctx, options),
   disconnect: () => disconnectAction(ctx),
-  refreshOverview: (options) => refreshOverviewAction(ctx, options),
+  refreshOverview: (options) => refreshOverviewAction(ctx, options, true),
   goToRoot: () => goToRootAction(ctx),
   openFolder: (folderId, options) => openFolderAction(ctx, folderId, options),
   openPath: (path, options) => openPathAction(ctx, path, options),
-  goToPath: (folderId, path, options) => goToPathAction(ctx, folderId, path, options),
-  reloadCurrentDirectory: (options) => reloadCurrentDirectoryAction(ctx, options),
-  setFolderPasswords: (folderPasswords) => setFolderPasswordsAction(ctx, folderPasswords),
+  goToPath: (folderId, path, options) =>
+    goToPathAction(ctx, folderId, path, options),
+  reloadCurrentDirectory: (options) =>
+    reloadCurrentDirectoryAction(ctx, options),
+  setFolderPasswords: (folderPasswords) =>
+    setFolderPasswordsAction(ctx, folderPasswords),
   setOnline: async (online) => {
     await ctx.deps.transport.setOnline?.(online);
   },
@@ -602,9 +711,12 @@ const applyLifecycleState = (
     if (needsRecovery) recoveryOptions = { ...current.connectOptions! };
     return {
       ...current,
-      phase: lifecycleConnected && missingRuntime
-        ? (needsRecovery ? "reconnecting" : "connecting")
-        : lifecycle.phase,
+      phase:
+        lifecycleConnected && missingRuntime
+          ? needsRecovery
+            ? "reconnecting"
+            : "connecting"
+          : lifecycle.phase,
       attempt: lifecycle.attempt,
       nextRetryAtMs: lifecycle.nextRetryAtMs,
       closureReason: lifecycle.closureReason,
@@ -625,10 +737,15 @@ const applyLifecycleState = (
 
 const subscribeToLifecycle = (ctx: SessionActionContext): void => {
   let lifecycleRecovery: Promise<void> | null = null;
+  let pendingRecoveryOptions: ConnectOptions | null = null;
+  let previousPhase: ConnectionLifecycleState["phase"] | null = null;
   const recover = (options: ConnectOptions): void => {
-    if (lifecycleRecovery) return;
+    if (lifecycleRecovery) {
+      pendingRecoveryOptions = options;
+      return;
+    }
     const recovery = Promise.resolve()
-      .then(() => connectAction(ctx, options))
+      .then(() => connectAction(ctx, options, true))
       .catch((error) => {
         ctx.emitTrace(
           "warning",
@@ -639,18 +756,38 @@ const subscribeToLifecycle = (ctx: SessionActionContext): void => {
       });
     lifecycleRecovery = recovery;
     void recovery.finally(() => {
-      if (lifecycleRecovery === recovery) lifecycleRecovery = null;
+      if (lifecycleRecovery !== recovery) return;
+      lifecycleRecovery = null;
+      const pending = pendingRecoveryOptions;
+      pendingRecoveryOptions = null;
+      if (pending && previousPhase === "connected") recover(pending);
     });
   };
   ctx.deps.transport.subscribeLifecycle?.((lifecycle) => {
+    const transitionedToConnected =
+      lifecycle.phase === "connected" && previousPhase !== "connected";
+    previousPhase = lifecycle.phase;
+    const hadRuntime = ctx.getState().remoteFs !== null;
     const recoveryOptions = applyLifecycleState(ctx, lifecycle);
     if (recoveryOptions) recover(recoveryOptions);
+    else if (
+      transitionedToConnected &&
+      hadRuntime &&
+      ctx.getState().connectOptions
+    ) {
+      // A lifecycle reconnect/replacement creates a new underlying session.
+      // Rebind remoteFs through the normal connect path; refreshing only the
+      // overview would leave file operations attached to the retired session.
+      recover({ ...ctx.getState().connectOptions! });
+    }
   });
 };
 
 const createSessionTrace = (depsInput: SessionRuntimeDeps) => {
   const now = depsInput.now ?? (() => Date.now());
-  const sleep = depsInput.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const sleep =
+    depsInput.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const emitTrace: TraceEmitter = (level, event, message, details) => {
     depsInput.onTrace?.({ atMs: now(), level, event, message, details });
   };
@@ -692,7 +829,9 @@ const createSessionContext = (args: {
   const resolveOptions = (options?: ConnectOptions): ConnectOptions => {
     const resolved = options ?? store.getState().connectOptions;
     if (!resolved) {
-      throw new Error("No connection options available. Call connect() with options first.");
+      throw new Error(
+        "No connection options available. Call connect() with options first.",
+      );
     }
     return resolved;
   };
@@ -703,11 +842,13 @@ const createSessionContext = (args: {
   const flowDeps: FlowDeps = {
     sleep,
     now,
-    log: (entry) => emitTrace(entry.level, entry.event, entry.message, entry.details),
+    log: (entry) =>
+      emitTrace(entry.level, entry.event, entry.message, entry.details),
   };
   const context: SessionActionContext = {
     deps,
     now,
+    sleep,
     emitTrace,
     getState: store.getState,
     setState: store.setState,
@@ -716,15 +857,24 @@ const createSessionContext = (args: {
     waitForFoldersToPopulate: makeWaitForFoldersToPopulateFlow(flowDeps),
     waitForFolderIndexToArrive: makeWaitForFolderIndexToArriveFlow(flowDeps),
     readDirWithRetry: makeReadDirWithRetryFlow({ sleep, now }),
-    reloadCurrentDirectory: (options) => reloadCurrentDirectoryAction(context, options),
+    reloadCurrentDirectory: (options) =>
+      reloadCurrentDirectoryAction(context, options),
   };
   return context;
 };
 
-export const createSyncpeerSessionStore = (depsInput: SessionRuntimeDeps): SyncpeerSessionStore => {
+export const createSyncpeerSessionStore = (
+  depsInput: SessionRuntimeDeps,
+): SyncpeerSessionStore => {
   const { now, sleep, emitTrace } = createSessionTrace(depsInput);
   const store = createSessionStateStore();
-  const context = createSessionContext({ deps: depsInput, now, sleep, emitTrace, store });
+  const context = createSessionContext({
+    deps: depsInput,
+    now,
+    sleep,
+    emitTrace,
+    store,
+  });
   const actions = createSessionActions(context);
   subscribeToLifecycle(context);
   return {

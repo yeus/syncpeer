@@ -8,6 +8,7 @@ export interface PairingInvitation {
   expiresAt: number;
   nonce: string;
   publicKey: string;
+  transferAck?: true;
 }
 
 export interface PairingRequest {
@@ -17,6 +18,7 @@ export interface PairingRequest {
   publicKey: string;
   device: OwnedSpaceDevice;
   deviceProof: string;
+  transferAck?: true;
 }
 
 export interface PairingTransfer {
@@ -51,7 +53,8 @@ export async function createPairingInvitation(subtle: SubtleCrypto,
   const pair = await keyPair(subtle), nonce = await randomBytes(16);
   if (nonce.length !== 16) throw new Error("Invalid pairing random source.");
   return { privateKey: pair.privateKey, invitation: { format: 1 as const, deviceId, endpoint, expiresAt,
-    nonce: encode(nonce), publicKey: encode(new Uint8Array(await subtle.exportKey("raw", pair.publicKey))) } };
+    nonce: encode(nonce), publicKey: encode(new Uint8Array(await subtle.exportKey("raw", pair.publicKey))),
+    transferAck: true as const } };
 }
 
 export async function createPairingRequest(subtle: SubtleCrypto,
@@ -68,7 +71,8 @@ export async function createPairingRequest(subtle: SubtleCrypto,
   return { privateKey: pair.privateKey, request: { format: 1 as const, deviceId, nonce: encode(nonce),
     publicKey: encode(new Uint8Array(await subtle.exportKey("raw", pair.publicKey))),
     device, deviceProof: encode(new Uint8Array(await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signingKey,
-      deviceProofBytes(invitation, device)))) }, deviceIdentity };
+      deviceProofBytes(invitation, device)))),
+    ...(invitation.transferAck === true ? { transferAck: true as const } : {}) }, deviceIdentity };
 }
 
 /** The transport must supply the peer ID from its verified TLS certificate. */

@@ -186,6 +186,99 @@ test("incoming Hello uses folders prepared before listening, without reopening d
   }
 });
 
+for (const direction of ["incoming", "outgoing"] as const) {
+test(`${direction} session configuration invalidation reopens with the current shared-folder view`, { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-live-folder-refresh-"));
+  const adapter = createNodeHostAdapter();
+  const [highIdentity, lowIdentity] = (await Promise.all([
+    identity(root, "high"), identity(root, "low"),
+  ])).sort((a, b) => b.deviceId.replaceAll("-", "").localeCompare(a.deviceId.replaceAll("-", "")));
+  const trusted = [
+    { id: "high-slot", syncthingId: highIdentity.deviceId, state: "active" as const, signingKey: "high-key" },
+    { id: "low-slot", syncthingId: lowIdentity.deviceId, state: "active" as const, signingKey: "low-key" },
+  ];
+  const internalFolder = { id: "settings", internal: true, encryption: { mode: "plaintext" as const } };
+  const sharedFolder = { id: "shared", encryption: { mode: "plaintext" as const } };
+  let highPort = 0;
+  let revision = 0;
+  let invalidate = () => {};
+  let currentFolders = [internalFolder];
+  const selections: number[] = [];
+  const phases: string[] = [];
+  const diagnostics: string[] = [];
+  const onLog = (entry: { event: string; details?: Record<string, unknown> }) => {
+    if (entry.event === "client.shared_folders.selected" && typeof entry.details?.count === "number") {
+      selections.push(entry.details.count);
+    }
+  };
+  const refreshingPlatform = {
+    sessionConfigurationRevision: () => revision,
+    onSessionConfigurationChange: (listener: () => void) => { invalidate = listener; },
+  };
+  const high = createSyncpeerBrowserClient({
+    ...(direction === "incoming" ? { onLog } : {}), hostAdapter: { ...adapter,
+    log: (event, details) => {
+      if (/failed|handshake.ready|socket.closed/.test(event)) diagnostics.push(`incoming:${event}:${details?.message ?? ""}`);
+    },
+    listenTls: async options => {
+      const listener = await adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 });
+      highPort = listener.port;
+      return listener;
+    },
+  }, platformAdapter: {
+    readDefaultIdentity: async () => highIdentity,
+    ownedDevices: async () => trusted,
+    ...(direction === "incoming" ? refreshingPlatform : {}),
+    sessionSharedFolders: async () => direction === "incoming" ? currentFolders : [internalFolder, sharedFolder],
+  } });
+  const low = createSyncpeerBrowserClient({ hostAdapter: { ...adapter,
+    log: (event, details) => {
+      if (/failed|handshake.ready|socket.closed/.test(event)) diagnostics.push(`outgoing:${event}:${details?.message ?? ""}`);
+    }, },
+    ...(direction === "outgoing" ? { onLog } : {}), platformAdapter: {
+    readDefaultIdentity: async () => lowIdentity,
+    ownedDevices: async () => trusted,
+    ...(direction === "outgoing" ? refreshingPlatform : {}),
+    sessionSharedFolders: async () => direction === "outgoing" ? currentFolders : [internalFolder, sharedFolder],
+  } });
+  const highConnected = Promise.withResolvers<void>();
+  const unsubscribeHigh = high.subscribeLifecycle(state => {
+    if (state.phase === "connected") highConnected.resolve();
+    if (direction === "incoming") phases.push(state.phase);
+  });
+  const unsubscribeLow = low.subscribeLifecycle(state => {
+    if (direction === "outgoing") phases.push(state.phase);
+  });
+  try {
+    await assert.rejects(high.connectAndSync({ host: "127.0.0.1", port: 1,
+      remoteId: lowIdentity.deviceId, discoveryMode: "direct", timeoutMs: 1000 }));
+    await low.connectAndSync({ host: "127.0.0.1", port: highPort,
+      remoteId: highIdentity.deviceId, discoveryMode: "direct", timeoutMs: 3000 });
+    await highConnected.promise;
+    assert.ok(selections.includes(1), `Initial shared-folder view was not observed: ${selections.join(",")}`);
+    const refreshPhaseStart = phases.length;
+    currentFolders = [internalFolder, sharedFolder];
+    revision++;
+    invalidate();
+    const deadline = Date.now() + 8000;
+    while ((!selections.includes(2) || !phases.slice(refreshPhaseStart).includes("connected")) &&
+      Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(selections.includes(2),
+      `Invalidation did not select the current shared-folder view: ${selections.join(",")}`);
+    assert.ok(phases.slice(refreshPhaseStart).includes("connected"),
+      `Invalidation selected fresh folders but did not complete a replacement session: ${phases.slice(refreshPhaseStart).join(",")}; ${diagnostics.join(";")}`);
+  } finally {
+    unsubscribeHigh();
+    unsubscribeLow();
+    await Promise.allSettled([low.disconnect(), high.disconnect()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+}
+
+
 test("browser clients pair over the production LAN TLS adapters and persist only after confirmation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-browser-pairing-"));
   let handle: Awaited<ReturnType<ReturnType<typeof createSyncpeerBrowserClient>["startPairingInvitation"]>> | undefined;

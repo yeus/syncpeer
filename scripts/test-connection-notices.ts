@@ -43,6 +43,45 @@ test("high-frequency storage and socket operations do not flood the visible sess
   assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_listen"), true);
 });
 
+test("native sockets keep bulk reads binary but use reliable structured writes", async () => {
+  const calls: Array<{ command: string; args?: unknown }> = [];
+  const scope = globalThis as typeof globalThis & {
+    __TAURI__?: { core?: { invoke?: <T>(command: string, args?: unknown) => Promise<T> } };
+  };
+  const previousTauri = scope.__TAURI__;
+  scope.__TAURI__ = { core: { invoke: async <T>(command: string, args?: unknown): Promise<T> => {
+    calls.push({ command, args });
+    if (command === "syncpeer_tls_open") {
+      return { sessionId: 7, peerCertificateDer: [1, 2, 3] } as T;
+    }
+    if (command === "syncpeer_tls_read_binary") {
+      assert.ok(args instanceof Uint8Array);
+      const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+      assert.equal(view.getUint32(0, true), 7);
+      assert.equal(view.getUint32(8, true), 65540);
+      return new Uint8Array([9, 10]).buffer as unknown as T;
+    }
+    if (command === "syncpeer_tls_write") {
+      assert.deepEqual(args, { request: { sessionId: 7, bytes: [11, 12] } });
+      return undefined as T;
+    }
+    if (command === "syncpeer_tls_close") return undefined as T;
+    throw new Error(`Unexpected command: ${command}`);
+  } } };
+
+  try {
+    const socket = await createTauriAdapters({ runtimePlatform: "linux" }).hostAdapter.connectTls!({
+      host: "127.0.0.1", port: 22000, certPem: "cert", keyPem: "key", alpnProtocols: ["bep/1.0"],
+    });
+    assert.deepEqual([...await socket.read(65540)], [9, 10]);
+    await socket.write(new Uint8Array([11, 12]));
+    await socket.close();
+    assert.equal(calls.some(call => call.command === "syncpeer_tls_write_binary"), false);
+  } finally {
+    scope.__TAURI__ = previousTauri;
+  }
+});
+
 test("serializes overlapping native local discovery calls", async () => {
   let discoveryCalls = 0;
   let releaseFirstDiscovery = () => {};

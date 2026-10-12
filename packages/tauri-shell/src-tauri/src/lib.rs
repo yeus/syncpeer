@@ -3761,18 +3761,6 @@ fn binary_socket_read_request(request: &tauri::ipc::Request<'_>) -> Result<TlsRe
     })
 }
 
-fn binary_socket_write_request(
-    request: &tauri::ipc::Request<'_>,
-) -> Result<TlsWriteRequest, String> {
-    let body = raw_socket_body(request)?;
-    if body.len() < 8 || body.len() > 8 + 64 * 1024 * 1024 {
-        return Err("Invalid binary socket write request".into());
-    }
-    Ok(TlsWriteRequest {
-        session_id: raw_socket_u64(body, 0)?,
-        bytes: body[8..].to_vec(),
-    })
-}
 
 fn binary_socket_read_response(response: TlsReadResponse) -> Result<tauri::ipc::Response, String> {
     if response.eof {
@@ -3797,14 +3785,6 @@ async fn syncpeer_quic_read_binary(
     binary_socket_read_response(
         read_quic_session(store.inner(), binary_socket_read_request(&request)?).await?,
     )
-}
-
-#[tauri::command]
-async fn syncpeer_quic_write_binary(
-    store: tauri::State<'_, SharedQuicStore>,
-    request: tauri::ipc::Request<'_>,
-) -> Result<(), String> {
-    write_quic_session(store.inner(), binary_socket_write_request(&request)?).await
 }
 
 #[tauri::command]
@@ -3835,18 +3815,6 @@ async fn syncpeer_tls_read_binary(
             .await
             .map_err(|error| format!("TLS read task join error: {error}"))??;
     binary_socket_read_response(response)
-}
-
-#[tauri::command]
-async fn syncpeer_tls_write_binary(
-    store: tauri::State<'_, SharedTlsStore>,
-    request: tauri::ipc::Request<'_>,
-) -> Result<(), String> {
-    let request = binary_socket_write_request(&request)?;
-    let shared_store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || write_tls_session(&shared_store, request))
-        .await
-        .map_err(|error| format!("TLS write task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -5497,12 +5465,10 @@ pub fn run() {
             syncpeer_tls_read,
             syncpeer_tls_write,
             syncpeer_tls_read_binary,
-            syncpeer_tls_write_binary,
             syncpeer_tls_close,
             syncpeer_quic_read,
             syncpeer_quic_write,
             syncpeer_quic_read_binary,
-            syncpeer_quic_write_binary,
             syncpeer_quic_close,
             syncpeer_log_ui_error,
             syncpeer_list_favorites,

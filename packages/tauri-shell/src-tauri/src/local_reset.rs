@@ -71,9 +71,16 @@ pub async fn syncpeer_reset_local_data(
             .try_for_each(|path| clear_app_directory(path, identifier))
             .and_then(|_| crate::vault_secret::remove_local_reset_credentials());
         let closing = app.clone();
+        let reset_succeeded = result.is_ok();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            closing.exit(0);
+            // Use Tauri's build mode, not the Rust optimization profile: packaged
+            // debug builds also have a self-contained frontend and can restart.
+            if reset_succeeded && !cfg!(dev) {
+                closing.request_restart();
+            } else {
+                closing.exit(0);
+            }
         });
         result?;
     }

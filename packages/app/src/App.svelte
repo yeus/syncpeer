@@ -129,7 +129,6 @@
         invoke: (command, args) => invoke(command, args),
         prompt: message => window.prompt(message),
         clearLocalState: () => window.localStorage.clear(),
-        reload: () => window.location.reload(),
       });
     } catch {
       privateStorageResetError = "Syncpeer could not reset its private local data. Nothing outside the app was changed.";

@@ -27,7 +27,6 @@
         invoke: (command, args) => invoke(command, args),
         prompt: message => window.prompt(message),
         clearLocalState: () => window.localStorage.clear(),
-        reload: () => window.location.reload(),
       });
     } catch {
       resetError = "Local reset failed or was incomplete. Restart Syncpeer before using it again.";

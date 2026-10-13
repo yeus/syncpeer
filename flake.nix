@@ -404,6 +404,7 @@ EOF
             mesa
             xdg-utils
             openbox
+            scrot
             xorg.xprop
             xvfb-run
 

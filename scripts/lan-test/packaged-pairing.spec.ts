@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -40,10 +41,13 @@ async function captureScreenshot(peer: WebdriverIO.Browser, name: string) {
   if (!screenshotDir) return;
   await mkdir(screenshotDir, { recursive: true });
   console.log(`Packaged screenshots: capturing ${name}.`);
-  // WebKit snapshots can remain pending while the other packaged app has focus.
+  // Capture the requested app, not whichever isolated peer last had focus.
   await focusPeer(peer);
   console.log(`Packaged screenshots: focused ${name}.`);
-  await peer.saveScreenshot(path.join(screenshotDir, `syncpeer-${name}.png`));
+  const destination = path.join(screenshotDir, `syncpeer-${name}.png`);
+  const result = spawnSync("scrot", ["-u", destination], { stdio: "inherit" });
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, "The focused desktop window screenshot failed.");
   console.log(`Packaged screenshots: captured ${name}.`);
 }
 

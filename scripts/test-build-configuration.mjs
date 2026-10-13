@@ -90,6 +90,19 @@ test("packaged screenshot capture ensures ignored Tauri icons before building", 
   );
 });
 
+test("packaged screenshots use focused-window capture in screenshot environments", () => {
+  const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
+  assert.match(spec, /spawnSync\("scrot", \["-u",/);
+  assert.doesNotMatch(spec, /\.saveScreenshot\(/);
+  for (const file of [
+    ".github/workflows/screenshots.yml",
+    ".github/workflows/release.yml",
+  ]) {
+    assert.match(fs.readFileSync(file, "utf8"), /\n\s+scrot\s+\\/);
+  }
+  assert.match(fs.readFileSync("flake.nix", "utf8"), /\n\s+scrot\s*\n/);
+});
+
 test("desktop screenshot focus permission is limited to LAN E2E builds", () => {
   const root = "packages/tauri-shell/src-tauri";
   const permission = "core:window:allow-set-focus";

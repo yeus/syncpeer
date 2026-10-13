@@ -42,6 +42,7 @@ jobs:
             libxdo-dev \
             librsvg2-dev \
             patchelf \
+            scrot \
             webkit2gtk-driver \
             wget \
             xauth \

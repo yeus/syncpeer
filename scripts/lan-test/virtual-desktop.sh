@@ -10,6 +10,11 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
+# Xvfb has no GPU, so keep WebKit on its supported software-rendering path.
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+
 # Native window activation needs a window manager, even on a virtual display.
 openbox --sm-disable &
 virtual_desktop_wm_pid=$!

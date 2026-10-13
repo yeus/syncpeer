@@ -10,6 +10,7 @@ import {
   openGeneralSettings,
   openFolderSettings,
   clickButtonByText,
+  setAutomaticConnectionPaused,
   setDirectConnectionFields,
   setUploadBytes,
 } from "./ui-helpers.js";
@@ -22,11 +23,7 @@ const folderName = "Synthetic desktop folder";
 
 const screenshotDir = process.env.SYNCPEER_SCREENSHOT_DIR?.trim();
 
-async function captureScreenshot(peer: WebdriverIO.Browser, name: string) {
-  if (!screenshotDir) return;
-  await mkdir(screenshotDir, { recursive: true });
-  console.log(`Packaged screenshots: capturing ${name}.`);
-  // WebKit snapshots can remain pending while the other packaged app has focus.
+async function focusPeer(peer: WebdriverIO.Browser) {
   await peer.execute(async () => {
     const tauri = (window as typeof window & {
       __TAURI__: typeof Tauri;
@@ -35,8 +32,16 @@ async function captureScreenshot(peer: WebdriverIO.Browser, name: string) {
   });
   await peer.waitUntil(() => peer.execute(() => document.hasFocus()), {
     timeout: 5_000,
-    timeoutMsg: "The screenshot target window did not gain focus.",
+    timeoutMsg: "The target desktop window did not gain focus.",
   });
+}
+
+async function captureScreenshot(peer: WebdriverIO.Browser, name: string) {
+  if (!screenshotDir) return;
+  await mkdir(screenshotDir, { recursive: true });
+  console.log(`Packaged screenshots: capturing ${name}.`);
+  // WebKit snapshots can remain pending while the other packaged app has focus.
+  await focusPeer(peer);
   console.log(`Packaged screenshots: focused ${name}.`);
   await peer.saveScreenshot(path.join(screenshotDir, `syncpeer-${name}.png`));
   console.log(`Packaged screenshots: captured ${name}.`);
@@ -70,38 +75,7 @@ async function configureConnection(
   remotePort: number,
   localPort: number,
 ) {
-  await peer.$("[data-testid='tab-devices']").click();
-  for (const testId of [
-    "connection-settings-toggle",
-    "connection-status-toggle",
-  ]) {
-    if (testId === "connection-status-toggle") {
-      await peer.execute(() => {
-        const expert = document.querySelector("[data-testid='expert-view']");
-        if (!(expert instanceof HTMLInputElement))
-          throw new Error("Expert view is unavailable.");
-        if (!expert.checked) expert.click();
-      });
-    }
-    await peer.execute((id) => {
-      const button = document.querySelector(`[data-testid='${id}']`);
-      if (!(button instanceof HTMLButtonElement))
-        throw new Error(`Connection control ${id} is unavailable.`);
-      if (button.getAttribute("aria-expanded") !== "true") button.click();
-    }, testId);
-  }
-  await peer
-    .$("[data-testid='expert-connection-control']")
-    .waitForExist({ timeout: 5_000 });
-  await peer.execute(() => {
-    const control = document.querySelector(
-      "[data-testid='expert-connection-control']",
-    );
-    if (!(control instanceof HTMLButtonElement))
-      throw new Error("Expert connection control is unavailable.");
-    if (control.textContent?.includes("Pause automatic connection"))
-      control.click();
-  });
+  await setAutomaticConnectionPaused(peer, true);
   await setDirectConnectionFields(peer, {
     remoteId,
     host: "127.0.0.1",
@@ -1057,8 +1031,21 @@ describe("Two isolated packaged desktop apps", () => {
         ),
       ),
     );
+    await focusPeer(joiner);
     await configureConnection(owner, joinerId, joinerPort, ownerPort);
+    await focusPeer(owner);
     await configureConnection(joiner, ownerId, ownerPort, joinerPort);
+    for (const peer of [owner, joiner]) {
+      await focusPeer(peer === owner ? joiner : owner);
+      assert.equal(await peer.execute(() => document.hasFocus()), false);
+      await setAutomaticConnectionPaused(peer, true);
+      await setAutomaticConnectionPaused(peer, true);
+      assert.equal(
+        (await peer.$("[data-testid='expert-connection-control']").getText()).trim(),
+        "Resume automatic connection",
+        "Repeated pause requests must leave this peer paused.",
+      );
+    }
     await Promise.all([owner, joiner].map(captureSelectedFolderCounts));
     console.log("Packaged folder test: resuming direct connections.");
     // The higher device ID accepts the retained socket. Resume it first;
@@ -1067,7 +1054,15 @@ describe("Two isolated packaged desktop apps", () => {
       preferredPeerDirection(ownerId, joinerId) === "incoming";
     const acceptor = ownerAccepts ? owner : joiner;
     const dialer = ownerAccepts ? joiner : owner;
-    await acceptor.$("[data-testid='expert-connection-control']").click();
+    await focusPeer(dialer);
+    assert.equal(await acceptor.execute(() => document.hasFocus()), false);
+    await setAutomaticConnectionPaused(acceptor, false);
+    await setAutomaticConnectionPaused(acceptor, false);
+    assert.equal(
+      (await dialer.$("[data-testid='expert-connection-control']").getText()).trim(),
+      "Resume automatic connection",
+      "Resuming the acceptor must leave the dialer paused.",
+    );
     const acceptorPort = ownerAccepts ? ownerPort : joinerPort;
     try {
       await acceptor.waitUntil(() => isListening(acceptorPort), {
@@ -1075,7 +1070,17 @@ describe("Two isolated packaged desktop apps", () => {
         timeoutMsg:
           "The packaged acceptor did not open its configured LAN listener.",
       });
-      await dialer.$("[data-testid='expert-connection-control']").click();
+      await focusPeer(acceptor);
+      assert.equal(await dialer.execute(() => document.hasFocus()), false);
+      await setAutomaticConnectionPaused(dialer, false);
+      await setAutomaticConnectionPaused(dialer, false);
+      for (const peer of [owner, joiner]) {
+        assert.equal(
+          (await peer.$("[data-testid='expert-connection-control']").getText()).trim(),
+          "Pause automatic connection",
+          "Both background peers must resume before waiting for a connection.",
+        );
+      }
       await Promise.all(
         [owner, joiner].map((peer) =>
           peer.waitUntil(
@@ -1207,35 +1212,46 @@ describe("Two isolated packaged desktop apps", () => {
         `The packaged peer did not select its encrypted settings replica: ${JSON.stringify(selections)}.`,
       );
     }
-    await joiner.waitUntil(
-      async () => {
-        const states = await joiner.execute(
-          () =>
-            (
-              window as typeof window & {
-                __syntheticReplicaStates?: string[];
-              }
-            ).__syntheticReplicaStates ?? [],
-        );
-        return states.some((value) => {
-          const state = JSON.parse(value) as {
-            event?: string;
-            internal?: boolean;
-            changed?: boolean;
-          };
-          return (
-            state.event === "core.replica.index.receive.done" &&
-            state.internal === true &&
-            state.changed === true
+    try {
+      await joiner.waitUntil(
+        async () => {
+          const states = await joiner.execute(
+            () =>
+              (
+                window as typeof window & {
+                  __syntheticReplicaStates?: string[];
+                }
+              ).__syntheticReplicaStates ?? [],
           );
-        });
-      },
-      {
-        timeout: 20_000,
-        timeoutMsg:
-          "The packaged personal-space settings replica did not finish receiving within the BEP request budget.",
-      },
-    );
+          return states.some((value) => {
+            const state = JSON.parse(value) as {
+              event?: string;
+              internal?: boolean;
+              changed?: boolean;
+            };
+            return (
+              state.event === "core.replica.index.receive.done" &&
+              state.internal === true &&
+              state.changed === true
+            );
+          });
+        },
+        {
+          timeout: 20_000,
+          timeoutMsg:
+            "The packaged personal-space settings replica did not finish receiving within the BEP request budget.",
+        },
+      );
+    } catch (error) {
+      const diagnostics = await captureReconnectDiagnostics(owner, joiner, [
+        ownerPort,
+        joinerPort,
+      ]);
+      throw new Error(
+        `Packaged settings replica failed: ${JSON.stringify(diagnostics)}.`,
+        { cause: error },
+      );
+    }
     // Observe Folders before the joiner changes its selection. A folder-row
     // assertion while Devices is selected cannot prove automatic view refresh.
     await owner.$("[data-testid='tab-folders']").click();
@@ -1317,39 +1333,19 @@ describe("Two isolated packaged desktop apps", () => {
     const { owner, joiner } = peers();
 
     for (const peer of [owner, joiner]) {
-      await peer.$("[data-testid='tab-devices']").click();
-      await peer.execute(() => {
-        for (const testId of [
-          "connection-settings-toggle",
-          "connection-status-toggle",
-        ]) {
-          const button = document.querySelector(`[data-testid='${testId}']`);
-          if (!(button instanceof HTMLButtonElement))
-            throw new Error(`Connection control ${testId} is unavailable.`);
-          if (button.getAttribute("aria-expanded") !== "true") button.click();
-        }
-        const expert = document.querySelector("[data-testid='expert-view']");
-        if (!(expert instanceof HTMLInputElement))
-          throw new Error("Expert view is unavailable.");
-        if (!expert.checked) expert.click();
-      });
-      const control = peer.$("[data-testid='expert-connection-control']");
-      await control.waitForExist({ timeout: 5_000 });
-      if ((await control.getText()).includes("Pause automatic connection")) {
-        await control.click();
-        await peer.waitUntil(
-          async () =>
-            !(
-              await peer.$("[data-testid='connection-status']").getText()
-            ).includes("Connected"),
-          {
-            timeout: 30_000,
-            interval: 250,
-            timeoutMsg:
-              "Packaged desktop did not close its direct session before public-network testing.",
-          },
-        );
-      }
+      await setAutomaticConnectionPaused(peer, true);
+      await peer.waitUntil(
+        async () =>
+          !(
+            await peer.$("[data-testid='connection-status']").getText()
+          ).includes("Connected"),
+        {
+          timeout: 30_000,
+          interval: 250,
+          timeoutMsg:
+            "Packaged desktop did not close its direct session before public-network testing.",
+        },
+      );
 
       await peer
         .$("[data-testid='connection-discovery-mode']")
@@ -1377,11 +1373,7 @@ describe("Two isolated packaged desktop apps", () => {
     }
 
     await Promise.all(
-      [owner, joiner].map(async (peer) => {
-        const control = peer.$("[data-testid='expert-connection-control']");
-        if ((await control.getText()).includes("Resume automatic connection"))
-          await control.click();
-      }),
+      [owner, joiner].map((peer) => setAutomaticConnectionPaused(peer, false)),
     );
     await Promise.all(
       [owner, joiner].map((peer) =>

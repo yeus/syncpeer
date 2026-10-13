@@ -107,7 +107,7 @@ test("desktop screenshot focus permission is limited to LAN E2E builds", () => {
   }
 });
 
-test("the virtual desktop preserves target failures and stops its window manager", context => {
+test("the virtual desktop uses software rendering, preserves target failures and stops its window manager", context => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-virtual-desktop-test-"));
   const pidFile = path.join(root, "wm.pid");
   context.after(() => {
@@ -125,8 +125,14 @@ test("the virtual desktop preserves target failures and stops its window manager
     'printf "%s\\n" "_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1234"\n',
     { mode: 0o700 });
   const result = spawnSync("bash", ["scripts/lan-test/virtual-desktop.sh",
-    "--inside-xvfb", "sh", "-c", "exit 7"], {
-    env: { ...process.env, PATH: `${root}:${process.env.PATH}`, SYNCPEER_FAKE_WM_PID: pidFile },
+    "--inside-xvfb", "sh", "-c", [
+      'test "$WEBKIT_DISABLE_DMABUF_RENDERER" = 1 || exit 9',
+      'test "$LIBGL_ALWAYS_SOFTWARE" = 1 || exit 9',
+      'test "$GALLIUM_DRIVER" = llvmpipe || exit 9',
+      "exit 7",
+    ].join("\n")], {
+    env: { ...process.env, PATH: `${root}:${process.env.PATH}`, SYNCPEER_FAKE_WM_PID: pidFile,
+      WEBKIT_DISABLE_DMABUF_RENDERER: "0", LIBGL_ALWAYS_SOFTWARE: "0", GALLIUM_DRIVER: "synthetic-hardware" },
     encoding: "utf8", timeout: 10_000,
   });
   assert.equal(result.status, 7, result.stderr);

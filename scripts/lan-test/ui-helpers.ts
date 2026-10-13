@@ -252,20 +252,40 @@ export const waitForDisconnected = async (
 };
 
 export const setAutomaticConnectionPaused = async (
-  browser: TauriBrowser,
+  browser: WebdriverIO.Browser,
   paused: boolean,
 ): Promise<void> => {
-  await $("[data-testid='tab-devices']").click();
-  const settings = $("[data-testid='connection-settings-toggle']");
-  if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
-  const expert = $("[data-testid='expert-view']");
-  if (!(await expert.isSelected())) await expert.click();
-  const disclosure = $("[data-testid='connection-status-toggle']");
-  if (await disclosure.getAttribute("aria-expanded") !== "true") await disclosure.click();
-  const control = $("[data-testid='expert-connection-control']");
+  await browser.$("[data-testid='tab-devices']").waitForExist({ timeout: 5_000 });
+  await browser.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-devices']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Device tab is unavailable.");
+    tab.click();
+  });
+  for (const testId of ["connection-settings-toggle", "expert-view", "connection-status-toggle"]) {
+    await browser.$(`[data-testid='${testId}']`).waitForExist({ timeout: 5_000 });
+    await browser.execute((id: string) => {
+      const control = document.querySelector(`[data-testid='${id}']`);
+      if (id === "expert-view" && control instanceof HTMLInputElement) {
+        if (!control.checked) control.click();
+      } else if (control instanceof HTMLButtonElement) {
+        if (control.getAttribute("aria-expanded") !== "true") control.click();
+      } else {
+        throw new Error(`Connection control ${id} is unavailable.`);
+      }
+    }, testId);
+  }
+  const control = browser.$("[data-testid='expert-connection-control']");
+  await control.waitForEnabled({ timeout: 5_000 });
+  const expected = paused ? "Resume automatic connection" : "Pause automatic connection";
+  const action = paused ? "Pause automatic connection" : "Resume automatic connection";
   const label = (await control.getText()).trim();
-  if (paused && label === "Pause automatic connection") await control.click();
-  if (!paused && label === "Resume automatic connection") await control.click();
+  if (label !== expected && label !== action)
+    throw new Error(`Unexpected automatic connection control: ${label}.`);
+  if (label === action) await clickButtonByText(browser, action);
+  await browser.waitUntil(async () => (await control.getText()).trim() === expected, {
+    timeout: 5_000,
+    timeoutMsg: `Automatic connection did not become ${paused ? "paused" : "resumed"}.`,
+  });
 };
 
 export const readCachedHash = async (

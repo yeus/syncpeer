@@ -247,6 +247,7 @@ jobs:
             dbus-x11 \
             file \
             gnome-keyring \
+            openbox \
             libayatana-appindicator3-dev \
             libfuse2 \
             libgtk-3-dev \
@@ -258,6 +259,7 @@ jobs:
             webkit2gtk-driver \
             wget \
             xauth \
+            x11-utils \
             xvfb
 
       - name: Setup Node.js

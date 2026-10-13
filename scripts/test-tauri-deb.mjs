@@ -23,6 +23,7 @@ if (serial) {
 }
 const root = await mkdtemp(path.join(tmpdir(), "syncpeer-deb-smoke-"));
 try {
+  const virtualDesktop = path.resolve("scripts/lan-test/virtual-desktop.sh");
   const packageRoot = path.join(root, "package");
   const extracted = spawnSync("dpkg-deb", ["--extract", artifact, packageRoot], { stdio: "inherit" });
   if (extracted.error) throw extracted.error;
@@ -30,7 +31,7 @@ try {
   const binary = path.join(packageRoot, "usr", "bin", "tauri-shell");
   assert.ok((await stat(binary)).isFile(), "The .deb payload has no Tauri executable.");
   if (!crossAppOnly) {
-    const code = await runWithPrivateSecretService("xvfb-run", ["-a", process.execPath,
+    const code = await runWithPrivateSecretService("bash", [virtualDesktop, process.execPath,
       "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
       "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {
       SYNCPEER_LAN_SPEC: "scripts/lan-test/release-smoke.spec.ts",
@@ -41,7 +42,7 @@ try {
       XDG_DATA_DIRS: process.env.SYNCPEER_DEB_XDG_DATA_DIRS ?? "/usr/share",
     });
     assert.equal(code, 0, "The packaged fresh-profile smoke test failed.");
-    const pairing = spawnSync("xvfb-run", ["-a", process.execPath, "--import", "tsx",
+    const pairing = spawnSync("bash", [virtualDesktop, process.execPath, "--import", "tsx",
       path.resolve("node_modules/@wdio/cli/bin/wdio.js"), "run",
       path.resolve("scripts/lan-test/wdio-pairing.conf.ts")], {
       stdio: "inherit", env: { ...process.env, SYNCPEER_LAN_APP_BINARY: binary,
@@ -101,7 +102,7 @@ try {
       assert.equal(recovery.status, 0, "Android packaged recovery acceptance failed.");
     }
     clearAndroid();
-    const crossApp = await runWithPrivateSecretService("xvfb-run", ["-a", process.execPath,
+    const crossApp = await runWithPrivateSecretService("bash", [virtualDesktop, process.execPath,
       "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
       "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {
       SYNCPEER_LAN_SPEC: "scripts/lan-test/packaged-android-pairing.spec.ts",

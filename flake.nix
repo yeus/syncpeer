@@ -403,6 +403,8 @@ EOF
             libdecor
             mesa
             xdg-utils
+            openbox
+            xorg.xprop
             xvfb-run
 
             jdk

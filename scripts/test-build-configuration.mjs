@@ -90,6 +90,61 @@ test("packaged screenshot capture ensures ignored Tauri icons before building", 
   );
 });
 
+test("desktop screenshot focus permission is limited to LAN E2E builds", () => {
+  const root = "packages/tauri-shell/src-tauri";
+  const permission = "core:window:allow-set-focus";
+  const e2e = json(`${root}/tauri.lan-e2e.conf.json`);
+  assert.ok(e2e.app.security.capabilities
+    .flatMap(capability => capability.permissions).includes(permission));
+  const production = json(`${root}/tauri.conf.json`);
+  for (const capability of production.app.security.capabilities) {
+    const permissions = typeof capability === "string"
+      ? json(`${root}/capabilities/${capability}.json`).permissions
+      : capability.permissions;
+    assert.ok(!permissions.some(value =>
+      (typeof value === "string" ? value : value.identifier) === permission),
+    "Screenshot focus permission must remain outside production capabilities.");
+  }
+});
+
+test("the virtual desktop preserves target failures and stops its window manager", context => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-virtual-desktop-test-"));
+  const pidFile = path.join(root, "wm.pid");
+  context.after(() => {
+    if (fs.existsSync(pidFile)) {
+      try { process.kill(Number(fs.readFileSync(pidFile, "utf8").trim()), "SIGTERM"); }
+      catch (error) { if (error.code !== "ESRCH") throw error; }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(root, "openbox"),
+    '#!/bin/sh\nprintf "%s\\n" "$$" > "$SYNCPEER_FAKE_WM_PID"\n' +
+    "trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(root, "xprop"),
+    '#!/bin/sh\ntest -s "$SYNCPEER_FAKE_WM_PID" || exit 1\n' +
+    'printf "%s\\n" "_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1234"\n',
+    { mode: 0o700 });
+  const result = spawnSync("bash", ["scripts/lan-test/virtual-desktop.sh",
+    "--inside-xvfb", "sh", "-c", "exit 7"], {
+    env: { ...process.env, PATH: `${root}:${process.env.PATH}`, SYNCPEER_FAKE_WM_PID: pidFile },
+    encoding: "utf8", timeout: 10_000,
+  });
+  assert.equal(result.status, 7, result.stderr);
+  const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+});
+
+test("screenshot environments provide a window manager and its readiness probe", () => {
+  for (const file of [".github/workflows/screenshots.yml", ".github/workflows/release.yml"]) {
+    const workflow = fs.readFileSync(file, "utf8");
+    assert.match(workflow, /\n\s+openbox\s*\\/);
+    assert.match(workflow, /\n\s+x11-utils\s*\\/);
+  }
+  const shell = fs.readFileSync("flake.nix", "utf8");
+  assert.match(shell, /\n\s+openbox\s*\n/);
+  assert.match(shell, /\n\s+xorg\.xprop\s*\n/);
+});
+
 test("Android release setup uses tools available on standard runners", () => {
   const script = fs.readFileSync("scripts/build-android-prod-with-secrets.sh", "utf8");
   assert.doesNotMatch(script, /\brg\b/);

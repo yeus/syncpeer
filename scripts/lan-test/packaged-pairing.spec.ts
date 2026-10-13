@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { browser } from "@wdio/globals";
+import type * as Tauri from "@tauri-apps/api";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 import {
@@ -24,7 +25,21 @@ const screenshotDir = process.env.SYNCPEER_SCREENSHOT_DIR?.trim();
 async function captureScreenshot(peer: WebdriverIO.Browser, name: string) {
   if (!screenshotDir) return;
   await mkdir(screenshotDir, { recursive: true });
+  console.log(`Packaged screenshots: capturing ${name}.`);
+  // WebKit snapshots can remain pending while the other packaged app has focus.
+  await peer.execute(async () => {
+    const tauri = (window as typeof window & {
+      __TAURI__: typeof Tauri;
+    }).__TAURI__;
+    await tauri.window.getCurrentWindow().setFocus();
+  });
+  await peer.waitUntil(() => peer.execute(() => document.hasFocus()), {
+    timeout: 5_000,
+    timeoutMsg: "The screenshot target window did not gain focus.",
+  });
+  console.log(`Packaged screenshots: focused ${name}.`);
   await peer.saveScreenshot(path.join(screenshotDir, `syncpeer-${name}.png`));
+  console.log(`Packaged screenshots: captured ${name}.`);
 }
 
 async function freePort(): Promise<number> {
@@ -891,7 +906,9 @@ describe("Two isolated packaged desktop apps", () => {
     }
     await Promise.all(
       [owner, joiner].map(async (peer) => {
-        await peer.$("button=Create folder").waitForExist({ timeout: 30_000 });
+        await peer
+          .$("[data-testid='general-settings-page']")
+          .waitForExist({ timeout: 30_000 });
         await peer
           .$("//h2[normalize-space()='Devices with access to this space']")
           .waitForExist({ timeout: 30_000 });
@@ -959,32 +976,41 @@ describe("Two isolated packaged desktop apps", () => {
       }),
     );
     await owner.$("[data-testid='tab-folders']").click();
-    await owner.$("button=New folder").click();
-    console.log("Packaged folder test: creating owner folder.");
+    const newFolder = owner.$("[data-testid='new-folder']");
+    await newFolder.waitForExist({ timeout: 30_000 });
+    await newFolder.click();
     await owner
-      .$("//label[contains(., 'New folder name')]/input")
-      .setValue(folderName);
+      .$("[data-testid='new-folder-page']")
+      .waitForExist({ timeout: 30_000 });
+    console.log("Packaged folder test: creating owner folder.");
+    const folderNameInput = owner.$(
+      "//label[contains(., 'New folder name')]/input",
+    );
+    await folderNameInput.waitForExist({ timeout: 30_000 });
+    await folderNameInput.setValue(folderName);
     assert.equal(
-      await owner.$("//label[contains(., 'New folder name')]/input").getValue(),
+      await folderNameInput.getValue(),
       folderName,
     );
+    console.log("Packaged folder test: owner folder name entered.");
     const createFolder = owner.$("button=Create folder");
     await createFolder.waitForEnabled({ timeout: 10_000 });
+    console.log("Packaged folder test: submitting owner folder.");
     await clickButtonByText(owner, "Create folder");
+    console.log("Packaged folder test: waiting for owner folder list.");
     try {
-      const folderExists = async () =>
-        (
-          await owner
-            .$(".item-title")
-            .getText()
-            .catch(() => "")
-        ).includes(folderName);
+      const folderExists = async () => owner.execute(
+        name => [...document.querySelectorAll("[data-testid^='folder-root-'] .item-title")]
+          .some(title => title.textContent?.trim() === name),
+        folderName,
+      );
       await owner.waitUntil(folderExists, { timeout: 30_000, interval: 1_000,
         timeoutMsg: "The newly created folder did not return to the folder list." });
       assert.ok(
         await folderExists(),
         "The newly created folder is absent from the folder list.",
       );
+      console.log("Packaged folder test: owner folder listed.");
       await captureScreenshot(owner, "encrypted-folder");
     } catch (error) {
       const issue = await owner
@@ -999,7 +1025,7 @@ describe("Two isolated packaged desktop apps", () => {
           [...document.querySelectorAll("label")]
             .find((value) => value.textContent?.includes("New folder name"))
             ?.querySelector("input")?.value ?? "missing",
-        folders: [...document.querySelectorAll("li > span")]
+        folders: [...document.querySelectorAll("[data-testid^='folder-root-'] .item-title")]
           .map((value) => value.textContent?.trim())
           .filter(Boolean),
         status: [...document.querySelectorAll("p[role='status'], p.error")].map(
@@ -1011,7 +1037,6 @@ describe("Two isolated packaged desktop apps", () => {
         { cause: error },
       );
     }
-    await owner.$("button=Back").click();
     await owner.$("[data-testid='tab-devices']").click();
     console.log("Packaged folder test: preparing peer connection.");
     await joiner.$("//label[contains(., 'Device ID')]/input").setValue(ownerId);

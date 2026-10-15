@@ -2334,11 +2334,15 @@ async fn syncpeer_read_binary_file(request: ReadBinaryFileRequest) -> Result<Vec
 async fn syncpeer_read_default_cli_identity(
     app: tauri::AppHandle,
 ) -> Result<CliNodeIdentityResponse, String> {
-    let _ = app_data_root(&app)?;
-    if let Some(identity) = load_protected_identity(&app)? {
-        return Ok(identity);
-    }
-    create_protected_identity(&app)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app_data_root(&app)?;
+        if let Some(identity) = load_protected_identity(&app)? {
+            return Ok(identity);
+        }
+        create_protected_identity(&app)
+    })
+    .await
+    .map_err(|error| format!("Protected identity task join error: {error}"))?
 }
 
 #[tauri::command]
@@ -2369,17 +2373,20 @@ async fn syncpeer_get_default_device_id(app: tauri::AppHandle) -> Result<String,
 
 #[tauri::command]
 async fn syncpeer_regenerate_default_cli_identity(app: tauri::AppHandle) -> Result<String, String> {
-    let _ = app_data_root(&app)?;
-    let identity = create_protected_identity(&app)?;
-    device_id_from_cert_pem(&identity.cert_pem)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app_data_root(&app)?;
+        let identity = create_protected_identity(&app)?;
+        device_id_from_cert_pem(&identity.cert_pem)
+    })
+    .await
+    .map_err(|error| format!("Protected identity task join error: {error}"))?
 }
 
-#[tauri::command]
-async fn syncpeer_restore_identity_recovery(
-    app: tauri::AppHandle,
+fn restore_identity_recovery(
+    app: &tauri::AppHandle,
     request: IdentityRecoveryRestoreRequest,
 ) -> Result<CliNodeIdentityResponse, String> {
-    let _ = app_data_root(&app)?;
+    let _ = app_data_root(app)?;
     let raw = request.recovery_secret.trim();
     if raw.is_empty() {
         return Err("Recovery secret is empty.".to_string());
@@ -2408,7 +2415,7 @@ async fn syncpeer_restore_identity_recovery(
 
     let stored = serde_json::to_string(&payload)
         .map_err(|_| "Could not encode protected identity.".to_string())?;
-    vault_secret::identity_record(&app, "save", Some(stored))?;
+    vault_secret::identity_record(app, "save", Some(stored))?;
 
     Ok(CliNodeIdentityResponse {
         cert_path: String::new(),
@@ -2416,6 +2423,16 @@ async fn syncpeer_restore_identity_recovery(
         cert_pem: payload.cert_pem,
         key_pem: payload.key_pem,
     })
+}
+
+#[tauri::command]
+async fn syncpeer_restore_identity_recovery(
+    app: tauri::AppHandle,
+    request: IdentityRecoveryRestoreRequest,
+) -> Result<CliNodeIdentityResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || restore_identity_recovery(&app, request))
+        .await
+        .map_err(|error| format!("Protected identity task join error: {error}"))?
 }
 
 #[tauri::command]

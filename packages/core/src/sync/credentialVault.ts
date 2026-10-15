@@ -50,6 +50,11 @@ export interface RememberedUnlockSecretStore {
   load: () => Promise<string | null>;
   save: (password: string) => Promise<void>;
   remove: () => Promise<void>;
+  /**
+   * Report whether the remembered secret is usable. Desktop platforms with a
+   * locked system keyring request its unlock prompt and wait for the user
+   * instead of failing, so automatic vault unlock can continue afterwards.
+   */
   isDeviceUnlocked: () => Promise<boolean>;
 }
 

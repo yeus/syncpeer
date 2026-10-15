@@ -57,19 +57,40 @@ fn protected_metadata_exists(metadata_root: &std::path::Path) -> Result<bool, St
 }
 
 #[cfg(target_os = "linux")]
+fn unlock_default_collection(
+    collection: &secret_service::blocking::Collection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !collection.is_locked()? {
+        return Ok(());
+    }
+    // The Secret Service shows the desktop keyring unlock prompt here and the
+    // call returns once the user answers it. A dismissed prompt is an error.
+    collection.unlock()?;
+    if collection.is_locked()? {
+        return Err(std::io::Error::other("locked").into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn desktop_secret(request: VaultSecretRequest) -> Result<Value, String> {
     use secret_service::{blocking::SecretService, EncryptionType};
-    // Never prompt to unlock a locked collection during automatic startup.
+    // A locked keyring shows one unlock prompt. Serialize access so concurrent
+    // startup reads wait for that prompt instead of racing each other.
+    static SECRET_SERVICE_GATE: Mutex<()> = Mutex::new(());
+    let _gate = SECRET_SERVICE_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let result = (|| -> Result<Value, Box<dyn std::error::Error>> {
         let service = SecretService::connect(EncryptionType::Dh)?;
         let collection = service.get_default_collection()?;
-        let locked = collection.is_locked()?;
         if request.operation == "isDeviceUnlocked" {
-            return Ok(json!(!locked));
+            // Report whether the store is usable now. On a locked desktop
+            // keyring this asks the Secret Service for its unlock prompt and
+            // waits, so automatic vault unlock can proceed once it is open.
+            return Ok(json!(unlock_default_collection(&collection).is_ok()));
         }
-        if locked {
-            return Err(std::io::Error::other("locked").into());
-        }
+        unlock_default_collection(&collection)?;
         let attributes = std::collections::HashMap::from([
             ("application", "dev.syncpeer.vault"),
             ("profile", request.profile_id.as_str()),

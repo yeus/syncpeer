@@ -57,6 +57,22 @@ export interface LocalDiscoveredDevice {
   anonymous?: boolean;
 }
 
+/** State of the always-on incoming TLS listener. */
+export interface BackgroundListenerStatus {
+  active: boolean;
+  port: number | null;
+  /** True when the configured port was busy and an OS-assigned port is in use. */
+  ephemeral: boolean;
+  error: string | null;
+}
+
+/** Emitted when an approved peer opens an incoming session while idle. */
+export interface IncomingSessionEvent {
+  remoteDeviceId: string;
+  options: ConnectOptions;
+  session: SyncpeerSessionHandle;
+}
+
 export interface RemoteFsLike {
   listFolders: () => Promise<FolderInfo[]>;
   requestFolderIndex: (folderId: string) => Promise<void>;
@@ -312,6 +328,8 @@ export interface CreateSyncpeerBrowserClientOptions {
   hostAdapter: SyncpeerHostAdapter;
   platformAdapter?: SyncpeerPlatformAdapter;
   onLog?: (entry: UiLogEntry) => void;
+  /** An approved peer connected while no connect attempt was active. */
+  onIncomingSession?: (event: IncomingSessionEvent) => void;
 }
 
 export interface SyncpeerBrowserClient {
@@ -321,6 +339,13 @@ export interface SyncpeerBrowserClient {
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<LocalDiscoveredDevice[]>;
+  /**
+   * Keep the incoming TLS listener open independently of any connect attempt,
+   * so approved peers can dial this device while it is idle.
+   */
+  startBackgroundListener: (options?: { listenPort?: number }) => Promise<BackgroundListenerStatus>;
+  stopBackgroundListener: () => Promise<void>;
+  backgroundListenerStatus: () => BackgroundListenerStatus;
   disconnect: () => Promise<void>;
   startPairingInvitation: (options: { advertisedHost: string; port?: number; expiresInMs?: number;
     confirm: (code: string) => boolean | Promise<boolean> }) => Promise<{
@@ -604,6 +629,11 @@ export const createSyncpeerBrowserClient = (
   let incomingServiceKey = "";
   let incomingServiceClosing = Promise.resolve();
   let incomingServiceUpdate: Promise<unknown> = Promise.resolve();
+  let incomingServicePort: number | null = null;
+  let incomingListenerEphemeral = false;
+  let incomingListenerError: string | null = null;
+  let backgroundListenerActive = false;
+  let backgroundListenerListenPort = 22000;
   let sessionConfigurationRefresh = Promise.resolve();
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
     if (cachedDefaultIdentity) return cachedDefaultIdentity;
@@ -618,9 +648,66 @@ export const createSyncpeerBrowserClient = (
     const service = incomingService;
     incomingService = null;
     incomingServiceKey = "";
+    incomingServicePort = null;
+    incomingListenerEphemeral = false;
     const closing = incomingServiceClosing.then(() => service?.close());
     incomingServiceClosing = closing.catch(() => undefined);
     return closing;
+  };
+
+  const backgroundListenerStatus = (): BackgroundListenerStatus => ({
+    active: backgroundListenerActive && incomingService !== null,
+    port: incomingServicePort,
+    ephemeral: incomingListenerEphemeral,
+    error: incomingListenerError,
+  });
+
+  /**
+   * Keep the incoming TLS listener open independently of any connect attempt
+   * so approved peers can dial this device while it is idle.
+   */
+  const startBackgroundListener = async (
+    listenerOptions?: { listenPort?: number },
+  ): Promise<BackgroundListenerStatus> => {
+    if (platformAdapter.incomingSessionOwnedByService || !coreAdapter.listenTls) {
+      backgroundListenerActive = true;
+      return backgroundListenerStatus();
+    }
+    const identity = await resolveDefaultIdentity();
+    backgroundListenerListenPort = localListenPort(
+      listenerOptions?.listenPort ?? backgroundListenerListenPort,
+    );
+    backgroundListenerActive = true;
+    const connectOptions: ConnectOptions = {
+      host: "",
+      port: 0,
+      listenPort: backgroundListenerListenPort,
+      deviceName: "",
+      discoveryMode: "automatic",
+      enableRelayFallback: false,
+    };
+    const coreOptions: SyncpeerConnectOptions = {
+      host: "",
+      port: 0,
+      certPem: identity.certPem,
+      keyPem: identity.keyPem,
+      expectedDeviceId: "",
+      deviceName: "",
+      sharedFolders: [],
+    };
+    try {
+      await ensureIncomingService(connectOptions, coreOptions, true);
+    } catch (error) {
+      backgroundListenerActive = false;
+      incomingListenerError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
+    return backgroundListenerStatus();
+  };
+
+  const stopBackgroundListener = async (): Promise<void> => {
+    backgroundListenerActive = false;
+    if (!activeConnectOptions) await stopIncomingService();
   };
 
   const identityForPairing = async () => {
@@ -667,22 +754,29 @@ export const createSyncpeerBrowserClient = (
   };
 
   const ensureIncomingService = async (connectOptions: ConnectOptions,
-    coreOptions: SyncpeerConnectOptions): Promise<typeof incomingService> => {
-    if (platformAdapter.incomingSessionOwnedByService || !coreAdapter.listenTls || !coreOptions.expectedDeviceId) return null;
+    coreOptions: SyncpeerConnectOptions,
+    background = false): Promise<typeof incomingService> => {
+    if (platformAdapter.incomingSessionOwnedByService || !coreAdapter.listenTls) return null;
+    const expectedDeviceId = coreOptions.expectedDeviceId ?? "";
+    if (!background && !expectedDeviceId) return null;
     coreAdapter.log?.("core.incoming.prepare.identity_start", {});
     const localDeviceId = await deviceIdFromCertificate(coreAdapter,
       certificateDerFromPem(coreOptions.certPem));
     coreAdapter.log?.("core.incoming.prepare.trust_start", {});
     const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
     coreAdapter.log?.("core.incoming.prepare.trust_done", { deviceCount: trustedDevices.length });
-    const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
-      localDeviceId, trustedDevices);
-    if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
+    const approvedDeviceIds = background && !expectedDeviceId
+      ? trustedDevices
+          .filter(device => device.state === "active")
+          .map(device => device.syncthingId)
+          .filter(id => id && !sameDeviceId(id, localDeviceId))
+      : resolveIncomingPeerDeviceIds(expectedDeviceId, localDeviceId, trustedDevices);
+    if (!background && !approvedDeviceIds.length) { await stopIncomingService(); return null; }
     const listenPort = localListenPort(connectOptions.listenPort);
     const automaticRelay = automaticRelayConfiguration(connectOptions);
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem, listenPort, automaticRelay]);
-    const remoteDeviceId = coreOptions.expectedDeviceId;
+    const remoteDeviceId = expectedDeviceId;
     const revision = platformAdapter.sessionConfigurationRevision?.();
     const prepared = new Map<string, SyncpeerConnectOptions>();
     for (const remote of approvedDeviceIds) {
@@ -709,28 +803,53 @@ export const createSyncpeerBrowserClient = (
         return { ...ready, ...endpoint };
       },
       onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
-        if (!sameDeviceId(connectedRemoteDeviceId, remoteDeviceId) ||
-          preferredPeerDirection(localDeviceId, connectedRemoteDeviceId) !== "incoming") return;
-        const resolvedOptions: ConnectOptions = {
-          ...connectOptions,
-          host: coreOptions.host,
-          port: coreOptions.port,
-          cert: coreOptions.certPem,
-          key: coreOptions.keyPem,
-          remoteId: connectedRemoteDeviceId,
-        };
-        void prepareBackgroundHandoff(resolvedOptions)
-          .then(() => lifecycle.adopt(connectOptions, session))
+        if (sameDeviceId(connectedRemoteDeviceId, remoteDeviceId) &&
+          preferredPeerDirection(localDeviceId, connectedRemoteDeviceId) === "incoming") {
+          const resolvedOptions: ConnectOptions = {
+            ...connectOptions,
+            host: coreOptions.host,
+            port: coreOptions.port,
+            cert: coreOptions.certPem,
+            key: coreOptions.keyPem,
+            remoteId: connectedRemoteDeviceId,
+          };
+          void prepareBackgroundHandoff(resolvedOptions)
+            .then(() => lifecycle.adopt(connectOptions, session))
+            .then(adopted => {
+              if (!adopted) return;
+              activeResolvedConnectOptions = resolvedOptions;
+              logClient(options.onLog, "client.session.incoming.ready", {
+                transportKind: session.transportKind, connectionScope: session.connectionScope,
+              });
+            })
+            .catch(error => {
+              void session.close().catch(() => undefined);
+              coreAdapter.log?.("core.background.prepare.failed", {
+                message: error instanceof Error ? error.message : String(error),
+              });
+            });
+          return;
+        }
+        if (!background) return;
+        const preparedOptions = prepared.get(
+          connectedRemoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase());
+        if (!preparedOptions) {
+          void session.close().catch(() => undefined);
+          return;
+        }
+        void lifecycle.adoptIncoming(preparedOptions, session)
           .then(adopted => {
             if (!adopted) return;
-            activeResolvedConnectOptions = resolvedOptions;
-            logClient(options.onLog, "client.session.incoming.ready", {
+            activeResolvedConnectOptions = preparedOptions;
+            logClient(options.onLog, "client.session.incoming.background_ready", {
               transportKind: session.transportKind, connectionScope: session.connectionScope,
             });
+            options.onIncomingSession?.({ remoteDeviceId: connectedRemoteDeviceId,
+              options: preparedOptions, session });
           })
           .catch(error => {
             void session.close().catch(() => undefined);
-            coreAdapter.log?.("core.background.prepare.failed", {
+            coreAdapter.log?.("core.incoming.adopt.failed", {
               message: error instanceof Error ? error.message : String(error),
             });
           });
@@ -749,14 +868,38 @@ export const createSyncpeerBrowserClient = (
       coreAdapter.log?.("core.incoming.prepare.previous_close_start", {});
       await stopIncomingService();
       coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
-      incomingService = await startIncomingPeerService(coreAdapter, {
-        host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      const startIncoming = (port: number) => startIncomingPeerService(coreAdapter, {
+        host: "0.0.0.0", port, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
         localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
+        // An idle listener may have no approved peers yet; pairing invitations
+        // are owned by the UI pairing flow and use their own listener.
+        onPairingSocket: async accepted => {
+          await accepted.socket.close().catch(() => undefined);
+        },
         onError: error => coreAdapter.log?.("core.incoming.failed", {
           message: error instanceof Error ? error.message : String(error),
         }),
       });
+      let started: Awaited<ReturnType<typeof startIncomingPeerService>>;
+      try {
+        started = await startIncoming(listenPort);
+        incomingListenerEphemeral = false;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const bindFailure = /could not listen|eaddrinuse|address already in use/i.test(message);
+        if (listenPort !== 0 && bindFailure) {
+          coreAdapter.log?.("core.incoming.listen.retry_ephemeral", { port: listenPort });
+          started = await startIncoming(0);
+          incomingListenerEphemeral = true;
+        } else {
+          incomingListenerError = message;
+          throw error;
+        }
+      }
+      incomingService = started;
       incomingServiceKey = key;
+      incomingServicePort = started.port;
+      incomingListenerError = null;
       return incomingService;
     });
     incomingServiceUpdate = update.catch(() => undefined);
@@ -1175,13 +1318,20 @@ export const createSyncpeerBrowserClient = (
         }));
       return [...known, ...anonymous];
     },
+    startBackgroundListener,
+    stopBackgroundListener,
+    backgroundListenerStatus,
     disconnect: async (): Promise<void> => {
       activeConnectOptions = null;
       activeResolvedConnectOptions = null;
       focusedFolderId = null;
-      await platformAdapter.stopBackgroundSession?.();
+      if (!backgroundListenerActive) await platformAdapter.stopBackgroundSession?.();
       await lifecycle.disconnect();
-      await stopIncomingService();
+      if (backgroundListenerActive) {
+        await startBackgroundListener({ listenPort: backgroundListenerListenPort });
+      } else {
+        await stopIncomingService();
+      }
     },
     subscribeLifecycle: lifecycle.subscribe,
     setOnline: lifecycle.setOnline,

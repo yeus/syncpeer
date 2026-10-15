@@ -21,6 +21,8 @@ export interface ConnectionLifecycleState {
 export interface ConnectionLifecycle<TOptions> {
   connect: (options: TOptions) => Promise<SyncpeerSessionHandle>;
   adopt: (options: TOptions, session: SyncpeerSessionHandle) => Promise<boolean>;
+  /** Adopt an incoming session when no connect attempt is active. */
+  adoptIncoming: (options: TOptions, session: SyncpeerSessionHandle) => Promise<boolean>;
   disconnect: () => Promise<void>;
   ensureSession: (options?: TOptions) => Promise<SyncpeerSessionHandle>;
   getSession: () => SyncpeerSessionHandle | null;
@@ -347,6 +349,27 @@ export const createConnectionLifecycle = <TOptions>(deps: {
       update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
       watchClosure(session, generation);
       scheduleUpgrade(generation);
+      if (previous && previous !== session) await previous.close().catch(() => undefined);
+      return true;
+    },
+    adoptIncoming: async (options, session) => {
+      // No connect attempt is active yet, so eligibility is checked without
+      // requiring a desired connection; the incoming session becomes desired.
+      if (!online || !(foreground || transferActive) || session.isClosed()) {
+        await session.close().catch(() => undefined);
+        return false;
+      }
+      desired = options;
+      const key = deps.keyFor(options);
+      generation += 1;
+      cancelOpening();
+      const previous = active;
+      active = session;
+      activeKey = key;
+      connectedAtMs = now();
+      failureStreak = 0;
+      update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
+      watchClosure(session, generation);
       if (previous && previous !== session) await previous.close().catch(() => undefined);
       return true;
     },

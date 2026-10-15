@@ -186,9 +186,10 @@ fn execute(
             Ok(serde_json::to_value(read_random_bytes(size as usize)?).unwrap_or_default())
         }
         "discoverLocal" => {
-            let input: DiscoveryLocalRequest = serde_json::from_value(request.clone())
-                .map_err(|error| format!("Invalid local discovery request: {error}"))?;
-            let response = discover_local_candidates(&input)?;
+            let input: local_discovery::DiscoveryLocalRequest =
+                serde_json::from_value(request.clone())
+                    .map_err(|error| format!("Invalid local discovery request: {error}"))?;
+            let response = local_discovery::shared_local_discovery().query(&input);
             Ok(serde_json::to_value(response)
                 .map_err(|error| format!("Could not encode discovery response: {error}"))?)
         }

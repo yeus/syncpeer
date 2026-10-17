@@ -1189,6 +1189,80 @@ mod tests {
         }
     }
 
+    /// End-to-end receive check against a real Syncthing on a separate L2
+    /// segment. Skipped unless the netns harness sets `SYNCPEER_LAN_INTEROP=1`
+    /// and supplies the fixture device ID.
+    #[test]
+    fn local_discovery_receives_real_syncthing_announcements() {
+        if std::env::var("SYNCPEER_LAN_INTEROP").as_deref() != Ok("1") {
+            return;
+        }
+        let expected = std::env::var("SYNCPEER_EXPECTED_SYNCTHING_ID").unwrap_or_default();
+        let runtime = LocalDiscoveryRuntime::start(LocalDiscoveryPorts::default());
+        let response = runtime.query(&DiscoveryLocalRequest {
+            expected_device_id: if expected.is_empty() {
+                None
+            } else {
+                Some(expected.clone())
+            },
+            timeout_ms: Some(45_000),
+        });
+        assert!(
+            !response.candidates.is_empty(),
+            "no real Syncthing announcement was discovered"
+        );
+        if !expected.is_empty() {
+            let canonical = canonical_device_id(&expected);
+            assert!(
+                response
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.device_id.as_deref() == Some(canonical.as_str())),
+                "the expected Syncthing device ID was not discovered"
+            );
+        }
+    }
+
+    /// Syncpeer probe/reply check across a real L2 segment. Skipped unless
+    /// the netns harness sets `SYNCPEER_LAN_INTEROP=1`; the harness runs this
+    /// test in both namespaces with mirrored identities.
+    #[test]
+    fn local_discovery_discovers_syncpeer_peers_on_a_real_network() {
+        if std::env::var("SYNCPEER_LAN_INTEROP").as_deref() != Ok("1") {
+            return;
+        }
+        let Ok(local_id) = std::env::var("SYNCPEER_LOCAL_ID") else {
+            return;
+        };
+        let expected = std::env::var("SYNCPEER_EXPECTED_PEER_ID").unwrap_or_default();
+        let runtime = LocalDiscoveryRuntime::start(LocalDiscoveryPorts::default());
+        runtime.set_local_device_id(&local_id);
+        let response = runtime.query(&DiscoveryLocalRequest {
+            expected_device_id: if expected.is_empty() {
+                None
+            } else {
+                Some(expected.clone())
+            },
+            timeout_ms: Some(30_000),
+        });
+        assert!(
+            !response.candidates.is_empty(),
+            "no Syncpeer peer was discovered over the real network"
+        );
+        if !expected.is_empty() {
+            let canonical = canonical_device_id(&expected);
+            assert!(
+                response
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.device_id.as_deref() == Some(canonical.as_str())),
+                "the expected Syncpeer device ID was not discovered"
+            );
+            // Keep answering the mirrored peer's probes while it discovers us.
+            thread::sleep(Duration::from_secs(8));
+        }
+    }
+
     fn wait_for_tcp_port(port: u16) {
         for _ in 0..100 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {

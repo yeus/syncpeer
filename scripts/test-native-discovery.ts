@@ -113,3 +113,52 @@ test("acknowledged native cancellation ends discovery even when the fetch reply 
     assert.equal(getEventListeners(stop.signal, "abort").length, 0);
   } finally { clearTimeout(timer); bridge.result.resolve({ status: 204, body: "", headers: {} }); bridge.restore(); }
 });
+
+test("Android socket reads use the JSON command instead of a raw IPC body", async () => {
+  const scope = globalThis as typeof globalThis & { __TAURI__?: unknown };
+  const previous = scope.__TAURI__;
+  const calls: string[] = [];
+  const invoke = async (command: string, args?: { request?: Record<string, unknown> }) => {
+    calls.push(command);
+    if (command === "syncpeer_tls_open") return { sessionId: 3, peerCertificateDer: [1, 2, 3] };
+    if (command === "syncpeer_tls_read") {
+      assert.deepEqual(args?.request, { sessionId: 3, maxBytes: 16 });
+      return { bytes: [9, 8, 7], eof: false };
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+  scope.__TAURI__ = { core: { invoke } };
+  try {
+    const host = createTauriAdapters({ runtimePlatform: "android" }).hostAdapter;
+    const socket = await host.connectTls({ host: "127.0.0.1", port: 1, certPem: "synthetic", keyPem: "synthetic" });
+    assert.deepEqual([...await socket.read(16)], [9, 8, 7]);
+    assert.ok(calls.includes("syncpeer_tls_read"), "Android must use the JSON read command");
+    assert.ok(!calls.includes("syncpeer_tls_read_binary"), "Android must not send raw IPC bodies");
+  } finally {
+    scope.__TAURI__ = previous;
+  }
+});
+
+test("desktop socket reads keep the bounded raw binary command", async () => {
+  const scope = globalThis as typeof globalThis & { __TAURI__?: unknown };
+  const previous = scope.__TAURI__;
+  const calls: string[] = [];
+  const invoke = async (command: string, args?: unknown) => {
+    calls.push(command);
+    if (command === "syncpeer_tls_open") return { sessionId: 4, peerCertificateDer: [1] };
+    if (command === "syncpeer_tls_read_binary") {
+      assert.ok(args instanceof Uint8Array, "Desktop reads must send a raw body");
+      return new Uint8Array([5, 6]).buffer;
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+  scope.__TAURI__ = { core: { invoke } };
+  try {
+    const host = createTauriAdapters({ runtimePlatform: "linux" }).hostAdapter;
+    const socket = await host.connectTls({ host: "127.0.0.1", port: 1, certPem: "synthetic", keyPem: "synthetic" });
+    assert.deepEqual([...await socket.read(8)], [5, 6]);
+    assert.ok(calls.includes("syncpeer_tls_read_binary"));
+  } finally {
+    scope.__TAURI__ = previous;
+  }
+});

@@ -311,10 +311,21 @@ const createTlsSocket = (
   sessionId: number,
   peerCertificateDer: Uint8Array,
   commandPrefix = "syncpeer_tls",
+  // Tauri's Android IPC cannot carry raw request bodies, so Android uses the
+  // JSON read command while desktop keeps the bounded raw fast path.
+  useRawBody = true,
 ): SyncpeerTlsSocket => ({
   peerCertificateDer: async () => peerCertificateDer,
-  read: async (maxBytes?: number) => rawByteView(await invoke<ArrayBuffer>(
-    `${commandPrefix}_read_binary`, socketReadRequest(sessionId, maxBytes))),
+  read: async (maxBytes?: number) => {
+    if (useRawBody) {
+      return rawByteView(await invoke<ArrayBuffer>(
+        `${commandPrefix}_read_binary`, socketReadRequest(sessionId, maxBytes)));
+    }
+    const response = await invoke<{ bytes: number[]; eof: boolean }>(
+      `${commandPrefix}_read`, { request: { sessionId, maxBytes: maxBytes ?? null } });
+    if (response.eof) throw new Error("Connection closed");
+    return new Uint8Array(response.bytes);
+  },
   write: async (bytes: Uint8Array) => {
     await invoke<void>(`${commandPrefix}_write`, {
       request: { sessionId, bytes: Array.from(bytes) },
@@ -458,6 +469,8 @@ export const createTauriAdapters = (
         invokeWithLogging,
         sessionId,
         new Uint8Array(opened.peerCertificateDer),
+        "syncpeer_tls",
+        platform !== "android",
       );
     },
     listenTls: async ({ host, port, certPem, keyPem, alpnProtocols, handshakeTimeoutMs }) => {
@@ -465,14 +478,14 @@ export const createTauriAdapters = (
         request: { host, port, certPem, keyPem, alpnProtocols: [...alpnProtocols],
           handshakeTimeoutMs: handshakeTimeoutMs ?? null },
       });
-      return createNativeTlsListener(invokeWithLogging, opened);
+      return createNativeTlsListener(invokeWithLogging, opened, undefined, platform !== "android");
     },
     listenRelay: async ({ relayAddress, certPem, keyPem, alpnProtocols, handshakeTimeoutMs }) => {
       const opened = await invokeWithLogging<TlsListenResponse>("syncpeer_relay_listen", {
         request: { relayAddress, certPem, keyPem, alpnProtocols: [...alpnProtocols],
           handshakeTimeoutMs: handshakeTimeoutMs ?? null },
       });
-      return createNativeTlsListener(invokeWithLogging, opened, relayAddress);
+      return createNativeTlsListener(invokeWithLogging, opened, relayAddress, platform !== "android");
     },
     connectQuic: async ({
       host,
@@ -508,6 +521,7 @@ export const createTauriAdapters = (
         Number(opened.sessionId),
         new Uint8Array(opened.peerCertificateDer),
         "syncpeer_quic",
+        platform !== "android",
       );
     },
     connectRelay: async ({ relayAddress, expectedDeviceId, certPem, keyPem, caPem, timeoutMs, signal,
@@ -534,6 +548,8 @@ export const createTauriAdapters = (
           invokeWithLogging,
           sessionId,
           new Uint8Array(opened.peerCertificateDer),
+          "syncpeer_tls",
+          platform !== "android",
         ),
       };
     },
@@ -888,7 +904,8 @@ export const createTauriAdapters = (
     } : undefined };
 };
 
-const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse, relayAddress?: string) => {
+const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse, relayAddress?: string,
+  useRawBody = true) => {
   let closed = false;
   return {
     port: opened.port,
@@ -899,7 +916,8 @@ const createNativeTlsListener = (invoke: InvokeFn, opened: TlsListenResponse, re
             request: { listenerId: opened.listenerId, timeoutMs: 60_000 },
           });
           const socket = { socket: createTlsSocket(invoke, Number(accepted.sessionId),
-            new Uint8Array(accepted.peerCertificateDer)), remoteAddress: accepted.remoteAddress,
+            new Uint8Array(accepted.peerCertificateDer), "syncpeer_tls", useRawBody),
+            remoteAddress: accepted.remoteAddress,
           remotePort: accepted.remotePort, alpn: accepted.alpn };
           return relayAddress ? { ...socket,
             connectedVia: `${relayAddress} -> ${accepted.remoteAddress}:${accepted.remotePort}`,

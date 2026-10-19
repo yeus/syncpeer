@@ -5,6 +5,7 @@
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
   import { formatBuildTimeLocal, getAppBuildInfo } from "../lib/appInfo.ts";
+  import { formatSyncthingDeviceId } from "../app/devicePolicies.ts";
   import { downloadTransportText, type AppState } from "../app/state.ts";
 
   interface Props {
@@ -185,7 +186,7 @@
         <StatusChip small>loading...</StatusChip>
       {/if}
     </div>
-    <div class="item-meta" data-testid="current-device-id">{app.devices.currentDeviceId || "Unavailable"}</div>
+    <div class="item-meta" data-testid="current-device-id">{formatSyncthingDeviceId(app.devices.currentDeviceId) || "Unavailable"}</div>
     <div class="item-meta">
       Advertised name: {app.connection.deviceName.trim() || "syncpeer-ui"}
     </div>

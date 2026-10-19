@@ -3,6 +3,7 @@
   import { defaultFolderSettings, type PersonalSpaceSettings, type SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import type { createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { safeNativeFailureText } from "./app/storageErrors.ts";
+  import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
   let { folderId, folderLabel, encrypted, passwordDraft, passwordSaved, passwordError, actionError,
     managedStorage, onBack, onOpenGeneralSettings, onUpdatePassword, onSavePassword, onClearPassword,
     onImport, peerId, onMigrate, onRelease, onSettingsSaved, command }: {
@@ -267,7 +268,7 @@
                   onchange={event => { newHolderId = event.currentTarget.value; }}>
                   <option value="">Select a trusted device</option>
                   {#each trustedDevices.filter(device => device.state === "active") as device (device.id)}
-                    <option value={device.id}>{device.id === localTrustedDeviceId ? "This device" : device.syncthingId}</option>
+                    <option value={device.id}>{device.id === localTrustedDeviceId ? "This device" : formatSyncthingDeviceId(device.syncthingId)}</option>
                   {/each}
                 </select>
               </label>

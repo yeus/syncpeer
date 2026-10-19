@@ -4,6 +4,7 @@
   import Trash2 from "lucide-svelte/icons/trash-2";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
+  import { formatSyncthingDeviceId } from "../app/devicePolicies.ts";
 
 export interface SavedDeviceRow {
     kind: "saved";
@@ -97,7 +98,7 @@ export interface SavedDeviceRow {
     {/if}
   </div>
 
-  <div class="item-meta">{row.deviceId}</div>
+  <div class="item-meta">{formatSyncthingDeviceId(row.deviceId)}</div>
 
   {#each row.metaLines as line, index (index)}
     {#if line}

@@ -3,6 +3,7 @@
   import type { PairingInvitation, SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { formatProfileCreationError } from "./app/storageErrors.ts";
+  import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
   import { createWorkerPasswordKdf } from "./lib/passwordKdf.ts";
   let { onBack, onOpenFolderSettings, onUnlock, onUnlockBiometric, onRotateMasterPassword, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId, onStartPairing, onJoinPairing,
@@ -306,7 +307,7 @@
         <ul>
           {#each trustedDevices as device (device.id)}
             <li>
-              <code>{device.syncthingId}</code> — {device.id === localTrustedDeviceId ? "this device" : device.state}
+              <code>{formatSyncthingDeviceId(device.syncthingId)}</code> — {device.id === localTrustedDeviceId ? "this device" : device.state}
               {#if device.state === "active" && device.id !== localTrustedDeviceId}
                 <button disabled={busy} onclick={() => void revokeDevice(device.id)}>Remove device</button>
               {/if}

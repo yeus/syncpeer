@@ -16,6 +16,41 @@ const sortByName = <T extends { name: string }>(items: T[]) =>
 export const normalizeCandidateDeviceId = (deviceId: string) =>
   normalizeDeviceId(deviceId);
 
+const SYNCTHING_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+const luhn32CheckDigit = (value: string): string => {
+  let factor = 1;
+  let sum = 0;
+  for (const character of value) {
+    const codepoint = SYNCTHING_ID_ALPHABET.indexOf(character);
+    if (codepoint < 0) return "";
+    let addend = factor * codepoint;
+    factor = factor === 2 ? 1 : 2;
+    addend = Math.floor(addend / 32) + (addend % 32);
+    sum += addend;
+  }
+  return SYNCTHING_ID_ALPHABET[(32 - (sum % 32)) % 32];
+};
+
+/**
+ * Render a canonical 52-character device ID in the grouped form Syncthing
+ * shows (Luhn check digits plus 7-character groups). Values that are not
+ * device IDs, such as anonymous LAN placeholders, pass through.
+ */
+export const formatSyncthingDeviceId = (deviceId: string): string => {
+  const normalized = normalizeDeviceId(deviceId);
+  const canonical = normalized.length === 56
+    ? [...normalized].filter((_, index) => (index + 1) % 14 !== 0).join("")
+    : normalized;
+  if (canonical.length !== 52) return String(deviceId ?? "").trim();
+  let grouped = "";
+  for (let index = 0; index < 4; index += 1) {
+    const chunk = canonical.slice(index * 13, (index + 1) * 13);
+    grouped += chunk + luhn32CheckDigit(chunk);
+  }
+  return grouped.match(/.{1,7}/g)?.join("-") ?? grouped;
+};
+
 export const normalizeCandidateAddresses = (addresses: string[]) =>
   [...new Set(addresses.map((item) => String(item ?? "").trim()).filter(Boolean))].sort();
 

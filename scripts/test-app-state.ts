@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createInitialSessionState } from "../packages/core/src/ui/sessionPolicies.ts";
+import { formatSyncthingDeviceId } from "../packages/app/src/app/devicePolicies.ts";
 import {
   activeDownloadForFile,
   activeDownloadProgressPercent,
@@ -284,4 +285,12 @@ test("startup persistence retains legacy sensitive state until verified migratio
   persistState(state, true);
   assert.equal(JSON.parse(raw).pim, undefined);
   assert.equal(JSON.parse(raw).folderPasswords, undefined);
+});
+
+test("device IDs render in Syncthing's grouped form", () => {
+  const canonical = "DPNAVCUNBE5A5HUY4AN5YALD4RILEIXAJCYRGJBAGNLHYXFBWDKA";
+  const grouped = "DPNAVCU-NBE5A5I-HUY4AN5-YALD4RU-ILEIXAJ-CYRGJBW-AGNLHYX-FBWDKAT";
+  assert.equal(formatSyncthingDeviceId(canonical), grouped);
+  assert.equal(formatSyncthingDeviceId(grouped), grouped);
+  assert.equal(formatSyncthingDeviceId("LAN-UNKNOWN-1"), "LAN-UNKNOWN-1");
 });

@@ -29,7 +29,7 @@ import { restoreOfflineSnapshot, setRemoteApprovalPending } from "./syncPolicies
 import { suggestedClientName } from "./suggestedNames.ts";
 import { suggestedSavedDeviceName, upsertSavedDevice } from "./devicePolicies.ts";
 
-export const createDeviceActions = (args: {
+type DeviceActionArgs = {
   readonly state: AppState;
   readonly client: SyncpeerBrowserClient;
   readonly sessionStore: SyncpeerSessionStore;
@@ -37,279 +37,298 @@ export const createDeviceActions = (args: {
   readonly refreshActiveView: () => Promise<void>;
   readonly refreshCurrentDeviceId: () => Promise<void>;
   readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
-}) => {
-  const {
-    state,
-    client,
-    sessionStore,
-    refreshOverview,
-    refreshActiveView,
-    refreshCurrentDeviceId,
-  } = args;
-
-const updateFolderPasswordDraft = (folderId: string, password: string) => {
-  state.passwords.drafts = {
-    ...state.passwords.drafts,
-    [folderId]: password,
-  };
 };
 
-const changeFolderPassword = async (folderId: string, password: string) => {
-  const scopedKey = folderPasswordScopedKey(
-    activeFolderPasswordScopeDeviceId(state),
-    folderId,
-  );
-  const next = { ...state.passwords.saved };
-  delete next[folderId];
-  if (scopedKey) delete next[scopedKey];
-  if (password) {
-    next[scopedKey || folderId] = password;
-  }
-  try {
-    await args.savePasswords?.(next);
-    state.passwords.saved = next;
-    if (!password) state.passwords.drafts = { ...state.passwords.drafts, [folderId]: "" };
-    await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
-    if (state.session.isConnected) {
-      await refreshOverview();
-      if (password && !folderIsLocked(state, folderId) && state.session.currentFolderId === folderId) {
-        await sessionStore.actions.reloadCurrentDirectory(connectionDetails(state));
-        applySessionState(state, sessionStore.getState());
-        await loadDirectorySideEffects(state, client);
-      }
+class DeviceActionsRuntime {
+  constructor(
+    private readonly state: AppState,
+    private readonly client: SyncpeerBrowserClient,
+    private readonly sessionStore: SyncpeerSessionStore,
+    private readonly refreshOverview: () => Promise<void>,
+    private readonly refreshActiveView: () => Promise<void>,
+    private readonly refreshCurrentDeviceId: () => Promise<void>,
+    private readonly savePasswords?: (values: Record<string, string>) => Promise<void>,
+  ) {}
+
+  private updateFolderPasswordDraft = (folderId: string, password: string) => {
+    this.state.passwords.drafts = {
+      ...this.state.passwords.drafts,
+      [folderId]: password,
+    };
+  };
+
+  private changeFolderPassword = async (folderId: string, password: string) => {
+    const scopedKey = folderPasswordScopedKey(
+      activeFolderPasswordScopeDeviceId(this.state),
+      folderId,
+    );
+    const next = { ...this.state.passwords.saved };
+    delete next[folderId];
+    if (scopedKey) delete next[scopedKey];
+    if (password) {
+      next[scopedKey || folderId] = password;
     }
-  } catch (error) {
-    reportActionError(state, "folder_password.save.failed", error, { folderId });
-  }
-};
-
-const addSavedDevice = () => {
-  const normalized = normalizeDeviceId(state.devices.newSavedDeviceId);
-  if (!normalized) {
-    state.ui.recentError = "Device ID is required.";
-    return;
-  }
-  if (!isValidSyncthingDeviceId(normalized)) {
-    state.ui.recentError =
-      "Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
-    return;
-  }
-  const customName = state.devices.newSavedDeviceCustomName.trim();
-  upsertSavedDevice(state, normalized, customName || suggestedSavedDeviceName(state, normalized), {
-    customName: customName !== "",
-    isIntroducer: state.devices.newSavedDeviceIsIntroducer,
-  });
-  state.devices.selectedSavedDeviceId = normalized;
-  state.connection.remoteId = normalized;
-  state.connection.discoveryMode = "automatic";
-  state.connection.host = "";
-  state.devices.newSavedDeviceId = "";
-  state.devices.newSavedDeviceCustomName = "";
-  state.devices.newSavedDeviceIsIntroducer = false;
-  state.ui.recentError = null;
-};
-
-const editSavedDeviceName = (deviceId: string) => {
-  const normalized = normalizeDeviceId(deviceId);
-  if (!normalized) return;
-  const initial = suggestedSavedDeviceName(state, normalized);
-  const updated =
-    typeof window !== "undefined"
-      ? window.prompt("Edit device name:", initial)
-      : initial;
-  if (updated === null) return;
-  if (!updated.trim()) {
-    state.ui.recentError = "Device name cannot be empty.";
-    return;
-  }
-  upsertSavedDevice(state, normalized, updated.trim(), { customName: true });
-  state.ui.recentError = null;
-};
-
-const useSavedDevice = (deviceId: string) => {
-  state.devices.selectedSavedDeviceId = deviceId;
-  state.connection.remoteId = deviceId;
-  state.connection.discoveryMode = "automatic";
-  state.connection.host = "";
-  if (!state.session.isConnected) {
-    restoreOfflineSnapshot(state, clearDirectoryView, deviceId, "use_saved_device");
-    return;
-  }
-  void refreshActiveView();
-};
-
-const setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean) => {
-  upsertSavedDevice(state, deviceId, suggestedSavedDeviceName(state, deviceId), {
-    customName:
-      state.devices.savedDevices.find((item) => sameDeviceId(item.id, deviceId))
-        ?.customName ?? false,
-    isIntroducer,
-  });
-};
-
-const removeSavedDevice = (deviceId: string) => {
-  const normalized = normalizeDeviceId(deviceId);
-  setRemoteApprovalPending(state, normalized, false);
-  if (sameDeviceId(state.approvals.pendingApprovalPromptDeviceId, normalized)) {
-    state.approvals.pendingApprovalPromptDeviceId = "";
-  }
-  state.devices.savedDevices = state.devices.savedDevices.filter(
-    (item) => !sameDeviceId(item.id, normalized),
-  );
-  if (sameDeviceId(state.connection.remoteId, normalized)) {
-    state.connection.remoteId = "";
-  }
-  state.approvals.syncApprovedFolderKeys = new Set(
-    [...state.approvals.syncApprovedFolderKeys].filter(
-      (key) => !key.startsWith(`${normalized}:`),
-    ),
-  );
-  const scopedPrefix = `${normalized}${FOLDER_PASSWORD_SCOPE_SEPARATOR}`;
-  state.passwords.saved = Object.fromEntries(
-    Object.entries(state.passwords.saved).filter(
-      ([key]) => !key.startsWith(scopedPrefix),
-    ),
-  );
-  state.offline.snapshots = Object.fromEntries(
-    Object.entries(state.offline.snapshots).filter(
-      ([key]) => !sameDeviceId(key, normalized),
-    ),
-  );
-};
-
-const approveAdvertisedDevice = (device: ReturnType<typeof advertisedDevices>[number]) => {
-  if (!isValidSyncthingDeviceId(device.id)) {
-    state.ui.recentError = `Advertised device ID is invalid and cannot be approved: ${device.id}`;
-    return;
-  }
-  upsertSavedDevice(state, device.id, device.name, { customName: false });
-  state.devices.selectedSavedDeviceId = device.id;
-  state.connection.remoteId = device.id;
-  state.connection.discoveryMode = "automatic";
-  state.connection.host = "";
-  state.ui.recentError = null;
-};
-
-const approveFolderSync = (folder: ReturnType<typeof advertisedFolders>[number]) => {
-  const next = new Set(state.approvals.syncApprovedFolderKeys);
-  next.add(folder.key);
-  state.approvals.syncApprovedFolderKeys = next;
-  state.ui.recentError = null;
-};
-
-const resetDiscoveryServer = () => {
-  state.connection.discoveryServer = getDefaultDiscoveryServer();
-};
-
-const clearOfflineFolderState = () => {
-  state.offline.snapshots = {};
-  if (!state.session.isConnected) {
-    state.session.folders = [];
-    state.session.folderSyncStates = [];
-    state.session.remoteDevice = null;
-    state.session.connectionPath = "";
-    state.session.connectionTransport = "";
-    clearDirectoryView(state);
-  }
-  pushSessionLog(
-    state,
-    "info",
-    "offline.snapshot.cleared",
-    "Cleared all persisted offline folder snapshots.",
-  );
-};
-
-const regenerateDeviceId = async () => {
-  if (state.devices.isRegeneratingDeviceId) return;
-  const confirmed =
-    typeof window !== "undefined"
-      ? window.confirm(
-          "Generate a new device ID now? Other peers will treat this as a new device until approved again.",
-        )
-      : true;
-  if (!confirmed) return;
-  state.devices.isRegeneratingDeviceId = true;
-  try {
-    state.devices.currentDeviceId = await client.regenerateDefaultIdentity();
-    state.devices.identityNotice = "New device ID generated.";
-    state.devices.identityRecoverySecret = "";
-    state.ui.showRestoreFromBackup = false;
-  } catch (error) {
-    reportActionError(state, "device_id.regenerate.failed", error);
-  } finally {
-    state.devices.isRegeneratingDeviceId = false;
-  }
-};
-
-const editLocalDeviceName = () => {
-  const initial = state.connection.deviceName.trim() || suggestedClientName();
-  const updated =
-    typeof window !== "undefined"
-      ? window.prompt("Edit this device name (advertised to peers):", initial)
-      : initial;
-  if (updated === null) return;
-  if (!updated.trim()) {
-    state.ui.recentError = "Device name is required.";
-    return;
-  }
-  state.connection.deviceName = updated.trim();
-  state.devices.identityNotice = "Advertised device name updated.";
-  state.ui.recentError = null;
-};
-
-const copyIdentityBackupSecret = async () => {
-  if (state.devices.isExportingIdentityRecovery) return;
-  state.devices.isExportingIdentityRecovery = true;
-  try {
-    const exported = await client.exportIdentityRecovery();
-    await copyText(exported.recoverySecret);
-    state.devices.currentDeviceId = exported.deviceId;
-    state.devices.identityNotice = "Backup secret copied. Keep it in a safe place.";
-  } catch (error) {
-    reportActionError(state, "identity_backup.copy_secret.failed", error);
-  } finally {
-    state.devices.isExportingIdentityRecovery = false;
-  }
-};
-
-const restoreIdentityRecovery = async () => {
-  if (state.devices.isRestoringIdentityRecovery) return;
-  if (!state.devices.identityRecoverySecret.trim()) {
-    state.ui.recentError = "Backup secret is required.";
-    return;
-  }
-  state.devices.isRestoringIdentityRecovery = true;
-  try {
-    await client.restoreIdentityRecovery(state.devices.identityRecoverySecret.trim());
-    await refreshCurrentDeviceId();
-    state.devices.identityRecoverySecret = "";
-    state.ui.showRestoreFromBackup = false;
-    state.devices.identityNotice = "Device identity restored from backup secret.";
-  } catch (error) {
-    reportActionError(state, "identity_backup.restore.failed", error);
-  } finally {
-    state.devices.isRestoringIdentityRecovery = false;
-  }
-};
-
-
-  return {
-    updateFolderPasswordDraft,
-    saveFolderPassword: (folderId: string) => changeFolderPassword(folderId,
-      (state.passwords.drafts[folderId] ?? activeFolderPasswords(state)[folderId] ?? "").trim()),
-    clearFolderPassword: (folderId: string) => changeFolderPassword(folderId, ""),
-    addSavedDevice,
-    editSavedDeviceName,
-    useSavedDevice,
-    setSavedDeviceIntroducer,
-    removeSavedDevice,
-    approveAdvertisedDevice,
-    approveFolderSync,
-    resetDiscoveryServer,
-    clearOfflineFolderState,
-    regenerateDeviceId,
-    editLocalDeviceName,
-    copyIdentityBackupSecret,
-    restoreIdentityRecovery,
+    try {
+      await this.savePasswords?.(next);
+      this.state.passwords.saved = next;
+      if (!password) this.state.passwords.drafts = { ...this.state.passwords.drafts, [folderId]: "" };
+      await this.sessionStore.actions.setFolderPasswords(activeFolderPasswords(this.state));
+      if (this.state.session.isConnected) {
+        await this.refreshOverview();
+        if (password && !folderIsLocked(this.state, folderId) && this.state.session.currentFolderId === folderId) {
+          await this.sessionStore.actions.reloadCurrentDirectory(connectionDetails(this.state));
+          applySessionState(this.state, this.sessionStore.getState());
+          await loadDirectorySideEffects(this.state, this.client);
+        }
+      }
+    } catch (error) {
+      reportActionError(this.state, "folder_password.save.failed", error, { folderId });
+    }
   };
-};
+
+  private addSavedDevice = () => {
+    const normalized = normalizeDeviceId(this.state.devices.newSavedDeviceId);
+    if (!normalized) {
+      this.state.ui.recentError = "Device ID is required.";
+      return;
+    }
+    if (!isValidSyncthingDeviceId(normalized)) {
+      this.state.ui.recentError =
+        "Device ID looks invalid. Expected 52 or 56 base32 chars (A-Z, 2-7), usually shown as grouped with dashes.";
+      return;
+    }
+    const customName = this.state.devices.newSavedDeviceCustomName.trim();
+    upsertSavedDevice(this.state, normalized, customName || suggestedSavedDeviceName(this.state, normalized), {
+      customName: customName !== "",
+      isIntroducer: this.state.devices.newSavedDeviceIsIntroducer,
+    });
+    this.state.devices.selectedSavedDeviceId = normalized;
+    this.state.connection.remoteId = normalized;
+    this.state.connection.discoveryMode = "automatic";
+    this.state.connection.host = "";
+    this.state.devices.newSavedDeviceId = "";
+    this.state.devices.newSavedDeviceCustomName = "";
+    this.state.devices.newSavedDeviceIsIntroducer = false;
+    this.state.ui.recentError = null;
+  };
+
+  private editSavedDeviceName = (deviceId: string) => {
+    const normalized = normalizeDeviceId(deviceId);
+    if (!normalized) return;
+    const initial = suggestedSavedDeviceName(this.state, normalized);
+    const updated =
+      typeof window !== "undefined"
+        ? window.prompt("Edit device name:", initial)
+        : initial;
+    if (updated === null) return;
+    if (!updated.trim()) {
+      this.state.ui.recentError = "Device name cannot be empty.";
+      return;
+    }
+    upsertSavedDevice(this.state, normalized, updated.trim(), { customName: true });
+    this.state.ui.recentError = null;
+  };
+
+  private useSavedDevice = (deviceId: string) => {
+    this.state.devices.selectedSavedDeviceId = deviceId;
+    this.state.connection.remoteId = deviceId;
+    this.state.connection.discoveryMode = "automatic";
+    this.state.connection.host = "";
+    if (!this.state.session.isConnected) {
+      restoreOfflineSnapshot(this.state, clearDirectoryView, deviceId, "use_saved_device");
+      return;
+    }
+    void this.refreshActiveView();
+  };
+
+  private setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean) => {
+    upsertSavedDevice(this.state, deviceId, suggestedSavedDeviceName(this.state, deviceId), {
+      customName:
+        this.state.devices.savedDevices.find((item) => sameDeviceId(item.id, deviceId))
+          ?.customName ?? false,
+      isIntroducer,
+    });
+  };
+
+  private removeSavedDevice = (deviceId: string) => {
+    const normalized = normalizeDeviceId(deviceId);
+    setRemoteApprovalPending(this.state, normalized, false);
+    if (sameDeviceId(this.state.approvals.pendingApprovalPromptDeviceId, normalized)) {
+      this.state.approvals.pendingApprovalPromptDeviceId = "";
+    }
+    this.state.devices.savedDevices = this.state.devices.savedDevices.filter(
+      (item) => !sameDeviceId(item.id, normalized),
+    );
+    if (sameDeviceId(this.state.connection.remoteId, normalized)) {
+      this.state.connection.remoteId = "";
+    }
+    this.state.approvals.syncApprovedFolderKeys = new Set(
+      [...this.state.approvals.syncApprovedFolderKeys].filter(
+        (key) => !key.startsWith(`${normalized}:`),
+      ),
+    );
+    const scopedPrefix = `${normalized}${FOLDER_PASSWORD_SCOPE_SEPARATOR}`;
+    this.state.passwords.saved = Object.fromEntries(
+      Object.entries(this.state.passwords.saved).filter(
+        ([key]) => !key.startsWith(scopedPrefix),
+      ),
+    );
+    this.state.offline.snapshots = Object.fromEntries(
+      Object.entries(this.state.offline.snapshots).filter(
+        ([key]) => !sameDeviceId(key, normalized),
+      ),
+    );
+  };
+
+  private approveAdvertisedDevice = (device: ReturnType<typeof advertisedDevices>[number]) => {
+    if (!isValidSyncthingDeviceId(device.id)) {
+      this.state.ui.recentError = `Advertised device ID is invalid and cannot be approved: ${device.id}`;
+      return;
+    }
+    upsertSavedDevice(this.state, device.id, device.name, { customName: false });
+    this.state.devices.selectedSavedDeviceId = device.id;
+    this.state.connection.remoteId = device.id;
+    this.state.connection.discoveryMode = "automatic";
+    this.state.connection.host = "";
+    this.state.ui.recentError = null;
+  };
+
+  private approveFolderSync = (folder: ReturnType<typeof advertisedFolders>[number]) => {
+    const next = new Set(this.state.approvals.syncApprovedFolderKeys);
+    next.add(folder.key);
+    this.state.approvals.syncApprovedFolderKeys = next;
+    this.state.ui.recentError = null;
+  };
+
+  private resetDiscoveryServer = () => {
+    this.state.connection.discoveryServer = getDefaultDiscoveryServer();
+  };
+
+  private clearOfflineFolderState = () => {
+    this.state.offline.snapshots = {};
+    if (!this.state.session.isConnected) {
+      this.state.session.folders = [];
+      this.state.session.folderSyncStates = [];
+      this.state.session.remoteDevice = null;
+      this.state.session.connectionPath = "";
+      this.state.session.connectionTransport = "";
+      clearDirectoryView(this.state);
+    }
+    pushSessionLog(
+      this.state,
+      "info",
+      "offline.snapshot.cleared",
+      "Cleared all persisted offline folder snapshots.",
+    );
+  };
+
+  private regenerateDeviceId = async () => {
+    if (this.state.devices.isRegeneratingDeviceId) return;
+    const confirmed =
+      typeof window !== "undefined"
+        ? window.confirm(
+            "Generate a new device ID now? Other peers will treat this as a new device until approved again.",
+          )
+        : true;
+    if (!confirmed) return;
+    this.state.devices.isRegeneratingDeviceId = true;
+    try {
+      this.state.devices.currentDeviceId = await this.client.regenerateDefaultIdentity();
+      this.state.devices.identityNotice = "New device ID generated.";
+      this.state.devices.identityRecoverySecret = "";
+      this.state.ui.showRestoreFromBackup = false;
+    } catch (error) {
+      reportActionError(this.state, "device_id.regenerate.failed", error);
+    } finally {
+      this.state.devices.isRegeneratingDeviceId = false;
+    }
+  };
+
+  private editLocalDeviceName = () => {
+    const initial = this.state.connection.deviceName.trim() || suggestedClientName();
+    const updated =
+      typeof window !== "undefined"
+        ? window.prompt("Edit this device name (advertised to peers):", initial)
+        : initial;
+    if (updated === null) return;
+    if (!updated.trim()) {
+      this.state.ui.recentError = "Device name is required.";
+      return;
+    }
+    this.state.connection.deviceName = updated.trim();
+    this.state.devices.identityNotice = "Advertised device name updated.";
+    this.state.ui.recentError = null;
+  };
+
+  private copyIdentityBackupSecret = async () => {
+    if (this.state.devices.isExportingIdentityRecovery) return;
+    this.state.devices.isExportingIdentityRecovery = true;
+    try {
+      const exported = await this.client.exportIdentityRecovery();
+      await copyText(exported.recoverySecret);
+      this.state.devices.currentDeviceId = exported.deviceId;
+      this.state.devices.identityNotice = "Backup secret copied. Keep it in a safe place.";
+    } catch (error) {
+      reportActionError(this.state, "identity_backup.copy_secret.failed", error);
+    } finally {
+      this.state.devices.isExportingIdentityRecovery = false;
+    }
+  };
+
+  private restoreIdentityRecovery = async () => {
+    if (this.state.devices.isRestoringIdentityRecovery) return;
+    if (!this.state.devices.identityRecoverySecret.trim()) {
+      this.state.ui.recentError = "Backup secret is required.";
+      return;
+    }
+    this.state.devices.isRestoringIdentityRecovery = true;
+    try {
+      await this.client.restoreIdentityRecovery(this.state.devices.identityRecoverySecret.trim());
+      await this.refreshCurrentDeviceId();
+      this.state.devices.identityRecoverySecret = "";
+      this.state.ui.showRestoreFromBackup = false;
+      this.state.devices.identityNotice = "Device identity restored from backup secret.";
+    } catch (error) {
+      reportActionError(this.state, "identity_backup.restore.failed", error);
+    } finally {
+      this.state.devices.isRestoringIdentityRecovery = false;
+    }
+  };
+
+  private saveFolderPassword = (folderId: string) => this.changeFolderPassword(folderId,
+    (this.state.passwords.drafts[folderId] ?? activeFolderPasswords(this.state)[folderId] ?? "").trim());
+
+  private clearFolderPassword = (folderId: string) => this.changeFolderPassword(folderId, "");
+
+  api() {
+    return {
+      updateFolderPasswordDraft: this.updateFolderPasswordDraft,
+      saveFolderPassword: this.saveFolderPassword,
+      clearFolderPassword: this.clearFolderPassword,
+      addSavedDevice: this.addSavedDevice,
+      editSavedDeviceName: this.editSavedDeviceName,
+      useSavedDevice: this.useSavedDevice,
+      setSavedDeviceIntroducer: this.setSavedDeviceIntroducer,
+      removeSavedDevice: this.removeSavedDevice,
+      approveAdvertisedDevice: this.approveAdvertisedDevice,
+      approveFolderSync: this.approveFolderSync,
+      resetDiscoveryServer: this.resetDiscoveryServer,
+      clearOfflineFolderState: this.clearOfflineFolderState,
+      regenerateDeviceId: this.regenerateDeviceId,
+      editLocalDeviceName: this.editLocalDeviceName,
+      copyIdentityBackupSecret: this.copyIdentityBackupSecret,
+      restoreIdentityRecovery: this.restoreIdentityRecovery,
+    };
+  }
+}
+
+export const createDeviceActions = (args: DeviceActionArgs) =>
+  new DeviceActionsRuntime(
+    args.state,
+    args.client,
+    args.sessionStore,
+    args.refreshOverview,
+    args.refreshActiveView,
+    args.refreshCurrentDeviceId,
+    args.savePasswords,
+  ).api();

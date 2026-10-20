@@ -160,29 +160,86 @@ async function startDocuments(android: AndroidRuntime) {
   };
 }
 
-async function startSession(android: AndroidRuntime, documents: Awaited<ReturnType<typeof startDocuments>>) {
-  const adapter = await createAndroidSessionAdapter(android);
-  const core = createSyncpeerCoreClient(adapter);
-  let activeOptions: ConnectOptions | null = null;
-  let sharedFolderIds: string[] = [];
-  let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
-  let incomingServiceKey = "";
-  let incomingServiceClosing = Promise.resolve();
-  const stopIncomingService = () => {
-    const service = incomingService;
-    incomingService = null;
-    incomingServiceKey = "";
-    const closing = incomingServiceClosing.then(() => service?.close());
-    incomingServiceClosing = closing.catch(() => undefined);
+type Documents = Awaited<ReturnType<typeof startDocuments>>;
+
+type IncomingContext = {
+  localDeviceId: string;
+  approvedDeviceIds: string[];
+  listenPort: number;
+  automaticRelay: ReturnType<typeof automaticRelayConfiguration>;
+  key: string;
+  remoteDeviceId: string;
+  revision: number;
+  saved: Record<string, string>;
+  unlocked: boolean;
+};
+
+class AndroidSessionRuntime {
+  private activeOptions: ConnectOptions | null = null;
+  private sharedFolderIds: string[] = [];
+  private incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+  private incomingServiceKey = "";
+  private incomingServiceClosing: Promise<unknown> = Promise.resolve();
+  private readonly lifecycle: ConnectionLifecycle<ConnectOptions>;
+
+  private constructor(
+    private readonly documents: Documents,
+    private readonly adapter: SyncpeerHostAdapter,
+    private readonly core: ReturnType<typeof createSyncpeerCoreClient>,
+  ) {
+    this.lifecycle = this.createLifecycle();
+  }
+
+  static async create(android: AndroidRuntime, documents: Documents): Promise<AndroidSessionRuntime> {
+    const adapter = await createAndroidSessionAdapter(android);
+    return new AndroidSessionRuntime(documents, adapter, createSyncpeerCoreClient(adapter));
+  }
+
+  start() {
+    this.documents.onSessionConfigurationChange(() => {
+      setTimeout(() => {
+        void (async () => {
+          await this.stopIncomingService();
+          if (!this.activeOptions) return;
+          await this.lifecycle.ensureSession(this.activeOptions);
+        })().catch(() => undefined);
+      }, 0);
+    });
+    return { command: this.command, close: this.close };
+  }
+
+  private createLifecycle(): ConnectionLifecycle<ConnectOptions> {
+    return createConnectionLifecycle<ConnectOptions>({
+      open: (options, signal) => this.openSession(options, signal),
+      keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName,
+        // Shared-folder credentials and the replica receiver are resolved from
+        // the document owner when the session opens. A later folder attach,
+        // favorite or credential change must invalidate the live session so it
+        // reopens with the current selection.
+        sessionConfigurationRevision: this.documents.sessionConfigurationRevision() }),
+    });
+  }
+
+  private stopIncomingService = () => {
+    const service = this.incomingService;
+    this.incomingService = null;
+    this.incomingServiceKey = "";
+    const closing = this.incomingServiceClosing.then(() => service?.close());
+    this.incomingServiceClosing = closing.catch(() => undefined);
     return closing;
   };
-  const ensureIncomingService = async (options: ConnectOptions, coreOptions: SyncpeerConnectOptions) => {
+
+  private prepareIncomingContext = async (
+    options: ConnectOptions,
+    coreOptions: SyncpeerConnectOptions,
+  ): Promise<IncomingContext | null> => {
     if (!coreOptions.expectedDeviceId) return null;
-    const localDeviceId = await deviceIdFromCertificate(adapter, certificateDerFromPem(coreOptions.certPem));
-    const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
+    const localDeviceId = await deviceIdFromCertificate(this.adapter,
+      certificateDerFromPem(coreOptions.certPem));
+    const trustedDevices = (await this.documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
     const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
       localDeviceId, trustedDevices);
-    if (!approvedDeviceIds.length) { await stopIncomingService(); return null; }
+    if (!approvedDeviceIds.length) { await this.stopIncomingService(); return null; }
     const listenPort = options.listenPort ?? 22000;
     if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
       throw new Error("Incoming TCP port must be between 1 and 65535.");
@@ -190,32 +247,56 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
     const automaticRelay = automaticRelayConfiguration(options);
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem, listenPort, automaticRelay]);
-    const remoteDeviceId = coreOptions.expectedDeviceId;
-    const revision = documents.sessionConfigurationRevision();
-    const saved = await documents.connectionPasswords().catch(() => ({}));
-    const unlocked = (await documents.status()).vault.phase === "unlocked";
+    return {
+      localDeviceId,
+      approvedDeviceIds,
+      listenPort,
+      automaticRelay,
+      key,
+      remoteDeviceId: coreOptions.expectedDeviceId,
+      revision: this.documents.sessionConfigurationRevision(),
+      saved: await this.documents.connectionPasswords().catch(() => ({})),
+      unlocked: (await this.documents.status()).vault.phase === "unlocked",
+    };
+  };
+
+  private prepareIncomingSessions = async (
+    context: IncomingContext,
+    options: ConnectOptions,
+    coreOptions: SyncpeerConnectOptions,
+  ): Promise<Map<string, SyncpeerConnectOptions>> => {
     const prepared = new Map<string, SyncpeerConnectOptions>();
-    for (const remote of approvedDeviceIds) {
+    for (const remote of context.approvedDeviceIds) {
       try {
         const folderPasswords = {
-          ...resolveFolderPasswordsForDevice(saved, remote),
+          ...resolveFolderPasswordsForDevice(context.saved, remote),
           ...(sameDeviceId(remote, options.remoteId ?? "") ? options.folderPasswords : {}),
         };
-        const sharedFolders = unlocked
-          ? sameDeviceId(remote, remoteDeviceId) && coreOptions.sharedFolders
-            ? coreOptions.sharedFolders : await documents.sessionSharedFolders(remote)
+        const sharedFolders = context.unlocked
+          ? sameDeviceId(remote, context.remoteDeviceId) && coreOptions.sharedFolders
+            ? coreOptions.sharedFolders : await this.documents.sessionSharedFolders(remote)
           : [];
         prepared.set(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase(),
           { ...coreOptions, expectedDeviceId: remote, folderPasswords, sharedFolders });
       } catch (error) {
-        adapter.log?.("core.incoming.prepare.failed", {
+        this.adapter.log?.("core.incoming.prepare.failed", {
           message: error instanceof Error ? error.message : String(error),
         });
       }
     }
+    return prepared;
+  };
+
+  private ensureIncomingService = async (
+    options: ConnectOptions,
+    coreOptions: SyncpeerConnectOptions,
+  ) => {
+    const context = await this.prepareIncomingContext(options, coreOptions);
+    if (!context) return null;
+    const prepared = await this.prepareIncomingSessions(context, options, coreOptions);
     const sessionHandlers = {
       connectionOptions: (remote: string, endpoint: { host: string; port: number }) => {
-        if (revision !== documents.sessionConfigurationRevision()) {
+        if (context.revision !== this.documents.sessionConfigurationRevision()) {
           throw new Error("Incoming peer folder preparation changed; reconnect to refresh it.");
         }
         const ready = prepared.get(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase());
@@ -223,193 +304,200 @@ async function startSession(android: AndroidRuntime, documents: Awaited<ReturnTy
         return { ...ready, ...endpoint };
       },
       onSession: (session: SyncpeerSessionHandle) => {
-        if (preferredPeerDirection(localDeviceId, remoteDeviceId) !== "incoming") return;
-        void lifecycle.adopt(options, session);
+        if (preferredPeerDirection(context.localDeviceId, context.remoteDeviceId) !== "incoming") return;
+        void this.lifecycle.adopt(options, session);
       },
     };
-    if (revision !== documents.sessionConfigurationRevision()) {
+    if (context.revision !== this.documents.sessionConfigurationRevision()) {
       throw new Error("Incoming peer folder preparation changed before the listener started.");
     }
-    if (incomingService && incomingServiceKey === key) {
-      incomingService.updateSessionHandlers(sessionHandlers);
-      return incomingService;
+    if (this.incomingService && this.incomingServiceKey === context.key) {
+      this.incomingService.updateSessionHandlers(sessionHandlers);
+      return this.incomingService;
     }
-    await stopIncomingService();
-    incomingService = await startIncomingPeerService(adapter, {
-      host: "0.0.0.0", port: listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
-      localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
-      onError: error => adapter.log?.("core.incoming.failed", {
+    await this.stopIncomingService();
+    this.incomingService = await startIncomingPeerService(this.adapter, {
+      host: "0.0.0.0", port: context.listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
+      localDeviceId: context.localDeviceId, approvedDeviceIds: context.approvedDeviceIds,
+      automaticRelay: context.automaticRelay, ...sessionHandlers,
+      onError: error => this.adapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
       }),
     });
-    incomingServiceKey = key;
-    return incomingService;
+    this.incomingServiceKey = context.key;
+    return this.incomingService;
   };
-  const lifecycle: ConnectionLifecycle<ConnectOptions> = createConnectionLifecycle<ConnectOptions>({
-    open: async (options, signal) => {
-      let passwords: Record<string, string> = {};
-      try {
-        passwords = await documents.connectionPasswords();
-      } catch {
-        // A manually locked document vault must not prevent the authenticated
-        // metadata session from reconnecting.  The foreground client can
-        // unlock it later before requesting a favorite download.
-      }
-      if (!options.cert || !options.key) throw new Error("Background session is missing the resolved identity.");
-      const trustedDevices = (await documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
-      if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices)
-        .some(id => sameDeviceId(id, options.remoteId!))) {
-        throw new Error("This peer was removed from the trusted device list.");
-      }
-      const folderPasswords = {
-        ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
-        ...options.folderPasswords,
-      };
-      const sharedFolders = await documents.sessionSharedFolders(options.remoteId ?? "");
-      const coreOptions: SyncpeerConnectOptions = {
-        host: options.host,
-        port: options.port,
-        certPem: options.cert,
-        keyPem: options.key,
-        discoveryMode: options.discoveryMode,
-        discoveryServer: options.discoveryServer,
-        expectedDeviceId: options.remoteId,
-        deviceName: options.deviceName,
-        timeoutMs: options.timeoutMs,
-        enableRelayFallback: options.enableRelayFallback,
-        relayOnly: options.relayOnly,
-        quicOnly: options.quicOnly,
-        folderPasswords,
-        sharedFolders,
-      };
-      let listenerFailure: unknown;
-      let service: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
-      try { service = await ensureIncomingService(options, coreOptions); }
-      catch (error) { listenerFailure = error; }
-      let session;
-      try { session = await core.openSession(coreOptions, signal); }
-      catch (error) {
-        if (listenerFailure) throw new AggregateError([error, listenerFailure],
-          `Could not connect to the peer or start the incoming LAN listener on TCP port ${options.listenPort ?? 22000}.`,
-          { cause: error });
-        throw error;
-      }
-      if (service && options.remoteId) {
-        const admitted = await service.admitOutgoing(options.remoteId, session.connectedVia, session);
-        if (!admitted) {
-          const remote = options.remoteId.replace(/[^A-Z2-7]/gi, "").toUpperCase();
-          const selected = service.activeSessions().find(candidate => candidate.remoteDeviceId === remote);
-          if (!selected) throw new Error("The authenticated peer session was replaced before it became active.");
-          session = selected.session;
-        }
-      }
-      sharedFolderIds = sharedFolders.map(folder => folder.id);
-      return session;
-    },
-    keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName,
-      // Shared-folder credentials and the replica receiver are resolved from
-      // the document owner when the session opens. A later folder attach,
-      // favorite or credential change must invalidate the live session so it
-      // reopens with the current selection.
-      sessionConfigurationRevision: documents.sessionConfigurationRevision() }),
-  });
-  documents.onSessionConfigurationChange(() => {
-    setTimeout(() => {
-      void (async () => {
-        await stopIncomingService();
-        if (!activeOptions) return;
-        await lifecycle.ensureSession(activeOptions);
-      })().catch(() => undefined);
-    }, 0);
-  });
-  const connectSession = async (options: ConnectOptions): Promise<SyncpeerSessionHandle> => {
+
+  private resolveCoreOptions = async (options: ConnectOptions): Promise<SyncpeerConnectOptions> => {
+    let passwords: Record<string, string> = {};
     try {
-      return await lifecycle.connect(options);
+      passwords = await this.documents.connectionPasswords();
+    } catch {
+      // A manually locked document vault must not prevent the authenticated
+      // metadata session from reconnecting.  The foreground client can
+      // unlock it later before requesting a favorite download.
+    }
+    if (!options.cert || !options.key) throw new Error("Background session is missing the resolved identity.");
+    const trustedDevices = (await this.documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
+    if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices)
+      .some(id => sameDeviceId(id, options.remoteId!))) {
+      throw new Error("This peer was removed from the trusted device list.");
+    }
+    const folderPasswords = {
+      ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
+      ...options.folderPasswords,
+    };
+    const sharedFolders = await this.documents.sessionSharedFolders(options.remoteId ?? "");
+    return {
+      host: options.host,
+      port: options.port,
+      certPem: options.cert,
+      keyPem: options.key,
+      discoveryMode: options.discoveryMode,
+      discoveryServer: options.discoveryServer,
+      expectedDeviceId: options.remoteId,
+      deviceName: options.deviceName,
+      timeoutMs: options.timeoutMs,
+      enableRelayFallback: options.enableRelayFallback,
+      relayOnly: options.relayOnly,
+      quicOnly: options.quicOnly,
+      folderPasswords,
+      sharedFolders,
+    };
+  };
+
+  private openSession = async (
+    options: ConnectOptions,
+    signal: AbortSignal,
+  ): Promise<SyncpeerSessionHandle> => {
+    const coreOptions = await this.resolveCoreOptions(options);
+    let listenerFailure: unknown;
+    let service: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+    try { service = await this.ensureIncomingService(options, coreOptions); }
+    catch (error) { listenerFailure = error; }
+    let session;
+    try { session = await this.core.openSession(coreOptions, signal); }
+    catch (error) {
+      if (listenerFailure) throw new AggregateError([error, listenerFailure],
+        `Could not connect to the peer or start the incoming LAN listener on TCP port ${options.listenPort ?? 22000}.`,
+        { cause: error });
+      throw error;
+    }
+    if (service && options.remoteId) {
+      const admitted = await service.admitOutgoing(options.remoteId, session.connectedVia, session);
+      if (!admitted) {
+        const remote = options.remoteId.replace(/[^A-Z2-7]/gi, "").toUpperCase();
+        const selected = service.activeSessions().find(candidate => candidate.remoteDeviceId === remote);
+        if (!selected) throw new Error("The authenticated peer session was replaced before it became active.");
+        session = selected.session;
+      }
+    }
+    this.sharedFolderIds = coreOptions.sharedFolders?.map(folder => folder.id) ?? [];
+    return session;
+  };
+
+  private connectSession = async (options: ConnectOptions): Promise<SyncpeerSessionHandle> => {
+    try {
+      return await this.lifecycle.connect(options);
     } catch (error) {
       // The lifecycle keeps retrying after a failed opening, for example when
       // the foreground app's session briefly overlaps the background handoff.
       // The service needs the runtime-bound session rather than the first
       // rejection, so wait for the lifecycle's own retry to connect.
-      const phase = lifecycle.getState().phase;
+      const phase = this.lifecycle.getState().phase;
       if (phase !== "waiting" && phase !== "reconnecting" && phase !== "connecting") {
-        adapter.log?.("core.session.connect.failed", { message: phase });
+        this.adapter.log?.("core.session.connect.failed", { message: phase });
         throw error;
       }
-      adapter.log?.("core.session.connect.retrying", { message: phase });
-      const connected = await waitForLifecyclePhase(lifecycle, "connected", 60_000);
+      this.adapter.log?.("core.session.connect.retrying", { message: phase });
+      const connected = await waitForLifecyclePhase(this.lifecycle, "connected", 60_000);
       if (!connected) {
-        adapter.log?.("core.session.connect.failed", { message: lifecycle.getState().phase });
+        this.adapter.log?.("core.session.connect.failed", { message: this.lifecycle.getState().phase });
         throw error;
       }
-      adapter.log?.("core.session.connect.recovered", {});
-      return await lifecycle.ensureSession(options);
+      this.adapter.log?.("core.session.connect.recovered", {});
+      return await this.lifecycle.ensureSession(options);
     }
   };
-  return {
-    command: async (input: unknown) => {
-      if (!input || typeof input !== "object" || Array.isArray(input)) {
-        throw new Error("Session request must be an object.");
-      }
-      const request = input as Record<string, unknown>;
-      if (request.operation === "connect") {
-        if (!request.options || typeof request.options !== "object" || Array.isArray(request.options)) {
-          throw new Error("Session connect options are missing.");
-        }
-        const options = request.options as ConnectOptions;
-        activeOptions = options;
-        const session = await connectSession(options);
-        // Remember newly advertised roots. Folders already attached to the
-        // DocumentsProvider are supplied above as explicit full replicas;
-        // unattached folders remain metadata-only until selected.
-        for (const folder of await session.remoteFs.listFolders()) {
-          await documents.rememberFolder({ id: folder.id, label: folder.label || folder.id });
-        }
-        return { phase: lifecycle.getState().phase };
-      }
-      if (request.operation === "disconnect") {
-        activeOptions = null;
-        sharedFolderIds = [];
-        await lifecycle.disconnect();
-        await stopIncomingService();
-        return { phase: "idle" };
-      }
-      if (request.operation === "syncFavorites") {
-        const session = lifecycle.getSession();
-        if (!session) return { phase: "waiting" };
-        return documents.syncFavorites(session.remoteFs, sharedFolderIds);
-      }
-      if (request.operation === "releaseLocalCopy") {
-        if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096) {
-          throw new Error("Invalid release folder identity.");
-        }
-        let result;
-        if (request.mode === "dangerous") {
-          if (typeof request.confirmedText !== "string") throw new Error("Release confirmation is missing.");
-          result = await documents.releaseLocalCopy(request.folderId,
-            { mode: "dangerous", confirmedText: request.confirmedText });
-        } else {
-          if (request.mode !== "safe") throw new Error("Invalid local release mode.");
-          const sessions = [...incomingService?.activeSessions().map(value => value.session) ?? [],
-            ...(lifecycle.getSession() ? [lifecycle.getSession()!] : [])]
-            .filter(session => !session.isClosed());
-          if (!sessions.length) throw new Error("No peer connected to the Android background service for safe release.");
-          result = await documents.releaseLocalCopy(request.folderId, { mode: "safe", sessions });
-        }
-        await lifecycle.disconnect();
-        await stopIncomingService();
-        sharedFolderIds = [];
-        return result;
-      }
-      if (request.operation === "status") return { ...lifecycle.getState(), active: !!lifecycle.getSession(), hasOptions: !!activeOptions };
-      throw new Error(`Unknown session operation: ${String(request.operation)}`);
-    },
-    close: async () => {
-      activeOptions = null;
-      sharedFolderIds = [];
-      await lifecycle.disconnect();
-      await stopIncomingService();
-    },
+
+  private connectCommand = async (request: Record<string, unknown>) => {
+    if (!request.options || typeof request.options !== "object" || Array.isArray(request.options)) {
+      throw new Error("Session connect options are missing.");
+    }
+    const options = request.options as ConnectOptions;
+    this.activeOptions = options;
+    const session = await this.connectSession(options);
+    // Remember newly advertised roots. Folders already attached to the
+    // DocumentsProvider are supplied above as explicit full replicas;
+    // unattached folders remain metadata-only until selected.
+    for (const folder of await session.remoteFs.listFolders()) {
+      await this.documents.rememberFolder({ id: folder.id, label: folder.label || folder.id });
+    }
+    return { phase: this.lifecycle.getState().phase };
   };
+
+  private disconnectCommand = async () => {
+    this.activeOptions = null;
+    this.sharedFolderIds = [];
+    await this.lifecycle.disconnect();
+    await this.stopIncomingService();
+    return { phase: "idle" };
+  };
+
+  private syncFavoritesCommand = async () => {
+    const session = this.lifecycle.getSession();
+    if (!session) return { phase: "waiting" };
+    return this.documents.syncFavorites(session.remoteFs, this.sharedFolderIds);
+  };
+
+  private releaseLocalCopyCommand = async (request: Record<string, unknown>) => {
+    if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096) {
+      throw new Error("Invalid release folder identity.");
+    }
+    let result;
+    if (request.mode === "dangerous") {
+      if (typeof request.confirmedText !== "string") throw new Error("Release confirmation is missing.");
+      result = await this.documents.releaseLocalCopy(request.folderId,
+        { mode: "dangerous", confirmedText: request.confirmedText });
+    } else {
+      if (request.mode !== "safe") throw new Error("Invalid local release mode.");
+      const sessions = [...this.incomingService?.activeSessions().map(value => value.session) ?? [],
+        ...(this.lifecycle.getSession() ? [this.lifecycle.getSession()!] : [])]
+        .filter(session => !session.isClosed());
+      if (!sessions.length) throw new Error("No peer connected to the Android background service for safe release.");
+      result = await this.documents.releaseLocalCopy(request.folderId, { mode: "safe", sessions });
+    }
+    await this.lifecycle.disconnect();
+    await this.stopIncomingService();
+    this.sharedFolderIds = [];
+    return result;
+  };
+
+  private command = async (input: unknown) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new Error("Session request must be an object.");
+    }
+    const request = input as Record<string, unknown>;
+    switch (request.operation) {
+      case "connect": return this.connectCommand(request);
+      case "disconnect": return this.disconnectCommand();
+      case "syncFavorites": return this.syncFavoritesCommand();
+      case "releaseLocalCopy": return this.releaseLocalCopyCommand(request);
+      case "status": return { ...this.lifecycle.getState(), active: !!this.lifecycle.getSession(), hasOptions: !!this.activeOptions };
+      default: throw new Error(`Unknown session operation: ${String(request.operation)}`);
+    }
+  };
+
+  private close = async () => {
+    this.activeOptions = null;
+    this.sharedFolderIds = [];
+    await this.lifecycle.disconnect();
+    await this.stopIncomingService();
+  };
+}
+
+async function startSession(android: AndroidRuntime, documents: Documents) {
+  return (await AndroidSessionRuntime.create(android, documents)).start();
 }
 
 Object.defineProperty(globalThis, "syncpeerDocumentsCore", {

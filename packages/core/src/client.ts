@@ -823,19 +823,13 @@ export function extractDiscoveryAuth(url: URL): {
   return { pinServerDeviceId, allowInsecureTls };
 }
 
-async function resolveGlobalDiscoveryInternal(
+async function fetchGlobalDiscovery(
   adapter: SyncpeerHostAdapter,
   options: SyncpeerGlobalDiscoveryOptions,
+  server: URL,
+  auth: ReturnType<typeof extractDiscoveryAuth>,
   signal?: AbortSignal,
-): Promise<SyncpeerGlobalDiscoveryResult> {
-  if (!options.expectedDeviceId) {
-    throw new Error(
-      "Remote Device ID is required when discovery mode is global.",
-    );
-  }
-  const server = normalizeDiscoveryServerUrl(options.discoveryServer);
-  const auth = extractDiscoveryAuth(server);
-  server.searchParams.set("device", options.expectedDeviceId);
+) {
   const response = await adapter.discoveryFetch(server.toString(), {
     method: "GET",
     headers: { Accept: "application/json" },
@@ -844,33 +838,45 @@ async function resolveGlobalDiscoveryInternal(
     signal,
   });
   if (response.status === 404) {
-    throw new Error(
-      `Global discovery did not find device ${options.expectedDeviceId}.`,
-    );
+    throw new Error(`Global discovery did not find device ${options.expectedDeviceId}.`);
   }
   if (!response.ok) {
-    throw new Error(
-      `Global discovery failed (${response.status}): ${await response.text()}`,
-    );
+    throw new Error(`Global discovery failed (${response.status}): ${await response.text()}`);
   }
-  const payload = await response.json();
+  return response.json();
+}
+
+function parseGlobalCandidates(payload: unknown): DiscoveredCandidate[] {
   const rawAddresses: unknown[] =
     typeof payload === "object" && payload !== null &&
     "addresses" in payload && Array.isArray(payload.addresses)
       ? payload.addresses
       : [];
-  const candidates = dedupeCandidates(
+  return dedupeCandidates(
     rawAddresses
       .map(parseDiscoveryCandidate)
       .filter((entry): entry is DiscoveredCandidate => entry !== null),
   );
+}
 
+async function resolveGlobalDiscoveryInternal(
+  adapter: SyncpeerHostAdapter,
+  options: SyncpeerGlobalDiscoveryOptions,
+  signal?: AbortSignal,
+): Promise<SyncpeerGlobalDiscoveryResult> {
+  if (!options.expectedDeviceId) {
+    throw new Error("Remote Device ID is required when discovery mode is global.");
+  }
+  const server = normalizeDiscoveryServerUrl(options.discoveryServer);
+  const auth = extractDiscoveryAuth(server);
+  server.searchParams.set("device", options.expectedDeviceId);
+  const payload = await fetchGlobalDiscovery(adapter, options, server, auth, signal);
+  const candidates = parseGlobalCandidates(payload);
   adapter.log?.("core.discovery.full_response", {
     expectedDeviceId: options.expectedDeviceId,
     payload,
     candidates,
   });
-
   return { payload, candidates };
 }
 
@@ -880,6 +886,42 @@ export async function resolveGlobalDiscovery(
 ): Promise<SyncpeerGlobalDiscoveryResult> {
   return resolveGlobalDiscoveryInternal(adapter, options);
 }
+
+type UploadPlan = {
+  folder: FolderState;
+  folderId: string;
+  path: string;
+  source: FileUploadSource;
+  options?: FileUploadOptions;
+  plaintextBlocks: UploadedBlock[];
+  modifiedMs: number;
+  sequence: number;
+  baseVersion: ReturnType<typeof advanceVersionVector>;
+  blockSize: number;
+  startedAtMs: number;
+  throwIfCancelled: () => void;
+  uploadRateBps: (processedBytes: number) => number;
+  notifyProgress: (processedBytes: number, phase: "preparing" | "publishing") => void;
+};
+
+type ClusterFolder = NonNullable<BepClusterConfig["folders"]>[number];
+type ClusterDevice = NonNullable<ClusterFolder["devices"]>[number];
+type ClusterFolderContext = {
+  folderId: string;
+  folderDevices: ClusterDevice[];
+  advertisedDevices: AdvertisedDeviceInfo[];
+  remoteDevice: ClusterDevice | undefined;
+  localDeviceEntry: ClusterDevice | undefined;
+  remoteIndexId: string;
+  remoteMaxSequence: string;
+  stopReason: number;
+  normalizedDeviceIds: string[];
+  localToken: Uint8Array | null;
+  remoteToken: Uint8Array | null;
+  announcedToken: Uint8Array | null;
+  encrypted: boolean;
+  folderPassword: string | undefined;
+};
 
 class BepSession {
   private parser: FrameParser;
@@ -910,6 +952,8 @@ class BepSession {
   private pendingIndexByFolder = new Map<string, PendingIndexFrame>();
   private indexApplyInFlight = new Set<string>();
   private stateTasks = new Set<Promise<void>>();
+  private readonly indexTasks = new Set<Promise<void>>();
+  private clusterFoldersTask: Promise<void> = Promise.resolve();
   private replicaScanTimer: ReturnType<typeof setInterval> | null = null;
   private replicaScanInFlight = false;
   private sentReplicaSequences = new Map<string, number>();
@@ -976,44 +1020,48 @@ class BepSession {
         .map(([folderId, password]) => [folderId.trim(), password.trim()] as const)
         .filter(([folderId, password]) => folderId !== "" && password !== ""),
     );
-    for (const folder of sharedFolders ?? []) {
-      const id = folder.id.trim();
-      if (!id) throw new Error("Shared folder ID must not be empty.");
-      if (this.sharedFolders.has(id)) {
-        throw new Error(`Shared folder ID must be unique: ${id}`);
-      }
-      const label = folder.label?.trim() || id;
-      if (folder.encryption.mode === "ciphertext") {
-        if (!folder.ciphertextReplica || folder.replica) throw new Error("Ciphertext sharing requires exactly one ciphertext replica.");
-        const identity = createCiphertextIndex({ folderId: id, passwordToken: folder.encryption.passwordToken }).identity;
-        this.sharedFolders.set(id, { id, label, internal: folder.internal === true,
-          ciphertextReplica: folder.ciphertextReplica,
-          encryption: { mode: "ciphertext", passwordToken: identity.passwordToken } });
-        continue;
-      }
-      if (folder.ciphertextReplica) throw new Error("Ciphertext replica requires explicit ciphertext sharing.");
-      if (folder.encryption.mode === "encrypted") {
-        const password = folder.encryption.password.trim();
-        if (!password) {
-          throw new Error(`Encrypted shared folder ${id} requires a password.`);
-        }
-        this.folderPasswords.set(id, password);
-        this.sharedFolders.set(id, {
-          id,
-          label,
-          internal: folder.internal === true,
-          encryption: { mode: "encrypted", password },
-          replica: folder.replica,
-        });
-      } else {
-        this.sharedFolders.set(id, {
-          id,
-          label,
-          internal: folder.internal === true,
-          encryption: { mode: "plaintext" },
-          replica: folder.replica,
-        });
-      }
+    this.configureSharedFolders(sharedFolders);
+  }
+
+  private configureSharedFolders(sharedFolders?: SharedFolder[]) {
+    for (const folder of sharedFolders ?? []) this.configureSharedFolder(folder);
+  }
+
+  private configureSharedFolder(folder: SharedFolder) {
+    const id = folder.id.trim();
+    if (!id) throw new Error("Shared folder ID must not be empty.");
+    if (this.sharedFolders.has(id)) {
+      throw new Error(`Shared folder ID must be unique: ${id}`);
+    }
+    const label = folder.label?.trim() || id;
+    if (folder.encryption.mode === "ciphertext") {
+      if (!folder.ciphertextReplica || folder.replica) throw new Error("Ciphertext sharing requires exactly one ciphertext replica.");
+      const identity = createCiphertextIndex({ folderId: id, passwordToken: folder.encryption.passwordToken }).identity;
+      this.sharedFolders.set(id, { id, label, internal: folder.internal === true,
+        ciphertextReplica: folder.ciphertextReplica,
+        encryption: { mode: "ciphertext", passwordToken: identity.passwordToken } });
+      return;
+    }
+    if (folder.ciphertextReplica) throw new Error("Ciphertext replica requires explicit ciphertext sharing.");
+    if (folder.encryption.mode === "encrypted") {
+      const password = folder.encryption.password.trim();
+      if (!password) throw new Error(`Encrypted shared folder ${id} requires a password.`);
+      this.folderPasswords.set(id, password);
+      this.sharedFolders.set(id, {
+        id,
+        label,
+        internal: folder.internal === true,
+        encryption: { mode: "encrypted", password },
+        replica: folder.replica,
+      });
+    } else {
+      this.sharedFolders.set(id, {
+        id,
+        label,
+        internal: folder.internal === true,
+        encryption: { mode: "plaintext" },
+        replica: folder.replica,
+      });
     }
   }
 
@@ -1203,25 +1251,36 @@ class BepSession {
     }, intervalMs);
   }
 
-  private onFrame(type: number, msg: unknown): void {
+  private logFrameReceived(type: number) {
     if (
-      type !== MessageTypeValues.PING &&
-      type !== MessageTypeValues.INDEX &&
-      type !== MessageTypeValues.INDEX_UPDATE
-    ) {
-      this.log("frame.received", {
-        type,
-        isClusterConfig: type === MessageTypeValues.CLUSTER_CONFIG,
-        isIndex: type === MessageTypeValues.INDEX,
-        isIndexUpdate: type === MessageTypeValues.INDEX_UPDATE,
-        isRequest: type === MessageTypeValues.REQUEST,
-        isResponse: type === MessageTypeValues.RESPONSE,
-      });
-    }
+      type === MessageTypeValues.PING ||
+      type === MessageTypeValues.INDEX ||
+      type === MessageTypeValues.INDEX_UPDATE
+    ) return;
+    this.log("frame.received", {
+      type,
+      isClusterConfig: type === MessageTypeValues.CLUSTER_CONFIG,
+      isIndex: type === MessageTypeValues.INDEX,
+      isIndexUpdate: type === MessageTypeValues.INDEX_UPDATE,
+      isRequest: type === MessageTypeValues.REQUEST,
+      isResponse: type === MessageTypeValues.RESPONSE,
+    });
+  }
+
+  private onFrame(type: number, msg: unknown): void {
+    this.logFrameReceived(type);
     switch (type) {
-      case MessageTypeValues.CLUSTER_CONFIG:
-        this.trackStateTask(this.handleClusterConfig(msg as BepClusterConfig));
+      case MessageTypeValues.CLUSTER_CONFIG: {
+        const config = msg as BepClusterConfig;
+        if (config.secondary) {
+          this.handleSecondaryClusterConfig(config);
+          break;
+        }
+        const folders = this.prepareClusterFolders(config);
+        this.clusterFoldersTask = folders;
+        this.trackStateTask(folders.then(() => this.finishClusterConfig(config)));
         break;
+      }
       case MessageTypeValues.INDEX:
       case MessageTypeValues.INDEX_UPDATE:
         this.enqueueIndex(type, msg as BepIndex);
@@ -1263,7 +1322,10 @@ class BepSession {
       pending ? coalescePendingIndexFrame(pending, incoming, this.sharedFolders.get(folderId)?.ciphertextReplica ? "history" : "latest") : incoming,
     );
     if (this.indexApplyInFlight.has(folderId)) return;
-    this.trackStateTask(this.drainIndexQueue(folderId));
+    const task = this.drainIndexQueue(folderId);
+    this.indexTasks.add(task);
+    void task.finally(() => this.indexTasks.delete(task));
+    this.trackStateTask(task);
   }
 
   private trackStateTask(operation: Promise<void>): void {
@@ -1275,6 +1337,7 @@ class BepSession {
   }
 
   private async drainIndexQueue(folderId: string): Promise<void> {
+    await this.clusterFoldersTask;
     this.indexApplyInFlight.add(folderId);
     try {
       while (!this.closed) {
@@ -1352,327 +1415,426 @@ class BepSession {
     };
   }
 
+  private async sendCiphertextIndex(
+    folderId: string,
+    folder: FolderState,
+    replica: NonNullable<SharedFolder["ciphertextReplica"]>,
+    changedOnly: boolean,
+  ) {
+    if (!folder.localDevicePresentInFolder || folder.stopReason) return;
+    const snapshot = await replica.snapshot();
+    if (changedOnly && this.sentReplicaSequences.get(folderId) === snapshot.sequence) return;
+    const files = selectCiphertextPublication(snapshot).map(entry => entry.info);
+    await this.writeFrame(encodeMessageFrame(MessageTypeValues.INDEX, Index, {
+      folder: folderId, files, last_sequence: snapshot.sequence,
+    }, 0));
+    this.localSequencesByFolder.set(folderId, snapshot.sequence);
+    this.sentReplicaSequences.set(folderId, snapshot.sequence);
+  }
+
+  private async sendReplicaIndex(
+    folderId: string,
+    folder: FolderState,
+    replica: NonNullable<SharedFolder["replica"]> | undefined,
+    changedOnly: boolean,
+  ) {
+    if (replica?.isPaused?.()) return;
+    if (changedOnly && !replica) return;
+    if (replica) this.log("shared_folder.index.scan.start");
+    const files = replica ? await replica.scan() : [...folder.files.values()].map(file => file.indexFile);
+    if (replica) this.log("shared_folder.index.scan.done", { fileCount: files.length });
+    const advertisedFiles = folder.folderCrypto
+      ? await Promise.all(files.map(async file => encryptUntrustedFileInfo(
+        folder.folderCrypto!.folderKey, file, await this.adapter.randomBytes(24))))
+      : files;
+    if (replica?.isPaused?.()) return;
+    if (replica) {
+      this.localSequencesByFolder.set(folderId,
+        files.reduce((max, file) => Math.max(max, Number(file.sequence ?? 0)), 0));
+    }
+    const sequence = this.localSequencesByFolder.get(folderId) ?? 0;
+    if (changedOnly && this.sentReplicaSequences.get(folderId) === sequence) return;
+    if (replica) {
+      this.advertisedReplicaFiles.set(folderId, new Map(advertisedFiles.map((advertised, index) =>
+        [advertised.name, { original: files[index], advertised }])));
+    }
+    const frame = encodeMessageFrame(
+      MessageTypeValues.INDEX,
+      Index,
+      { folder: folderId, files: advertisedFiles, last_sequence: sequence },
+      0,
+    );
+    await this.writeFrame(frame);
+    if (replica) this.sentReplicaSequences.set(folderId, sequence);
+    this.log("shared_folder.index.sent", {
+      folderId,
+      fileCount: folder.files.size,
+      bytes: frame.length,
+    });
+  }
+
   private async sendSharedFolderIndexes(changedOnly = false): Promise<void> {
     for (const folderId of this.sharedFolders.keys()) {
       const folder = this.folders.get(folderId);
       if (!folder) continue;
-      const ciphertextReplica = this.sharedFolders.get(folderId)?.ciphertextReplica;
-      if (ciphertextReplica) {
-        if (!folder.localDevicePresentInFolder || folder.stopReason) continue;
-        const snapshot = await ciphertextReplica.snapshot();
-        if (changedOnly && this.sentReplicaSequences.get(folderId) === snapshot.sequence) continue;
-        const files = selectCiphertextPublication(snapshot).map(entry => entry.info);
-        await this.writeFrame(encodeMessageFrame(MessageTypeValues.INDEX, Index, {
-          folder: folderId, files, last_sequence: snapshot.sequence,
-        }, 0));
-        this.localSequencesByFolder.set(folderId, snapshot.sequence);
-        this.sentReplicaSequences.set(folderId, snapshot.sequence);
-        continue;
+      const shared = this.sharedFolders.get(folderId);
+      if (shared?.ciphertextReplica) {
+        await this.sendCiphertextIndex(folderId, folder, shared.ciphertextReplica, changedOnly);
+      } else {
+        await this.sendReplicaIndex(folderId, folder, shared?.replica, changedOnly);
       }
-      const replica = this.sharedFolders.get(folderId)?.replica;
-      if (replica?.isPaused?.()) continue;
-      if (changedOnly && !replica) continue;
-      if (replica) this.log("shared_folder.index.scan.start");
-      const files = replica ? await replica.scan() : [...folder.files.values()].map(file => file.indexFile);
-      if (replica) this.log("shared_folder.index.scan.done", { fileCount: files.length });
-      const advertisedFiles = folder.folderCrypto
-        ? await Promise.all(files.map(async file => encryptUntrustedFileInfo(
-          folder.folderCrypto!.folderKey, file, await this.adapter.randomBytes(24))))
-        : files;
-      if (replica?.isPaused?.()) continue;
-      if (replica) this.localSequencesByFolder.set(folderId, files.reduce((max, file) => Math.max(max, Number(file.sequence ?? 0)), 0));
-      const sequence = this.localSequencesByFolder.get(folderId) ?? 0;
-      if (changedOnly && this.sentReplicaSequences.get(folderId) === sequence) continue;
-      if (replica) this.advertisedReplicaFiles.set(folderId, new Map(advertisedFiles.map((advertised, index) =>
-        [advertised.name, { original: files[index], advertised }])));
-      const frame = encodeMessageFrame(
-        MessageTypeValues.INDEX,
-        Index,
-        {
-          folder: folderId,
-          files: advertisedFiles,
-          last_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
-        },
-        0,
-      );
-      await this.writeFrame(frame);
-      if (replica) this.sentReplicaSequences.set(folderId, sequence);
-      this.log("shared_folder.index.sent", {
-        folderId,
-        fileCount: folder.files.size,
-        bytes: frame.length,
+    }
+  }
+
+  private clusterFolderContext(folder: ClusterFolder): ClusterFolderContext {
+    const folderDevices = folder.devices ?? [];
+    const advertisedDevices: AdvertisedDeviceInfo[] = folderDevices
+      .filter((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
+      .map((device) => ({
+        id: encodeDeviceId(device.id),
+        name: typeof device.name === "string" && device.name.trim() !== "" ? device.name.trim() : undefined,
+      }));
+    const remoteDevice = this.remoteDeviceId
+      ? folderDevices.find((device) => bytesEqual(device.id, this.remoteDeviceId!))
+      : folderDevices.find((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId));
+    const localDeviceEntry = folderDevices.find((device) =>
+      device?.id instanceof Uint8Array && bytesEqual(device.id, this.localDeviceId));
+    const folderId = String(folder.id ?? "").trim();
+    const localToken = localDeviceEntry?.encryption_password_token instanceof Uint8Array
+      ? localDeviceEntry.encryption_password_token : null;
+    const remoteToken = remoteDevice?.encryption_password_token instanceof Uint8Array
+      ? remoteDevice.encryption_password_token : null;
+    return {
+      folderId,
+      folderDevices,
+      advertisedDevices,
+      remoteDevice,
+      localDeviceEntry,
+      remoteIndexId: remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0",
+      remoteMaxSequence: String(remoteDevice?.max_sequence ?? 0),
+      stopReason: Number(folder.stop_reason ?? 0),
+      normalizedDeviceIds: folderDevices.filter((device) => device.id instanceof Uint8Array)
+        .map((device) => encodeDeviceId(device.id)),
+      localToken,
+      remoteToken,
+      announcedToken: localToken ?? remoteToken,
+      encrypted: Number(folder.type ?? 0) === 3 || ((localToken ?? remoteToken)?.length ?? 0) > 0,
+      folderPassword: this.folderPasswords.get(folderId),
+    };
+  }
+
+  private acceptSharedClusterFolder(folder: ClusterFolder, ctx: ClusterFolderContext, shared: SharedFolder) {
+    if (shared.encryption.mode === "ciphertext") {
+      const offered = [ctx.localToken, ctx.remoteToken].filter((token): token is Uint8Array => !!token?.length);
+      const expected = shared.encryption.passwordToken;
+      if (!offered.length || offered.some(token => !bytesEqual(token, expected))) {
+        throw new Error("Remote encrypted folder identity mismatch.");
+      }
+    }
+    const state = this.folders.get(ctx.folderId);
+    if (state) {
+      state.advertisedDevices = ctx.advertisedDevices;
+      state.localDevicePresentInFolder = !!ctx.localDeviceEntry;
+      state.remoteIndexId = ctx.remoteIndexId;
+      state.remoteMaxSequence = ctx.remoteMaxSequence;
+      state.stopReason = ctx.stopReason;
+    }
+    this.log("shared_folder.acceptance.received", {
+      folderId: ctx.folderId,
+      folderType: Number(folder.type ?? 0),
+      localDevicePresentInFolder: !!ctx.localDeviceEntry,
+      encrypted: shared.encryption.mode === "encrypted",
+    });
+  }
+
+  private async resolveClusterFolderCrypto(ctx: ClusterFolderContext) {
+    if (!ctx.encrypted) return { folderCrypto: undefined, needsPassword: false, passwordError: undefined };
+    if (!ctx.folderPassword) return { folderCrypto: undefined, needsPassword: true, passwordError: undefined };
+    try {
+      const derived = await deriveUntrustedFolderCrypto(ctx.folderId, ctx.folderPassword, this.kdf);
+      const tokenValid = await verifyUntrustedPasswordToken(derived, ctx.announcedToken);
+      this.log("untrusted.folder.token_check", {
+        folderId: ctx.folderId,
+        hasPassword: true,
+        localTokenLengthFromPeer: ctx.localToken?.length ?? 0,
+        remoteTokenLengthFromPeer: ctx.remoteToken?.length ?? 0,
+        localTokenLength: derived.passwordToken.length,
+        tokenValid,
+      });
+      if (!tokenValid) {
+        return { folderCrypto: undefined, needsPassword: true,
+          passwordError: `Encryption password did not match folder ${ctx.folderId}.` };
+      }
+      return { folderCrypto: derived, needsPassword: false, passwordError: undefined };
+    } catch (error) {
+      return { folderCrypto: undefined, needsPassword: true,
+        passwordError: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  private applyClusterFolderState(
+    folder: ClusterFolder,
+    ctx: ClusterFolderContext,
+    crypto: Awaited<ReturnType<BepSession["resolveClusterFolderCrypto"]>>,
+  ) {
+    const previousState = this.folders.get(ctx.folderId);
+    const preserveIndexState = previousState &&
+      previousState.remoteIndexId === ctx.remoteIndexId &&
+      previousState.remoteMaxSequence === ctx.remoteMaxSequence;
+    const state: FolderState = {
+      id: ctx.folderId,
+      label: folder.label || ctx.folderId,
+      readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
+      advertisedDevices: ctx.advertisedDevices,
+      encrypted: ctx.encrypted,
+      needsPassword: crypto.needsPassword,
+      passwordError: crypto.passwordError,
+      folderCrypto: crypto.folderCrypto,
+      localDevicePresentInFolder: !!ctx.localDeviceEntry,
+      stopReason: ctx.stopReason,
+      indexReceived: preserveIndexState ? previousState.indexReceived : false,
+      remoteIndexId: ctx.remoteIndexId,
+      remoteMaxSequence: ctx.remoteMaxSequence,
+      files: preserveIndexState ? previousState.files : new Map(),
+    };
+    this.folders.set(ctx.folderId, state);
+    const knownSequence = Number.isFinite(Number(ctx.remoteMaxSequence)) ? Number(ctx.remoteMaxSequence) : 0;
+    if (knownSequence > (this.localSequencesByFolder.get(ctx.folderId) ?? 0)) {
+      this.localSequencesByFolder.set(ctx.folderId, knownSequence);
+    }
+    if (ctx.encrypted) {
+      this.log("untrusted.folder.state", {
+        folderId: ctx.folderId,
+        hasFolderPassword: !!ctx.folderPassword,
+        needsPassword: crypto.needsPassword,
+        hasFolderCrypto: !!crypto.folderCrypto,
+        passwordError: crypto.passwordError ?? null,
       });
     }
   }
 
-  private async handleClusterConfig(cfg: BepClusterConfig): Promise<void> {
-    if (cfg.secondary) {
-      this.log("cluster.secondary.received", {
-        folderCount: cfg.folders?.length ?? 0,
-      });
+  private async handleClusterFolder(folder: ClusterFolder) {
+    const ctx = this.clusterFolderContext(folder);
+    const shared = this.sharedFolders.get(ctx.folderId);
+    if (shared) {
+      this.acceptSharedClusterFolder(folder, ctx, shared);
       return;
     }
-    for (const folder of cfg.folders ?? []) {
-      const folderDevices = folder.devices ?? [];
-      const advertisedDevices: AdvertisedDeviceInfo[] = folderDevices
-        .filter((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
-        .map((device) => ({
-          id: encodeDeviceId(device.id),
-          name:
-            typeof device.name === "string" && device.name.trim() !== ""
-              ? device.name.trim()
-              : undefined,
-        }));
-      const remoteDevice = this.remoteDeviceId
-        ? folderDevices.find((device) =>
-            bytesEqual(device.id, this.remoteDeviceId!),
-          )
-        : folderDevices.find(
-            (device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId),
-          );
-      const localDeviceEntry = folderDevices.find((device) =>
-        device?.id instanceof Uint8Array && bytesEqual(device.id, this.localDeviceId),
-      );
-      const remoteIndexId =
-        remoteDevice?.index_id != null ? String(remoteDevice.index_id) : "0";
-      const remoteMaxSequence = String(remoteDevice?.max_sequence ?? 0);
-      const folderId = String(folder.id ?? "").trim();
-      const stopReason = Number(folder.stop_reason ?? 0);
-      const normalizedDeviceIds = folderDevices
-        .filter((device) => device.id instanceof Uint8Array)
-        .map((device) => encodeDeviceId(device.id));
-      const localToken =
-        localDeviceEntry?.encryption_password_token instanceof Uint8Array
-          ? localDeviceEntry.encryption_password_token
-          : null;
-      const remoteToken =
-        remoteDevice?.encryption_password_token instanceof Uint8Array
-          ? remoteDevice.encryption_password_token
-          : null;
-      const announcedToken = localToken ?? remoteToken;
-      const sharedFolder = this.sharedFolders.get(folderId);
-      if (sharedFolder) {
-        if (sharedFolder.encryption.mode === "ciphertext") {
-          const offered = [localToken, remoteToken].filter((token): token is Uint8Array => !!token?.length);
-          const expected = sharedFolder.encryption.passwordToken;
-          if (!offered.length || offered.some(token => !bytesEqual(token, expected))) {
-            throw new Error("Remote encrypted folder identity mismatch.");
-          }
+    this.log("cluster.folder.received", {
+      folderId: ctx.folderId,
+      folderType: Number(folder.type ?? 0),
+      stopReason: ctx.stopReason,
+      remoteIndexId: ctx.remoteIndexId,
+      remoteMaxSequence: ctx.remoteMaxSequence,
+      deviceCount: ctx.folderDevices.length,
+      localDevicePresentInFolder: !!ctx.localDeviceEntry,
+      remoteDevicePresentInFolder: !!ctx.remoteDevice,
+      folderDeviceIds: ctx.normalizedDeviceIds,
+      advertisedDeviceIds: ctx.advertisedDevices.map((device) => device.id),
+      localTokenLengthFromPeer: ctx.localToken?.length ?? 0,
+      remoteTokenLengthFromPeer: ctx.remoteToken?.length ?? 0,
+    });
+    const crypto = await this.resolveClusterFolderCrypto(ctx);
+    this.applyClusterFolderState(folder, ctx, crypto);
+  }
+
+  private echoFolderDevices(folder: ClusterFolder, localFolderIndexId: string) {
+    const baseDevices = folder.devices ? [...folder.devices] : [];
+    const devices = baseDevices
+      .filter((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
+      .map((device) => {
+        const next = { ...device };
+        if (this.remoteDeviceId && bytesEqual(device.id, this.remoteDeviceId)) {
+          next.max_sequence = 0;
+          next.index_id = 0;
         }
-        const state = this.folders.get(folderId);
-        if (state) {
-          state.advertisedDevices = advertisedDevices;
-          state.localDevicePresentInFolder = !!localDeviceEntry;
-          state.remoteIndexId = remoteIndexId;
-          state.remoteMaxSequence = remoteMaxSequence;
-          state.stopReason = stopReason;
-        }
-        this.log("shared_folder.acceptance.received", {
-          folderId,
-          folderType: Number(folder.type ?? 0),
-          localDevicePresentInFolder: !!localDeviceEntry,
-          encrypted: sharedFolder.encryption.mode === "encrypted",
-        });
-        continue;
-      }
-      this.log("cluster.folder.received", {
-        folderId,
-        folderType: Number(folder.type ?? 0),
-        stopReason,
-        remoteIndexId,
-        remoteMaxSequence,
-        deviceCount: folderDevices.length,
-        localDevicePresentInFolder: !!localDeviceEntry,
-        remoteDevicePresentInFolder: !!remoteDevice,
-        folderDeviceIds: normalizedDeviceIds,
-        advertisedDeviceIds: advertisedDevices.map((device) => device.id),
-        localTokenLengthFromPeer: localToken?.length ?? 0,
-        remoteTokenLengthFromPeer: remoteToken?.length ?? 0,
+        return next;
       });
-      const encrypted =
-        Number(folder.type ?? 0) === 3 ||
-        (announcedToken?.length ?? 0) > 0;
-      const folderPassword = this.folderPasswords.get(folderId);
-      let folderCrypto: UntrustedFolderCrypto | undefined;
-      let needsPassword = false;
-      let passwordError: string | undefined;
-      if (encrypted) {
-        if (!folderPassword) {
-          needsPassword = true;
-        } else {
-          try {
-            const derived = await deriveUntrustedFolderCrypto(folderId, folderPassword, this.kdf);
-            const tokenValid = await verifyUntrustedPasswordToken(
-              derived,
-              announcedToken,
-            );
-            this.log("untrusted.folder.token_check", {
-              folderId,
-              hasPassword: true,
-              localTokenLengthFromPeer: localToken?.length ?? 0,
-              remoteTokenLengthFromPeer: remoteToken?.length ?? 0,
-              localTokenLength: derived.passwordToken.length,
-              tokenValid,
-            });
-            if (!tokenValid) {
-              needsPassword = true;
-              passwordError = `Encryption password did not match folder ${folderId}.`;
-            } else {
-              folderCrypto = derived;
-            }
-          } catch (error) {
-            needsPassword = true;
-            passwordError = error instanceof Error ? error.message : String(error);
-          }
-        }
-      }
-      const previousState = this.folders.get(folderId);
-      const preserveIndexState =
-        previousState &&
-        previousState.remoteIndexId === remoteIndexId &&
-        previousState.remoteMaxSequence === remoteMaxSequence;
-      const state: FolderState = {
-        id: folderId,
-        label: folder.label || folderId,
-        readOnly: !!folder.read_only || Number(folder.type ?? 0) === 2,
-        advertisedDevices,
-        encrypted,
-        needsPassword,
-        passwordError,
-        folderCrypto,
-        localDevicePresentInFolder: !!localDeviceEntry,
-        stopReason,
-        indexReceived: preserveIndexState
-          ? previousState.indexReceived
-          : false,
-        remoteIndexId,
-        remoteMaxSequence,
-        files: preserveIndexState
-          ? previousState.files
-          : new Map(),
-      };
-      this.folders.set(folderId, state);
-      const knownSequence = Number.isFinite(Number(remoteMaxSequence))
-        ? Number(remoteMaxSequence)
-        : 0;
-      const previousSequence = this.localSequencesByFolder.get(folderId) ?? 0;
-      if (knownSequence > previousSequence) {
-        this.localSequencesByFolder.set(folderId, knownSequence);
-      }
-      if (encrypted) {
-        this.log("untrusted.folder.state", {
-          folderId,
-          hasFolderPassword: !!folderPassword,
-          needsPassword,
-          hasFolderCrypto: !!folderCrypto,
-          passwordError: passwordError ?? null,
-        });
-      }
+    const incomingLocalDevice = baseDevices.find((device) => bytesEqual(device.id, this.localDeviceId));
+    const incomingLocalToken =
+      incomingLocalDevice?.encryption_password_token instanceof Uint8Array &&
+      incomingLocalDevice.encryption_password_token.length > 0
+        ? incomingLocalDevice.encryption_password_token : undefined;
+    devices.push({
+      id: this.localDeviceId,
+      name: this.localDeviceName,
+      addresses: ["dynamic"],
+      compression: 0,
+      max_sequence: this.localSequencesByFolder.get(String(folder.id ?? "")) ?? 0,
+      index_id: localFolderIndexId,
+      encryption_password_token: incomingLocalToken,
+    });
+    return devices;
+  }
+
+  private echoClusterFolder(folder: ClusterFolder) {
+    const folderId = String(folder.id ?? "");
+    if (this.sharedFolders.has(folderId)) return this.sharedFolderConfig(folderId);
+    const state = this.folders.get(folderId);
+    const localFolderIndexId = this.localIndexIdForFolder(folderId);
+    const devices = this.echoFolderDevices(folder, localFolderIndexId);
+    const sourceType = Number(folder.type ?? 0);
+    const echoedType = state?.encrypted ? 3 : sourceType;
+    this.log("cluster.echo.folder.prepared", {
+      folderId,
+      stopReason: Number(folder.stop_reason ?? 0),
+      deviceCountIn: folder.devices?.length ?? 0,
+      deviceCountOut: devices.length,
+      localDeviceInserted: true,
+    });
+    if (state?.encrypted) {
+      this.log("untrusted.folder.echo_config", {
+        folderId: folder.id,
+        sourceType,
+        echoedType,
+        localTokenLength: devices.at(-1)?.encryption_password_token?.length ?? 0,
+        localTokenIncluded: !!devices.at(-1)?.encryption_password_token,
+      });
     }
-    if (!this.echoedClusterConfig) {
-      this.echoedClusterConfig = true;
-      const folders = (cfg.folders ?? []).map((folder) => {
-        const folderId = String(folder.id ?? "");
-        if (this.sharedFolders.has(folderId)) {
-          return this.sharedFolderConfig(folderId);
-        }
-        const state = this.folders.get(folderId);
-        const localFolderIndexId = this.localIndexIdForFolder(folderId);
-        const baseDevices = folder.devices ? [...folder.devices] : [];
-        const devices = baseDevices
-          .filter((device) => device.id instanceof Uint8Array && !bytesEqual(device.id, this.localDeviceId))
-          .map((device) => {
-            const next = { ...device };
-            if (
-              this.remoteDeviceId &&
-              bytesEqual(device.id, this.remoteDeviceId)
-            ) {
-              next.max_sequence = 0;
-              next.index_id = 0;
-            }
-            return next;
-          });
-        const incomingLocalDevice = baseDevices.find((device) =>
-          bytesEqual(device.id, this.localDeviceId),
-        );
-        const incomingLocalToken =
-          incomingLocalDevice?.encryption_password_token instanceof Uint8Array &&
-          incomingLocalDevice.encryption_password_token.length > 0
-            ? incomingLocalDevice.encryption_password_token
-            : undefined;
-        devices.push({
-          id: this.localDeviceId,
-          name: this.localDeviceName,
-          addresses: ["dynamic"],
-          compression: 0,
-          max_sequence: this.localSequencesByFolder.get(folderId) ?? 0,
-          index_id: localFolderIndexId,
-          // Syncthing puts the token on exactly one device entry. Preserve a
-          // token it announced for this device, but do not duplicate a token
-          // announced for the remote device after validating the password.
-          encryption_password_token: incomingLocalToken,
-        });
-        const sourceType = Number(folder.type ?? 0);
-        const echoedType = state?.encrypted ? 3 : sourceType;
-        this.log("cluster.echo.folder.prepared", {
-          folderId: String(folder.id ?? ""),
-          stopReason: Number(folder.stop_reason ?? 0),
-          deviceCountIn: folder.devices?.length ?? 0,
-          deviceCountOut: devices.length,
-          localDeviceInserted: true,
-        });
-        if (state?.encrypted) {
-          this.log("untrusted.folder.echo_config", {
-            folderId: folder.id,
-            sourceType,
-            echoedType,
-            localTokenLength: incomingLocalToken?.length ?? 0,
-            localTokenIncluded: !!incomingLocalToken,
-          });
-        }
-        return {
-          ...folder,
-          type: echoedType,
-          devices,
-        };
-      });
-      const incomingFolderIds = new Set(
-        (cfg.folders ?? []).map((folder) => String(folder.id ?? "")),
-      );
-      for (const folderId of this.sharedFolders.keys()) {
-        if (!incomingFolderIds.has(folderId)) {
-          folders.push(this.sharedFolderConfig(folderId));
-        }
-      }
-      const frame = encodeMessageFrame(
-        MessageTypeValues.CLUSTER_CONFIG,
-        ClusterConfig,
-        { folders },
-        0,
-      );
-      this.log("cluster.echo.send.start", {
-        folderCount: folders.length,
-      });
-      try {
-        await this.writeFrame(frame);
-        this.log("cluster.echo.send.done", {
-          folderCount: folders.length,
-          bytes: frame.length,
-        });
-        this.log("index.bootstrap.deferred", {
-          reason: "lazy_on_folder_open",
-          folderCount: folders.length,
-        });
-      } catch (error) {
-        this.log("cluster.echo.send.failed", {
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
+    return { ...folder, type: echoedType, devices };
+  }
+
+  private async echoClusterConfig(cfg: BepClusterConfig) {
+    this.echoedClusterConfig = true;
+    const folders = (cfg.folders ?? []).map((folder) => this.echoClusterFolder(folder));
+    const incomingFolderIds = new Set((cfg.folders ?? []).map((folder) => String(folder.id ?? "")));
+    for (const folderId of this.sharedFolders.keys()) {
+      if (!incomingFolderIds.has(folderId)) folders.push(this.sharedFolderConfig(folderId));
     }
+    const frame = encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, { folders }, 0);
+    this.log("cluster.echo.send.start", { folderCount: folders.length });
+    try {
+      await this.writeFrame(frame);
+      this.log("cluster.echo.send.done", { folderCount: folders.length, bytes: frame.length });
+      this.log("index.bootstrap.deferred", { reason: "lazy_on_folder_open", folderCount: folders.length });
+    } catch (error) {
+      this.log("cluster.echo.send.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private handleSecondaryClusterConfig(cfg: BepClusterConfig) {
+    this.log("cluster.secondary.received", { folderCount: cfg.folders?.length ?? 0 });
+  }
+
+  private async prepareClusterFolders(cfg: BepClusterConfig) {
+    for (const folder of cfg.folders ?? []) await this.handleClusterFolder(folder);
+  }
+
+  private async finishClusterConfig(cfg: BepClusterConfig) {
+    if (!this.echoedClusterConfig) await this.echoClusterConfig(cfg);
     await this.sendSharedFolderIndexes();
+    if (this.indexTasks.size) await Promise.allSettled([...this.indexTasks]);
     if (this.readyState === "pending") {
       this.readyState = "ready";
       this.readyResolve();
+    }
+  }
+
+  private async handleCiphertextIndex(
+    folderId: string,
+    state: FolderState,
+    files: BepFileInfo[],
+    shared: SharedFolder & { ciphertextReplica: NonNullable<SharedFolder["ciphertextReplica"]> },
+  ) {
+    if (!state.localDevicePresentInFolder || state.stopReason) {
+      throw new Error("Encrypted folder is not shared by the remote peer.");
+    }
+    for (const file of files) {
+      await shared.ciphertextReplica.receive(
+        { folderId, passwordToken: shared.encryption.passwordToken },
+        file,
+        (offset, size, hash, signal) =>
+          this.requestBlock(folderId, file.name, offset, size, { hash, signal }),
+      );
+    }
+    state.indexReceived = true;
+    await this.sendSharedFolderIndexes(true);
+  }
+
+  private applyPlainIndexFile(state: FolderState, folderId: string, file: BepFileInfo) {
+    state.files.set(file.name, { indexFile: file });
+    this.acknowledgePublication(folderId, file.name, file);
+  }
+
+  private async applyEncryptedIndexFile(state: FolderState, folderId: string, file: BepFileInfo) {
+    if (!state.folderCrypto) return { original: undefined, failed: false };
+    try {
+      const encryptedName = String(file.name ?? "");
+      const { fileInfo: originalFile, fileKey } = await decryptUntrustedFileInfo(state.folderCrypto.folderKey, file);
+      const encryptedBlocks = (file.blocks ?? file.Blocks ?? []).map((block) => ({
+        offset: Number(block.offset),
+        size: Number(block.size),
+        hash: block.hash,
+      }));
+      state.files.set(originalFile.name, {
+        indexFile: originalFile,
+        request: { encryptedName, fileKey, encryptedBlocks },
+      });
+      this.acknowledgePublication(folderId, originalFile.name, originalFile);
+      return { original: originalFile, failed: false };
+    } catch (error) {
+      this.log("untrusted.index.decrypt_failed", {
+        folderId,
+        encryptedName: String(file?.name ?? ""),
+        message: error instanceof Error ? error.message : String(error),
+      });
+      state.passwordError = error instanceof Error ? error.message : String(error);
+      state.needsPassword = true;
+      return { original: undefined, failed: true };
+    }
+  }
+
+  private async applyIndexFiles(state: FolderState, folderId: string, files: BepFileInfo[]) {
+    let decryptedStored = 0;
+    let decryptFailed = 0;
+    const replicaFiles: BepFileInfo[] = [];
+    for (const file of files) {
+      if (!state.encrypted) {
+        this.applyPlainIndexFile(state, folderId, file);
+        replicaFiles.push(file);
+        decryptedStored += 1;
+        continue;
+      }
+      const applied = await this.applyEncryptedIndexFile(state, folderId, file);
+      if (applied.failed) decryptFailed += 1;
+      if (applied.original) {
+        replicaFiles.push(applied.original);
+        decryptedStored += 1;
+      }
+    }
+    return { decryptedStored, decryptFailed, replicaFiles };
+  }
+
+  private async receiveReplicaIndex(folderId: string, state: FolderState, replicaFiles: BepFileInfo[]) {
+    const replica = this.sharedFolders.get(folderId)?.replica;
+    this.log("replica.index.decision", {
+      internal: this.sharedFolders.get(folderId)?.internal === true,
+      hasReceiver: !!replica?.receive,
+      paused: replica?.isPaused?.() ?? false,
+      needsPassword: state.needsPassword,
+      fileCount: replicaFiles.length,
+    });
+    if (!replica?.receive || replica.isPaused?.() || state.needsPassword) return;
+    try {
+      this.log("replica.index.receive.start", {
+        internal: this.sharedFolders.get(folderId)?.internal === true,
+        fileCount: replicaFiles.length,
+      });
+      const changed = await replica.receive(folderId, replicaFiles,
+        (path, offset, size, hash) => this.requestReplicaRange(folderId, path, offset, size, hash));
+      this.log("replica.index.receive.done", {
+        internal: this.sharedFolders.get(folderId)?.internal === true,
+        changed,
+      });
+      if (changed) await this.sendSharedFolderIndexes();
+    } catch (error) {
+      if (!this.closed) {
+        this.log("replica.receive.failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 
@@ -1680,27 +1842,14 @@ class BepSession {
     const folderId = String(index.folder ?? "");
     const state = this.folders.get(folderId);
     if (!state) return;
-    // Index frames carry the sender's highest sequence for this folder. Track it
-    // so the UI sees a folder version change when a peer publishes an update;
-    // otherwise the version key stays fixed and a received file never appears in
-    // an already open directory.
     const lastSequence = Number(index.last_sequence ?? 0);
     if (Number.isFinite(lastSequence) && lastSequence > Number(state.remoteMaxSequence ?? 0)) {
       state.remoteMaxSequence = String(lastSequence);
     }
-    // Syncthing may send the initial index before the UI opens this folder.
-    // Keep that authoritative snapshot; an empty INDEX frame from the client
-    // does not make Syncthing resend an unchanged index.
     const files = index.files ?? [];
-    const ciphertextShared = this.sharedFolders.get(folderId);
-    if (ciphertextShared?.ciphertextReplica && ciphertextShared.encryption.mode === "ciphertext") {
-      if (!state.localDevicePresentInFolder || state.stopReason) throw new Error("Encrypted folder is not shared by the remote peer.");
-      for (const file of files) {
-        await ciphertextShared.ciphertextReplica.receive({ folderId, passwordToken: ciphertextShared.encryption.passwordToken }, file,
-          (offset, size, hash, signal) => this.requestBlock(folderId, file.name, offset, size, { hash, signal }));
-      }
-      state.indexReceived = true;
-      await this.sendSharedFolderIndexes(true);
+    const shared = this.sharedFolders.get(folderId);
+    if (shared?.ciphertextReplica && shared.encryption.mode === "ciphertext") {
+      await this.handleCiphertextIndex(folderId, state, files, shared);
       return;
     }
     this.log("index.received", {
@@ -1711,83 +1860,18 @@ class BepSession {
       needsPassword: state.needsPassword,
     });
     state.indexReceived = true;
-    let decryptedStored = 0;
-    let decryptFailed = 0;
-    const replicaFiles: BepFileInfo[] = [];
-    for (const file of files) {
-      if (!state.encrypted) {
-        state.files.set(file.name, { indexFile: file });
-        replicaFiles.push(file);
-        this.acknowledgePublication(folderId, file.name, file);
-        decryptedStored += 1;
-        continue;
-      }
-      if (!state.folderCrypto) {
-        continue;
-      }
-      try {
-        const encryptedName = String(file.name ?? "");
-        const { fileInfo: originalFile, fileKey } = await decryptUntrustedFileInfo(state.folderCrypto.folderKey, file);
-        const plaintextName = originalFile.name;
-        replicaFiles.push(originalFile);
-        const encryptedBlocks = (file.blocks ?? file.Blocks ?? []).map((block) => ({
-          offset: Number(block.offset),
-          size: Number(block.size),
-          hash: block.hash,
-        }));
-        state.files.set(plaintextName, {
-          indexFile: originalFile,
-          request: {
-            encryptedName,
-            fileKey,
-            encryptedBlocks,
-          },
-        });
-        this.acknowledgePublication(folderId, plaintextName, originalFile);
-        decryptedStored += 1;
-      } catch (error) {
-        decryptFailed += 1;
-        this.log("untrusted.index.decrypt_failed", {
-          folderId,
-          encryptedName: String(file?.name ?? ""),
-          message: error instanceof Error ? error.message : String(error),
-        });
-        state.passwordError =
-          error instanceof Error ? error.message : String(error);
-        state.needsPassword = true;
-      }
-    }
+    const applied = await this.applyIndexFiles(state, folderId, files);
     this.log("index.applied", {
       folderId,
       encrypted: state.encrypted,
       storedFiles: state.files.size,
       processedFiles: files.length,
-      decryptedStored,
-      decryptFailed,
+      decryptedStored: applied.decryptedStored,
+      decryptFailed: applied.decryptFailed,
       needsPassword: state.needsPassword,
       passwordError: state.passwordError ?? null,
     });
-    const replica = this.sharedFolders.get(folderId)?.replica;
-    this.log("replica.index.decision", {
-      internal: this.sharedFolders.get(folderId)?.internal === true,
-      hasReceiver: !!replica?.receive,
-      paused: replica?.isPaused?.() ?? false,
-      needsPassword: state.needsPassword,
-      fileCount: replicaFiles.length,
-    });
-    if (replica?.receive && !replica.isPaused?.() && !state.needsPassword) {
-      try {
-        this.log("replica.index.receive.start", { internal: this.sharedFolders.get(folderId)?.internal === true,
-          fileCount: replicaFiles.length });
-        const changed = await replica.receive(folderId, replicaFiles,
-          (path, offset, size, hash) => this.requestReplicaRange(folderId, path, offset, size, hash));
-        this.log("replica.index.receive.done", { internal: this.sharedFolders.get(folderId)?.internal === true,
-          changed });
-        if (changed) await this.sendSharedFolderIndexes();
-      } catch (error) {
-        if (!this.closed) this.log("replica.receive.failed", { message: error instanceof Error ? error.message : String(error) });
-      }
-    }
+    await this.receiveReplicaIndex(folderId, state, applied.replicaFiles);
   }
 
   private handleResponse(resp: BepResponse): void {
@@ -1892,13 +1976,41 @@ class BepSession {
     finally { bytes.fill(0); key.fill(0); }
   }
 
-  private async handleRequest(req: BepRequest): Promise<void> {
-    const id = Number(req?.id ?? 0);
+  private async readCiphertextRequest(
+    folderId: string,
+    path: string,
+    offset: number,
+    size: number,
+    req: BepRequest,
+    shared: SharedFolder & { ciphertextReplica: NonNullable<SharedFolder["ciphertextReplica"]> },
+  ) {
+    const state = this.folders.get(folderId);
+    if (!state?.localDevicePresentInFolder || state.stopReason) {
+      throw new Error("Encrypted folder is not shared by the remote peer.");
+    }
+    if (!(req.hash instanceof Uint8Array)) throw new Error("Ciphertext block token is required.");
+    return shared.ciphertextReplica.readNamedBlock(path, offset, size, req.hash);
+  }
+
+  private async readUploadRequestData(record: UploadedFileRecord, req: BepRequest, path: string, offset: number, size: number) {
+    if (record.encryptedName && normalizePathValue(path) === normalizePathValue(record.encryptedName)) {
+      if (offset < 0 || size < 0) return { code: 2, data: new Uint8Array(0) };
+      return { code: 0, data: await this.readEncryptedUploadRange(record, offset, size) };
+    }
+    if (record.encryptedName) return { code: 2, data: new Uint8Array(0) };
+    if (offset > record.size) return { code: 2, data: new Uint8Array(0) };
+    return {
+      code: 0,
+      data: await this.readPlaintextUploadRange(record, offset, size,
+        req.hash instanceof Uint8Array ? req.hash : undefined),
+    };
+  }
+
+  private async readRequestData(req: BepRequest, record: UploadedFileRecord | null) {
     const folderId = String(req?.folder ?? "").trim();
     const path = String(req?.name ?? "");
     const offset = Math.max(0, Number(req?.offset ?? 0));
     const size = Math.max(0, Number(req?.size ?? 0));
-    const record = this.getUploadedFile(folderId, path);
     let code = 0;
     let data: Uint8Array = new Uint8Array(0);
     try {
@@ -1907,37 +2019,20 @@ class BepSession {
       const shared = this.sharedFolders.get(folderId);
       const replica = shared?.replica;
       if (shared?.ciphertextReplica) {
-        const state = this.folders.get(folderId);
-        if (!state?.localDevicePresentInFolder || state.stopReason) throw new Error("Encrypted folder is not shared by the remote peer.");
-        if (!(req.hash instanceof Uint8Array)) throw new Error("Ciphertext block token is required.");
-        data = await shared.ciphertextReplica.readNamedBlock(path, offset, size, req.hash);
+        data = await this.readCiphertextRequest(folderId, path, offset, size, req, shared);
       } else if (!record && replica) {
         data = shared.folderCrypto
           ? await this.readEncryptedReplicaRequest(folderId, req, replica, shared.folderCrypto)
           : await replica.readBlock(path, offset, size, req.hash);
       } else if (!record) {
         code = 2;
-      } else if (
-        record.encryptedName &&
-        normalizePathValue(path) === normalizePathValue(record.encryptedName)
-      ) {
-        if (offset < 0 || size < 0) {
-          code = 2;
-        } else {
-          data = await this.readEncryptedUploadRange(record, offset, size);
-        }
-      } else if (record.encryptedName) {
-        code = 2;
-      } else if (offset > record.size) {
-        code = 2;
       } else {
-        data = await this.readPlaintextUploadRange(record, offset, size,
-          req.hash instanceof Uint8Array ? req.hash : undefined);
+        ({ code, data } = await this.readUploadRequestData(record, req, path, offset, size));
       }
     } catch (error) {
       code = 1;
       this.log("upload.request.failed", {
-        id,
+        id: Number(req?.id ?? 0),
         folderId,
         path,
         offset,
@@ -1945,20 +2040,23 @@ class BepSession {
         message: error instanceof Error ? error.message : String(error),
       });
     }
-    const responseFrame = encodeMessageFrame(
-      MessageTypeValues.RESPONSE,
-      Response,
-      { id, data, code },
-      0,
-    );
+    return { code, data };
+  }
+
+  private async sendRequestResponse(
+    id: number,
+    folderId: string,
+    path: string,
+    offset: number,
+    size: number,
+    code: number,
+    data: Uint8Array,
+  ) {
+    const responseFrame = encodeMessageFrame(MessageTypeValues.RESPONSE, Response, { id, data, code }, 0);
     try {
       await this.writeFrame(responseFrame);
       this.log("upload.request.responded", {
-        id,
-        folderId,
-        path,
-        offset,
-        size,
+        id, folderId, path, offset, size,
         responseCode: code,
         responseBytes: data.length,
       });
@@ -1970,6 +2068,17 @@ class BepSession {
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  private async handleRequest(req: BepRequest): Promise<void> {
+    const id = Number(req?.id ?? 0);
+    const folderId = String(req?.folder ?? "").trim();
+    const path = String(req?.name ?? "");
+    const offset = Math.max(0, Number(req?.offset ?? 0));
+    const size = Math.max(0, Number(req?.size ?? 0));
+    const record = this.getUploadedFile(folderId, path);
+    const { code, data } = await this.readRequestData(req, record);
+    await this.sendRequestResponse(id, folderId, path, offset, size, code, data);
   }
 
   /** Re-reads and verifies one plaintext block so a changed source fails closed. */
@@ -2045,26 +2154,15 @@ class BepSession {
    * one at a time, and peers are served by re-reading the source instead of
    * retaining the file in memory.
    */
-  async publishFileFromSource(
-    folderId: string,
-    path: string,
-    source: FileUploadSource,
-    options?: FileUploadOptions,
-  ): Promise<void> {
+  private uploadTarget(folderId: string, path: string, source: FileUploadSource) {
     const folder = this.folders.get(folderId);
-    if (!folder) {
-      throw new Error(`Unknown folder: ${folderId}`);
-    }
-    if (folder.readOnly) {
-      throw new Error(`Folder ${folderId} is read-only for this client.`);
-    }
+    if (!folder) throw new Error(`Unknown folder: ${folderId}`);
+    if (folder.readOnly) throw new Error(`Folder ${folderId} is read-only for this client.`);
     if (folder.stopReason !== 0) {
       throw new Error(`Folder ${folderId} is stopped on remote (stopReason=${folder.stopReason}).`);
     }
     const normalizedPath = normalizePathValue(path);
-    if (!normalizedPath) {
-      throw new Error("Upload path must not be empty.");
-    }
+    if (!normalizedPath) throw new Error("Upload path must not be empty.");
     assertReplicaPath(normalizedPath);
     if (isInternalReplicaPath(normalizedPath)) throw new Error("Internal files cannot be published.");
     if (!Number.isSafeInteger(source.size) || source.size < 0) {
@@ -2073,37 +2171,39 @@ class BepSession {
     if (folder.encrypted && (!folder.folderCrypto || folder.needsPassword)) {
       throw new Error(`Folder ${folderId} requires a valid encryption password before upload.`);
     }
+    return { folder, normalizedPath };
+  }
+
+  private uploadProgress(source: FileUploadSource, options: FileUploadOptions | undefined, startedAtMs: number) {
     const throwIfCancelled = () => {
       if (!options?.signal?.aborted) return;
       const error = new Error("Upload cancelled.");
       error.name = "AbortError";
       throw error;
     };
-    throwIfCancelled();
-    const blockSize = 128 * 1024;
-    const uploadStartedAtMs = Date.now();
     const uploadRateBps = (processedBytes: number) =>
       processedBytes > 0
-        ? Math.floor((processedBytes * 1000) / Math.max(1, Date.now() - uploadStartedAtMs))
+        ? Math.floor((processedBytes * 1000) / Math.max(1, Date.now() - startedAtMs))
         : 0;
-    this.log("upload.start", {
-      folderId,
-      path: normalizedPath,
-      encrypted: folder.encrypted,
-      sizeBytes: source.size,
-      blockSize,
-      streamed: true,
-    });
     const notifyProgress = (processedBytes: number, phase: "preparing" | "publishing") => {
       options?.onProgress?.({
         processedBytes: Math.min(source.size, Math.max(0, processedBytes)),
         totalBytes: source.size,
-        elapsedMs: Math.max(1, Date.now() - uploadStartedAtMs),
+        elapsedMs: Math.max(1, Date.now() - startedAtMs),
         phase,
       });
     };
-    const digest = options?.expectedHash ? sha256.create() : undefined;
-    const plaintextBlocks: UploadedBlock[] = [];
+    return { throwIfCancelled, uploadRateBps, notifyProgress };
+  }
+
+  private async readUploadBlocks(
+    source: FileUploadSource,
+    blockSize: number,
+    throwIfCancelled: () => void,
+    digest: ReturnType<typeof sha256.create> | undefined,
+    notifyProgress: (processedBytes: number, phase: "preparing" | "publishing") => void,
+  ) {
+    const blocks: UploadedBlock[] = [];
     for (let offset = 0; offset < source.size; offset += blockSize) {
       throwIfCancelled();
       const length = Math.min(blockSize, source.size - offset);
@@ -2111,99 +2211,39 @@ class BepSession {
       try {
         if (chunk.length !== length) throw new Error("Upload source returned an unexpected length.");
         digest?.update(chunk);
-        plaintextBlocks.push({ offset, size: chunk.length, hash: toUint8Array(await this.adapter.sha256(chunk)) });
-      } finally { chunk.fill(0); }
+        blocks.push({ offset, size: chunk.length, hash: toUint8Array(await this.adapter.sha256(chunk)) });
+      } finally {
+        chunk.fill(0);
+      }
       notifyProgress(offset + length, "preparing");
     }
-    if (digest && bytesToHex(digest.digest()) !== options!.expectedHash) {
-      throw new Error("Upload source changed after publication started; retry later.");
-    }
-    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
-    const sequence = this.nextFolderSequence(folderId);
-    const baseVersion = advanceVersionVector(folder.files.get(normalizedPath)?.indexFile.version, this.localVersionCounterId);
-    if (!folder.encrypted) {
-      const fileInfo = {
-        name: normalizedPath,
-        type: 0,
-        size: source.size,
-        permissions: 0o644,
-        modified_s: Math.floor(modifiedMs / 1000),
-        modified_ns: (modifiedMs % 1000) * 1_000_000,
-        modified_by: this.localVersionCounterId,
-        deleted: false,
-        invalid: false,
-        no_permissions: false,
-        version: baseVersion,
-        sequence,
-        block_size: blockSize,
-        blocks: plaintextBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
-      };
-      throwIfCancelled();
-      folder.files.set(normalizedPath, { indexFile: fileInfo });
-      this.log("upload.prepared", {
-        folderId,
-        path: normalizedPath,
-        encrypted: false,
-        sizeBytes: source.size,
-        blockCount: plaintextBlocks.length,
-        elapsedMs: Date.now() - uploadStartedAtMs,
-        avgRateBps: uploadRateBps(source.size),
-      });
-      this.storeUploadedFile(folderId, { path: normalizedPath, size: source.size, blocks: plaintextBlocks,
-        plaintextBlocks, source, modifiedMs, sequence });
-      const frame = encodeMessageFrame(
-        MessageTypeValues.INDEX_UPDATE,
-        IndexUpdate,
-        {
-          folder: folderId,
-          files: [fileInfo],
-        },
-        0,
-      );
-      await this.publishAndWait(frame, folderId, normalizedPath, fileInfo, options);
-      notifyProgress(source.size, "publishing");
-      this.log("upload.index_update.sent", {
-        folderId,
-        path: normalizedPath,
-        encrypted: false,
-        sizeBytes: source.size,
-        blockCount: plaintextBlocks.length,
-        sequence,
-      });
-      this.log("upload.complete", {
-        folderId,
-        path: normalizedPath,
-        encrypted: false,
-        sizeBytes: source.size,
-        blockCount: plaintextBlocks.length,
-        elapsedMs: Date.now() - uploadStartedAtMs,
-        avgRateBps: uploadRateBps(source.size),
-      });
-      return;
-    }
-    const folderCrypto = folder.folderCrypto;
-    if (!folderCrypto) throw new Error(`Folder ${folderId} requires a valid encryption password before upload.`);
-    const fileKey = deriveUntrustedFileKey(folderCrypto.folderKey, normalizedPath);
-    const encryptedName = await encryptUntrustedFilename(
-      folderCrypto.folderKey,
-      normalizedPath,
-    );
-    const originalFileInfo = {
-      name: normalizedPath,
+    return blocks;
+  }
+
+  private plaintextUploadInfo(plan: UploadPlan) {
+    return {
+      name: plan.path,
       type: 0,
-      size: source.size,
+      size: plan.source.size,
       permissions: 0o644,
-      modified_s: Math.floor(modifiedMs / 1000),
-      modified_ns: (modifiedMs % 1000) * 1_000_000,
+      modified_s: Math.floor(plan.modifiedMs / 1000),
+      modified_ns: (plan.modifiedMs % 1000) * 1_000_000,
       modified_by: this.localVersionCounterId,
       deleted: false,
       invalid: false,
       no_permissions: false,
-      version: baseVersion,
-      sequence,
-      block_size: blockSize,
-      blocks: plaintextBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
+      version: plan.baseVersion,
+      sequence: plan.sequence,
+      block_size: plan.blockSize,
+      blocks: plan.plaintextBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
     };
+  }
+
+  private async encryptedUploadInfo(plan: UploadPlan) {
+    const folderCrypto = plan.folder.folderCrypto!;
+    const fileKey = deriveUntrustedFileKey(folderCrypto.folderKey, plan.path);
+    const encryptedName = await encryptUntrustedFilename(folderCrypto.folderKey, plan.path);
+    const originalFileInfo = this.plaintextUploadInfo(plan);
     const advertisedFileInfo = await encryptUntrustedFileInfo(
       folderCrypto.folderKey,
       originalFileInfo,
@@ -2214,56 +2254,117 @@ class BepSession {
       size: Number(block.size),
       hash: toUint8Array(block.hash),
     }));
-    throwIfCancelled();
+    return { originalFileInfo, advertisedFileInfo, advertisedBlocks, encryptedName, fileKey };
+  }
+
+  private async publishPlaintextUpload(plan: UploadPlan) {
+    const fileInfo = this.plaintextUploadInfo(plan);
+    plan.throwIfCancelled();
+    plan.folder.files.set(plan.path, { indexFile: fileInfo });
     this.log("upload.prepared", {
-      folderId,
-      path: normalizedPath,
-      encrypted: true,
-      sizeBytes: source.size,
-      blockCount: plaintextBlocks.length,
-      elapsedMs: Date.now() - uploadStartedAtMs,
-      avgRateBps: uploadRateBps(source.size),
+      folderId: plan.folderId,
+      path: plan.path,
+      encrypted: false,
+      sizeBytes: plan.source.size,
+      blockCount: plan.plaintextBlocks.length,
+      elapsedMs: Date.now() - plan.startedAtMs,
+      avgRateBps: plan.uploadRateBps(plan.source.size),
     });
-    folder.files.set(normalizedPath, {
-      indexFile: originalFileInfo,
-      request: {
-        encryptedName,
-        fileKey,
-        encryptedBlocks: advertisedBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
-      },
-    });
-    this.storeUploadedFile(folderId, { path: normalizedPath, size: source.size, blocks: advertisedBlocks,
-      plaintextBlocks, source, modifiedMs, sequence, encryptedName, fileKey });
-    const frame = encodeMessageFrame(
-      MessageTypeValues.INDEX_UPDATE,
-      IndexUpdate,
-      {
-        folder: folderId,
-        files: [advertisedFileInfo],
-      },
-      0,
-    );
-    await this.publishAndWait(frame, folderId, normalizedPath, originalFileInfo, options);
-    notifyProgress(source.size, "publishing");
+    this.storeUploadedFile(plan.folderId, { path: plan.path, size: plan.source.size,
+      blocks: plan.plaintextBlocks, plaintextBlocks: plan.plaintextBlocks, source: plan.source,
+      modifiedMs: plan.modifiedMs, sequence: plan.sequence });
+    const frame = encodeMessageFrame(MessageTypeValues.INDEX_UPDATE, IndexUpdate,
+      { folder: plan.folderId, files: [fileInfo] }, 0);
+    await this.publishAndWait(frame, plan.folderId, plan.path, fileInfo, plan.options);
+    plan.notifyProgress(plan.source.size, "publishing");
     this.log("upload.index_update.sent", {
-      folderId,
-      path: normalizedPath,
-      encrypted: true,
-      encryptedName,
-      sizeBytes: source.size,
-      blockCount: plaintextBlocks.length,
-      sequence,
+      folderId: plan.folderId, path: plan.path, encrypted: false,
+      sizeBytes: plan.source.size, blockCount: plan.plaintextBlocks.length, sequence: plan.sequence,
     });
     this.log("upload.complete", {
-      folderId,
-      path: normalizedPath,
-      encrypted: true,
-      sizeBytes: source.size,
-      blockCount: plaintextBlocks.length,
-      elapsedMs: Date.now() - uploadStartedAtMs,
-      avgRateBps: uploadRateBps(source.size),
+      folderId: plan.folderId, path: plan.path, encrypted: false,
+      sizeBytes: plan.source.size, blockCount: plan.plaintextBlocks.length,
+      elapsedMs: Date.now() - plan.startedAtMs,
+      avgRateBps: plan.uploadRateBps(plan.source.size),
     });
   }
+
+  private async publishEncryptedUpload(plan: UploadPlan) {
+    const info = await this.encryptedUploadInfo(plan);
+    plan.throwIfCancelled();
+    this.log("upload.prepared", {
+      folderId: plan.folderId,
+      path: plan.path,
+      encrypted: true,
+      sizeBytes: plan.source.size,
+      blockCount: plan.plaintextBlocks.length,
+      elapsedMs: Date.now() - plan.startedAtMs,
+      avgRateBps: plan.uploadRateBps(plan.source.size),
+    });
+    plan.folder.files.set(plan.path, {
+      indexFile: info.originalFileInfo,
+      request: {
+        encryptedName: info.encryptedName,
+        fileKey: info.fileKey,
+        encryptedBlocks: info.advertisedBlocks.map(({ offset, size, hash }) => ({ offset, size, hash })),
+      },
+    });
+    this.storeUploadedFile(plan.folderId, { path: plan.path, size: plan.source.size,
+      blocks: info.advertisedBlocks, plaintextBlocks: plan.plaintextBlocks, source: plan.source,
+      modifiedMs: plan.modifiedMs, sequence: plan.sequence,
+      encryptedName: info.encryptedName, fileKey: info.fileKey });
+    const frame = encodeMessageFrame(MessageTypeValues.INDEX_UPDATE, IndexUpdate,
+      { folder: plan.folderId, files: [info.advertisedFileInfo] }, 0);
+    await this.publishAndWait(frame, plan.folderId, plan.path, info.originalFileInfo, plan.options);
+    plan.notifyProgress(plan.source.size, "publishing");
+    this.log("upload.index_update.sent", {
+      folderId: plan.folderId, path: plan.path, encrypted: true,
+      encryptedName: info.encryptedName, sizeBytes: plan.source.size,
+      blockCount: plan.plaintextBlocks.length, sequence: plan.sequence,
+    });
+    this.log("upload.complete", {
+      folderId: plan.folderId, path: plan.path, encrypted: true,
+      sizeBytes: plan.source.size, blockCount: plan.plaintextBlocks.length,
+      elapsedMs: Date.now() - plan.startedAtMs,
+      avgRateBps: plan.uploadRateBps(plan.source.size),
+    });
+  }
+
+  async publishFileFromSource(
+    folderId: string,
+    path: string,
+    source: FileUploadSource,
+    options?: FileUploadOptions,
+  ): Promise<void> {
+    const { folder, normalizedPath } = this.uploadTarget(folderId, path, source);
+    const startedAtMs = Date.now();
+    const { throwIfCancelled, uploadRateBps, notifyProgress } =
+      this.uploadProgress(source, options, startedAtMs);
+    const blockSize = 128 * 1024;
+    this.log("upload.start", {
+      folderId, path: normalizedPath, encrypted: folder.encrypted,
+      sizeBytes: source.size, blockSize, streamed: true,
+    });
+    const digest = options?.expectedHash ? sha256.create() : undefined;
+    const plaintextBlocks = await this.readUploadBlocks(
+      source, blockSize, throwIfCancelled, digest, notifyProgress,
+    );
+    if (digest && bytesToHex(digest.digest()) !== options!.expectedHash) {
+      throw new Error("Upload source changed after publication started; retry later.");
+    }
+    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
+    const sequence = this.nextFolderSequence(folderId);
+    const baseVersion = advanceVersionVector(
+      folder.files.get(normalizedPath)?.indexFile.version,
+      this.localVersionCounterId,
+    );
+    const plan: UploadPlan = { folder, folderId, path: normalizedPath, source, options,
+      plaintextBlocks, modifiedMs, sequence, baseVersion, blockSize, startedAtMs,
+      throwIfCancelled, uploadRateBps, notifyProgress };
+    if (!folder.encrypted) await this.publishPlaintextUpload(plan);
+    else await this.publishEncryptedUpload(plan);
+  }
+
   private acknowledgePublication(folderId: string, path: string, file: BepFileInfo): void {
     const pending = this.awaitingPublications.get(`${folderId}\0${path}`);
     if (!pending) return;
@@ -2289,11 +2390,7 @@ class BepSession {
     } finally { this.awaitingPublications.delete(key); }
   }
 
-  async publishDeletion(
-    folderId: string,
-    path: string,
-    options?: FileDeleteOptions,
-  ): Promise<void> {
+  private deletionTarget(folderId: string, path: string) {
     const folder = this.folders.get(folderId);
     if (!folder) throw new Error(`Unknown folder: ${folderId}`);
     if (folder.readOnly) throw new Error(`Folder ${folderId} is read-only for this client.`);
@@ -2307,12 +2404,10 @@ class BepSession {
     if (!normalizedPath) throw new Error("Deletion path must not be empty.");
     assertReplicaPath(normalizedPath);
     if (isInternalReplicaPath(normalizedPath)) throw new Error("Internal files cannot be deleted remotely.");
-    const sequence = this.nextFolderSequence(folderId);
-    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
-    let advertisedName = normalizedPath;
-    if (folder.encrypted && folder.folderCrypto) {
-      advertisedName = await encryptUntrustedFilename(folder.folderCrypto.folderKey, normalizedPath);
-    }
+    return { folder, normalizedPath };
+  }
+
+  private deletionFileInfo(folder: FolderState, normalizedPath: string, sequence: number, modifiedMs: number, advertisedName: string) {
     const fileInfo = {
       name: advertisedName,
       type: 0,
@@ -2329,7 +2424,22 @@ class BepSession {
       block_size: 128 * 1024,
       blocks: [],
     };
-    const originalFileInfo = { ...fileInfo, name: normalizedPath, modified_s: Math.floor(modifiedMs / 1000), modified_ns: (modifiedMs % 1000) * 1000000 };
+    const originalFileInfo = { ...fileInfo, name: normalizedPath,
+      modified_s: Math.floor(modifiedMs / 1000), modified_ns: (modifiedMs % 1000) * 1000000 };
+    return { fileInfo, originalFileInfo };
+  }
+
+  async publishDeletion(folderId: string, path: string, options?: FileDeleteOptions): Promise<void> {
+    const { folder, normalizedPath } = this.deletionTarget(folderId, path);
+    const sequence = this.nextFolderSequence(folderId);
+    const modifiedMs = Math.max(0, Math.floor(options?.modifiedMs ?? Date.now()));
+    let advertisedName = normalizedPath;
+    if (folder.encrypted && folder.folderCrypto) {
+      advertisedName = await encryptUntrustedFilename(folder.folderCrypto.folderKey, normalizedPath);
+    }
+    const { fileInfo, originalFileInfo } = this.deletionFileInfo(
+      folder, normalizedPath, sequence, modifiedMs, advertisedName,
+    );
     const advertisedFileInfo = folder.encrypted && folder.folderCrypto
       ? await encryptUntrustedFileInfo(folder.folderCrypto.folderKey, originalFileInfo,
         toUint8Array(await this.adapter.randomBytes(24)))
@@ -2365,6 +2475,64 @@ class BepSession {
     return this.requestBlock(folderId, path, offset, size, { hash });
   }
 
+  private pendingBlockRequest(
+    frame: Uint8Array,
+    meta: PendingRequestMeta,
+    options?: { signal?: AbortSignal },
+  ): Promise<Uint8Array> {
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        options?.signal?.removeEventListener("abort", onAbort);
+      };
+      const timer: ReturnType<typeof setTimeout> = setTimeout(
+        () => this.blockRequestTimeout(meta, reject, cleanup),
+        this.requestTimeoutMs,
+      );
+      const onAbort = () => this.blockRequestAbort(meta, reject, cleanup);
+      this.pending.set(meta.id, { resolve, reject, timer, onAbort, cleanup, meta });
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options?.signal?.aborted) onAbort();
+      this.writeFrame(frame).catch((error) => this.blockRequestWriteFailure(meta, reject, error));
+    });
+  }
+
+  private blockRequestTimeout(meta: PendingRequestMeta, reject: (error: Error) => void, cleanup: () => void) {
+    this.pending.delete(meta.id);
+    cleanup();
+    this.log("request.timeout", {
+      ...meta,
+      timeoutMs: this.requestTimeoutMs,
+      durationMs: Date.now() - meta.startedAtMs,
+    });
+    reject(new Error(`Request timeout for ${meta.name} at offset ${meta.offset}`));
+  }
+
+  private blockRequestAbort(meta: PendingRequestMeta, reject: (error: Error) => void, cleanup: () => void) {
+    if (!this.pending.has(meta.id)) {
+      cleanup();
+      return;
+    }
+    this.pending.delete(meta.id);
+    cleanup();
+    const error = new Error("Download cancelled.");
+    error.name = "AbortError";
+    reject(error);
+  }
+
+  private blockRequestWriteFailure(meta: PendingRequestMeta, reject: (error: Error) => void, error: unknown) {
+    const entry = this.pending.get(meta.id);
+    if (!entry) return;
+    entry.cleanup?.();
+    this.pending.delete(meta.id);
+    this.log("request.write_failed", {
+      ...meta,
+      message: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - meta.startedAtMs,
+    });
+    reject(error instanceof Error ? error : new Error(String(error)));
+  }
+
   requestBlock(
     folder: string,
     name: string,
@@ -2385,81 +2553,24 @@ class BepSession {
     }
     const id = this.nextId++;
     const blockHash = options?.hash ?? new Uint8Array(0);
-    const blockNo = Number.isFinite(options?.blockNo)
-      ? Number(options?.blockNo)
-      : 0;
+    const blockNo = Number.isFinite(options?.blockNo) ? Number(options?.blockNo) : 0;
     const fromTemporary = options?.fromTemporary ?? true;
     const meta: PendingRequestMeta = {
-      id,
-      folder,
-      name,
-      offset,
-      size,
-      blockNo,
-      fromTemporary,
+      id, folder, name, offset, size, blockNo, fromTemporary,
       hashLength: blockHash.length,
       startedAtMs: Date.now(),
     };
     this.log("request.start", { ...meta });
-    const frame = encodeMessageFrame(
-      MessageTypeValues.REQUEST,
-      Request,
-      {
-        id,
-        folder,
-        name,
-        offset,
-        size,
-        hash: blockHash,
-        block_no: blockNo,
-        from_temporary: fromTemporary,
-      },
-      0,
+    return this.pendingBlockRequest(
+      encodeMessageFrame(
+        MessageTypeValues.REQUEST,
+        Request,
+        { id, folder, name, offset, size, hash: blockHash, block_no: blockNo, from_temporary: fromTemporary },
+        0,
+      ),
+      meta,
+      options,
     );
-    return new Promise<Uint8Array>((resolve, reject) => {
-      const timeoutMs = this.requestTimeoutMs;
-      const cleanup = () => {
-        clearTimeout(timer);
-        options?.signal?.removeEventListener("abort", onAbort);
-      };
-      const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
-        this.pending.delete(id);
-        cleanup();
-        const error = new Error(`Request timeout for ${name} at offset ${offset}`);
-        this.log("request.timeout", {
-          ...meta,
-          timeoutMs,
-          durationMs: Date.now() - meta.startedAtMs,
-        });
-        reject(error);
-      }, timeoutMs);
-      const onAbort = () => {
-        if (!this.pending.has(id)) {
-          cleanup();
-          return;
-        }
-        this.pending.delete(id);
-        cleanup();
-        const error = new Error("Download cancelled.");
-        error.name = "AbortError";
-        reject(error);
-      };
-      this.pending.set(id, { resolve, reject, timer, onAbort, cleanup, meta });
-      options?.signal?.addEventListener("abort", onAbort, { once: true });
-      if (options?.signal?.aborted) onAbort();
-      this.writeFrame(frame).catch((error) => {
-        const entry = this.pending.get(id);
-        if (!entry) return;
-        entry.cleanup?.();
-        this.pending.delete(id);
-        this.log("request.write_failed", {
-          ...meta,
-          message: error instanceof Error ? error.message : String(error),
-          durationMs: Date.now() - meta.startedAtMs,
-        });
-        reject(error instanceof Error ? error : new Error(String(error)));
-      });
-    });
   }
 
   buildRemoteFs(metadata?: RemoteDeviceInfo): RemoteFs {
@@ -2488,28 +2599,21 @@ class BepSession {
     );
   }
 
-  async close(): Promise<void> {
-    if (this.closed) { await Promise.allSettled(this.stateTasks); return; }
-    this.closed = true;
-    this.closureResolve({ kind: "manual", message: "Session closed by request" });
-    this.stopKeepalive();
-    const closeError = this.closeReason ?? new Error("Connection closed");
+  private rejectPendingRequests(error: Error) {
     for (const { reject, cleanup } of this.pending.values()) {
       cleanup?.();
-      reject(closeError);
+      reject(error);
     }
     this.pending.clear();
+  }
+
+  private async sendCloseFrame() {
     let closeFrameTimedOut = false;
     let closeFrameTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         this.writeFrame(
-          encodeMessageFrame(
-            MessageTypeValues.CLOSE,
-            Close,
-            { reason: "Client closed" },
-            0,
-          ),
+          encodeMessageFrame(MessageTypeValues.CLOSE, Close, { reason: "Client closed" }, 0),
           true,
         ),
         new Promise<void>((resolve) => {
@@ -2526,9 +2630,19 @@ class BepSession {
     } finally {
       if (closeFrameTimer) clearTimeout(closeFrameTimer);
     }
-    if (closeFrameTimedOut) {
-      this.log("close.frame_timeout");
+    if (closeFrameTimedOut) this.log("close.frame_timeout");
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      await Promise.allSettled(this.stateTasks);
+      return;
     }
+    this.closed = true;
+    this.closureResolve({ kind: "manual", message: "Session closed by request" });
+    this.stopKeepalive();
+    this.rejectPendingRequests(this.closeReason ?? new Error("Connection closed"));
+    await this.sendCloseFrame();
     await this.socket.close();
     await Promise.allSettled(this.stateTasks);
   }
@@ -2565,23 +2679,14 @@ async function readRemoteHello(
   }
 }
 
-async function openBepSessionOnSocketUncancelled(
+async function readBepPeerIdentity(
   adapter: SyncpeerHostAdapter,
   socket: SyncpeerTlsSocket,
   opts: SyncpeerConnectOptions,
   connectedHost: string,
   connectedPort: number,
-  connectedVia: string,
-  transportKind: "direct-tcp" | "direct-quic" | "relay",
-  connectionScope: ConnectionScope,
-  incoming = false,
-): Promise<SyncpeerSessionHandle> {
-  adapter.log?.("core.bep.handshake.start", {
-    direction: incoming ? "incoming" : "outgoing",
-    connectedHost,
-    connectedPort,
-    expectedDeviceId: opts.expectedDeviceId,
-  });
+  direction: "incoming" | "outgoing",
+) {
   const localCertDer = certificateDerFromPem(opts.certPem);
   const localDeviceId = await adapter.sha256(localCertDer);
   const localDeviceIdEncoded = encodeDeviceId(localDeviceId);
@@ -2589,14 +2694,13 @@ async function openBepSessionOnSocketUncancelled(
   const remoteDeviceIdBytes = await adapter.sha256(peerCertDer);
   const remoteDeviceId = await deviceIdFromCertificate(adapter, peerCertDer);
   adapter.log?.("core.bep.handshake.peer_cert", {
-    direction: incoming ? "incoming" : "outgoing",
+    direction,
     connectedHost,
     connectedPort,
     localDeviceId: localDeviceIdEncoded,
     remoteDeviceId,
     peerCertificateBytes: peerCertDer.length,
   });
-
   if (opts.expectedDeviceId) {
     const got = canonicalDeviceId(remoteDeviceId);
     const want = canonicalDeviceId(opts.expectedDeviceId);
@@ -2607,12 +2711,18 @@ async function openBepSessionOnSocketUncancelled(
       );
     }
   }
+  return { localDeviceId, remoteDeviceIdBytes, remoteDeviceId };
+}
 
-  adapter.log?.("core.bep.handshake.hello_send", {
-    direction: incoming ? "incoming" : "outgoing",
-    connectedHost,
-    connectedPort,
-  });
+async function exchangeBepHello(
+  adapter: SyncpeerHostAdapter,
+  socket: SyncpeerTlsSocket,
+  opts: SyncpeerConnectOptions,
+  direction: "incoming" | "outgoing",
+  connectedHost: string,
+  connectedPort: number,
+) {
+  adapter.log?.("core.bep.handshake.hello_send", { direction, connectedHost, connectedPort });
   const helloFrame = encodeHelloFrame({
     device_name: opts.deviceName,
     client_name: opts.clientName ?? "syncpeer",
@@ -2620,19 +2730,12 @@ async function openBepSessionOnSocketUncancelled(
   });
   await socket.write(helloFrame);
   adapter.log?.("core.bep.handshake.hello_sent", {
-    direction: incoming ? "incoming" : "outgoing",
-    connectedHost,
-    connectedPort,
-    bytes: helloFrame.length,
+    direction, connectedHost, connectedPort, bytes: helloFrame.length,
   });
-  adapter.log?.("core.bep.handshake.hello_read.start", {
-    direction: incoming ? "incoming" : "outgoing",
-    connectedHost,
-    connectedPort,
-  });
+  adapter.log?.("core.bep.handshake.hello_read.start", { direction, connectedHost, connectedPort });
   const { hello, leftover } = await readRemoteHello(socket);
   adapter.log?.("core.bep.handshake.hello_recv", {
-    direction: incoming ? "incoming" : "outgoing",
+    direction,
     connectedHost,
     connectedPort,
     remoteDeviceName: String(hello.device_name ?? "unknown"),
@@ -2640,13 +2743,18 @@ async function openBepSessionOnSocketUncancelled(
     remoteClientVersion: String(hello.client_version ?? "unknown"),
     leftoverBytes: leftover.length,
   });
-  const remoteDeviceInfo: RemoteDeviceInfo = {
-    id: remoteDeviceId,
-    deviceName: String(hello.device_name ?? "unknown"),
-    clientName: String(hello.client_name ?? "unknown"),
-    clientVersion: String(hello.client_version ?? "unknown"),
-  };
+  return { hello, leftover };
+}
 
+async function createReadyBepSession(
+  adapter: SyncpeerHostAdapter,
+  socket: SyncpeerTlsSocket,
+  opts: SyncpeerConnectOptions,
+  localDeviceId: Uint8Array,
+  remoteDeviceIdBytes: Uint8Array,
+  leftover: Uint8Array,
+  incoming: boolean,
+) {
   const session = new BepSession(
     socket,
     adapter,
@@ -2660,22 +2768,58 @@ async function openBepSessionOnSocketUncancelled(
   );
   await session.initialize(leftover);
   if (incoming) await session.advertiseSharedFolders();
-  adapter.log?.("core.bep.cluster_config.wait", {
-    direction: incoming ? "incoming" : "outgoing",
-    connectedHost,
-    connectedPort,
+  return session;
+}
+
+async function openBepSessionOnSocketUncancelled(
+  adapter: SyncpeerHostAdapter,
+  socket: SyncpeerTlsSocket,
+  opts: SyncpeerConnectOptions,
+  connectedHost: string,
+  connectedPort: number,
+  connectedVia: string,
+  transportKind: "direct-tcp" | "direct-quic" | "relay",
+  connectionScope: ConnectionScope,
+  incoming = false,
+): Promise<SyncpeerSessionHandle> {
+  const direction = incoming ? "incoming" : "outgoing";
+  adapter.log?.("core.bep.handshake.start", {
+    direction, connectedHost, connectedPort, expectedDeviceId: opts.expectedDeviceId,
   });
+  const identity = await readBepPeerIdentity(
+    adapter, socket, opts, connectedHost, connectedPort, direction,
+  );
+  const { hello, leftover } = await exchangeBepHello(
+    adapter, socket, opts, direction, connectedHost, connectedPort,
+  );
+  const session = await createReadyBepSession(
+    adapter, socket, opts, identity.localDeviceId, identity.remoteDeviceIdBytes, leftover, incoming,
+  );
+  adapter.log?.("core.bep.cluster_config.wait", { direction, connectedHost, connectedPort });
   await session.waitForReady();
   session.startReplicaSync(opts.replicaScanIntervalMs);
   adapter.log?.("core.bep.handshake.ready", {
-    direction: incoming ? "incoming" : "outgoing",
-    connectedHost,
-    connectedPort,
-    remoteDeviceId,
+    direction, connectedHost, connectedPort, remoteDeviceId: identity.remoteDeviceId,
   });
+  return bepSessionHandle(session, identity.remoteDeviceId, hello, connectedVia, transportKind, connectionScope);
+}
+
+function bepSessionHandle(
+  session: BepSession,
+  remoteDeviceId: string,
+  hello: BepHello,
+  connectedVia: string,
+  transportKind: "direct-tcp" | "direct-quic" | "relay",
+  connectionScope: ConnectionScope,
+): SyncpeerSessionHandle {
   return {
     remoteDeviceId,
-    remoteFs: session.buildRemoteFs(remoteDeviceInfo),
+    remoteFs: session.buildRemoteFs({
+      id: remoteDeviceId,
+      deviceName: String(hello.device_name ?? "unknown"),
+      clientName: String(hello.client_name ?? "unknown"),
+      clientVersion: String(hello.client_version ?? "unknown"),
+    }),
     connectedVia,
     transportKind,
     connectionScope,
@@ -2746,15 +2890,14 @@ export async function acceptSyncpeerSession(
     clearTimeout(timer);
   }
 }
-async function openDirectSession(
+async function openDirectTls(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
   host: string,
   port: number,
   timeoutMs?: number,
-  connectionScope = connectionScopeForHost(host),
   signal?: AbortSignal,
-): Promise<SyncpeerSessionHandle> {
+) {
   adapter.log?.("core.direct.connect.start", {
     host,
     port,
@@ -2770,10 +2913,20 @@ async function openDirectSession(
     timeoutMs,
     signal,
   });
-  adapter.log?.("core.direct.connect.tls_ready", {
-    host,
-    port,
-  });
+  adapter.log?.("core.direct.connect.tls_ready", { host, port });
+  return socket;
+}
+
+async function openDirectSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  host: string,
+  port: number,
+  timeoutMs?: number,
+  connectionScope = connectionScopeForHost(host),
+  signal?: AbortSignal,
+): Promise<SyncpeerSessionHandle> {
+  const socket = await openDirectTls(adapter, opts, host, port, timeoutMs, signal);
   const session = await openBepSessionOnSocket(
     adapter,
     socket,
@@ -2785,10 +2938,7 @@ async function openDirectSession(
     connectionScope,
     signal,
   );
-  adapter.log?.("core.direct.connect.ready", {
-    host,
-    port,
-  });
+  adapter.log?.("core.direct.connect.ready", { host, port });
   return session;
 }
 
@@ -2852,19 +3002,15 @@ export async function connectRelayWithRetry(adapter: SyncpeerHostAdapter, option
   }
 }
 
-async function openRelaySession(
+async function openRelayTunnel(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
   relayAddress: string,
-  timeoutMs = opts.timeoutMs,
+  timeoutMs?: number,
   signal?: AbortSignal,
-): Promise<SyncpeerSessionHandle> {
-  if (!adapter.connectRelay) {
-    throw new Error("Relay transport is not available in this host adapter");
-  }
-  if (!opts.expectedDeviceId) {
-    throw new Error("Remote Device ID is required for relay connection");
-  }
+) {
+  if (!adapter.connectRelay) throw new Error("Relay transport is not available in this host adapter");
+  if (!opts.expectedDeviceId) throw new Error("Remote Device ID is required for relay connection");
   adapter.log?.("core.relay.connect.start", {
     relayAddress,
     expectedDeviceId: opts.expectedDeviceId,
@@ -2882,6 +3028,17 @@ async function openRelaySession(
     relayAddress,
     connectedVia: relay.connectedVia,
   });
+  return relay;
+}
+
+async function openRelaySession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  relayAddress: string,
+  timeoutMs = opts.timeoutMs,
+  signal?: AbortSignal,
+): Promise<SyncpeerSessionHandle> {
+  const relay = await openRelayTunnel(adapter, opts, relayAddress, timeoutMs, signal);
   const session = await openBepSessionOnSocket(
     adapter,
     relay.socket,
@@ -2900,6 +3057,402 @@ async function openRelaySession(
   return session;
 }
 
+type DiscoveryOutcome = {
+  global: PromiseSettledResult<SyncpeerGlobalDiscoveryResult>;
+  local: PromiseSettledResult<DiscoveredCandidate[]>;
+};
+
+class ConnectionAttempt {
+  private readonly adapter: SyncpeerHostAdapter;
+  private readonly opts: SyncpeerConnectOptions;
+  private readonly totalTimeout: number;
+  private readonly candidateHealth: Map<string, CandidateHealth>;
+  private readonly runtime: CandidateRuntime;
+  private readonly signal?: AbortSignal;
+  private readonly discoveryMode: NonNullable<SyncpeerConnectOptions["discoveryMode"]>;
+  private readonly localDiscoveryTimeoutMs: number;
+  private readonly raceController = new AbortController();
+  private readonly errors: string[] = [];
+  private connectDeadline = 0;
+  private perCandidateTimeout = 0;
+  private relayStartDelayMs = 0;
+  private relayEnabled = false;
+  private directCandidates: DiscoveredCandidate[] = [];
+  private relayCandidates: DiscoveredCandidate[] = [];
+  private winningSession: SyncpeerSessionHandle | null = null;
+
+  constructor(
+    adapter: SyncpeerHostAdapter,
+    opts: SyncpeerConnectOptions,
+    totalTimeout: number,
+    candidateHealth: Map<string, CandidateHealth>,
+    runtime: CandidateRuntime,
+    signal?: AbortSignal,
+  ) {
+    this.adapter = adapter;
+    this.opts = opts;
+    this.totalTimeout = totalTimeout;
+    this.candidateHealth = candidateHealth;
+    this.runtime = runtime;
+    this.signal = signal;
+    this.discoveryMode = opts.discoveryMode ?? "automatic";
+    this.localDiscoveryTimeoutMs = this.discoveryMode === "lan"
+      ? totalTimeout
+      : Math.max(250, Math.min(2000, Math.floor(totalTimeout * 0.15)));
+  }
+
+  private get raceSignal() {
+    return this.raceController.signal;
+  }
+
+  async run(): Promise<SyncpeerSessionHandle> {
+    const ordered = await this.discoverCandidates();
+    this.selectCandidates(ordered);
+    if (this.opts.relayOnly && this.relayCandidates.length === 0) {
+      throw new Error("Relay-only mode requires a relay address from global discovery.");
+    }
+    if (this.opts.quicOnly && !this.adapter.connectQuic) {
+      throw new Error("QUIC is unavailable in this runtime.");
+    }
+    if (this.relayCandidates.length > 0 && !this.relayEnabled) {
+      this.errors.push("Relay fallback is disabled by settings");
+    }
+    this.prepareRace();
+    const attempts = [this.directAttempt(), this.relayAttempt()].filter(
+      (attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null,
+    );
+    return this.awaitRace(attempts);
+  }
+
+  private async discoverCandidates() {
+    const outcome = await this.runDiscovery();
+    const globalCandidates = outcome.global.status === "fulfilled"
+      ? outcome.global.value.candidates
+      : [];
+    const localCandidates = outcome.local.status === "fulfilled"
+      ? outcome.local.value.map((candidate) => ({
+          ...candidate,
+          source: "local" as const,
+          scope: candidate.scope ?? "lan",
+        }))
+      : [];
+    this.logDiscovery(outcome, localCandidates);
+    const merged = dedupeCandidates([
+      ...(this.discoveryMode === "automatic" ? this.manualCandidates() : []),
+      ...localCandidates,
+      ...globalCandidates,
+    ]);
+    this.assertDiscovery(outcome, merged);
+    return normalizeDiscoveredCandidates(merged);
+  }
+
+  private async runDiscovery(): Promise<DiscoveryOutcome> {
+    const global = this.discoveryMode === "lan"
+      ? Promise.resolve({ payload: null, candidates: [] } as SyncpeerGlobalDiscoveryResult)
+      : resolveGlobalDiscoveryInternal(this.adapter, {
+          expectedDeviceId: this.opts.expectedDeviceId ?? "",
+          discoveryServer: this.opts.discoveryServer,
+        }, this.signal);
+    const local = this.discoveryMode === "global"
+      ? Promise.resolve([])
+      : this.adapter.discoverLocalCandidates
+        ? this.adapter.discoverLocalCandidates({
+            expectedDeviceId: this.opts.expectedDeviceId ?? "",
+            timeoutMs: this.localDiscoveryTimeoutMs,
+            signal: this.signal,
+          })
+        : Promise.resolve([]);
+    const [globalResult, localResult] = await Promise.allSettled([global, local]);
+    return { global: globalResult, local: localResult };
+  }
+
+  private logDiscovery(outcome: DiscoveryOutcome, localCandidates: DiscoveredCandidate[]) {
+    if (localCandidates.length > 0) {
+      this.adapter.log?.("core.discovery.local_response", {
+        timeoutMs: this.localDiscoveryTimeoutMs,
+        candidates: localCandidates,
+      });
+    }
+    if (outcome.local.status === "rejected") {
+      this.adapter.log?.("core.discovery.local_failed", {
+        timeoutMs: this.localDiscoveryTimeoutMs,
+        message: outcome.local.reason instanceof Error
+          ? outcome.local.reason.message
+          : String(outcome.local.reason),
+      });
+    }
+  }
+
+  private manualCandidates(): DiscoveredCandidate[] {
+    if (this.opts.host.trim() === "") return [];
+    return [
+      {
+        address: `tcp://${this.opts.host}:${this.opts.port}`,
+        protocol: "tcp",
+        host: this.opts.host,
+        port: this.opts.port,
+        scope: connectionScopeForHost(this.opts.host),
+        source: "manual",
+      },
+      ...(this.adapter.connectQuic ? [{
+        address: `quic://${this.opts.host}:${this.opts.port}`,
+        protocol: "quic" as const,
+        host: this.opts.host,
+        port: this.opts.port,
+        scope: connectionScopeForHost(this.opts.host),
+        source: "manual" as const,
+      }] : []),
+    ];
+  }
+
+  private assertDiscovery(outcome: DiscoveryOutcome, merged: DiscoveredCandidate[]) {
+    if (this.discoveryMode === "lan" && outcome.local.status === "rejected") {
+      throw outcome.local.reason instanceof Error
+        ? outcome.local.reason
+        : new Error(String(outcome.local.reason));
+    }
+    if (
+      this.discoveryMode === "global" &&
+      outcome.global.status === "rejected" &&
+      merged.length === 0
+    ) {
+      throw outcome.global.reason instanceof Error
+        ? outcome.global.reason
+        : new Error(String(outcome.global.reason));
+    }
+    if (merged.length === 0) {
+      throw new Error(
+        this.discoveryMode === "lan"
+          ? "No LAN discovery candidates available."
+          : "No global discovery candidates available.",
+      );
+    }
+  }
+
+  private selectCandidates(ordered: DiscoveredCandidate[]) {
+    const direct = this.opts.relayOnly ? [] : ordered.filter(
+      (candidate) =>
+        (candidate.protocol === "tcp" || candidate.protocol === "quic") &&
+        (!this.opts.quicOnly || candidate.protocol === "quic") &&
+        candidate.host &&
+        Number.isFinite(candidate.port) &&
+        (candidate.protocol !== "quic" || this.adapter.connectQuic !== undefined),
+    );
+    const relay = this.opts.quicOnly ? [] : ordered.filter(
+      (candidate) => candidate.protocol === "relay",
+    ).sort((left, right) =>
+      (this.candidateHealth.get(candidateKey(left))?.cooldownUntilMs ?? 0) -
+      (this.candidateHealth.get(candidateKey(right))?.cooldownUntilMs ?? 0));
+    this.adapter.log?.("core.discovery.candidates.ordered", {
+      directCandidates: direct,
+      relayCandidates: relay,
+    });
+    this.connectDeadline = this.runtime.now() + this.totalTimeout;
+    this.relayEnabled = this.opts.enableRelayFallback !== false;
+    this.relayStartDelayMs = this.relayEnabled && relay.length > 0 && !this.opts.relayOnly
+      ? Math.min(2500, Math.max(0, Math.floor(this.totalTimeout * 0.25)))
+      : 0;
+    this.perCandidateTimeout = Math.max(
+      8000,
+      Math.min(30000, Math.floor(this.totalTimeout / Math.max(direct.length || 1, 1))),
+    );
+    this.adapter.log?.("core.discovery.connect_strategy", {
+      totalTimeout: this.totalTimeout,
+      perCandidateTimeout: this.perCandidateTimeout,
+      relayStartDelayMs: this.relayStartDelayMs,
+      directCandidateCount: direct.length,
+      relayCandidateCount: relay.length,
+      orderedCandidates: ordered.map((candidate) => describeCandidate(candidate)),
+    });
+    this.directCandidates = direct;
+    this.relayCandidates = relay;
+  }
+
+  private prepareRace() {
+    if (this.signal?.aborted) this.abortRace();
+    else this.signal?.addEventListener("abort", this.abortRace, { once: true });
+  }
+
+  private abortRace = () => this.raceController.abort();
+
+  private async waitForCandidate(candidate: DiscoveredCandidate) {
+    const until = this.candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0;
+    const delayMs = Math.max(0, until - this.runtime.now());
+    if (delayMs >= this.connectDeadline - this.runtime.now()) {
+      throw new Error("Candidate cooldown exceeds connection budget");
+    }
+    if (delayMs > 0) await this.runtime.sleep(delayMs, this.raceSignal);
+    throwIfConnectionAborted(this.raceSignal);
+  }
+
+  private async claimSession(session: SyncpeerSessionHandle) {
+    if (this.winningSession) {
+      await session.close().catch(() => undefined);
+      throw new Error("Connection attempt lost the connection race");
+    }
+    this.winningSession = session;
+    this.abortRace();
+    return session;
+  }
+
+  private directAttempt() {
+    if (this.directCandidates.length === 0) return null;
+    return Promise.any(this.directCandidates.map((candidate) => this.openDirectCandidate(candidate)));
+  }
+
+  private async openDirectCandidate(candidate: DiscoveredCandidate) {
+    await this.waitForCandidate(candidate);
+    if (this.winningSession) throw new Error("Direct connection race cancelled");
+    throwIfConnectionAborted(this.raceSignal);
+    const remainingMs = Math.max(0, this.connectDeadline - this.runtime.now());
+    if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
+    const candidateTimeoutMs = Math.min(this.perCandidateTimeout, remainingMs);
+    try {
+      return await this.tryDirectCandidate(candidate, candidateTimeoutMs);
+    } catch (error) {
+      this.handleDirectFailure(candidate, error);
+      throw error;
+    }
+  }
+
+  private async tryDirectCandidate(candidate: DiscoveredCandidate, candidateTimeoutMs: number) {
+    this.adapter.log?.("core.discovery.candidate.try", {
+      address: candidate.address,
+      host: candidate.host,
+      port: candidate.port,
+      perCandidateTimeout: candidateTimeoutMs,
+      strategy: "parallel-with-relay-fallback",
+    });
+    const open = candidate.protocol === "quic" ? openQuicSession : openDirectSession;
+    const session = await withSessionTimeout(
+      open(
+        this.adapter,
+        this.opts,
+        candidate.host!,
+        candidate.port!,
+        candidateTimeoutMs,
+        candidate.scope ?? (candidate.source === "local" ? "lan" : connectionScopeForHost(candidate.host!)),
+        this.raceSignal,
+      ),
+      candidateTimeoutMs,
+    );
+    trackCandidateSession(this.candidateHealth, candidate, session, this.runtime.now);
+    return this.claimSession(session);
+  }
+
+  private handleDirectFailure(candidate: DiscoveredCandidate, error: unknown) {
+    if (this.raceSignal.aborted) return;
+    const message = error instanceof Error ? error.message : String(error);
+    this.adapter.log?.("core.discovery.candidate.failed", {
+      address: candidate.address,
+      host: candidate.host,
+      port: candidate.port,
+      message,
+    });
+    this.errors.push(`${candidate.address}: ${message}`);
+    recordCandidateFailure(this.candidateHealth, candidate, this.runtime.now);
+  }
+
+  private relayAttempt() {
+    if (!this.relayEnabled || this.relayCandidates.length === 0) return null;
+    return this.runRelayCandidates();
+  }
+
+  private async runRelayCandidates(): Promise<SyncpeerSessionHandle> {
+    if (this.relayStartDelayMs > 0) await this.runtime.sleep(this.relayStartDelayMs);
+    throwIfConnectionAborted(this.raceSignal);
+    if (this.winningSession) throw new Error("Relay connection race cancelled");
+    for (const candidate of this.relayCandidates) {
+      if ((this.candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) >= this.connectDeadline) {
+        continue;
+      }
+      await this.waitForCandidate(candidate);
+      const session = await this.tryRelayCandidate(candidate);
+      if (session) return session;
+    }
+    throw new Error("All relay discovery candidates failed.");
+  }
+
+  private relayFailure(
+    candidate: DiscoveredCandidate,
+    attempt: number,
+    relayMaxAttempts: number,
+    error: unknown,
+  ) {
+    if (this.raceSignal.aborted) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    this.adapter.log?.("core.discovery.relay.failed", {
+      address: candidate.address,
+      attempt,
+      attemptsTotal: relayMaxAttempts,
+      message,
+    });
+    this.errors.push(`${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`);
+    recordCandidateFailure(this.candidateHealth, candidate, this.runtime.now);
+    return attempt < relayMaxAttempts &&
+      (isTimeoutLikeError(message) || isTransientRelayError(message));
+  }
+
+  private async tryRelaySession(
+    candidate: DiscoveredCandidate,
+    attempt: number,
+    relayMaxAttempts: number,
+    attemptTimeoutMs: number,
+  ) {
+    this.adapter.log?.("core.discovery.relay.try", {
+      address: candidate.address,
+      attempt,
+      attemptsTotal: relayMaxAttempts,
+      timeoutMs: attemptTimeoutMs,
+      strategy: this.relayStartDelayMs > 0 ? "parallel-fallback" : "preferred",
+    });
+    const session = await withSessionTimeout(
+      openRelaySession(this.adapter, this.opts, candidate.address, attemptTimeoutMs, this.raceSignal),
+      attemptTimeoutMs,
+    );
+    trackCandidateSession(this.candidateHealth, candidate, session, this.runtime.now);
+    return this.claimSession(session);
+  }
+
+  private async tryRelayCandidate(candidate: DiscoveredCandidate) {
+    const relayMaxAttempts = 2;
+    for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
+      if (this.winningSession) throw new Error("Relay connection race cancelled");
+      const remainingMs = Math.max(0, this.connectDeadline - this.runtime.now());
+      if (remainingMs <= 0) return null;
+      const attemptTimeoutMs = Math.min(
+        remainingMs,
+        Math.max(1000, Math.min(10000, Math.floor(remainingMs / (relayMaxAttempts - attempt + 1)))),
+      );
+      try {
+        return await this.tryRelaySession(candidate, attempt, relayMaxAttempts, attemptTimeoutMs);
+      } catch (error) {
+        if (!this.relayFailure(candidate, attempt, relayMaxAttempts, error)) return null;
+        await this.runtime.sleep(250);
+      }
+    }
+    return null;
+  }
+
+  private async awaitRace(attempts: Promise<SyncpeerSessionHandle>[]) {
+    try {
+      if (attempts.length > 0) {
+        try {
+          return await Promise.any(attempts);
+        } catch {
+          // The detailed candidate errors below are more useful than AggregateError.
+        }
+      }
+      const hint = maybeConnectionHint(this.opts, this.errors);
+      const technical = `Could not connect using discovered candidates. ${this.errors.join(" | ")}`;
+      throw new Error(hint ? `${hint} Technical details: ${technical}` : technical);
+    } finally {
+      this.signal?.removeEventListener("abort", this.abortRace);
+      this.abortRace();
+    }
+  }
+}
+
 async function openSessionAttempt(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
@@ -2908,341 +3461,46 @@ async function openSessionAttempt(
   runtime: CandidateRuntime,
   signal?: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
-  const discoveryMode = opts.discoveryMode ?? "automatic";
-  const localDiscoveryTimeoutMs = discoveryMode === "lan"
-    ? totalTimeout
-    : Math.max(250, Math.min(2000, Math.floor(totalTimeout * 0.15)));
-  const globalDiscoveryPromise = discoveryMode === "lan"
-    ? Promise.resolve({ payload: null, candidates: [] } as SyncpeerGlobalDiscoveryResult)
-    : resolveGlobalDiscoveryInternal(adapter, {
-        expectedDeviceId: opts.expectedDeviceId ?? "",
-        discoveryServer: opts.discoveryServer,
-      }, signal);
-  const localDiscoveryPromise = discoveryMode === "global"
-    ? Promise.resolve([])
-    : adapter.discoverLocalCandidates
-    ? adapter.discoverLocalCandidates({
-        expectedDeviceId: opts.expectedDeviceId ?? "",
-        timeoutMs: localDiscoveryTimeoutMs,
-        signal,
-      })
-    : Promise.resolve([]);
-  const [globalDiscoveryResult, localDiscoveryResult] = await Promise.allSettled([
-    globalDiscoveryPromise,
-    localDiscoveryPromise,
-  ]);
-  const globalCandidates = globalDiscoveryResult.status === "fulfilled"
-    ? globalDiscoveryResult.value.candidates
-    : [];
-  const localCandidates = localDiscoveryResult.status === "fulfilled"
-    ? localDiscoveryResult.value.map((candidate) => ({
-        ...candidate,
-        source: "local" as const,
-        scope: candidate.scope ?? "lan",
-      }))
-    : [];
+  return new ConnectionAttempt(adapter, opts, totalTimeout, candidateHealth, runtime, signal).run();
+}
 
-  if (localCandidates.length > 0) {
-    adapter.log?.("core.discovery.local_response", {
-      timeoutMs: localDiscoveryTimeoutMs,
-      candidates: localCandidates,
-    });
-  }
-  if (localDiscoveryResult.status === "rejected") {
-    adapter.log?.("core.discovery.local_failed", {
-      timeoutMs: localDiscoveryTimeoutMs,
-      message:
-        localDiscoveryResult.reason instanceof Error
-          ? localDiscoveryResult.reason.message
-          : String(localDiscoveryResult.reason),
-    });
-  }
-
-  const manualCandidates: DiscoveredCandidate[] = opts.host.trim() === "" ? [] : [
-    {
-      address: `tcp://${opts.host}:${opts.port}`,
-      protocol: "tcp",
-      host: opts.host,
-      port: opts.port,
-      scope: connectionScopeForHost(opts.host),
-      source: "manual",
-    },
-    ...(adapter.connectQuic ? [{
-      address: `quic://${opts.host}:${opts.port}`,
-      protocol: "quic" as const,
-      host: opts.host,
-      port: opts.port,
-      scope: connectionScopeForHost(opts.host),
-      source: "manual" as const,
-    }] : []),
-  ];
-  const mergedCandidates = dedupeCandidates([
-    ...(discoveryMode === "automatic" ? manualCandidates : []),
-    ...localCandidates,
-    ...globalCandidates,
-  ]);
-  if (discoveryMode === "lan" && localDiscoveryResult.status === "rejected") {
-    throw localDiscoveryResult.reason instanceof Error
-      ? localDiscoveryResult.reason
-      : new Error(String(localDiscoveryResult.reason));
-  }
-  if (
-    discoveryMode === "global" &&
-    globalDiscoveryResult.status === "rejected" &&
-    mergedCandidates.length === 0
-  ) {
-    throw globalDiscoveryResult.reason instanceof Error
-      ? globalDiscoveryResult.reason
-      : new Error(String(globalDiscoveryResult.reason));
-  }
-  if (mergedCandidates.length === 0) {
-    throw new Error(
-      discoveryMode === "lan"
-        ? "No LAN discovery candidates available."
-        : "No global discovery candidates available.",
-    );
-  }
-
-  const ordered = normalizeDiscoveredCandidates(mergedCandidates);
-
-  const directCandidates = opts.relayOnly ? [] : ordered.filter(
-    (candidate) =>
-      (candidate.protocol === "tcp" || candidate.protocol === "quic") &&
-      (!opts.quicOnly || candidate.protocol === "quic") &&
-      candidate.host &&
-      Number.isFinite(candidate.port) &&
-      (candidate.protocol !== "quic" || adapter.connectQuic !== undefined),
-  );
-
-  const relayCandidates = opts.quicOnly ? [] : ordered.filter(
-    (candidate) => candidate.protocol === "relay",
-  ).sort((left, right) =>
-    (candidateHealth.get(candidateKey(left))?.cooldownUntilMs ?? 0) -
-    (candidateHealth.get(candidateKey(right))?.cooldownUntilMs ?? 0));
-
-  adapter.log?.("core.discovery.candidates.ordered", {
-    directCandidates,
-    relayCandidates,
-  });
-
-  const connectDeadline = runtime.now() + totalTimeout;
-  const relayEnabled = opts.enableRelayFallback !== false;
-  const relayStartDelayMs = relayEnabled && relayCandidates.length > 0 && !opts.relayOnly
-    ? Math.min(2500, Math.max(0, Math.floor(totalTimeout * 0.25)))
-    : 0;
-  const perCandidateTimeout = Math.max(
-    8000,
-    Math.min(30000, Math.floor(totalTimeout / Math.max(directCandidates.length || 1, 1))),
-  );
-  adapter.log?.("core.discovery.connect_strategy", {
-    totalTimeout,
-    perCandidateTimeout,
-    relayStartDelayMs,
-    directCandidateCount: directCandidates.length,
-    relayCandidateCount: relayCandidates.length,
-    orderedCandidates: ordered.map((candidate) => describeCandidate(candidate)),
-  });
-
-  const errors: string[] = [];
-  if (opts.relayOnly && relayCandidates.length === 0) {
-    throw new Error("Relay-only mode requires a relay address from global discovery.");
-  }
-  if (opts.quicOnly && !adapter.connectQuic) {
-    throw new Error("QUIC is unavailable in this runtime.");
-  }
-  const raceController = new AbortController();
-  const abortRace = (): void => raceController.abort();
-  if (signal?.aborted) abortRace();
-  else signal?.addEventListener("abort", abortRace, { once: true });
-  const raceSignal = raceController.signal;
-  const waitForCandidate = async (candidate: DiscoveredCandidate) => {
-    const until = candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0;
-    const delayMs = Math.max(0, until - runtime.now());
-    if (delayMs >= connectDeadline - runtime.now()) throw new Error("Candidate cooldown exceeds connection budget");
-    if (delayMs > 0) await runtime.sleep(delayMs, raceSignal);
-    throwIfConnectionAborted(raceSignal);
-  };
-  let winningSession: SyncpeerSessionHandle | null = null;
-  const claimSession = async (session: SyncpeerSessionHandle) => {
-    if (winningSession) {
-      await session.close().catch(() => undefined);
-      throw new Error("Connection attempt lost the connection race");
-    }
-    winningSession = session;
-    abortRace();
-    return session;
-  };
-
-  const openDirectCandidate = async (
-    candidate: DiscoveredCandidate,
-  ): Promise<SyncpeerSessionHandle> => {
-    await waitForCandidate(candidate);
-    if (winningSession) throw new Error("Direct connection race cancelled");
-    throwIfConnectionAborted(raceSignal);
-    const remainingMs = Math.max(0, connectDeadline - runtime.now());
-    if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
-    const candidateTimeoutMs = Math.min(perCandidateTimeout, remainingMs);
-    try {
-      adapter.log?.("core.discovery.candidate.try", {
-        address: candidate.address,
-        host: candidate.host,
-        port: candidate.port,
-        perCandidateTimeout: candidateTimeoutMs,
-        strategy: "parallel-with-relay-fallback",
-      });
-      const openCandidate = candidate.protocol === "quic" ? openQuicSession : openDirectSession;
-      const session = await withSessionTimeout(
-        openCandidate(
-          adapter,
-          opts,
-          candidate.host!,
-          candidate.port!,
-          candidateTimeoutMs,
-          candidate.scope ?? (candidate.source === "local" ? "lan" : connectionScopeForHost(candidate.host!)),
-          raceSignal,
-        ),
-        candidateTimeoutMs,
-      );
-      trackCandidateSession(candidateHealth, candidate, session, runtime.now);
-      return await claimSession(session);
-    } catch (error) {
-      if (raceSignal.aborted) throw error;
-      const message = error instanceof Error ? error.message : String(error);
-      adapter.log?.("core.discovery.candidate.failed", {
-        address: candidate.address,
-        host: candidate.host,
-        port: candidate.port,
-        message,
-      });
-      errors.push(`${candidate.address}: ${message}`);
-      recordCandidateFailure(candidateHealth, candidate, runtime.now);
-      throw error;
-    }
-  };
-
-  const directTask = directCandidates.length === 0
-    ? null
-    : Promise.any(directCandidates.map(openDirectCandidate));
-
-  const relayTask = !relayEnabled || relayCandidates.length === 0
-    ? null
-    : (async (): Promise<SyncpeerSessionHandle> => {
-        if (relayStartDelayMs > 0) await runtime.sleep(relayStartDelayMs);
-        throwIfConnectionAborted(raceSignal);
-        if (winningSession) throw new Error("Relay connection race cancelled");
-        const relayMaxAttempts = 2;
-        for (const candidate of relayCandidates) {
-          if ((candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) >= connectDeadline) continue;
-          await waitForCandidate(candidate);
-          for (let attempt = 1; attempt <= relayMaxAttempts; attempt += 1) {
-            if (winningSession) throw new Error("Relay connection race cancelled");
-            const remainingMs = Math.max(0, connectDeadline - runtime.now());
-            if (remainingMs <= 0) break;
-            const attemptTimeoutMs = Math.min(
-              remainingMs,
-              Math.max(
-                1000,
-                Math.min(10000, Math.floor(remainingMs / (relayMaxAttempts - attempt + 1))),
-              ),
-            );
-            try {
-              adapter.log?.("core.discovery.relay.try", {
-                address: candidate.address,
-                attempt,
-                attemptsTotal: relayMaxAttempts,
-                timeoutMs: attemptTimeoutMs,
-                strategy: relayStartDelayMs > 0 ? "parallel-fallback" : "preferred",
-              });
-              const session = await withSessionTimeout(
-                openRelaySession(adapter, opts, candidate.address, attemptTimeoutMs, raceSignal),
-                attemptTimeoutMs,
-              );
-              trackCandidateSession(candidateHealth, candidate, session, runtime.now);
-              return await claimSession(session);
-            } catch (error) {
-              if (raceSignal.aborted) throw error;
-              const message = error instanceof Error ? error.message : String(error);
-              adapter.log?.("core.discovery.relay.failed", {
-                address: candidate.address,
-                attempt,
-                attemptsTotal: relayMaxAttempts,
-                message,
-              });
-              errors.push(
-                `${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`,
-              );
-              recordCandidateFailure(candidateHealth, candidate, runtime.now);
-              const isLastAttempt = attempt >= relayMaxAttempts;
-              const shouldRetry =
-                !isLastAttempt &&
-                (isTimeoutLikeError(message) || isTransientRelayError(message));
-              if (!shouldRetry) break;
-              await runtime.sleep(250);
-            }
-          }
-        }
-        throw new Error("All relay discovery candidates failed.");
-      })();
-
-  if (relayCandidates.length > 0 && !relayEnabled) {
-    errors.push("Relay fallback is disabled by settings");
-  }
-  const attempts = [directTask, relayTask].filter(
-    (attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null,
-  );
+async function openDirectMode(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  signal?: AbortSignal,
+) {
+  throwIfConnectionAborted(signal);
+  const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs! > 0 ? opts.timeoutMs! : 15000;
+  const attempt = new AbortController();
+  const forwardAbort = () => attempt.abort();
+  signal?.addEventListener("abort", forwardAbort, { once: true });
+  const timer = setTimeout(forwardAbort, timeoutMs);
   try {
-    if (attempts.length > 0) {
-      try {
-        return await Promise.any(attempts);
-      } catch {
-        // The detailed candidate errors below are more useful than AggregateError.
-      }
-    }
-
-    const hint = maybeConnectionHint(opts, errors);
-    const technical = `Could not connect using discovered candidates. ${errors.join(" | ")}`;
-    throw new Error(hint ? `${hint} Technical details: ${technical}` : technical);
+    const opening = opts.quicOnly
+      ? openQuicSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal)
+      : openDirectSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal);
+    return await withSessionTimeout(opening, timeoutMs);
+  } catch (error) {
+    attempt.abort();
+    throw error;
   } finally {
-    signal?.removeEventListener("abort", abortRace);
-    abortRace();
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", forwardAbort);
   }
 }
 
-async function openSession(
+async function openWithDiscoveryRetry(
   adapter: SyncpeerHostAdapter,
   opts: SyncpeerConnectOptions,
   candidateHealth: Map<string, CandidateHealth>,
   runtime: CandidateRuntime,
   signal?: AbortSignal,
-): Promise<SyncpeerSessionHandle> {
-  const discoveryMode = opts.discoveryMode ?? "automatic";
-  if (discoveryMode === "direct") {
-    throwIfConnectionAborted(signal);
-    const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs! > 0 ? opts.timeoutMs! : 15000;
-    const attempt = new AbortController();
-    const forwardAbort = () => attempt.abort();
-    signal?.addEventListener("abort", forwardAbort, { once: true });
-    const timer = setTimeout(forwardAbort, timeoutMs);
-    try {
-      const opening = opts.quicOnly
-        ? openQuicSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal)
-        : openDirectSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal);
-      return await withSessionTimeout(opening, timeoutMs);
-    } catch (error) {
-      attempt.abort();
-      throw error;
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", forwardAbort);
-    }
-  }
-
+) {
   const totalTimeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs && opts.timeoutMs > 0
     ? opts.timeoutMs
     : 15000;
   const deadline = runtime.now() + totalTimeout;
   let lastError: Error | null = null;
-
   while (runtime.now() < deadline) {
     throwIfConnectionAborted(signal);
     const remainingMs = deadline - runtime.now();
@@ -3269,8 +3527,20 @@ async function openSession(
       await runtime.sleep(waitForMs);
     }
   }
-
   throw lastError ?? new Error("Connection timed out while discovering the remote device.");
+}
+
+async function openSession(
+  adapter: SyncpeerHostAdapter,
+  opts: SyncpeerConnectOptions,
+  candidateHealth: Map<string, CandidateHealth>,
+  runtime: CandidateRuntime,
+  signal?: AbortSignal,
+): Promise<SyncpeerSessionHandle> {
+  if ((opts.discoveryMode ?? "automatic") === "direct") {
+    return openDirectMode(adapter, opts, signal);
+  }
+  return openWithDiscoveryRetry(adapter, opts, candidateHealth, runtime, signal);
 }
 
 export interface SyncpeerCoreClient {

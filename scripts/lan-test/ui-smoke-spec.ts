@@ -1,3 +1,4 @@
+// code-analysis-disable function-lines -- WebdriverIO/Mocha suite files keep each test title beside its body; the describe callback is a registration container, not an executable function.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";

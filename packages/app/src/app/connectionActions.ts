@@ -55,7 +55,7 @@ import {
 } from "./actionSupport.ts";
 import type { TransferRuntime } from "./transferRuntime.ts";
 
-export const createConnectionActions = (args: {
+type ConnectionActionArgs = {
   readonly state: AppState;
   readonly client: SyncpeerBrowserClient;
   readonly sessionStore: SyncpeerSessionStore;
@@ -63,22 +63,54 @@ export const createConnectionActions = (args: {
   readonly syncStarredFiles: () => Promise<void>;
   readonly loadFavoriteSyncStates: () => Promise<void>;
   readonly appInfo: AppBuildInfo;
-}) => {
-  const { state, client, sessionStore, transfers, syncStarredFiles, loadFavoriteSyncStates, appInfo } = args;
-  const { transferInProgress } = transfers;
-  let connectInFlight: Promise<void> | null = null;
-  let connectionSettingsTimer: ReturnType<typeof setTimeout> | null = null;
-  let connectionSettingsGeneration = 0;
+};
 
-const connect = async (targetDeviceId?: string) => {
-  connectionSettingsGeneration += 1;
-  if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
-  connectionSettingsTimer = null;
-  if (connectInFlight) {
-    await connectInFlight;
+type ConnectionActionControl = {
+  connectInFlight: Promise<void> | null;
+  connectionSettingsTimer: ReturnType<typeof setTimeout> | null;
+  connectionSettingsGeneration: number;
+};
+
+export const createConnectionActions = (args: ConnectionActionArgs) => {
+  const control: ConnectionActionControl = {
+    connectInFlight: null,
+    connectionSettingsTimer: null,
+    connectionSettingsGeneration: 0,
+  };
+  return {
+    connect: (targetDeviceId?: string) => connect(args, control, targetDeviceId),
+    ensureConnectedForTransfer: (kind: "download" | "upload") =>
+      ensureConnectedForTransfer(args, control, kind),
+    refreshOverview: () => refreshOverview(args),
+    refreshActiveView: () => refreshActiveView(args),
+    hydrate: () => hydrate(args),
+    disconnect: () => disconnect(args, control),
+    scheduleConnectionSettingsApply: () => scheduleConnectionSettingsApply(args, control),
+    refreshCurrentDeviceId: () => refreshCurrentDeviceId(args),
+    discoverLocalDevices: (options?: { timeoutMs?: number }) =>
+      discoverLocalDevices(args, options),
+    connectViaLanAnonymousCandidate: (candidateId: string) =>
+      connectViaLanAnonymousCandidate(args, control, candidateId),
+    copyCurrentDeviceId: () => copyCurrentDeviceId(args),
+    copySessionLogs: () => copySessionLogs(args),
+    dispose: () => dispose(control),
+  };
+};
+
+const connect = async (
+  args: ConnectionActionArgs,
+  control: ConnectionActionControl,
+  targetDeviceId?: string,
+) => {
+  const { state, client, sessionStore } = args;
+  control.connectionSettingsGeneration += 1;
+  if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
+  control.connectionSettingsTimer = null;
+  if (control.connectInFlight) {
+    await control.connectInFlight;
     return;
   }
-  connectInFlight = (async () => {
+  control.connectInFlight = (async () => {
   state.ui.recentError = null;
   state.ui.uploadMessage = "";
   state.ui.autoConnectPaused = false;
@@ -156,15 +188,18 @@ const connect = async (targetDeviceId?: string) => {
   }
   })();
   try {
-    await connectInFlight;
+    await control.connectInFlight;
   } finally {
-    connectInFlight = null;
+    control.connectInFlight = null;
   }
 };
 
 const ensureConnectedForTransfer = async (
+  args: ConnectionActionArgs,
+  control: ConnectionActionControl,
   transferKind: "download" | "upload",
 ): Promise<boolean> => {
+  const { state } = args;
   if (state.session.isConnected && state.session.remoteFs) return true;
   pushSessionLog(
     state,
@@ -173,7 +208,7 @@ const ensureConnectedForTransfer = async (
     `Reconnecting before ${transferKind}.`,
     { transferKind },
   );
-  await connect();
+  await connect(args, control);
   const connected = state.session.isConnected && !!state.session.remoteFs;
   if (!connected) {
     pushSessionLog(
@@ -187,7 +222,9 @@ const ensureConnectedForTransfer = async (
   return connected;
 };
 
-const refreshOverview = async () => {
+const refreshOverview = async (args: ConnectionActionArgs) => {
+  const { state, client, sessionStore, transfers } = args;
+  const { transferInProgress } = transfers;
   if (
     !state.session.isConnected ||
     !state.session.remoteFs ||
@@ -236,14 +273,15 @@ const refreshOverview = async () => {
   }
 };
 
-const refreshActiveView = async () => {
-  if (transferInProgress()) return;
-  await refreshOverview();
-  await syncStarredFiles();
-  await loadFavoriteSyncStates();
+const refreshActiveView = async (args: ConnectionActionArgs) => {
+  if (args.transfers.transferInProgress()) return;
+  await refreshOverview(args);
+  await args.syncStarredFiles();
+  await args.loadFavoriteSyncStates();
 };
 
-const hydrate = async () => {
+const hydrate = async (args: ConnectionActionArgs) => {
+  const { state, client, loadFavoriteSyncStates, appInfo } = args;
   pushSessionLog(state, "info", "app.build.info", "Build metadata", {
     ...appInfo,
   });
@@ -272,13 +310,14 @@ const hydrate = async () => {
   }
 };
 
-const disconnect = async () => {
+const disconnect = async (args: ConnectionActionArgs, control: ConnectionActionControl) => {
+  const { state, sessionStore } = args;
   saveCurrentOfflineState(state, activeSourceDeviceId(state));
-  connectionSettingsGeneration += 1;
-  if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
-  connectionSettingsTimer = null;
+  control.connectionSettingsGeneration += 1;
+  if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
+  control.connectionSettingsTimer = null;
   state.ui.autoConnectPaused = true;
-  const obsoleteConnect = connectInFlight;
+  const obsoleteConnect = control.connectInFlight;
   try {
     await sessionStore.actions.disconnect();
     if (obsoleteConnect) await obsoleteConnect;
@@ -292,11 +331,16 @@ const disconnect = async () => {
   }
 };
 
-const applyConnectionSettings = async (generation: number) => {
-  if (generation !== connectionSettingsGeneration) return;
+const applyConnectionSettings = async (
+  args: ConnectionActionArgs,
+  control: ConnectionActionControl,
+  generation: number,
+) => {
+  const { state, sessionStore } = args;
+  if (generation !== control.connectionSettingsGeneration) return;
   if (state.ui.autoConnectPaused) return;
   if (!hasAutoConnectTarget(state)) return;
-  const obsoleteConnect = connectInFlight;
+  const obsoleteConnect = control.connectInFlight;
   if (
     obsoleteConnect || (
       state.session.lifecyclePhase !== "idle" &&
@@ -305,26 +349,30 @@ const applyConnectionSettings = async (generation: number) => {
   ) {
     await sessionStore.actions.disconnect();
     if (obsoleteConnect) await obsoleteConnect;
-    if (generation !== connectionSettingsGeneration || state.ui.autoConnectPaused) return;
+    if (generation !== control.connectionSettingsGeneration || state.ui.autoConnectPaused) return;
     resetRuntimeState(state);
   }
-  if (generation !== connectionSettingsGeneration || state.ui.autoConnectPaused) return;
+  if (generation !== control.connectionSettingsGeneration || state.ui.autoConnectPaused) return;
   state.ui.autoConnectPaused = false;
-  await connect();
+  await connect(args, control);
 };
 
-const scheduleConnectionSettingsApply = () => {
-  if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
-  const generation = ++connectionSettingsGeneration;
-  connectionSettingsTimer = setTimeout(() => {
-    connectionSettingsTimer = null;
-    void applyConnectionSettings(generation).catch((error) => {
-      reportActionError(state, "connection_settings.apply_failed", error);
+const scheduleConnectionSettingsApply = (
+  args: ConnectionActionArgs,
+  control: ConnectionActionControl,
+) => {
+  if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
+  const generation = ++control.connectionSettingsGeneration;
+  control.connectionSettingsTimer = setTimeout(() => {
+    control.connectionSettingsTimer = null;
+    void applyConnectionSettings(args, control, generation).catch((error) => {
+      reportActionError(args.state, "connection_settings.apply_failed", error);
     });
   }, 500);
 };
 
-const refreshCurrentDeviceId = async () => {
+const refreshCurrentDeviceId = async (args: ConnectionActionArgs) => {
+  const { state, client } = args;
   if (state.devices.isLoadingCurrentDeviceId) return;
   state.devices.isLoadingCurrentDeviceId = true;
   try {
@@ -336,8 +384,12 @@ const refreshCurrentDeviceId = async () => {
   }
 };
 
-const discoverLocalDevices = async (options?: { timeoutMs?: number }) => {
-  if (transferInProgress()) return;
+const discoverLocalDevices = async (
+  args: ConnectionActionArgs,
+  options?: { timeoutMs?: number },
+) => {
+  const { state, client, transfers } = args;
+  if (transfers.transferInProgress()) return;
   if (state.devices.isDiscoveringLanDevices) return;
   state.devices.isDiscoveringLanDevices = true;
   try {
@@ -403,7 +455,12 @@ const discoverLocalDevices = async (options?: { timeoutMs?: number }) => {
   }
 };
 
-const connectViaLanAnonymousCandidate = async (candidateId: string) => {
+const connectViaLanAnonymousCandidate = async (
+  args: ConnectionActionArgs,
+  control: ConnectionActionControl,
+  candidateId: string,
+) => {
+  const { state } = args;
   const candidate = state.devices.lanAnonymousCandidates.find(
     (entry) => entry.id === candidateId,
   );
@@ -423,13 +480,14 @@ const connectViaLanAnonymousCandidate = async (candidateId: string) => {
   state.connection.port = parsed.port;
   state.connection.remoteId = "";
   state.devices.selectedSavedDeviceId = "";
-  await connect();
+  await connect(args, control);
 };
 
-const copyCurrentDeviceId = async () => {
+const copyCurrentDeviceId = async (args: ConnectionActionArgs) => {
+  const { state } = args;
   try {
     if (!state.devices.currentDeviceId) {
-      await refreshCurrentDeviceId();
+      await refreshCurrentDeviceId(args);
     }
     await copyText(state.devices.currentDeviceId);
     state.devices.identityNotice = "Device ID copied.";
@@ -438,7 +496,8 @@ const copyCurrentDeviceId = async () => {
   }
 };
 
-const copySessionLogs = async () => {
+const copySessionLogs = async (args: ConnectionActionArgs) => {
+  const { state, appInfo } = args;
   const logBody = state.logs.items
     .slice()
     .reverse()
@@ -463,22 +522,7 @@ const copySessionLogs = async () => {
 };
 
 
-  return {
-    connect,
-    ensureConnectedForTransfer,
-    refreshOverview,
-    refreshActiveView,
-    hydrate,
-    disconnect,
-    scheduleConnectionSettingsApply,
-    refreshCurrentDeviceId,
-    discoverLocalDevices,
-    connectViaLanAnonymousCandidate,
-    copyCurrentDeviceId,
-    copySessionLogs,
-    dispose: () => {
-      if (connectionSettingsTimer) clearTimeout(connectionSettingsTimer);
-      connectionSettingsTimer = null;
-    },
-  };
+const dispose = (control: ConnectionActionControl) => {
+  if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
+  control.connectionSettingsTimer = null;
 };

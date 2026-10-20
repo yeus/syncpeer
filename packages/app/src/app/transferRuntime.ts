@@ -37,47 +37,87 @@ interface PendingNotification {
   readonly cancellable: boolean;
 }
 
-export const createTransferRuntime = (args: {
+type TransferRuntimeArgs = {
   state: AppState;
   client: SyncpeerBrowserClient;
   runtimeSurface: "cli" | "desktop-ui" | "android-ui" | "web-ui";
-}) => {
-  let downloadNoticeTimer: number | null = null;
-  let lastNotificationAtMs = 0;
-  let permissionRequested = false;
-  let notificationSetup: Promise<void> | null = null;
-  let notificationTimer: ReturnType<typeof setTimeout> | null = null;
-  let notificationInFlight: Promise<void> | null = null;
-  let pendingNotification: PendingNotification | null = null;
-  let transferState = createTransferNotificationState();
-  const cancellations = new Map<
-    string,
-    { direction: ActiveTransfer["direction"]; cancel: () => void }
-  >();
-  let runtimeStarted = false;
-  let runtimeTransition = Promise.resolve();
+};
 
-  const cancelAll = () => {
-    for (const transfer of cancellations.values()) transfer.cancel();
+type TransferRuntimeState = ReturnType<typeof createTransferNotificationState>;
+
+type TransferRuntimeControl = {
+  downloadNoticeTimer: number | null;
+  lastNotificationAtMs: number;
+  permissionRequested: boolean;
+  notificationSetup: Promise<void> | null;
+  notificationTimer: ReturnType<typeof setTimeout> | null;
+  notificationInFlight: Promise<void> | null;
+  pendingNotification: PendingNotification | null;
+  transferState: TransferRuntimeState;
+  cancellations: Map<string, { direction: ActiveTransfer["direction"]; cancel: () => void }>;
+  runtimeStarted: boolean;
+  runtimeTransition: Promise<void>;
+};
+
+export const createTransferRuntime = (args: TransferRuntimeArgs) => {
+  const control: TransferRuntimeControl = {
+    downloadNoticeTimer: null,
+    lastNotificationAtMs: 0,
+    permissionRequested: false,
+    notificationSetup: null,
+    notificationTimer: null,
+    notificationInFlight: null,
+    pendingNotification: null,
+    transferState: createTransferNotificationState(),
+    cancellations: new Map(),
+    runtimeStarted: false,
+    runtimeTransition: Promise.resolve(),
+  };
+  return {
+    begin: (transfer: ActiveTransfer, cancel: () => void) =>
+      begin(args, control, transfer, cancel),
+    update: (id: string, completedBytes: number, totalBytes: number) =>
+      update(args, control, id, completedBytes, totalBytes),
+    finish: (id: string, outcome: "completed" | "failed" | "cancelled") =>
+      finish(args, control, id, outcome),
+    setDownloadNotice: (message: string, clearAfterMs = 0) =>
+      setDownloadNotice(args, control, message, clearAfterMs),
+    setActiveDownload: (
+      key: string,
+      value: { name: string; text: string; progressPercent: number },
+    ) => setActiveDownload(args, key, value),
+    clearActiveDownload: (key: string) => clearActiveDownload(args, key),
+    cancelDownload: (folderId?: string, path?: string) =>
+      cancelDownload(args, control, folderId, path),
+    cancelAll: () => cancelAll(control),
+    transferInProgress: () => transferInProgress(args),
+    hasActiveDirection: (direction: ActiveTransfer["direction"]) =>
+      hasActiveDirection(control, direction),
+    dispose: () => dispose(control),
+  };
+};
+
+  const cancelAll = (control: TransferRuntimeControl) => {
+    for (const transfer of control.cancellations.values()) transfer.cancel();
   };
 
-  const ensurePermission = async () => {
+  const ensurePermission = async (control: TransferRuntimeControl) => {
     try {
       if (await isNativeNotificationPermissionGranted()) return true;
-      if (permissionRequested) return false;
-      permissionRequested = true;
+      if (control.permissionRequested) return false;
+      control.permissionRequested = true;
       return (await requestNativeNotificationPermission()) === "granted";
     } catch {
       return false;
     }
   };
 
-  const ensureNotificationSetup = () => {
+  const ensureNotificationSetup = (args: TransferRuntimeArgs, control: TransferRuntimeControl) => {
     if (!supportsOngoingTransferNotifications(args.runtimeSurface)) {
       return Promise.resolve();
     }
-    if (!notificationSetup) {
-      notificationSetup = (async () => {
+    if (!control.notificationSetup) {
+      control.notificationSetup = (async () => {
         if (args.client.updateTransferNotification) {
           await addPluginListener<{ actionId?: string; notification?: { id?: number } }>(
             "syncpeer-android",
@@ -87,7 +127,7 @@ export const createTransferRuntime = (args: {
                 event.actionId === CANCEL_ACTION &&
                 Number(event.notification?.id) === NOTIFICATION_ID
               ) {
-                cancelAll();
+                cancelAll(control);
               }
             },
           );
@@ -116,21 +156,21 @@ export const createTransferRuntime = (args: {
             data.actionId === CANCEL_ACTION &&
             Number(data.notification?.id) === NOTIFICATION_ID
           ) {
-            cancelAll();
+            cancelAll(control);
           }
         });
       })().catch(() => undefined);
     }
-    return notificationSetup;
+    return control.notificationSetup;
   };
 
-  const flushNotification = async () => {
-    if (notificationInFlight || !pendingNotification) return;
-    const next = pendingNotification;
-    pendingNotification = null;
-    notificationInFlight = (async () => {
-      await ensureNotificationSetup();
-      if (!(await ensurePermission())) return;
+  const flushNotification = async (args: TransferRuntimeArgs, control: TransferRuntimeControl) => {
+    if (control.notificationInFlight || !control.pendingNotification) return;
+    const next = control.pendingNotification;
+    control.pendingNotification = null;
+    control.notificationInFlight = (async () => {
+      await ensureNotificationSetup(args, control);
+      if (!(await ensurePermission(control))) return;
       const android = supportsOngoingTransferNotifications(args.runtimeSurface);
       try {
         if (android && args.client.updateTransferNotification) {
@@ -159,27 +199,29 @@ export const createTransferRuntime = (args: {
             silent: true,
           });
         }
-        lastNotificationAtMs = Date.now();
+        control.lastNotificationAtMs = Date.now();
       } catch {
         // Notifications are best-effort.
       }
     })().finally(() => {
-      notificationInFlight = null;
-      if (!pendingNotification) return;
-      const elapsed = Date.now() - lastNotificationAtMs;
-      if (pendingNotification.force || elapsed >= UPDATE_INTERVAL_MS) {
-        void flushNotification();
-      } else if (!notificationTimer) {
-        notificationTimer = setTimeout(() => {
-          notificationTimer = null;
-          void flushNotification();
+      control.notificationInFlight = null;
+      if (!control.pendingNotification) return;
+      const elapsed = Date.now() - control.lastNotificationAtMs;
+      if (control.pendingNotification.force || elapsed >= UPDATE_INTERVAL_MS) {
+        void flushNotification(args, control);
+      } else if (!control.notificationTimer) {
+        control.notificationTimer = setTimeout(() => {
+          control.notificationTimer = null;
+          void flushNotification(args, control);
         }, UPDATE_INTERVAL_MS - elapsed);
       }
     });
-    await notificationInFlight;
+    await control.notificationInFlight;
   };
 
   const showNotification = async (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
     title: string,
     body: string,
     options?: {
@@ -196,7 +238,7 @@ export const createTransferRuntime = (args: {
     ) {
       return;
     }
-    pendingNotification = {
+    control.pendingNotification = {
       id: NOTIFICATION_ID,
       title,
       body,
@@ -205,29 +247,29 @@ export const createTransferRuntime = (args: {
       progressPercent: options?.progressPercent,
       cancellable: options?.cancellable ?? false,
     };
-    const elapsed = Date.now() - lastNotificationAtMs;
+    const elapsed = Date.now() - control.lastNotificationAtMs;
     if (
       options?.force ||
-      (!notificationInFlight && elapsed >= UPDATE_INTERVAL_MS)
+      (!control.notificationInFlight && elapsed >= UPDATE_INTERVAL_MS)
     ) {
-      await flushNotification();
+      await flushNotification(args, control);
       return;
     }
-    if (!notificationTimer) {
-      notificationTimer = setTimeout(() => {
-        notificationTimer = null;
-        void flushNotification();
+    if (!control.notificationTimer) {
+      control.notificationTimer = setTimeout(() => {
+        control.notificationTimer = null;
+        void flushNotification(args, control);
       }, Math.max(0, UPDATE_INTERVAL_MS - elapsed));
     }
   };
 
-  const clearNotification = async () => {
+  const clearNotification = async (args: TransferRuntimeArgs, control: TransferRuntimeControl) => {
     if (!supportsOngoingTransferNotifications(args.runtimeSurface)) return;
-    pendingNotification = null;
-    if (notificationTimer) clearTimeout(notificationTimer);
-    notificationTimer = null;
-    if (notificationInFlight) await notificationInFlight.catch(() => undefined);
-    if (transferState.active.length > 0) return;
+    control.pendingNotification = null;
+    if (control.notificationTimer) clearTimeout(control.notificationTimer);
+    control.notificationTimer = null;
+    if (control.notificationInFlight) await control.notificationInFlight.catch(() => undefined);
+    if (control.transferState.active.length > 0) return;
     try {
       await args.client.stopTransfer?.();
     } catch {
@@ -240,25 +282,25 @@ export const createTransferRuntime = (args: {
     }
   };
 
-  const reconcileRuntime = () => {
-    runtimeTransition = runtimeTransition
+  const reconcileRuntime = (args: TransferRuntimeArgs, control: TransferRuntimeControl) => {
+    control.runtimeTransition = control.runtimeTransition
       .catch(() => undefined)
       .then(async () => {
-        const shouldRun = transferState.active.length > 0;
-        if (shouldRun === runtimeStarted) return;
-        runtimeStarted = shouldRun;
+        const shouldRun = control.transferState.active.length > 0;
+        if (shouldRun === control.runtimeStarted) return;
+        control.runtimeStarted = shouldRun;
         try {
           if (shouldRun) {
             await args.client.startTransfer?.(
-              transferState.active.length === 1
-                ? transferState.active[0].label
-                : `${transferState.active.length} transfers`,
+              control.transferState.active.length === 1
+                ? control.transferState.active[0].label
+                : `${control.transferState.active.length} transfers`,
             );
           } else {
             await args.client.stopTransfer?.();
           }
         } catch (error) {
-          runtimeStarted = false;
+          control.runtimeStarted = false;
           reportActionError(
             args.state,
             shouldRun
@@ -268,16 +310,20 @@ export const createTransferRuntime = (args: {
           );
         }
       });
-    return runtimeTransition;
+    return control.runtimeTransition;
   };
 
-  const renderNotification = async (force = false) => {
-    const view = transferNotificationView(transferState);
+  const renderNotification = async (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
+    force = false,
+  ) => {
+    const view = transferNotificationView(control.transferState);
     if (!view) {
-      await clearNotification();
+      await clearNotification(args, control);
       return;
     }
-    await showNotification(view.title, view.body, {
+    await showNotification(args, control, view.title, view.body, {
       ongoing: view.ongoing,
       force,
       progress: view.ongoing,
@@ -286,53 +332,72 @@ export const createTransferRuntime = (args: {
     });
   };
 
-  const begin = async (transfer: ActiveTransfer, cancel: () => void) => {
-    transferState = reduceTransferNotification(transferState, {
+  const begin = async (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
+    transfer: ActiveTransfer,
+    cancel: () => void,
+  ) => {
+    control.transferState = reduceTransferNotification(control.transferState, {
       type: "begin",
       transfer,
     });
-    cancellations.set(transfer.id, { direction: transfer.direction, cancel });
-    await reconcileRuntime();
-    await renderNotification(true);
+    control.cancellations.set(transfer.id, { direction: transfer.direction, cancel });
+    await reconcileRuntime(args, control);
+    await renderNotification(args, control, true);
   };
 
-  const update = (id: string, completedBytes: number, totalBytes: number) => {
-    transferState = reduceTransferNotification(transferState, {
+  const update = (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
+    id: string,
+    completedBytes: number,
+    totalBytes: number,
+  ) => {
+    control.transferState = reduceTransferNotification(control.transferState, {
       type: "progress",
       id,
       completedBytes,
       totalBytes,
     });
-    void renderNotification();
+    void renderNotification(args, control);
   };
 
   const finish = async (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
     id: string,
     outcome: "completed" | "failed" | "cancelled",
   ) => {
-    cancellations.delete(id);
-    transferState = reduceTransferNotification(transferState, {
+    control.cancellations.delete(id);
+    control.transferState = reduceTransferNotification(control.transferState, {
       type: "finish",
       id,
       outcome,
     });
-    await reconcileRuntime();
-    await renderNotification(true);
+    await reconcileRuntime(args, control);
+    await renderNotification(args, control, true);
   };
 
-  const setDownloadNotice = (message: string, clearAfterMs = 0) => {
+  const setDownloadNotice = (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
+    message: string,
+    clearAfterMs = 0,
+  ) => {
     args.state.ui.downloadNotice = message;
-    if (downloadNoticeTimer) clearTimeout(downloadNoticeTimer);
-    downloadNoticeTimer = null;
+    if (control.downloadNoticeTimer) clearTimeout(control.downloadNoticeTimer);
+    control.downloadNoticeTimer = null;
     if (clearAfterMs > 0 && typeof window !== "undefined") {
-      downloadNoticeTimer = window.setTimeout(() => {
+      control.downloadNoticeTimer = window.setTimeout(() => {
         args.state.ui.downloadNotice = "";
-        downloadNoticeTimer = null;
+        control.downloadNoticeTimer = null;
       }, clearAfterMs);
     }
   };
 
   const setActiveDownload = (
+    args: TransferRuntimeArgs,
     key: string,
     value: { name: string; text: string; progressPercent: number },
   ) => {
@@ -346,52 +411,45 @@ export const createTransferRuntime = (args: {
     args.state.favorites.isDownloading = true;
   };
 
-  const clearActiveDownload = (key: string) => {
+  const clearActiveDownload = (args: TransferRuntimeArgs, key: string) => {
     const remaining = { ...args.state.favorites.activeDownloads };
     delete remaining[key];
     args.state.favorites.activeDownloads = remaining;
     args.state.favorites.isDownloading = Object.keys(remaining).length > 0;
   };
 
-  const cancelDownload = (folderId?: string, path?: string) => {
+  const cancelDownload = (
+    args: TransferRuntimeArgs,
+    control: TransferRuntimeControl,
+    folderId?: string,
+    path?: string,
+  ) => {
     if (!args.state.favorites.isDownloading) return;
     if (folderId !== undefined && path !== undefined) {
-      cancellations.get(`download:${cachedFileKey(folderId, path)}`)?.cancel();
+      control.cancellations.get(`download:${cachedFileKey(folderId, path)}`)?.cancel();
       return;
     }
-    for (const transfer of cancellations.values()) {
+    for (const transfer of control.cancellations.values()) {
       if (transfer.direction === "download") transfer.cancel();
     }
   };
 
-  const transferInProgress = () =>
+  const transferInProgress = (args: TransferRuntimeArgs) =>
     Object.keys(args.state.favorites.activeDownloads).length > 0 ||
     args.state.ui.uploadProgressActive ||
     args.state.sync.isSyncingStarredFiles;
 
-  const hasActiveDirection = (direction: ActiveTransfer["direction"]) =>
-    transferState.active.some((item) => item.direction === direction);
+  const hasActiveDirection = (
+    control: TransferRuntimeControl,
+    direction: ActiveTransfer["direction"],
+  ) =>
+    control.transferState.active.some((item) => item.direction === direction);
 
-  const dispose = () => {
-    if (downloadNoticeTimer) clearTimeout(downloadNoticeTimer);
-    if (notificationTimer) clearTimeout(notificationTimer);
-    downloadNoticeTimer = null;
-    notificationTimer = null;
+  const dispose = (control: TransferRuntimeControl) => {
+    if (control.downloadNoticeTimer) clearTimeout(control.downloadNoticeTimer);
+    if (control.notificationTimer) clearTimeout(control.notificationTimer);
+    control.downloadNoticeTimer = null;
+    control.notificationTimer = null;
   };
-
-  return {
-    begin,
-    update,
-    finish,
-    setDownloadNotice,
-    setActiveDownload,
-    clearActiveDownload,
-    cancelDownload,
-    cancelAll,
-    transferInProgress,
-    hasActiveDirection,
-    dispose,
-  };
-};
 
 export type TransferRuntime = ReturnType<typeof createTransferRuntime>;

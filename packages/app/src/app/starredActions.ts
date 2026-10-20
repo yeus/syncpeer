@@ -20,19 +20,29 @@ import { updateCachedKey } from "./downloadPolicies.ts";
 import { pushSessionLog, type AppState } from "./state.ts";
 import type { TransferRuntime } from "./transferRuntime.ts";
 
-export const createStarredActions = (args: {
+type StarredActionArgs = {
   readonly state: AppState;
   readonly client: SyncpeerBrowserClient;
   readonly transfers: TransferRuntime;
-}) => {
-  const { state, client, transfers } = args;
+};
+
+export const createStarredActions = (args: StarredActionArgs) => ({
+  syncStarredFiles: () => syncStarredFiles(args),
+  loadFavoriteSyncStates: () => loadFavoriteSyncStates(args),
+  retryFavorite: (favorite: Pick<FavoriteRecord, "folderId" | "path">) =>
+    retryFavorite(args, favorite),
+  resolveFavoriteConflict: (
+    favorite: Pick<FavoriteRecord, "folderId" | "path">,
+    resolution: "keep-local" | "keep-remote",
+  ) => resolveFavoriteConflict(args, favorite, resolution),
+});
+
+const syncStarredFiles = async ({ state, client, transfers }: StarredActionArgs) => {
   const {
     begin: beginManagedTransfer,
     update: updateManagedTransfer,
     finish: finishManagedTransfer,
   } = transfers;
-
-const syncStarredFiles = async () => {
   if (state.sync.isSyncingStarredFiles) return;
   if (!state.ui.isAppVisible) return;
   if (!state.session.isConnected || !state.session.remoteFs) return;
@@ -368,7 +378,7 @@ const syncStarredFiles = async () => {
 };
 
 
-const loadFavoriteSyncStates = async () => {
+const loadFavoriteSyncStates = async ({ state, client }: StarredActionArgs) => {
   if (!client.listFavoriteSyncStates) return;
   const folderIds = [...new Set(state.favorites.items.map(item => item.folderId))];
   if (folderIds.length === 0) {
@@ -387,14 +397,18 @@ const loadFavoriteSyncStates = async () => {
   }
 };
 
-const retryFavorite = async (favorite: Pick<FavoriteRecord, "folderId" | "path">) => {
+const retryFavorite = async (
+  args: StarredActionArgs,
+  favorite: Pick<FavoriteRecord, "folderId" | "path">,
+) => {
+  const { state, client } = args;
   if (!client.retryFavoriteSync) return;
   state.sync.isRetryingFavorite = true;
   try {
     await client.retryFavoriteSync(favorite.folderId, normalizePath(favorite.path));
     delete state.sync.favoriteSyncStates[`${favorite.folderId}:${normalizePath(favorite.path)}`];
-    await syncStarredFiles();
-    await loadFavoriteSyncStates();
+    await syncStarredFiles(args);
+    await loadFavoriteSyncStates(args);
   } catch (error) {
     reportActionError(state, "favorite.retry.failed", error, { key: `${favorite.folderId}:${favorite.path}` });
   } finally {
@@ -403,21 +417,20 @@ const retryFavorite = async (favorite: Pick<FavoriteRecord, "folderId" | "path">
 };
 
 const resolveFavoriteConflict = async (
+  args: StarredActionArgs,
   favorite: Pick<FavoriteRecord, "folderId" | "path">,
   resolution: "keep-local" | "keep-remote",
 ) => {
+  const { state, client } = args;
   if (!client.resolveFavoriteConflict) return;
   state.sync.isResolvingFavorite = true;
   try {
     await client.resolveFavoriteConflict(favorite.folderId, normalizePath(favorite.path), resolution);
-    await syncStarredFiles();
-    await loadFavoriteSyncStates();
+    await syncStarredFiles(args);
+    await loadFavoriteSyncStates(args);
   } catch (error) {
     reportActionError(state, "favorite.conflict.failed", error, { key: `${favorite.folderId}:${favorite.path}` });
   } finally {
     state.sync.isResolvingFavorite = false;
   }
-};
-
-  return { syncStarredFiles, loadFavoriteSyncStates, retryFavorite, resolveFavoriteConflict };
 };

@@ -107,8 +107,51 @@ const validDownload = (download: DownloadDraft | undefined) => !download || (
  * Acknowledged writes survive process death; fsync/close publish one versioned file.
  * Only the document owner calls this object, with operations serialized by its queue.
  */
-async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, options: DraftOptions,
-  expectedDownloadBlocks?: readonly RangeDigest[]) {
+type DraftSource = { size: number; readRange: (offset: number, size: number) => Promise<Uint8Array> };
+type DraftMetadata = Awaited<ReturnType<typeof loadEncryptedDiskMetadata>>;
+
+class DocumentDraft {
+  private readonly bytes: DraftStorage;
+  private readonly prefix: string;
+  private head: DraftHead;
+  private readonly options: DraftOptions;
+  private readonly chunkSize: number;
+  private readonly chunks: Set<number>;
+  private readonly source: DraftSource | null;
+  private readonly metadata: DraftMetadata | null;
+  private readonly downloadBlocks: readonly RangeDigest[] | undefined;
+  private closed = false;
+
+  private constructor(
+    bytes: DraftStorage,
+    prefix: string,
+    head: DraftHead,
+    options: DraftOptions,
+    chunkSize: number,
+    chunks: Set<number>,
+    source: DraftSource | null,
+    metadata: DraftMetadata | null,
+    downloadBlocks?: readonly RangeDigest[],
+  ) {
+    this.bytes = bytes;
+    this.prefix = prefix;
+    this.head = head;
+    this.options = options;
+    this.chunkSize = chunkSize;
+    this.chunks = chunks;
+    this.source = source;
+    this.metadata = metadata;
+    this.downloadBlocks = downloadBlocks;
+  }
+
+  static async create(
+    bytes: DraftStorage,
+    prefix: string,
+    head: DraftHead,
+    options: DraftOptions,
+    expectedDownloadBlocks?: readonly RangeDigest[],
+  ) {
+
   assertReplicaPath(head.path);
   const chunkSize = head.chunkSize ?? LEGACY_DRAFT_CHUNK_SIZE;
   if (head.format !== 1 || isInternalReplicaPath(head.path) || typeof head.dirty !== "boolean" ||
@@ -136,51 +179,56 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
   if (head.baseSize && (!metadata || Number(metadata.fileInfo.size) !== head.baseSize)) {
     metadata?.fileKey.fill(0); throw new Error("Draft base is missing or changed.");
   }
-  let closed = false;
-  const ensureOpen = () => { if (closed) throw new Error("Document draft is closed."); };
-  const saveHead = async () => {
-    const data = new TextEncoder().encode(JSON.stringify(head));
-    try { await writeRecord(bytes, prefix + "/head", data, options); } finally { data.fill(0); }
+    return new DocumentDraft(bytes, prefix, head, options, chunkSize, chunks, source, metadata, downloadBlocks);
+  }
+
+  private ensureOpen = () => { if (this.closed) throw new Error("Document draft is closed."); };
+
+  private saveHead = async () => {
+    const data = new TextEncoder().encode(JSON.stringify(this.head));
+    try { await writeRecord(this.bytes, this.prefix + "/head", data, this.options); } finally { data.fill(0); }
   };
-  const chunk = async (index: number) => {
-    if (chunks.has(index)) {
-      const data = await readRecord(bytes, `${prefix}/chunk-${index}`, options.folderKey);
-      if (data.length !== chunkSize) { data.fill(0); throw new Error("Invalid document draft block."); }
+
+  private chunk = async (index: number) => {
+    if (this.chunks.has(index)) {
+      const data = await readRecord(this.bytes, `${this.prefix}/chunk-${index}`, this.options.folderKey);
+      if (data.length !== this.chunkSize) { data.fill(0); throw new Error("Invalid document draft block."); }
       return data;
     }
-    const data = new Uint8Array(chunkSize), offset = index * chunkSize;
-    if (source && metadata && offset < head.baseSize) {
-      const original = await readEncryptedDiskRange(source, metadata, offset, Math.min(data.length, head.baseSize - offset));
+    const data = new Uint8Array(this.chunkSize), offset = index * this.chunkSize;
+    if (this.source && this.metadata && offset < this.head.baseSize) {
+      const original = await readEncryptedDiskRange(this.source, this.metadata, offset, Math.min(data.length, this.head.baseSize - offset));
       try { data.set(original); } finally { original.fill(0); }
     }
     return data;
   };
-  const readRange = async (offset: number, size: number) => {
-    ensureOpen();
+
+  private readRange = async (offset: number, size: number) => {
+    this.ensureOpen();
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(size) || size < 0 || size > 16 * 1024 * 1024) throw new Error("Invalid document range.");
-    const output = new Uint8Array(Math.max(0, Math.min(size, head.size - offset)));
+    const output = new Uint8Array(Math.max(0, Math.min(size, this.head.size - offset)));
     const segments: Array<{ index: number; start: number; count: number; target: number }> = [];
     for (let done = 0; done < output.length;) {
-      const position = offset + done, start = position % chunkSize,
-        count = Math.min(output.length - done, chunkSize - start);
-      segments.push({ index: Math.floor(position / chunkSize), start, count, target: done });
+      const position = offset + done, start = position % this.chunkSize,
+        count = Math.min(output.length - done, this.chunkSize - start);
+      segments.push({ index: Math.floor(position / this.chunkSize), start, count, target: done });
       done += count;
     }
     const batched = new Map<number, Uint8Array>();
     try {
-      const indexes = [...new Set(segments.map(segment => segment.index).filter(index => chunks.has(index)))];
-      if (bytes.readFiles && indexes.length > 1) {
-        const values = await readRecords(bytes, indexes.map(index => `${prefix}/chunk-${index}`),
-          options.folderKey, chunkSize);
+      const indexes = [...new Set(segments.map(segment => segment.index).filter(index => this.chunks.has(index)))];
+      if (this.bytes.readFiles && indexes.length > 1) {
+        const values = await readRecords(this.bytes, indexes.map(index => `${this.prefix}/chunk-${index}`),
+          this.options.folderKey, this.chunkSize);
         for (let position = 0; position < indexes.length; position++) {
           const data = values[position]!;
-          if (data.length !== chunkSize) { data.fill(0); throw new Error("Invalid document draft block."); }
+          if (data.length !== this.chunkSize) { data.fill(0); throw new Error("Invalid document draft block."); }
           batched.set(indexes[position]!, data);
         }
       }
       for (const segment of segments) {
         const cached = batched.get(segment.index);
-        const data = cached ?? await chunk(segment.index);
+        const data = cached ?? await this.chunk(segment.index);
         try { output.set(data.subarray(segment.start, segment.start + segment.count), segment.target); }
         finally { if (!cached) data.fill(0); }
       }
@@ -188,58 +236,61 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     } catch (error) { output.fill(0); throw error; }
     finally { for (const data of batched.values()) data.fill(0); }
   };
-  const digest = async () => {
+
+  private digest = async () => {
     const hash = sha256.create();
-    for (let offset = 0; offset < head.size; offset += chunkSize) {
-      const data = await readRange(offset, Math.min(chunkSize, head.size - offset));
+    for (let offset = 0; offset < this.head.size; offset += this.chunkSize) {
+      const data = await this.readRange(offset, Math.min(this.chunkSize, this.head.size - offset));
       try { hash.update(data); } finally { data.fill(0); }
     }
     return hash.digest();
   };
-  const matches = async (path: string) => {
-    const current = (await options.replica.scan()).find(file => file.name === path && !file.deleted);
-    if (!current || current.type === 1 || Number(current.size) !== head.size) return false;
-    const source = await createReplicaFileSource(options.replica, path), hash = sha256.create();
-    for (let offset = 0; offset < source.size; offset += 131072) {
-      const data = await source.readRange(offset, Math.min(131072, source.size - offset));
+
+  private matches = async (path: string) => {
+    const current = (await this.options.replica.scan()).find(file => file.name === path && !file.deleted);
+    if (!current || current.type === 1 || Number(current.size) !== this.head.size) return false;
+    const replicaSource = await createReplicaFileSource(this.options.replica, path), hash = sha256.create();
+    for (let offset = 0; offset < replicaSource.size; offset += 131072) {
+      const data = await replicaSource.readRange(offset, Math.min(131072, replicaSource.size - offset));
       try { hash.update(data); } finally { data.fill(0); }
     }
-    return equalHash(hash.digest(), await digest());
+    return equalHash(hash.digest(), await this.digest());
   };
-  const flush = async (recover = false, modifiedMs?: number) => {
-    ensureOpen();
-    if (!head.dirty) return;
-    let target = head.path, version = head.version;
+
+  private flush = async (recover = false, modifiedMs?: number) => {
+    this.ensureOpen();
+    if (!this.head.dirty) return;
+    let target = this.head.path, version = this.head.version;
     if (recover) {
-      const current = (await options.replica.scan()).find(file => file.name === target);
+      const current = (await this.options.replica.scan()).find(file => file.name === target);
       const sameVersion = !current ? version === null
         : version !== null && compareConcurrentVersionCounters(current.version ?? {}, version) === 0;
       if (!sameVersion) {
-        if (await matches(target)) {
-          head = { ...head, version: current!.version ?? {}, dirty: false };
-          await saveHead();
+        if (await this.matches(target)) {
+          this.head = { ...this.head, version: current!.version ?? {}, dirty: false };
+          await this.saveHead();
           return;
         }
-        target = `${head.path}.sync-conflict-${prefix.slice(".syncpeer-draft-".length)}`;
-        if (await matches(target)) {
-          head = { ...head, dirty: false };
-          await saveHead();
+        target = `${this.head.path}.sync-conflict-${this.prefix.slice(".syncpeer-draft-".length)}`;
+        if (await this.matches(target)) {
+          this.head = { ...this.head, dirty: false };
+          await this.saveHead();
           return;
         }
         version = null;
       }
     }
 
-    const expectedBlocks = recover ? undefined : downloadBlocks;
-    const reusableBlocks = expectedBlocks && hasReplicaBlockLayout(expectedBlocks, head.size)
+    const expectedBlocks = recover ? undefined : this.downloadBlocks;
+    const reusableBlocks = expectedBlocks && hasReplicaBlockLayout(expectedBlocks, this.head.size)
       ? expectedBlocks : undefined;
     const expectedByOffset = reusableBlocks
       ? new Map(reusableBlocks.map(block => [block.offset, block] as const))
       : undefined;
-    const wholeHash = head.download ? sha256.create() : undefined;
+    const wholeHash = this.head.download ? sha256.create() : undefined;
     const pendingHashChunks = new Map<number, Uint8Array>();
     let nextHashOffset = 0;
-    let publishedDigest = head.size === 0 && wholeHash ? wholeHash.digest() : undefined;
+    let publishedDigest = this.head.size === 0 && wholeHash ? wholeHash.digest() : undefined;
 
     const addToWholeHash = (offset: number, data: Uint8Array) => {
       if (!wholeHash || publishedDigest || offset < nextHashOffset) return;
@@ -259,11 +310,11 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
           pending.fill(0);
         }
       }
-      if (nextHashOffset === head.size) publishedDigest = wholeHash.digest();
+      if (nextHashOffset === this.head.size) publishedDigest = wholeHash.digest();
     };
 
     const publicationReadRange = async (offset: number, size: number) => {
-      const data = await readRange(offset, size);
+      const data = await this.readRange(offset, size);
       if (expectedByOffset) {
         let cursor = offset, consumed = 0;
         while (consumed < data.length) {
@@ -285,7 +336,7 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
       for (const block of expectedBlocks) {
         const hash = sha256.create();
         for (let done = 0; done < block.size; done += 131072) {
-          const data = await readRange(block.offset + done, Math.min(131072, block.size - done));
+          const data = await this.readRange(block.offset + done, Math.min(131072, block.size - done));
           try { hash.update(data); } finally { data.fill(0); }
         }
         if (!equalHash(hash.digest(), block.hash)) {
@@ -295,23 +346,23 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     }
 
     try {
-      const result = await options.replica.edit!({
+      const result = await this.options.replica.edit!({
         method: "write",
-        folderId: options.folderId,
+        folderId: this.options.folderId,
         path: target,
         expectedVersion: version,
         modifiedMs: modifiedMs ?? Date.now(),
         source: {
-          size: head.size,
-          readRange: head.download ? publicationReadRange : readRange,
+          size: this.head.size,
+          readRange: this.head.download ? publicationReadRange : this.readRange,
         },
         ...(reusableBlocks ? { blocks: reusableBlocks } : {}),
       });
-      if (head.download && !publishedDigest) {
+      if (this.head.download && !publishedDigest) {
         throw new Error("Document publication did not verify the complete download.");
       }
-      head = { ...head, version: result.version ?? {}, dirty: false };
-      await saveHead();
+      this.head = { ...this.head, version: result.version ?? {}, dirty: false };
+      await this.saveHead();
       return publishedDigest;
     } finally {
       for (const pending of pendingHashChunks.values()) pending.fill(0);
@@ -319,25 +370,26 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     }
   };
 
-  const discard = async () => {
-    closed = true;
-    metadata?.fileKey.fill(0);
+  private discard = async () => {
+    this.closed = true;
+    this.metadata?.fileKey.fill(0);
     // No recursive delete and no externally supplied path. Unexpected entries fail closed.
-    const entries = await bytes.listDirectory(prefix);
+    const entries = await this.bytes.listDirectory(this.prefix);
     for (const entry of entries) {
-      if (entry.type !== "file" || !/^(head|base|chunk-\d+)$/.test(entry.path.slice(prefix.length + 1))) {
+      if (entry.type !== "file" || !/^(head|base|chunk-\d+)$/.test(entry.path.slice(this.prefix.length + 1))) {
         throw new Error("Unexpected draft entry.");
       }
     }
     const paths = entries.map(entry => entry.path);
     if (paths.length) {
-      if (bytes.removeFiles) await bytes.removeFiles(paths);
-      else for (const path of paths) await bytes.remove(path, false);
+      if (this.bytes.removeFiles) await this.bytes.removeFiles(paths);
+      else for (const path of paths) await this.bytes.remove(path, false);
     }
-    await bytes.remove(prefix, true);
+    await this.bytes.remove(this.prefix, true);
   };
-  const writeBatch = async (writes: readonly { offset: number; bytes: Uint8Array }[]) => {
-    ensureOpen();
+
+  private writeBatch = async (writes: readonly { offset: number; bytes: Uint8Array }[]) => {
+    this.ensureOpen();
     if (!Array.isArray(writes) || writes.length > 8 || writes.some(write =>
       !Number.isSafeInteger(write.offset) || write.offset < 0 ||
       !Number.isSafeInteger(write.offset + write.bytes.length) || write.bytes.length > 131072) ||
@@ -345,11 +397,11 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
       throw new Error("Invalid document write batch.");
     }
     const changed = new Set<string>();
-    let nextHead = head;
-    if (writes.some(write => write.bytes.length) && !head.dirty) {
-      head = { ...head, dirty: true };
-      await saveHead();
-      nextHead = head;
+    let nextHead = this.head;
+    if (writes.some(write => write.bytes.length) && !this.head.dirty) {
+      this.head = { ...this.head, dirty: true };
+      await this.saveHead();
+      nextHead = this.head;
     }
 
     const grouped = new Map<number, Array<{ start: number; bytes: Uint8Array }>>();
@@ -357,9 +409,9 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
       if (!input.length) continue;
       for (let done = 0; done < input.length;) {
         const position = offset + done;
-        const index = Math.floor(position / chunkSize);
-        const start = position % chunkSize;
-        const count = Math.min(input.length - done, chunkSize - start);
+        const index = Math.floor(position / this.chunkSize);
+        const start = position % this.chunkSize;
+        const count = Math.min(input.length - done, this.chunkSize - start);
         const parts = grouped.get(index) ?? [];
         parts.push({ start, bytes: input.subarray(done, done + count) });
         grouped.set(index, parts);
@@ -381,8 +433,8 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
     try {
       for (const [index, parts] of [...grouped].sort((left, right) => left[0] - right[0])) {
         const logicalSize = nextHead.download
-          ? Math.max(0, Math.min(chunkSize, nextHead.download.sizeBytes - index * chunkSize))
-          : chunkSize;
+          ? Math.max(0, Math.min(this.chunkSize, nextHead.download.sizeBytes - index * this.chunkSize))
+          : this.chunkSize;
         const sorted = [...parts].sort((left, right) => left.start - right.start);
         let covered = 0;
         for (const part of sorted) {
@@ -390,14 +442,14 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
           covered = Math.max(covered, part.start + part.bytes.length);
         }
         const replacesWholeDownloadChunk = !!nextHead.download && covered >= logicalSize;
-        const data = replacesWholeDownloadChunk ? new Uint8Array(chunkSize) : await chunk(index);
+        const data = replacesWholeDownloadChunk ? new Uint8Array(this.chunkSize) : await this.chunk(index);
         try {
           for (const part of parts) data.set(part.bytes, part.start);
-          const name = `${prefix}/chunk-${index}`;
-          if (bytes.writeFiles) encodedRecords.push({ path: name, bytes: await encodeRecord(bytes, name, data, options), index });
-          else await writeRecord(bytes, name, data, options, false);
-          if (!bytes.writeFiles) {
-            chunks.add(index);
+          const name = `${this.prefix}/chunk-${index}`;
+          if (this.bytes.writeFiles) encodedRecords.push({ path: name, bytes: await encodeRecord(this.bytes, name, data, this.options), index });
+          else await writeRecord(this.bytes, name, data, this.options, false);
+          if (!this.bytes.writeFiles) {
+            this.chunks.add(index);
             changed.add(name);
           }
         } finally { data.fill(0); }
@@ -421,26 +473,48 @@ async function useDraft(bytes: DraftStorage, prefix: string, head: DraftHead, op
         }
         if (batch.length) batches.push(batch);
         for (const records of batches) {
-          await bytes.writeFiles!(records);
+          await this.bytes.writeFiles!(records);
           for (const record of records) {
-            chunks.add(record.index);
+            this.chunks.add(record.index);
             changed.add(record.path);
           }
         }
       }
     } finally { encodedRecords.forEach(record => record.bytes.fill(0)); }
     if (!changed.size) return;
-    await bytes.flushChanges([...changed]);
-    head = nextHead;
-    await saveHead();
+    await this.bytes.flushChanges([...changed]);
+    this.head = nextHead;
+    await this.saveHead();
   };
-  return {
-    path: head.path, size: async () => { ensureOpen(); return head.size; }, readRange, digest, flush, discard,
-    downloadRanges: () => head.download?.ranges.map(range => ({ ...range })) ?? [],
-    write: (offset: number, input: Uint8Array) => writeBatch([{ offset, bytes: input }]),
-    writeBatch,
-    close: async () => { closed = true; metadata?.fileKey.fill(0); if (!head.dirty) await discard(); },
-  };
+
+  api() {
+    return {
+      path: this.head.path,
+      size: async () => { this.ensureOpen(); return this.head.size; },
+      readRange: this.readRange,
+      digest: this.digest,
+      flush: this.flush,
+      discard: this.discard,
+      downloadRanges: () => this.head.download?.ranges.map(range => ({ ...range })) ?? [],
+      write: (offset: number, input: Uint8Array) => this.writeBatch([{ offset, bytes: input }]),
+      writeBatch: this.writeBatch,
+      close: async () => {
+        this.closed = true;
+        this.metadata?.fileKey.fill(0);
+        if (!this.head.dirty) await this.discard();
+      },
+    };
+  }
+}
+
+async function useDraft(
+  bytes: DraftStorage,
+  prefix: string,
+  head: DraftHead,
+  options: DraftOptions,
+  expectedDownloadBlocks?: readonly RangeDigest[],
+) {
+  return (await DocumentDraft.create(bytes, prefix, head, options, expectedDownloadBlocks)).api();
 }
 
 export async function openDocumentDraft(bytes: DraftStorage, options: DraftOptions & {

@@ -29,8 +29,314 @@ export async function dispatchDocumentCommandWithSessionConfiguration(
   return result;
 }
 
+type Documents = ReturnType<typeof createDocumentFilesystem>;
+
+type DocumentCommandContext = {
+  documents: Documents;
+  command: Record<string, unknown>;
+  text: (field: string) => string;
+  integer: (field: string) => number;
+  ranges: () => Array<{ offset: number; size: number }>;
+  blocks: () => Array<{ offset: number; size: number; hash: Uint8Array }> | undefined;
+};
+
+type CommandHandler = (context: DocumentCommandContext) => unknown | Promise<unknown>;
+
+function sessionSharedFolders({ documents, command }: DocumentCommandContext) {
+  if (typeof command.remoteDeviceId !== "string" || command.remoteDeviceId.length > 128) {
+    throw new Error("Invalid remote device identity.");
+  }
+  return documents.sessionSharedFolders(command.remoteDeviceId);
+}
+
+function savePersonalSpaceSetting({ documents, command }: DocumentCommandContext) {
+  if (!Array.isArray(command.path) || command.path.length < 3 || command.path.length > 4 ||
+    command.path.some(part => typeof part !== "string" || !part || part.length > 1024)) {
+    throw new Error("Invalid shared setting path.");
+  }
+  if (!Object.hasOwn(command, "value")) throw new Error("Shared setting value is missing.");
+  return documents.savePersonalSpaceSetting(command.path as string[], command.value);
+}
+
+function resolvePersonalSpaceConflict({ documents, command, text }: DocumentCommandContext) {
+  if (!Array.isArray(command.path) || command.path.length < 3 || command.path.length > 4 ||
+    command.path.some(part => typeof part !== "string" || !part || part.length > 1024)) {
+    throw new Error("Invalid shared setting path.");
+  }
+  return documents.resolvePersonalSpaceConflict(command.path as string[], text("selectedHead"));
+}
+
+function appendPersonalSpaceChange({ documents, command }: DocumentCommandContext) {
+  if (!command.change || typeof command.change !== "object" || Array.isArray(command.change)) {
+    throw new Error("Invalid personal-space change.");
+  }
+  return documents.appendPersonalSpaceChange(
+    command.change as Parameters<Documents["appendPersonalSpaceChange"]>[0]);
+}
+
+function saveDirectorySnapshot({ documents, command, text }: DocumentCommandContext) {
+  if (!command.snapshot || typeof command.snapshot !== "object" || Array.isArray(command.snapshot)) {
+    throw new Error("Invalid directory snapshot.");
+  }
+  return documents.saveDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
+    command.path === "" ? "" : text("path"), command.snapshot as Parameters<Documents["saveDirectorySnapshot"]>[3]);
+}
+
+function saveProfileSettings({ documents, command }: DocumentCommandContext) {
+  if (!command.settings || typeof command.settings !== "object" || Array.isArray(command.settings)) {
+    throw new Error("Invalid profile settings.");
+  }
+  return documents.saveProfileSettings(command.settings as Parameters<Documents["saveProfileSettings"]>[0]);
+}
+
+function saveConnectionPasswords({ documents, command }: DocumentCommandContext) {
+  if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
+  return documents.saveConnectionPasswords(command.passwords as Record<string, string>);
+}
+
+function mergeConnectionPasswords({ documents, command }: DocumentCommandContext) {
+  if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
+  return documents.mergeConnectionPasswords(command.passwords as Record<string, string>);
+}
+
+function recoverOwnedDevice({ documents, command, text }: DocumentCommandContext) {
+  if (!command.kit || typeof command.kit !== "object" || Array.isArray(command.kit)) {
+    throw new Error("Invalid owned recovery kit.");
+  }
+  return documents.recoverOwnedDevice(text("localDeviceId"),
+    command.kit as Parameters<Documents["recoverOwnedDevice"]>[1], text("password"));
+}
+
+function exportPairingTransfer({ documents, command, text }: DocumentCommandContext) {
+  if (!command.joiningDevice || typeof command.joiningDevice !== "object" || Array.isArray(command.joiningDevice)) {
+    throw new Error("Invalid joining device identity.");
+  }
+  return documents.exportPairingTransfer(text("localDeviceId"),
+    command.joiningDevice as Parameters<Documents["exportPairingTransfer"]>[1]);
+}
+
+function importPairingTransfer({ documents, command, text }: DocumentCommandContext) {
+  if (!command.transfer || typeof command.transfer !== "object" || Array.isArray(command.transfer) ||
+    (command.remember !== undefined && typeof command.remember !== "boolean")) {
+    throw new Error("Invalid personal-space pairing transfer.");
+  }
+  if (!command.identity || typeof command.identity !== "object" || Array.isArray(command.identity)) {
+    throw new Error("Invalid local device identity.");
+  }
+  return documents.importPairingTransfer(command.transfer as Parameters<Documents["importPairingTransfer"]>[0],
+    command.identity as Parameters<Documents["importPairingTransfer"]>[1], text("password"), command.remember !== false);
+}
+
+function restoreRecoveryBackup({ documents, command, text }: DocumentCommandContext) {
+  if (!command.backup || typeof command.backup !== "object" || Array.isArray(command.backup)) {
+    throw new Error("Invalid personal-space recovery backup.");
+  }
+  return documents.restoreRecoveryBackup(command.backup as Parameters<Documents["restoreRecoveryBackup"]>[0],
+    text("recoveryPassword"), text("password"));
+}
+
+function saveUiState({ documents, command }: DocumentCommandContext) {
+  const state = command.state ?? null;
+  if (state !== null) {
+    const encoded = JSON.stringify(state);
+    if (typeof encoded !== "string" || encoded.length > 512 * 1024) throw new Error("Invalid UI state record.");
+  }
+  return documents.saveUiState(state);
+}
+
+function digestCachedFiles({ documents, command }: DocumentCommandContext) {
+  if (!Array.isArray(command.files) || command.files.length > 256 || command.files.some(file =>
+    !file || typeof file !== "object" || typeof file.folderId !== "string" || !file.folderId ||
+    file.folderId.length > 4096 || typeof file.path !== "string" || !file.path || file.path.length > 4096)) {
+    throw new Error("Invalid cached document digest request.");
+  }
+  return documents.digestCachedFiles(command.files.map(file => ({ folderId: file.folderId, path: file.path })));
+}
+
+function cachedStatuses({ documents, command, text }: DocumentCommandContext) {
+  if (!Array.isArray(command.paths) || command.paths.length > 4096 || command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");
+  return documents.cachedStatuses(text("folderId"), command.paths);
+}
+
+function recordFavoriteResolution({ documents, command, text }: DocumentCommandContext) {
+  if (command.resolution !== "keep-local" && command.resolution !== "keep-remote") {
+    throw new Error("Invalid favorite conflict resolution.");
+  }
+  return documents.recordFavoriteResolution(text("folderId"), text("path"), command.resolution);
+}
+
+function clearFavoriteRenames({ documents, command, text }: DocumentCommandContext) {
+  if (!Array.isArray(command.paths) || command.paths.length > 4096 ||
+    command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");
+  return documents.clearFavoriteRenames(text("folderId"), command.paths);
+}
+
+function saveFavoriteSyncEntries({ documents, command, text }: DocumentCommandContext) {
+  if (!command.entries || typeof command.entries !== "object" || Array.isArray(command.entries)) {
+    throw new Error("Invalid favorite sync entries.");
+  }
+  return documents.saveFavoriteSyncEntries(text("folderId"),
+    command.entries as Parameters<Documents["saveFavoriteSyncEntries"]>[1]);
+}
+
+function beginDownload({ documents, command, text, integer, blocks }: DocumentCommandContext) {
+  if (typeof command.encrypted !== "boolean") throw new Error("Invalid download encryption metadata.");
+  return documents.beginDownload(text("folderId"), text("path"), integer("size"), integer("modifiedMs"),
+    command.expectedLocalHash === undefined || command.expectedLocalHash === null ? command.expectedLocalHash : text("expectedLocalHash"), {
+    encrypted: command.encrypted,
+    ...(command.sourceDeviceId === undefined ? {} : { sourceDeviceId: text("sourceDeviceId") }),
+    ...(command.contentId === undefined ? {} : { contentId: text("contentId") }),
+    ...(command.blocks === undefined ? {} : { blocks: blocks() }),
+  });
+}
+
+async function digestRanges({ documents, command, integer, ranges }: DocumentCommandContext) {
+  if (command.source !== "cached" && command.source !== "partial") throw new Error("Invalid document source.");
+  return (await documents.digestRanges(integer("handle"), command.source, ranges()))
+    .map(range => ({ ...range, hash: Array.from(range.hash) }));
+}
+
+function createVault({ documents, command, text }: DocumentCommandContext) {
+  if (command.remember !== undefined && typeof command.remember !== "boolean") throw new Error("Invalid remember setting.");
+  return documents.createVault(text("password"), command.remember === true,
+    command.localDeviceId === undefined ? undefined : text("localDeviceId"),
+    command.recoveryKey === undefined ? undefined : text("recoveryKey"));
+}
+
+function registerDocument({ documents, command, text }: DocumentCommandContext) {
+  return documents.register({ id: text("id"), label: text("label"),
+    ...(command.password === undefined ? {} : { password: text("password") }) });
+}
+
+function createDocument({ documents, command, text }: DocumentCommandContext) {
+  if (typeof command.directory !== "boolean") throw new Error("Invalid document type.");
+  return documents.create(text("id"), text("name"), command.directory);
+}
+
+async function readDocument({ documents, integer }: DocumentCommandContext) {
+  const size = integer("size");
+  if (size > 131072) throw new Error("Document read exceeds bridge limit.");
+  const bytes = await documents.read(integer("handle"), integer("offset"), size);
+  try { return Array.from(bytes); } finally { bytes.fill(0); }
+}
+
+async function writeDocument({ documents, command, integer }: DocumentCommandContext) {
+  const value = command.bytes;
+  if (!Array.isArray(value) || value.length > 131072 || value.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid document bytes.");
+  const bytes = new Uint8Array(value);
+  try { await documents.write(integer("handle"), integer("offset"), bytes); return bytes.length; }
+  finally { bytes.fill(0); value.fill(0); }
+}
+
+async function writeDocumentBatch({ documents, command, integer }: DocumentCommandContext) {
+  const values = command.writes;
+  if (!Array.isArray(values) || values.length < 1 || values.length > 8) {
+    throw new Error("Invalid document write batch.");
+  }
+  let total = 0;
+  for (const value of values) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid document write batch.");
+    const write = value as Record<string, unknown>;
+    if (!Number.isSafeInteger(write.offset) || Number(write.offset) < 0 ||
+      !Array.isArray(write.bytes) || write.bytes.length > 131072) throw new Error("Invalid document write batch.");
+    for (const byte of write.bytes) {
+      if (!Number.isInteger(byte) || byte < 0 || byte > 255) throw new Error("Invalid document write batch.");
+    }
+    total += write.bytes.length;
+    if (total > 8 * 131072 || !Number.isSafeInteger(Number(write.offset) + write.bytes.length)) {
+      throw new Error("Invalid document write batch.");
+    }
+  }
+  const writes = values.map(value => {
+    const write = value as { offset: number; bytes: number[] };
+    return { offset: write.offset, bytes: new Uint8Array(write.bytes) };
+  });
+  try { await documents.writeBatch(integer("handle"), writes); return total; }
+  finally {
+    writes.forEach(write => write.bytes.fill(0));
+    values.forEach(value => ((value as { bytes: number[] }).bytes).fill(0));
+  }
+}
+
+function releaseDocument({ documents, command, integer }: DocumentCommandContext) {
+  if (command.abort !== undefined && typeof command.abort !== "boolean") throw new Error("Invalid document release.");
+  return documents.release(integer("handle"), command.abort === true);
+}
+
+const unknownCommand = (): never => { throw new Error("Unknown document command."); };
+
+const commandHandlers: Record<string, CommandHandler> = {
+  status: ({ documents }) => documents.status(),
+  cacheRegistrations: ({ documents }) => documents.status(),
+  connectionPasswords: ({ documents }) => documents.connectionPasswords(),
+  sessionSharedFolders,
+  profileSettings: ({ documents }) => documents.profileSettings(),
+  localReleaseHistory: ({ documents }) => documents.localReleaseHistory(),
+  personalSpaceChanges: ({ documents }) => documents.personalSpaceChanges(),
+  sharedPersonalSpaceSettings: ({ documents }) => documents.sharedPersonalSpaceSettings(),
+  savePersonalSpaceSetting,
+  resolvePersonalSpaceConflict,
+  appendPersonalSpaceChange,
+  loadDirectorySnapshot: ({ documents, command, text }) => documents.loadDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
+    command.path === "" ? "" : text("path")),
+  saveDirectorySnapshot,
+  enforceCacheQuota: ({ documents }) => documents.enforceCacheQuota(),
+  saveProfileSettings,
+  saveConnectionPasswords,
+  mergeConnectionPasswords,
+  exportRecoveryBackup: ({ documents, text }) => documents.exportRecoveryBackup(text("password")),
+  ownedDevices: ({ documents }) => documents.ownedDevices(),
+  revokeOwnedDevice: ({ documents, text }) => documents.revokeOwnedDevice(text("deviceId")),
+  recoverOwnedDevice,
+  exportPairingTransfer,
+  importPairingTransfer,
+  restoreRecoveryBackup,
+  uiState: ({ documents }) => documents.uiState(),
+  saveUiState,
+  rememberFolder: ({ documents, text }) => documents.rememberFolder({ id: text("id"), label: text("label") }),
+  cachedFiles: ({ documents }) => documents.cachedFiles(),
+  digestCachedFiles,
+  folderFiles: ({ documents, text }) => documents.cachedFiles(text("folderId")),
+  cachedStatuses,
+  versions: ({ documents, text }) => documents.versions(text("id")),
+  restoreVersion: ({ documents, text }) => documents.restoreVersion(text("id"), text("versionId")),
+  favoriteSyncState: ({ documents, text }) => documents.favoriteSyncState(text("folderId")),
+  clearFavoriteSyncEntry: ({ documents, text }) => documents.clearFavoriteSyncEntry(text("folderId"), text("path")),
+  recordFavoriteResolution,
+  clearFavoriteRenames,
+  saveFavoriteSyncEntries,
+  attachDownloads: ({ documents, text }) => documents.attachDownloads(text("id")),
+  detachDownloads: ({ documents, text }) => documents.detachDownloads(text("id")),
+  beginDownload,
+  downloadRanges: ({ documents, integer }) => documents.downloadRanges(integer("handle")),
+  suspendDownload: ({ documents, integer }) => documents.suspendDownload(integer("handle")),
+  finishDownload: ({ documents, integer }) => documents.finishDownload(integer("handle")),
+  digest: ({ documents, integer }) => documents.digest(integer("handle")),
+  copyRanges: ({ documents, integer, ranges }) => documents.copyRanges(integer("handle"), ranges()),
+  digestRanges,
+  remove: ({ documents, text }) => documents.remove(text("id")),
+  rename: ({ documents, text }) => documents.rename(text("id"), text("name")),
+  setSyncBaseline: ({ documents, text, integer }) => documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") }),
+  createVault,
+  unlock: ({ documents, text }) => documents.unlock(text("password")),
+  unlockRemembered: ({ documents }) => documents.unlockRemembered(),
+  changeMasterPassword: ({ documents, text }) => documents.changeMasterPassword(text("password")),
+  lock: ({ documents }) => documents.lock(),
+  register: registerDocument,
+  stat: ({ documents, text }) => documents.stat(text("id")),
+  list: ({ documents, text }) => documents.list(text("id")),
+  create: createDocument,
+  open: ({ documents, text }) => documents.open(text("id"), text("mode")),
+  size: ({ documents, integer }) => documents.size(integer("handle")),
+  read: readDocument,
+  write: writeDocument,
+  writeBatch: writeDocumentBatch,
+  flush: ({ documents, integer }) => documents.flush(integer("handle")),
+  release: releaseDocument,
+};
+
 /** Validate the native/UI boundary before dispatching to the one document owner. */
-export async function dispatchDocumentCommand(documents: ReturnType<typeof createDocumentFilesystem>, input: unknown): Promise<unknown> {
+export async function dispatchDocumentCommand(documents: Documents, input: unknown): Promise<unknown> {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid document command.");
   const command = input as Record<string, unknown>;
   const text = (field: string) => {
@@ -67,238 +373,6 @@ export async function dispatchDocumentCommand(documents: ReturnType<typeof creat
       return { offset: block.offset, size: block.size, hash: new Uint8Array(block.hash) };
     });
   };
-  switch (command.operation) {
-    case "status": case "cacheRegistrations": return documents.status();
-    case "connectionPasswords": return documents.connectionPasswords();
-    case "sessionSharedFolders": {
-      if (typeof command.remoteDeviceId !== "string" || command.remoteDeviceId.length > 128) {
-        throw new Error("Invalid remote device identity.");
-      }
-      return documents.sessionSharedFolders(command.remoteDeviceId);
-    }
-    case "profileSettings": return documents.profileSettings();
-    case "localReleaseHistory": return documents.localReleaseHistory();
-    case "personalSpaceChanges": return documents.personalSpaceChanges();
-    case "sharedPersonalSpaceSettings": return documents.sharedPersonalSpaceSettings();
-    case "savePersonalSpaceSetting": {
-      if (!Array.isArray(command.path) || command.path.length < 3 || command.path.length > 4 ||
-        command.path.some(part => typeof part !== "string" || !part || part.length > 1024)) {
-        throw new Error("Invalid shared setting path.");
-      }
-      if (!Object.hasOwn(command, "value")) throw new Error("Shared setting value is missing.");
-      return documents.savePersonalSpaceSetting(command.path as string[], command.value);
-    }
-    case "resolvePersonalSpaceConflict": {
-      if (!Array.isArray(command.path) || command.path.length < 3 || command.path.length > 4 ||
-        command.path.some(part => typeof part !== "string" || !part || part.length > 1024)) {
-        throw new Error("Invalid shared setting path.");
-      }
-      return documents.resolvePersonalSpaceConflict(command.path as string[], text("selectedHead"));
-    }
-    case "appendPersonalSpaceChange": {
-      if (!command.change || typeof command.change !== "object" || Array.isArray(command.change)) {
-        throw new Error("Invalid personal-space change.");
-      }
-      return documents.appendPersonalSpaceChange(
-        command.change as Parameters<typeof documents.appendPersonalSpaceChange>[0]);
-    }
-    case "loadDirectorySnapshot": return documents.loadDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
-      command.path === "" ? "" : text("path"));
-    case "saveDirectorySnapshot": {
-      if (!command.snapshot || typeof command.snapshot !== "object" || Array.isArray(command.snapshot)) {
-        throw new Error("Invalid directory snapshot.");
-      }
-      return documents.saveDirectorySnapshot(text("folderId"), text("sourceDeviceId"),
-        command.path === "" ? "" : text("path"), command.snapshot as Parameters<typeof documents.saveDirectorySnapshot>[3]);
-    }
-    case "enforceCacheQuota": return documents.enforceCacheQuota();
-    case "saveProfileSettings": {
-      if (!command.settings || typeof command.settings !== "object" || Array.isArray(command.settings)) {
-        throw new Error("Invalid profile settings.");
-      }
-      return documents.saveProfileSettings(command.settings as Parameters<typeof documents.saveProfileSettings>[0]);
-    }
-    case "saveConnectionPasswords": {
-      if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
-      return documents.saveConnectionPasswords(command.passwords as Record<string, string>);
-    }
-    case "mergeConnectionPasswords": {
-      if (!command.passwords || typeof command.passwords !== "object" || Array.isArray(command.passwords)) throw new Error("Invalid credentials.");
-      return documents.mergeConnectionPasswords(command.passwords as Record<string, string>);
-    }
-    case "exportRecoveryBackup": return documents.exportRecoveryBackup(text("password"));
-    case "ownedDevices": return documents.ownedDevices();
-    case "revokeOwnedDevice": return documents.revokeOwnedDevice(text("deviceId"));
-    case "recoverOwnedDevice": {
-      if (!command.kit || typeof command.kit !== "object" || Array.isArray(command.kit)) {
-        throw new Error("Invalid owned recovery kit.");
-      }
-      return documents.recoverOwnedDevice(text("localDeviceId"),
-        command.kit as Parameters<typeof documents.recoverOwnedDevice>[1], text("password"));
-    }
-    case "exportPairingTransfer": {
-      if (!command.joiningDevice || typeof command.joiningDevice !== "object" || Array.isArray(command.joiningDevice)) {
-        throw new Error("Invalid joining device identity.");
-      }
-      return documents.exportPairingTransfer(text("localDeviceId"),
-        command.joiningDevice as Parameters<typeof documents.exportPairingTransfer>[1]);
-    }
-    case "importPairingTransfer": {
-      if (!command.transfer || typeof command.transfer !== "object" || Array.isArray(command.transfer) ||
-        (command.remember !== undefined && typeof command.remember !== "boolean")) {
-        throw new Error("Invalid personal-space pairing transfer.");
-      }
-      if (!command.identity || typeof command.identity !== "object" || Array.isArray(command.identity)) {
-        throw new Error("Invalid local device identity.");
-      }
-      return documents.importPairingTransfer(command.transfer as Parameters<typeof documents.importPairingTransfer>[0],
-        command.identity as Parameters<typeof documents.importPairingTransfer>[1], text("password"), command.remember !== false);
-    }
-    case "restoreRecoveryBackup": {
-      if (!command.backup || typeof command.backup !== "object" || Array.isArray(command.backup)) {
-        throw new Error("Invalid personal-space recovery backup.");
-      }
-      return documents.restoreRecoveryBackup(command.backup as Parameters<typeof documents.restoreRecoveryBackup>[0],
-        text("recoveryPassword"), text("password"));
-    }
-    case "uiState": return documents.uiState();
-    case "saveUiState": {
-      const state = command.state ?? null;
-      if (state !== null) {
-        const encoded = JSON.stringify(state);
-        if (typeof encoded !== "string" || encoded.length > 512 * 1024) throw new Error("Invalid UI state record.");
-      }
-      return documents.saveUiState(state);
-    }
-    case "rememberFolder": return documents.rememberFolder({ id: text("id"), label: text("label") });
-    case "cachedFiles": return documents.cachedFiles();
-    case "digestCachedFiles": {
-      if (!Array.isArray(command.files) || command.files.length > 256 || command.files.some(file =>
-        !file || typeof file !== "object" || typeof file.folderId !== "string" || !file.folderId ||
-        file.folderId.length > 4096 || typeof file.path !== "string" || !file.path || file.path.length > 4096)) {
-        throw new Error("Invalid cached document digest request.");
-      }
-      return documents.digestCachedFiles(command.files.map(file => ({ folderId: file.folderId, path: file.path })));
-    }
-    case "folderFiles": return documents.cachedFiles(text("folderId"));
-    case "cachedStatuses": {
-      if (!Array.isArray(command.paths) || command.paths.length > 4096 || command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");
-      return documents.cachedStatuses(text("folderId"), command.paths);
-    }
-    case "versions": return documents.versions(text("id"));
-    case "restoreVersion": return documents.restoreVersion(text("id"), text("versionId"));
-    case "favoriteSyncState": return documents.favoriteSyncState(text("folderId"));
-    case "clearFavoriteSyncEntry": return documents.clearFavoriteSyncEntry(text("folderId"), text("path"));
-    case "recordFavoriteResolution": {
-      if (command.resolution !== "keep-local" && command.resolution !== "keep-remote") {
-        throw new Error("Invalid favorite conflict resolution.");
-      }
-      return documents.recordFavoriteResolution(text("folderId"), text("path"), command.resolution);
-    }
-    case "clearFavoriteRenames": {
-      if (!Array.isArray(command.paths) || command.paths.length > 4096 ||
-        command.paths.some(path => typeof path !== "string" || path.length > 4096)) throw new Error("Invalid document paths.");
-      return documents.clearFavoriteRenames(text("folderId"), command.paths);
-    }
-    case "saveFavoriteSyncEntries": {
-      if (!command.entries || typeof command.entries !== "object" || Array.isArray(command.entries)) {
-        throw new Error("Invalid favorite sync entries.");
-      }
-      return documents.saveFavoriteSyncEntries(text("folderId"),
-        command.entries as Parameters<typeof documents.saveFavoriteSyncEntries>[1]);
-    }
-    case "attachDownloads": return documents.attachDownloads(text("id"));
-    case "detachDownloads": return documents.detachDownloads(text("id"));
-    case "beginDownload": {
-      if (typeof command.encrypted !== "boolean") throw new Error("Invalid download encryption metadata.");
-      return documents.beginDownload(text("folderId"), text("path"), integer("size"), integer("modifiedMs"),
-        command.expectedLocalHash === undefined || command.expectedLocalHash === null ? command.expectedLocalHash : text("expectedLocalHash"), {
-        encrypted: command.encrypted,
-        ...(command.sourceDeviceId === undefined ? {} : { sourceDeviceId: text("sourceDeviceId") }),
-        ...(command.contentId === undefined ? {} : { contentId: text("contentId") }),
-        ...(command.blocks === undefined ? {} : { blocks: blocks() }),
-      });
-    }
-    case "downloadRanges": return documents.downloadRanges(integer("handle"));
-    case "suspendDownload": return documents.suspendDownload(integer("handle"));
-    case "finishDownload": return documents.finishDownload(integer("handle"));
-    case "digest": return documents.digest(integer("handle"));
-    case "copyRanges": return documents.copyRanges(integer("handle"), ranges());
-    case "digestRanges": {
-      if (command.source !== "cached" && command.source !== "partial") throw new Error("Invalid document source.");
-      return (await documents.digestRanges(integer("handle"), command.source, ranges()))
-        .map(range => ({ ...range, hash: Array.from(range.hash) }));
-    }
-    case "remove": return documents.remove(text("id"));
-    case "rename": return documents.rename(text("id"), text("name"));
-    case "setSyncBaseline": return documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") });
-    case "createVault": {
-      if (command.remember !== undefined && typeof command.remember !== "boolean") throw new Error("Invalid remember setting.");
-      return documents.createVault(text("password"), command.remember === true,
-        command.localDeviceId === undefined ? undefined : text("localDeviceId"),
-        command.recoveryKey === undefined ? undefined : text("recoveryKey"));
-    }
-    case "unlock": return documents.unlock(text("password"));
-    case "unlockRemembered": return documents.unlockRemembered();
-    case "changeMasterPassword": return documents.changeMasterPassword(text("password"));
-    case "lock": return documents.lock();
-    case "register": return documents.register({ id: text("id"), label: text("label"),
-      ...(command.password === undefined ? {} : { password: text("password") }) });
-    case "stat": return documents.stat(text("id"));
-    case "list": return documents.list(text("id"));
-    case "create": {
-      if (typeof command.directory !== "boolean") throw new Error("Invalid document type.");
-      return documents.create(text("id"), text("name"), command.directory);
-    }
-    case "open": return documents.open(text("id"), text("mode"));
-    case "size": return documents.size(integer("handle"));
-    case "read": {
-      const size = integer("size");
-      if (size > 131072) throw new Error("Document read exceeds bridge limit.");
-      const bytes = await documents.read(integer("handle"), integer("offset"), size);
-      try { return Array.from(bytes); } finally { bytes.fill(0); }
-    }
-    case "write": {
-      const value = command.bytes;
-      if (!Array.isArray(value) || value.length > 131072 || value.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid document bytes.");
-      const bytes = new Uint8Array(value);
-      try { await documents.write(integer("handle"), integer("offset"), bytes); return bytes.length; }
-      finally { bytes.fill(0); value.fill(0); }
-    }
-    case "writeBatch": {
-      const values = command.writes;
-      if (!Array.isArray(values) || values.length < 1 || values.length > 8) {
-        throw new Error("Invalid document write batch.");
-      }
-      let total = 0;
-      for (const value of values) {
-        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid document write batch.");
-        const write = value as Record<string, unknown>;
-        if (!Number.isSafeInteger(write.offset) || Number(write.offset) < 0 ||
-          !Array.isArray(write.bytes) || write.bytes.length > 131072) throw new Error("Invalid document write batch.");
-        for (const byte of write.bytes) {
-          if (!Number.isInteger(byte) || byte < 0 || byte > 255) throw new Error("Invalid document write batch.");
-        }
-        total += write.bytes.length;
-        if (total > 8 * 131072 || !Number.isSafeInteger(Number(write.offset) + write.bytes.length)) {
-          throw new Error("Invalid document write batch.");
-        }
-      }
-      const writes = values.map(value => {
-        const write = value as { offset: number; bytes: number[] };
-        return { offset: write.offset, bytes: new Uint8Array(write.bytes) };
-      });
-      try { await documents.writeBatch(integer("handle"), writes); return total; }
-      finally {
-        writes.forEach(write => write.bytes.fill(0));
-        values.forEach(value => ((value as { bytes: number[] }).bytes).fill(0));
-      }
-    }
-    case "flush": return documents.flush(integer("handle"));
-    case "release": {
-      if (command.abort !== undefined && typeof command.abort !== "boolean") throw new Error("Invalid document release.");
-      return documents.release(integer("handle"), command.abort === true);
-    }
-    default: throw new Error("Unknown document command.");
-  }
+  const handler = typeof command.operation === "string" ? commandHandlers[command.operation] ?? unknownCommand : unknownCommand;
+  return handler({ documents, command, text, integer, ranges, blocks });
 }

@@ -73,343 +73,366 @@ export const waitForLifecyclePhase = <TOptions>(
   });
 };
 
-export const createConnectionLifecycle = <TOptions>(deps: {
+export type ConnectionLifecycleDeps<TOptions> = {
   open: (options: TOptions, signal: AbortSignal) => Promise<SyncpeerSessionHandle>;
   keyFor: (options: TOptions) => string;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
-}): ConnectionLifecycle<TOptions> => {
-  const now = deps.now ?? Date.now;
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const random = deps.random ?? Math.random;
-  const listeners = new Set<(state: ConnectionLifecycleState) => void>();
-  let state = initialState();
-  let active: SyncpeerSessionHandle | null = null;
-  let activeKey = "";
-  let desired: TOptions | null = null;
-  let opening: Promise<SyncpeerSessionHandle> | null = null;
-  let openingKey = "";
-  let openingController: AbortController | null = null;
-  let generation = 0;
-  let failureStreak = 0;
-  let connectedAtMs = 0;
-  let online = true;
-  let foreground = true;
-  let transferActive = false;
-  let upgradeTimerGeneration: number | null = null;
-  let upgradeController: AbortController | null = null;
+};
 
-  const update = (next: Partial<ConnectionLifecycleState>): void => {
-    state = { ...state, ...next };
-    const snapshot = { ...state };
-    for (const listener of listeners) listener(snapshot);
+class ConnectionLifecycleRuntime<TOptions> {
+  private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly random: () => number;
+  private readonly listeners = new Set<(state: ConnectionLifecycleState) => void>();
+  private state = initialState();
+  private active: SyncpeerSessionHandle | null = null;
+  private activeKey = "";
+  private desired: TOptions | null = null;
+  private opening: Promise<SyncpeerSessionHandle> | null = null;
+  private openingKey = "";
+  private openingController: AbortController | null = null;
+  private generation = 0;
+  private failureStreak = 0;
+  private connectedAtMs = 0;
+  private online = true;
+  private foreground = true;
+  private transferActive = false;
+  private upgradeTimerGeneration: number | null = null;
+  private upgradeController: AbortController | null = null;
+
+  constructor(private readonly deps: ConnectionLifecycleDeps<TOptions>) {
+    this.now = deps.now ?? Date.now;
+    this.sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+    this.random = deps.random ?? Math.random;
+  }
+
+  private update = (next: Partial<ConnectionLifecycleState>): void => {
+    this.state = { ...this.state, ...next };
+    const snapshot = { ...this.state };
+    for (const listener of this.listeners) listener(snapshot);
   };
 
-  const eligible = (): boolean => online && (foreground || transferActive) && desired !== null;
-  const cancelOpening = (): void => {
-    openingController?.abort();
-    openingController = null;
-    opening = null;
-    openingKey = "";
-    upgradeController?.abort();
-    upgradeController = null;
+  private eligible = (): boolean => this.online && (this.foreground || this.transferActive) && this.desired !== null;
+  private cancelOpening = (): void => {
+    this.openingController?.abort();
+    this.openingController = null;
+    this.opening = null;
+    this.openingKey = "";
+    this.upgradeController?.abort();
+    this.upgradeController = null;
   };
-  const pathRank = (session: SyncpeerSessionHandle): number => {
+  private pathRank = (session: SyncpeerSessionHandle): number => {
     if (session.transportKind === "relay") return 1;
     const lan = session.connectionScope === "lan";
     if (session.transportKind === "direct-tcp") return lan ? 5 : 3;
     return lan ? 4 : 2;
   };
 
-  const scheduleUpgrade = (sessionGeneration: number): void => {
-    if (!active || pathRank(active) >= 5) return;
-    if (upgradeTimerGeneration === sessionGeneration) return;
-    upgradeTimerGeneration = sessionGeneration;
-    void sleep(60_000).then(async () => {
-      if (upgradeTimerGeneration === sessionGeneration) upgradeTimerGeneration = null;
+  private scheduleUpgrade = (sessionGeneration: number): void => {
+    if (!this.active || this.pathRank(this.active) >= 5) return;
+    if (this.upgradeTimerGeneration === sessionGeneration) return;
+    this.upgradeTimerGeneration = sessionGeneration;
+    void this.sleep(60_000).then(async () => {
+      if (this.upgradeTimerGeneration === sessionGeneration) this.upgradeTimerGeneration = null;
       if (
-        sessionGeneration !== generation ||
-        !active ||
-        !desired ||
-        !online ||
-        !foreground ||
-        transferActive
+        sessionGeneration !== this.generation ||
+        !this.active ||
+        !this.desired ||
+        !this.online ||
+        !this.foreground ||
+        this.transferActive
       ) return;
-      const previous = active;
+      const previous = this.active;
       const controller = new AbortController();
-      upgradeController = controller;
-      update({ upgradeStatus: "probing" });
+      this.upgradeController = controller;
+      this.update({ upgradeStatus: "probing" });
       try {
-        const replacement = await deps.open(desired, controller.signal);
-        if (sessionGeneration !== generation || active !== previous) {
+        const replacement = await this.deps.open(this.desired, controller.signal);
+        if (sessionGeneration !== this.generation || this.active !== previous) {
           await replacement.close().catch(() => undefined);
           return;
         }
-        if (pathRank(replacement) <= pathRank(previous)) {
+        if (this.pathRank(replacement) <= this.pathRank(previous)) {
           await replacement.close().catch(() => undefined);
           return;
         }
-        update({ upgradeStatus: "switching" });
-        active = replacement;
-        connectedAtMs = now();
-        watchClosure(replacement, sessionGeneration);
+        this.update({ upgradeStatus: "switching" });
+        this.active = replacement;
+        this.connectedAtMs = this.now();
+        this.watchClosure(replacement, sessionGeneration);
         await previous.close().catch(() => undefined);
       } catch {
         // A failed optional probe does not disturb the steady session.
       } finally {
-        if (upgradeController === controller) upgradeController = null;
-        if (sessionGeneration === generation) {
-          update({ upgradeStatus: "idle" });
-          scheduleUpgrade(sessionGeneration);
+        if (this.upgradeController === controller) this.upgradeController = null;
+        if (sessionGeneration === this.generation) {
+          this.update({ upgradeStatus: "idle" });
+          this.scheduleUpgrade(sessionGeneration);
         }
       }
     });
   };
 
-  const scheduleRetry = (reason: string): void => {
-    if (!eligible()) return;
-    const retryGeneration = generation;
-    const delayMs = retryDelayMs(failureStreak, random);
-    failureStreak += 1;
-    update({
+  private scheduleRetry = (reason: string): void => {
+    if (!this.eligible()) return;
+    const retryGeneration = this.generation;
+    const delayMs = retryDelayMs(this.failureStreak, this.random);
+    this.failureStreak += 1;
+    this.update({
       phase: "waiting",
-      attempt: failureStreak,
-      nextRetryAtMs: now() + delayMs,
+      attempt: this.failureStreak,
+      nextRetryAtMs: this.now() + delayMs,
       closureReason: reason,
     });
-    void sleep(delayMs).then(async () => {
-      if (retryGeneration !== generation || !eligible()) return;
-      update({ phase: "reconnecting", nextRetryAtMs: null });
+    void this.sleep(delayMs).then(async () => {
+      if (retryGeneration !== this.generation || !this.eligible()) return;
+      this.update({ phase: "reconnecting", nextRetryAtMs: null });
       try {
-        await openDesired(retryGeneration);
+        await this.openDesired(retryGeneration);
       } catch {
         // openDesired records the failure and schedules the next attempt.
       }
     });
   };
 
-  const watchClosure = (session: SyncpeerSessionHandle, sessionGeneration: number): void => {
+  private watchClosure = (session: SyncpeerSessionHandle, sessionGeneration: number): void => {
     void session.closed.then((closure) => {
-      if (sessionGeneration !== generation || active !== session) return;
-      active = null;
-      activeKey = "";
-      if (now() - connectedAtMs >= 30_000) failureStreak = 0;
-      if (closure.kind === "manual" || !desired) {
-        update({ phase: "idle", nextRetryAtMs: null, closureReason: closure.message });
+      if (sessionGeneration !== this.generation || this.active !== session) return;
+      this.active = null;
+      this.activeKey = "";
+      if (this.now() - this.connectedAtMs >= 30_000) this.failureStreak = 0;
+      if (closure.kind === "manual" || !this.desired) {
+        this.update({ phase: "idle", nextRetryAtMs: null, closureReason: closure.message });
         return;
       }
-      scheduleRetry(closure.message);
+      this.scheduleRetry(closure.message);
     });
   };
 
-  const openDesired = async (openGeneration: number): Promise<SyncpeerSessionHandle> => {
-    if (!desired) throw new Error("No connection options are active.");
-    const options = desired;
-    const key = deps.keyFor(options);
-    if (active && !active.isClosed() && activeKey === key) return active;
-    if (opening) return opening;
-    update({
-      phase: state.phase === "reconnecting" ? "reconnecting" : "connecting",
+  private openDesired = async (openGeneration: number): Promise<SyncpeerSessionHandle> => {
+    if (!this.desired) throw new Error("No connection options are active.");
+    const options = this.desired;
+    const key = this.deps.keyFor(options);
+    if (this.active && !this.active.isClosed() && this.activeKey === key) return this.active;
+    if (this.opening) return this.opening;
+    this.update({
+      phase: this.state.phase === "reconnecting" ? "reconnecting" : "connecting",
       nextRetryAtMs: null,
       closureReason: null,
     });
     const controller = new AbortController();
-    openingController = controller;
+    this.openingController = controller;
     const pending = (async () => {
-      if (active && activeKey !== key) {
-        const previous = active;
-        active = null;
-        activeKey = "";
+      if (this.active && this.activeKey !== key) {
+        const previous = this.active;
+        this.active = null;
+        this.activeKey = "";
         await previous.close().catch(() => undefined);
       }
-      const session = await deps.open(options, controller.signal);
-      if (controller.signal.aborted || openGeneration !== generation || !eligible()) {
+      const session = await this.deps.open(options, controller.signal);
+      if (controller.signal.aborted || openGeneration !== this.generation || !this.eligible()) {
         // Adoption transfers ownership to the current lifecycle generation.
         // A stale opening must compare that session with the desired revision,
         // rather than close it because its captured revision is older.
-        if (active === session && desired && activeKey === deps.keyFor(desired) &&
-          !session.isClosed() && eligible()) return session;
+        if (this.active === session && this.desired && this.activeKey === this.deps.keyFor(this.desired) &&
+          !session.isClosed() && this.eligible()) return session;
         await session.close().catch(() => undefined);
         throw new Error("Connection attempt was cancelled.");
       }
-      const previous = active;
-      active = session;
-      activeKey = key;
-      connectedAtMs = now();
-      update({ phase: "connected", nextRetryAtMs: null, closureReason: null });
-      watchClosure(session, openGeneration);
-      scheduleUpgrade(openGeneration);
+      const previous = this.active;
+      this.active = session;
+      this.activeKey = key;
+      this.connectedAtMs = this.now();
+      this.update({ phase: "connected", nextRetryAtMs: null, closureReason: null });
+      this.watchClosure(session, openGeneration);
+      this.scheduleUpgrade(openGeneration);
       if (previous && previous !== session) await previous.close().catch(() => undefined);
       return session;
     })();
-    opening = pending;
-    openingKey = key;
+    this.opening = pending;
+    this.openingKey = key;
     try {
       return await pending;
     } catch (error) {
-      if (openGeneration === generation && eligible()) {
+      if (openGeneration === this.generation && this.eligible()) {
         const message = error instanceof Error ? error.message : String(error);
-        scheduleRetry(message);
+        this.scheduleRetry(message);
       }
       throw error;
     } finally {
-      if (opening === pending) {
-        opening = null;
-        openingKey = "";
-        openingController = null;
+      if (this.opening === pending) {
+        this.opening = null;
+        this.openingKey = "";
+        this.openingController = null;
       }
     }
   };
 
-  const suspend = async (): Promise<void> => {
-    generation += 1;
-    cancelOpening();
-    const previous = active;
-    active = null;
-    activeKey = "";
-    update({ phase: "suspended", nextRetryAtMs: null });
+  private suspend = async (): Promise<void> => {
+    this.generation += 1;
+    this.cancelOpening();
+    const previous = this.active;
+    this.active = null;
+    this.activeKey = "";
+    this.update({ phase: "suspended", nextRetryAtMs: null });
     await previous?.close().catch(() => undefined);
   };
 
-  const attemptNow = async (): Promise<void> => {
-    if (!eligible() || (active && !active.isClosed())) return;
-    if (opening) {
-      await opening.catch(() => undefined);
+  private attemptNow = async (): Promise<void> => {
+    if (!this.eligible() || (this.active && !this.active.isClosed())) return;
+    if (this.opening) {
+      await this.opening.catch(() => undefined);
       return;
     }
-    generation += 1;
+    this.generation += 1;
     try {
-      await openDesired(generation);
+      await this.openDesired(this.generation);
     } catch {
       // Retry scheduling is owned by openDesired.
     }
   };
 
-  const ensureSession = async (options?: TOptions): Promise<SyncpeerSessionHandle> => {
-    if (options) desired = options;
-    if (active && !active.isClosed() && desired && activeKey === deps.keyFor(desired)) return active;
-    if (!eligible()) throw new Error("Connection is suspended or offline.");
-    if (opening && desired && openingKey === deps.keyFor(desired)) return opening;
-    generation += 1;
-    const refreshGeneration = generation;
-    if (opening) {
-      const staleOpening = opening;
-      cancelOpening();
+  private ensureSession = async (options?: TOptions): Promise<SyncpeerSessionHandle> => {
+    if (options) this.desired = options;
+    if (this.active && !this.active.isClosed() && this.desired && this.activeKey === this.deps.keyFor(this.desired)) return this.active;
+    if (!this.eligible()) throw new Error("Connection is suspended or offline.");
+    if (this.opening && this.desired && this.openingKey === this.deps.keyFor(this.desired)) return this.opening;
+    this.generation += 1;
+    const refreshGeneration = this.generation;
+    if (this.opening) {
+      const staleOpening = this.opening;
+      this.cancelOpening();
       await staleOpening.catch(() => undefined);
     }
-    const current = desired;
+    const current = this.desired;
     if (!current) throw new Error("No connection options are active.");
-    if (refreshGeneration !== generation) return ensureSession(current);
+    if (refreshGeneration !== this.generation) return this.ensureSession(current);
     try {
-      return await openDesired(refreshGeneration);
+      return await this.openDesired(refreshGeneration);
     } catch (error) {
-      if (active && !active.isClosed() && activeKey === deps.keyFor(current)) return active;
-      if (refreshGeneration !== generation && desired !== null &&
-        deps.keyFor(desired) === deps.keyFor(current)) return ensureSession(current);
+      if (this.active && !this.active.isClosed() && this.activeKey === this.deps.keyFor(current)) return this.active;
+      if (refreshGeneration !== this.generation && this.desired !== null &&
+        this.deps.keyFor(this.desired) === this.deps.keyFor(current)) return this.ensureSession(current);
       throw error;
     }
   };
 
-  return {
-    connect: async (options) => {
-      desired = options;
-      if (!eligible()) throw new Error("Connection is suspended or offline.");
-      const key = deps.keyFor(options);
-      if (active && !active.isClosed() && activeKey === key) return active;
-      if (opening && openingKey === key) return opening;
-      generation += 1;
-      const connectGeneration = generation;
-      cancelOpening();
-      if (!desired || deps.keyFor(desired) !== key) {
+  private connect = async (options: TOptions) => {
+      this.desired = options;
+      if (!this.eligible()) throw new Error("Connection is suspended or offline.");
+      const key = this.deps.keyFor(options);
+      if (this.active && !this.active.isClosed() && this.activeKey === key) return this.active;
+      if (this.opening && this.openingKey === key) return this.opening;
+      this.generation += 1;
+      const connectGeneration = this.generation;
+      this.cancelOpening();
+      if (!this.desired || this.deps.keyFor(this.desired) !== key) {
         throw new Error("Connection attempt was cancelled.");
       }
       try {
-        return await openDesired(generation);
+        return await this.openDesired(this.generation);
       } catch (error) {
-        if (active && !active.isClosed() && activeKey === deps.keyFor(options)) return active;
-        if (connectGeneration !== generation && desired !== null &&
-          deps.keyFor(desired) === deps.keyFor(options)) return ensureSession(options);
+        if (this.active && !this.active.isClosed() && this.activeKey === this.deps.keyFor(options)) return this.active;
+        if (connectGeneration !== this.generation && this.desired !== null &&
+          this.deps.keyFor(this.desired) === this.deps.keyFor(options)) return this.ensureSession(options);
         throw error;
       }
-    },
-    adopt: async (options, session) => {
-      const key = deps.keyFor(options);
-      if (!desired || deps.keyFor(desired) !== key || !eligible() || session.isClosed()) {
+  };
+  private adopt = async (options: TOptions, session: SyncpeerSessionHandle) => {
+      const key = this.deps.keyFor(options);
+      if (!this.desired || this.deps.keyFor(this.desired) !== key || !this.eligible() || session.isClosed()) {
         await session.close().catch(() => undefined);
         return false;
       }
-      generation += 1;
-      cancelOpening();
-      const previous = active;
-      active = session;
-      activeKey = key;
-      connectedAtMs = now();
-      failureStreak = 0;
-      update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
-      watchClosure(session, generation);
-      scheduleUpgrade(generation);
+      this.generation += 1;
+      this.cancelOpening();
+      const previous = this.active;
+      this.active = session;
+      this.activeKey = key;
+      this.connectedAtMs = this.now();
+      this.failureStreak = 0;
+      this.update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
+      this.watchClosure(session, this.generation);
+      this.scheduleUpgrade(this.generation);
       if (previous && previous !== session) await previous.close().catch(() => undefined);
       return true;
-    },
-    adoptIncoming: async (options, session) => {
+  };
+  private adoptIncoming = async (options: TOptions, session: SyncpeerSessionHandle) => {
       // No connect attempt is active yet, so eligibility is checked without
       // requiring a desired connection; the incoming session becomes desired.
-      if (!online || !(foreground || transferActive) || session.isClosed()) {
+      if (!this.online || !(this.foreground || this.transferActive) || session.isClosed()) {
         await session.close().catch(() => undefined);
         return false;
       }
-      desired = options;
-      const key = deps.keyFor(options);
-      generation += 1;
-      cancelOpening();
-      const previous = active;
-      active = session;
-      activeKey = key;
-      connectedAtMs = now();
-      failureStreak = 0;
-      update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
-      watchClosure(session, generation);
+      this.desired = options;
+      const key = this.deps.keyFor(options);
+      this.generation += 1;
+      this.cancelOpening();
+      const previous = this.active;
+      this.active = session;
+      this.activeKey = key;
+      this.connectedAtMs = this.now();
+      this.failureStreak = 0;
+      this.update({ phase: "connected", attempt: 0, nextRetryAtMs: null, closureReason: null });
+      this.watchClosure(session, this.generation);
       if (previous && previous !== session) await previous.close().catch(() => undefined);
       return true;
-    },
-    disconnect: async () => {
-      desired = null;
-      generation += 1;
-      cancelOpening();
-      update({ phase: "stopping", nextRetryAtMs: null });
-      const previous = active;
-      active = null;
-      activeKey = "";
-      await previous?.close().catch(() => undefined);
-      failureStreak = 0;
-      update({ ...initialState() });
-    },
-    ensureSession,
-    getSession: () => active,
-    getState: () => ({ ...state }),
-    subscribe: (listener) => {
-      listeners.add(listener);
-      listener({ ...state });
-      return () => listeners.delete(listener);
-    },
-    setOnline: async (nextOnline) => {
-      online = nextOnline;
-      if (online) await attemptNow();
-    },
-    setForeground: async (nextForeground) => {
-      foreground = nextForeground;
-      if (!foreground && !transferActive) await suspend();
-      else if (foreground) {
-        await attemptNow();
-        scheduleUpgrade(generation);
-      }
-    },
-    setTransferActive: async (activeTransfer) => {
-      transferActive = activeTransfer;
-      if (!transferActive && !foreground) await suspend();
-      else if (transferActive) await attemptNow();
-      else scheduleUpgrade(generation);
-    },
   };
-};
+  private disconnect = async () => {
+      this.desired = null;
+      this.generation += 1;
+      this.cancelOpening();
+      this.update({ phase: "stopping", nextRetryAtMs: null });
+      const previous = this.active;
+      this.active = null;
+      this.activeKey = "";
+      await previous?.close().catch(() => undefined);
+      this.failureStreak = 0;
+      this.update({ ...initialState() });
+  };
+  private getSession = () => this.active;
+  private getState = () => ({ ...this.state });
+  private subscribe = (listener: (state: ConnectionLifecycleState) => void) => {
+      this.listeners.add(listener);
+      listener({ ...this.state });
+      return () => this.listeners.delete(listener);
+  };
+  private setOnline = async (nextOnline: boolean) => {
+      this.online = nextOnline;
+      if (this.online) await this.attemptNow();
+  };
+  private setForeground = async (nextForeground: boolean) => {
+      this.foreground = nextForeground;
+      if (!this.foreground && !this.transferActive) await this.suspend();
+      else if (this.foreground) {
+        await this.attemptNow();
+        this.scheduleUpgrade(this.generation);
+      }
+  };
+  private setTransferActive = async (activeTransfer: boolean) => {
+      this.transferActive = activeTransfer;
+      if (!this.transferActive && !this.foreground) await this.suspend();
+      else if (this.transferActive) await this.attemptNow();
+      else this.scheduleUpgrade(this.generation);
+  };
+  api(): ConnectionLifecycle<TOptions> {
+    return {
+      connect: this.connect,
+      adopt: this.adopt,
+      adoptIncoming: this.adoptIncoming,
+      disconnect: this.disconnect,
+      ensureSession: this.ensureSession,
+      getSession: this.getSession,
+      getState: this.getState,
+      subscribe: this.subscribe,
+      setOnline: this.setOnline,
+      setForeground: this.setForeground,
+      setTransferActive: this.setTransferActive,
+    };
+  }
+}
+
+export const createConnectionLifecycle = <TOptions>(deps: ConnectionLifecycleDeps<TOptions>): ConnectionLifecycle<TOptions> =>
+  new ConnectionLifecycleRuntime(deps).api();

@@ -1,3 +1,4 @@
+// code-analysis-disable lines -- Packaged two-app E2E harness; scenario steps and session-log instrumentation are kept together for readability.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir } from "node:fs/promises";
@@ -326,11 +327,8 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
     );
     const list = summary?.parentElement?.querySelector("ul.list");
     if (!list) throw new Error("The session log list is unavailable.");
-    const observer = new MutationObserver((records) => {
-      for (const record of records)
-        for (const node of record.addedNodes) {
-          if (!(node instanceof Element) || !node.matches("li")) continue;
-          for (const entry of node.querySelectorAll(".item-meta")) {
+    type Observed = typeof observed;
+    const processEntry = (entry: Element, node: Element, observed: Observed) => {
             const event = entry.textContent?.split(" | ").at(-1)?.trim();
             if (event === "document.session_folders.queued") {
               const details =
@@ -505,8 +503,14 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
             ) {
               observed.__syntheticFolderTotalCounts?.push(counts.count);
             }
-          }
-        }
+    };
+    const processNode = (node: Node, observed: Observed) => {
+      if (!(node instanceof Element) || !node.matches("li")) return;
+      for (const entry of node.querySelectorAll(".item-meta")) processEntry(entry, node, observed);
+    };
+    const observer = new MutationObserver((records) => {
+      for (const record of records)
+        for (const node of record.addedNodes) processNode(node, observed);
     });
     observer.observe(list, { childList: true });
   });

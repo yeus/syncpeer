@@ -440,7 +440,13 @@ const emitLog = (
   });
 };
 
-const deferred = <T,>() => {
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
+
+const deferred = <T,>(): Deferred<T> => {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
@@ -596,9 +602,219 @@ export const reportClientError = async (
   }
 };
 
-export const createSyncpeerBrowserClient = (
-  options: CreateSyncpeerBrowserClientOptions,
-): SyncpeerBrowserClient => {
+type BrowserClientState = {
+  cachedDefaultIdentity: SyncpeerIdentityRecord | null;
+  activeConnectOptions: ConnectOptions | null;
+  activeResolvedConnectOptions: ConnectOptions | null;
+  focusedFolderId: string | null;
+  incomingService: IncomingService | null;
+  incomingServiceKey: string;
+  incomingServiceClosing: Promise<void>;
+  incomingServiceUpdate: Promise<unknown>;
+  incomingServicePort: number | null;
+  incomingListenerEphemeral: boolean;
+  incomingListenerError: string | null;
+  backgroundListenerActive: boolean;
+  backgroundListenerListenPort: number;
+  sessionConfigurationRefresh: Promise<void>;
+};
+
+type IncomingService = Awaited<ReturnType<typeof startIncomingPeerService>>;
+
+type BrowserClientBase = {
+  options: CreateSyncpeerBrowserClientOptions;
+  platformAdapter: SyncpeerPlatformAdapter;
+  coreAdapter: SyncpeerHostAdapter;
+  coreClient: ReturnType<typeof createSyncpeerCoreClient>;
+  state: BrowserClientState;
+};
+
+type IncomingContext = BrowserClientBase & {
+  resolveDefaultIdentity: () => Promise<SyncpeerIdentityRecord>;
+  getLifecycle: () => ConnectionLifecycle<ConnectOptions>;
+};
+
+type IncomingRuntime = {
+  ensureIncomingService: (
+    connectOptions: ConnectOptions,
+    coreOptions: SyncpeerConnectOptions,
+    background?: boolean,
+  ) => Promise<IncomingService | null>;
+  stopIncomingService: () => Promise<void>;
+  startBackgroundListener: (options?: { listenPort?: number }) => Promise<BackgroundListenerStatus>;
+  stopBackgroundListener: () => Promise<void>;
+  backgroundListenerStatus: () => BackgroundListenerStatus;
+  api: Pick<SyncpeerBrowserClient,
+    "startBackgroundListener" | "stopBackgroundListener" | "backgroundListenerStatus">;
+};
+
+type SessionContext = BrowserClientBase & {
+  resolveDefaultIdentity: () => Promise<SyncpeerIdentityRecord>;
+  incoming: IncomingRuntime;
+};
+
+type SessionRuntime = {
+  lifecycle: ConnectionLifecycle<ConnectOptions>;
+  api: Pick<SyncpeerBrowserClient,
+    | "connectAndSync"
+    | "connectAndGetOverview"
+    | "connectAndGetFolderVersions"
+    | "disconnect"
+    | "releaseLocalCopy"
+    | "setForeground"
+    | "subscribeLifecycle"
+    | "setOnline"
+    | "setTransferActive"
+    | "acknowledgeCachedSync">;
+};
+
+type PairingContext = BrowserClientBase & {
+  identityForPairing: () => Promise<SyncpeerIdentityRecord & { deviceId: string }>;
+  lifecycle: ConnectionLifecycle<ConnectOptions>;
+  incoming: IncomingRuntime;
+};
+
+type InvitationRecord = Awaited<ReturnType<typeof createPairingInvitation>>;
+type PairingInvitationOptions = Parameters<SyncpeerBrowserClient["startPairingInvitation"]>[0];
+type PairingJoinOptions = Parameters<SyncpeerBrowserClient["joinPairingInvitation"]>[0];
+type PairingSocketHandler = NonNullable<
+  Parameters<typeof startIncomingPeerService>[1]["onPairingSocket"]
+>;
+
+type PairingSession = {
+  settled: boolean;
+  completion: Deferred<{ remoteDeviceId: string }>;
+  invitationReady: Deferred<InvitationRecord>;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
+const backgroundSessionOptions = (connectOptions: ConnectOptions | null) => connectOptions
+  ? Object.fromEntries(Object.entries(connectOptions).filter(([key]) => key !== "sharedFolders")) as Omit<ConnectOptions, "sharedFolders">
+  : null;
+
+async function prepareBackgroundHandoff(
+  platformAdapter: SyncpeerPlatformAdapter,
+  connectOptions: ConnectOptions | null,
+) {
+  const backgroundOptions = backgroundSessionOptions(connectOptions);
+  if (backgroundOptions && platformAdapter.prepareBackgroundSession) {
+    await platformAdapter.prepareBackgroundSession(backgroundOptions);
+  }
+}
+
+function tcpEndpoint(value: string, errorMessage: string) {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value.includes("://") ? value : `tcp://${value}`);
+  } catch {
+    throw new Error(errorMessage);
+  }
+  const port = Number(endpoint.port);
+  if (
+    endpoint.protocol !== "tcp:" || !endpoint.hostname ||
+    !Number.isInteger(port) || port < 1 || port > 65535
+  ) {
+    throw new Error(errorMessage);
+  }
+  return { host: endpoint.hostname, port };
+}
+
+const pairingEndpoint = (value: string) =>
+  tcpEndpoint(value, "Invalid pairing invitation endpoint.");
+
+function advertisedPairingEndpoint(value: string, fallbackPort: number) {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value.includes("://") ? value : `tcp://${value}`);
+  } catch {
+    throw new Error("Invalid advertised pairing address.");
+  }
+  if (
+    endpoint.protocol !== "tcp:" || !endpoint.hostname ||
+    (endpoint.pathname !== "" && endpoint.pathname !== "/")
+  ) {
+    throw new Error("Invalid advertised pairing address.");
+  }
+  const port = endpoint.port ? Number(endpoint.port) : fallbackPort;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Invalid advertised pairing address.");
+  }
+  const host = endpoint.hostname.includes(":") ? `[${endpoint.hostname}]` : endpoint.hostname;
+  return `${host}:${port}`;
+}
+
+function relayPairingEndpoint(value: string) {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    throw new Error("Invalid advertised relay pairing address.");
+  }
+  if (
+    endpoint.protocol !== "relay:" || !endpoint.hostname || endpoint.username || endpoint.password ||
+    endpoint.hash || (endpoint.pathname !== "" && endpoint.pathname !== "/")
+  ) {
+    throw new Error("Invalid advertised relay pairing address.");
+  }
+  return endpoint.toString();
+}
+
+type LocalCandidate = Awaited<
+  ReturnType<NonNullable<SyncpeerHostAdapter["discoverLocalCandidates"]>>
+>[number];
+
+function collectDiscoveredDevices(candidates: readonly LocalCandidate[]): LocalDiscoveredDevice[] {
+  const devices = new Map<string, Set<string>>();
+  const anonymousAddresses = new Set<string>();
+  for (const candidate of candidates) {
+    const normalizedId = (candidate.deviceId ?? "")
+      .replace(/[^A-Z2-7]/gi, "")
+      .toUpperCase();
+    const normalizedAddress = candidate.address.trim();
+    if (!normalizedId) {
+      if (normalizedAddress) anonymousAddresses.add(normalizedAddress);
+      continue;
+    }
+    if (!devices.has(normalizedId)) devices.set(normalizedId, new Set<string>());
+    if (normalizedAddress) devices.get(normalizedId)?.add(normalizedAddress);
+  }
+  const known = [...devices.entries()]
+    .map(([deviceId, addresses]) => ({
+      deviceId,
+      addresses: [...addresses].sort(),
+      anonymous: false,
+    }))
+    .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+  const anonymous = [...anonymousAddresses]
+    .sort()
+    .map((address, index) => ({
+      deviceId: `LAN-UNKNOWN-${index + 1}`,
+      addresses: [address],
+      anonymous: true,
+    }));
+  return [...known, ...anonymous];
+}
+
+function createBrowserClientState(): BrowserClientState {
+  return {
+    cachedDefaultIdentity: null,
+    activeConnectOptions: null,
+    activeResolvedConnectOptions: null,
+    focusedFolderId: null,
+    incomingService: null,
+    incomingServiceKey: "",
+    incomingServiceClosing: Promise.resolve(),
+    incomingServiceUpdate: Promise.resolve(),
+    incomingServicePort: null,
+    incomingListenerEphemeral: false,
+    incomingListenerError: null,
+    backgroundListenerActive: false,
+    backgroundListenerListenPort: 22000,
+    sessionConfigurationRefresh: Promise.resolve(),
+  };
+}
+
+function createBrowserClientBase(options: CreateSyncpeerBrowserClientOptions): BrowserClientBase {
   const platformAdapter = options.platformAdapter ?? {};
   const coreAdapter: SyncpeerHostAdapter = {
     ...options.hostAdapter,
@@ -610,738 +826,1200 @@ export const createSyncpeerBrowserClient = (
       logClient(options.onLog, event, details);
     },
   };
-  const coreClient = createSyncpeerCoreClient(coreAdapter);
-
-  let cachedDefaultIdentity: SyncpeerIdentityRecord | null = null;
-  let activeConnectOptions: ConnectOptions | null = null;
-  let activeResolvedConnectOptions: ConnectOptions | null = null;
-  const backgroundSessionOptions = (connectOptions: ConnectOptions | null) => connectOptions
-    ? Object.fromEntries(Object.entries(connectOptions).filter(([key]) => key !== "sharedFolders")) as Omit<ConnectOptions, "sharedFolders">
-    : null;
-  const prepareBackgroundHandoff = async (connectOptions: ConnectOptions | null) => {
-    const backgroundOptions = backgroundSessionOptions(connectOptions);
-    if (backgroundOptions && platformAdapter.prepareBackgroundSession) {
-      await platformAdapter.prepareBackgroundSession(backgroundOptions);
-    }
+  return {
+    options,
+    platformAdapter,
+    coreAdapter,
+    coreClient: createSyncpeerCoreClient(coreAdapter),
+    state: createBrowserClientState(),
   };
-  let focusedFolderId: string | null = null;
-  let incomingService: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
-  let incomingServiceKey = "";
-  let incomingServiceClosing = Promise.resolve();
-  let incomingServiceUpdate: Promise<unknown> = Promise.resolve();
-  let incomingServicePort: number | null = null;
-  let incomingListenerEphemeral = false;
-  let incomingListenerError: string | null = null;
-  let backgroundListenerActive = false;
-  let backgroundListenerListenPort = 22000;
-  let sessionConfigurationRefresh = Promise.resolve();
+}
+
+function createIdentityRecoveryApi(
+  platformAdapter: SyncpeerPlatformAdapter,
+  clearDefaultIdentity: () => void,
+) {
+  return {
+    exportIdentityRecovery: async () => platformAdapter.exportIdentityRecovery
+      ? platformAdapter.exportIdentityRecovery()
+      : throwMissingAdapter("exportIdentityRecovery"),
+    restoreIdentityRecovery: async (recoverySecret: string) => {
+      if (!platformAdapter.restoreIdentityRecovery)
+        return throwMissingAdapter("restoreIdentityRecovery");
+      await platformAdapter.restoreIdentityRecovery(recoverySecret);
+      clearDefaultIdentity();
+    },
+    getDefaultDeviceId: async () => platformAdapter.getDefaultDeviceId
+      ? platformAdapter.getDefaultDeviceId()
+      : throwMissingAdapter("getDefaultDeviceId"),
+    regenerateDefaultIdentity: async () => {
+      if (!platformAdapter.regenerateDefaultIdentity)
+        return throwMissingAdapter("regenerateDefaultIdentity");
+      const deviceId = await platformAdapter.regenerateDefaultIdentity();
+      clearDefaultIdentity();
+      return deviceId;
+    },
+  };
+}
+
+function createIdentityFileApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
+    readBinaryFile: async (path: string) => platformAdapter.readBinaryFile
+      ? platformAdapter.readBinaryFile(path)
+      : throwMissingAdapter("readBinaryFile"),
+    readCachedFile: platformAdapter.readCachedFile
+      ? (folderId: string, path: string) => platformAdapter.readCachedFile!(folderId, path)
+      : undefined,
+    pickUploadFile: async () => platformAdapter.pickUploadFile
+      ? platformAdapter.pickUploadFile()
+      : undefined,
+  };
+}
+
+function createIdentityApi(
+  platformAdapter: SyncpeerPlatformAdapter,
+  clearDefaultIdentity: () => void,
+) {
+  return {
+    ...createIdentityRecoveryApi(platformAdapter, clearDefaultIdentity),
+    ...createIdentityFileApi(platformAdapter),
+  };
+}
+
+function createIdentityController({ platformAdapter, coreAdapter, state }: BrowserClientBase) {
   const resolveDefaultIdentity = async (): Promise<SyncpeerIdentityRecord> => {
-    if (cachedDefaultIdentity) return cachedDefaultIdentity;
-    if (!platformAdapter.readDefaultIdentity) {
+    if (state.cachedDefaultIdentity) return state.cachedDefaultIdentity;
+    if (!platformAdapter.readDefaultIdentity)
       throw new Error("No readDefaultIdentity adapter is configured.");
-    }
-    cachedDefaultIdentity = await platformAdapter.readDefaultIdentity();
-    return cachedDefaultIdentity;
+    state.cachedDefaultIdentity = await platformAdapter.readDefaultIdentity();
+    return state.cachedDefaultIdentity;
   };
-
-  const stopIncomingService = (): Promise<void> => {
-    const service = incomingService;
-    incomingService = null;
-    incomingServiceKey = "";
-    incomingServicePort = null;
-    incomingListenerEphemeral = false;
-    const closing = incomingServiceClosing.then(() => service?.close());
-    incomingServiceClosing = closing.catch(() => undefined);
-    return closing;
-  };
-
-  const backgroundListenerStatus = (): BackgroundListenerStatus => ({
-    active: backgroundListenerActive && incomingService !== null,
-    port: incomingServicePort,
-    ephemeral: incomingListenerEphemeral,
-    error: incomingListenerError,
-  });
-
-  /**
-   * Keep the incoming TLS listener open independently of any connect attempt
-   * so approved peers can dial this device while it is idle.
-   */
-  const startBackgroundListener = async (
-    listenerOptions?: { listenPort?: number },
-  ): Promise<BackgroundListenerStatus> => {
-    if (platformAdapter.incomingSessionOwnedByService || !coreAdapter.listenTls) {
-      backgroundListenerActive = true;
-      return backgroundListenerStatus();
-    }
-    const identity = await resolveDefaultIdentity();
-    backgroundListenerListenPort = localListenPort(
-      listenerOptions?.listenPort ?? backgroundListenerListenPort,
-    );
-    backgroundListenerActive = true;
-    const connectOptions: ConnectOptions = {
-      host: "",
-      port: 0,
-      listenPort: backgroundListenerListenPort,
-      deviceName: "",
-      discoveryMode: "automatic",
-      enableRelayFallback: false,
-    };
-    const coreOptions: SyncpeerConnectOptions = {
-      host: "",
-      port: 0,
-      certPem: identity.certPem,
-      keyPem: identity.keyPem,
-      expectedDeviceId: "",
-      deviceName: "",
-      sharedFolders: [],
-    };
-    try {
-      await ensureIncomingService(connectOptions, coreOptions, true);
-    } catch (error) {
-      backgroundListenerActive = false;
-      incomingListenerError = error instanceof Error ? error.message : String(error);
-      throw error;
-    }
-    return backgroundListenerStatus();
-  };
-
-  const stopBackgroundListener = async (): Promise<void> => {
-    backgroundListenerActive = false;
-    if (!activeConnectOptions) await stopIncomingService();
-  };
-
   const identityForPairing = async () => {
     const identity = await resolveDefaultIdentity();
-    return { ...identity, deviceId: await deviceIdFromCertificate(coreAdapter,
-      certificateDerFromPem(identity.certPem)) };
-  };
-
-  const pairingEndpoint = (value: string) => {
-    let endpoint: URL;
-    try { endpoint = new URL(value.includes("://") ? value : `tcp://${value}`); }
-    catch { throw new Error("Invalid pairing invitation endpoint."); }
-    const port = Number(endpoint.port);
-    if (endpoint.protocol !== "tcp:" || !endpoint.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error("Invalid pairing invitation endpoint.");
-    }
-    return { host: endpoint.hostname, port };
-  };
-
-  const advertisedPairingEndpoint = (value: string, fallbackPort: number) => {
-    let endpoint: URL;
-    try { endpoint = new URL(value.includes("://") ? value : `tcp://${value}`); }
-    catch { throw new Error("Invalid advertised pairing address."); }
-    if (endpoint.protocol !== "tcp:" || !endpoint.hostname ||
-      (endpoint.pathname !== "" && endpoint.pathname !== "/")) {
-      throw new Error("Invalid advertised pairing address.");
-    }
-    const port = endpoint.port ? Number(endpoint.port) : fallbackPort;
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error("Invalid advertised pairing address.");
-    }
-    const host = endpoint.hostname.includes(":") ? `[${endpoint.hostname}]` : endpoint.hostname;
-    return `${host}:${port}`;
-  };
-  const relayPairingEndpoint = (value: string) => {
-    let endpoint: URL;
-    try { endpoint = new URL(value); }
-    catch { throw new Error("Invalid advertised relay pairing address."); }
-    if (endpoint.protocol !== "relay:" || !endpoint.hostname || endpoint.username || endpoint.password ||
-      endpoint.hash || (endpoint.pathname !== "" && endpoint.pathname !== "/")) {
-      throw new Error("Invalid advertised relay pairing address.");
-    }
-    return endpoint.toString();
-  };
-
-  const ensureIncomingService = async (connectOptions: ConnectOptions,
-    coreOptions: SyncpeerConnectOptions,
-    background = false): Promise<typeof incomingService> => {
-    if (platformAdapter.incomingSessionOwnedByService || !coreAdapter.listenTls) return null;
-    const expectedDeviceId = coreOptions.expectedDeviceId ?? "";
-    if (!background && !expectedDeviceId) return null;
-    coreAdapter.log?.("core.incoming.prepare.identity_start", {});
-    const localDeviceId = await deviceIdFromCertificate(coreAdapter,
-      certificateDerFromPem(coreOptions.certPem));
-    coreAdapter.log?.("core.incoming.prepare.trust_start", {});
-    const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
-    coreAdapter.log?.("core.incoming.prepare.trust_done", { deviceCount: trustedDevices.length });
-    const approvedDeviceIds = background && !expectedDeviceId
-      ? trustedDevices
-          .filter(device => device.state === "active")
-          .map(device => device.syncthingId)
-          .filter(id => id && !sameDeviceId(id, localDeviceId))
-      : resolveIncomingPeerDeviceIds(expectedDeviceId, localDeviceId, trustedDevices);
-    if (!background && !approvedDeviceIds.length) { await stopIncomingService(); return null; }
-    const listenPort = localListenPort(connectOptions.listenPort);
-    const automaticRelay = automaticRelayConfiguration(connectOptions);
-    const key = JSON.stringify([localDeviceId, approvedDeviceIds,
-      coreOptions.certPem, coreOptions.keyPem, listenPort, automaticRelay]);
-    const remoteDeviceId = expectedDeviceId;
-    const revision = platformAdapter.sessionConfigurationRevision?.();
-    const prepared = new Map<string, SyncpeerConnectOptions>();
-    for (const remote of approvedDeviceIds) {
-      try {
-        const folders = sameDeviceId(remote, remoteDeviceId) && coreOptions.sharedFolders
-          ? coreOptions.sharedFolders : await platformAdapter.sessionSharedFolders?.(remote) ?? [];
-        logClient(options.onLog, "client.shared_folders.selected", sharedFolderCounts(folders));
-        prepared.set(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase(),
-          { ...coreOptions, expectedDeviceId: remote, sharedFolders: folders,
-            folderPasswords: sameDeviceId(remote, remoteDeviceId) ? coreOptions.folderPasswords : {} });
-      } catch (error) {
-        coreAdapter.log?.("core.incoming.prepare.failed", {
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-    const sessionHandlers = {
-      connectionOptions: (remote: string, endpoint: { host: string; port: number }) => {
-        if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
-          throw new Error("Incoming peer folder preparation changed; reconnect to refresh it.");
-        }
-        const ready = prepared.get(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase());
-        if (!ready) throw new Error("Incoming peer folder preparation is unavailable.");
-        return { ...ready, ...endpoint };
-      },
-      onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
-        if (sameDeviceId(connectedRemoteDeviceId, remoteDeviceId) &&
-          preferredPeerDirection(localDeviceId, connectedRemoteDeviceId) === "incoming") {
-          const resolvedOptions: ConnectOptions = {
-            ...connectOptions,
-            host: coreOptions.host,
-            port: coreOptions.port,
-            cert: coreOptions.certPem,
-            key: coreOptions.keyPem,
-            remoteId: connectedRemoteDeviceId,
-          };
-          void prepareBackgroundHandoff(resolvedOptions)
-            .then(() => lifecycle.adopt(connectOptions, session))
-            .then(adopted => {
-              if (!adopted) return;
-              activeResolvedConnectOptions = resolvedOptions;
-              logClient(options.onLog, "client.session.incoming.ready", {
-                transportKind: session.transportKind, connectionScope: session.connectionScope,
-              });
-            })
-            .catch(error => {
-              void session.close().catch(() => undefined);
-              coreAdapter.log?.("core.background.prepare.failed", {
-                message: error instanceof Error ? error.message : String(error),
-              });
-            });
-          return;
-        }
-        if (!background) return;
-        const preparedOptions = prepared.get(
-          connectedRemoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase());
-        if (!preparedOptions) {
-          void session.close().catch(() => undefined);
-          return;
-        }
-        void lifecycle.adoptIncoming(preparedOptions, session)
-          .then(adopted => {
-            if (!adopted) return;
-            activeResolvedConnectOptions = preparedOptions;
-            logClient(options.onLog, "client.session.incoming.background_ready", {
-              transportKind: session.transportKind, connectionScope: session.connectionScope,
-            });
-            options.onIncomingSession?.({ remoteDeviceId: connectedRemoteDeviceId,
-              options: preparedOptions, session });
-          })
-          .catch(error => {
-            void session.close().catch(() => undefined);
-            coreAdapter.log?.("core.incoming.adopt.failed", {
-              message: error instanceof Error ? error.message : String(error),
-            });
-          });
-      },
+    return {
+      ...identity,
+      deviceId: await deviceIdFromCertificate(
+        coreAdapter,
+        certificateDerFromPem(identity.certPem),
+      ),
     };
-    if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
-      throw new Error("Incoming peer folder preparation changed before the listener started.");
-    }
-    // Serialize listener replacement. Overlapping session opens must not bind
-    // the same listen port twice or rebind before the previous listener closes.
-    const update = incomingServiceUpdate.then(async () => {
-      if (incomingService && incomingServiceKey === key) {
-        incomingService.updateSessionHandlers(sessionHandlers);
-        return incomingService;
-      }
-      coreAdapter.log?.("core.incoming.prepare.previous_close_start", {});
-      await stopIncomingService();
-      coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
-      const startIncoming = (port: number) => startIncomingPeerService(coreAdapter, {
-        host: "0.0.0.0", port, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
-        localDeviceId, approvedDeviceIds, automaticRelay, ...sessionHandlers,
-        // An idle listener may have no approved peers yet; pairing invitations
-        // are owned by the UI pairing flow and use their own listener.
-        onPairingSocket: async accepted => {
-          await accepted.socket.close().catch(() => undefined);
-        },
-        onError: error => coreAdapter.log?.("core.incoming.failed", {
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      });
-      let started: Awaited<ReturnType<typeof startIncomingPeerService>>;
-      try {
-        started = await startIncoming(listenPort);
-        incomingListenerEphemeral = false;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const bindFailure = /could not listen|eaddrinuse|address already in use/i.test(message);
-        if (listenPort !== 0 && bindFailure) {
-          coreAdapter.log?.("core.incoming.listen.retry_ephemeral", { port: listenPort });
-          started = await startIncoming(0);
-          incomingListenerEphemeral = true;
-        } else {
-          incomingListenerError = message;
-          throw error;
-        }
-      }
-      incomingService = started;
-      incomingServiceKey = key;
-      incomingServicePort = started.port;
-      incomingListenerError = null;
-      return incomingService;
-    });
-    incomingServiceUpdate = update.catch(() => undefined);
-    return update;
   };
+  const clearDefaultIdentity = () => {
+    state.cachedDefaultIdentity = null;
+  };
+  return {
+    resolveDefaultIdentity,
+    identityForPairing,
+    api: createIdentityApi(platformAdapter, clearDefaultIdentity),
+  };
+}
 
-  const openSession = async (
-    connectOptions: ConnectOptions,
-    signal: AbortSignal,
-  ): Promise<SyncpeerSessionHandle> => {
-    const normalized = normalizeConnectOptions(connectOptions);
-    coreAdapter.log?.("core.session.open.trust_start", {});
-    const trustedDevices = await platformAdapter.ownedDevices?.().catch(() => []) ?? [];
-    coreAdapter.log?.("core.session.open.trust_done", { deviceCount: trustedDevices.length });
-    if (normalized.remoteId && !resolveApprovedPeerDeviceIds(normalized.remoteId, trustedDevices)
-      .some(id => sameDeviceId(id, normalized.remoteId!))) {
-      throw new Error("This peer was removed from the trusted device list.");
-    }
-    let certPem: string | null = null;
-    let keyPem: string | null = null;
-    let defaultIdentityError: string | null = null;
+function stopIncomingService(state: BrowserClientState): Promise<void> {
+  const service = state.incomingService;
+  state.incomingService = null;
+  state.incomingServiceKey = "";
+  state.incomingServicePort = null;
+  state.incomingListenerEphemeral = false;
+  const closing = state.incomingServiceClosing.then(async () => service?.close());
+  state.incomingServiceClosing = closing.catch(() => undefined);
+  return closing;
+}
 
-    if (normalized.cert) {
-      certPem = await resolvePemValue(platformAdapter, "cert", normalized.cert);
-    }
-    if (normalized.key) {
-      keyPem = await resolvePemValue(platformAdapter, "key", normalized.key);
-    }
+function backgroundListenerStatus(state: BrowserClientState): BackgroundListenerStatus {
+  return {
+    active: state.backgroundListenerActive && state.incomingService !== null,
+    port: state.incomingServicePort,
+    ephemeral: state.incomingListenerEphemeral,
+    error: state.incomingListenerError,
+  };
+}
 
-    if (!certPem || !keyPem) {
-      try {
-        const identity = await resolveDefaultIdentity();
-        if (!certPem) certPem = identity.certPem;
-        if (!keyPem) keyPem = identity.keyPem;
-      } catch (error) {
-        defaultIdentityError = error instanceof Error ? error.message : String(error);
-      }
-    }
+const backgroundListenerConnectOptions = (port: number): ConnectOptions => ({
+  host: "",
+  port: 0,
+  listenPort: port,
+  deviceName: "",
+  discoveryMode: "automatic",
+  enableRelayFallback: false,
+});
 
-    coreAdapter.log?.("core.session.open.identity_done", {});
+const backgroundListenerCoreOptions = (
+  identity: SyncpeerIdentityRecord,
+): SyncpeerConnectOptions => ({
+  host: "",
+  port: 0,
+  certPem: identity.certPem,
+  keyPem: identity.keyPem,
+  expectedDeviceId: "",
+  deviceName: "",
+  sharedFolders: [],
+});
 
-    if (!certPem) {
-      if (defaultIdentityError) {
-        throw new Error(`Missing cert. Provide PEM text or a readable file path. Default identity lookup failed: ${defaultIdentityError}`);
-      }
-      throw new Error("Missing cert. Provide PEM text or a readable file path.");
-    }
-    if (!keyPem) {
-      if (defaultIdentityError) {
-        throw new Error(`Missing key. Provide PEM text or a readable file path. Default identity lookup failed: ${defaultIdentityError}`);
-      }
-      throw new Error("Missing key. Provide PEM text or a readable file path.");
-    }
+async function startBackgroundListenerImpl(
+  ctx: IncomingContext,
+  listenerOptions?: { listenPort?: number },
+): Promise<BackgroundListenerStatus> {
+  if (ctx.platformAdapter.incomingSessionOwnedByService || !ctx.coreAdapter.listenTls) {
+    ctx.state.backgroundListenerActive = true;
+    return backgroundListenerStatus(ctx.state);
+  }
+  const identity = await ctx.resolveDefaultIdentity();
+  ctx.state.backgroundListenerListenPort = localListenPort(
+    listenerOptions?.listenPort ?? ctx.state.backgroundListenerListenPort,
+  );
+  ctx.state.backgroundListenerActive = true;
+  try {
+    await ensureIncomingServiceImpl(
+      ctx,
+      backgroundListenerConnectOptions(ctx.state.backgroundListenerListenPort),
+      backgroundListenerCoreOptions(identity),
+      true,
+    );
+  } catch (error) {
+    ctx.state.backgroundListenerActive = false;
+    ctx.state.incomingListenerError = error instanceof Error ? error.message : String(error);
+    throw error;
+  }
+  return backgroundListenerStatus(ctx.state);
+}
 
-    coreAdapter.log?.("core.session.open.folders_start", {});
-    const sharedFolders = normalized.sharedFolders ??
-      await platformAdapter.sessionSharedFolders?.(normalized.remoteId ?? "");
-    logClient(options.onLog, "client.shared_folders.selected", {
-      ...sharedFolderCounts(sharedFolders ?? []),
-      folderPasswordCount: Object.keys(normalized.folderPasswords ?? {}).length,
-    });
-    const coreOptions: SyncpeerConnectOptions = {
-      host: normalized.host,
-      port: normalized.port,
-      discoveryMode: normalized.discoveryMode,
-      discoveryServer: normalized.discoveryServer,
-      certPem,
-      keyPem,
-      expectedDeviceId: normalized.remoteId,
-      deviceName: normalized.deviceName,
-      timeoutMs: normalized.timeoutMs,
-      enableRelayFallback: normalized.enableRelayFallback,
-      relayOnly: normalized.relayOnly,
-      quicOnly: normalized.quicOnly,
-      folderPasswords: normalized.folderPasswords,
-      sharedFolders,
-    };
-    let listenerFailure: unknown;
-    let service: Awaited<ReturnType<typeof startIncomingPeerService>> | null = null;
+async function stopBackgroundListenerImpl(ctx: IncomingContext): Promise<void> {
+  ctx.state.backgroundListenerActive = false;
+  if (!ctx.state.activeConnectOptions) await stopIncomingService(ctx.state);
+}
+
+async function selectIncomingDevices(
+  ctx: IncomingContext,
+  coreOptions: SyncpeerConnectOptions,
+  background: boolean,
+) {
+  const expectedDeviceId = coreOptions.expectedDeviceId ?? "";
+  if (!background && !expectedDeviceId) return null;
+  ctx.coreAdapter.log?.("core.incoming.prepare.identity_start", {});
+  const localDeviceId = await deviceIdFromCertificate(
+    ctx.coreAdapter,
+    certificateDerFromPem(coreOptions.certPem),
+  );
+  ctx.coreAdapter.log?.("core.incoming.prepare.trust_start", {});
+  const trustedDevices = (await ctx.platformAdapter.ownedDevices?.().catch(() => [])) ?? [];
+  ctx.coreAdapter.log?.("core.incoming.prepare.trust_done", {
+    deviceCount: trustedDevices.length,
+  });
+  const approvedDeviceIds = background && !expectedDeviceId
+    ? trustedDevices
+        .filter((device) => device.state === "active")
+        .map((device) => device.syncthingId)
+        .filter((id) => id && !sameDeviceId(id, localDeviceId))
+    : resolveIncomingPeerDeviceIds(expectedDeviceId, localDeviceId, trustedDevices);
+  return { expectedDeviceId, localDeviceId, approvedDeviceIds };
+}
+
+async function prepareIncomingOptions(
+  ctx: IncomingContext,
+  connectOptions: ConnectOptions,
+  coreOptions: SyncpeerConnectOptions,
+  devices: { expectedDeviceId: string; localDeviceId: string; approvedDeviceIds: string[] },
+) {
+  const listenPort = localListenPort(connectOptions.listenPort);
+  const automaticRelay = automaticRelayConfiguration(connectOptions);
+  const key = JSON.stringify([
+    devices.localDeviceId,
+    devices.approvedDeviceIds,
+    coreOptions.certPem,
+    coreOptions.keyPem,
+    listenPort,
+    automaticRelay,
+  ]);
+  const revision = ctx.platformAdapter.sessionConfigurationRevision?.();
+  const prepared = new Map<string, SyncpeerConnectOptions>();
+  for (const remote of devices.approvedDeviceIds) {
     try {
-      service = await ensureIncomingService(connectOptions, coreOptions);
+      const folders = sameDeviceId(remote, devices.expectedDeviceId) && coreOptions.sharedFolders
+        ? coreOptions.sharedFolders
+        : (await ctx.platformAdapter.sessionSharedFolders?.(remote)) ?? [];
+      logClient(ctx.options.onLog, "client.shared_folders.selected", sharedFolderCounts(folders));
+      prepared.set(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase(), {
+        ...coreOptions,
+        expectedDeviceId: remote,
+        sharedFolders: folders,
+        folderPasswords: sameDeviceId(remote, devices.expectedDeviceId)
+          ? coreOptions.folderPasswords
+          : {},
+      });
     } catch (error) {
-      listenerFailure = error;
-      coreAdapter.log?.("core.incoming.listen.failed", {
+      ctx.coreAdapter.log?.("core.incoming.prepare.failed", {
         message: error instanceof Error ? error.message : String(error),
       });
     }
-    if (service && normalized.remoteId && preferredPeerDirection(
-      await deviceIdFromCertificate(coreAdapter, certificateDerFromPem(certPem)), normalized.remoteId,
-    ) === "incoming") {
-      const deadline = Date.now() + (coreOptions.timeoutMs ?? 15000);
-      while (!signal.aborted && Date.now() < deadline) {
-        const active = lifecycle.getSession();
-        if (active && sameDeviceId(active.remoteDeviceId, normalized.remoteId) && !active.isClosed()) return active;
-        const services = [...new Set([incomingService, service])];
-        const candidate = services.flatMap(value => value?.activeSessions() ?? []).find(value =>
-          sameDeviceId(value.remoteDeviceId, normalized.remoteId!) && !value.session.isClosed());
-        if (candidate) return candidate.session;
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-      if (signal.aborted) {
-        const error = new Error("Connection attempt was cancelled.");
-        error.name = "AbortError";
-        throw error;
-      }
-      throw new Error(`Timed out waiting for the preferred incoming connection from ${normalized.remoteId}.`);
-    }
-    let session: SyncpeerSessionHandle;
-    try {
-      session = await coreClient.openSession(coreOptions, signal);
-    } catch (error) {
-      if (listenerFailure) {
-        throw new AggregateError([error, listenerFailure],
-          `Could not connect to the peer or start the incoming LAN listener on TCP port ${connectOptions.listenPort ?? 22000}.`,
-          { cause: error });
-      }
-      throw error;
-    }
-    if (service && normalized.remoteId) {
-      const admitted = await service.admitOutgoing(normalized.remoteId, session.connectedVia, session);
-      if (!admitted) {
-        const selected = service.activeSessions().find(candidate =>
-          candidate.remoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase() ===
-          normalized.remoteId!.replace(/[^A-Z2-7]/gi, "").toUpperCase());
-        if (!selected) throw new Error("The authenticated peer session was replaced before it became active.");
-        session = selected.session;
-      }
-    }
-    activeResolvedConnectOptions = {
-      ...normalized,
-      cert: certPem,
-      key: keyPem,
-    };
-    await prepareBackgroundHandoff(activeResolvedConnectOptions);
-    logClient(options.onLog, "client.session.open.ready", {
-      transportKind: session.transportKind,
-      connectionScope: session.connectionScope,
-    });
-    return session;
-  };
+  }
+  return { listenPort, automaticRelay, key, revision, prepared };
+}
 
-  const lifecycle: ConnectionLifecycle<ConnectOptions> = createConnectionLifecycle<ConnectOptions>({
-    open: openSession,
+function incomingConnectionOptions(
+  prepared: Map<string, SyncpeerConnectOptions>,
+  revision: number | undefined,
+  platformAdapter: SyncpeerPlatformAdapter,
+) {
+  return (remote: string, endpoint: { host: string; port: number }) => {
+    if (revision !== platformAdapter.sessionConfigurationRevision?.()) {
+      throw new Error("Incoming peer folder preparation changed; reconnect to refresh it.");
+    }
+    const ready = prepared.get(remote.replace(/[^A-Z2-7]/gi, "").toUpperCase());
+    if (!ready) throw new Error("Incoming peer folder preparation is unavailable.");
+    return { ...ready, ...endpoint };
+  };
+}
+
+function handlePreferredIncoming(
+  ctx: IncomingContext,
+  params: {
+    connectOptions: ConnectOptions;
+    coreOptions: SyncpeerConnectOptions;
+    session: SyncpeerSessionHandle;
+    connectedRemoteDeviceId: string;
+  },
+) {
+  const resolvedOptions: ConnectOptions = {
+    ...params.connectOptions,
+    host: params.coreOptions.host,
+    port: params.coreOptions.port,
+    cert: params.coreOptions.certPem,
+    key: params.coreOptions.keyPem,
+    remoteId: params.connectedRemoteDeviceId,
+  };
+  void prepareBackgroundHandoff(ctx.platformAdapter, resolvedOptions)
+    .then(() => ctx.getLifecycle().adopt(params.connectOptions, params.session))
+    .then((adopted) => {
+      if (!adopted) return;
+      ctx.state.activeResolvedConnectOptions = resolvedOptions;
+      logClient(ctx.options.onLog, "client.session.incoming.ready", {
+        transportKind: params.session.transportKind,
+        connectionScope: params.session.connectionScope,
+      });
+    })
+    .catch((error) => {
+      void params.session.close().catch(() => undefined);
+      ctx.coreAdapter.log?.("core.background.prepare.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+}
+
+function handleBackgroundIncoming(
+  ctx: IncomingContext,
+  params: {
+    session: SyncpeerSessionHandle;
+    connectedRemoteDeviceId: string;
+    prepared: Map<string, SyncpeerConnectOptions>;
+  },
+) {
+  const preparedOptions = params.prepared.get(
+    params.connectedRemoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase(),
+  );
+  if (!preparedOptions) {
+    void params.session.close().catch(() => undefined);
+    return;
+  }
+  void ctx.getLifecycle().adoptIncoming(preparedOptions, params.session)
+    .then((adopted) => {
+      if (!adopted) return;
+      ctx.state.activeResolvedConnectOptions = preparedOptions;
+      logClient(ctx.options.onLog, "client.session.incoming.background_ready", {
+        transportKind: params.session.transportKind,
+        connectionScope: params.session.connectionScope,
+      });
+      ctx.options.onIncomingSession?.({
+        remoteDeviceId: params.connectedRemoteDeviceId,
+        options: preparedOptions,
+        session: params.session,
+      });
+    })
+    .catch((error) => {
+      void params.session.close().catch(() => undefined);
+      ctx.coreAdapter.log?.("core.incoming.adopt.failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+}
+
+function createIncomingSessionHandlers(
+  ctx: IncomingContext,
+  params: {
+    connectOptions: ConnectOptions;
+    coreOptions: SyncpeerConnectOptions;
+    expectedDeviceId: string;
+    localDeviceId: string;
+    prepared: Map<string, SyncpeerConnectOptions>;
+    revision: number | undefined;
+    background: boolean;
+  },
+) {
+  return {
+    connectionOptions: incomingConnectionOptions(
+      params.prepared,
+      params.revision,
+      ctx.platformAdapter,
+    ),
+    onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
+      if (
+        sameDeviceId(connectedRemoteDeviceId, params.expectedDeviceId) &&
+        preferredPeerDirection(params.localDeviceId, connectedRemoteDeviceId) === "incoming"
+      ) {
+        handlePreferredIncoming(ctx, { ...params, session, connectedRemoteDeviceId });
+        return;
+      }
+      if (params.background) {
+        handleBackgroundIncoming(ctx, {
+          session,
+          connectedRemoteDeviceId,
+          prepared: params.prepared,
+        });
+      }
+    },
+  };
+}
+
+type IncomingListenerParams = {
+  certPem: string;
+  keyPem: string;
+  localDeviceId: string;
+  approvedDeviceIds: string[];
+  automaticRelay: ReturnType<typeof automaticRelayConfiguration>;
+  listenPort: number;
+  sessionHandlers: ReturnType<typeof createIncomingSessionHandlers>;
+};
+
+function startIncomingPeer(
+  ctx: IncomingContext,
+  params: IncomingListenerParams,
+  port: number,
+): Promise<IncomingService> {
+  return startIncomingPeerService(ctx.coreAdapter, {
+    host: "0.0.0.0",
+    port,
+    certPem: params.certPem,
+    keyPem: params.keyPem,
+    localDeviceId: params.localDeviceId,
+    approvedDeviceIds: params.approvedDeviceIds,
+    automaticRelay: params.automaticRelay,
+    ...params.sessionHandlers,
+    onPairingSocket: async (accepted) => {
+      await accepted.socket.close().catch(() => undefined);
+    },
+    onError: (error) => ctx.coreAdapter.log?.("core.incoming.failed", {
+      message: error instanceof Error ? error.message : String(error),
+    }),
+  });
+}
+
+async function startIncomingWithFallback(
+  ctx: IncomingContext,
+  params: IncomingListenerParams,
+): Promise<IncomingService> {
+  try {
+    const started = await startIncomingPeer(ctx, params, params.listenPort);
+    ctx.state.incomingListenerEphemeral = false;
+    return started;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const bindFailure = /could not listen|eaddrinuse|address already in use/i.test(message);
+    if (params.listenPort !== 0 && bindFailure) {
+      ctx.coreAdapter.log?.("core.incoming.listen.retry_ephemeral", {
+        port: params.listenPort,
+      });
+      const started = await startIncomingPeer(ctx, params, 0);
+      ctx.state.incomingListenerEphemeral = true;
+      return started;
+    }
+    ctx.state.incomingListenerError = message;
+    throw error;
+  }
+}
+
+async function replaceIncomingService(
+  ctx: IncomingContext,
+  params: IncomingListenerParams & { key: string },
+): Promise<IncomingService> {
+  const update = ctx.state.incomingServiceUpdate.then(async () => {
+    if (ctx.state.incomingService && ctx.state.incomingServiceKey === params.key) {
+      ctx.state.incomingService.updateSessionHandlers(params.sessionHandlers);
+      return ctx.state.incomingService;
+    }
+    ctx.coreAdapter.log?.("core.incoming.prepare.previous_close_start", {});
+    await stopIncomingService(ctx.state);
+    ctx.coreAdapter.log?.("core.incoming.prepare.previous_close_done", {});
+    const started = await startIncomingWithFallback(ctx, params);
+    ctx.state.incomingService = started;
+    ctx.state.incomingServiceKey = params.key;
+    ctx.state.incomingServicePort = started.port;
+    ctx.state.incomingListenerError = null;
+    return ctx.state.incomingService;
+  });
+  ctx.state.incomingServiceUpdate = update.catch(() => undefined);
+  return update;
+}
+
+async function ensureIncomingServiceImpl(
+  ctx: IncomingContext,
+  connectOptions: ConnectOptions,
+  coreOptions: SyncpeerConnectOptions,
+  background = false,
+): Promise<IncomingService | null> {
+  if (ctx.platformAdapter.incomingSessionOwnedByService || !ctx.coreAdapter.listenTls) {
+    return null;
+  }
+  const devices = await selectIncomingDevices(ctx, coreOptions, background);
+  if (!devices) return null;
+  if (!background && !devices.approvedDeviceIds.length) {
+    await stopIncomingService(ctx.state);
+    return null;
+  }
+  const prepared = await prepareIncomingOptions(ctx, connectOptions, coreOptions, devices);
+  const sessionHandlers = createIncomingSessionHandlers(ctx, {
+    ...devices,
+    ...prepared,
+    connectOptions,
+    coreOptions,
+    background,
+  });
+  if (prepared.revision !== ctx.platformAdapter.sessionConfigurationRevision?.()) {
+    throw new Error("Incoming peer folder preparation changed before the listener started.");
+  }
+  return replaceIncomingService(ctx, {
+    key: prepared.key,
+    listenPort: prepared.listenPort,
+    certPem: coreOptions.certPem,
+    keyPem: coreOptions.keyPem,
+    localDeviceId: devices.localDeviceId,
+    approvedDeviceIds: devices.approvedDeviceIds,
+    automaticRelay: prepared.automaticRelay,
+    sessionHandlers,
+  });
+}
+
+function createIncomingController(ctx: IncomingContext): IncomingRuntime {
+  const stop = () => stopIncomingService(ctx.state);
+  const status = () => backgroundListenerStatus(ctx.state);
+  const start = (options?: { listenPort?: number }) => startBackgroundListenerImpl(ctx, options);
+  const stopListener = () => stopBackgroundListenerImpl(ctx);
+  const ensure = (
+    connectOptions: ConnectOptions,
+    coreOptions: SyncpeerConnectOptions,
+    background = false,
+  ) => ensureIncomingServiceImpl(ctx, connectOptions, coreOptions, background);
+  return {
+    ensureIncomingService: ensure,
+    stopIncomingService: stop,
+    startBackgroundListener: start,
+    stopBackgroundListener: stopListener,
+    backgroundListenerStatus: status,
+    api: {
+      startBackgroundListener: start,
+      stopBackgroundListener: stopListener,
+      backgroundListenerStatus: status,
+    },
+  };
+}
+
+function assertTrustedPeer(normalized: ConnectOptions, trustedDevices: OwnedSpaceDevice[]) {
+  if (
+    normalized.remoteId &&
+    !resolveApprovedPeerDeviceIds(normalized.remoteId, trustedDevices)
+      .some((id) => sameDeviceId(id, normalized.remoteId!))
+  ) {
+    throw new Error("This peer was removed from the trusted device list.");
+  }
+}
+
+function missingCredential(label: "cert" | "key", defaultIdentityError: string | null) {
+  const suffix = defaultIdentityError
+    ? ` Default identity lookup failed: ${defaultIdentityError}`
+    : "";
+  return new Error(`Missing ${label}. Provide PEM text or a readable file path.${suffix}`);
+}
+
+async function resolveSessionCredentials(
+  ctx: SessionContext,
+  normalized: ConnectOptions,
+): Promise<{ certPem: string; keyPem: string }> {
+  let certPem = normalized.cert
+    ? await resolvePemValue(ctx.platformAdapter, "cert", normalized.cert)
+    : null;
+  let keyPem = normalized.key
+    ? await resolvePemValue(ctx.platformAdapter, "key", normalized.key)
+    : null;
+  let defaultIdentityError: string | null = null;
+  if (!certPem || !keyPem) {
+    try {
+      const identity = await ctx.resolveDefaultIdentity();
+      certPem ??= identity.certPem;
+      keyPem ??= identity.keyPem;
+    } catch (error) {
+      defaultIdentityError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  if (!certPem) throw missingCredential("cert", defaultIdentityError);
+  if (!keyPem) throw missingCredential("key", defaultIdentityError);
+  return { certPem, keyPem };
+}
+
+async function resolveSessionFolders(ctx: SessionContext, normalized: ConnectOptions) {
+  const sharedFolders = normalized.sharedFolders ??
+    await ctx.platformAdapter.sessionSharedFolders?.(normalized.remoteId ?? "");
+  logClient(ctx.options.onLog, "client.shared_folders.selected", {
+    ...sharedFolderCounts(sharedFolders ?? []),
+    folderPasswordCount: Object.keys(normalized.folderPasswords ?? {}).length,
+  });
+  return sharedFolders;
+}
+
+function buildCoreConnectOptions(
+  normalized: ConnectOptions,
+  credentials: { certPem: string; keyPem: string },
+  sharedFolders: ConnectOptions["sharedFolders"],
+): SyncpeerConnectOptions {
+  return {
+    host: normalized.host,
+    port: normalized.port,
+    discoveryMode: normalized.discoveryMode,
+    discoveryServer: normalized.discoveryServer,
+    certPem: credentials.certPem,
+    keyPem: credentials.keyPem,
+    expectedDeviceId: normalized.remoteId,
+    deviceName: normalized.deviceName,
+    timeoutMs: normalized.timeoutMs,
+    enableRelayFallback: normalized.enableRelayFallback,
+    relayOnly: normalized.relayOnly,
+    quicOnly: normalized.quicOnly,
+    folderPasswords: normalized.folderPasswords,
+    sharedFolders,
+  };
+}
+
+async function prepareIncomingListener(
+  ctx: SessionContext,
+  connectOptions: ConnectOptions,
+  coreOptions: SyncpeerConnectOptions,
+) {
+  try {
+    return {
+      service: await ctx.incoming.ensureIncomingService(connectOptions, coreOptions),
+      failure: undefined as unknown,
+    };
+  } catch (error) {
+    ctx.coreAdapter.log?.("core.incoming.listen.failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { service: null, failure: error };
+  }
+}
+
+async function waitForPreferredIncoming(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  normalized: ConnectOptions,
+  coreOptions: SyncpeerConnectOptions,
+  service: IncomingService | null,
+  signal: AbortSignal,
+) {
+  const remoteId = normalized.remoteId;
+  if (!service || !remoteId) return undefined;
+  const localDeviceId = await deviceIdFromCertificate(
+    ctx.coreAdapter,
+    certificateDerFromPem(coreOptions.certPem),
+  );
+  if (preferredPeerDirection(localDeviceId, remoteId) !== "incoming") return undefined;
+  const deadline = Date.now() + (coreOptions.timeoutMs ?? 15000);
+  while (!signal.aborted && Date.now() < deadline) {
+    const active = lifecycle.getSession();
+    if (active && sameDeviceId(active.remoteDeviceId, remoteId) && !active.isClosed()) {
+      return active;
+    }
+    const services = [...new Set([ctx.state.incomingService, service])];
+    const candidate = services.flatMap((value) => value?.activeSessions() ?? []).find((value) =>
+      sameDeviceId(value.remoteDeviceId, remoteId) && !value.session.isClosed());
+    if (candidate) return candidate.session;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (signal.aborted) {
+    const error = new Error("Connection attempt was cancelled.");
+    error.name = "AbortError";
+    throw error;
+  }
+  throw new Error(`Timed out waiting for the preferred incoming connection from ${remoteId}.`);
+}
+
+async function openCoreSession(
+  ctx: SessionContext,
+  coreOptions: SyncpeerConnectOptions,
+  signal: AbortSignal,
+  listenerFailure: unknown,
+  listenPort: number,
+) {
+  try {
+    return await ctx.coreClient.openSession(coreOptions, signal);
+  } catch (error) {
+    if (listenerFailure) {
+      throw new AggregateError(
+        [error, listenerFailure],
+        `Could not connect to the peer or start the incoming LAN listener on TCP port ${listenPort}.`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+async function admitOutgoingSession(
+  session: SyncpeerSessionHandle,
+  normalized: ConnectOptions,
+  service: IncomingService | null,
+) {
+  if (!service || !normalized.remoteId) return session;
+  const remoteId = normalized.remoteId;
+  const admitted = await service.admitOutgoing(remoteId, session.connectedVia, session);
+  if (admitted) return session;
+  const normalizedRemote = remoteId.replace(/[^A-Z2-7]/gi, "").toUpperCase();
+  const selected = service.activeSessions().find((candidate) =>
+    candidate.remoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase() === normalizedRemote);
+  if (!selected) {
+    throw new Error("The authenticated peer session was replaced before it became active.");
+  }
+  return selected.session;
+}
+
+async function prepareSession(ctx: SessionContext, connectOptions: ConnectOptions) {
+  const normalized = normalizeConnectOptions(connectOptions);
+  ctx.coreAdapter.log?.("core.session.open.trust_start", {});
+  const trustedDevices = (await ctx.platformAdapter.ownedDevices?.().catch(() => [])) ?? [];
+  ctx.coreAdapter.log?.("core.session.open.trust_done", {
+    deviceCount: trustedDevices.length,
+  });
+  assertTrustedPeer(normalized, trustedDevices);
+  const credentials = await resolveSessionCredentials(ctx, normalized);
+  const sharedFolders = await resolveSessionFolders(ctx, normalized);
+  const coreOptions = buildCoreConnectOptions(normalized, credentials, sharedFolders);
+  return { normalized, credentials, coreOptions };
+}
+
+async function openSessionImpl(
+  ctx: SessionContext,
+  getLifecycle: () => ConnectionLifecycle<ConnectOptions>,
+  connectOptions: ConnectOptions,
+  signal: AbortSignal,
+): Promise<SyncpeerSessionHandle> {
+  const { normalized, credentials, coreOptions } = await prepareSession(ctx, connectOptions);
+  const listener = await prepareIncomingListener(ctx, connectOptions, coreOptions);
+  const preferred = await waitForPreferredIncoming(
+    ctx,
+    getLifecycle(),
+    normalized,
+    coreOptions,
+    listener.service,
+    signal,
+  );
+  if (preferred) return preferred;
+  let session = await openCoreSession(
+    ctx,
+    coreOptions,
+    signal,
+    listener.failure,
+    connectOptions.listenPort ?? 22000,
+  );
+  session = await admitOutgoingSession(session, normalized, listener.service);
+  ctx.state.activeResolvedConnectOptions = {
+    ...normalized,
+    cert: credentials.certPem,
+    key: credentials.keyPem,
+  };
+  await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
+  logClient(ctx.options.onLog, "client.session.open.ready", {
+    transportKind: session.transportKind,
+    connectionScope: session.connectionScope,
+  });
+  return session;
+}
+
+async function refreshSessionConfiguration(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  requestedRevision: number | undefined,
+) {
+  if (requestedRevision !== ctx.platformAdapter.sessionConfigurationRevision?.()) return;
+  const currentOptions = ctx.state.activeConnectOptions ?? ctx.state.activeResolvedConnectOptions;
+  if (!currentOptions) return;
+  try {
+    await lifecycle.ensureSession(currentOptions);
+  } catch (error) {
+    ctx.coreAdapter.log?.("core.session.refresh.failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function createSessionLifecycle(
+  ctx: SessionContext,
+  open: (connectOptions: ConnectOptions, signal: AbortSignal) => Promise<SyncpeerSessionHandle>,
+) {
+  const lifecycle = createConnectionLifecycle<ConnectOptions>({
+    open,
     keyFor: (connectOptions) => serializeConnectionKey(
       normalizeConnectOptions(connectOptions),
       connectOptions.cert ?? "default-cert",
       connectOptions.key ?? "default-key",
-      platformAdapter.sessionConfigurationRevision?.() ?? 0,
+      ctx.platformAdapter.sessionConfigurationRevision?.() ?? 0,
     ),
   });
-  platformAdapter.onSessionConfigurationChange?.(() => {
-    const requestedRevision = platformAdapter.sessionConfigurationRevision?.();
-    sessionConfigurationRefresh = sessionConfigurationRefresh.then(async () => {
-      if (requestedRevision !== platformAdapter.sessionConfigurationRevision?.()) return;
-      const currentOptions = activeConnectOptions ?? activeResolvedConnectOptions;
-      if (!currentOptions) return;
-      try {
-        // The lifecycle key includes the session-configuration revision. Reusing
-        // the current options therefore retires the stale session while keeping
-        // the incoming listener alive; ensureIncomingService updates its
-        // prepared folder handlers before the replacement handshake.
-        await lifecycle.ensureSession(currentOptions);
-      } catch (error) {
-        coreAdapter.log?.("core.session.refresh.failed", {
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
-    });
-  });
-  const ensureSession = (connectOptions: ConnectOptions): Promise<SyncpeerSessionHandle> =>
-    lifecycle.ensureSession(connectOptions);
-
-  const withSessionOperation = async <TResult>(
-    connectOptions: ConnectOptions | null,
-    operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
-  ): Promise<TResult> => {
-    return withMetadataSession(
-      connectOptions,
-      ensureSession,
-      focusedFolderId,
-      operation,
+  ctx.platformAdapter.onSessionConfigurationChange?.(() => {
+    const requestedRevision = ctx.platformAdapter.sessionConfigurationRevision?.();
+    ctx.state.sessionConfigurationRefresh = ctx.state.sessionConfigurationRefresh.then(
+      () => refreshSessionConfiguration(ctx, lifecycle, requestedRevision),
     );
-  };
+  });
+  return lifecycle;
+}
 
-  const remoteFsLike = createRecoveringRemoteFs({
-    getOptions: () => activeConnectOptions,
-    ensureSession,
-    getFocusedFolderId: () => focusedFolderId,
-    setFocusedFolderId: (folderId) => { focusedFolderId = folderId; },
+function createRemoteFsLike(ctx: SessionContext, lifecycle: ConnectionLifecycle<ConnectOptions>) {
+  return createRecoveringRemoteFs({
+    getOptions: () => ctx.state.activeConnectOptions,
+    ensureSession: (options) => lifecycle.ensureSession(options),
+    getFocusedFolderId: () => ctx.state.focusedFolderId,
+    setFocusedFolderId: (folderId) => { ctx.state.focusedFolderId = folderId; },
     getActiveSession: lifecycle.getSession,
   });
+}
 
-  const setSessionForeground = async (foreground: boolean) => {
-    if (foreground) {
-      await platformAdapter.stopBackgroundSession?.();
-      await lifecycle.setForeground(true);
-      await prepareBackgroundHandoff(activeResolvedConnectOptions);
-      return;
+function withSessionOperation<TResult>(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  connectOptions: ConnectOptions | null,
+  operation: (session: SyncpeerSessionHandle) => Promise<TResult>,
+) {
+  return withMetadataSession(
+    connectOptions,
+    (options) => lifecycle.ensureSession(options),
+    ctx.state.focusedFolderId,
+    operation,
+  );
+}
+
+async function setSessionForegroundImpl(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  foreground: boolean,
+) {
+  if (foreground) {
+    await ctx.platformAdapter.stopBackgroundSession?.();
+    await lifecycle.setForeground(true);
+    await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
+    return;
+  }
+  const backgroundOptions = backgroundSessionOptions(ctx.state.activeResolvedConnectOptions);
+  const backgroundSession = backgroundOptions && ctx.platformAdapter.startBackgroundSession
+    ? ctx.platformAdapter.startBackgroundSession(backgroundOptions)
+    : null;
+  backgroundSession?.catch(() => undefined);
+  if (ctx.platformAdapter.startBackgroundSession) {
+    await lifecycle.setTransferActive(false);
+  }
+  await lifecycle.setForeground(false);
+  await ctx.incoming.stopIncomingService();
+  if (backgroundSession) await backgroundSession;
+}
+
+async function releaseLocalCopyImpl(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  folderId: string,
+  mode: "safe" | "dangerous",
+  confirmedText = "",
+) {
+  if (!ctx.platformAdapter.releaseLocalCopy) {
+    throw new Error("Local copy release is unavailable on this platform.");
+  }
+  const handoff = mode === "safe" && !!ctx.platformAdapter.startBackgroundSession;
+  if (handoff && !ctx.state.activeResolvedConnectOptions) {
+    throw new Error("Connect to a peer before verifying online copies.");
+  }
+  try {
+    if (handoff) await setSessionForegroundImpl(ctx, lifecycle, false);
+    const sessions = [
+      ...(ctx.state.incomingService?.activeSessions().map((value) => value.session) ?? []),
+      ...(lifecycle.getSession() ? [lifecycle.getSession()!] : []),
+    ].filter((session) => !session.isClosed());
+    await ctx.platformAdapter.releaseLocalCopy(folderId, mode, confirmedText, sessions);
+    if (!handoff) {
+      await lifecycle.disconnect();
+      await ctx.incoming.stopIncomingService();
     }
-    // Android arms this request while the activity is foreground. Native
-    // activity lifecycle code can therefore start the foreground service at
-    // onPause, without depending on a delayed WebView visibility callback.
-    const backgroundOptions = backgroundSessionOptions(activeResolvedConnectOptions);
-    const backgroundSession = backgroundOptions && platformAdapter.startBackgroundSession
-      ? platformAdapter.startBackgroundSession(backgroundOptions)
-      : null;
-    backgroundSession?.catch(() => undefined);
-    if (platformAdapter.startBackgroundSession) {
-      // The background service owns synchronization after the handoff. A paused
-      // foreground WebView cannot make progress on a transfer, and keeping its
-      // session alive would block the service from dialing a peer that allows
-      // one connection per device.
-      await lifecycle.setTransferActive(false);
-    }
-    await lifecycle.setForeground(false);
-    await stopIncomingService();
-    if (backgroundSession) await backgroundSession;
-  };
+  } finally {
+    if (handoff) await setSessionForegroundImpl(ctx, lifecycle, true);
+  }
+}
+
+async function connectAndSyncImpl(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  remoteFsLike: ReturnType<typeof createRemoteFsLike>,
+  connectOptions: ConnectOptions,
+) {
+  ctx.state.activeConnectOptions = connectOptions;
+  await lifecycle.connect(connectOptions);
+  return remoteFsLike;
+}
+
+async function connectAndGetOverviewImpl(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  connectOptions: ConnectOptions,
+) {
+  const overview = await withSessionOperation(
+    ctx,
+    lifecycle,
+    connectOptions,
+    (session) => toConnectionOverview(session),
+  );
+  ctx.state.activeConnectOptions = connectOptions;
+  return overview;
+}
+
+async function connectAndGetFolderVersionsImpl(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+  connectOptions: ConnectOptions,
+) {
+  const versions = await withSessionOperation(
+    ctx,
+    lifecycle,
+    connectOptions,
+    (session) => Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
+  );
+  ctx.state.activeConnectOptions = connectOptions;
+  return versions;
+}
+
+async function disconnectSessionImpl(
+  ctx: SessionContext,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+) {
+  ctx.state.activeConnectOptions = null;
+  ctx.state.activeResolvedConnectOptions = null;
+  ctx.state.focusedFolderId = null;
+  if (!ctx.state.backgroundListenerActive) {
+    await ctx.platformAdapter.stopBackgroundSession?.();
+  }
+  await lifecycle.disconnect();
+  if (ctx.state.backgroundListenerActive) {
+    await ctx.incoming.startBackgroundListener({
+      listenPort: ctx.state.backgroundListenerListenPort,
+    });
+  } else {
+    await ctx.incoming.stopIncomingService();
+  }
+}
+
+function createSessionController(ctx: SessionContext): SessionRuntime {
+  const lifecycle = createSessionLifecycle(ctx, (connectOptions, signal) =>
+    openSessionImpl(ctx, () => lifecycle, connectOptions, signal));
+  const remoteFsLike = createRemoteFsLike(ctx, lifecycle);
   return {
-    releaseLocalCopy: async (folderId: string, mode: "safe" | "dangerous", confirmedText = "") => {
-      if (!platformAdapter.releaseLocalCopy) throw new Error("Local copy release is unavailable on this platform.");
-      const handoff = mode === "safe" && !!platformAdapter.startBackgroundSession;
-      if (handoff && !activeResolvedConnectOptions) throw new Error("Connect to a peer before verifying online copies.");
-      try {
-        if (handoff) await setSessionForeground(false);
-        const sessions = [...incomingService?.activeSessions().map(value => value.session) ?? [],
-          ...(lifecycle.getSession() ? [lifecycle.getSession()!] : [])]
-          .filter(session => !session.isClosed());
-        await platformAdapter.releaseLocalCopy(folderId, mode, confirmedText, sessions);
-        if (!handoff) {
-          await lifecycle.disconnect();
-          await stopIncomingService();
-        }
-      } finally {
-        if (handoff) await setSessionForeground(true);
-      }
+    lifecycle,
+    api: {
+      connectAndSync: (connectOptions) =>
+        connectAndSyncImpl(ctx, lifecycle, remoteFsLike, connectOptions),
+      connectAndGetOverview: (connectOptions) =>
+        connectAndGetOverviewImpl(ctx, lifecycle, connectOptions),
+      connectAndGetFolderVersions: (connectOptions) =>
+        connectAndGetFolderVersionsImpl(ctx, lifecycle, connectOptions),
+      disconnect: () => disconnectSessionImpl(ctx, lifecycle),
+      releaseLocalCopy: (folderId, mode, confirmedText) =>
+        releaseLocalCopyImpl(ctx, lifecycle, folderId, mode, confirmedText),
+      setForeground: (foreground) => setSessionForegroundImpl(ctx, lifecycle, foreground),
+      subscribeLifecycle: lifecycle.subscribe,
+      setOnline: lifecycle.setOnline,
+      setTransferActive: lifecycle.setTransferActive,
+      acknowledgeCachedSync: ctx.platformAdapter.acknowledgeCachedSync,
     },
-    startPairingInvitation: async pairingOptions => {
-      const relayAddress = pairingOptions.advertisedHost.startsWith("relay://")
-        ? relayPairingEndpoint(pairingOptions.advertisedHost) : null;
-      if (relayAddress ? !coreAdapter.listenRelay : !coreAdapter.listenTls) {
-        throw new Error(relayAddress ? "This platform cannot accept relay pairing connections."
-          : "This platform cannot accept LAN pairing connections.");
-      }
-      if (!platformAdapter.exportPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
-      // Validate before opening a listener; port zero is resolved after binding.
-      if (!relayAddress) advertisedPairingEndpoint(pairingOptions.advertisedHost, pairingOptions.port || 22000);
-      const identity = await identityForPairing();
-      await platformAdapter.stopBackgroundSession?.();
-      activeConnectOptions = null;
-      activeResolvedConnectOptions = null;
-      focusedFolderId = null;
-      await lifecycle.disconnect();
-      await stopIncomingService();
-      const completion = deferred<{ remoteDeviceId: string }>();
-      const invitationReady = deferred<Awaited<ReturnType<typeof createPairingInvitation>>>();
-      void invitationReady.promise.catch(() => undefined);
-      let settled = false;
-      incomingService = await startIncomingPeerService(coreAdapter, {
-        mode: relayAddress ? "relay" : "direct", ...(relayAddress ? { relayAddress } : {}),
-        host: "0.0.0.0", port: pairingOptions.port ?? 22000, certPem: identity.certPem,
-        keyPem: identity.keyPem, localDeviceId: identity.deviceId, approvedDeviceIds: [],
-        connectionOptions: () => { throw new Error("A pairing invitation does not approve BEP access."); },
-        onSession: session => { void session.close(); },
-        onPairingSocket: async (accepted, remoteDeviceId) => {
-          if (settled) throw new Error("Pairing invitation is unavailable or already used.");
-          logClient(options.onLog, "client.pairing.accept.socket", {});
-          try {
-            const invitationRecord = await invitationReady.promise;
-            logClient(options.onLog, "client.pairing.accept.transfer_start", {});
-            const result = await acceptPairingTransfer({ subtle: crypto.subtle, socket: accepted.socket,
-              invitation: invitationRecord, verifiedRemoteId: remoteDeviceId,
-              createTransfer: joiningDevice => platformAdapter.exportPairingTransfer!(identity.deviceId, joiningDevice),
-              randomBytes: coreAdapter.randomBytes,
-              confirm: pairingOptions.confirm });
-            logClient(options.onLog, "client.pairing.accept.transfer_done", {});
-            settled = true; completion.resolve({ remoteDeviceId: result.remoteDeviceId });
-            setTimeout(() => { void stopIncomingService(); }, 0);
-          } catch (error) {
-            logClient(options.onLog, "client.pairing.accept.failed", {
-              message: error instanceof Error ? error.message : String(error),
-            });
-            settled = true; completion.reject(error); throw error;
-          }
-        },
+  };
+}
+
+function pairingRelayAddress(ctx: PairingContext, pairingOptions: PairingInvitationOptions) {
+  const relayAddress = pairingOptions.advertisedHost.startsWith("relay://")
+    ? relayPairingEndpoint(pairingOptions.advertisedHost)
+    : null;
+  if (relayAddress ? !ctx.coreAdapter.listenRelay : !ctx.coreAdapter.listenTls) {
+    throw new Error(relayAddress
+      ? "This platform cannot accept relay pairing connections."
+      : "This platform cannot accept LAN pairing connections.");
+  }
+  if (!relayAddress) {
+    advertisedPairingEndpoint(pairingOptions.advertisedHost, pairingOptions.port || 22000);
+  }
+  return relayAddress;
+}
+
+async function resetForPairing(ctx: PairingContext) {
+  await ctx.platformAdapter.stopBackgroundSession?.();
+  ctx.state.activeConnectOptions = null;
+  ctx.state.activeResolvedConnectOptions = null;
+  ctx.state.focusedFolderId = null;
+  await ctx.lifecycle.disconnect();
+  await ctx.incoming.stopIncomingService();
+}
+
+function createPairingAcceptHandler(
+  ctx: PairingContext,
+  identity: SyncpeerIdentityRecord & { deviceId: string },
+  pairingOptions: PairingInvitationOptions,
+  session: PairingSession,
+): PairingSocketHandler {
+  return async (accepted, remoteDeviceId) => {
+    if (session.settled) {
+      throw new Error("Pairing invitation is unavailable or already used.");
+    }
+    logClient(ctx.options.onLog, "client.pairing.accept.socket", {});
+    try {
+      const invitationRecord = await session.invitationReady.promise;
+      logClient(ctx.options.onLog, "client.pairing.accept.transfer_start", {});
+      const result = await acceptPairingTransfer({
+        subtle: crypto.subtle,
+        socket: accepted.socket,
+        invitation: invitationRecord,
+        verifiedRemoteId: remoteDeviceId,
+        createTransfer: (joiningDevice) =>
+          ctx.platformAdapter.exportPairingTransfer!(identity.deviceId, joiningDevice),
+        randomBytes: ctx.coreAdapter.randomBytes,
+        confirm: pairingOptions.confirm,
       });
-      incomingServiceKey = "pairing";
-      let invitationRecord: Awaited<ReturnType<typeof createPairingInvitation>>;
-      try {
-        const advertisedEndpoint = relayAddress ?? advertisedPairingEndpoint(pairingOptions.advertisedHost,
-          incomingService.port);
-        invitationRecord = await createPairingInvitation(crypto.subtle, coreAdapter.randomBytes,
-          identity.deviceId, advertisedEndpoint,
-          Date.now() + (pairingOptions.expiresInMs ?? 5 * 60_000));
-        invitationReady.resolve(invitationRecord);
-      } catch (error) {
-        settled = true;
-        invitationReady.reject(error);
-        void completion.promise.catch(() => undefined);
-        await stopIncomingService();
-        throw error;
-      }
-      const timer = setTimeout(() => {
-        if (!settled) { settled = true; completion.reject(new Error("Pairing invitation expired.")); }
-        void stopIncomingService();
-      }, Math.max(0, invitationRecord.invitation.expiresAt - Date.now()));
-      void completion.promise.finally(() => clearTimeout(timer)).catch(() => undefined);
-      return { invitation: invitationRecord.invitation, completed: completion.promise,
-        cancel: async () => {
-          if (!settled) { settled = true; completion.reject(new Error("Pairing invitation cancelled.")); }
-          await stopIncomingService();
-        } };
-    },
-    joinPairingInvitation: async pairingOptions => {
-      if (!platformAdapter.importPairingTransfer) throw new Error("Personal-space pairing storage is unavailable.");
-      logClient(options.onLog, "client.pairing.join.started", {});
-      const identity = await identityForPairing();
-      const relayAddress = pairingOptions.invitation.endpoint.startsWith("relay://")
-        ? relayPairingEndpoint(pairingOptions.invitation.endpoint) : null;
-      let socket: SyncpeerTlsSocket;
-      if (relayAddress) {
-        if (!coreAdapter.connectRelay) throw new Error("This platform cannot join relay pairing connections.");
-        socket = (await connectRelayWithRetry(coreAdapter, { relayAddress,
-          expectedDeviceId: pairingOptions.invitation.deviceId,
-          certPem: identity.certPem, keyPem: identity.keyPem,
-          alpnProtocols: ["syncpeer-pairing/1"] })).socket;
-      } else {
-        socket = await coreAdapter.connectTls({ ...pairingEndpoint(pairingOptions.invitation.endpoint),
-          certPem: identity.certPem, keyPem: identity.keyPem, alpnProtocols: ["syncpeer-pairing/1"] });
-      }
-      logClient(options.onLog, "client.pairing.join.connected", {});
-      try {
-        const verifiedRemoteId = await deviceIdFromCertificate(coreAdapter, await socket.peerCertificateDer());
-        logClient(options.onLog, "client.pairing.join.transfer_start", {});
-        const joined = await joinPersonalSpace({ subtle: crypto.subtle, socket,
-          invitation: pairingOptions.invitation, localDeviceId: identity.deviceId,
-          verifiedRemoteId, randomBytes: coreAdapter.randomBytes, confirm: pairingOptions.confirm });
-        logClient(options.onLog, "client.pairing.join.transfer_done", {});
-        logClient(options.onLog, "client.pairing.join.import_start", {});
-        await platformAdapter.importPairingTransfer(joined.transfer, joined.deviceIdentity, pairingOptions.password,
-          pairingOptions.remember);
-        logClient(options.onLog, "client.pairing.join.import_done", {});
-        return { remoteDeviceId: verifiedRemoteId };
-      } catch (error) {
-        logClient(options.onLog, "client.pairing.join.failed", {
-          message: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      } finally { await socket.close().catch(() => undefined); }
-    },
-    connectAndSync: async (connectOptions: ConnectOptions): Promise<RemoteFsLike> => {
-      // The lifecycle retains these desired options while opening or retrying.
-      // Configuration changes during that work must refresh the same request,
-      // rather than substitute the resolved incoming handoff's PEM/options.
-      activeConnectOptions = connectOptions;
-      await lifecycle.connect(connectOptions);
-      return remoteFsLike;
-    },
-    connectAndGetOverview: async (
-      connectOptions: ConnectOptions,
-    ): Promise<ConnectionOverview> => {
-      const overview = await withSessionOperation(
-        connectOptions,
-        (session) => toConnectionOverview(session),
-      );
-      activeConnectOptions = connectOptions;
-      return overview;
-    },
-    connectAndGetFolderVersions: async (
-      connectOptions: ConnectOptions,
-    ): Promise<FolderSyncState[]> => {
-      const states = await withSessionOperation(
-        connectOptions,
-        (session) => Promise.resolve(session.remoteFs.listFolderSyncStates?.() ?? []),
-      );
-      activeConnectOptions = connectOptions;
-      return states;
-    },
-    discoverLocalDevices: async (discoverOptions?: { timeoutMs?: number }) => {
-      if (!coreAdapter.discoverLocalCandidates) return [];
-      const candidates = await coreAdapter.discoverLocalCandidates({
-        expectedDeviceId: "",
-        timeoutMs: discoverOptions?.timeoutMs,
+      logClient(ctx.options.onLog, "client.pairing.accept.transfer_done", {});
+      session.settled = true;
+      session.completion.resolve({ remoteDeviceId: result.remoteDeviceId });
+      setTimeout(() => { void ctx.incoming.stopIncomingService(); }, 0);
+    } catch (error) {
+      logClient(ctx.options.onLog, "client.pairing.accept.failed", {
+        message: error instanceof Error ? error.message : String(error),
       });
-      const devices = new Map<string, Set<string>>();
-      const anonymousAddresses = new Set<string>();
-      for (const candidate of candidates) {
-        const normalizedId = (candidate.deviceId ?? "")
-          .replace(/[^A-Z2-7]/gi, "")
-          .toUpperCase();
-        const normalizedAddress = candidate.address.trim();
-        if (!normalizedId) {
-          if (normalizedAddress) anonymousAddresses.add(normalizedAddress);
-          continue;
-        }
-        if (!devices.has(normalizedId)) {
-          devices.set(normalizedId, new Set<string>());
-        }
-        if (normalizedAddress) {
-          devices.get(normalizedId)?.add(normalizedAddress);
-        }
-      }
-      const known = [...devices.entries()]
-        .map(([deviceId, addresses]) => ({
-          deviceId,
-          addresses: [...addresses].sort(),
-          anonymous: false,
-        }))
-        .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
-      const anonymous = [...anonymousAddresses]
-        .sort()
-        .map((address, index) => ({
-          deviceId: `LAN-UNKNOWN-${index + 1}`,
-          addresses: [address],
-          anonymous: true,
-        }));
-      return [...known, ...anonymous];
+      session.settled = true;
+      session.completion.reject(error);
+      throw error;
+    }
+  };
+}
+
+async function startPairingListener(
+  ctx: PairingContext,
+  relayAddress: string | null,
+  pairingOptions: PairingInvitationOptions,
+  identity: SyncpeerIdentityRecord & { deviceId: string },
+  onPairingSocket: PairingSocketHandler,
+) {
+  ctx.state.incomingService = await startIncomingPeerService(ctx.coreAdapter, {
+    mode: relayAddress ? "relay" : "direct",
+    ...(relayAddress ? { relayAddress } : {}),
+    host: "0.0.0.0",
+    port: pairingOptions.port ?? 22000,
+    certPem: identity.certPem,
+    keyPem: identity.keyPem,
+    localDeviceId: identity.deviceId,
+    approvedDeviceIds: [],
+    connectionOptions: () => {
+      throw new Error("A pairing invitation does not approve BEP access.");
     },
-    startBackgroundListener,
-    stopBackgroundListener,
-    backgroundListenerStatus,
-    disconnect: async (): Promise<void> => {
-      activeConnectOptions = null;
-      activeResolvedConnectOptions = null;
-      focusedFolderId = null;
-      if (!backgroundListenerActive) await platformAdapter.stopBackgroundSession?.();
-      await lifecycle.disconnect();
-      if (backgroundListenerActive) {
-        await startBackgroundListener({ listenPort: backgroundListenerListenPort });
-      } else {
-        await stopIncomingService();
+    onSession: (session) => { void session.close(); },
+    onPairingSocket,
+  });
+  ctx.state.incomingServiceKey = "pairing";
+}
+
+async function publishPairingInvitation(
+  ctx: PairingContext,
+  identity: SyncpeerIdentityRecord & { deviceId: string },
+  relayAddress: string | null,
+  pairingOptions: PairingInvitationOptions,
+  session: PairingSession,
+) {
+  try {
+    const advertisedEndpoint = relayAddress ?? advertisedPairingEndpoint(
+      pairingOptions.advertisedHost,
+      ctx.state.incomingService!.port,
+    );
+    const invitation = await createPairingInvitation(
+      crypto.subtle,
+      ctx.coreAdapter.randomBytes,
+      identity.deviceId,
+      advertisedEndpoint,
+      Date.now() + (pairingOptions.expiresInMs ?? 5 * 60_000),
+    );
+    session.invitationReady.resolve(invitation);
+    return invitation;
+  } catch (error) {
+    session.settled = true;
+    session.invitationReady.reject(error);
+    void session.completion.promise.catch(() => undefined);
+    await ctx.incoming.stopIncomingService();
+    throw error;
+  }
+}
+
+async function startPairingInvitationImpl(
+  ctx: PairingContext,
+  pairingOptions: PairingInvitationOptions,
+) {
+  const relayAddress = pairingRelayAddress(ctx, pairingOptions);
+  if (!ctx.platformAdapter.exportPairingTransfer) {
+    throw new Error("Personal-space pairing storage is unavailable.");
+  }
+  const identity = await ctx.identityForPairing();
+  await resetForPairing(ctx);
+  const completion = deferred<{ remoteDeviceId: string }>();
+  const invitationReady = deferred<InvitationRecord>();
+  void invitationReady.promise.catch(() => undefined);
+  const session: PairingSession = { settled: false, completion, invitationReady };
+  await startPairingListener(
+    ctx,
+    relayAddress,
+    pairingOptions,
+    identity,
+    createPairingAcceptHandler(ctx, identity, pairingOptions, session),
+  );
+  const invitation = await publishPairingInvitation(
+    ctx,
+    identity,
+    relayAddress,
+    pairingOptions,
+    session,
+  );
+  return finishPairingInvitation(ctx, session, invitation);
+}
+
+function finishPairingInvitation(
+  ctx: PairingContext,
+  session: PairingSession,
+  invitation: InvitationRecord,
+) {
+  session.timer = setTimeout(() => {
+    if (!session.settled) {
+      session.settled = true;
+      session.completion.reject(new Error("Pairing invitation expired."));
+    }
+    void ctx.incoming.stopIncomingService();
+  }, Math.max(0, invitation.invitation.expiresAt - Date.now()));
+  void session.completion.promise
+    .finally(() => { if (session.timer) clearTimeout(session.timer); })
+    .catch(() => undefined);
+  return {
+    invitation: invitation.invitation,
+    completed: session.completion.promise,
+    cancel: async () => {
+      if (!session.settled) {
+        session.settled = true;
+        session.completion.reject(new Error("Pairing invitation cancelled."));
       }
+      await ctx.incoming.stopIncomingService();
     },
-    subscribeLifecycle: lifecycle.subscribe,
-    setOnline: lifecycle.setOnline,
-    setForeground: setSessionForeground,
-    setTransferActive: lifecycle.setTransferActive,
-    acknowledgeCachedSync: platformAdapter.acknowledgeCachedSync,
-    listFavorites: async (): Promise<FavoriteRecord[]> =>
-      platformAdapter.listFavorites
-        ? platformAdapter.listFavorites()
-        : throwMissingAdapter("listFavorites"),
+  };
+}
+
+async function connectPairingSocket(
+  ctx: PairingContext,
+  pairingOptions: PairingJoinOptions,
+  identity: SyncpeerIdentityRecord & { deviceId: string },
+  relayAddress: string | null,
+) {
+  if (relayAddress) {
+    if (!ctx.coreAdapter.connectRelay) {
+      throw new Error("This platform cannot join relay pairing connections.");
+    }
+    return (await connectRelayWithRetry(ctx.coreAdapter, {
+      relayAddress,
+      expectedDeviceId: pairingOptions.invitation.deviceId,
+      certPem: identity.certPem,
+      keyPem: identity.keyPem,
+      alpnProtocols: ["syncpeer-pairing/1"],
+    })).socket;
+  }
+  return ctx.coreAdapter.connectTls({
+    ...pairingEndpoint(pairingOptions.invitation.endpoint),
+    certPem: identity.certPem,
+    keyPem: identity.keyPem,
+    alpnProtocols: ["syncpeer-pairing/1"],
+  });
+}
+
+async function completePairingJoin(
+  ctx: PairingContext,
+  socket: SyncpeerTlsSocket,
+  pairingOptions: PairingJoinOptions,
+  identity: SyncpeerIdentityRecord & { deviceId: string },
+) {
+  try {
+    const verifiedRemoteId = await deviceIdFromCertificate(
+      ctx.coreAdapter,
+      await socket.peerCertificateDer(),
+    );
+    logClient(ctx.options.onLog, "client.pairing.join.transfer_start", {});
+    const joined = await joinPersonalSpace({
+      subtle: crypto.subtle,
+      socket,
+      invitation: pairingOptions.invitation,
+      localDeviceId: identity.deviceId,
+      verifiedRemoteId,
+      randomBytes: ctx.coreAdapter.randomBytes,
+      confirm: pairingOptions.confirm,
+    });
+    logClient(ctx.options.onLog, "client.pairing.join.transfer_done", {});
+    logClient(ctx.options.onLog, "client.pairing.join.import_start", {});
+    await ctx.platformAdapter.importPairingTransfer!(
+      joined.transfer,
+      joined.deviceIdentity,
+      pairingOptions.password,
+      pairingOptions.remember,
+    );
+    logClient(ctx.options.onLog, "client.pairing.join.import_done", {});
+    return { remoteDeviceId: verifiedRemoteId };
+  } catch (error) {
+    logClient(ctx.options.onLog, "client.pairing.join.failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    await socket.close().catch(() => undefined);
+  }
+}
+
+async function joinPairingInvitationImpl(
+  ctx: PairingContext,
+  pairingOptions: PairingJoinOptions,
+) {
+  if (!ctx.platformAdapter.importPairingTransfer) {
+    throw new Error("Personal-space pairing storage is unavailable.");
+  }
+  logClient(ctx.options.onLog, "client.pairing.join.started", {});
+  const identity = await ctx.identityForPairing();
+  const relayAddress = pairingOptions.invitation.endpoint.startsWith("relay://")
+    ? relayPairingEndpoint(pairingOptions.invitation.endpoint)
+    : null;
+  const socket = await connectPairingSocket(ctx, pairingOptions, identity, relayAddress);
+  logClient(ctx.options.onLog, "client.pairing.join.connected", {});
+  return completePairingJoin(ctx, socket, pairingOptions, identity);
+}
+
+function createPairingController(ctx: PairingContext) {
+  return {
+    api: {
+      startPairingInvitation: (pairingOptions: PairingInvitationOptions) =>
+        startPairingInvitationImpl(ctx, pairingOptions),
+      joinPairingInvitation: (pairingOptions: PairingJoinOptions) =>
+        joinPairingInvitationImpl(ctx, pairingOptions),
+    },
+  };
+}
+
+function createFavoriteProfileApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
+    listFavorites: async (): Promise<FavoriteRecord[]> => platformAdapter.listFavorites
+      ? platformAdapter.listFavorites()
+      : throwMissingAdapter("listFavorites"),
     upsertFavorite: async (favorite: FavoriteRecord): Promise<FavoriteRecord[]> =>
       platformAdapter.upsertFavorite
         ? platformAdapter.upsertFavorite(favorite)
@@ -1353,77 +2031,87 @@ export const createSyncpeerBrowserClient = (
     loadProfileSettings: async () => platformAdapter.loadProfileSettings
       ? platformAdapter.loadProfileSettings()
       : throwMissingAdapter("loadProfileSettings"),
-    saveProfileSettings: async settings => platformAdapter.saveProfileSettings
-      ? platformAdapter.saveProfileSettings(settings)
-      : throwMissingAdapter("saveProfileSettings"),
-    loadDirectorySnapshot: async (folderId, sourceDeviceId, path) => platformAdapter.loadDirectorySnapshot
-      ? platformAdapter.loadDirectorySnapshot(folderId, sourceDeviceId, path)
-      : null,
-    saveDirectorySnapshot: async (folderId, sourceDeviceId, path, snapshot) => {
+    saveProfileSettings: async (settings: Parameters<NonNullable<SyncpeerPlatformAdapter["saveProfileSettings"]>>[0]) =>
+      platformAdapter.saveProfileSettings
+        ? platformAdapter.saveProfileSettings(settings)
+        : throwMissingAdapter("saveProfileSettings"),
+    loadDirectorySnapshot: async (folderId: string, sourceDeviceId: string, path: string) =>
+      platformAdapter.loadDirectorySnapshot
+        ? platformAdapter.loadDirectorySnapshot(folderId, sourceDeviceId, path)
+        : null,
+    saveDirectorySnapshot: async (
+      folderId: string,
+      sourceDeviceId: string,
+      path: string,
+      snapshot: Parameters<NonNullable<SyncpeerPlatformAdapter["saveDirectorySnapshot"]>>[3],
+    ) => {
       await platformAdapter.saveDirectorySnapshot?.(folderId, sourceDeviceId, path, snapshot);
     },
+  };
+}
+
+function createCacheQueryApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
     enforceCacheQuota: async () => platformAdapter.enforceCacheQuota
       ? platformAdapter.enforceCacheQuota()
       : ({ quotaBytes: 0, cachedBytes: 0, protectedBytes: 0, evicted: [] }),
-    listDocumentVersions: async (folderId, path) => platformAdapter.listDocumentVersions
-      ? platformAdapter.listDocumentVersions(folderId, path)
-      : throwMissingAdapter("listDocumentVersions"),
-    restoreDocumentVersion: async (folderId, path, versionId) => platformAdapter.restoreDocumentVersion
-      ? platformAdapter.restoreDocumentVersion(folderId, path, versionId)
-      : throwMissingAdapter("restoreDocumentVersion"),
-    listFavoriteSyncStates: async folderIds => platformAdapter.listFavoriteSyncStates
-      ? platformAdapter.listFavoriteSyncStates(folderIds)
-      : [],
-    retryFavoriteSync: async (folderId, path) => platformAdapter.retryFavoriteSync
-      ? platformAdapter.retryFavoriteSync(folderId, path)
-      : throwMissingAdapter("retryFavoriteSync"),
-    resolveFavoriteConflict: async (folderId, path, resolution) => platformAdapter.resolveFavoriteConflict
+    listDocumentVersions: async (folderId: string, path: string) =>
+      platformAdapter.listDocumentVersions
+        ? platformAdapter.listDocumentVersions(folderId, path)
+        : throwMissingAdapter("listDocumentVersions"),
+    restoreDocumentVersion: async (folderId: string, path: string, versionId: string) =>
+      platformAdapter.restoreDocumentVersion
+        ? platformAdapter.restoreDocumentVersion(folderId, path, versionId)
+        : throwMissingAdapter("restoreDocumentVersion"),
+    listFavoriteSyncStates: async (folderIds: readonly string[]) =>
+      platformAdapter.listFavoriteSyncStates
+        ? platformAdapter.listFavoriteSyncStates(folderIds)
+        : [],
+    retryFavoriteSync: async (folderId: string, path: string) =>
+      platformAdapter.retryFavoriteSync
+        ? platformAdapter.retryFavoriteSync(folderId, path)
+        : throwMissingAdapter("retryFavoriteSync"),
+    resolveFavoriteConflict: async (
+      folderId: string,
+      path: string,
+      resolution: "keep-local" | "keep-remote",
+    ) => platformAdapter.resolveFavoriteConflict
       ? platformAdapter.resolveFavoriteConflict(folderId, path, resolution)
       : throwMissingAdapter("resolveFavoriteConflict"),
+  };
+}
+
+function createCacheDataApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
     cacheFile: async (
       folderId: string,
       path: string,
       name: string,
       bytes: Uint8Array,
       modifiedMs?: number,
-    ): Promise<void> => {
+    ) => {
       if (!platformAdapter.cacheFile) return throwMissingAdapter("cacheFile");
       return platformAdapter.cacheFile(folderId, path, name, bytes, modifiedMs);
     },
-    createFileDownloadSink: platformAdapter.createFileDownloadSink
-      ? (args) => platformAdapter.createFileDownloadSink!(args)
-      : undefined,
-    startTransfer: async (label) => {
-      await lifecycle.setTransferActive(true);
-      try {
-        await platformAdapter.startTransfer?.(label);
-      } catch (error) {
-        await lifecycle.setTransferActive(false);
-        throw error;
-      }
-    },
-    stopTransfer: async () => {
-      try {
-        await platformAdapter.stopTransfer?.();
-      } finally {
-        await lifecycle.setTransferActive(false);
-      }
-    },
-    updateTransferNotification: platformAdapter.updateTransferNotification
-      ? (args) => platformAdapter.updateTransferNotification!(args)
-      : undefined,
-    getCachedStatuses: async (folderId: string, paths: string[]): Promise<CachedFileStatus[]> =>
+    getCachedStatuses: async (folderId: string, paths: string[]) =>
       platformAdapter.getCachedStatuses
         ? platformAdapter.getCachedStatuses(folderId, paths)
         : throwMissingAdapter("getCachedStatuses"),
     digestCachedFiles: platformAdapter.digestCachedFiles
-      ? (files) => platformAdapter.digestCachedFiles!(files)
+      ? (files: Parameters<NonNullable<SyncpeerPlatformAdapter["digestCachedFiles"]>>[0]) =>
+          platformAdapter.digestCachedFiles!(files)
       : undefined,
-    listLocalDirectory: async (folderId, path) => platformAdapter.listLocalDirectory?.(folderId, path) ?? null,
+    listLocalDirectory: async (folderId: string, path: string) =>
+      platformAdapter.listLocalDirectory?.(folderId, path) ?? null,
     listCachedFiles: async (): Promise<CachedFileRecord[]> =>
       platformAdapter.listCachedFiles
         ? platformAdapter.listCachedFiles()
         : throwMissingAdapter("listCachedFiles"),
+  };
+}
+
+function createCachedFileApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
     openCachedFile: async (folderId: string, path: string): Promise<void> =>
       platformAdapter.openCachedFile
         ? platformAdapter.openCachedFile(folderId, path)
@@ -1440,10 +2128,46 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.removeCachedFile
         ? platformAdapter.removeCachedFile(folderId, path)
         : throwMissingAdapter("removeCachedFile"),
-    clearCache: async (): Promise<void> =>
-      platformAdapter.clearCache
-        ? platformAdapter.clearCache()
-        : throwMissingAdapter("clearCache"),
+    clearCache: async (): Promise<void> => platformAdapter.clearCache
+      ? platformAdapter.clearCache()
+      : throwMissingAdapter("clearCache"),
+  };
+}
+
+function createTransferApi(
+  platformAdapter: SyncpeerPlatformAdapter,
+  lifecycle: ConnectionLifecycle<ConnectOptions>,
+) {
+  return {
+    createFileDownloadSink: platformAdapter.createFileDownloadSink
+      ? (args: Parameters<NonNullable<SyncpeerPlatformAdapter["createFileDownloadSink"]>>[0]) =>
+          platformAdapter.createFileDownloadSink!(args)
+      : undefined,
+    startTransfer: async (label: string) => {
+      await lifecycle.setTransferActive(true);
+      try {
+        await platformAdapter.startTransfer?.(label);
+      } catch (error) {
+        await lifecycle.setTransferActive(false);
+        throw error;
+      }
+    },
+    stopTransfer: async () => {
+      try {
+        await platformAdapter.stopTransfer?.();
+      } finally {
+        await lifecycle.setTransferActive(false);
+      }
+    },
+    updateTransferNotification: platformAdapter.updateTransferNotification
+      ? (args: Parameters<NonNullable<SyncpeerPlatformAdapter["updateTransferNotification"]>>[0]) =>
+          platformAdapter.updateTransferNotification!(args)
+      : undefined,
+  };
+}
+
+function createAndroidSafApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
     getAndroidSafTreeUri: async (): Promise<string | null> =>
       platformAdapter.getAndroidSafTreeUri
         ? platformAdapter.getAndroidSafTreeUri()
@@ -1460,63 +2184,90 @@ export const createSyncpeerBrowserClient = (
       platformAdapter.listAndroidPersistedSafUris
         ? platformAdapter.listAndroidPersistedSafUris()
         : throwMissingAdapter("listAndroidPersistedSafUris"),
+  };
+}
+
+function createAndroidPimApi(platformAdapter: SyncpeerPlatformAdapter) {
+  return {
     listAndroidContacts: async (): Promise<AndroidContactRecord[]> =>
       platformAdapter.listAndroidContacts
         ? platformAdapter.listAndroidContacts()
         : throwMissingAdapter("listAndroidContacts"),
-    upsertAndroidContact: async (input): Promise<{ contactId: string }> =>
-      platformAdapter.upsertAndroidContact
-        ? platformAdapter.upsertAndroidContact(input)
-        : throwMissingAdapter("upsertAndroidContact"),
+    upsertAndroidContact: async (
+      input: Parameters<NonNullable<SyncpeerPlatformAdapter["upsertAndroidContact"]>>[0],
+    ): Promise<{ contactId: string }> => platformAdapter.upsertAndroidContact
+      ? platformAdapter.upsertAndroidContact(input)
+      : throwMissingAdapter("upsertAndroidContact"),
     deleteAndroidContact: async (contactId: string): Promise<{ deleted: boolean }> =>
       platformAdapter.deleteAndroidContact
         ? platformAdapter.deleteAndroidContact(contactId)
         : throwMissingAdapter("deleteAndroidContact"),
-    listAndroidCalendarEvents: async (args): Promise<AndroidCalendarEventRecord[]> =>
-      platformAdapter.listAndroidCalendarEvents
-        ? platformAdapter.listAndroidCalendarEvents(args)
-        : throwMissingAdapter("listAndroidCalendarEvents"),
-    upsertAndroidCalendarEvent: async (input): Promise<{ eventId: string }> =>
-      platformAdapter.upsertAndroidCalendarEvent
-        ? platformAdapter.upsertAndroidCalendarEvent(input)
-        : throwMissingAdapter("upsertAndroidCalendarEvent"),
+    listAndroidCalendarEvents: async (
+      args?: Parameters<NonNullable<SyncpeerPlatformAdapter["listAndroidCalendarEvents"]>>[0],
+    ): Promise<AndroidCalendarEventRecord[]> => platformAdapter.listAndroidCalendarEvents
+      ? platformAdapter.listAndroidCalendarEvents(args)
+      : throwMissingAdapter("listAndroidCalendarEvents"),
+    upsertAndroidCalendarEvent: async (
+      input: Parameters<NonNullable<SyncpeerPlatformAdapter["upsertAndroidCalendarEvent"]>>[0],
+    ): Promise<{ eventId: string }> => platformAdapter.upsertAndroidCalendarEvent
+      ? platformAdapter.upsertAndroidCalendarEvent(input)
+      : throwMissingAdapter("upsertAndroidCalendarEvent"),
     deleteAndroidCalendarEvent: async (eventId: string): Promise<{ deleted: boolean }> =>
       platformAdapter.deleteAndroidCalendarEvent
         ? platformAdapter.deleteAndroidCalendarEvent(eventId)
         : throwMissingAdapter("deleteAndroidCalendarEvent"),
-    exportIdentityRecovery: async (): Promise<IdentityRecoveryExportResponse> =>
-      platformAdapter.exportIdentityRecovery
-        ? platformAdapter.exportIdentityRecovery()
-        : throwMissingAdapter("exportIdentityRecovery"),
-    restoreIdentityRecovery: async (recoverySecret: string): Promise<void> => {
-      if (!platformAdapter.restoreIdentityRecovery) {
-        return throwMissingAdapter("restoreIdentityRecovery");
-      }
-      await platformAdapter.restoreIdentityRecovery(recoverySecret);
-      cachedDefaultIdentity = null;
+  };
+}
+
+function createDiscoveryApi(
+  coreAdapter: SyncpeerHostAdapter,
+): Pick<SyncpeerBrowserClient, "discoverLocalDevices"> {
+  return {
+    discoverLocalDevices: async (discoverOptions?: { timeoutMs?: number }) => {
+      if (!coreAdapter.discoverLocalCandidates) return [];
+      const candidates = await coreAdapter.discoverLocalCandidates({
+        expectedDeviceId: "",
+        timeoutMs: discoverOptions?.timeoutMs,
+      });
+      return collectDiscoveredDevices(candidates);
     },
-    getDefaultDeviceId: async (): Promise<string> =>
-      platformAdapter.getDefaultDeviceId
-        ? platformAdapter.getDefaultDeviceId()
-        : throwMissingAdapter("getDefaultDeviceId"),
-    regenerateDefaultIdentity: async (): Promise<string> => {
-      if (!platformAdapter.regenerateDefaultIdentity) {
-        return throwMissingAdapter("regenerateDefaultIdentity");
-      }
-      const deviceId = await platformAdapter.regenerateDefaultIdentity();
-      cachedDefaultIdentity = null;
-      return deviceId;
-    },
-    readBinaryFile: async (path: string): Promise<Uint8Array> =>
-      platformAdapter.readBinaryFile
-        ? platformAdapter.readBinaryFile(path)
-        : throwMissingAdapter("readBinaryFile"),
-    readCachedFile: platformAdapter.readCachedFile
-      ? (folderId, path) => platformAdapter.readCachedFile!(folderId, path)
-      : undefined,
-    pickUploadFile: async (): Promise<string | null | undefined> =>
-      platformAdapter.pickUploadFile
-        ? platformAdapter.pickUploadFile()
-        : undefined,
+  };
+}
+
+export const createSyncpeerBrowserClient = (
+  options: CreateSyncpeerBrowserClientOptions,
+): SyncpeerBrowserClient => {
+  const base = createBrowserClientBase(options);
+  const identity = createIdentityController(base);
+  const incoming = createIncomingController({
+    ...base,
+    resolveDefaultIdentity: identity.resolveDefaultIdentity,
+    getLifecycle: () => session.lifecycle,
+  });
+  const session = createSessionController({
+    ...base,
+    resolveDefaultIdentity: identity.resolveDefaultIdentity,
+    incoming,
+  });
+  const lifecycle = session.lifecycle;
+  const pairing = createPairingController({
+    ...base,
+    identityForPairing: identity.identityForPairing,
+    lifecycle,
+    incoming,
+  });
+  return {
+    ...session.api,
+    ...incoming.api,
+    ...pairing.api,
+    ...identity.api,
+    ...createFavoriteProfileApi(base.platformAdapter),
+    ...createCacheQueryApi(base.platformAdapter),
+    ...createCacheDataApi(base.platformAdapter),
+    ...createCachedFileApi(base.platformAdapter),
+    ...createTransferApi(base.platformAdapter, lifecycle),
+    ...createAndroidSafApi(base.platformAdapter),
+    ...createAndroidPimApi(base.platformAdapter),
+    ...createDiscoveryApi(base.coreAdapter),
   };
 };

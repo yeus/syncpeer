@@ -1,5 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import type { CachedFileRecord, FavoriteRecord, FavoriteSyncStateRecord,
+import type { CachedFileRecord, CachedFileStatus, FavoriteRecord, FavoriteSyncStateRecord,
   SyncpeerPlatformAdapter } from "../ui/browserClient.js";
 import type { FileDownloadSink } from "../transfer/stream.js";
 import { sameDownloadMetadata } from "../transfer/stream.js";
@@ -12,7 +12,7 @@ import type { OwnedSpaceDevice } from "./personalSpaceSharing.js";
 /** Route prepared folders to the service owner, never mirror two writable copies.
  * Migration changes ownership only after bytes and cleanup have been verified.
  */
-export function createDocumentCache(options: {
+type DocumentCacheOptions = {
   enabled: () => boolean;
   request: <T>(input: Record<string, unknown>) => Promise<T>;
   legacy: SyncpeerPlatformAdapter;
@@ -21,20 +21,44 @@ export function createDocumentCache(options: {
     verify: () => Promise<void>; close: () => Promise<void>;
   }>;
   show: (id: string) => Promise<void>;
-}) {
-  const active = new Map<string, number>(), migrating = new Map<string, Promise<void>>();
-  type CacheStatus = { vault: { phase: string }; folders: FolderRegistration[] };
-  const cacheStatus = () => options.request<CacheStatus>({ operation: "cacheRegistrations" });
-  const registrations = async () => options.enabled() ? (await cacheStatus()).folders : [];
-  const waitForMigration = async (folderId: string) => {
-    while (migrating.has(folderId)) await migrating.get(folderId);
-  };
-  const owner = async (folderId: string) => {
+};
+
+type CacheStatus = { vault: { phase: string }; folders: FolderRegistration[] };
+
+class DocumentCache {
+  private readonly options: DocumentCacheOptions;
+  private readonly active = new Map<string, number>();
+  private readonly migrating = new Map<string, Promise<void>>();
+  private readonly observed = new Map<string, string>();
+  private favoritesMigrated = false;
+  private folderQueue = Promise.resolve();
+
+  constructor(options: DocumentCacheOptions) {
+    this.options = options;
+  }
+
+  private request<T>(input: Record<string, unknown>) {
+    return this.options.request<T>(input);
+  }
+
+  private cacheStatus() {
+    return this.request<CacheStatus>({ operation: "cacheRegistrations" });
+  }
+
+  private async registrations() {
+    return this.options.enabled() ? (await this.cacheStatus()).folders : [];
+  }
+
+  private async waitForMigration(folderId: string) {
+    while (this.migrating.has(folderId)) await this.migrating.get(folderId);
+  }
+
+  private async owner(folderId: string) {
     while (true) {
-      await waitForMigration(folderId);
-      if (!options.enabled()) return undefined;
-      const status = await cacheStatus();
-      if (migrating.has(folderId)) continue;
+      await this.waitForMigration(folderId);
+      if (!this.options.enabled()) return undefined;
+      const status = await this.cacheStatus();
+      if (this.migrating.has(folderId)) continue;
       // An uninitialized vault still needs to expose existing legacy files; lock never does.
       if (status.vault.phase === "uninitialized") return undefined;
       if (status.vault.phase !== "unlocked") {
@@ -42,98 +66,137 @@ export function createDocumentCache(options: {
       }
       return status.folders.find(folder => folder.id === folderId && folder.downloads);
     }
-  };
-  const documentId = (folder: FolderRegistration, path: string) => JSON.stringify([folder.storageId, path]);
-  const track = async (folderId: string) => {
-    while (migrating.has(folderId)) await migrating.get(folderId);
-    active.set(folderId, (active.get(folderId) ?? 0) + 1);
+  }
+
+  private documentId(folder: FolderRegistration, path: string) {
+    return JSON.stringify([folder.storageId, path]);
+  }
+
+  private async track(folderId: string) {
+    while (this.migrating.has(folderId)) await this.migrating.get(folderId);
+    this.active.set(folderId, (this.active.get(folderId) ?? 0) + 1);
     let released = false;
-    return () => { if (!released) { released = true; active.set(folderId, active.get(folderId)! - 1); } };
-  };
-  const request = options.request;
-  const loadProfileSettings = async () => {
-    if (!options.enabled()) return options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
-    const status = await cacheStatus();
+    return () => {
+      if (released) return;
+      released = true;
+      this.active.set(folderId, this.active.get(folderId)! - 1);
+    };
+  }
+
+  private async loadProfileSettings() {
+    if (!this.options.enabled()) return this.options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
+    const status = await this.cacheStatus();
     return status.vault.phase === "uninitialized"
       ? defaultProfileSettings()
-      : request<SyncpeerProfileSettings>({ operation: "profileSettings" });
-  };
-  const saveProfileSettings = async (settings: SyncpeerProfileSettings) => {
-    if (options.enabled()) {
-      await request({ operation: "saveProfileSettings", settings });
-      await request({ operation: "enforceCacheQuota" });
-    }
-    else if (options.legacy.saveProfileSettings) await options.legacy.saveProfileSettings(settings);
-    else throw new Error("Encrypted profile settings are unavailable.");
-  };
-  const listFavorites = async () => Object.values((await loadProfileSettings()).folders)
-    .flatMap(folder => folder.favorites)
-    .sort((left, right) => left.name.localeCompare(right.name));
-  const updateFavorites = async (transform: (favorites: FavoriteRecord[]) => FavoriteRecord[]) => {
-    const settings = await loadProfileSettings();
+      : this.request<SyncpeerProfileSettings>({ operation: "profileSettings" });
+  }
+
+  private async saveProfileSettings(settings: SyncpeerProfileSettings) {
+    if (this.options.enabled()) {
+      await this.request({ operation: "saveProfileSettings", settings });
+      await this.request({ operation: "enforceCacheQuota" });
+    } else if (this.options.legacy.saveProfileSettings) {
+      await this.options.legacy.saveProfileSettings(settings);
+    } else throw new Error("Encrypted profile settings are unavailable.");
+  }
+
+  private async listFavorites() {
+    return Object.values((await this.loadProfileSettings()).folders)
+      .flatMap(folder => folder.favorites)
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  private async updateFavorites(transform: (favorites: FavoriteRecord[]) => FavoriteRecord[]) {
+    const settings = await this.loadProfileSettings();
     const favorites = transform(Object.values(settings.folders).flatMap(folder => folder.favorites));
     const folderIds = new Set([...Object.keys(settings.folders), ...favorites.map(item => item.folderId)]);
     settings.folders = Object.fromEntries([...folderIds].map(folderId => {
       const current = settings.folders[folderId] ?? defaultFolderSettings();
       return [folderId, { ...current, favorites: favorites.filter(item => item.folderId === folderId) }];
     }));
-    await saveProfileSettings(settings);
+    await this.saveProfileSettings(settings);
     return favorites.sort((left, right) => left.name.localeCompare(right.name));
-  };
-  let favoritesMigrated = false;
-  const listMigratedFavorites = async () => {
-    const secure = await listFavorites();
-    if (favoritesMigrated || secure.length || !options.legacy.listFavorites) {
-      favoritesMigrated = true; return secure;
+  }
+
+  private async listMigratedFavorites() {
+    const secure = await this.listFavorites();
+    if (this.favoritesMigrated || secure.length || !this.options.legacy.listFavorites) {
+      this.favoritesMigrated = true;
+      return secure;
     }
-    const legacy = await options.legacy.listFavorites();
-    favoritesMigrated = true;
+    const legacy = await this.options.legacy.listFavorites();
+    this.favoritesMigrated = true;
     if (!legacy.length) return secure;
-    const migrated = await updateFavorites(() => legacy);
-    if (options.legacy.removeFavorite) {
-      for (const favorite of legacy) await options.legacy.removeFavorite(favorite.key);
+    const migrated = await this.updateFavorites(() => legacy);
+    if (this.options.legacy.removeFavorite) {
+      for (const favorite of legacy) await this.options.legacy.removeFavorite(favorite.key);
     }
     return migrated;
-  };
-  const legacyFiles = async (folderId: string) =>
-    (await options.legacy.listCachedFiles?.() ?? []).filter(file => file.folderId === folderId);
-  const removeLegacyFile = async (file: CachedFileRecord) => {
-    if (!options.legacy.removeCachedFile) {
+  }
+
+  private async legacyFiles(folderId: string) {
+    return (await this.options.legacy.listCachedFiles?.() ?? []).filter(file => file.folderId === folderId);
+  }
+
+  private async removeLegacyFile(file: CachedFileRecord) {
+    if (!this.options.legacy.removeCachedFile) {
       throw new Error("The old local copy cannot be removed safely; migration was not completed.");
     }
-    if (!await options.legacy.removeCachedFile(file.folderId, file.path)) {
+    if (!await this.options.legacy.removeCachedFile(file.folderId, file.path)) {
       throw new Error("The old local copy could not be removed; migration was not completed.");
     }
-    if ((await legacyFiles(file.folderId)).some(value => value.folderId === file.folderId && value.path === file.path)) {
+    if ((await this.legacyFiles(file.folderId)).some(value => value.folderId === file.folderId && value.path === file.path)) {
       throw new Error("The old local copy is still present; migration was not completed.");
     }
-  };
-  const readSourceBytes = async (id: string) => {
-    const file = await source(id);
+  }
+
+  private async readSourceBytes(id: string) {
+    const file = await this.source(id);
     try {
       const bytes = new Uint8Array(file.size);
       for (let offset = 0; offset < file.size; offset += 131072) {
         const chunk = await file.readRange(offset, Math.min(131072, file.size - offset));
-        try { bytes.set(chunk, offset); } finally { chunk.fill(0); }
+        try {
+          bytes.set(chunk, offset);
+        } finally {
+          chunk.fill(0);
+        }
       }
       return bytes;
-    } finally { await file.close(); }
-  };
-  const digestReader = async (reader: { size: number; readRange: (offset: number, size: number) => Promise<Uint8Array> }) => {
+    } finally {
+      await file.close();
+    }
+  }
+
+  private async digestReader(reader: { size: number; readRange: (offset: number, size: number) => Promise<Uint8Array> }) {
     const hash = sha256.create();
     for (let offset = 0; offset < reader.size; offset += 131072) {
       const chunk = await reader.readRange(offset, Math.min(131072, reader.size - offset));
-      try { hash.update(chunk); } finally { chunk.fill(0); }
+      try {
+        hash.update(chunk);
+      } finally {
+        chunk.fill(0);
+      }
     }
     return [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
-  };
-  const source = async (id: string) => {
-    const handle = await request<number>({ operation: "open", id, mode: "r" });
-    return { size: await request<number>({ operation: "size", handle }),
-      readRange: async (offset: number, size: number) => new Uint8Array(await request<number[]>({ operation: "read", handle, offset, size })),
-      close: () => request<void>({ operation: "release", handle }) };
-  };
-  const sink = (folderId: string, path: string, modifiedMs = 0, expectedLocalHash?: string | null): FileDownloadSink => {
+  }
+
+  private async source(id: string) {
+    const handle = await this.request<number>({ operation: "open", id, mode: "r" });
+    return {
+      size: await this.request<number>({ operation: "size", handle }),
+      readRange: async (offset: number, size: number) =>
+        new Uint8Array(await this.request<number[]>({ operation: "read", handle, offset, size })),
+      close: () => this.request<void>({ operation: "release", handle }),
+    };
+  }
+
+  private sink(
+    folderId: string,
+    path: string,
+    modifiedMs = 0,
+    expectedLocalHash?: string | null,
+  ): FileDownloadSink {
     let handle: number | undefined;
     let aborting = false;
     let metadata: Parameters<FileDownloadSink["begin"]>[0] | undefined;
@@ -175,7 +238,7 @@ export function createDocumentCache(options: {
       const task = (async () => {
         try {
           if (handle === undefined) throw new Error("Download has not started.");
-          await request({ operation: "writeBatch", handle, writes: batch.map(({ offset, bytes }) => ({
+          await this.request({ operation: "writeBatch", handle, writes: batch.map(({ offset, bytes }) => ({
             offset, bytes: Array.from(bytes),
           })) });
           batch.forEach(write => { rememberRange(write.offset, write.bytes.length); write.resolve(); });
@@ -187,8 +250,9 @@ export function createDocumentCache(options: {
         }
       })();
       flushingWrites = task;
-      try { await task; }
-      finally {
+      try {
+        await task;
+      } finally {
         if (flushingWrites === task) flushingWrites = undefined;
         if (pendingWrites.length >= 8) void flushPendingWrites().catch(() => {});
         else if (pendingWrites.length) scheduleFlush();
@@ -210,7 +274,7 @@ export function createDocumentCache(options: {
     const digestRanges = async (source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) => {
       const result: Array<{ offset: number; size: number; hash: Uint8Array }> = [];
       for (let offset = 0; offset < ranges.length; offset += 256) {
-        const batch = await request<Array<{ offset: number; size: number; hash: number[] }>>({
+        const batch = await this.request<Array<{ offset: number; size: number; hash: number[] }>>({
           operation: "digestRanges", handle, source, ranges: ranges.slice(offset, offset + 256),
         });
         result.push(...batch.map(range => ({ ...range, hash: new Uint8Array(range.hash) })));
@@ -224,7 +288,7 @@ export function createDocumentCache(options: {
       copyCachedRanges: async ranges => {
         await flushPendingWrites();
         for (let offset = 0; offset < ranges.length; offset += 256) {
-          await request({ operation: "copyRanges", handle, ranges: ranges.slice(offset, offset + 256) });
+          await this.request({ operation: "copyRanges", handle, ranges: ranges.slice(offset, offset + 256) });
         }
       },
       begin: async value => {
@@ -232,12 +296,12 @@ export function createDocumentCache(options: {
           if (!metadata || !sameDownloadMetadata(metadata, value)) throw new Error("Download metadata changed.");
           return;
         }
-        handle = await request<number>({ operation: "beginDownload", folderId, path, size: value.sizeBytes, modifiedMs,
+        handle = await this.request<number>({ operation: "beginDownload", folderId, path, size: value.sizeBytes, modifiedMs,
           expectedLocalHash, encrypted: value.encrypted, sourceDeviceId: value.sourceDeviceId, contentId: value.contentId,
           ...(value.blocks ? { blocks: value.blocks.map(block => ({
             offset: block.offset, size: block.size, hash: Array.from(block.hash),
           })) } : {}) });
-        completedRanges = await request<Array<{ offset: number; size: number }>>({ operation: "downloadRanges", handle });
+        completedRanges = await this.request<Array<{ offset: number; size: number }>>({ operation: "downloadRanges", handle });
         metadata = value;
       },
       write: async (offset, bytes) => {
@@ -253,220 +317,335 @@ export function createDocumentCache(options: {
         }
       },
       hasRange: (offset, size) => completedRanges.some(range => offset >= range.offset && offset + size <= range.offset + range.size),
-      digestFile: async () => { await flushPendingWrites(); return request<string>({ operation: "digest", handle }); },
+      digestFile: async () => { await flushPendingWrites(); return this.request<string>({ operation: "digest", handle }); },
       commit: async () => {
         if (handle === undefined) throw new Error("Download has not started.");
         await flushPendingWrites();
-        await request({ operation: "finishDownload", handle }); handle = undefined;
+        await this.request({ operation: "finishDownload", handle });
+        handle = undefined;
       },
       abort: async error => {
         aborting = true;
         cancelPendingWrites(error ?? new Error("Download aborted."));
         if (flushingWrites) await flushingWrites.catch(() => {});
-        if (handle !== undefined) { await request({ operation: "release", handle, abort: true }); handle = undefined; }
+        if (handle !== undefined) {
+          await this.request({ operation: "release", handle, abort: true });
+          handle = undefined;
+        }
       },
       suspend: async () => {
         await flushPendingWrites();
-        if (handle !== undefined) { await request({ operation: "suspendDownload", handle }); handle = undefined; }
+        if (handle !== undefined) {
+          await this.request({ operation: "suspendDownload", handle });
+          handle = undefined;
+        }
       },
     };
-  };
-  const createFileDownloadSink: NonNullable<SyncpeerPlatformAdapter["createFileDownloadSink"]> = async args => {
-    await folderQueue;
-    const release = await track(args.folderId);
+  }
+
+  private async createFileDownloadSink(args: Parameters<NonNullable<SyncpeerPlatformAdapter["createFileDownloadSink"]>>[0]) {
+    await this.folderQueue;
+    const release = await this.track(args.folderId);
     let destination: FileDownloadSink;
     try {
-      const folder = await owner(args.folderId);
-      if (folder) destination = sink(args.folderId, args.path, args.modifiedMs, args.expectedLocalHash);
+      const folder = await this.owner(args.folderId);
+      if (folder) destination = this.sink(args.folderId, args.path, args.modifiedMs, args.expectedLocalHash);
       else {
-        if (options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
-        if (!options.legacy.createFileDownloadSink) throw new Error("Download storage is unavailable.");
-        destination = await options.legacy.createFileDownloadSink(args);
+        if (this.options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
+        if (!this.options.legacy.createFileDownloadSink) throw new Error("Download storage is unavailable.");
+        destination = await this.options.legacy.createFileDownloadSink(args);
       }
-    } catch (error) { release(); throw error; }
+    } catch (error) {
+      release();
+      throw error;
+    }
+    return this.releaseDownloadSink(destination, release);
+  }
+
+  private releaseDownloadSink(destination: FileDownloadSink, release: () => void): FileDownloadSink {
     return { ...destination,
       commit: async () => {
         try {
           await destination.commit();
-          if (options.enabled()) await request({ operation: "enforceCacheQuota" });
-        } finally { release(); }
+          if (this.options.enabled()) await this.request({ operation: "enforceCacheQuota" });
+        } finally {
+          release();
+        }
       },
-      abort: async error => { try { await destination.abort(error); } finally { release(); } },
-      ...(destination.suspend ? { suspend: async () => { try { await destination.suspend!(); } finally { release(); } } } : {}),
+      abort: async (error: unknown) => {
+        try {
+          await destination.abort(error);
+        } finally {
+          release();
+        }
+      },
+      ...(destination.suspend ? { suspend: async () => {
+        try {
+          await destination.suspend!();
+        } finally {
+          release();
+        }
+      } } : {}),
     };
-  };
-  const listCachedFiles = async () => {
-    const attached = (await registrations()).filter(folder => folder.downloads);
-    const legacy = await options.legacy.listCachedFiles?.() ?? [];
+  }
+
+  private async listCachedFiles() {
+    const attached = (await this.registrations()).filter(folder => folder.downloads);
+    const legacy = await this.options.legacy.listCachedFiles?.() ?? [];
     if (!attached.length) return legacy;
     return legacy.filter(file => !attached.some(folder => folder.id === file.folderId))
-      .concat(await request<CachedFileRecord[]>({ operation: "cachedFiles" }));
-  };
-  const digestCachedFiles: NonNullable<SyncpeerPlatformAdapter["digestCachedFiles"]> = async files => {
+      .concat(await this.request<CachedFileRecord[]>({ operation: "cachedFiles" }));
+  }
+
+  private async digestCachedFiles(files: readonly { folderId: string; path: string }[]) {
     const encryptedFiles: Array<{ folderId: string; path: string }> = [];
     const legacy: Array<{ folderId: string; path: string }> = [];
     for (const file of files) {
-      const folder = await owner(file.folderId);
-      if (!folder) { legacy.push(file); continue; }
+      const folder = await this.owner(file.folderId);
+      if (!folder) {
+        legacy.push(file);
+        continue;
+      }
       encryptedFiles.push(file);
     }
-    const current = encryptedFiles.length ? await request<Array<{ folderId: string; path: string; hash: string }>>(
+    const current = encryptedFiles.length ? await this.request<Array<{ folderId: string; path: string; hash: string }>>(
       { operation: "digestCachedFiles", files: encryptedFiles }) : [];
-    const old = legacy.length ? await options.legacy.digestCachedFiles?.(legacy) ?? [] : [];
+    const old = legacy.length ? await this.options.legacy.digestCachedFiles?.(legacy) ?? [] : [];
     const encrypted = new Map(current.map(file => [JSON.stringify([file.folderId, file.path]), file.hash]));
     const legacyByKey = new Map(old.map(file => [JSON.stringify([file.folderId, file.path]), file.hash]));
     return files.map(file => ({ ...file, hash: encrypted.get(JSON.stringify([file.folderId, file.path]))
       ?? legacyByKey.get(JSON.stringify([file.folderId, file.path])) }));
-  };
-  const show = async (folderId: string, path: string, parent: boolean) => {
-    const folder = await owner(folderId);
+  }
+
+  private async show(folderId: string, path: string, parent: boolean) {
+    const folder = await this.owner(folderId);
     if (!folder) {
-      const method = parent ? options.legacy.openCachedFileDirectory : options.legacy.openCachedFile;
+      const method = parent ? this.options.legacy.openCachedFileDirectory : this.options.legacy.openCachedFile;
       if (!method) throw new Error("Opening cached documents is unavailable.");
-      await method(folderId, path); return;
+      await method(folderId, path);
+      return;
     }
-    await options.show(documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
-  };
-  const platformAdapter: SyncpeerPlatformAdapter = { ...options.legacy, createFileDownloadSink, listCachedFiles,
-    digestCachedFiles,
-    exportPairingTransfer: (localDeviceId, joiningDevice) => request({ operation: "exportPairingTransfer",
-      localDeviceId, joiningDevice }),
-    importPairingTransfer: async (transfer, identity, password, remember) => {
-      await request({ operation: "importPairingTransfer", transfer, identity, password, remember });
-    },
-    ownedDevices: async () => (await request<{ devices: OwnedSpaceDevice[] }>({ operation: "ownedDevices" })).devices,
-    revokeOwnedDevice: deviceId => request({ operation: "revokeOwnedDevice", deviceId }),
-    sessionSharedFolders: async remoteDeviceId => {
-      if (!options.enabled() || (await cacheStatus()).vault.phase !== "unlocked") return [];
-      return request({ operation: "sessionSharedFolders", remoteDeviceId });
-    },
-    loadProfileSettings,
-    saveProfileSettings,
-    loadDirectorySnapshot: (folderId, sourceDeviceId, path) => request({
-      operation: "loadDirectorySnapshot", folderId, sourceDeviceId, path,
-    }),
-    saveDirectorySnapshot: (folderId, sourceDeviceId, path, snapshot) => request({
-      operation: "saveDirectorySnapshot", folderId, sourceDeviceId, path, snapshot,
-    }),
-    enforceCacheQuota: () => request({ operation: "enforceCacheQuota" }),
-    listDocumentVersions: async (folderId, path) => {
-      const folder = await owner(folderId);
-      if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
-      return request({ operation: "versions", id: documentId(folder, path) });
-    },
-    restoreDocumentVersion: async (folderId, path, versionId) => {
-      const folder = await owner(folderId);
-      if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
-      await request({ operation: "restoreVersion", id: documentId(folder, path), versionId });
-    },
-    listFavoriteSyncStates: async folderIds => {
-      const states = [];
-      for (const folderId of folderIds) {
-        if (!await owner(folderId)) continue;
-        const state = await request<{ entries: Record<string, Omit<FavoriteSyncStateRecord, "path">> }>(
-          { operation: "favoriteSyncState", folderId });
-        states.push({ folderId,
-          entries: Object.entries(state.entries).map(([path, entry]) => ({ path, ...entry })) });
-      }
-      return states;
-    },
-    retryFavoriteSync: async (folderId, path) => {
-      if (!await owner(folderId)) throw new Error("Encrypted folder storage is not ready.");
-      await request({ operation: "clearFavoriteSyncEntry", folderId, path });
-    },
-    resolveFavoriteConflict: async (folderId, path, resolution) => {
-      if (!await owner(folderId)) throw new Error("Encrypted folder storage is not ready.");
-      await request({ operation: "recordFavoriteResolution", folderId, path, resolution });
-    },
-    listFavorites: () => options.enabled() ? listMigratedFavorites() : options.legacy.listFavorites?.() ?? Promise.resolve([]),
-    upsertFavorite: favorite => options.enabled()
-      ? updateFavorites(favorites => [...favorites.filter(item => item.key !== favorite.key), favorite])
-      : options.legacy.upsertFavorite?.(favorite) ?? Promise.reject(new Error("Favorite storage is unavailable.")),
-    removeFavorite: key => options.enabled()
-      ? updateFavorites(favorites => favorites.filter(item => item.key !== key))
-      : options.legacy.removeFavorite?.(key) ?? Promise.reject(new Error("Favorite storage is unavailable.")),
-    listLocalDirectory: async (folderId, path) => {
-      const folder = (await registrations()).find(folder => folder.id === folderId);
-      if (!folder) return await options.legacy.listLocalDirectory?.(folderId, path) ?? null;
-      if (path) assertReplicaPath(path);
-      const entries = await request<Array<{ name: string; directory: boolean; size: number; modifiedMs: number }>>({
-        operation: "list", id: documentId(folder, path),
-      });
-      return entries.map(entry => ({ name: entry.name, path: path ? `${path}/${entry.name}` : entry.name,
-        type: entry.directory ? "directory" as const : "file" as const, size: entry.size, modifiedMs: entry.modifiedMs }));
-    },
-    acknowledgeCachedSync: async (folderId, path, baseline) => {
-      const folder = await owner(folderId);
-      if (!folder) return false;
-      await request({ operation: "setSyncBaseline", id: documentId(folder, path), ...baseline });
-      return true;
-    },
-    cacheFile: async (folderId, path, name, bytes, modifiedMs) => {
-      await folderQueue;
-      const release = await track(folderId);
-      try {
-        if (!await owner(folderId)) {
-          if (options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
-          if (!options.legacy.cacheFile) throw new Error("Cache is unavailable.");
-          await options.legacy.cacheFile(folderId, path, name, bytes, modifiedMs); return;
+    await this.options.show(this.documentId(folder, parent ? path.split("/").slice(0, -1).join("/") : path));
+  }
+
+  private adapterSharing(): Pick<SyncpeerPlatformAdapter,
+    "exportPairingTransfer" | "importPairingTransfer" | "ownedDevices" | "revokeOwnedDevice" | "sessionSharedFolders"> {
+    return {
+      exportPairingTransfer: (localDeviceId, joiningDevice) => this.request({
+        operation: "exportPairingTransfer", localDeviceId, joiningDevice,
+      }),
+      importPairingTransfer: async (transfer, identity, password, remember) => {
+        await this.request({ operation: "importPairingTransfer", transfer, identity, password, remember });
+      },
+      ownedDevices: async () => (await this.request<{ devices: OwnedSpaceDevice[] }>({ operation: "ownedDevices" })).devices,
+      revokeOwnedDevice: deviceId => this.request({ operation: "revokeOwnedDevice", deviceId }),
+      sessionSharedFolders: async remoteDeviceId => {
+        if (!this.options.enabled() || (await this.cacheStatus()).vault.phase !== "unlocked") return [];
+        return this.request({ operation: "sessionSharedFolders", remoteDeviceId });
+      },
+    };
+  }
+
+  private adapterProfile(): Pick<SyncpeerPlatformAdapter,
+    "loadProfileSettings" | "saveProfileSettings" | "loadDirectorySnapshot" | "saveDirectorySnapshot" |
+    "enforceCacheQuota" | "listFavorites" | "upsertFavorite" | "removeFavorite" | "listLocalDirectory" |
+    "acknowledgeCachedSync"> {
+    return {
+      loadProfileSettings: () => this.loadProfileSettings(),
+      saveProfileSettings: settings => this.saveProfileSettings(settings),
+      loadDirectorySnapshot: (folderId, sourceDeviceId, path) => this.request({
+        operation: "loadDirectorySnapshot", folderId, sourceDeviceId, path,
+      }),
+      saveDirectorySnapshot: (folderId, sourceDeviceId, path, snapshot) => this.request({
+        operation: "saveDirectorySnapshot", folderId, sourceDeviceId, path, snapshot,
+      }),
+      enforceCacheQuota: () => this.request({ operation: "enforceCacheQuota" }),
+      listFavorites: () => this.options.enabled() ? this.listMigratedFavorites() : this.options.legacy.listFavorites?.() ?? Promise.resolve([]),
+      upsertFavorite: favorite => this.options.enabled()
+        ? this.updateFavorites(favorites => [...favorites.filter(item => item.key !== favorite.key), favorite])
+        : this.options.legacy.upsertFavorite?.(favorite) ?? Promise.reject(new Error("Favorite storage is unavailable.")),
+      removeFavorite: key => this.options.enabled()
+        ? this.updateFavorites(favorites => favorites.filter(item => item.key !== key))
+        : this.options.legacy.removeFavorite?.(key) ?? Promise.reject(new Error("Favorite storage is unavailable.")),
+      listLocalDirectory: async (folderId, path) => {
+        const folder = (await this.registrations()).find(value => value.id === folderId);
+        if (!folder) return await this.options.legacy.listLocalDirectory?.(folderId, path) ?? null;
+        if (path) assertReplicaPath(path);
+        const entries = await this.request<Array<{ name: string; directory: boolean; size: number; modifiedMs: number }>>({
+          operation: "list", id: this.documentId(folder, path),
+        });
+        return entries.map(entry => ({ name: entry.name, path: path ? `${path}/${entry.name}` : entry.name,
+          type: entry.directory ? "directory" as const : "file" as const, size: entry.size, modifiedMs: entry.modifiedMs }));
+      },
+      acknowledgeCachedSync: async (folderId, path, baseline) => {
+        const folder = await this.owner(folderId);
+        if (!folder) return false;
+        await this.request({ operation: "setSyncBaseline", id: this.documentId(folder, path), ...baseline });
+        return true;
+      },
+    };
+  }
+
+  private adapterVersions(): Pick<SyncpeerPlatformAdapter,
+    "listDocumentVersions" | "restoreDocumentVersion" | "listFavoriteSyncStates" |
+    "retryFavoriteSync" | "resolveFavoriteConflict"> {
+    return {
+      listDocumentVersions: async (folderId, path) => {
+        const folder = await this.owner(folderId);
+        if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
+        return this.request({ operation: "versions", id: this.documentId(folder, path) });
+      },
+      restoreDocumentVersion: async (folderId, path, versionId) => {
+        const folder = await this.owner(folderId);
+        if (!folder) throw new Error("Encrypted version history is unavailable for this folder.");
+        await this.request({ operation: "restoreVersion", id: this.documentId(folder, path), versionId });
+      },
+      listFavoriteSyncStates: async folderIds => {
+        const states = [];
+        for (const folderId of folderIds) {
+          if (!await this.owner(folderId)) continue;
+          const state = await this.request<{ entries: Record<string, Omit<FavoriteSyncStateRecord, "path">> }>(
+            { operation: "favoriteSyncState", folderId });
+          states.push({ folderId,
+            entries: Object.entries(state.entries).map(([path, entry]) => ({ path, ...entry })) });
         }
-        const target = sink(folderId, path, modifiedMs);
-        try { await target.begin({ folderId, path, sizeBytes: bytes.length, encrypted: false });
-          await target.write(0, bytes); await target.commit();
-          await request({ operation: "enforceCacheQuota" }); }
-        catch (error) { await target.abort(error); throw error; }
-      } finally { release(); }
-    },
-    getCachedStatuses: async (folderId, paths) => {
-      if (!await owner(folderId)) return await options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
-      return request({ operation: "cachedStatuses", folderId, paths });
-    },
-    readBinaryFile: async path => {
-      if (!path.startsWith("syncpeer-document:")) {
-        if (!options.legacy.readBinaryFile) throw new Error("File reads are unavailable.");
-        return options.legacy.readBinaryFile(path);
-      }
-      const file = await source(path.slice("syncpeer-document:".length));
+        return states;
+      },
+      retryFavoriteSync: async (folderId, path) => {
+        if (!await this.owner(folderId)) throw new Error("Encrypted folder storage is not ready.");
+        await this.request({ operation: "clearFavoriteSyncEntry", folderId, path });
+      },
+      resolveFavoriteConflict: async (folderId, path, resolution) => {
+        if (!await this.owner(folderId)) throw new Error("Encrypted folder storage is not ready.");
+        await this.request({ operation: "recordFavoriteResolution", folderId, path, resolution });
+      },
+    };
+  }
+
+  private cacheFile(
+    folderId: string,
+    path: string,
+    name: string,
+    bytes: Uint8Array,
+    modifiedMs?: number,
+  ) {
+    return this.folderQueue.then(async () => {
+      const release = await this.track(folderId);
       try {
-        const bytes = new Uint8Array(file.size);
-        for (let offset = 0; offset < file.size; offset += 131072) {
-          const chunk = await file.readRange(offset, Math.min(131072, file.size - offset));
-          try { bytes.set(chunk, offset); } finally { chunk.fill(0); }
+        if (!await this.owner(folderId)) {
+          if (this.options.enabled()) throw new Error("Encrypted folder storage is not ready. Unlock the folder before downloading.");
+          if (!this.options.legacy.cacheFile) throw new Error("Cache is unavailable.");
+          await this.options.legacy.cacheFile(folderId, path, name, bytes, modifiedMs);
+          return;
         }
-        return bytes;
-      } finally { await file.close(); }
-    },
-    openCachedFile: (folderId, path) => show(folderId, path, false),
-    openCachedFileDirectory: (folderId, path) => show(folderId, path, true),
-    openCachedDirectory: async (folderId, path) => {
-      const folder = await owner(folderId);
-      if (folder) await options.show(documentId(folder, path));
-      else await options.legacy.openCachedDirectory?.(folderId, path);
-    },
-    removeCachedFile: async (folderId, path) => {
-      const folder = await owner(folderId);
-      return folder ? request<boolean>({ operation: "remove", id: documentId(folder, path) })
-        : await options.legacy.removeCachedFile?.(folderId, path) ?? false;
-    },
-    clearCache: async () => {
-      if ((await registrations()).some(folder => folder.downloads)) throw new Error("Encrypted documents may contain local edits. Remove individual downloads instead; preserved migration backups are not cleared automatically.");
-      await options.legacy.clearCache?.();
-    },
-  };
-  const connectFolder = async (folder: { id: string; label: string; password?: string }) => {
-    if (!options.enabled()) throw new Error("Document storage is unavailable.");
-    if (migrating.has(folder.id) || active.get(folder.id)) throw new Error("Wait for this folder’s transfers to finish before moving it.");
+        const target = this.sink(folderId, path, modifiedMs);
+        try {
+          await target.begin({ folderId, path, sizeBytes: bytes.length, encrypted: false });
+          await target.write(0, bytes);
+          await target.commit();
+          await this.request({ operation: "enforceCacheQuota" });
+        } catch (error) {
+          await target.abort(error);
+          throw error;
+        }
+      } finally {
+        release();
+      }
+    });
+  }
+
+  private async getCachedStatuses(folderId: string, paths: string[]) {
+    if (!await this.owner(folderId)) return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+    return this.request<CachedFileStatus[]>({ operation: "cachedStatuses", folderId, paths });
+  }
+
+  private async readBinaryFile(path: string) {
+    if (!path.startsWith("syncpeer-document:")) {
+      if (!this.options.legacy.readBinaryFile) throw new Error("File reads are unavailable.");
+      return this.options.legacy.readBinaryFile(path);
+    }
+    const file = await this.source(path.slice("syncpeer-document:".length));
+    try {
+      const bytes = new Uint8Array(file.size);
+      for (let offset = 0; offset < file.size; offset += 131072) {
+        const chunk = await file.readRange(offset, Math.min(131072, file.size - offset));
+        try {
+          bytes.set(chunk, offset);
+        } finally {
+          chunk.fill(0);
+        }
+      }
+      return bytes;
+    } finally {
+      await file.close();
+    }
+  }
+
+  private async openCachedDirectory(folderId: string, path: string) {
+    const folder = await this.owner(folderId);
+    if (folder) await this.options.show(this.documentId(folder, path));
+    else await this.options.legacy.openCachedDirectory?.(folderId, path);
+  }
+
+  private async removeCachedFile(folderId: string, path: string) {
+    const folder = await this.owner(folderId);
+    return folder ? this.request<boolean>({ operation: "remove", id: this.documentId(folder, path) })
+      : await this.options.legacy.removeCachedFile?.(folderId, path) ?? false;
+  }
+
+  private async clearCache() {
+    if ((await this.registrations()).some(folder => folder.downloads)) {
+      throw new Error("Encrypted documents may contain local edits. Remove individual downloads instead; preserved migration backups are not cleared automatically.");
+    }
+    await this.options.legacy.clearCache?.();
+  }
+
+  private adapterTransfer(): Pick<SyncpeerPlatformAdapter,
+    "createFileDownloadSink" | "listCachedFiles" | "digestCachedFiles" | "cacheFile" |
+    "getCachedStatuses" | "readBinaryFile" | "openCachedFile" | "openCachedFileDirectory" |
+    "openCachedDirectory" | "removeCachedFile" | "clearCache"> {
+    return {
+      createFileDownloadSink: async args => this.createFileDownloadSink(args),
+      listCachedFiles: () => this.listCachedFiles(),
+      digestCachedFiles: files => this.digestCachedFiles(files),
+      cacheFile: (folderId, path, name, bytes, modifiedMs) =>
+        this.cacheFile(folderId, path, name, bytes, modifiedMs),
+      getCachedStatuses: (folderId, paths) => this.getCachedStatuses(folderId, paths),
+      readBinaryFile: path => this.readBinaryFile(path),
+      openCachedFile: (folderId, path) => this.show(folderId, path, false),
+      openCachedFileDirectory: (folderId, path) => this.show(folderId, path, true),
+      openCachedDirectory: (folderId, path) => this.openCachedDirectory(folderId, path),
+      removeCachedFile: (folderId, path) => this.removeCachedFile(folderId, path),
+      clearCache: () => this.clearCache(),
+    };
+  }
+
+  private platformAdapter(): SyncpeerPlatformAdapter {
+    return {
+      ...this.options.legacy,
+      ...this.adapterSharing(),
+      ...this.adapterProfile(),
+      ...this.adapterVersions(),
+      ...this.adapterTransfer(),
+    };
+  }
+
+  private async connectFolder(folder: { id: string; label: string; password?: string }) {
+    if (!this.options.enabled()) throw new Error("Document storage is unavailable.");
+    if (this.migrating.has(folder.id) || this.active.get(folder.id)) {
+      throw new Error("Wait for this folder’s transfers to finish before moving it.");
+    }
     const migration = Promise.resolve().then(async () => {
-      let registered = (await registrations()).find(value => value.id === folder.id);
-      await request({ operation: "register", ...folder });
+      let registered = (await this.registrations()).find(value => value.id === folder.id);
+      await this.request({ operation: "register", ...folder });
       if (registered?.downloads) return;
-      registered = (await registrations()).find(value => value.id === folder.id)!;
-      const files = await legacyFiles(folder.id);
-      const existing = await request<CachedFileRecord[]>({ operation: "folderFiles", folderId: folder.id });
+      registered = (await this.registrations()).find(value => value.id === folder.id)!;
+      const files = await this.legacyFiles(folder.id);
+      const existing = await this.request<CachedFileRecord[]>({ operation: "folderFiles", folderId: folder.id });
       for (const file of files) {
         assertReplicaPath(file.path);
-        const original = await options.openLegacySource(file);
-        const target = sink(folder.id, file.path, file.modifiedMs ?? file.cachedAtMs,
+        const original = await this.options.openLegacySource(file);
+        const target = this.sink(folder.id, file.path, file.modifiedMs ?? file.cachedAtMs,
           existing.some(value => value.path === file.path) ? undefined : null);
         try {
           if (original.size !== file.sizeBytes) throw new Error("Cached file changed. Refresh downloads before migration.");
@@ -474,100 +653,144 @@ export function createDocumentCache(options: {
           const hash = sha256.create();
           for (let offset = 0; offset < original.size; offset += 131072) {
             const data = await original.readRange(offset, Math.min(131072, original.size - offset));
-            try { hash.update(data); await target.write(offset, data); } finally { data.fill(0); }
+            try {
+              hash.update(data);
+              await target.write(offset, data);
+            } finally {
+              data.fill(0);
+            }
           }
           const expected = [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
           if (await target.digestFile!() !== expected) throw new Error("Document migration verification failed.");
           await original.verify();
           if (existing.some(value => value.path === file.path)) {
-            const current = await source(documentId(registered, file.path)), currentHash = sha256.create();
+            const current = await this.source(this.documentId(registered, file.path)), currentHash = sha256.create();
             try {
               for (let offset = 0; offset < current.size; offset += 131072) {
                 const data = await current.readRange(offset, Math.min(131072, current.size - offset));
-                try { currentHash.update(data); } finally { data.fill(0); }
+                try {
+                  currentHash.update(data);
+                } finally {
+                  data.fill(0);
+                }
               }
               if (current.size !== original.size || [...currentHash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("") !== expected) {
                 throw new Error("A document already contains different data. Migration left both copies unchanged.");
               }
-            } finally { await current.close(); }
-            await request({ operation: "setSyncBaseline", id: documentId(registered, file.path), hash: expected,
+            } finally {
+              await current.close();
+            }
+            await this.request({ operation: "setSyncBaseline", id: this.documentId(registered, file.path), hash: expected,
               sizeBytes: original.size, modifiedMs: file.modifiedMs ?? file.cachedAtMs });
             await target.abort(new Error("Already imported"));
           } else await target.commit();
-          await removeLegacyFile(file);
-        } catch (error) { await target.abort(error); throw error; }
-        finally { await original.close(); }
+          await this.removeLegacyFile(file);
+        } catch (error) {
+          await target.abort(error);
+          throw error;
+        } finally {
+          await original.close();
+        }
       }
-      await request({ operation: "attachDownloads", id: folder.id });
+      await this.request({ operation: "attachDownloads", id: folder.id });
     });
-    migrating.set(folder.id, migration);
-    try { await migration; }
-    finally { if (migrating.get(folder.id) === migration) migrating.delete(folder.id); }
-  };
-  const disconnectFolder = async (folderId: string) => {
-    if (!options.enabled()) throw new Error("Document storage is unavailable.");
-    if (migrating.has(folderId) || active.get(folderId)) throw new Error("Wait for this folder’s transfers to finish before moving it.");
-    const registered = (await registrations()).find(value => value.id === folderId && value.downloads);
+    this.migrating.set(folder.id, migration);
+    try {
+      await migration;
+    } finally {
+      if (this.migrating.get(folder.id) === migration) this.migrating.delete(folder.id);
+    }
+  }
+
+  private async migrateToLegacy(folderId: string, cacheFile: NonNullable<SyncpeerPlatformAdapter["cacheFile"]>) {
+    const encrypted = await this.request<CachedFileRecord[]>({ operation: "folderFiles", folderId });
+    const staged: Array<{ file: CachedFileRecord; bytes: Uint8Array; hash: string }> = [];
+    try {
+      for (const file of encrypted) {
+        if (!file.localPath?.startsWith("syncpeer-document:")) throw new Error("Encrypted document path is unavailable.");
+        const bytes = await this.readSourceBytes(file.localPath.slice("syncpeer-document:".length));
+        try {
+          const hash = await this.digestReader({ size: bytes.length, readRange: async (offset, size) => bytes.slice(offset, offset + size) });
+          await cacheFile(folderId, file.path, file.name, bytes, file.modifiedMs ?? file.cachedAtMs);
+          staged.push({ file, bytes, hash });
+        } finally {
+          bytes.fill(0);
+        }
+      }
+      for (const stagedFile of staged) {
+        const copy = (await this.legacyFiles(folderId)).find(value => value.path === stagedFile.file.path);
+        if (!copy) throw new Error("Plain local copy was not created; migration was not completed.");
+        const original = await this.options.openLegacySource(copy);
+        try {
+          if (original.size !== stagedFile.file.sizeBytes || await this.digestReader(original) !== stagedFile.hash) {
+            throw new Error("Plain local copy failed verification; encrypted data was retained.");
+          }
+        } finally {
+          await original.close();
+        }
+      }
+      await this.request({ operation: "detachDownloads", id: folderId });
+    } finally {
+      staged.forEach(value => value.bytes.fill(0));
+    }
+  }
+
+  private async disconnectFolder(folderId: string) {
+    if (!this.options.enabled()) throw new Error("Document storage is unavailable.");
+    if (this.migrating.has(folderId) || this.active.get(folderId)) {
+      throw new Error("Wait for this folder’s transfers to finish before moving it.");
+    }
+    const registered = (await this.registrations()).find(value => value.id === folderId && value.downloads);
     if (!registered) throw new Error("Encrypted folder storage is not attached.");
-    const cacheFile = options.legacy.cacheFile;
-    if (!cacheFile || !options.legacy.listCachedFiles || !options.legacy.removeCachedFile) {
+    const cacheFile = this.options.legacy.cacheFile;
+    if (!cacheFile || !this.options.legacy.listCachedFiles || !this.options.legacy.removeCachedFile) {
       throw new Error("Plain local storage is unavailable; migration was not completed.");
     }
-    const migration = Promise.resolve().then(async () => {
-      const encrypted = await request<CachedFileRecord[]>({ operation: "folderFiles", folderId });
-      const staged: Array<{ file: CachedFileRecord; bytes: Uint8Array; hash: string }> = [];
-      try {
-        for (const file of encrypted) {
-          if (!file.localPath?.startsWith("syncpeer-document:")) throw new Error("Encrypted document path is unavailable.");
-          const bytes = await readSourceBytes(file.localPath.slice("syncpeer-document:".length));
-          try {
-            const hash = await digestReader({ size: bytes.length, readRange: async (offset, size) => bytes.slice(offset, offset + size) });
-            await cacheFile(folderId, file.path, file.name, bytes, file.modifiedMs ?? file.cachedAtMs);
-            staged.push({ file, bytes, hash });
-          } finally { bytes.fill(0); }
-        }
-        for (const stagedFile of staged) {
-          const copy = (await legacyFiles(folderId)).find(value => value.path === stagedFile.file.path);
-          if (!copy) throw new Error("Plain local copy was not created; migration was not completed.");
-          const original = await options.openLegacySource(copy);
-          try {
-            if (original.size !== stagedFile.file.sizeBytes || await digestReader(original) !== stagedFile.hash) {
-              throw new Error("Plain local copy failed verification; encrypted data was retained.");
-            }
-          } finally { await original.close(); }
-        }
-        await request({ operation: "detachDownloads", id: folderId });
-      } finally { staged.forEach(value => value.bytes.fill(0)); }
-    });
-    migrating.set(folderId, migration);
-    try { await migration; }
-    finally { if (migrating.get(folderId) === migration) migrating.delete(folderId); }
-  };
-  let folderQueue = Promise.resolve();
-  const observed = new Map<string, string>();
-  const syncFolders = (folders: FolderInfo[], passwords: Record<string, string>) => {
-    const task = folderQueue.then(async () => {
-      if (!options.enabled()) return [];
+    const migration = Promise.resolve().then(() => this.migrateToLegacy(folderId, cacheFile));
+    this.migrating.set(folderId, migration);
+    try {
+      await migration;
+    } finally {
+      if (this.migrating.get(folderId) === migration) this.migrating.delete(folderId);
+    }
+  }
+
+  private async syncFolders(folders: FolderInfo[], passwords: Record<string, string>) {
+    const task = this.folderQueue.then(async () => {
+      if (!this.options.enabled()) return [];
       // Discovery must finish even if preparing one folder's contents later fails.
       for (const folder of folders) {
-        await request({ operation: "rememberFolder", id: folder.id, label: folder.label || folder.id });
+        await this.request({ operation: "rememberFolder", id: folder.id, label: folder.label || folder.id });
       }
       for (const folder of folders) {
         const signature = JSON.stringify([folder.label, folder.encrypted, folder.needsPassword, passwords[folder.id]]);
-        if (observed.get(folder.id) === signature) continue;
-        if ((await registrations()).some(value => value.id === folder.id && value.browseOnly)) {
-          observed.set(folder.id, signature);
+        if (this.observed.get(folder.id) === signature) continue;
+        if ((await this.registrations()).some(value => value.id === folder.id && value.browseOnly)) {
+          this.observed.set(folder.id, signature);
           continue;
         }
         if (!folder.needsPassword && (!folder.encrypted || passwords[folder.id])) {
-          await connectFolder({ id: folder.id, label: folder.label || folder.id, password: passwords[folder.id] });
+          await this.connectFolder({ id: folder.id, label: folder.label || folder.id, password: passwords[folder.id] });
         }
-        observed.set(folder.id, signature);
+        this.observed.set(folder.id, signature);
       }
-      return registrations();
+      return this.registrations();
     });
-    folderQueue = task.then(() => {}, () => {});
+    this.folderQueue = task.then(() => {}, () => {});
     return task;
-  };
-  return { platformAdapter, connectFolder, disconnectFolder, syncFolders };
+  }
+
+  api() {
+    return {
+      platformAdapter: this.platformAdapter(),
+      connectFolder: (folder: { id: string; label: string; password?: string }) => this.connectFolder(folder),
+      disconnectFolder: (folderId: string) => this.disconnectFolder(folderId),
+      syncFolders: (folders: FolderInfo[], passwords: Record<string, string>) =>
+        this.syncFolders(folders, passwords),
+    };
+  }
+}
+
+export function createDocumentCache(options: DocumentCacheOptions) {
+  return new DocumentCache(options).api();
 }

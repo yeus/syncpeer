@@ -25,18 +25,22 @@ export const runLanWdio = async (env: NodeJS.ProcessEnv): Promise<number> => {
   const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
   const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
   const runEnv = { ...process.env, ...env, SYNCPEER_LAN_APP_BINARY: lanAppBinary() };
-  const useXvfb = process.platform === "linux" &&
+  const useVirtualDesktop = process.platform === "linux" &&
     (runEnv.SYNCPEER_LAN_XVFB === "1" || !runEnv.DISPLAY);
-  if (useXvfb) {
+  if (useVirtualDesktop) {
     try {
       execFileSync("which", ["xvfb-run"], { stdio: "ignore" });
+      execFileSync("which", ["openbox"], { stdio: "ignore" });
+      execFileSync("which", ["xprop"], { stdio: "ignore" });
     } catch {
-      throw new Error("No DISPLAY is available and xvfb-run is missing. Enter the Nix flake shell first.");
+      throw new Error("No DISPLAY is available and the virtual desktop tools are missing. Enter the Nix flake shell first.");
     }
   }
   return runChild(
-    useXvfb ? "xvfb-run" : process.execPath,
-    useXvfb ? ["-a", process.execPath, ...wdioArgs] : wdioArgs,
+    useVirtualDesktop ? "bash" : process.execPath,
+    useVirtualDesktop
+      ? [path.resolve("scripts", "lan-test", "virtual-desktop.sh"), process.execPath, ...wdioArgs]
+      : wdioArgs,
     runEnv,
   );
 };

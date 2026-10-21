@@ -547,8 +547,10 @@ later be reused by a Taskyon Syncthing storage backend.
 
 This harness runs a real Tauri Syncpeer client against an isolated Syncthing
 fixture on another computer. Enter the flake development shell on both
-computers first; it provides the GTK/WebKit runtime and `xvfb-run`. The local
-E2E umbrella uses `xvfb-run` for a deterministic Tauri display.
+computers first; it provides the GTK/WebKit runtime, `xvfb-run`, `openbox`,
+and `xprop`. The local E2E umbrella uses `scripts/lan-test/virtual-desktop.sh`
+to run Tauri under Xvfb with a window manager, which native window activation
+requires even on a virtual display.
 
 Keep both checkouts on compatible LAN protocol versions. They do not
 need to use the same Git commit: the server checkout defines the Syncthing

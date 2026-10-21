@@ -26,7 +26,7 @@ const startEmulator = async (): Promise<RunningEmulator> => {
   const selected = profile("compat");
   create(selected);
   const knownSerials = listDeviceTransports();
-  const child = spawn("emulator", emulatorArguments(selected, ["-no-snapshot"]), {
+  const child = spawn("emulator", emulatorArguments(selected, ["-no-window", "-no-snapshot"]), {
     stdio: "ignore",
   });
   try {

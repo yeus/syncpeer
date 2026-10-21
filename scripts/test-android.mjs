@@ -225,7 +225,9 @@ const runProfile = async (profileName, testArguments, prepareDevice,
   const knownTransports = listDeviceTransports();
   const selected = profile(profileName);
   create(selected);
-  const child = spawn("emulator", emulatorArguments(selected), { stdio: "ignore" });
+  // The Android acceptance harness drives devices through ADB. Keep the
+  // emulator headless so it also works on CI hosts without a display server.
+  const child = spawn("emulator", emulatorArguments(selected, ["-no-window"]), { stdio: "ignore" });
   const previousSerial = process.env.ANDROID_SERIAL;
   let serial;
   try {

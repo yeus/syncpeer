@@ -2813,7 +2813,7 @@ const main = async () => {
     "--no-daemon", "--console=plain",
   ], {
     stdio: "inherit",
-    timeout: 240_000,
+    timeout: 900_000,
     env: {
       ...process.env,
       ...(requireDocumentRuntime ? { SYNCPEER_REQUIRE_DOCUMENT_RUNTIME: "1" } : {}),

@@ -255,6 +255,76 @@ export const syncAndroidPimNow = async (args: PimActionDependencies) => {
   }
 };
 
+const importPimContacts = async (
+  client: SyncpeerBrowserClient,
+  remoteFs: NonNullable<AppState["session"]["remoteFs"]>,
+  folderId: string,
+  entriesDir: string,
+): Promise<number> => {
+  const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, entriesDir, 3);
+  const decoder = new TextDecoder();
+  let imported = 0;
+  for (const entry of entries) {
+    if (entry.type !== "file" || !entry.path.endsWith(".vcf")) continue;
+    if ((entry.path.split("/").pop() ?? "").startsWith("android-")) continue;
+    const bytes = await remoteFs.readFileFully(folderId, entry.path);
+    for (const vcardText of splitVcards(decoder.decode(bytes))) {
+      const parsed = parseVcard(vcardText);
+      if (!parsed.displayName) continue;
+      await client.upsertAndroidContact({
+        displayName: parsed.displayName,
+        phones: parsed.phones,
+        emails: parsed.emails,
+      });
+      imported += 1;
+    }
+  }
+  return imported;
+};
+
+const importPimEvents = async (
+  client: SyncpeerBrowserClient,
+  remoteFs: NonNullable<AppState["session"]["remoteFs"]>,
+  folderId: string,
+  entriesDir: string,
+): Promise<number> => {
+  const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, entriesDir, 3);
+  const decoder = new TextDecoder();
+  let imported = 0;
+  for (const entry of entries) {
+    if (entry.type !== "file" || !entry.path.endsWith(".ics")) continue;
+    if ((entry.path.split("/").pop() ?? "").startsWith("android-")) continue;
+    const bytes = await remoteFs.readFileFully(folderId, entry.path);
+    const text = decoder.decode(bytes);
+    const eventBlocks = splitIcsEvents(text);
+    if (eventBlocks.length === 0) {
+      const parsed = parseIcsEvent(text);
+      if (parsed.title && parsed.startMs > 0 && parsed.endMs > 0) {
+        await client.upsertAndroidCalendarEvent({
+          title: parsed.title,
+          startMs: parsed.startMs,
+          endMs: parsed.endMs,
+          allDay: false,
+        });
+        imported += 1;
+      }
+      continue;
+    }
+    for (const eventText of eventBlocks) {
+      const parsed = parseIcsEvent(eventText);
+      if (!parsed.title || parsed.startMs <= 0 || parsed.endMs <= 0) continue;
+      await client.upsertAndroidCalendarEvent({
+        title: parsed.title,
+        startMs: parsed.startMs,
+        endMs: parsed.endMs,
+        allDay: false,
+      });
+      imported += 1;
+    }
+  }
+  return imported;
+};
+
 export const importProviderPimFromSyncthingFolder = async (args: PimActionDependencies) => {
   const { state, client } = args;
   if (!state.pim.enabled) {
@@ -268,74 +338,16 @@ export const importProviderPimFromSyncthingFolder = async (args: PimActionDepend
   const folderId = state.session.currentFolderId;
   const remoteFs = state.session.remoteFs;
   const root = normalizePimRoot(state.pim.syncFolderPath);
-  const contactsEntriesDir = `${root}/syncpeer/pim/contacts/collections/default/entries`;
-  const calendarEntriesDir = `${root}/syncpeer/pim/calendar/collections/default/entries`;
-  const decoder = new TextDecoder();
   try {
-    let importedContacts = 0;
-    let importedEvents = 0;
-
-    if (state.pim.contactsEnabled && state.pim.androidContactsIntegration) {
-      const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, contactsEntriesDir, 3);
-      for (const entry of entries) {
-        if (entry.type !== "file" || !entry.path.endsWith(".vcf")) continue;
-        const name = entry.path.split("/").pop() ?? "";
-        if (name.startsWith("android-")) continue;
-        const bytes = await remoteFs.readFileFully(folderId, entry.path);
-        const vcards = splitVcards(decoder.decode(bytes));
-        for (const vcardText of vcards) {
-          const parsed = parseVcard(vcardText);
-          if (!parsed.displayName) continue;
-          await client.upsertAndroidContact({
-            displayName: parsed.displayName,
-            phones: parsed.phones,
-            emails: parsed.emails,
-          });
-          importedContacts += 1;
-        }
-      }
-    }
-
-    if (state.pim.calendarEnabled && state.pim.androidCalendarIntegration) {
-      const entries = await readDirectoryEntriesRecursively(remoteFs, folderId, calendarEntriesDir, 3);
-      for (const entry of entries) {
-        if (entry.type !== "file" || !entry.path.endsWith(".ics")) continue;
-        const name = entry.path.split("/").pop() ?? "";
-        if (name.startsWith("android-")) continue;
-        const bytes = await remoteFs.readFileFully(folderId, entry.path);
-        const text = decoder.decode(bytes);
-        const eventBlocks = splitIcsEvents(text);
-        if (eventBlocks.length === 0) {
-          const parsedSingle = parseIcsEvent(text);
-          if (parsedSingle.title && parsedSingle.startMs > 0 && parsedSingle.endMs > 0) {
-            await client.upsertAndroidCalendarEvent({
-              title: parsedSingle.title,
-              startMs: parsedSingle.startMs,
-              endMs: parsedSingle.endMs,
-              allDay: false,
-            });
-            importedEvents += 1;
-          }
-          continue;
-        }
-        for (const eventText of eventBlocks) {
-          const parsed = parseIcsEvent(eventText);
-          if (!parsed.title || parsed.startMs <= 0 || parsed.endMs <= 0) continue;
-          await client.upsertAndroidCalendarEvent({
-            title: parsed.title,
-            startMs: parsed.startMs,
-            endMs: parsed.endMs,
-            allDay: false,
-          });
-          importedEvents += 1;
-        }
-      }
-    }
-
+    const importedContacts = state.pim.contactsEnabled && state.pim.androidContactsIntegration
+      ? await importPimContacts(client, remoteFs, folderId, `${root}/syncpeer/pim/contacts/collections/default/entries`)
+      : 0;
+    const importedEvents = state.pim.calendarEnabled && state.pim.androidCalendarIntegration
+      ? await importPimEvents(client, remoteFs, folderId, `${root}/syncpeer/pim/calendar/collections/default/entries`)
+      : 0;
     const pimTreeRoot = `${root}/syncpeer/pim`;
     await ensurePimFolderFavorite(state, client, folderId, pimTreeRoot);
     await cachePimTreeOffline(state, client, folderId, remoteFs, pimTreeRoot);
-
     state.ui.uploadMessage =
       `Provider import complete. Imported ${importedContacts} contacts and ${importedEvents} events into Android.`;
   } catch (error) {

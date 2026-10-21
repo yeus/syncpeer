@@ -635,71 +635,89 @@ class DocumentCache {
     if (this.migrating.has(folder.id) || this.active.get(folder.id)) {
       throw new Error("Wait for this folder’s transfers to finish before moving it.");
     }
-    const migration = Promise.resolve().then(async () => {
-      let registered = (await this.registrations()).find(value => value.id === folder.id);
-      await this.request({ operation: "register", ...folder });
-      if (registered?.downloads) return;
-      registered = (await this.registrations()).find(value => value.id === folder.id)!;
-      const files = await this.legacyFiles(folder.id);
-      const existing = await this.request<CachedFileRecord[]>({ operation: "folderFiles", folderId: folder.id });
-      for (const file of files) {
-        assertReplicaPath(file.path);
-        const original = await this.options.openLegacySource(file);
-        const target = this.sink(folder.id, file.path, file.modifiedMs ?? file.cachedAtMs,
-          existing.some(value => value.path === file.path) ? undefined : null);
-        try {
-          if (original.size !== file.sizeBytes) throw new Error("Cached file changed. Refresh downloads before migration.");
-          await target.begin({ folderId: folder.id, path: file.path, sizeBytes: original.size, encrypted: false });
-          const hash = sha256.create();
-          for (let offset = 0; offset < original.size; offset += 131072) {
-            const data = await original.readRange(offset, Math.min(131072, original.size - offset));
-            try {
-              hash.update(data);
-              await target.write(offset, data);
-            } finally {
-              data.fill(0);
-            }
-          }
-          const expected = [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
-          if (await target.digestFile!() !== expected) throw new Error("Document migration verification failed.");
-          await original.verify();
-          if (existing.some(value => value.path === file.path)) {
-            const current = await this.source(this.documentId(registered, file.path)), currentHash = sha256.create();
-            try {
-              for (let offset = 0; offset < current.size; offset += 131072) {
-                const data = await current.readRange(offset, Math.min(131072, current.size - offset));
-                try {
-                  currentHash.update(data);
-                } finally {
-                  data.fill(0);
-                }
-              }
-              if (current.size !== original.size || [...currentHash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("") !== expected) {
-                throw new Error("A document already contains different data. Migration left both copies unchanged.");
-              }
-            } finally {
-              await current.close();
-            }
-            await this.request({ operation: "setSyncBaseline", id: this.documentId(registered, file.path), hash: expected,
-              sizeBytes: original.size, modifiedMs: file.modifiedMs ?? file.cachedAtMs });
-            await target.abort(new Error("Already imported"));
-          } else await target.commit();
-          await this.removeLegacyFile(file);
-        } catch (error) {
-          await target.abort(error);
-          throw error;
-        } finally {
-          await original.close();
-        }
-      }
-      await this.request({ operation: "attachDownloads", id: folder.id });
-    });
+    const migration = this.migrateFolder(folder);
     this.migrating.set(folder.id, migration);
     try {
       await migration;
     } finally {
       if (this.migrating.get(folder.id) === migration) this.migrating.delete(folder.id);
     }
+  }
+
+  private async migrateFolder(folder: { id: string; label: string; password?: string }): Promise<void> {
+    let registered = (await this.registrations()).find(value => value.id === folder.id);
+    await this.request({ operation: "register", ...folder });
+    if (registered?.downloads) return;
+    registered = (await this.registrations()).find(value => value.id === folder.id)!;
+    const files = await this.legacyFiles(folder.id);
+    const existing = await this.request<CachedFileRecord[]>({ operation: "folderFiles", folderId: folder.id });
+    for (const file of files) await this.migrateLegacyFile(folder.id, registered, file, existing);
+    await this.request({ operation: "attachDownloads", id: folder.id });
+  }
+
+  private async migrateLegacyFile(
+    folderId: string,
+    registered: FolderRegistration,
+    file: CachedFileRecord,
+    existing: CachedFileRecord[],
+  ): Promise<void> {
+    assertReplicaPath(file.path);
+    const original = await this.options.openLegacySource(file);
+    const alreadyImported = existing.some(value => value.path === file.path);
+    const target = this.sink(folderId, file.path, file.modifiedMs ?? file.cachedAtMs,
+      alreadyImported ? undefined : null);
+    try {
+      if (original.size !== file.sizeBytes) throw new Error("Cached file changed. Refresh downloads before migration.");
+      await target.begin({ folderId, path: file.path, sizeBytes: original.size, encrypted: false });
+      const expected = await this.copyLegacyBytes(original, target);
+      if (await target.digestFile!() !== expected) throw new Error("Document migration verification failed.");
+      await original.verify();
+      if (alreadyImported) await this.verifyExistingDocument(registered, file, original.size, expected, target);
+      else await target.commit();
+      await this.removeLegacyFile(file);
+    } catch (error) {
+      await target.abort(error);
+      throw error;
+    } finally {
+      await original.close();
+    }
+  }
+
+  private async copyLegacyBytes(
+    original: Awaited<ReturnType<DocumentCacheOptions["openLegacySource"]>>,
+    target: FileDownloadSink,
+  ): Promise<string> {
+    const hash = sha256.create();
+    for (let offset = 0; offset < original.size; offset += 131072) {
+      const data = await original.readRange(offset, Math.min(131072, original.size - offset));
+      try {
+        hash.update(data);
+        await target.write(offset, data);
+      } finally {
+        data.fill(0);
+      }
+    }
+    return [...hash.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  private async verifyExistingDocument(
+    registered: FolderRegistration,
+    file: CachedFileRecord,
+    originalSize: number,
+    expected: string,
+    target: FileDownloadSink,
+  ): Promise<void> {
+    const current = await this.source(this.documentId(registered, file.path));
+    try {
+      if (current.size !== originalSize || await this.digestReader(current) !== expected) {
+        throw new Error("A document already contains different data. Migration left both copies unchanged.");
+      }
+    } finally {
+      await current.close();
+    }
+    await this.request({ operation: "setSyncBaseline", id: this.documentId(registered, file.path), hash: expected,
+      sizeBytes: originalSize, modifiedMs: file.modifiedMs ?? file.cachedAtMs });
+    await target.abort(new Error("Already imported"));
   }
 
   private async migrateToLegacy(folderId: string, cacheFile: NonNullable<SyncpeerPlatformAdapter["cacheFile"]>) {

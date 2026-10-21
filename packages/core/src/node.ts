@@ -1099,6 +1099,9 @@ async function rawPinnedDiscoveryFetch(
   }
 }
 
+const discoveryResponseHeaders = (headers: Record<string, string | string[] | undefined>): Record<string, string> =>
+  Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value ?? "")]));
+
 async function nodeDiscoveryFetch(
   input: string | URL,
   init?: SyncpeerDiscoveryFetchInit,
@@ -1125,7 +1128,7 @@ async function nodeDiscoveryFetch(
             createDiscoveryResponse(
               response.statusCode ?? 0,
               Buffer.concat(chunks),
-              Object.fromEntries(Object.entries(response.headers).map(([key, value]) => [key, String(value ?? "")])),
+              discoveryResponseHeaders(response.headers),
             ),
           );
         });

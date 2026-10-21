@@ -32,6 +32,7 @@ import {
   type UiLogEntry,
 } from "@syncpeer/core/browser";
 import { normalizeThemePreferences, type ThemePreferences } from "./theme.ts";
+import { isConfiguredDeviceName } from "./suggestedNames.ts";
 
 const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
 const SESSION_LOG_LIMIT = 2000;
@@ -67,6 +68,7 @@ export interface PersistedAppState {
   theme?: Partial<ThemePreferences>;
   expertView?: boolean;
   stabilityNoticeAcknowledged?: boolean;
+  deviceName?: string;
 }
 
 export const loadPersistedState = (): PersistedAppState | null => {
@@ -81,6 +83,7 @@ export const loadPersistedState = (): PersistedAppState | null => {
     theme: persisted.theme,
     expertView: persisted.expertView,
     stabilityNoticeAcknowledged: persisted.stabilityNoticeAcknowledged,
+    deviceName: typeof persisted.deviceName === "string" ? persisted.deviceName : undefined,
   };
 };
 
@@ -114,6 +117,8 @@ export const persistState = (state: AppState, migrated = false) => {
       theme: state.ui.theme,
       expertView: state.ui.expertView,
       stabilityNoticeAcknowledged: !state.ui.showStabilityNotice,
+      deviceName: isConfiguredDeviceName(state.connection.deviceName)
+        ? state.connection.deviceName.trim() : undefined,
     }),
   );
 };
@@ -167,7 +172,11 @@ export const applySensitiveAppState = (state: AppState, value: unknown) => {
   const record = value as Partial<SensitiveAppState>;
   if (!Array.isArray(record.approvals) || typeof record.offlineFolderSnapshots !== "object" ||
     record.offlineFolderSnapshots === null || Array.isArray(record.offlineFolderSnapshots)) return false;
+  const confirmedLocalName = state.ui.deviceNameConfirmed && isConfiguredDeviceName(state.connection.deviceName)
+    ? state.connection.deviceName.trim() : "";
   if (record.connection) Object.assign(state.connection, fromConnectionSettings({ ...record.connection, key: "" }));
+  if (confirmedLocalName) state.connection.deviceName = confirmedLocalName;
+  else if (isConfiguredDeviceName(state.connection.deviceName)) state.ui.deviceNameConfirmed = true;
   if (record.savedDevices) state.devices.savedDevices = normalizeSavedDevices(record.savedDevices);
   state.devices.selectedSavedDeviceId = record.selectedSavedDeviceId ?? "";
   state.approvals.syncApprovedFolderKeys = normalizeSyncApprovedIntroducedFolderKeys(
@@ -213,6 +222,10 @@ export const readLegacyFolderPasswords = (): Record<string, string> => {
 export const createInitialState = (persisted = loadPersistedState()) => {
   const initialConnection = fromConnectionSettings(persisted?.connection
     ? { ...persisted.connection, key: "" } as StoredConnectionSettingsLike : null);
+  const persistedDeviceName = persisted?.deviceName?.trim() ?? "";
+  const initialDeviceName = isConfiguredDeviceName(persistedDeviceName)
+    ? persistedDeviceName
+    : initialConnection.deviceName;
   const savedDevices = normalizeSavedDevices(persisted?.savedDevices);
   return {
     localFolders: [] as FolderInfo[],
@@ -231,7 +244,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       cert: initialConnection.cert,
       key: initialConnection.key,
       remoteId: initialConnection.remoteId,
-      deviceName: initialConnection.deviceName,
+      deviceName: initialDeviceName,
       timeoutMs: initialConnection.timeoutMs,
       discoveryMode: initialConnection.discoveryMode,
       quicOnly: initialConnection.quicOnly === true,
@@ -376,6 +389,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       theme: normalizeThemePreferences(persisted?.theme),
       expertView: persisted?.expertView === true,
       showStabilityNotice: persisted?.stabilityNoticeAcknowledged !== true,
+      deviceNameConfirmed: isConfiguredDeviceName(initialDeviceName),
     },
     sync: {
       isSyncingStarredFiles: false,

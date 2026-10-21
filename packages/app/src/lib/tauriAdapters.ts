@@ -972,7 +972,7 @@ class TauriAdapters {
     return {
       hostAdapter: this.hostAdapter(),
       platformAdapter,
-      documentCommand: (request: Record<string, unknown>) => this.documentRequest(request),
+      documentCommand: <T>(request: Record<string, unknown>) => this.documentRequest<T>(request),
       connectDocumentFolder: documents.connectFolder,
       disconnectDocumentFolder: documents.disconnectFolder,
       syncDocumentFolders: documents.syncFolders,

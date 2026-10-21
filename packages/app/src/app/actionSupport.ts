@@ -16,7 +16,7 @@ import {
   activeSourceDeviceId,
   type AppState,
 } from "./state.ts";
-import { suggestedClientName } from "./suggestedNames.ts";
+import { isConfiguredDeviceName, suggestedClientName } from "./suggestedNames.ts";
 import {
   clearDirectoryViewState,
   resetRuntimeSessionState,
@@ -106,10 +106,12 @@ export const ensureClientName = (state: AppState) => {
   const currentName = state.connection.deviceName.trim();
   if (import.meta.env.SYNCPEER_LAN_E2E === true && currentName === "syncpeer-ui") {
     state.connection.deviceName = "syncpeer-ui-e2e";
+    state.ui.deviceNameConfirmed = true;
     return true;
   }
-  if (currentName && currentName !== "syncpeer-ui") {
+  if (isConfiguredDeviceName(currentName)) {
     state.connection.deviceName = currentName;
+    state.ui.deviceNameConfirmed = true;
     return true;
   }
   const chosen =
@@ -129,6 +131,7 @@ export const ensureClientName = (state: AppState) => {
     return false;
   }
   state.connection.deviceName = normalized;
+  state.ui.deviceNameConfirmed = true;
   return true;
 };
 

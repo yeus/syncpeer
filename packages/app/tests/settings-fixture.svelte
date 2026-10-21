@@ -2,6 +2,7 @@
   import { defaultFolderSettings, defaultProfileSettings } from "../../core/src/sync/profileSettings.ts";
   import { createInitialState } from "../src/app/state.ts";
   import GeneralSettingsPage from "../src/GeneralSettingsPage.svelte";
+  import PersonalSpaceOnboarding from "../src/components/PersonalSpaceOnboarding.svelte";
   import FolderSettingsPage from "../src/FolderSettingsPage.svelte";
   import NewFolderPage from "../src/NewFolderPage.svelte";
   import DeviceTab from "../src/components/DeviceTab.svelte";
@@ -49,6 +50,7 @@
 <button data-testid="lock-fixture" onclick={() => { phase = "locked"; }}>Lock fixture</button>
 <button data-testid="uninitialized-fixture" onclick={() => { phase = "uninitialized"; }}>Reset fixture</button>
 <button data-testid="browser-fixture" onclick={() => { managedStorage = false; }}>Browser fixture</button>
+<button data-testid="onboarding-fixture" onclick={() => { page = "onboarding"; }}>Onboarding fixture</button>
 <output data-testid="calls" hidden>{JSON.stringify(calls)}</output>
 {#if page === "main"}
   <DeviceTab {app} advertisedDevices={[]} currentSourceIsIntroducer={false}
@@ -82,6 +84,10 @@
     onClearPassword={async id => { password = ""; record({ operation: "clearFolderPassword", folderId: id }); }}
     onImport={async () => {}} onMigrate={async (id, target) => { record({ operation: "migrate", folderId: id, target }); }}
     onRelease={async () => {}} onSettingsSaved={() => {}} />
+{:else if page === "onboarding"}
+  <PersonalSpaceOnboarding mode="create" suggestedName="synthetic-device" initialDeviceName=""
+    {command} getDefaultDeviceId={async () => "synthetic-device"}
+    onDeviceNameSaved={() => {}} onReady={async () => {}} onOpenSettings={() => { page = "general"; }} />
 {:else}
   <NewFolderPage {command} onBack={() => { page = "main"; }} onOpenGeneralSettings={() => { page = "general"; }}
     onCreate={async label => { record({ operation: "createFolder", label }); }} />

@@ -15,6 +15,8 @@ import {
   persistState,
   sensitiveAppState,
 } from "../packages/app/src/app/state.ts";
+import { isConfiguredDeviceName } from "../packages/app/src/app/suggestedNames.ts";
+import { generateMasterPassword } from "../packages/app/src/app/passwords.ts";
 
 test("stability warning appears on first run and stays dismissed", () => {
   assert.equal(createInitialState(null).ui.showStabilityNotice, true);
@@ -285,6 +287,60 @@ test("startup persistence retains legacy sensitive state until verified migratio
   persistState(state, true);
   assert.equal(JSON.parse(raw).pim, undefined);
   assert.equal(JSON.parse(raw).folderPasswords, undefined);
+});
+
+
+test("the placeholder device name is not considered configured", () => {
+  assert.equal(isConfiguredDeviceName(""), false);
+  assert.equal(isConfiguredDeviceName("  "), false);
+  assert.equal(isConfiguredDeviceName("syncpeer-ui"), false);
+  assert.equal(isConfiguredDeviceName("syncpeer-android"), true);
+});
+
+test("a first-run device name persists before the encrypted profile exists", t => {
+  let written = "";
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true,
+    value: { localStorage: { setItem: (_key: string, value: string) => { written = value; } } } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  state.connection.deviceName = "Alice phone";
+  state.ui.deviceNameConfirmed = true;
+  persistState(state);
+  const persisted = JSON.parse(written);
+  assert.equal(persisted.deviceName, "Alice phone");
+  const restored = createInitialState(persisted);
+  assert.equal(restored.connection.deviceName, "Alice phone");
+  assert.equal(restored.ui.deviceNameConfirmed, true);
+});
+
+test("a confirmed first-run name survives an older encrypted placeholder", () => {
+  const state = createInitialState({ deviceName: "Alice phone" });
+  const payload = sensitiveAppState(state);
+  payload.connection = { ...payload.connection!, deviceName: "syncpeer-ui" };
+  applySensitiveAppState(state, payload);
+  assert.equal(state.connection.deviceName, "Alice phone");
+  assert.equal(state.ui.deviceNameConfirmed, true);
+});
+
+test("a configured encrypted device name completes first-run naming", () => {
+  const state = createInitialState(null);
+  assert.equal(state.ui.deviceNameConfirmed, false);
+  const payload = sensitiveAppState(state);
+  payload.connection = { ...payload.connection!, deviceName: "Existing device" };
+  applySensitiveAppState(state, payload);
+  assert.equal(state.connection.deviceName, "Existing device");
+  assert.equal(state.ui.deviceNameConfirmed, true);
+});
+
+test("generated master passwords are base64url and unpredictable", () => {
+  assert.equal(generateMasterPassword(() => new Uint8Array(32)), "A".repeat(43));
+  const first = generateMasterPassword();
+  const second = generateMasterPassword();
+  assert.match(first, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(second, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(first, second);
 });
 
 test("device IDs render in Syncthing's grouped form", () => {

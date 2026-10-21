@@ -183,8 +183,11 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         val request = JSONObject(args.request)
         val privateRoot = prepareSyncpeerPrivateStorageRoot(activity.noBackupFilesDir)
         // A never-configured vault must not require JavaScriptEngine just to use the legacy cache.
+        // Keep the canonical status shape because the cache reads the vault phase.
         if (request.optString("operation") == "cacheRegistrations" && !File(privateRoot, "documents/profile").exists()) {
-          invoke.resolve(app.tauri.plugin.JSObject("{\"result\":{\"folders\":[]}}")); return@Thread
+          invoke.resolve(app.tauri.plugin.JSObject(
+            "{\"result\":{\"vault\":{\"phase\":\"uninitialized\"},\"folders\":[]}}"))
+          return@Thread
         }
         if (Build.VERSION.SDK_INT < 26) {
           invoke.reject("Document access requires Android 8 or newer."); return@Thread

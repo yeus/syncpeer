@@ -3,6 +3,7 @@
   import type { PairingInvitation, SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { formatProfileCreationError } from "./app/storageErrors.ts";
+  import { generateMasterPassword } from "./app/passwords.ts";
   import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
   import { createWorkerPasswordKdf } from "./lib/passwordKdf.ts";
   let { onBack, onOpenFolderSettings, onUnlock, onUnlockBiometric, onRotateMasterPassword, onSettingsSaved,
@@ -180,9 +181,14 @@
   }
 
   function generatePassword() {
-    const bytes = crypto.getRandomValues(new Uint8Array(32));
-    generatedPassword = btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-    masterPassword = generatedPassword; generatedSaved = false;
+    try {
+      generatedPassword = generateMasterPassword();
+      masterPassword = generatedPassword;
+      generatedSaved = false;
+      error = "";
+    } catch {
+      error = "A master password could not be generated on this device. Enter one manually.";
+    }
   }
 
   async function saveMasterPassword() {
@@ -221,6 +227,12 @@
 <main class="panel" data-testid="general-settings-page">
   <button onclick={onBack}>Back</button>
   <h1>Settings</h1>
+  {#if status && status.vault.phase !== "unlocked"}
+    <p class="hint" data-testid="personal-space-required">
+      Encrypted shared folders need a master password on this device. Create a new personal space
+      below, or join or restore an existing one before opening them.
+    </p>
+  {/if}
   {#if error}<p role="alert">{error}</p>{/if}
   <section data-testid="personal-space-settings">
     <h2>Personal space</h2>

@@ -129,6 +129,20 @@ async function runSettingsUiTest(browser) {
   await click("[data-testid='unlock-folder-photos']");
   assert.equal((await calls()).at(-1).operation, "saveFolderPassword");
   console.log("Passed: browser-only folder passwords work without accessing native storage.");
+
+  await click("[data-testid='onboarding-fixture']");
+  await waitFor("[data-testid='personal-space-onboarding']");
+  assert.equal(await browser.$("[data-testid='onboarding-device-name']").isExisting(), true);
+  await click("[data-testid='onboarding-generate-password']");
+  const generatedPassword = await browser.$("[data-testid='generated-master-password']");
+  await generatedPassword.waitForExist();
+  const generatedText = await generatedPassword.getText();
+  assert.match(generatedText, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(await browser.$("[data-testid='onboarding-master-password']").getValue(), generatedText);
+  await click("[data-testid='onboarding-generated-saved']");
+  await click("[data-testid='onboarding-continue']");
+  await waitFor("[data-testid='onboarding-create']");
+  console.log("Passed: first-run onboarding generates a visible master password and reaches the create step.");
 }
 
 async function main() {

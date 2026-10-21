@@ -21,6 +21,11 @@ export const inferPlatformLabel = () => {
   return "device";
 };
 
+export const isConfiguredDeviceName = (value: string | null | undefined): boolean => {
+  const name = value?.trim() ?? "";
+  return name !== "" && name !== "syncpeer-ui";
+};
+
 export const suggestedClientName = () => {
   if (typeof window !== "undefined") {
     const host = window.location.hostname.trim().toLowerCase();

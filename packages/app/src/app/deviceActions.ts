@@ -256,6 +256,7 @@ class DeviceActionsRuntime {
       return;
     }
     this.state.connection.deviceName = updated.trim();
+    this.state.ui.deviceNameConfirmed = true;
     this.state.devices.identityNotice = "Advertised device name updated.";
     this.state.ui.recentError = null;
   };

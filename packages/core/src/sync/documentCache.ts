@@ -23,7 +23,9 @@ type DocumentCacheOptions = {
   show: (id: string) => Promise<void>;
 };
 
-type CacheStatus = { vault: { phase: string }; folders: FolderRegistration[] };
+type CacheStatus = { vault?: { phase: string }; folders: FolderRegistration[] };
+
+const vaultPhase = (status: CacheStatus) => status.vault?.phase ?? "uninitialized";
 
 class DocumentCache {
   private readonly options: DocumentCacheOptions;
@@ -60,8 +62,9 @@ class DocumentCache {
       const status = await this.cacheStatus();
       if (this.migrating.has(folderId)) continue;
       // An uninitialized vault still needs to expose existing legacy files; lock never does.
-      if (status.vault.phase === "uninitialized") return undefined;
-      if (status.vault.phase !== "unlocked") {
+      const phase = vaultPhase(status);
+      if (phase === "uninitialized") return undefined;
+      if (phase !== "unlocked") {
         throw new Error("Encrypted folder storage is locked. Unlock the vault before downloading.");
       }
       return status.folders.find(folder => folder.id === folderId && folder.downloads);
@@ -86,7 +89,7 @@ class DocumentCache {
   private async loadProfileSettings() {
     if (!this.options.enabled()) return this.options.legacy.loadProfileSettings?.() ?? defaultProfileSettings();
     const status = await this.cacheStatus();
-    return status.vault.phase === "uninitialized"
+    return vaultPhase(status) === "uninitialized"
       ? defaultProfileSettings()
       : this.request<SyncpeerProfileSettings>({ operation: "profileSettings" });
   }
@@ -440,7 +443,7 @@ class DocumentCache {
       ownedDevices: async () => (await this.request<{ devices: OwnedSpaceDevice[] }>({ operation: "ownedDevices" })).devices,
       revokeOwnedDevice: deviceId => this.request({ operation: "revokeOwnedDevice", deviceId }),
       sessionSharedFolders: async remoteDeviceId => {
-        if (!this.options.enabled() || (await this.cacheStatus()).vault.phase !== "unlocked") return [];
+        if (!this.options.enabled() || vaultPhase(await this.cacheStatus()) !== "unlocked") return [];
         return this.request({ operation: "sessionSharedFolders", remoteDeviceId });
       },
     };
@@ -555,7 +558,16 @@ class DocumentCache {
   }
 
   private async getCachedStatuses(folderId: string, paths: string[]) {
-    if (!await this.owner(folderId)) return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+    if (!this.options.enabled()) return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+    const status = await this.cacheStatus();
+    const phase = vaultPhase(status);
+    if (phase === "uninitialized") {
+      return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+    }
+    if (phase !== "unlocked") return [];
+    if (!await this.owner(folderId)) {
+      return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+    }
     return this.request<CachedFileStatus[]>({ operation: "cachedStatuses", folderId, paths });
   }
 
@@ -776,6 +788,10 @@ class DocumentCache {
   private async syncFolders(folders: FolderInfo[], passwords: Record<string, string>) {
     const task = this.folderQueue.then(async () => {
       if (!this.options.enabled()) return [];
+      const status = await this.cacheStatus();
+      // Folder registration mutates the encrypted registry. Wait for unlock; the
+      // post-unlock credential load calls syncFolders again.
+      if (vaultPhase(status) !== "unlocked") return status.folders;
       // Discovery must finish even if preparing one folder's contents later fails.
       for (const folder of folders) {
         await this.request({ operation: "rememberFolder", id: folder.id, label: folder.label || folder.id });

@@ -260,6 +260,61 @@ test("automatic folder discovery does not reattach a browse-only local copy", as
   assert.ok(!requests.includes("register") && !requests.includes("attachDownloads"));
 });
 
+test("folder discovery waits for an unlocked vault before registration", async () => {
+  const requests: string[] = [];
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      requests.push(String(input.operation));
+      if (input.operation === "cacheRegistrations") {
+        return { vault: { phase: "locked" }, folders: [] } as T;
+      }
+      throw new Error(`Unexpected document request: ${String(input.operation)}`);
+    },
+    legacy: {}, openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  const folders = await cache.syncFolders([
+    { id: "photos", label: "Photos", readOnly: true, encrypted: true, needsPassword: true },
+  ], {});
+  assert.deepEqual(folders, []);
+  assert.deepEqual(requests, ["cacheRegistrations"]);
+});
+
+test("an uninitialized registration response without a vault field is treated as uninitialized storage", async () => {
+  const requests: string[] = [];
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      requests.push(String(input.operation));
+      if (input.operation === "cacheRegistrations") return { folders: [] } as T;
+      throw new Error(`Unexpected document request: ${String(input.operation)}`);
+    },
+    legacy: {}, openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  const folders = await cache.syncFolders([
+    { id: "photos", label: "Photos", readOnly: true, encrypted: true, needsPassword: true },
+  ], {});
+  assert.deepEqual(folders, []);
+  assert.deepEqual(requests, ["cacheRegistrations"]);
+});
+
+test("cached status reads do not touch encrypted storage while the vault is locked", async () => {
+  const requests: string[] = [];
+  let legacyReads = 0;
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      requests.push(String(input.operation));
+      if (input.operation === "cacheRegistrations") {
+        return { vault: { phase: "locked" }, folders: [] } as T;
+      }
+      throw new Error(`Unexpected document request: ${String(input.operation)}`);
+    },
+    legacy: { getCachedStatuses: async () => { legacyReads += 1; return []; } },
+    openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  assert.deepEqual(await cache.platformAdapter.getCachedStatuses!("photos", [""]), []);
+  assert.equal(legacyReads, 0, "A locked vault must not fall back to the plaintext cache");
+  assert.deepEqual(requests, ["cacheRegistrations"]);
+});
+
 test("opening a folder waits for encrypted attachment migration to finish", async () => {
   let releaseAttach!: () => void;
   let markAttachStarted!: () => void;

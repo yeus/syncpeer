@@ -70,6 +70,9 @@
   import VersionsPage from "./VersionsPage.svelte";
   import { applyTheme } from "./app/theme.ts";
   import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
+  import { isConfiguredDeviceName, suggestedClientName } from "./app/suggestedNames.ts";
+  import DeviceNameOnboarding from "./components/DeviceNameOnboarding.svelte";
+  import PersonalSpaceOnboarding from "./components/PersonalSpaceOnboarding.svelte";
   import { requestLocalDataReset } from "./app/localReset.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
@@ -120,6 +123,21 @@
   let privateStorageRecoveryMessage = $state<string | null>(null);
   let privateStorageResetPending = $state(false);
   let privateStorageResetError = $state("");
+  let startupReady = $state(false);
+  let vaultOnboardingMode = $state<"create" | "unlock" | null>(null);
+  const showDeviceNameOnboarding = $derived(
+    startupReady &&
+    app.currentPage === "main" &&
+    !vaultOnboardingMode &&
+    !app.ui.deviceNameConfirmed &&
+    !isConfiguredDeviceName(app.connection.deviceName) &&
+    app.devices.savedDevices.length === 0
+  );
+  const onboardingSuggestedName = $derived(
+    isConfiguredDeviceName(app.connection.deviceName)
+      ? app.connection.deviceName.trim()
+      : suggestedClientName()
+  );
 
   async function resetPrivateStorage() {
     privateStorageResetPending = true;
@@ -219,6 +237,13 @@
       void documentCommand({ operation: "saveUiState", state: payload })
         .catch(() => { uiStateLoaded = false; });
     }, 500);
+  };
+
+  const saveDeviceName = (name: string) => {
+    app.connection.deviceName = name;
+    app.ui.deviceNameConfirmed = true;
+    persistState(app);
+    persistSensitiveState();
   };
 
   async function loadFolderCredentials() {
@@ -429,10 +454,13 @@
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
     void (async () => {
-      if (biometric && (await biometric.status()).enabled &&
-        (await documentCommand<{ vault: { phase: string } }>({ operation: "status" })).vault.phase === "locked") {
-        await unlockWithBiometric();
-      } else await loadFolderCredentials();
+      const initialVault = await documentCommand<{ vault: { phase: string } }>({ operation: "status" })
+        .catch(() => null);
+      if (initialVault?.vault.phase === "unlocked") await loadFolderCredentials();
+      else if (initialVault?.vault.phase === "locked" && biometric &&
+        await biometric.status().then(status => status.enabled).catch(() => false)) {
+        await unlockWithBiometric().catch(() => undefined);
+      }
       await Promise.all([
         actions.hydrate(),
         actions.refreshCurrentDeviceId(),
@@ -441,7 +469,18 @@
       await actions.restoreNavigationRoute(false);
       await actions.onAppForeground();
       await actions.restoreNavigationRoute(true);
-    })().catch(() => { app.ui.recentError = "Unlock your personal space in Settings to restore saved passwords."; });
+      const finalVault = await documentCommand<{ vault: { phase: string } }>({ operation: "status" })
+        .catch(() => null);
+      if (finalVault && finalVault.vault.phase !== "unlocked") {
+        pushSessionLog(app, "info", "app.personal_space.required",
+          "Personal space must be created or unlocked.", { phase: finalVault.vault.phase });
+        vaultOnboardingMode = finalVault.vault.phase === "locked" ? "unlock" : "create";
+      }
+    })().catch(() => {
+      app.ui.recentError = "Unlock your personal space in Settings to restore saved passwords.";
+    }).finally(() => {
+      startupReady = true;
+    });
 
     const handleOnline = () => {
       void actions.onNetworkOnline();
@@ -927,6 +966,32 @@
     onBack={actions.closeVersions} onRestore={actions.restoreVersion} />
 {:else}
   <AboutPage onBack={actions.closeAboutPage} />
+{/if}
+
+{#if vaultOnboardingMode}
+  <PersonalSpaceOnboarding
+    mode={vaultOnboardingMode}
+    suggestedName={onboardingSuggestedName}
+    initialDeviceName={app.connection.deviceName}
+    command={documentCommand}
+    getDefaultDeviceId={() => client.getDefaultDeviceId()}
+    biometric={biometric}
+    onDeviceNameSaved={saveDeviceName}
+    onReady={async () => {
+      vaultOnboardingMode = null;
+      await loadFolderCredentials().catch(error => {
+        app.ui.recentError = error instanceof Error ? error.message : String(error);
+      });
+    }}
+    onOpenSettings={() => {
+      vaultOnboardingMode = null;
+      actions.openGeneralSettings();
+    }}
+  />
+{/if}
+
+{#if showDeviceNameOnboarding}
+  <DeviceNameOnboarding suggestedName={onboardingSuggestedName} onSave={saveDeviceName} />
 {/if}
 
 <style>

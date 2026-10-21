@@ -482,11 +482,11 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
                   observed.__syntheticIndexes?.push(summary);
               }
             }
-            if (event !== "client.shared_folders.selected") continue;
+            if (event !== "client.shared_folders.selected") return;
             observed.__syntheticSelectionEvents =
               (observed.__syntheticSelectionEvents ?? 0) + 1;
             const details = node.querySelector("pre.log-details")?.textContent;
-            if (!details) continue;
+            if (!details) return;
             const counts = JSON.parse(details) as {
               count?: number;
               internalCount?: number;

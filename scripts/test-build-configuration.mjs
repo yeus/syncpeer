@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -88,6 +89,16 @@ test("packaged screenshot capture ensures ignored Tauri icons before building", 
     script,
     /run\("npm", \["run", "icons:ensure", "-w", "@syncpeer\/tauri-shell"\]\);[\s\S]*?run\("npx", \[[\s\S]*?"tauri", "build"/,
   );
+});
+
+test("packaged pairing spec parses with the TypeScript loader before acceptance", () => {
+  const require = createRequire(import.meta.resolve("tsx"));
+  const { transformSync } = require("esbuild");
+  const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
+  assert.doesNotThrow(() => transformSync(spec, {
+    loader: "ts",
+    sourcefile: "scripts/lan-test/packaged-pairing.spec.ts",
+  }));
 });
 
 test("packaged screenshots use focused-window capture in screenshot environments", () => {

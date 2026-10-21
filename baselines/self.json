@@ -1,12 +1,12 @@
 {
   "version": 4,
-  "engine": "eslint@9.39.5/block-depth-v1",
+  "engine": "eslint@9.39.5/depth-v2",
   "nestingLimit": 4,
   "limits": {
     "lines": 40,
     "nesting": 4,
     "callDepth": 4,
-    "callbackDepth": 4
+    "callbackDepth": 3
   },
   "thresholds": {},
   "metrics": {
@@ -14,91 +14,91 @@
       "unit": "files",
       "meaning": "Source inventory; growth alone is not deterioration.",
       "direction": "context",
-      "value": 252,
+      "value": 325,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "functions": {
       "unit": "functions",
       "meaning": "Includes named functions, nested callbacks and test scopes.",
       "direction": "context",
-      "value": 5088,
+      "value": 8296,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "lines.physical": {
       "unit": "lines",
       "meaning": "Physical source lines; size-only languages included.",
       "direction": "context",
-      "value": 56096,
+      "value": 83629,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "lines.code": {
       "unit": "lines",
       "meaning": "ESLint code lines for supported scripts only.",
       "direction": "context",
-      "value": 42760,
+      "value": 64493,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "fileLines.mean": {
       "unit": "lines",
       "meaning": "File code size; splitting is not automatically an improvement. Average across measured items.",
       "direction": "context",
-      "value": 181.1864406779661,
+      "value": 210.76143790849673,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "fileLines.p95": {
       "unit": "lines",
       "meaning": "File code size; splitting is not automatically an improvement. At least 95% of items are at or below this value.",
       "direction": "context",
-      "value": 641,
+      "value": 791,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "fileLines.max": {
       "unit": "lines",
       "meaning": "File code size; splitting is not automatically an improvement. Largest observed value.",
       "direction": "context",
-      "value": 2993,
+      "value": 3366,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "fileBytes.mean": {
       "unit": "bytes",
       "meaning": "UTF-8 byte size of each inventoried source file; large files deserve a boundary review. Average across measured items.",
       "direction": "context",
-      "value": 8656.742063492064,
+      "value": 10536.378461538461,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "fileBytes.p95": {
       "unit": "bytes",
       "meaning": "UTF-8 byte size of each inventoried source file; large files deserve a boundary review. At least 95% of items are at or below this value.",
       "direction": "context",
-      "value": 29825,
+      "value": 43005,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "fileBytes.max": {
       "unit": "bytes",
       "meaning": "UTF-8 byte size of each inventoried source file; large files deserve a boundary review. Largest observed value.",
       "direction": "context",
-      "value": 158947,
+      "value": 196194,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "largeFiles": {
       "unit": "files",
       "meaning": "Above the 300-code-line review signal.",
       "direction": "context",
-      "value": 40,
+      "value": 56,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "coverage.sizeOnly": {
       "unit": "files",
       "meaning": "Files measured only for physical size.",
       "direction": "context",
-      "value": 16,
+      "value": 19,
       "why": "Expose gaps so missing relationships do not look like improved independence."
     },
     "coverage.unresolved": {
       "unit": "observations",
       "meaning": "Unknown relationships; reductions may reflect code deletion or changed resolution.",
       "direction": "context",
-      "value": 14076,
+      "value": 22542,
       "why": "Expose gaps so missing relationships do not look like improved independence."
     },
     "coverage.errors": {
@@ -112,42 +112,42 @@
       "unit": "objects",
       "meaning": "Module-level const objects/arrays with nested literal data; this is a scope inventory.",
       "direction": "context",
-      "value": 8,
+      "value": 12,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "immutability.mutableConstData": {
       "unit": "objects",
       "meaning": "Module-level nested const data without a deep-readonly marker; these values remain writable through their references.",
       "direction": "lower",
-      "value": 8,
+      "value": 12,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "functionLines.mean": {
       "unit": "lines",
-      "meaning": "Executable function code size; suite registration scopes are excluded. Average across measured items.",
+      "meaning": "Executable function code size; blank and comment-only lines are excluded. Average across measured items.",
       "direction": "context",
-      "value": 10.235259433962264,
+      "value": 8.938162970106076,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "functionLines.p95": {
       "unit": "lines",
-      "meaning": "Executable function code size; suite registration scopes are excluded. At least 95% of items are at or below this value.",
+      "meaning": "Executable function code size; blank and comment-only lines are excluded. At least 95% of items are at or below this value.",
       "direction": "context",
-      "value": 35,
+      "value": 32,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "functionLines.max": {
       "unit": "lines",
-      "meaning": "Executable function code size; suite registration scopes are excluded. Largest observed value.",
+      "meaning": "Executable function code size; blank and comment-only lines are excluded. Largest observed value.",
       "direction": "context",
-      "value": 580,
+      "value": 680,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "nesting.mean": {
       "unit": "levels",
       "meaning": "ESLint block depth; lower is a simpler-control-flow signal. Average across measured items.",
       "direction": "lower",
-      "value": 0.36851415094339623,
+      "value": 0.34269527483124396,
       "why": "Keep the number of conditions a reader must hold in mind manageable."
     },
     "nesting.p95": {
@@ -161,14 +161,14 @@
       "unit": "levels",
       "meaning": "ESLint block depth; lower is a simpler-control-flow signal. Largest observed value.",
       "direction": "lower",
-      "value": 7,
+      "value": 6,
       "why": "Keep the number of conditions a reader must hold in mind manageable."
     },
     "callDepth.mean": {
       "unit": "levels",
       "meaning": "Calls nested inside arguments or receivers; callback bodies measured separately. Average across measured items.",
       "direction": "lower",
-      "value": 1.0182783018867925,
+      "value": 1.0150675024108005,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "callDepth.p95": {
@@ -187,30 +187,51 @@
     },
     "callbackDepth.mean": {
       "unit": "levels",
-      "meaning": "Control-flow depth carried across inline callbacks; each callback adds one level. Average across measured items.",
+      "meaning": "Maximum nesting of inline callback functions; each callback adds one level. Blocks are measured separately. Average across measured items.",
       "direction": "lower",
-      "value": 0.5493317610062893,
+      "value": 0.21612825458052073,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "callbackDepth.p95": {
       "unit": "levels",
-      "meaning": "Control-flow depth carried across inline callbacks; each callback adds one level. At least 95% of items are at or below this value.",
+      "meaning": "Maximum nesting of inline callback functions; each callback adds one level. Blocks are measured separately. At least 95% of items are at or below this value.",
       "direction": "lower",
-      "value": 2,
+      "value": 1,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "callbackDepth.max": {
       "unit": "levels",
-      "meaning": "Control-flow depth carried across inline callbacks; each callback adds one level. Largest observed value.",
+      "meaning": "Maximum nesting of inline callback functions; each callback adds one level. Blocks are measured separately. Largest observed value.",
       "direction": "lower",
-      "value": 7,
+      "value": 4,
+      "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
+    },
+    "visualDepth.mean": {
+      "unit": "levels",
+      "meaning": "Visual control-flow depth: inline callbacks plus per-function block depth. Advisory only. Average across measured items.",
+      "direction": "context",
+      "value": 0.5262777242044359,
+      "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
+    },
+    "visualDepth.p95": {
+      "unit": "levels",
+      "meaning": "Visual control-flow depth: inline callbacks plus per-function block depth. Advisory only. At least 95% of items are at or below this value.",
+      "direction": "context",
+      "value": 2,
+      "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
+    },
+    "visualDepth.max": {
+      "unit": "levels",
+      "meaning": "Visual control-flow depth: inline callbacks plus per-function block depth. Advisory only. Largest observed value.",
+      "direction": "context",
+      "value": 6,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "parameters.mean": {
       "unit": "parameters",
       "meaning": "Explicit inputs can replace hidden dependencies; fewer is not always better. Average across measured items.",
       "direction": "context",
-      "value": 0.9202044025157232,
+      "value": 0.9468418514946962,
       "why": "Make required inputs visible without encouraging oversized input objects."
     },
     "parameters.p95": {
@@ -231,63 +252,63 @@
       "unit": "functions",
       "meaning": "Executable functions above the 40-code-line review signal.",
       "direction": "context",
-      "value": 216,
+      "value": 189,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "captures.mean": {
       "unit": "bindings",
       "meaning": "Dependencies outside function parameters; imports and closures included. Average across measured items.",
       "direction": "context",
-      "value": 1.7063679245283019,
+      "value": 1.526036644165863,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "captures.p95": {
       "unit": "bindings",
       "meaning": "Dependencies outside function parameters; imports and closures included. At least 95% of items are at or below this value.",
       "direction": "context",
-      "value": 6,
+      "value": 5,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "captures.max": {
       "unit": "bindings",
       "meaning": "Dependencies outside function parameters; imports and closures included. Largest observed value.",
       "direction": "context",
-      "value": 27,
+      "value": 49,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "captures.mutable": {
       "unit": "bindings",
       "meaning": "Function/binding observations; not writes or object mutability.",
       "direction": "lower",
-      "value": 880,
+      "value": 1030,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "captures.module": {
       "unit": "bindings",
       "meaning": "Captured dependencies by origin; assess locality and reuse.",
       "direction": "context",
-      "value": 1793,
+      "value": 3154,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "captures.closure": {
       "unit": "bindings",
       "meaning": "Captured dependencies by origin; assess locality and reuse.",
       "direction": "context",
-      "value": 3493,
+      "value": 4223,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "captures.import": {
       "unit": "bindings",
       "meaning": "Captured dependencies by origin; assess locality and reuse.",
       "direction": "context",
-      "value": 3396,
+      "value": 5283,
       "why": "Expose hidden inputs and reliance on state outside the function."
     },
     "capabilityMembers.mean": {
       "unit": "members",
       "meaning": "Named parameter members accessed; a larger input object may conceal coupling. Average across measured items.",
       "direction": "context",
-      "value": 0.5754716981132075,
+      "value": 0.6098119575699132,
       "why": "Reveal how much of an input object a function really needs."
     },
     "capabilityMembers.p95": {
@@ -301,98 +322,98 @@
       "unit": "members",
       "meaning": "Named parameter members accessed; a larger input object may conceal coupling. Largest observed value.",
       "direction": "context",
-      "value": 41,
+      "value": 17,
       "why": "Reveal how much of an input object a function really needs."
     },
     "compliance.candidates": {
       "unit": "functions",
-      "meaning": "Functions subject to strict limits; suite registration scopes are excluded.",
+      "meaning": "Functions subject to strict limits; file-level metric exemptions are honored per metric.",
       "direction": "context",
-      "value": 5088,
+      "value": 8296,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "compliance.nonCompliantFunctions": {
       "unit": "functions",
       "meaning": "Unique executable functions exceeding at least one configured strict limit.",
       "direction": "lower",
-      "value": 222,
+      "value": 197,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "compliance.violations": {
       "unit": "violations",
       "meaning": "Strict limit breaches; one function may contribute several violations.",
       "direction": "lower",
-      "value": 247,
+      "value": 199,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "compliance.lines": {
       "unit": "functions",
       "meaning": "Functions exceeding the configured code-line limit.",
       "direction": "lower",
-      "value": 216,
+      "value": 189,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "compliance.nesting": {
       "unit": "functions",
       "meaning": "Functions exceeding the configured block-nesting limit.",
       "direction": "lower",
-      "value": 12,
+      "value": 5,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "compliance.callDepth": {
       "unit": "functions",
       "meaning": "Functions exceeding the configured nested-call limit.",
       "direction": "lower",
-      "value": 1,
+      "value": 3,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "compliance.callbackDepth": {
       "unit": "functions",
       "meaning": "Functions exceeding the configured callback-depth limit.",
       "direction": "lower",
-      "value": 18,
+      "value": 2,
       "why": "Put complexity changes in the context of code size; growth alone does not mean worse quality."
     },
     "edges.call": {
       "unit": "edges",
       "meaning": "Distinct directed endpoint/kind pairs; call and reference can describe the same connection.",
       "direction": "context",
-      "value": 3289,
+      "value": 5461,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "edges.reference": {
       "unit": "edges",
       "meaning": "Distinct directed endpoint/kind pairs; call and reference can describe the same connection.",
       "direction": "context",
-      "value": 3347,
+      "value": 5390,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "edges.import": {
       "unit": "edges",
       "meaning": "Distinct directed endpoint/kind pairs; call and reference can describe the same connection.",
       "direction": "context",
-      "value": 330,
+      "value": 470,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "edges.type-import": {
       "unit": "edges",
       "meaning": "Distinct directed endpoint/kind pairs; call and reference can describe the same connection.",
       "direction": "context",
-      "value": 136,
+      "value": 166,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "connections": {
       "unit": "edges",
       "meaning": "Distinct directed function pairs, deduplicating call/reference observations.",
       "direction": "context",
-      "value": 3498,
+      "value": 5695,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "fanOut.mean": {
       "unit": "functions",
       "meaning": "Direct dependency breadth; legitimate decomposition can increase it. Average across measured items.",
       "direction": "context",
-      "value": 0.6875,
+      "value": 0.6864754098360656,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "fanOut.p95": {
@@ -406,14 +427,14 @@
       "unit": "functions",
       "meaning": "Direct dependency breadth; legitimate decomposition can increase it. Largest observed value.",
       "direction": "context",
-      "value": 21,
+      "value": 41,
       "why": "Track how many other pieces must be understood to change this code."
     },
     "fanIn.mean": {
       "unit": "functions",
       "meaning": "Caller breadth; high fan-in can indicate valuable reuse. Average across measured items.",
       "direction": "context",
-      "value": 0.6875,
+      "value": 0.6864754098360656,
       "why": "Identify shared helpers and code whose changes could affect many callers."
     },
     "fanIn.p95": {
@@ -427,14 +448,14 @@
       "unit": "functions",
       "meaning": "Caller breadth; high fan-in can indicate valuable reuse. Largest observed value.",
       "direction": "context",
-      "value": 60,
+      "value": 69,
       "why": "Identify shared helpers and code whose changes could affect many callers."
     },
     "reach.functions.mean": {
       "unit": "functions",
       "meaning": "Dependencies reachable within two steps; static observations only. Average across measured items.",
       "direction": "context",
-      "value": 1.3064072327044025,
+      "value": 1.3587270973963357,
       "why": "Estimate how far a reader or change may need to travel through the code."
     },
     "reach.functions.p95": {
@@ -448,35 +469,35 @@
       "unit": "functions",
       "meaning": "Dependencies reachable within two steps; static observations only. Largest observed value.",
       "direction": "context",
-      "value": 45,
+      "value": 101,
       "why": "Estimate how far a reader or change may need to travel through the code."
     },
     "reach.files.mean": {
       "unit": "files",
       "meaning": "Files reachable within two steps, including imports. Average across measured items.",
       "direction": "context",
-      "value": 4.507936507936508,
+      "value": 5.32923076923077,
       "why": "Estimate how far a reader or change may need to travel through the code."
     },
     "reach.files.p95": {
       "unit": "files",
       "meaning": "Files reachable within two steps, including imports. At least 95% of items are at or below this value.",
       "direction": "context",
-      "value": 19,
+      "value": 23,
       "why": "Estimate how far a reader or change may need to travel through the code."
     },
     "reach.files.max": {
       "unit": "files",
       "meaning": "Files reachable within two steps, including imports. Largest observed value.",
       "direction": "context",
-      "value": 41,
+      "value": 61,
       "why": "Estimate how far a reader or change may need to travel through the code."
     },
     "cycles.functions": {
       "unit": "groups",
       "meaning": "Strongly connected groups including recursion; inspect members.",
       "direction": "context",
-      "value": 12,
+      "value": 17,
       "why": "Find pieces that depend on each other and may be difficult to understand or change separately."
     },
     "cycles.files": {
@@ -490,28 +511,28 @@
       "unit": "functions",
       "meaning": "No observed edges; callback/framework connections may be missing.",
       "direction": "context",
-      "value": 2639,
+      "value": 4367,
       "why": "Expose gaps so missing relationships do not look like improved independence."
     },
     "boundaries.file": {
       "unit": "edges",
       "meaning": "Cross-file connections include function pairs and import observations.",
       "direction": "context",
-      "value": 1467,
+      "value": 2176,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     },
     "boundaries.folder": {
       "unit": "edges",
       "meaning": "Cross-boundary resolved function connections; imports excluded.",
       "direction": "context",
-      "value": 395,
+      "value": 707,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     },
     "boundaries.package": {
       "unit": "edges",
       "meaning": "Cross-boundary resolved function connections; imports excluded.",
       "direction": "context",
-      "value": 154,
+      "value": 307,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     },
     "boundaries.submodule": {
@@ -525,21 +546,21 @@
       "unit": "clusters",
       "meaning": "Fresh discovery; more clusters is not inherently better.",
       "direction": "context",
-      "value": 2773,
+      "value": 4598,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     },
     "clusters.singletons": {
       "unit": "clusters",
       "meaning": "Often unresolved callbacks, not proof of independence.",
       "direction": "context",
-      "value": 2639,
+      "value": 4367,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     },
     "clusters.crossings": {
       "unit": "edges",
       "meaning": "Crossings against saved borders during comparison; new/unmatched functions excluded.",
       "direction": "context",
-      "value": 129,
+      "value": 181,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     },
     "clusters.unassigned": {
@@ -553,7 +574,7 @@
       "unit": "%",
       "meaning": "Percentage of resolved function pairs crossing the compared borders; unassigned endpoints excluded.",
       "direction": "context",
-      "value": 3.687821612349914,
+      "value": 3.1782265144863917,
       "why": "Find bridges between responsibilities and judge whether related code stays together."
     }
   }

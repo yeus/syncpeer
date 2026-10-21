@@ -805,6 +805,17 @@ test("foreground and online transitions retry immediately", async () => {
   await lifecycle.disconnect();
 });
 
+test("foreground return without a desired connection clears suspension", async () => {
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => { throw new Error("no connection was requested"); },
+    keyFor: (value) => value,
+  });
+  await lifecycle.setForeground(false);
+  assert.equal(lifecycle.getState().phase, "suspended");
+  await lifecycle.setForeground(true);
+  assert.equal(lifecycle.getState().phase, "idle");
+});
+
 test("upgrade probes swap only after replacement readiness and then close the old path", async () => {
   const relay = { ...session(), transportKind: "relay" as const, connectionScope: "wan" as const };
   const direct = { ...session(), transportKind: "direct-tcp" as const, connectionScope: "lan" as const };

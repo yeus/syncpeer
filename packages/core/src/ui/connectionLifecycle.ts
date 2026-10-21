@@ -407,6 +407,9 @@ class ConnectionLifecycleRuntime<TOptions> {
       this.foreground = nextForeground;
       if (!this.foreground && !this.transferActive) await this.suspend();
       else if (this.foreground) {
+        if (!this.desired && this.state.phase === "suspended") {
+          this.update({ phase: "idle", nextRetryAtMs: null, closureReason: null });
+        }
         await this.attemptNow();
         this.scheduleUpgrade(this.generation);
       }

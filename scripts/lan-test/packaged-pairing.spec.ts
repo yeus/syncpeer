@@ -328,7 +328,11 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
     const list = summary?.parentElement?.querySelector("ul.list");
     if (!list) throw new Error("The session log list is unavailable.");
     type Observed = typeof observed;
-    const processEntry = (entry: Element, node: Element, observed: Observed) => {
+    // WebdriverIO serializes this callback with Function#toString. Keep helpers
+    // as object methods: tsx names function bindings with a module-scoped
+    // __name helper that does not exist in the page.
+    const handlers = {
+      processEntry(entry: Element, node: Element, observed: Observed) {
             const event = entry.textContent?.split(" | ").at(-1)?.trim();
             if (event === "document.session_folders.queued") {
               const details =
@@ -503,14 +507,17 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
             ) {
               observed.__syntheticFolderTotalCounts?.push(counts.count);
             }
-    };
-    const processNode = (node: Node, observed: Observed) => {
-      if (!(node instanceof Element) || !node.matches("li")) return;
-      for (const entry of node.querySelectorAll(".item-meta")) processEntry(entry, node, observed);
+      },
+      processNode(node: Node, observed: Observed) {
+        if (!(node instanceof Element) || !node.matches("li")) return;
+        for (const entry of node.querySelectorAll(".item-meta")) {
+          handlers.processEntry(entry, node, observed);
+        }
+      },
     };
     const observer = new MutationObserver((records) => {
       for (const record of records)
-        for (const node of record.addedNodes) processNode(node, observed);
+        for (const node of record.addedNodes) handlers.processNode(node, observed);
     });
     observer.observe(list, { childList: true });
   });

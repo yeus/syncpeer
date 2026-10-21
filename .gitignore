@@ -12,6 +12,7 @@ dist/
 android.logs
 output.log
 output.*.log
+output.txt
 logs.txt
 logs/
 /syncpeer-offline-signing-kit.json

@@ -1,3 +1,4 @@
+// code-analysis-disable lines -- Large Android E2E scenario kept linear for readability.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";

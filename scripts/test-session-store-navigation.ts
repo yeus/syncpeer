@@ -1,3 +1,4 @@
+// code-analysis-disable lines -- Session navigation scenario matrix kept linear for readability.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSyncpeerSessionStore } from "../packages/core/src/ui/sessionStore.ts";

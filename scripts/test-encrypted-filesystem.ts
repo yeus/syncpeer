@@ -210,6 +210,29 @@ test("encrypted namespace rejects a file that collides with a parent directory",
   }, child.crypto.folderKey), /conflict/i);
 });
 
+const assertStoredEncryptedFile = async (
+  namespace: Awaited<ReturnType<typeof readEncryptedNamespace>>,
+  received: string,
+  folderKey: Uint8Array,
+  bytes: Uint8Array,
+): Promise<void> => {
+  const name = `nested/file-${bytes.length}`;
+  assert.equal(namespace.get(name)?.metadata, "authenticated");
+  const encryptedName = await encryptUntrustedFilename(folderKey, name);
+  const stored = await readFile(path.join(received, encryptedName));
+  const source = { size: stored.length,
+    readRange: async (offset: number, size: number) => stored.slice(offset, offset + size) };
+  const metadata = await loadEncryptedDiskMetadata(source, encryptedName, folderKey);
+  try {
+    assert.equal(metadata.fileInfo.name, name);
+    assert.equal(Number(metadata.fileInfo.size), bytes.length);
+    assert.deepEqual(await readEncryptedDiskRange(source, metadata, 0, bytes.length), bytes);
+    if (bytes.length > 131072) {
+      assert.deepEqual(await readEncryptedDiskRange(source, metadata, 131070, 5), bytes.slice(131070, 131075));
+    }
+  } finally { metadata.fileKey.fill(0); }
+};
+
 test("core reads actual Syncthing receiveencrypted files", { timeout: 90000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-upstream-encrypted-"));
   const peers: Awaited<ReturnType<typeof createLanFixture>>[] = [];
@@ -229,22 +252,7 @@ test("core reads actual Syncthing receiveencrypted files", { timeout: 90000 }, a
         readRange: async (name, offset, size) => (await readFile(path.join(received, name))).slice(offset, offset + size),
       }, crypto.folderKey);
       assert.equal(namespace.get("nested")?.fileInfo.type, 1);
-      for (const bytes of contents) {
-        const name = `nested/file-${bytes.length}`;
-        assert.equal(namespace.get(name)?.metadata, "authenticated");
-        const encryptedName = await encryptUntrustedFilename(crypto.folderKey, name);
-        const stored = await readFile(path.join(received, encryptedName));
-        const source = { size: stored.length, readRange: async (offset: number, size: number) => stored.slice(offset, offset + size) };
-        const metadata = await loadEncryptedDiskMetadata(source, encryptedName, crypto.folderKey);
-        try {
-          assert.equal(metadata.fileInfo.name, name);
-          assert.equal(Number(metadata.fileInfo.size), bytes.length);
-          assert.deepEqual(await readEncryptedDiskRange(source, metadata, 0, bytes.length), bytes);
-          if (bytes.length > 131072) {
-            assert.deepEqual(await readEncryptedDiskRange(source, metadata, 131070, 5), bytes.slice(131070, 131075));
-          }
-        } finally { metadata.fileKey.fill(0); }
-      }
+      for (const bytes of contents) await assertStoredEncryptedFile(namespace, received, crypto.folderKey, bytes);
     } finally { crypto.folderKey.fill(0); }
   } finally {
     await Promise.all(peers.map(peer => peer.stop()));

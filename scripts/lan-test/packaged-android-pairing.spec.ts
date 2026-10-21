@@ -1,3 +1,4 @@
+// code-analysis-disable lines -- Packaged Android pairing scenario kept linear for readability.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { X509Certificate } from "node:crypto";

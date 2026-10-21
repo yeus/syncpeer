@@ -326,99 +326,88 @@ const runServer = async (args: {
 const coordinatorUrlFor = (serverHost: string): string =>
   "http://" + serverHost + ":" + coordinatorPort;
 
-const main = async (): Promise<number> => {
-  if (selfClientMode) {
-    const coordinatorUrl = process.env.SYNCPEER_LAN_COORDINATOR_URL;
-    const token = process.env.SYNCPEER_LAN_COORDINATOR_TOKEN;
-    if (!coordinatorUrl || !token) throw new Error("Self client coordinator environment is missing.");
-    return runClient({
-      coordinatorUrl,
-      token,
-      assignment: {} as RoleAssignment,
-      hello: {} as PeerHello,
-      explicitIds: false,
-      openFirewall,
-    });
-  }
+const createHello = (): PeerHello => createPeerHello({
+  commit: source.commit,
+  pairCode: process.env.SYNCPEER_LAN_PAIR,
+  capabilities: { client: true, server: true },
+});
 
-  const explicitRole = explicitServerMode ? "server" : explicitClientMode ? "client" : undefined;
-  if (explicitRole) {
-    const hello = createPeerHello({
-      commit: source.commit,
-      pairCode: process.env.SYNCPEER_LAN_PAIR,
-      capabilities: { client: true, server: true },
-    });
-    const token = deriveManualPairToken(hello);
-    if (explicitRole === "client") {
-      const discoveryFirewall = openFirewall
-        ? createTemporaryNixosFirewall(true)
-        : undefined;
-      const closeDiscoveryFirewall = discoveryFirewall
-        ? installFirewallSignalCleanup(discoveryFirewall)
-        : null;
-      try {
-        if (discoveryFirewall) {
-          discoveryFirewall.open({ protocol: "udp", port: LAN_DISCOVERY_PORT });
-          discoveryFirewall.open({ protocol: "udp", port: SYNCTHING_LOCAL_DISCOVERY_PORT });
-        }
-        console.log(
-          manualPeer
-            ? "Using SYNCPEER_LAN_PEER=" + manualPeer + "."
-            : "Searching for the LAN test server via multicast (up to 15 minutes)...",
-        );
-        const progress = manualPeer
-          ? null
-          : setInterval(() => {
-              console.log("Still searching for the LAN test server...");
-            }, 10000);
-        let discovered: Awaited<ReturnType<typeof discoverRoleAssignment>> | null = null;
-        try {
-          discovered = manualPeer
-            ? null
-            : await discoverRoleAssignment({
-                hello,
-                timeoutMs: LAN_ROLE_DISCOVERY_TIMEOUT_MS,
-              });
-        } finally {
-          if (progress) clearInterval(progress);
-        }
-        const serverHost = manualPeer ?? discovered?.assignment.server.address;
-        if (!serverHost) {
-          throw new Error("Could not discover the LAN test server.");
-        }
-        return await runClient({
-          coordinatorUrl: coordinatorUrlFor(serverHost),
-          token,
-          assignment: discovered?.assignment ?? ({} as RoleAssignment),
-          hello,
-          explicitIds: true,
-          openFirewall,
-          firewall: discoveryFirewall,
-        });
-      } finally {
-        await closeDiscoveryFirewall?.().catch((error) => {
-          console.error("Firewall cleanup failed: " + String(error));
-        });
-      }
+const runSelfClient = async (): Promise<number> => {
+  const coordinatorUrl = process.env.SYNCPEER_LAN_COORDINATOR_URL;
+  const token = process.env.SYNCPEER_LAN_COORDINATOR_TOKEN;
+  if (!coordinatorUrl || !token) throw new Error("Self client coordinator environment is missing.");
+  return runClient({
+    coordinatorUrl,
+    token,
+    assignment: {} as RoleAssignment,
+    hello: {} as PeerHello,
+    explicitIds: false,
+    openFirewall,
+  });
+};
+
+const discoverManualServer = async (hello: PeerHello): Promise<{
+  serverHost: string;
+  assignment: RoleAssignment;
+}> => {
+  if (manualPeer) return { serverHost: manualPeer, assignment: {} as RoleAssignment };
+  const progress = setInterval(() => {
+    console.log("Still searching for the LAN test server...");
+  }, 10000);
+  try {
+    const discovered = await discoverRoleAssignment({ hello, timeoutMs: LAN_ROLE_DISCOVERY_TIMEOUT_MS });
+    const serverHost = discovered.assignment.server.address;
+    if (!serverHost) throw new Error("Could not discover the LAN test server.");
+    return { serverHost, assignment: discovered.assignment };
+  } finally {
+    clearInterval(progress);
+  }
+};
+
+const runManualClient = async (hello: PeerHello): Promise<number> => {
+  const discoveryFirewall = openFirewall ? createTemporaryNixosFirewall(true) : undefined;
+  const closeDiscoveryFirewall = discoveryFirewall ? installFirewallSignalCleanup(discoveryFirewall) : null;
+  try {
+    if (discoveryFirewall) {
+      discoveryFirewall.open({ protocol: "udp", port: LAN_DISCOVERY_PORT });
+      discoveryFirewall.open({ protocol: "udp", port: SYNCTHING_LOCAL_DISCOVERY_PORT });
     }
-    const serverHost = process.env.SYNCPEER_LAN_HOST?.trim() || resolveAdvertisedAddress();
-    return runServer({
-      coordinatorUrl: coordinatorUrlFor(serverHost),
-      token,
-      serverHost,
-      assignment: {} as RoleAssignment,
+    console.log(manualPeer
+      ? "Using SYNCPEER_LAN_PEER=" + manualPeer + "."
+      : "Searching for the LAN test server via multicast (up to 15 minutes)...");
+    const target = await discoverManualServer(hello);
+    return await runClient({
+      coordinatorUrl: coordinatorUrlFor(target.serverHost),
+      token: deriveManualPairToken(hello),
+      assignment: target.assignment,
       hello,
-      self: false,
       explicitIds: true,
       openFirewall,
+      firewall: discoveryFirewall,
+    });
+  } finally {
+    await closeDiscoveryFirewall?.().catch((error) => {
+      console.error("Firewall cleanup failed: " + String(error));
     });
   }
+};
 
-  const hello = createPeerHello({
-    commit: source.commit,
-    pairCode: process.env.SYNCPEER_LAN_PAIR,
-    capabilities: { client: true, server: true },
+const runExplicitServer = async (hello: PeerHello): Promise<number> => {
+  const serverHost = process.env.SYNCPEER_LAN_HOST?.trim() || resolveAdvertisedAddress();
+  return runServer({
+    coordinatorUrl: coordinatorUrlFor(serverHost),
+    token: deriveManualPairToken(hello),
+    serverHost,
+    assignment: {} as RoleAssignment,
+    hello,
+    self: false,
+    explicitIds: true,
+    openFirewall,
   });
+};
+
+const runDiscovered = async (): Promise<number> => {
+  const hello = createHello();
   const discovered = await discoverRoleAssignment({
     hello,
     manualPeer: selfMode ? "127.0.0.1" : manualPeer,
@@ -429,30 +418,28 @@ const main = async (): Promise<number> => {
   const token = manualPeer || manualRole || selfMode
     ? deriveManualPairToken(hello)
     : derivePairToken(hello, peer.hello);
-  const serverHost = role === "server"
-    ? await resolveLocalAddress(peer.address)
-    : peer.address;
+  const serverHost = role === "server" ? await resolveLocalAddress(peer.address) : peer.address;
   const coordinatorUrl = coordinatorUrlFor(serverHost);
+  return role === "client"
+    ? runClient({ coordinatorUrl, token, assignment: discovered.assignment, hello, openFirewall })
+    : runServer({
+        coordinatorUrl,
+        token,
+        serverHost,
+        assignment: discovered.assignment,
+        hello,
+        self: selfMode,
+        openFirewall,
+      });
+};
 
-  if (role === "client") {
-    return runClient({
-      coordinatorUrl,
-      token,
-      assignment: discovered.assignment,
-      hello,
-      openFirewall,
-    });
+const main = async (): Promise<number> => {
+  if (selfClientMode) return runSelfClient();
+  if (explicitServerMode || explicitClientMode) {
+    const hello = createHello();
+    return explicitClientMode ? runManualClient(hello) : runExplicitServer(hello);
   }
-
-  return runServer({
-    coordinatorUrl,
-    token,
-    serverHost,
-    assignment: discovered.assignment,
-    hello,
-    self: selfMode,
-    openFirewall,
-  });
+  return runDiscovered();
 };
 
 const run = () => selfMode && process.platform === "linux" &&

@@ -1,3 +1,4 @@
+// code-analysis-disable lines -- Multi-peer integration scenario kept linear for readability.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";

@@ -36,6 +36,59 @@ const promptForApproval = async (
   }
 };
 
+const announceServer = (
+  fixture: Awaited<ReturnType<typeof createLanFixture>>,
+  transport: string,
+): void => {
+  console.log("\nSyncpeer development server is running.");
+  console.log("Server device ID: " + fixture.fixture.remoteDeviceId);
+  console.log("Syncthing Web UI: " + fixture.syncGuiUrl);
+  console.log("Transport profile: " + transport);
+  if (transport === "relay") {
+    console.log("Relay selection: Syncthing dynamic relay pool");
+    console.log("No inbound firewall port is required for relay traffic.");
+  } else {
+    console.log("Direct tests require the advertised TCP/UDP port to be reachable.");
+  }
+  console.log("Waiting for pending clients. Press Ctrl-C to stop.\n");
+};
+
+const approvePendingDevices = async (
+  fixture: Awaited<ReturnType<typeof createLanFixture>>,
+  terminal: readline.Interface,
+  signal: AbortSignal,
+  dismissed: Set<string>,
+): Promise<void> => {
+  const pending = await fixture.listPendingDevices();
+  for (const device of pending.filter((candidate) => !dismissed.has(candidate.deviceId))) {
+    const approval = await promptForApproval(device, terminal, signal);
+    if (approval === "aborted") return;
+    if (approval === "rejected") {
+      dismissed.add(device.deviceId);
+      console.log("Client left unapproved.\n");
+      continue;
+    }
+    await fixture.approveDevice({ deviceId: device.deviceId, untrusted: approval === "untrusted" });
+    console.log(
+      (approval === "untrusted" ? "Encrypted test client" : "Trusted client") +
+      " approved. The client can reconnect now.\n",
+    );
+  }
+};
+
+const waitForPendingChange = async (
+  fixture: Awaited<ReturnType<typeof createLanFixture>>,
+  eventId: number,
+  signal: AbortSignal,
+): Promise<number> => {
+  try {
+    return await fixture.waitForPendingDeviceChange(eventId, signal);
+  } catch (error) {
+    if (!signal.aborted) throw error;
+    return eventId;
+  }
+};
+
 const runServer = async (serverRoot: string): Promise<number> => {
   const configuredTransport = process.env.SYNCPEER_DEV_SERVER_TRANSPORT?.trim() ?? "relay";
   if (configuredTransport !== "relay" && configuredTransport !== "direct" && configuredTransport !== "quic") {
@@ -53,48 +106,12 @@ const runServer = async (serverRoot: string): Promise<number> => {
   process.once("SIGTERM", stop);
   const dismissed = new Set<string>();
   let eventId = 0;
-
-  console.log("\nSyncpeer development server is running.");
-  console.log("Server device ID: " + fixture.fixture.remoteDeviceId);
-  console.log("Syncthing Web UI: " + fixture.syncGuiUrl);
-  console.log("Transport profile: " + configuredTransport);
-  if (configuredTransport === "relay") {
-    console.log("Relay selection: Syncthing dynamic relay pool");
-    console.log("No inbound firewall port is required for relay traffic.");
-  } else {
-    console.log("Direct tests require the advertised TCP/UDP port to be reachable.");
-  }
-  console.log("Waiting for pending clients. Press Ctrl-C to stop.\n");
-
+  announceServer(fixture, configuredTransport);
   try {
     while (!controller.signal.aborted) {
-      const pending = await fixture.listPendingDevices();
-      for (const device of pending.filter((candidate) => !dismissed.has(candidate.deviceId))) {
-        const approval = await promptForApproval(device, terminal, controller.signal);
-        if (approval === "aborted") break;
-        if (approval === "rejected") {
-          dismissed.add(device.deviceId);
-          console.log("Client left unapproved.\n");
-          continue;
-        }
-        await fixture.approveDevice({
-          deviceId: device.deviceId,
-          untrusted: approval === "untrusted",
-        });
-        console.log(
-          (approval === "untrusted" ? "Encrypted test client" : "Trusted client") +
-          " approved. The client can reconnect now.\n",
-        );
-      }
+      await approvePendingDevices(fixture, terminal, controller.signal, dismissed);
       if (!controller.signal.aborted) {
-        try {
-          eventId = await fixture.waitForPendingDeviceChange(
-            eventId,
-            controller.signal,
-          );
-        } catch (error) {
-          if (!controller.signal.aborted) throw error;
-        }
+        eventId = await waitForPendingChange(fixture, eventId, controller.signal);
       }
     }
     return 0;

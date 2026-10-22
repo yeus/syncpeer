@@ -17,6 +17,7 @@ import {
 } from "../packages/app/src/app/state.ts";
 import { isConfiguredDeviceName } from "../packages/app/src/app/suggestedNames.ts";
 import { generateMasterPassword } from "../packages/app/src/app/passwords.ts";
+import { createPageActions } from "../packages/app/src/app/pageActions.ts";
 
 test("stability warning appears on first run and stays dismissed", () => {
   assert.equal(createInitialState(null).ui.showStabilityNotice, true);
@@ -365,4 +366,38 @@ test("device IDs render in Syncthing's grouped form", () => {
   assert.equal(formatSyncthingDeviceId(canonical), grouped);
   assert.equal(formatSyncthingDeviceId(grouped), grouped);
   assert.equal(formatSyncthingDeviceId("LAN-UNKNOWN-1"), "LAN-UNKNOWN-1");
+});
+
+test("a restored saved peer is dialed after the app returns to the foreground", async () => {
+  const state = createInitialState(null);
+  const peerId = "DPNAVCUNBE5A5HUY4AN5YALD4RILEIXAJCYRGJBAGNLHYXFBWDKA";
+  const stored = createInitialState(null);
+  stored.devices.savedDevices = [{
+    id: peerId, name: "Saved peer", createdAtMs: 1, isIntroducer: false, customName: true,
+  }];
+  stored.devices.selectedSavedDeviceId = peerId;
+  assert.equal(applySensitiveAppState(state, JSON.parse(JSON.stringify(sensitiveAppState(stored)))), true);
+  const calls: string[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => undefined } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); },
+    connect: async () => { calls.push("connect"); },
+  });
+  await actions.onAppForeground();
+  assert.deepEqual(calls, ["discover", "connect"],
+    "Unlocking restores saved peers first, then the foreground pass must dial the selected one.");
+});
+
+test("a foreground pass without a restored peer does not dial anything", async () => {
+  const state = createInitialState(null);
+  const calls: string[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => undefined } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); },
+    connect: async () => { calls.push("connect"); },
+  });
+  await actions.onAppForeground();
+  assert.deepEqual(calls, ["discover"]);
 });

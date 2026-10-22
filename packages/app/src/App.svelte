@@ -63,6 +63,7 @@
     readLegacyFolderPasswords,
     sensitiveAppState,
   } from "./app/state.ts";
+  import { createEncryptedUiStateStore } from "./app/encryptedUiState.ts";
   import AboutPage from "./AboutPage.svelte";
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
   import GeneralSettingsPage from "./GeneralSettingsPage.svelte";
@@ -156,7 +157,7 @@
     }
   }
 
-  const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric } = createTauriAdapters({
+  const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric, logFile } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
@@ -185,6 +186,7 @@
       if (!app.passwords.secureStorage) throw new Error("Unlock folder storage before changing passwords.");
       await folderCredentials.save(passwords);
     } : undefined,
+    logFile,
   });
   const actions = createNavigableAppActions({
     state: app,
@@ -201,44 +203,28 @@
   const pimDependencies = { state: app, client, sessionStore };
 
   let uiStateLoaded = false;
-  let uiStateSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const encryptedUiState = createEncryptedUiStateStore({
+    command: documentCommand,
+    readLegacy: readLegacySensitiveState,
+    apply: value => applySensitiveAppState(app, value),
+    onFailure: (event, error) => {
+      try {
+        pushSessionLog(app, "warning", event,
+          "Encrypted app state could not be saved; the next change retries.",
+          { message: error instanceof Error ? error.message : String(error) });
+      } catch { /* Diagnostics must not block the app. */ }
+    },
+  });
 
   async function loadEncryptedUiState() {
     if (uiStateLoaded || !folderCredentials) return;
     const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
     if (status.vault.phase !== "unlocked") return;
-    const stored = await documentCommand<unknown>({ operation: "uiState" });
-    if (stored !== null && applySensitiveAppState(app, stored)) {
-      uiStateLoaded = true;
-      return;
-    }
-    if (stored !== null) throw new Error("Invalid encrypted UI state; existing data was retained.");
-    const legacy = readLegacySensitiveState();
-    if (!legacy) {
-      uiStateLoaded = true;
-      return;
-    }
-    await documentCommand({ operation: "saveUiState", state: legacy });
-    const verified = await documentCommand<unknown>({ operation: "uiState" });
-    if (JSON.stringify(verified) !== JSON.stringify(JSON.parse(JSON.stringify(legacy)))) {
-      throw new Error("Encrypted UI state migration could not be verified.");
-    }
-    applySensitiveAppState(app, legacy);
-    uiStateLoaded = true;
-    // Plaintext cleanup follows credential migration in loadFolderCredentials.
+    uiStateLoaded = await encryptedUiState.load();
   }
 
-  const persistSensitiveState = () => {
-    if (!uiStateLoaded) return;
-    // Read the payload while the effect tracks state so later edits schedule a save.
-    const payload = sensitiveAppState(app);
-    if (uiStateSaveTimer) clearTimeout(uiStateSaveTimer);
-    uiStateSaveTimer = setTimeout(() => {
-      uiStateSaveTimer = undefined;
-      void documentCommand({ operation: "saveUiState", state: payload })
-        .catch(() => { uiStateLoaded = false; });
-    }, 500);
-  };
+  const persistSensitiveState = () => encryptedUiState.scheduleSave(sensitiveAppState(app));
 
   const saveDeviceName = (name: string) => {
     app.connection.deviceName = name;
@@ -375,10 +361,7 @@
       clearInterval(localDiscoveryTimer);
       localDiscoveryTimer = null;
     }
-    if (uiStateSaveTimer) {
-      clearTimeout(uiStateSaveTimer);
-      uiStateSaveTimer = undefined;
-    }
+    encryptedUiState.cancelPendingSave();
     unsubscribe();
     actions.dispose();
     transferRuntime.dispose();
@@ -782,6 +765,8 @@
           onOpenGeneralSettings={folderCredentials ? actions.openGeneralSettings : undefined}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
           onCopySessionLogs={actions.copySessionLogs}
+          onSaveSessionLogs={logFile ? actions.saveSessionLogs : undefined}
+          onShareSessionLogs={logFile ? actions.shareSessionLogs : undefined}
           onEditLocalDeviceName={actions.editLocalDeviceName}
           onRegenerateDeviceId={actions.regenerateDeviceId}
           onCopyIdentityBackupSecret={actions.copyIdentityBackupSecret}
@@ -1027,6 +1012,9 @@
       await loadFolderCredentials().catch(error => {
         app.ui.recentError = error instanceof Error ? error.message : String(error);
       });
+      // Restored peers only exist after unlock; the startup foreground pass ran
+      // before the vault was unlocked, so resume discovery and auto-connect here.
+      void actions.onAppForeground();
     }}
     onOpenSettings={() => {
       skippedVaultOnboarding = false;

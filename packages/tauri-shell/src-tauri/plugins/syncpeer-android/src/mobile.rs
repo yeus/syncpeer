@@ -189,6 +189,26 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .map_err(Into::into)
   }
 
+  pub fn share_file(
+    &self,
+    path: &str,
+    mime_type: Option<&str>,
+    chooser_title: Option<&str>,
+  ) -> crate::Result<()> {
+    self
+      .0
+      .run_mobile_plugin::<serde_json::Value>(
+        "shareFile",
+        json!({
+          "path": path,
+          "mimeType": mime_type,
+          "chooserTitle": chooser_title
+        }),
+      )
+      .map(|_| ())
+      .map_err(Into::into)
+  }
+
   pub fn open_saf_path_with_chooser(
     &self,
     tree_uri: &str,

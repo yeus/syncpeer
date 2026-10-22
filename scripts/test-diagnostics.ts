@@ -190,6 +190,7 @@ const main = async (): Promise<void> => {
         "scripts/test-app-connection-settings.ts",
         "scripts/test-app-diagnostics.ts",
         "scripts/test-encrypted-ui-state.ts",
+        "scripts/test-session-logs.ts",
       ],
     },
     {

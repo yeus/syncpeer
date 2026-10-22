@@ -6,7 +6,15 @@ import {
   type SyncpeerSessionStore,
 } from "@syncpeer/core/browser";
 import { reportUiError } from "../lib/tauriAdapters.js";
-import { formatAppBuildInfo } from "../lib/appInfo.ts";
+import {
+  CLIPBOARD_SESSION_LOG_LIMIT_BYTES,
+  clipboardSessionLogsTooLarge,
+  describeSessionLogSize,
+  formatSessionLogs,
+  sessionLogFileName,
+  sessionLogTextSize,
+  type SessionLogFilePort,
+} from "./sessionLogs.ts";
 import { reportActionError } from "./actionErrors.ts";
 import {
   refreshCachedStatuses,
@@ -21,11 +29,11 @@ import {
   activeSourceDeviceId,
   hasSuccessfulConnectionHistory,
   pushSessionLog,
+  setError,
   shouldHintRemoteApprovalPending,
   type AppState,
 } from "./state.ts";
 import { localDiscoveryUnavailableNotice } from "./connectionNotices.ts";
-import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
 import {
   applyAutoApprovals,
   normalizeCandidateAddresses,
@@ -63,6 +71,7 @@ type ConnectionActionArgs = {
   readonly syncStarredFiles: () => Promise<void>;
   readonly loadFavoriteSyncStates: () => Promise<void>;
   readonly appInfo: AppBuildInfo;
+  readonly logFile?: SessionLogFilePort;
 };
 
 type ConnectionActionControl = {
@@ -93,6 +102,8 @@ export const createConnectionActions = (args: ConnectionActionArgs) => {
       connectViaLanAnonymousCandidate(args, control, candidateId),
     copyCurrentDeviceId: () => copyCurrentDeviceId(args),
     copySessionLogs: () => copySessionLogs(args),
+    saveSessionLogs: () => saveSessionLogs(args),
+    shareSessionLogs: () => shareSessionLogs(args),
     dispose: () => dispose(control),
   };
 };
@@ -496,24 +507,21 @@ const copyCurrentDeviceId = async (args: ConnectionActionArgs) => {
   }
 };
 
+const exportedSessionLogs = (args: ConnectionActionArgs) =>
+  formatSessionLogs(args.appInfo, args.state.logs.items);
+
 const copySessionLogs = async (args: ConnectionActionArgs) => {
-  const { state, appInfo } = args;
-  const logBody = state.logs.items
-    .slice()
-    .reverse()
-    .map((item) => {
-      const base = `${new Date(item.timestampMs).toISOString()} [${item.level.toUpperCase()}] ${item.event}`;
-      return item.details === undefined
-        ? base
-        : `${base}\n${JSON.stringify(sanitizeDiagnosticArtifact(item.details), null, 2)}`;
-    })
-    .join("\n\n");
-  const metadata = [
-    formatAppBuildInfo(appInfo),
-    "",
-    "# Session Logs",
-  ].join("\n");
-  const text = `${metadata}\n${logBody || "No session logs yet."}`;
+  const { state } = args;
+  const text = exportedSessionLogs(args);
+  const bytes = sessionLogTextSize(text);
+  if (clipboardSessionLogsTooLarge(text)) {
+    // Android copies through a shared ~1 MB Binder buffer; a bigger payload can
+    // fail or be truncated inside the clipboard service without an error.
+    setError(state, "logs.copy.too_large",
+      new Error(`Session logs are ${describeSessionLogSize(bytes)}, too large for the clipboard. Use Save logs or Share logs instead.`),
+      { bytes, limitBytes: CLIPBOARD_SESSION_LOG_LIMIT_BYTES });
+    return;
+  }
   try {
     await copyText(text);
   } catch (error) {
@@ -521,6 +529,29 @@ const copySessionLogs = async (args: ConnectionActionArgs) => {
   }
 };
 
+const saveSessionLogs = async (args: ConnectionActionArgs) => {
+  const { state, logFile } = args;
+  if (!logFile) return;
+  try {
+    const fileName = sessionLogFileName(new Date());
+    const saved = await logFile.save(fileName, exportedSessionLogs(args));
+    pushSessionLog(state, "info", "logs.saved", `Session logs saved as ${fileName}.`, { fileName: saved });
+  } catch (error) {
+    reportActionError(state, "logs.save.failed", error);
+  }
+};
+
+const shareSessionLogs = async (args: ConnectionActionArgs) => {
+  const { state, logFile } = args;
+  if (!logFile) return;
+  try {
+    const fileName = sessionLogFileName(new Date());
+    await logFile.share(fileName, exportedSessionLogs(args));
+    pushSessionLog(state, "info", "logs.shared", `Sharing session logs as ${fileName}.`, { fileName });
+  } catch (error) {
+    reportActionError(state, "logs.share.failed", error);
+  }
+};
 
 const dispose = (control: ConnectionActionControl) => {
   if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);

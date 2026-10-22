@@ -266,6 +266,16 @@ struct AndroidSafWriteFileRequest {
     mime_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AndroidTextFileRequest {
+    file_name: String,
+    text: String,
+    mime_type: Option<String>,
+    tree_uri: Option<String>,
+    chooser_title: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
@@ -1430,6 +1440,60 @@ fn android_write_to_saf_tree(
     app.syncpeer_android()
         .write_file_to_saf_tree(tree_uri, relative_path, bytes, mime_type)
         .map_err(|error| format!("Could not write {relative_path} to SAF tree: {error}"))
+}
+
+const MAX_ANDROID_EXPORT_BYTES: usize = 8 * 1024 * 1024;
+
+fn safe_export_file_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && !trimmed.starts_with('.')
+        && trimmed
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_'));
+    if !valid {
+        return Err("Invalid export file name.".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Write an export into the app cache so Android's FileProvider can hand it out.
+fn write_android_export_file(
+    app: &tauri::AppHandle,
+    file_name: &str,
+    text: &str,
+) -> Result<PathBuf, String> {
+    if text.len() > MAX_ANDROID_EXPORT_BYTES {
+        return Err(format!(
+            "Export is larger than {MAX_ANDROID_EXPORT_BYTES} bytes."
+        ));
+    }
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Could not resolve app cache dir: {error}"))?
+        .join("syncpeer")
+        .join("exports");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create export directory: {error}"))?;
+    let path = directory.join(file_name);
+    fs::write(&path, text.as_bytes())
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(target_os = "android")]
+fn android_share_file(
+    app: &tauri::AppHandle,
+    path: &Path,
+    mime_type: Option<&str>,
+    chooser_title: Option<&str>,
+) -> Result<(), String> {
+    let path_string = path.to_string_lossy().to_string();
+    app.syncpeer_android()
+        .share_file(&path_string, mime_type, chooser_title)
+        .map_err(|error| format!("Could not share {}: {error}", path.display()))
 }
 
 #[cfg(target_os = "android")]
@@ -4153,6 +4217,61 @@ async fn syncpeer_android_write_saf_file(
 }
 
 #[tauri::command]
+async fn syncpeer_android_save_text_file(
+    app: tauri::AppHandle,
+    request: AndroidTextFileRequest,
+) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        let file_name = safe_export_file_name(&request.file_name)?;
+        let tree_uri = request
+            .tree_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Choose a folder before saving the file.".to_string())?;
+        let path = write_android_export_file(&app, &file_name, &request.text)?;
+        let result = android_write_to_saf_tree_from_path(
+            &app,
+            tree_uri,
+            &file_name,
+            &path,
+            request.mime_type.as_deref(),
+        );
+        let _ = fs::remove_file(&path);
+        result.map(|_| file_name)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_share_text_file(
+    app: tauri::AppHandle,
+    request: AndroidTextFileRequest,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let file_name = safe_export_file_name(&request.file_name)?;
+        let path = write_android_export_file(&app, &file_name, &request.text)?;
+        android_share_file(
+            &app,
+            &path,
+            request.mime_type.as_deref(),
+            request.chooser_title.as_deref(),
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android-only command.".to_string())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_pick_saf_directory(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
@@ -4983,6 +5102,8 @@ pub fn run() {
             syncpeer_android_stop_background_session,
             syncpeer_android_update_transfer_notification,
             syncpeer_android_write_saf_file,
+            syncpeer_android_save_text_file,
+            syncpeer_android_share_text_file,
             syncpeer_android_pick_saf_directory,
             syncpeer_android_list_persisted_saf_uris,
             syncpeer_android_list_contacts,

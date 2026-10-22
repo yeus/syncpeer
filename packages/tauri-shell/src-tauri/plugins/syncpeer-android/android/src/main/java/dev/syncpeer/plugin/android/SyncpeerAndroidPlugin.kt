@@ -2,6 +2,7 @@ package dev.syncpeer.plugin.android
 
 import android.Manifest
 import android.app.Application
+import android.content.ClipData
 import android.content.ContentUris
 import android.content.ContentValues
 import android.app.job.JobInfo
@@ -577,23 +578,51 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         Intent(Intent.ACTION_VIEW)
           .setDataAndType(uri, mimeType)
           .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-
-      val resolved =
-        activity.packageManager.queryIntentActivities(viewIntent, PackageManager.MATCH_DEFAULT_ONLY)
-      for (info in resolved) {
-        activity.grantUriPermission(
-          info.activityInfo.packageName,
-          uri,
-          Intent.FLAG_GRANT_READ_URI_PERMISSION,
-        )
-      }
-
-      val chooser = Intent.createChooser(viewIntent, args.chooserTitle ?: "Open with")
-      chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-      activity.startActivity(chooser)
+      startFileChooser(viewIntent, uri, args.chooserTitle ?: "Open with")
       invoke.resolve()
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not open file.")
+    }
+  }
+
+  /** Grant the temporary read grant to every chooser target before showing it. */
+  private fun startFileChooser(intent: Intent, uri: Uri, title: String) {
+    val resolved =
+      activity.packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+    for (info in resolved) {
+      activity.grantUriPermission(
+        info.activityInfo.packageName,
+        uri,
+        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+      )
+    }
+    val chooser = Intent.createChooser(intent, title)
+    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    activity.startActivity(chooser)
+  }
+
+  @Command
+  fun shareFile(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(OpenWithChooserArgs::class.java)
+      val source = File(args.path)
+      if (!source.exists()) {
+        invoke.reject("File does not exist: ${args.path}")
+        return
+      }
+      val uri =
+        FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", source)
+      val mimeType = args.mimeType ?: guessMimeType(source.name)
+      val sendIntent =
+        Intent(Intent.ACTION_SEND)
+          .setType(mimeType)
+          .putExtra(Intent.EXTRA_STREAM, uri)
+          .setClipData(ClipData.newRawUri(null, uri))
+          .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      startFileChooser(sendIntent, uri, args.chooserTitle ?: "Share")
+      invoke.resolve()
+    } catch (error: Exception) {
+      invoke.reject(error.message ?: "Could not share file.")
     }
   }
 

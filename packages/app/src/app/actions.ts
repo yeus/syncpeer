@@ -20,6 +20,7 @@ import { createDeviceActions } from "./deviceActions.ts";
 import { createFileActions } from "./fileActions.ts";
 import { createPageActions } from "./pageActions.ts";
 import { createStarredActions } from "./starredActions.ts";
+import type { SessionLogFilePort } from "./sessionLogs.ts";
 import type { TransferRuntime } from "./transferRuntime.ts";
 import { clearDirectoryView } from "./actionSupport.ts";
 
@@ -29,6 +30,7 @@ export const createAppActions = (args: {
   readonly sessionStore: SyncpeerSessionStore;
   readonly transfers: TransferRuntime;
   readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
+  readonly logFile?: SessionLogFilePort;
 }) => {
   const { state, client, sessionStore, transfers } = args;
   const appInfo = getAppBuildInfo();
@@ -41,6 +43,7 @@ export const createAppActions = (args: {
     syncStarredFiles: starred.syncStarredFiles,
     loadFavoriteSyncStates: starred.loadFavoriteSyncStates,
     appInfo,
+    logFile: args.logFile,
   });
   const directory = createDirectoryActions({
     state,

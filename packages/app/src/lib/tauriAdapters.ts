@@ -152,6 +152,8 @@ const resolveInvoke = (): InvokeFn => {
   throw new Error("Tauri runtime is unavailable. Launch this app through Tauri (npm run dev -w @syncpeer/tauri-shell).");
 };
 
+const ANDROID_LOG_FOLDER_KEY = "syncpeer.logs.safTreeUri.v1";
+
 const tryForwardUiErrorToCli = async (
   invoke: InvokeFn,
   event: string,
@@ -763,6 +765,34 @@ class TauriAdapters {
     return this.invokeWithLogging<string[]>("syncpeer_android_list_persisted_saf_uris");
   }
 
+  /** Android clipboard/share handoff for large exports such as session logs. */
+  private async saveAndroidTextFile(fileName: string, text: string): Promise<string> {
+    const remembered = window.localStorage.getItem(ANDROID_LOG_FOLDER_KEY);
+    const treeUri = remembered ?? await this.rememberAndroidLogFolder();
+    try {
+      await this.invokeWithLogging("syncpeer_android_save_text_file", {
+        request: { fileName, text, mimeType: "text/plain", treeUri },
+      });
+      return fileName;
+    } catch (error) {
+      // A revoked SAF grant must not keep failing forever; the next attempt re-picks.
+      if (remembered) window.localStorage.removeItem(ANDROID_LOG_FOLDER_KEY);
+      throw error;
+    }
+  }
+
+  private async rememberAndroidLogFolder(): Promise<string> {
+    const picked = await this.pickAndroidSafDirectory();
+    window.localStorage.setItem(ANDROID_LOG_FOLDER_KEY, picked);
+    return picked;
+  }
+
+  private async shareAndroidTextFile(fileName: string, text: string): Promise<void> {
+    await this.invokeWithLogging("syncpeer_android_share_text_file", {
+      request: { fileName, text, mimeType: "text/plain", chooserTitle: "Share Syncpeer logs" },
+    });
+  }
+
   private listAndroidContacts() {
     return this.invokeWithLogging<Awaited<ReturnType<NonNullable<SyncpeerPlatformAdapter["listAndroidContacts"]>>>>(
       "syncpeer_android_list_contacts",
@@ -978,6 +1008,10 @@ class TauriAdapters {
       syncDocumentFolders: documents.syncFolders,
       folderCredentials: this.folderCredentials(),
       biometric: this.biometric(),
+      logFile: this.platform === "android" ? {
+        save: (fileName: string, text: string) => this.saveAndroidTextFile(fileName, text),
+        share: (fileName: string, text: string) => this.shareAndroidTextFile(fileName, text),
+      } : undefined,
     };
   }
 }

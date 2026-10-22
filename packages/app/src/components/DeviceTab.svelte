@@ -31,6 +31,8 @@
     onOpenGeneralSettings?: () => void;
     onCopyCurrentDeviceId: () => void;
     onCopySessionLogs: () => void;
+    onSaveSessionLogs?: () => void;
+    onShareSessionLogs?: () => void;
     onEditLocalDeviceName: () => void;
     onRegenerateDeviceId: () => void;
     onCopyIdentityBackupSecret: () => void;
@@ -64,6 +66,8 @@
     onOpenGeneralSettings,
     onCopyCurrentDeviceId,
     onCopySessionLogs,
+    onSaveSessionLogs,
+    onShareSessionLogs,
     onEditLocalDeviceName,
     onRegenerateDeviceId,
     onCopyIdentityBackupSecret,
@@ -647,6 +651,16 @@
     <button type="button" class="ghost" onclick={onCopySessionLogs}
       >Copy Logs</button
     >
+    {#if onSaveSessionLogs}
+      <button type="button" class="ghost" data-testid="save-session-logs" onclick={onSaveSessionLogs}
+        >Save Logs</button
+      >
+    {/if}
+    {#if onShareSessionLogs}
+      <button type="button" class="ghost" data-testid="share-session-logs" onclick={onShareSessionLogs}
+        >Share Logs</button
+      >
+    {/if}
   </div>
   <details bind:open={app.ui.isLogPanelExpanded}>
     <summary>View logs ({app.logs.items.length})</summary>

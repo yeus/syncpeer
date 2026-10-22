@@ -162,7 +162,11 @@ class DocumentRuntimeService : Service() {
 
     internal fun stopBackgroundSession(): CompletableFuture<JSONObject> {
       val result = stopSession(persist = true)
-      result.whenComplete { _, _ -> mainHandler.post { stopSelf() } }
+      // A superseded stop settles with the superseding request's phase; only an idle
+      // service may be stopped without killing that newer session.
+      result.whenComplete { status, _ ->
+        mainHandler.post { if (status?.optString("phase") == "idle") stopSelf() }
+      }
       return result
     }
 
@@ -441,14 +445,14 @@ class DocumentRuntimeService : Service() {
       worker.execute {
         if (persist) runCatching { backgroundSessions.clear() }
         if (!documentsStarted || runtimeHost == null) {
-          finishSessionStop(result)
+          finishSessionStop(generation, result)
           return@execute
         }
         evaluateRuntime("""
           if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
           return JSON.stringify({result: {phase: "idle"}});
         """.trimIndent(), ByteArray(0)).whenComplete { _, _ ->
-          if (generation == sessionGeneration) finishSessionStop(result)
+          finishSessionStop(generation, result)
         }
       }
     } catch (error: Exception) {
@@ -457,7 +461,16 @@ class DocumentRuntimeService : Service() {
     return result
   }
 
-  private fun finishSessionStop(result: CompletableFuture<JSONObject>) {
+  /**
+   * Settle every stop request. Only the current generation may reset the service state;
+   * a superseded stop still has to complete its future, because the WebView foreground
+   * handoff awaits it before it resumes the session.
+   */
+  private fun finishSessionStop(generation: Long, result: CompletableFuture<JSONObject>) {
+    if (generation != sessionGeneration) {
+      result.complete(sessionStatus())
+      return
+    }
     runOnMain {
       sessionStarted = false
       sessionPhase = "idle"

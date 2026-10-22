@@ -1603,13 +1603,40 @@ function withSessionOperation<TResult>(
   );
 }
 
+/**
+ * Stop the service-owned background session before the foreground session resumes.
+ * A rejected or stalled native stop must not gate the lifecycle: every later connect
+ * would fail immediately with "Connection is suspended or offline."
+ */
+async function stopBackgroundHandoff(ctx: SessionContext): Promise<void> {
+  const stopping = ctx.platformAdapter.stopBackgroundSession?.();
+  if (!stopping) return;
+  const timeoutMs = 15_000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stalled = new Promise<string>((resolve) => {
+    timer = setTimeout(() => resolve(
+      `Background session stop did not finish within ${timeoutMs} ms.`,
+    ), timeoutMs);
+  });
+  const failure = stopping.then(
+    () => null,
+    (error: unknown) => error instanceof Error ? error.message : String(error),
+  );
+  const reason = await Promise.race([failure, stalled]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (reason === null) return;
+  ctx.coreAdapter.log?.("core.background.stop.failed", {
+    message: reason || "Background session stop failed.",
+  });
+}
+
 async function setSessionForegroundImpl(
   ctx: SessionContext,
   lifecycle: ConnectionLifecycle<ConnectOptions>,
   foreground: boolean,
 ) {
   if (foreground) {
-    await ctx.platformAdapter.stopBackgroundSession?.();
+    await stopBackgroundHandoff(ctx);
     await lifecycle.setForeground(true);
     await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
     return;

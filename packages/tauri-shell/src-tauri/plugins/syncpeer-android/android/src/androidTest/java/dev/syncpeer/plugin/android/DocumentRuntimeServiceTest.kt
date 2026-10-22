@@ -171,6 +171,25 @@ class DocumentRuntimeServiceTest {
     assertNull(store.load())
   }
 
+  @Test fun supersededBackgroundSessionStopsStillSettle() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      // Wait for the document runtime so the stops take the service-worker path instead of
+      // the "runtime not started" shortcut, then issue two overlapping stop requests.
+      runtime.status().get(30, TimeUnit.SECONDS)
+      val first = runtime.stopBackgroundSession()
+      val second = runtime.stopBackgroundSession()
+      // A superseded stop that leaves its future pending pinned the WebView foreground
+      // handoff and kept the app from resuming its session.
+      first.get(20, TimeUnit.SECONDS)
+      second.get(20, TimeUnit.SECONDS)
+    } finally {
+      context.unbindService(client.first)
+    }
+  }
+
   @Test fun vaultReopensAfterProcessRestart() {
     val phase = InstrumentationRegistry.getArguments().getString("documentsRestartPhase") ?: return
     val context = InstrumentationRegistry.getInstrumentation().targetContext

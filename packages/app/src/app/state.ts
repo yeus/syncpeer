@@ -490,7 +490,8 @@ const classifyUiLogLevel = (
   }
   if (
     entry.event === "core.discovery.candidate.failed" ||
-    entry.event === "core.discovery.relay.failed"
+    entry.event === "core.discovery.relay.failed" ||
+    entry.event === "core.background.stop.failed"
   ) {
     return "warning" as const;
   }

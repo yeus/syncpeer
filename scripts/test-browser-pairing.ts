@@ -388,3 +388,48 @@ test("foreground handoff requests the background session before closing the acti
     await rm(root, { recursive: true, force: true });
   }
 });
+
+const foregroundHandoffClient = async (
+  root: string,
+  stopBackgroundSession: () => Promise<void>,
+) => {
+  const localIdentity = await identity(root, "foreground");
+  const client = createSyncpeerBrowserClient({
+    hostAdapter: createNodeHostAdapter(),
+    platformAdapter: { readDefaultIdentity: async () => localIdentity, stopBackgroundSession },
+  });
+  let phase = "";
+  client.subscribeLifecycle(state => { phase = state.phase; });
+  return { client, phase: () => phase };
+};
+
+test("a failing background stop still resumes the foreground session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-stop-failure-"));
+  try {
+    const session = await foregroundHandoffClient(root, async () => {
+      throw new Error("Synthetic background stop failure");
+    });
+    await session.client.setForeground(false);
+    assert.equal(session.phase(), "suspended");
+    await session.client.setForeground(true);
+    assert.equal(session.phase(), "idle",
+      "A rejected native stop must not leave the lifecycle gated in the background.");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a stalled background stop still resumes the foreground session", { timeout: 60000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-stop-stall-"));
+  try {
+    const stalled = new Promise<void>(() => undefined);
+    const session = await foregroundHandoffClient(root, () => stalled);
+    await session.client.setForeground(false);
+    assert.equal(session.phase(), "suspended");
+    await session.client.setForeground(true);
+    assert.equal(session.phase(), "idle",
+      "A native stop that never settles must not pin the lifecycle in the background.");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

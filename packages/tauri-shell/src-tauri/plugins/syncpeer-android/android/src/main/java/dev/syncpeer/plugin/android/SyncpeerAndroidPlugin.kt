@@ -617,8 +617,9 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         Intent(Intent.ACTION_SEND)
           .setType(mimeType)
           .putExtra(Intent.EXTRA_STREAM, uri)
-          .setClipData(ClipData.newRawUri(null, uri))
           .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      // Clip data carries the read grant to the receiving app on modern Android.
+      sendIntent.setClipData(ClipData.newRawUri(null, uri))
       startFileChooser(sendIntent, uri, args.chooserTitle ?: "Share")
       invoke.resolve()
     } catch (error: Exception) {

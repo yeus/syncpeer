@@ -268,10 +268,11 @@ class DocumentRuntimeService : Service() {
       }
     }
     if (wasStarted) {
+      // A policy pause also may not hold the shared worker behind a dead network.
       evaluateRuntime("""
         if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
         return JSON.stringify({result: {phase: "idle"}});
-      """.trimIndent(), ByteArray(0))
+      """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS)
     }
   }
 

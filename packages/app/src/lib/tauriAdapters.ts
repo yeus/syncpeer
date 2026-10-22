@@ -359,6 +359,8 @@ class TauriAdapters {
   private ownedDevicesCache: Awaited<
     ReturnType<NonNullable<SyncpeerPlatformAdapter["ownedDevices"]>>
   > | null = null;
+  /** Profile network policy; refreshed when profile settings change. */
+  private allowMeteredCache: boolean | null = null;
 
   constructor(options?: CreateTauriAdaptersOptions) {
     this.options = options;
@@ -399,8 +401,9 @@ class TauriAdapters {
   }
 
   private invalidateSessionConfiguration() {
-    // A membership or folder change also invalidates the cached trust roster.
+    // Membership, folder and profile changes also invalidate the cached vault reads.
     this.ownedDevicesCache = null;
+    this.allowMeteredCache = null;
     this.configurationRevision++;
     for (const listener of this.sessionConfigurationListeners) listener();
   }
@@ -612,14 +615,18 @@ class TauriAdapters {
   }
 
   private async androidBackgroundSessionRequest(options: Omit<ConnectOptions, "sharedFolders">) {
-    let allowMetered = false;
-    try {
-      const settings = await this.documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
-      allowMetered = settings.profile.allowMetered;
-    } catch {
-      // A locked vault keeps the safer default: background sessions wait for Wi-Fi.
+    if (this.allowMeteredCache === null) {
+      try {
+        const settings = await this.documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
+        this.allowMeteredCache = settings.profile.allowMetered === true;
+      } catch {
+        // A locked vault keeps the safer default: background sessions wait for Wi-Fi.
+        // The fallback is deliberately not cached, so a transient vault failure does
+        // not pin metered networking off for the rest of the session.
+        return { operation: "connect", options: { ...options, allowMetered: false } };
+      }
     }
-    return { operation: "connect", options: { ...options, allowMetered } };
+    return { operation: "connect", options: { ...options, allowMetered: this.allowMeteredCache } };
   }
 
   private async releaseLocalCopy(folderId: string, mode: "safe" | "dangerous", confirmedText: string,

@@ -146,3 +146,70 @@ test("a device announcing itself on the LAN still reaches the device list", asyn
     "A discovered peer must be offerable as a device to add.");
   assert.equal(state.devices.lanAnonymousCandidates.length, 1);
 });
+
+test("the background session request reads profile settings once", async () => {
+  const calls = installFakeTauri(({ command, args }) => {
+    const operation = (args?.request as { operation?: string } | undefined)?.operation;
+    if (command === "syncpeer_document_command" && operation === "profileSettings") {
+      return { result: { profile: { allowMetered: true } } };
+    }
+    if (command === "syncpeer_android_prepare_background_session") return null;
+    return { result: null };
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  const options = { host: "127.0.0.1", port: 22000, deviceName: "synthetic" } as never;
+  await adapters.platformAdapter.prepareBackgroundSession!(options);
+  await adapters.platformAdapter.prepareBackgroundSession!(options);
+  assert.equal(documentOperations(calls).filter(operation => operation === "profileSettings").length, 1,
+    "Arming the background session must not re-read profile settings each time.");
+  const requests = calls
+    .filter(call => call.command === "syncpeer_android_prepare_background_session")
+    .map(call => (call.args?.request as { options?: { allowMetered?: boolean } } | undefined)?.options);
+  assert.deepEqual(requests.map(request => request?.allowMetered), [true, true]);
+});
+
+test("changing profile settings refreshes the metered policy", async () => {
+  let allowMetered = true;
+  const calls = installFakeTauri(({ command, args }) => {
+    const operation = (args?.request as { operation?: string } | undefined)?.operation;
+    if (command === "syncpeer_document_command" && operation === "profileSettings") {
+      return { result: { profile: { allowMetered } } };
+    }
+    if (command === "syncpeer_document_command" && operation === "saveProfileSettings") {
+      allowMetered = false;
+      return { result: null };
+    }
+    return { result: null };
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  const options = { host: "127.0.0.1", port: 22000, deviceName: "synthetic" } as never;
+  await adapters.platformAdapter.prepareBackgroundSession!(options);
+  await adapters.documentCommand({ operation: "saveProfileSettings", settings: {} });
+  await adapters.platformAdapter.prepareBackgroundSession!(options);
+  assert.equal(documentOperations(calls).filter(operation => operation === "profileSettings").length, 2,
+    "Saving profile settings must force the next request to re-read the policy.");
+  const last = calls.filter(call => call.command === "syncpeer_android_prepare_background_session").at(-1);
+  assert.equal((last?.args?.request as { options?: { allowMetered?: boolean } }).options?.allowMetered, false);
+});
+
+test("a locked vault does not pin metered networking off", async () => {
+  let locked = true;
+  const calls = installFakeTauri(({ command, args }) => {
+    const operation = (args?.request as { operation?: string } | undefined)?.operation;
+    if (command === "syncpeer_document_command" && operation === "profileSettings") {
+      if (locked) throw new Error("Vault is locked.");
+      return { result: { profile: { allowMetered: true } } };
+    }
+    return { result: null };
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  const options = { host: "127.0.0.1", port: 22000, deviceName: "synthetic" } as never;
+  await adapters.platformAdapter.prepareBackgroundSession!(options);
+  locked = false;
+  await adapters.platformAdapter.prepareBackgroundSession!(options);
+  const requests = calls
+    .filter(call => call.command === "syncpeer_android_prepare_background_session")
+    .map(call => (call.args?.request as { options?: { allowMetered?: boolean } } | undefined)?.options);
+  assert.deepEqual(requests.map(request => request?.allowMetered), [false, true],
+    "The locked-vault fallback must not be cached as the permanent policy.");
+});

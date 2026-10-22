@@ -1,4 +1,6 @@
 <script lang="ts">
+  import "../src/lib/styles/tokens.css";
+  import "../src/lib/styles/base.css";
   import { defaultFolderSettings, defaultProfileSettings } from "../../core/src/sync/profileSettings.ts";
   import { createInitialState } from "../src/app/state.ts";
   import GeneralSettingsPage from "../src/GeneralSettingsPage.svelte";
@@ -12,6 +14,10 @@
   let page = $state("main"), phase = $state("unlocked");
   let managedStorage = $state(true), selectedFolderId = $state("photos");
   let password = $state("synthetic-folder-password");
+  let diagnosticsCopied = $state(false);
+  let generationLoggerBroken = $state(false);
+  let biometricStatusChecks = $state(0);
+  let promptDismissed = $state(false);
   let calls = $state<Record<string, unknown>[]>([]);
   let profile = $state({ ...defaultProfileSettings(), folders: {
     photos: { ...defaultFolderSettings(), ignorePatterns: ["photos-only"] },
@@ -41,6 +47,7 @@
       case "localReleaseHistory": return [] as T;
       case "saveProfileSettings": profile = request.settings as typeof profile; break;
       case "savePersonalSpaceSetting": minimumCopies = (request.value as { minimumCopies: number }).minimumCopies; break;
+      case "createVault": phase = "unlocked"; break;
       case "unlock": phase = "unlocked"; break;
     }
     return undefined as T;
@@ -51,9 +58,19 @@
 <button data-testid="uninitialized-fixture" onclick={() => { phase = "uninitialized"; }}>Reset fixture</button>
 <button data-testid="browser-fixture" onclick={() => { managedStorage = false; }}>Browser fixture</button>
 <button data-testid="onboarding-fixture" onclick={() => { page = "onboarding"; }}>Onboarding fixture</button>
+<button data-testid="break-generation-logger-fixture" onclick={() => { generationLoggerBroken = true; }}>Break diagnostic logger</button>
+<button data-testid="reset-local-name-fixture" onclick={() => {
+  app.connection.deviceName = ""; app.ui.deviceNameConfirmed = false; promptDismissed = false;
+}}>Reset device name fixture</button>
+<output data-testid={diagnosticsCopied ? "synthetic-diagnostics-copied" : "synthetic-diagnostics-idle"} hidden></output>
 <output data-testid="calls" hidden>{JSON.stringify(calls)}</output>
+<output data-testid="synthetic-biometric-status-checks" hidden>{biometricStatusChecks}</output>
 {#if page === "main"}
   <DeviceTab {app} advertisedDevices={[]} currentSourceIsIntroducer={false}
+    showDeviceNamePrompt={!promptDismissed && !app.ui.deviceNameConfirmed}
+    suggestedDeviceName="synthetic-device"
+    onSaveDeviceName={name => { app.connection.deviceName = name; app.ui.deviceNameConfirmed = true; }}
+    onDismissDeviceNamePrompt={() => { promptDismissed = true; }}
     isSavedDeviceConnected={() => false} isSavedDeviceAwaitingRemoteApproval={() => false} isLanDiscoveredDevice={() => false}
     onUseSavedDevice={() => {}} onResetDiscoveryServer={() => {}} onClearAllCache={() => {}} onClearOfflineFolderState={() => {}}
     onOpenDiagnosticsPage={() => {}} onOpenAboutPage={() => {}} onCopyCurrentDeviceId={() => {}} onCopySessionLogs={() => {}}
@@ -85,9 +102,24 @@
     onImport={async () => {}} onMigrate={async (id, target) => { record({ operation: "migrate", folderId: id, target }); }}
     onRelease={async () => {}} onSettingsSaved={() => {}} />
 {:else if page === "onboarding"}
-  <PersonalSpaceOnboarding mode="create" suggestedName="synthetic-device" initialDeviceName=""
+  <PersonalSpaceOnboarding mode="create" enableInputDiagnostics suggestedName="synthetic-device" initialDeviceName=""
     {command} getDefaultDeviceId={async () => "synthetic-device"}
-    onDeviceNameSaved={() => {}} onReady={async () => {}} onOpenSettings={() => { page = "general"; }} />
+    biometric={{status: async () => {
+      // Synchronous access plus mutation would self-trigger a tracking $effect.
+      biometricStatusChecks += 1;
+      return { available: false, enabled: false };
+    }, authenticate: async () => false}}
+    onDeviceNameSaved={name => { app.connection.deviceName = name; app.ui.deviceNameConfirmed = true; record({ operation: "saveDeviceName", name }); }}
+    onReady={async () => { page = "first-peer-folder"; }}
+    onSkip={() => { page = "main"; }}
+    onCopyDiagnostics={async () => { diagnosticsCopied = true; }}
+    onGenerationEvent={(stage, reason) => { if (generationLoggerBroken) throw new Error("Synthetic diagnostic logger failure."); record({ operation: "generationEvent", stage, reason }); }}
+    onOpenSettings={() => { page = "general"; }} />
+{:else if page === "first-peer-folder"}
+  <section data-testid="synthetic-first-peer-folder">
+    <h2>Peer folders (synthetic)</h2>
+    <p>Sample documents shared by another device</p>
+  </section>
 {:else}
   <NewFolderPage {command} onBack={() => { page = "main"; }} onOpenGeneralSettings={() => { page = "general"; }}
     onCreate={async label => { record({ operation: "createFolder", label }); }} />

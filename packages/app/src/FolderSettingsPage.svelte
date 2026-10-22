@@ -4,6 +4,7 @@
   import type { createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { safeNativeFailureText } from "./app/storageErrors.ts";
   import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
+  import PasswordInput from "./components/PasswordInput.svelte";
   let { folderId, folderLabel, encrypted, passwordDraft, passwordSaved, passwordError, actionError,
     managedStorage, onBack, onOpenGeneralSettings, onUpdatePassword, onSavePassword, onClearPassword,
     onImport, peerId, onMigrate, onRelease, onSettingsSaved, command }: {
@@ -156,7 +157,7 @@
     if (managedStorage) void refresh().catch(() => { error = "Folder settings are unavailable."; });
   });
 </script>
-<main class="panel" data-testid="folder-settings-page" data-folder-id={folderId}>
+<main class="panel settings-page" data-testid="folder-settings-page" data-folder-id={folderId}>
   <button onclick={onBack}>Back</button>
   <h1>Folder settings</h1>
   <p>{folderLabel || folderId}</p>
@@ -166,12 +167,10 @@
     <section>
       <h2>Folder password</h2>
       {#if passwordError}<p role="alert">{passwordError}</p>{/if}
-      <label>Folder Password
-        <input data-testid={`folder-password-${folderId}`} type="password"
-          value={passwordDraft} autocomplete="off"
-          oninput={event => onUpdatePassword(folderId, event.currentTarget.value)} />
-      </label>
-      <button disabled={busy} data-testid={`unlock-folder-${folderId}`} onclick={() => void changePassword("save")}
+      <PasswordInput label="Folder Password" testId={`folder-password-${folderId}`}
+        secretLabel="folder password" value={passwordDraft} autocomplete="off"
+        onValueChange={value => onUpdatePassword(folderId, value)} />
+      <button class="primary" disabled={busy} data-testid={`unlock-folder-${folderId}`} onclick={() => void changePassword("save")}
         aria-label="Unlock folder">Save and unlock folder</button>
       <button onclick={() => void changePassword("forget")} disabled={busy || !passwordSaved}
         aria-label="Forget saved folder password">Forget saved folder password</button>
@@ -200,19 +199,18 @@
         <h2>Register or recover this encrypted peer folder</h2>
         <p>Registration keeps the root browsable; only favorites download automatically.</p>
         <form onsubmit={event => { event.preventDefault(); void importFolder(); }}>
-          <label>Folder password (blank uses recovered credentials)
-            <input type="password" bind:value={importPassword} autocomplete="off" /></label>
+          <PasswordInput label="Folder password (blank uses recovered credentials)"
+            secretLabel="folder password" bind:value={importPassword} autocomplete="off" />
           <label><input type="checkbox" bind:checked={importApproved} /> I verified this peer and folder ID with the folder owner</label>
-          <button disabled={busy || !importApproved}>Approve and register folder</button>
+          <button class="primary" disabled={busy || !importApproved}>Approve and register folder</button>
         </form>
       </section>
     {/if}
   {#if folder}
     {@const lastRelease = releaseHistory.filter(value =>
       (value.kind === "safe" ? value.proposal.folderId : value.exception.folderId) === folder.id).at(-1)}
-  <ul>
-    <li>
-      <span>{folder.label}</span>
+  <section>
+      <h2>Local storage</h2>
       {#if status?.pendingLocalReleases.includes(folder.id)}
         <p>Local-copy cleanup is unfinished. Syncpeer will retry after the next unlock; this folder cannot be reattached yet.</p>
       {:else if folder.browseOnly}<p>Browse-only: no complete local copy is stored or shared.</p>{/if}
@@ -236,8 +234,7 @@
             onclick={() => void migrate(folder.id, "encrypted")}>Reattach encrypted local storage</button>
         {/if}
       {/if}
-    </li>
-  </ul>
+  </section>
   {/if}
       {#if settings}
         {@const folderSettings = settings.folders[folderId] ?? defaultFolderSettings()}

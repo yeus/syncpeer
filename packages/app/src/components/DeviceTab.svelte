@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { untrack } from "svelte";
+  import { isConfiguredDeviceName } from "../app/suggestedNames.ts";
   import type { AdvertisedDeviceItem } from "@syncpeer/core/browser";
+  import PasswordInput from "./PasswordInput.svelte";
   import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
   import ListRow from "./ListRow.svelte";
@@ -10,6 +13,10 @@
 
   interface Props {
     app: AppState;
+    showDeviceNamePrompt: boolean;
+    suggestedDeviceName: string;
+    onSaveDeviceName: (name: string) => void;
+    onDismissDeviceNamePrompt: () => void;
     advertisedDevices: AdvertisedDeviceItem[];
     isSavedDeviceConnected: (deviceId: string) => boolean;
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
@@ -39,6 +46,10 @@
 
   let {
     app,
+    showDeviceNamePrompt,
+    suggestedDeviceName,
+    onSaveDeviceName,
+    onDismissDeviceNamePrompt,
     advertisedDevices,
     isSavedDeviceConnected,
     isSavedDeviceAwaitingRemoteApproval,
@@ -67,6 +78,19 @@
   }: Props = $props();
 
   const appInfo = getAppBuildInfo();
+  let nameDraft = $state(untrack(() => suggestedDeviceName));
+  let nameError = $state("");
+  const submitLocalName = (event: SubmitEvent) => {
+    event.preventDefault();
+    const name = nameDraft.trim();
+    if (!isConfiguredDeviceName(name)) {
+      nameError = "Choose a device name other than the default placeholder.";
+      return;
+    }
+    nameError = "";
+    onSaveDeviceName(name);
+  };
+
   const buildTimeLocalLabel = formatBuildTimeLocal(appInfo.buildTimeUtc);
 
   let advertisedById = $derived.by(() => new Map(
@@ -179,6 +203,26 @@
     >About</button>
   </div>
 
+  {#if showDeviceNamePrompt}
+    <section class="name-prompt" data-testid="device-name-prompt" aria-labelledby="name-prompt-title">
+      <div>
+        <h3 id="name-prompt-title">Name this device</h3>
+        <p class="hint">Other devices will recognize it by this name. You can do this later.</p>
+      </div>
+      <form onsubmit={submitLocalName}>
+        <label for="local-name-entry">Device name</label>
+        <div class="name-prompt-actions">
+          <input id="local-name-entry" data-testid="local-name-entry" bind:value={nameDraft}
+            maxlength="64" autocomplete="off" spellcheck="false" />
+          <button type="submit" class="primary" data-testid="save-local-device-name">Save name</button>
+          <button type="button" class="ghost" data-testid="dismiss-local-name-prompt"
+            onclick={onDismissDeviceNamePrompt}>Not now</button>
+        </div>
+      </form>
+      {#if nameError}<p role="alert" class="name-prompt-error">{nameError}</p>{/if}
+    </section>
+  {/if}
+
   <div class="this-device-summary">
     <div class="item-title-row">
       <span class="item-title">This Device</span>
@@ -246,14 +290,9 @@
     </div>
 
     {#if app.ui.showRestoreFromBackup}
-      <label>
-        Backup Secret
-        <textarea
-          class="recovery-secret"
-          bind:value={app.devices.identityRecoverySecret}
-          placeholder="Paste backup secret here"
-        ></textarea>
-      </label>
+      <PasswordInput label="Backup Secret" secretLabel="device identity backup secret"
+        testId="device-identity-backup-secret" bind:value={app.devices.identityRecoverySecret}
+        placeholder="Paste backup secret here" autocomplete="off" />
       <div class="actions">
         <button
           type="button"
@@ -643,7 +682,7 @@
 <style>
   .appearance-settings {
     padding-bottom: 0.7rem;
-    border-bottom: 1px solid var(--border-soft);
+    border-bottom: 0;
   }
 
   .appearance-settings h3 {
@@ -694,16 +733,33 @@
     font-size: 0.8rem;
   }
 
+  .name-prompt {
+    display: grid;
+    gap: 0.55rem;
+    padding: 0.7rem;
+    margin-bottom: 0.7rem;
+    background: var(--bg-surface-muted);
+    border-radius: var(--radius-md);
+  }
+  .name-prompt h3 { margin: 0 0 0.25rem; font-size: 0.96rem; }
+  .name-prompt .hint { margin: 0; }
+  .name-prompt-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; }
+  .name-prompt-actions input { flex: 1 1 12rem; min-width: 0; min-height: 44px; }
+  .name-prompt-actions button { min-height: 44px; }
+  .name-prompt-error { margin: 0; color: var(--state-danger-text); }
+
   .this-device-summary {
-    border: 1px solid var(--border-default);
+    border: 0;
     border-radius: var(--radius-md);
     padding: 0.5rem 0.6rem;
-    background: var(--bg-surface);
+    background: var(--bg-surface-muted);
     margin-bottom: 0.5rem;
   }
 
   .settings-block {
-    margin-top: 0.5rem;
+    margin-top: 0.75rem;
+    display: grid;
+    gap: 0.75rem;
   }
 
   .version-meta {
@@ -718,7 +774,7 @@
 
   .settings-divider {
     grid-column: 1 / -1;
-    border-top: 1px solid var(--border-default);
+    border: 0;
     margin: 0.25rem 0;
   }
 
@@ -731,7 +787,7 @@
 
   form.settings {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
     gap: 0.45rem;
     margin-top: 0.45rem;
   }
@@ -753,6 +809,10 @@
     width: 18px;
     height: 18px;
     margin: 0;
+  }
+
+  @media (pointer: coarse) {
+    .top-actions .small { min-height: 44px; }
   }
 
   @media (max-width: 640px) {

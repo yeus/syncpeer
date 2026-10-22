@@ -44,6 +44,35 @@ async function runSettingsUiTest(browser) {
   };
 
   await waitFor("[data-testid='folder-settings-photos']");
+  await waitFor("[data-testid='device-name-prompt']");
+  assert.equal(await browser.$("[data-testid='device-name-onboarding']").isExisting(), false);
+  assert.equal(await browser.$("[data-testid='personal-space-onboarding']").isExisting(), false);
+  await browser.$("[data-testid='local-name-entry']").setValue("Synthetic Laptop");
+  await click("[data-testid='save-local-device-name']");
+  await browser.$("[data-testid='device-name-prompt']").waitForExist({ reverse: true });
+  assert.match(await text(), /Advertised name: Synthetic Laptop/);
+  await click("[data-testid='reset-local-name-fixture']");
+  await waitFor("[data-testid='device-name-prompt']");
+  await click("[data-testid='dismiss-local-name-prompt']");
+  await browser.$("[data-testid='device-name-prompt']").waitForExist({ reverse: true });
+  console.log("Passed: missing-name fallback is inline, saves a name, and can be dismissed without another onboarding modal.");
+  await browser.execute(() => {
+    const detail = [...document.querySelectorAll("summary")]
+      .find(element => element.textContent.trim() === "This Device Details");
+    detail?.click();
+  });
+  await clickText("Restore From Backup Secret");
+  const backupSecret = browser.$("[data-testid='device-identity-backup-secret']");
+  await backupSecret.waitForExist();
+  await backupSecret.setValue("synthetic-identity-secret");
+  assert.equal(await backupSecret.getAttribute("type"), "password");
+  await click("[data-testid='device-identity-backup-secret-visibility']");
+  assert.equal(await backupSecret.getAttribute("type"), "text");
+  assert.equal(await backupSecret.getValue(), "synthetic-identity-secret");
+  await click("[data-testid='device-identity-backup-secret-visibility']");
+  assert.equal(await backupSecret.getAttribute("type"), "password");
+  await clickText("Hide Restore");
+  console.log("Passed: device identity backup secrets are hidden by default and revealable.");
   assert.equal(await browser.$("[data-testid='folder-password-photos']").isExisting(), false);
   assert.equal(await browser.$("[aria-label='Forget saved folder password']").isExisting(), false);
   await click("[data-testid='folder-settings-photos']");
@@ -65,6 +94,13 @@ async function runSettingsUiTest(browser) {
   await browser.waitUntil(async () => (await calls()).some(call => call.operation === "savePersonalSpaceSetting"));
   assert.deepEqual((await calls()).findLast(call => call.operation === "savePersonalSpaceSetting").path,
     ["folders", "photos", "retention"]);
+  const folderSecret = browser.$("[data-testid='folder-password-photos']");
+  assert.equal(await folderSecret.getAttribute("type"), "password");
+  await click("[data-testid='folder-password-photos-visibility']");
+  assert.equal(await folderSecret.getAttribute("type"), "text");
+  assert.equal(await folderSecret.getValue(), "synthetic-folder-password");
+  await click("[data-testid='folder-password-photos-visibility']");
+  assert.equal(await folderSecret.getAttribute("type"), "password");
   await click("[data-testid='unlock-folder-photos']");
   assert.equal((await calls()).findLast(call => call.operation === "saveFolderPassword").folderId, "photos");
   await back();
@@ -130,19 +166,150 @@ async function runSettingsUiTest(browser) {
   assert.equal((await calls()).at(-1).operation, "saveFolderPassword");
   console.log("Passed: browser-only folder passwords work without accessing native storage.");
 
+  await browser.setWindowSize(390, 680);
   await click("[data-testid='onboarding-fixture']");
   await waitFor("[data-testid='personal-space-onboarding']");
+  await waitFor("[data-testid='onboarding-input-diagnostics']");
+  await browser.waitUntil(async () =>
+    (await browser.$("[data-testid='onboarding-trace-heartbeat']").getText()) !== "JS: 0s",
+    { timeout: 4000, timeoutMsg: "Onboarding JavaScript heartbeat stopped." });
+  const backdropStyle = await browser.execute(() => {
+    const style = getComputedStyle(document.querySelector(".onboarding-backdrop"));
+    return { blur: style.backdropFilter || style.webkitBackdropFilter, background: style.backgroundColor };
+  });
+  assert.match(backdropStyle.blur, /blur\(/, "The onboarding background should be blurred.");
+  assert.match(backdropStyle.background, /15, 23, 42/, "The backdrop should dim rather than wash out the app.");
   assert.equal(await browser.$("[data-testid='onboarding-device-name']").isExisting(), true);
-  await click("[data-testid='onboarding-generate-password']");
-  const generatedPassword = await browser.$("[data-testid='generated-master-password']");
-  await generatedPassword.waitForExist();
-  const generatedText = await generatedPassword.getText();
+  await browser.waitUntil(async () =>
+    Number(await browser.execute(() => document.querySelector("[data-testid='synthetic-biometric-status-checks']")?.textContent)) === 1,
+    { timeout: 5000, timeoutMsg: "Biometric initialization was not invoked exactly once." });
+  // Simulate an Android-style interrupted click propagation path: critical
+  // controls must remain usable with direct element listeners.
+  await browser.execute(() => {
+    document.querySelector("[data-testid='personal-space-onboarding']")
+      ?.addEventListener("click", event => event.stopPropagation());
+  });
+  await click("[data-testid='onboarding-skip']");
+  await browser.$("[data-testid='personal-space-onboarding']")
+    .waitForExist({ reverse: true });
+  await waitFor("[data-testid='folder-settings-photos']");
+  await click("[data-testid='onboarding-fixture']");
+  await waitFor("[data-testid='personal-space-onboarding']");
+  await browser.waitUntil(async () =>
+    Number(await browser.execute(() => document.querySelector("[data-testid='synthetic-biometric-status-checks']")?.textContent)) === 2,
+    { timeout: 5000, timeoutMsg: "Biometric initialization must run once per onboarding instance." });
+  await browser.execute(() => {
+    window.__stopOnboardingClicks = event => event.stopPropagation();
+    document.querySelector("[data-testid='personal-space-onboarding']")
+      ?.addEventListener("click", window.__stopOnboardingClicks);
+  });
+  await click("[data-testid='onboarding-copy-diagnostics']");
+  await waitFor("[data-testid='synthetic-diagnostics-copied']");
+  // Simulate an unavailable browser helper; this is not a confirmed Android root cause.
+  // Master-password generation must still succeed without btoa.
+  await browser.execute(() => {
+    window.__savedBtoa = window.btoa;
+    window.btoa = undefined;
+  });
+  await browser.$("[data-testid='onboarding-generate-password']").click();
+  const masterPasswordInput = browser.$("[data-testid='onboarding-master-password']");
+  await browser.waitUntil(async () => (await masterPasswordInput.getValue()).length === 43);
+  assert.equal(await browser.$("[data-testid='generated-master-password']").isExisting(), false);
+  assert.equal(await browser.$("[data-testid='onboarding-copy-password']").isExisting(), true);
+  assert.match(await browser.$("[data-testid='onboarding-trace-events']").getText(), /Click: [1-9]/);
+  assert.match(await browser.$("[data-testid='onboarding-trace-target']").getText(), /click on generate/);
+  assert.equal(await browser.$("[data-testid='onboarding-trace-action']").getText(), "Last action: generate handler entered");
+  // Touch pointer-up activates even if a WebView never emits a click.
+  // A subsequent compatibility click must not generate a second password.
+  await browser.execute(() => {
+    const button = document.querySelector("[data-testid='onboarding-generate-password']");
+    const options = { bubbles: true, pointerType: "touch", pointerId: 8, isPrimary: true, clientX: 10, clientY: 10 };
+    button.dispatchEvent(new PointerEvent("pointerdown", options));
+    button.dispatchEvent(new PointerEvent("pointerup", options));
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await browser.waitUntil(async () => (await calls()).filter(call => call.operation === "generationEvent").length === 4);
+  const generatedText = await masterPasswordInput.getValue();
+  assert.deepEqual((await calls()).filter(call => call.operation === "generationEvent")
+    .map(call => call.stage), ["requested", "generated", "requested", "generated"]);
   assert.match(generatedText, /^[A-Za-z0-9_-]{43}$/);
-  assert.equal(await browser.$("[data-testid='onboarding-master-password']").getValue(), generatedText);
-  await click("[data-testid='onboarding-generated-saved']");
+  const mobileLayout = await browser.execute(() => {
+    const dialog = document.querySelector("[data-testid='personal-space-onboarding']");
+    const password = document.querySelector("[data-testid='onboarding-master-password']");
+    const rect = password?.getBoundingClientRect();
+    return {
+      width: dialog?.scrollWidth ?? 0,
+      dialogWidth: dialog?.clientWidth ?? 0,
+      viewport: window.innerWidth,
+      passwordVisible: Boolean(rect && rect.top >= 0 && rect.bottom <= window.innerHeight),
+      hasDialog: Boolean(dialog),
+    };
+  });
+  assert.equal(mobileLayout.hasDialog, true);
+  assert.ok(mobileLayout.width <= mobileLayout.dialogWidth + 2, `Onboarding dialog overflows narrow screens: ${JSON.stringify(mobileLayout)}`);
+  assert.equal(mobileLayout.passwordVisible, true, "Master-password input must stay visible after generation.");
+  await browser.execute(() => {
+    const dialog = document.querySelector("[data-testid='personal-space-onboarding']");
+    dialog.removeEventListener("click", window.__stopOnboardingClicks);
+    delete window.__stopOnboardingClicks;
+  });
+  assert.equal(await masterPasswordInput.getValue(), generatedText);
+  assert.equal(await masterPasswordInput.getAttribute("type"), "password");
+  await browser.$("[data-testid='onboarding-master-password-visibility']").click();
+  assert.equal(await masterPasswordInput.getAttribute("type"), "text");
+  await browser.$("[data-testid='onboarding-master-password-visibility']").click();
+  assert.equal(await masterPasswordInput.getAttribute("type"), "password");
+  await browser.execute(() => {
+    window.btoa = window.__savedBtoa;
+    delete window.__savedBtoa;
+  });
+  assert.equal(await browser.$("[data-testid='onboarding-generated-saved']").isExisting(), false);
+  await browser.execute(() => {
+    window.__savedRequestSubmit = HTMLFormElement.prototype.requestSubmit;
+    HTMLFormElement.prototype.requestSubmit = undefined;
+  });
   await click("[data-testid='onboarding-continue']");
+  await waitFor("[data-testid='onboarding-confirm-password']");
+  await click("[data-testid='onboarding-confirm-password']");
   await waitFor("[data-testid='onboarding-create']");
-  console.log("Passed: first-run onboarding generates a visible master password and reaches the create step.");
+  const recoveryPosition = await browser.execute(() => {
+    const dialog = document.querySelector("[data-testid='personal-space-onboarding']");
+    const heading = dialog.querySelector(".dialog-heading").getBoundingClientRect();
+    return { scrollTop: dialog.scrollTop, headingTop: heading.top, headingBottom: heading.bottom };
+  });
+  assert.equal(recoveryPosition.scrollTop, 0, "A new onboarding step starts at its heading.");
+  assert.ok(recoveryPosition.headingTop >= 0 && recoveryPosition.headingBottom <= 680,
+    `Recovery heading must remain visible: ${JSON.stringify(recoveryPosition)}`);
+  await browser.execute(() => {
+    HTMLFormElement.prototype.requestSubmit = window.__savedRequestSubmit;
+    delete window.__savedRequestSubmit;
+  });
+  assert.equal(await browser.$("[data-testid='onboarding-create']").isEnabled(), true);
+  await click("[data-testid='onboarding-create']");
+  assert.match(await browser.$("[role='alert']").getText(), /generate.*recovery/i);
+  await click("[data-testid='onboarding-generate-kit']");
+  await browser.$("a[download='syncpeer-offline-signing-kit.json']")
+    .waitForExist({ timeout: 60000 });
+  assert.equal(await browser.execute(() =>
+    document.querySelectorAll("[data-testid='onboarding-recovery-phrase'] span").length), 12);
+  await click("[data-testid='onboarding-create']");
+  assert.match(await browser.$("[role='alert']").getText(), /confirm.*saved/i);
+  await click("[data-testid='onboarding-kit-confirm']");
+  await click("[data-testid='onboarding-create']");
+  await waitFor("[data-testid='synthetic-first-peer-folder']");
+  assert.equal((await calls()).filter(call => call.operation === "createVault").length, 1);
+  assert.equal((await calls()).findLast(call => call.operation === "saveDeviceName")?.name, "synthetic-device");
+  console.log("Passed: synthetic first-run flow reaches the first advertised peer folder; packaged tests cover real transport.");
+  await click("[data-testid='break-generation-logger-fixture']");
+  await click("[data-testid='onboarding-fixture']");
+  await waitFor("[data-testid='personal-space-onboarding']");
+  await browser.$("[data-testid='onboarding-generate-password']").click();
+  const loggerFailedPassword = browser.$("[data-testid='onboarding-master-password']");
+  await browser.waitUntil(async () => (await loggerFailedPassword.getValue()).length === 43);
+  assert.match(await loggerFailedPassword.getValue(), /^[A-Za-z0-9_-]{43}$/);
+  await click("[data-testid='onboarding-skip']");
+  await browser.$("[data-testid='personal-space-onboarding']").waitForExist({ reverse: true });
+  console.log("Passed: failed diagnostic logging cannot block password generation or skip.");
 }
 
 async function main() {
@@ -161,14 +328,15 @@ async function main() {
   });
   const files = new Map(built.output.map(file => [file.fileName, file.type === "chunk" ? file.code : file.source]));
   const entry = built.output.find(file => file.type === "chunk" && file.isEntry).fileName;
-  const html = `<html><body><script>
+  const styles = built.output.filter(file => file.type === "asset" && file.fileName.endsWith(".css"));
+  const html = `<html><head>${styles.map(file => `<link rel="stylesheet" href="/${file.fileName}">`).join("")}</head><body><script>
     window.addEventListener('error', event => { document.body.dataset.testError = event.message; });
     window.addEventListener('unhandledrejection', event => { document.body.dataset.testError = String(event.reason); });
     </script><script type="module" src="/${entry}"></script></body></html>`;
   const server = createHttpServer((request, response) => {
     const file = request.url === "/" ? html : files.get(request.url.slice(1));
     response.statusCode = file === undefined ? 404 : 200;
-    response.setHeader("Content-Type", request.url === "/" ? "text/html" : "application/javascript");
+    response.setHeader("Content-Type", request.url === "/" ? "text/html" : request.url.endsWith(".css") ? "text/css" : "application/javascript");
     response.end(file ?? "Not found");
   });
   const port = await unusedPort();

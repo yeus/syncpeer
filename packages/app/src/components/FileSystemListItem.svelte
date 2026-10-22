@@ -731,7 +731,7 @@
   }
 
   .item-main-hit-clickable:hover {
-    background: var(--bg-surface-soft);
+    background: var(--button-hover-bg);
   }
 
   .item-main-hit-clickable:active {
@@ -763,9 +763,9 @@
   .item-icon-grid {
     width: 2.3rem;
     height: 2.3rem;
-    border: 1px solid var(--border-soft);
+    border: 0;
     border-radius: var(--radius-xs);
-    background: var(--bg-surface-soft);
+    background: var(--button-hover-bg);
   }
 
   .item-thumbnail {
@@ -798,7 +798,7 @@
   }
 
   .row-action:hover:not(:disabled) {
-    background: var(--bg-surface-soft);
+    background: var(--button-hover-bg);
     border-color: transparent;
   }
 
@@ -818,5 +818,9 @@
 
   .favorite-star-on {
     color: var(--state-star);
+  }
+  @media (pointer: coarse) {
+    .row-action { min-width: 44px; min-height: 44px; }
+    .actions-col { flex-wrap: wrap; min-width: 0; max-width: 88px; gap: 0; }
   }
 </style>

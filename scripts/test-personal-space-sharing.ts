@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { generateMnemonic, validateMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { createOwnedDeviceIdentity, createOwnedRecoveryKit, openOwnedRecoveryKit, openOwnedDeviceSigningKey,
   resolveApprovedPeerDeviceIds, resolveFolderShareDevices, resolveIncomingPeerDeviceIds,
   settingsFolderDevices, signSpaceMembershipUpdate, verifySpaceDeviceMembership } from
@@ -30,6 +32,17 @@ test("offline recovery signing kit protects its key and rejects tampering", asyn
   assert.equal(await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, signature, challenge), true);
   await assert.rejects(openOwnedRecoveryKit(subtle, { ...kit, publicKey: "invalid" },
     "synthetic-offline-kit-password"), /recovery kit/i);
+});
+
+test("generated 12-word recovery phrase opens the existing encrypted signing kit", async () => {
+  const phrase = generateMnemonic(wordlist, 128);
+  assert.equal(phrase.split(" ").length, 12);
+  assert.equal(validateMnemonic(phrase, wordlist), true);
+  const kit = await createOwnedRecoveryKit(subtle,
+    size => crypto.getRandomValues(new Uint8Array(size)), phrase);
+  assert.equal((await openOwnedRecoveryKit(subtle, kit, phrase)).type, "private");
+  await assert.rejects(openOwnedRecoveryKit(subtle, kit,
+    generateMnemonic(wordlist, 128)), /recovery kit/i);
 });
 
 test("each device generates its own persistent signing identity", async () => {

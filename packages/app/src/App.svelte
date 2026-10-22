@@ -71,7 +71,6 @@
   import { applyTheme } from "./app/theme.ts";
   import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
   import { isConfiguredDeviceName, suggestedClientName } from "./app/suggestedNames.ts";
-  import DeviceNameOnboarding from "./components/DeviceNameOnboarding.svelte";
   import PersonalSpaceOnboarding from "./components/PersonalSpaceOnboarding.svelte";
   import { requestLocalDataReset } from "./app/localReset.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -125,13 +124,15 @@
   let privateStorageResetError = $state("");
   let startupReady = $state(false);
   let vaultOnboardingMode = $state<"create" | "unlock" | null>(null);
-  const showDeviceNameOnboarding = $derived(
+  let skippedVaultOnboarding = $state(false);
+  let skippedDeviceNamePrompt = $state(false);
+  const showDeviceNamePrompt = $derived(
     startupReady &&
     app.currentPage === "main" &&
     !vaultOnboardingMode &&
+    !skippedDeviceNamePrompt &&
     !app.ui.deviceNameConfirmed &&
-    !isConfiguredDeviceName(app.connection.deviceName) &&
-    app.devices.savedDevices.length === 0
+    !isConfiguredDeviceName(app.connection.deviceName)
   );
   const onboardingSuggestedName = $derived(
     isConfiguredDeviceName(app.connection.deviceName)
@@ -694,6 +695,20 @@
       </section>
     {/if}
     <main class="content" data-testid="app-content" bind:this={contentElement}>
+      {#if skippedVaultOnboarding}
+        <section class="panel" data-testid="setup-skipped-notice">
+          <p><strong>Personal space not set up.</strong> You can inspect devices and copy session logs. Encrypted shared folders require setup or unlock.</p>
+          <div class="actions">
+            <button class="primary" type="button" data-testid="resume-personal-space-setup" onclick={async () => {
+              const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" }).catch(() => null);
+              if (!status) { app.ui.recentError = "Personal-space status is unavailable."; return; }
+              skippedVaultOnboarding = false;
+              if (status.vault.phase !== "unlocked") vaultOnboardingMode = status.vault.phase === "locked" ? "unlock" : "create";
+            }}>Resume setup</button>
+            <button type="button" onclick={() => void actions.copySessionLogs()}>Copy Logs</button>
+          </div>
+        </section>
+      {/if}
       {#if app.ui.showStabilityNotice}
         <section class="panel" data-testid="stability-notice">
           <p>Syncpeer is still experimental. Keep a verified copy of important files on another Syncthing peer or in a separate backup; do not rely on this app as your only copy.</p>
@@ -745,6 +760,13 @@
       {#if app.activeTab === "devices"}
         <DeviceTab
           {app}
+          showDeviceNamePrompt={showDeviceNamePrompt}
+          suggestedDeviceName={onboardingSuggestedName}
+          onSaveDeviceName={saveDeviceName}
+          onDismissDeviceNamePrompt={() => {
+            skippedDeviceNamePrompt = true;
+            pushSessionLog(app, "info", "app.device_name.deferred", "Device naming deferred for this session.");
+          }}
           advertisedDevices={currentAdvertisedDevices}
           isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
@@ -808,7 +830,7 @@
 
       {#if app.activeTab === "folders"}
         {#if appInfo.runtimeSurface === "android-ui" || appInfo.runtimeSurface === "desktop-ui"}
-          <button data-testid="new-folder" onclick={actions.openNewFolder}>New folder</button>
+          <button class="new-folder-action" data-testid="new-folder" onclick={actions.openNewFolder}>New folder</button>
         {/if}
         <FoldersTab
           {app}
@@ -870,41 +892,45 @@
       </aside>
     {/if}
 
-    <nav class="bottom-tabs">
+    <nav class="bottom-tabs" aria-label="Main navigation">
       <button
         type="button"
         class={`tab-button ${app.activeTab === "favorites" ? "active" : ""}`}
+        aria-current={app.activeTab === "favorites" ? "page" : undefined}
         onclick={(event) => actions.switchTab("favorites", event)}
       >
         <Star size={18} aria-hidden="true" />
-        <span class="sr-only">Favorites</span>
+        <span class="tab-label">Favorites</span>
       </button>
       <button
         data-testid="tab-folders"
         type="button"
         class={`tab-button ${app.activeTab === "folders" ? "active" : ""}`}
+        aria-current={app.activeTab === "folders" ? "page" : undefined}
         onclick={(event) => actions.switchTab("folders", event)}
       >
         <FolderOpen size={18} aria-hidden="true" />
-        <span class="sr-only">Folders</span>
+        <span class="tab-label">Folders</span>
       </button>
       <button
         data-testid="tab-devices"
         type="button"
         class={`tab-button ${app.activeTab === "devices" ? "active" : ""}`}
+        aria-current={app.activeTab === "devices" ? "page" : undefined}
         onclick={(event) => actions.switchTab("devices", event)}
       >
         <Smartphone size={18} aria-hidden="true" />
-        <span class="sr-only">Devices</span>
+        <span class="tab-label">Devices</span>
       </button>
       <button
         data-testid="tab-pim"
         type="button"
         class={`tab-button ${app.activeTab === "pim" ? "active" : ""}`}
+        aria-current={app.activeTab === "pim" ? "page" : undefined}
         onclick={(event) => actions.switchTab("pim", event)}
       >
         <CalendarDays size={18} aria-hidden="true" />
-        <span class="sr-only">PIM</span>
+        <span class="tab-label">PIM</span>
       </button>
     </nav>
   </div>
@@ -977,22 +1003,39 @@
     getDefaultDeviceId={() => client.getDefaultDeviceId()}
     biometric={biometric}
     onDeviceNameSaved={saveDeviceName}
+    onSkip={() => {
+      skippedVaultOnboarding = true;
+      vaultOnboardingMode = null;
+      try { pushSessionLog(app, "info", "app.personal_space.skipped", "Setup skipped for this session."); } catch { /* Do not block dismissal. */ }
+    }}
+    onCopyDiagnostics={async () => {
+      pushSessionLog(app, "info", "app.personal_space.diagnostics", "Onboarding diagnostics requested.", {
+        secureContext: window.isSecureContext,
+        secureRandomAvailable: typeof globalThis.crypto?.getRandomValues === "function",
+      });
+      await actions.copySessionLogs();
+    }}
+    onGenerationEvent={(stage, reason) => {
+      try {
+        pushSessionLog(app, stage.endsWith("-failed") ? "warning" : "info",
+          "app.personal_space.password_generation", "Password generation state changed.", { stage, reason });
+      } catch { /* Diagnostics must not block setup. */ }
+    }}
     onReady={async () => {
+      skippedVaultOnboarding = false;
       vaultOnboardingMode = null;
       await loadFolderCredentials().catch(error => {
         app.ui.recentError = error instanceof Error ? error.message : String(error);
       });
     }}
     onOpenSettings={() => {
+      skippedVaultOnboarding = false;
       vaultOnboardingMode = null;
       actions.openGeneralSettings();
     }}
   />
 {/if}
 
-{#if showDeviceNameOnboarding}
-  <DeviceNameOnboarding suggestedName={onboardingSuggestedName} onSave={saveDeviceName} />
-{/if}
 
 <style>
   .app-shell {
@@ -1009,7 +1052,7 @@
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 0.5rem 0;
+    padding: 0.75rem;
     max-width: 960px;
     margin: 0 auto;
     width: 100%;
@@ -1029,7 +1072,7 @@
     flex-wrap: wrap;
     gap: 0.35rem 1rem;
     padding: 0.5rem 0.75rem;
-    border-bottom: 1px solid var(--border-default);
+    border-bottom: 0;
     background: var(--bg-surface-muted);
     color: var(--text-secondary);
     font-size: 0.78rem;
@@ -1067,7 +1110,7 @@
     grid-template-columns: repeat(4, minmax(0, 1fr));
     background: var(--bg-nav);
     backdrop-filter: blur(12px);
-    border-top: 1px solid var(--border-default);
+    border-top: 0;
     padding: 0.45rem 0.45rem calc(0.45rem + env(safe-area-inset-bottom));
     gap: 0.35rem;
     z-index: 1000;
@@ -1086,7 +1129,7 @@
     max-width: 32rem;
     margin: 0 auto;
     padding: 0.5rem 0.6rem;
-    border: 1px solid var(--border-soft);
+    border: 0;
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
     box-shadow: var(--shadow-soft);
@@ -1118,13 +1161,13 @@
   }
 
   .tab-button {
-    border: 1px solid transparent;
+    border: 0;
     color: var(--text-muted);
     background: transparent;
     border-radius: var(--radius-sm);
     font-weight: 700;
-    letter-spacing: 0.02em;
-    font-size: 0.9rem;
+    gap: 0.4rem;
+    font-size: 0.8rem;
     min-height: 44px;
     display: flex;
     align-items: center;
@@ -1134,36 +1177,34 @@
 
   .tab-button.active {
     position: relative;
-    background: transparent;
-    color: var(--color-primary);
+    background: var(--color-secondary-soft);
+    color: var(--text-strong);
   }
 
   .tab-button.active::after {
     content: "";
     position: absolute;
-    right: 24%;
-    bottom: -0.1rem;
-    left: 24%;
+    right: calc(50% - 0.65rem);
+    bottom: 0.2rem;
+    left: calc(50% - 0.65rem);
     height: 2px;
     border-radius: 2px;
     background: var(--color-secondary);
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
+  .new-folder-action { margin: 0 0 0.5rem; color: var(--color-primary); }
+
+  .tab-label { white-space: nowrap; }
 
   @media (max-width: 640px) {
     .content {
-      padding: 0.35rem 0 0.5rem;
+      padding: 0.5rem;
+    }
+    .tab-button {
+      flex-direction: column;
+      gap: 0.2rem;
+      padding: 0.35rem 0.2rem 0.55rem;
+      font-size: 0.68rem;
     }
   }
 </style>

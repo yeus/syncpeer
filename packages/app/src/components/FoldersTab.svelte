@@ -478,7 +478,7 @@
     padding: 0;
     list-style: none;
     display: grid;
-    gap: 0.45rem;
+    gap: 0.15rem;
   }
 
   .status-row {
@@ -521,7 +521,10 @@
 
   .view-toggle {
     display: inline-flex;
-    gap: 0.35rem;
+    gap: 0.15rem;
+    padding: 0.2rem;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface-muted);
     margin-left: auto;
   }
 
@@ -533,7 +536,7 @@
 
   .compact-toggle.active {
     background: var(--color-primary-soft);
-    border-color: var(--border-accent);
+    border-color: transparent;
     color: var(--color-primary-strong);
   }
 
@@ -548,9 +551,9 @@
 
   .list-grid :global(.list-item) {
     grid-template-columns: minmax(0, 1fr) auto;
-    border: 1px solid var(--border-soft);
+    border: 0;
     border-radius: var(--radius-sm);
-    background: var(--bg-surface);
+    background: var(--bg-surface-soft);
     padding: 0.45rem;
     min-height: 6.2rem;
   }
@@ -603,9 +606,9 @@
     margin-top: 0.45rem;
     margin-bottom: 0.2rem;
     padding: 0.4rem 0.55rem;
-    border: 1px solid var(--border-soft);
+    border: 0;
     border-radius: var(--radius-sm);
-    background: var(--bg-surface);
+    background: var(--bg-surface-soft);
     color: var(--text-secondary);
     font-size: 0.83rem;
   }
@@ -617,9 +620,9 @@
     margin: 0.35rem 0 0.65rem;
     padding: 0.42rem 0.6rem;
     border-radius: 0.6rem;
-    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border-soft));
-    background: color-mix(in srgb, var(--bg-surface) 86%, var(--accent) 14%);
-    color: var(--text);
+    border: 0;
+    background: color-mix(in srgb, var(--bg-surface) 86%, var(--color-secondary) 14%);
+    color: var(--text-primary);
     font-size: 0.82rem;
     font-weight: 600;
   }
@@ -628,9 +631,13 @@
     width: 0.72rem;
     height: 0.72rem;
     border-radius: 999px;
-    border: 2px solid color-mix(in srgb, var(--accent) 28%, transparent);
-    border-top-color: var(--accent);
+    border: 2px solid color-mix(in srgb, var(--color-secondary) 28%, transparent);
+    border-top-color: var(--color-secondary);
     animation: spin 0.9s linear infinite;
+  }
+
+  @media (pointer: coarse) {
+    .compact-toggle { min-height: 44px; }
   }
 
   @keyframes spin {

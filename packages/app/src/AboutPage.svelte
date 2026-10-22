@@ -49,7 +49,7 @@
   };
 </script>
 
-<main class="about-page" data-testid="about-page">
+<main class="settings-page about-page" data-testid="about-page">
   <header class="about-header">
     <button class="ghost" data-testid="about-back" onclick={onBack}>Back To Main App</button>
     <h1 class="about-title">About Syncpeer</h1>
@@ -145,14 +145,6 @@
 </main>
 
 <style>
-  .about-page {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 1.25rem;
-    display: grid;
-    gap: 1rem;
-  }
-
   .about-header {
     display: flex;
     align-items: center;
@@ -180,9 +172,9 @@
   .info-grid div {
     min-width: 0;
     padding: 0.55rem 0.65rem;
-    border: 1px solid var(--border-soft);
+    border: 0;
     border-radius: var(--radius-sm);
-    background: var(--bg-surface);
+    background: var(--bg-surface-soft);
   }
 
   dt {

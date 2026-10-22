@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@scure/bip39": "^2.4.0",
     "@syncpeer/core": "0.6.1-rc.2",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-notification": "^2.3.3",

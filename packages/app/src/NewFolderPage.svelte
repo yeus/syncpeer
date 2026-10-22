@@ -21,14 +21,14 @@
   });
 </script>
 
-<main class="panel" data-testid="new-folder-page">
+<main class="panel settings-page" data-testid="new-folder-page">
   <button onclick={onBack}>Back</button>
   <h1>New folder</h1>
   {#if error}<p role="alert">{error}</p>{/if}
   {#if phase === "unlocked"}
     <form onsubmit={event => { event.preventDefault(); void createFolder(); }}>
       <label>New folder name <input bind:value={label} required /></label>
-      <button disabled={busy || !label.trim()}>Create folder</button>
+      <button class="primary" disabled={busy || !label.trim()}>Create folder</button>
     </form>
     <p>New folders use encrypted local storage. Approved devices receive the folder credential through your personal space.</p>
   {:else if phase}

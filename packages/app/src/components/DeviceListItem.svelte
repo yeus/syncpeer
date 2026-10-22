@@ -179,4 +179,7 @@ export interface SavedDeviceRow {
     border-color: transparent;
     background: var(--button-hover-bg);
   }
+  @media (pointer: coarse) {
+    .name-edit-button { min-width: 44px; min-height: 44px; }
+  }
 </style>

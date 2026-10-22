@@ -1,13 +1,17 @@
 :root {
   color-scheme: light;
-  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, Arial, sans-serif;
-  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-sans:
+    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Noto Sans", Ubuntu, Cantarell, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Consolas,
+    "Liberation Mono", monospace;
   --brand-primary: #2a3548;
   --brand-secondary: #f78f3b;
   --bg-canvas: #f5f6f8;
   --bg-shell: #f5f6f8;
   --bg-surface: #ffffff;
-  --bg-surface-soft: #ffffff;
+  --bg-surface-soft: color-mix(in oklch, var(--brand-primary) 3%, white);
   --bg-surface-muted: color-mix(in oklch, var(--brand-primary) 4%, white);
   --bg-nav: rgba(255, 255, 255, 0.96);
   --text-primary: #202632;
@@ -15,11 +19,19 @@
   --text-secondary: #4f5968;
   --text-muted: #6c7685;
   --color-primary: color-mix(in oklch, var(--brand-primary) 82%, #111827);
-  --color-primary-strong: color-mix(in oklch, var(--brand-primary) 90%, #111827);
+  --color-primary-strong: color-mix(
+    in oklch,
+    var(--brand-primary) 90%,
+    #111827
+  );
   --color-primary-soft: color-mix(in oklch, var(--brand-primary) 8%, white);
   --color-primary-hover: color-mix(in oklch, var(--brand-primary) 88%, black);
   --color-secondary: color-mix(in oklch, var(--brand-secondary) 92%, #c65c16);
-  --color-secondary-soft: color-mix(in oklch, var(--brand-secondary) 12%, white);
+  --color-secondary-soft: color-mix(
+    in oklch,
+    var(--brand-secondary) 12%,
+    white
+  );
   --color-on-primary: #ffffff;
   --border-soft: color-mix(in oklch, var(--brand-primary) 11%, white);
   --border-default: color-mix(in oklch, var(--brand-primary) 16%, white);
@@ -32,7 +44,11 @@
   --state-success-text: #11663f;
   --state-success-dot: #19a561;
   --state-offline-bg: var(--color-secondary-soft);
-  --state-offline-text: color-mix(in oklch, var(--brand-secondary) 78%, #78350f);
+  --state-offline-text: color-mix(
+    in oklch,
+    var(--brand-secondary) 78%,
+    #78350f
+  );
   --state-danger-bg: #fff1f1;
   --state-danger-border: #efcaca;
   --state-danger-text: #a61b1b;
@@ -40,8 +56,8 @@
   --state-star: var(--color-secondary);
   --state-hint-text: #7c3b16;
   --radius-xs: 5px;
-  --radius-sm: 7px;
-  --radius-md: 9px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
   --space-1: 0.35rem;
   --space-2: 0.5rem;
   --space-3: 0.7rem;
@@ -52,8 +68,10 @@
   --text-separator: var(--text-muted);
   --text-empty: var(--text-muted);
   --text-log: var(--text-primary);
-  --shadow-soft: none;
-  --focus-ring: 0 0 0 3px color-mix(in oklch, var(--brand-secondary) 28%, transparent);
+  --shadow-soft: 0 8px 28px
+    color-mix(in srgb, var(--brand-primary) 9%, transparent);
+  --focus-ring: 0 0 0 3px
+    color-mix(in oklch, var(--brand-secondary) 28%, transparent);
 }
 
 :root[data-theme="dark"] {
@@ -70,10 +88,18 @@
   --text-muted: #9da7b5;
   --color-primary: color-mix(in oklch, var(--brand-primary) 45%, white);
   --color-primary-strong: color-mix(in oklch, var(--brand-primary) 28%, white);
-  --color-primary-soft: color-mix(in oklch, var(--brand-primary) 42%, transparent);
+  --color-primary-soft: color-mix(
+    in oklch,
+    var(--brand-primary) 42%,
+    transparent
+  );
   --color-primary-hover: color-mix(in oklch, var(--brand-primary) 35%, white);
   --color-secondary: color-mix(in oklch, var(--brand-secondary) 92%, white);
-  --color-secondary-soft: color-mix(in oklch, var(--brand-secondary) 16%, transparent);
+  --color-secondary-soft: color-mix(
+    in oklch,
+    var(--brand-secondary) 16%,
+    transparent
+  );
   --color-on-primary: #10151d;
   --border-soft: color-mix(in oklch, white 10%, transparent);
   --border-default: color-mix(in oklch, white 14%, transparent);
@@ -94,5 +120,6 @@
   --state-star: var(--color-secondary);
   --state-hint-text: #ffc38b;
   --button-hover-bg: color-mix(in oklch, white 7%, transparent);
-  --shadow-soft: none;
+  --shadow-soft: 0 8px 28px
+    color-mix(in srgb, var(--brand-primary) 9%, transparent);
 }

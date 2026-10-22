@@ -54,9 +54,9 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    min-height: 58px;
+    min-height: 54px;
     padding: 0.45rem 0.75rem;
-    border-bottom: 1px solid var(--border-default);
+    border-bottom: 0;
     background: var(--bg-nav);
     color: var(--text-strong);
   }
@@ -71,9 +71,9 @@
   }
 
   .brand img {
-    width: 38px;
-    height: 38px;
-    border: 1px solid var(--border-soft);
+    width: 32px;
+    height: 32px;
+    border: 0;
     border-radius: var(--radius-sm);
     background: #fff;
   }

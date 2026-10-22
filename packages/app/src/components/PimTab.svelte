@@ -164,7 +164,7 @@
 <style>
   .settings-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
     gap: 0.8rem;
   }
 
@@ -176,13 +176,9 @@
     color: var(--text-secondary);
   }
 
-  .settings-grid input,
+  .settings-grid input:not([type="checkbox"]),
   .settings-grid select {
-    border: 1px solid var(--border-soft);
-    border-radius: 0.55rem;
-    padding: 0.45rem 0.6rem;
-    background: var(--bg-elevated);
-    color: var(--text-primary);
+    width: 100%;
   }
 
   .checkbox-row {
@@ -199,18 +195,13 @@
     gap: 0.6rem;
   }
 
-  .actions button {
-    border: 1px solid var(--border-soft);
-    background: var(--bg-elevated);
-    color: var(--text-primary);
-    border-radius: 0.55rem;
-    padding: 0.45rem 0.7rem;
-    cursor: pointer;
-  }
-
   .status-list {
     display: grid;
     gap: 0.45rem;
+    margin-top: 0.8rem;
+    padding: 0.75rem;
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface-soft);
   }
 
   .status-line {

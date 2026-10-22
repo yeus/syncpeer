@@ -148,7 +148,7 @@
   void loadCatalog();
 </script>
 
-<main class="diagnostics-page">
+<main class="settings-page diagnostics-page">
   <header class="diagnostics-header">
     <button class="ghost" data-testid="diagnostics-back" onclick={onBack}>Back To Main App</button>
     <h1 class="diagnostics-title">Diagnostics</h1>
@@ -239,13 +239,6 @@
 </main>
 
 <style>
-  .diagnostics-page {
-    max-width: 980px;
-    margin: 0 auto;
-    padding: 1.25rem;
-    display: grid;
-    gap: 1rem;
-  }
   .diagnostics-header {
     display: flex;
     align-items: center;
@@ -277,12 +270,16 @@
     justify-content: space-between;
     gap: 0.5rem;
     align-items: center;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
+    border: 0;
+    border-radius: var(--radius-sm);
     padding: 0.5rem 0.6rem;
-    background: var(--bg-surface);
+    background: var(--bg-surface-soft);
+    min-width: 0;
+    flex-wrap: wrap;
   }
   .test-meta {
+    min-width: 0;
+    overflow-wrap: anywhere;
     display: grid;
     gap: 0.15rem;
   }
@@ -294,6 +291,9 @@
     min-height: 30px;
     padding: 0.15rem 0.45rem;
     font-size: 0.8rem;
+  }
+  @media (pointer: coarse) {
+    .small { min-height: 44px; }
   }
   .empty {
     color: var(--text-secondary);
@@ -331,7 +331,7 @@
   }
   .result-box {
     width: 100%;
-    min-height: 420px;
+    min-height: clamp(12rem, 40dvh, 26rem);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
     padding: 0.7rem;

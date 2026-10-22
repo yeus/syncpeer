@@ -336,11 +336,27 @@ test("a configured encrypted device name completes first-run naming", () => {
 
 test("generated master passwords are base64url and unpredictable", () => {
   assert.equal(generateMasterPassword(() => new Uint8Array(32)), "A".repeat(43));
+  assert.equal(generateMasterPassword(() => Uint8Array.from({ length: 32 }, (_, index) => index)),
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
   const first = generateMasterPassword();
   const second = generateMasterPassword();
   assert.match(first, /^[A-Za-z0-9_-]{43}$/);
   assert.match(second, /^[A-Za-z0-9_-]{43}$/);
   assert.notEqual(first, second);
+});
+
+test("master password generation does not depend on btoa or replaceAll", () => {
+  const originalBtoa = globalThis.btoa;
+  const originalReplaceAll = Object.getOwnPropertyDescriptor(String.prototype, "replaceAll");
+  try {
+    Object.defineProperty(globalThis, "btoa", { configurable: true, writable: true, value: undefined });
+    Object.defineProperty(String.prototype, "replaceAll", { configurable: true, writable: true, value: undefined });
+    assert.equal(generateMasterPassword(() => new Uint8Array(32)), "A".repeat(43));
+  } finally {
+    Object.defineProperty(globalThis, "btoa", { configurable: true, writable: true, value: originalBtoa });
+    if (originalReplaceAll) Object.defineProperty(String.prototype, "replaceAll", originalReplaceAll);
+    else Reflect.deleteProperty(String.prototype, "replaceAll");
+  }
 });
 
 test("device IDs render in Syncthing's grouped form", () => {

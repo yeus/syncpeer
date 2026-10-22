@@ -1,4 +1,4 @@
-* ,
+*,
 *::before,
 *::after {
   box-sizing: border-box;
@@ -17,7 +17,9 @@ body {
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  transition: background-color 140ms ease, color 140ms ease;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease;
 }
 
 button,
@@ -29,18 +31,19 @@ textarea {
 }
 
 :focus-visible {
-  outline: none;
+  outline: 2px solid var(--color-secondary);
+  outline-offset: 2px;
   box-shadow: var(--focus-ring);
 }
 
 button {
-  border: 1px solid var(--border-strong);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  background: var(--bg-surface);
+  background: var(--bg-surface-muted);
   color: var(--text-strong);
-  padding: 0.55rem 0.85rem;
+  padding: 0.4rem 0.7rem;
   font-size: 0.9rem;
-  min-height: 42px;
+  min-height: 36px;
   cursor: pointer;
   transition:
     background-color 120ms ease,
@@ -56,7 +59,7 @@ button {
 
 button:hover:not(:disabled) {
   background: var(--button-hover-bg);
-  border-color: var(--border-hover);
+  border-color: transparent;
 }
 
 button.primary {
@@ -70,7 +73,8 @@ button.primary:hover:not(:disabled) {
 }
 
 button.ghost {
-  background: var(--bg-surface-soft);
+  background: transparent;
+  color: var(--color-primary);
 }
 
 button.icon {
@@ -99,9 +103,22 @@ select,
 textarea {
   padding: 0.45rem 0.5rem;
   font-size: 0.88rem;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
-  background: var(--bg-surface);
+  background: var(--bg-surface-soft);
+  min-width: 0;
+  max-width: 100%;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="color"]),
+select {
+  min-height: 36px;
+}
+
+input[type="checkbox"],
+input[type="radio"],
+progress {
+  accent-color: var(--color-secondary);
 }
 
 textarea.recovery-secret {
@@ -118,14 +135,152 @@ label {
 }
 
 .panel {
-  background: var(--bg-surface-soft);
-  border-block: 1px solid var(--border-default);
-  border-inline: 0;
-  padding: var(--space-3);
+  background: var(--bg-surface);
+  border: 0;
+  padding: clamp(0.75rem, 2vw, 1rem);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+.panel + .panel {
+  margin-top: var(--space-2);
 }
 
-.panel + .panel {
-  margin-top: var(--space-1);
+/* First-run dialogs are scrollable on small screens without boxed field sections. */
+.onboarding-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: grid;
+  place-items: center;
+  padding: max(0.65rem, env(safe-area-inset-top)) 0.65rem
+    max(0.65rem, env(safe-area-inset-bottom));
+  background: rgb(15 23 42 / 42%);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.onboarding-card {
+  width: min(30rem, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: 0.65rem;
+  padding: clamp(0.7rem, 2vw, 1rem);
+  background: var(--bg-surface);
+  border-radius: calc(var(--radius-md) + 4px);
+  box-shadow: 0 12px 44px color-mix(in srgb, black 17%, transparent);
+}
+
+/* Forms and settings pages share a restrained hierarchy: fields first, actions second. */
+.settings-page {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+  width: min(100%, 52rem);
+  margin-inline: auto;
+  padding: clamp(0.9rem, 3vw, 1.5rem);
+  background: transparent;
+  border: 0;
+}
+.settings-page > button:first-child {
+  justify-self: start;
+  min-height: 36px;
+  border: 0;
+  background: transparent;
+  padding-inline: 0;
+  color: var(--color-primary);
+}
+.settings-page h1,
+.settings-page h2,
+.settings-page h3 {
+  margin: 0;
+  line-height: 1.3;
+}
+.settings-page h1 {
+  font-size: 1.35rem;
+}
+.settings-page h2 {
+  font-size: 1.05rem;
+}
+.settings-page h3 {
+  font-size: 0.96rem;
+}
+.settings-page p {
+  margin: 0;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+.settings-page > section {
+  display: grid;
+  gap: 0.75rem;
+  padding: clamp(0.8rem, 2vw, 1rem);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  min-width: 0;
+}
+.settings-page > section + section {
+  padding-top: 0.75rem;
+}
+.settings-page section > section {
+  display: grid;
+  gap: 0.65rem;
+  padding-top: 0.7rem;
+}
+.settings-page form {
+  display: grid;
+  gap: 0.7rem;
+}
+.settings-page label {
+  display: grid;
+  gap: 0.3rem;
+}
+.settings-page label:has(> input[type="checkbox"]) {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  line-height: 1.5;
+}
+.settings-page input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 0.15rem 0 0;
+}
+.settings-page ul {
+  display: grid;
+  gap: 0.5rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.settings-page li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.settings-page button {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.settings-page p {
+  overflow-wrap: anywhere;
+}
+.settings-page label > input:not([type="checkbox"]),
+.settings-page label > select,
+.settings-page label > textarea {
+  width: 100%;
+  min-width: 0;
+}
+.settings-page form > button,
+.settings-page section > button {
+  justify-self: start;
+  max-width: 100%;
+}
+.settings-page p[role="alert"] {
+  color: var(--state-danger-text);
+}
+.settings-page p[role="status"] {
+  color: var(--text-secondary);
 }
 
 .heading {
@@ -139,20 +294,17 @@ label {
   list-style: none;
   padding: 0;
   margin: 0;
-  border-block: 1px solid var(--border-soft);
-  border-inline: 0;
+  border: 0;
   border-radius: 0;
-  overflow: hidden;
-  background: var(--bg-surface);
+  overflow: visible;
+  background: transparent;
 }
 
 .list-item {
-  border-bottom: 1px solid var(--border-list-divider);
-  padding: 0.42rem 0.5rem;
-}
-
-.list-item:last-child {
-  border-bottom: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0.5rem;
+  transition: background-color 120ms ease;
 }
 
 .item-title {
@@ -200,14 +352,16 @@ label {
 }
 
 details {
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: 0.35rem 0.5rem;
-  background: var(--bg-surface);
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-surface-soft);
 }
 
 summary {
   cursor: pointer;
+  padding-block: 0.3rem;
+  line-height: 1.5;
   font-size: 0.86rem;
   color: var(--text-summary);
   font-weight: 600;
@@ -227,7 +381,7 @@ summary {
   color: var(--color-primary);
   padding: 0;
   border-radius: 0;
-  min-height: auto;
+  min-height: 32px;
 }
 
 .crumb-current {
@@ -264,7 +418,56 @@ summary {
   word-break: break-word;
   color: var(--text-log);
   background: var(--bg-surface-muted);
-  border: 1px solid var(--border-log);
+  border: 0;
   border-radius: var(--radius-xs);
   padding: 0.35rem 0.4rem;
+}
+
+/* Space and tonal surfaces provide hierarchy without enclosing every row. */
+.list-item:hover {
+  background: var(--bg-surface-soft);
+}
+.list-item:focus-within {
+  background: var(--bg-surface-muted);
+}
+a {
+  color: var(--color-primary);
+  text-underline-offset: 0.2em;
+}
+button,
+summary,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (pointer: coarse) {
+  button {
+    min-height: 44px;
+  }
+  button.icon,
+  button.icon-only {
+    min-width: 44px;
+    width: auto;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="color"]),
+  select {
+    min-height: 44px;
+  }
+  summary {
+    padding-block: 0.6rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

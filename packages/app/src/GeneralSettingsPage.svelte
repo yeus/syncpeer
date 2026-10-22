@@ -6,6 +6,7 @@
   import { generateMasterPassword } from "./app/passwords.ts";
   import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
   import { createWorkerPasswordKdf } from "./lib/passwordKdf.ts";
+  import PasswordInput from "./components/PasswordInput.svelte";
   let { onBack, onOpenFolderSettings, onUnlock, onUnlockBiometric, onRotateMasterPassword, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId, onStartPairing, onJoinPairing,
     onPairedDevice, biometric, command }: {
@@ -224,7 +225,7 @@
     void biometric?.status().then(value => { biometricState = value; }).catch(() => {});
   });
 </script>
-<main class="panel" data-testid="general-settings-page">
+<main class="panel settings-page" data-testid="general-settings-page">
   <button onclick={onBack}>Back</button>
   <h1>Settings</h1>
   {#if status && status.vault.phase !== "unlocked"}
@@ -239,8 +240,9 @@
     <p>Your approved devices share an encrypted settings folder containing folder credentials and shared policies. Each device keeps its own local master password.</p>
   {#if status?.vault.phase === "locked"}
     <form onsubmit={event => { event.preventDefault(); void unlock(); }}>
-      <label>Unlock personal space <input type="password" bind:value={password} autocomplete="current-password" required /></label>
-      <button disabled={busy}>Unlock</button>
+      <PasswordInput label="Unlock personal space" secretLabel="personal-space master password"
+        bind:value={password} autocomplete="current-password" required />
+      <button class="primary" disabled={busy}>Unlock</button>
     </form>
     {#if biometricState?.available && biometricState.enabled}
       <button disabled={busy} onclick={() => { busy = true; error = ""; void onUnlockBiometric().then(refresh).catch(() => { error = "Biometric unlock was not completed."; }).finally(() => { busy = false; }); }}>
@@ -249,7 +251,8 @@
     {/if}
   {:else if status?.vault.phase === "uninitialized"}
     <form onsubmit={event => { event.preventDefault(); void createProfile(); }}>
-      <label>Master password (at least 16 characters) <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" required /></label>
+      <PasswordInput label="Master password (at least 16 characters)" secretLabel="master password"
+        bind:value={masterPassword} autocomplete="new-password" minlength={16} required />
       <label><input type="checkbox" bind:checked={rememberMaster} /> Remember with the operating system’s protected credential store</label>
       <p>Remembering allows background access after restarting the app or rebooting, once the device is unlocked. Without it, enter your master password each time. Explicitly locking always requires the master password again.</p>
       <button type="button" onclick={generatePassword}>Generate local master password</button>
@@ -258,7 +261,8 @@
         <label><input type="checkbox" bind:checked={generatedSaved} /> I saved this recovery password</label>
       {/if}
       <p>Create and save a separate offline signing kit before creating this personal space. You need both this kit and a recent personal-space backup if every trusted device is lost. The kit is not saved in this app or included in the backup.</p>
-      <label>Offline kit password (at least 16 characters) <input type="password" bind:value={kitPassword} autocomplete="new-password" minlength="16" disabled={Boolean(kitText)} /></label>
+      <PasswordInput label="Offline kit password (at least 16 characters)" secretLabel="offline kit password"
+        bind:value={kitPassword} autocomplete="new-password" minlength={16} disabled={Boolean(kitText)} />
       {#if kitText}
         <label>Encrypted offline signing kit — save separately <textarea readonly rows="6" value={kitText} onclick={event => event.currentTarget.select()}></textarea></label>
         <a download="syncpeer-offline-signing-kit.json" href={`data:application/json;charset=utf-8,${encodeURIComponent(kitText)}`}>Save offline kit file</a>
@@ -267,15 +271,16 @@
       {:else}
         <button type="button" disabled={busy || kitPassword.length < 16} onclick={() => void prepareRecoveryKit()}>Generate encrypted offline kit</button>
       {/if}
-      <button disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
+      <button class="primary" disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
     </form>
     <section>
       <h2>Join an existing personal space</h2>
       <p>Paste the short-lived invitation from an already unlocked Syncpeer device. Both devices must confirm the same six-digit code.</p>
       <label>Pairing invitation <textarea rows="6" bind:value={pairingInvitation}></textarea></label>
-      <label>New local master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" /></label>
+      <PasswordInput label="New local master password" secretLabel="master password"
+        bind:value={masterPassword} autocomplete="new-password" minlength={16} />
       <label><input type="checkbox" bind:checked={rememberMaster} /> Remember on this device</label>
-      <button disabled={busy || masterPassword.length < 16 || !pairingInvitation.trim()} onclick={() => void joinDevice()}>Join personal space</button>
+      <button class="primary" disabled={busy || masterPassword.length < 16 || !pairingInvitation.trim()} onclick={() => void joinDevice()}>Join personal space</button>
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
     </section>
   {:else if status?.vault.phase === "unlocked"}
@@ -296,7 +301,8 @@
         <p>This backup has no device identity key. Use the separate offline signing kit to enroll this device and revoke every device in the backup's trusted list. Use the latest backup; an older copy of this space's device membership may conflict with later changes.</p>
         <label>Offline signing kit file <input type="file" accept="application/json,.json" onchange={event => { kitFile = event.currentTarget.files?.[0] ?? null; }} /></label>
         <label>Or paste encrypted kit <textarea rows="6" bind:value={kitText}></textarea></label>
-        <label>Offline kit password <input type="password" bind:value={kitPassword} autocomplete="off" /></label>
+        <PasswordInput label="12-word recovery phrase (or legacy kit password)" secretLabel="recovery phrase"
+          bind:value={kitPassword} autocomplete="off" />
         <button disabled={busy || !kitPassword || (!kitFile && !kitText)} onclick={() => void recoverTrustedDevice()}>Enroll this replacement device</button>
       </section>
     {/if}
@@ -304,7 +310,7 @@
       <h2>Pair another Syncpeer device</h2>
       <p>Enter this device’s LAN address or a Syncthing relay URL that both devices can reach. Creating an invitation temporarily disconnects the current sync session. The invitation expires after five minutes and transfers secrets only after both devices confirm the same code.</p>
       <label>LAN host/IP or relay:// URL <input bind:value={pairingHost} placeholder="192.168.1.20" /></label>
-      <button disabled={busy || !pairingHost.trim()} onclick={() => void inviteDevice()}>Create pairing invitation</button>
+      <button class="primary" disabled={busy || !pairingHost.trim()} onclick={() => void inviteDevice()}>Create pairing invitation</button>
       {#if pairingInvitation}
         <label>Invitation <textarea readonly rows="6" value={pairingInvitation} onclick={event => event.currentTarget.select()}></textarea></label>
         <button disabled={busy} onclick={() => void navigator.clipboard.writeText(pairingInvitation)}>Copy invitation</button>
@@ -329,7 +335,8 @@
       </section>
     {/if}
     <form onsubmit={event => { event.preventDefault(); void saveMasterPassword(); }}>
-      <label>Change personal-space master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" required /></label>
+      <PasswordInput label="Change personal-space master password" secretLabel="master password"
+        bind:value={masterPassword} autocomplete="new-password" minlength={16} required />
       <button disabled={busy || !masterPassword}>Change master password</button>
     </form>
   {/if}
@@ -337,7 +344,8 @@
     <section>
       <h2>Personal-space backup</h2>
       <p>This password-encrypted backup contains folder credentials and settings. It contains neither downloaded documents nor device identity keys. Keep its recovery password separately.</p>
-      <label>Backup recovery password <input type="password" bind:value={recoveryPassword} autocomplete="off" /></label>
+      <PasswordInput label="Backup recovery password" secretLabel="backup recovery password"
+        bind:value={recoveryPassword} autocomplete="off" />
       {#if status.vault.phase === "unlocked"}
         <button disabled={busy || !recoveryPassword} onclick={() => void transferBackup(false)}>Export encrypted backup</button>
         {#if backupText}
@@ -347,7 +355,8 @@
       {:else}
         <label>Backup file <input type="file" accept="application/json,.json" onchange={event => { backupFile = event.currentTarget.files?.[0] ?? null; }} /></label>
         <label>Or paste encrypted backup <textarea rows="6" bind:value={backupText}></textarea></label>
-        <label>New device master password <input type="password" bind:value={masterPassword} autocomplete="new-password" minlength="16" /></label>
+        <PasswordInput label="New device master password" secretLabel="master password"
+          bind:value={masterPassword} autocomplete="new-password" minlength={16} />
         <p>Recovery starts with remembering disabled. Your existing peer connections require approval on this device.</p>
         <button disabled={busy || !recoveryPassword || masterPassword.length < 16 || (!backupFile && !backupText)} onclick={() => void transferBackup(true)}>Import backup into this new profile</button>
       {/if}

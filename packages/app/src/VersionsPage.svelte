@@ -15,7 +15,7 @@
     bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 </script>
 
-<main class="panel">
+<main class="settings-page">
   <button onclick={onBack}>Back</button>
   <h1>Versions</h1>
   <p>{name}</p>
@@ -40,7 +40,7 @@
 </main>
 
 <style>
-  .panel { max-width: 720px; margin: 0 auto; padding: 1rem; }
-  ul { list-style: none; padding: 0; display: grid; gap: 0.5rem; }
-  li { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+  p { overflow-wrap: anywhere; }
+  ul { margin: 0; list-style: none; padding: 0; display: grid; gap: 0.5rem; }
+  li { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; padding: 0.65rem; background: var(--bg-surface); border-radius: var(--radius-sm); flex-wrap: wrap; }
 </style>

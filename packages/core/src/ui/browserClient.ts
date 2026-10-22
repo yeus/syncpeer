@@ -616,6 +616,8 @@ type BrowserClientState = {
   incomingListenerError: string | null;
   backgroundListenerActive: boolean;
   backgroundListenerListenPort: number;
+  /** Only a service session this client started has to be stopped again. */
+  backgroundSessionStarted: boolean;
   sessionConfigurationRefresh: Promise<void>;
 };
 
@@ -810,6 +812,7 @@ function createBrowserClientState(): BrowserClientState {
     incomingListenerError: null,
     backgroundListenerActive: false,
     backgroundListenerListenPort: 22000,
+    backgroundSessionStarted: false,
     sessionConfigurationRefresh: Promise.resolve(),
   };
 }
@@ -1636,7 +1639,13 @@ async function setSessionForegroundImpl(
   foreground: boolean,
 ) {
   if (foreground) {
-    await stopBackgroundHandoff(ctx);
+    // Resuming must not wait for the native stop: the service worker also runs
+    // document I/O, so a busy or stalled stop delayed the lifecycle for seconds
+    // and every connect in between failed with "Connection is suspended or offline."
+    if (ctx.state.backgroundSessionStarted) {
+      ctx.state.backgroundSessionStarted = false;
+      void stopBackgroundHandoff(ctx);
+    }
     await lifecycle.setForeground(true);
     await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
     return;
@@ -1645,7 +1654,12 @@ async function setSessionForegroundImpl(
   const backgroundSession = backgroundOptions && ctx.platformAdapter.startBackgroundSession
     ? ctx.platformAdapter.startBackgroundSession(backgroundOptions)
     : null;
-  backgroundSession?.catch(() => undefined);
+  if (backgroundSession) {
+    ctx.state.backgroundSessionStarted = true;
+    void backgroundSession.catch(() => {
+      ctx.state.backgroundSessionStarted = false;
+    });
+  }
   if (ctx.platformAdapter.startBackgroundSession) {
     await lifecycle.setTransferActive(false);
   }
@@ -1733,7 +1747,8 @@ async function disconnectSessionImpl(
   ctx.state.activeResolvedConnectOptions = null;
   ctx.state.focusedFolderId = null;
   if (!ctx.state.backgroundListenerActive) {
-    await ctx.platformAdapter.stopBackgroundSession?.();
+    ctx.state.backgroundSessionStarted = false;
+    await stopBackgroundHandoff(ctx);
   }
   await lifecycle.disconnect();
   if (ctx.state.backgroundListenerActive) {

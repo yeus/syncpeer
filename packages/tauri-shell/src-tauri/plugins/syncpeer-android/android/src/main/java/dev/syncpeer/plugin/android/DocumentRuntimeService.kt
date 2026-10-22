@@ -176,7 +176,16 @@ class DocumentRuntimeService : Service() {
     }
   }
 
-  private fun evaluateRuntime(code: String, input: ByteArray): CompletableFuture<String> {
+  /**
+   * Runs one evaluation on the shared worker. A caller-supplied [timeoutMs] means
+   * "give up on this step"; it frees the worker without restarting the runtime, and
+   * is only used for steps that must not block every later document command.
+   */
+  private fun evaluateRuntime(
+    code: String,
+    input: ByteArray,
+    timeoutMs: Long? = null,
+  ): CompletableFuture<String> {
     require(input.size <= 1024 * 1024) { "Document runtime input is too large." }
     val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
     val result = CompletableFuture<String>()
@@ -186,9 +195,14 @@ class DocumentRuntimeService : Service() {
         check(terminalStatus == null && runtimeHost != null) { "Document runtime unavailable." }
         // Trusted core publication is bounded by file size, not a fixed startup deadline.
         // Killing the runtime after 15 seconds made large-file fsync impossible.
-        result.complete(checkNotNull(runtimeHost).evaluate(code, data).get())
+        val evaluation = checkNotNull(runtimeHost).evaluate(code, data)
+        result.complete(
+          if (timeoutMs == null) evaluation.get()
+          else evaluation.get(timeoutMs, TimeUnit.MILLISECONDS),
+        )
       } catch (error: Exception) {
-        if (error is TimeoutException) startRecovery()
+        // A host-level timeout means the runtime is wedged; a caller bound does not.
+        if (error is TimeoutException && timeoutMs == null) startRecovery()
         result.completeExceptionally(error)
       } finally { data.fill(0) }
     }
@@ -451,7 +465,10 @@ class DocumentRuntimeService : Service() {
         evaluateRuntime("""
           if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
           return JSON.stringify({result: {phase: "idle"}});
-        """.trimIndent(), ByteArray(0)).whenComplete { _, _ ->
+        """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS).whenComplete { _, error ->
+          if (error != null && applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            Log.w("SyncpeerRuntime", "session stop gave up after ${SESSION_STOP_TIMEOUT_MS}ms")
+          }
           finishSessionStop(generation, result)
         }
       }
@@ -772,5 +789,7 @@ class DocumentRuntimeService : Service() {
 
   private companion object {
     const val FAVORITE_SYNC_INTERVAL_MS = 15_000L
+    /** A session teardown may not hold the shared document worker behind a dead network. */
+    const val SESSION_STOP_TIMEOUT_MS = 10_000L
   }
 }

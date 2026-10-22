@@ -332,10 +332,11 @@ test("browser clients pair over the production LAN TLS adapters and persist only
   }
 });
 
-test("foreground handoff requests the background session before closing the active session", { timeout: 15000 }, async () => {
+test("background handoff arms one service session and stops it once on resume", { timeout: 45000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-handoff-"));
   const adapter = createNodeHostAdapter();
   const events: string[] = [];
+  let stallStop = true;
   let port = 0;
   const [ownerIdentity, joiningIdentity] = (await Promise.all([
     identity(root, "one"), identity(root, "two"),
@@ -351,6 +352,11 @@ test("foreground handoff requests the background session before closing the acti
     readDefaultIdentity: async () => ownerIdentity,
     prepareBackgroundSession: async () => { events.push("background:prepare"); },
     startBackgroundSession: async () => { events.push("background:start"); },
+    // Stalls once, to prove the foreground resume does not wait for it.
+    stopBackgroundSession: () => {
+      events.push("background:stop");
+      return stallStop ? new Promise<void>(() => undefined) : Promise.resolve();
+    },
   } });
   const connected = Promise.withResolvers<void>();
   const unsubscribeConnected = owner.subscribeLifecycle(state => {
@@ -380,56 +386,28 @@ test("foreground handoff requests the background session before closing the acti
       `The background session must start before foreground teardown: ${events.join(",")}`);
     assert.ok(events.includes("state:suspended"),
       "A foreground transfer must not keep the WebView session alive across the handoff.");
+    assert.equal(events.filter(event => event === "background:start").length, 1,
+      `The background session must be requested exactly once: ${events.join(",")}`);
+    // The stalled native stop must not keep the lifecycle in the background: the
+    // phase has to leave "suspended" while that stop is still pending. A later
+    // connect would otherwise fail with "Connection is suspended or offline."
+    const phases: string[] = [];
+    const unsubscribePhases = owner.subscribeLifecycle(state => { phases.push(state.phase); });
+    const resuming = owner.setForeground(true);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.notEqual(phases.at(-1), "suspended",
+      `Returning to the foreground waited for the native stop: ${events.join(",")}`);
+    assert.ok(events.includes("background:stop"), "Returning to the foreground must stop the service session.");
+    assert.equal(events.filter(event => event === "background:stop").length, 1,
+      `Only the session this client started may be stopped: ${events.join(",")}`);
+    unsubscribePhases();
+    await resuming.catch(() => undefined);
+    stallStop = false;
   } finally {
     unsubscribeConnected();
     unsubscribeOrdering();
     await outgoing?.close();
     await owner.disconnect();
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-const foregroundHandoffClient = async (
-  root: string,
-  stopBackgroundSession: () => Promise<void>,
-) => {
-  const localIdentity = await identity(root, "foreground");
-  const client = createSyncpeerBrowserClient({
-    hostAdapter: createNodeHostAdapter(),
-    platformAdapter: { readDefaultIdentity: async () => localIdentity, stopBackgroundSession },
-  });
-  let phase = "";
-  client.subscribeLifecycle(state => { phase = state.phase; });
-  return { client, phase: () => phase };
-};
-
-test("a failing background stop still resumes the foreground session", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-stop-failure-"));
-  try {
-    const session = await foregroundHandoffClient(root, async () => {
-      throw new Error("Synthetic background stop failure");
-    });
-    await session.client.setForeground(false);
-    assert.equal(session.phase(), "suspended");
-    await session.client.setForeground(true);
-    assert.equal(session.phase(), "idle",
-      "A rejected native stop must not leave the lifecycle gated in the background.");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a stalled background stop still resumes the foreground session", { timeout: 60000 }, async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-stop-stall-"));
-  try {
-    const stalled = new Promise<void>(() => undefined);
-    const session = await foregroundHandoffClient(root, () => stalled);
-    await session.client.setForeground(false);
-    assert.equal(session.phase(), "suspended");
-    await session.client.setForeground(true);
-    assert.equal(session.phase(), "idle",
-      "A native stop that never settles must not pin the lifecycle in the background.");
-  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

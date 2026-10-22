@@ -745,7 +745,9 @@ describe("Two isolated packaged desktop apps", () => {
         await peer
           .$("[data-testid='tab-devices']")
           .waitForExist({ timeout: 60_000 });
-        await peer.$("[data-testid='tab-devices']").click();
+        await peer.execute(() => {
+          (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
+        });
         await peer
           .$("[data-testid='current-device-id']")
           .waitForExist({ timeout: 60_000 });

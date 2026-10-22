@@ -2633,6 +2633,63 @@ const runWholeFolderSafeRelease = async () => {
   } finally { cdp.close(); }
 };
 
+// For disposable fresh-install emulators. This checks the real Android
+// WebView/Svelte lifecycle, not only simulated browser event dispatch.
+const runAndroidOnboardingSmoke = async () => {
+  runAdb(["logcat", "-c"]);
+  const cdp = await launchAndroidApp(true);
+  try {
+    const dialog = "[data-testid='personal-space-onboarding']";
+    const generate = "[data-testid='onboarding-generate-password']";
+    const generated = "[data-testid='generated-master-password']";
+    await waitForUiCondition(cdp,
+      `document.querySelector(${JSON.stringify(generate)}) instanceof HTMLButtonElement`,
+      "new-profile onboarding (install into a disposable fresh emulator)", 45_000);
+    await waitForUiCondition(cdp,
+      `Number(document.querySelector("[data-testid='onboarding-trace-heartbeat']")
+        ?.textContent?.match(/\\d+/)?.[0]) >= 1`,
+      "onboarding JS heartbeat (Svelte onMount must complete)", 10_000);
+    const tappedGenerate = await cdp.evaluate(`(() => {
+      const button = document.querySelector(${JSON.stringify(generate)});
+      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    if (!tappedGenerate) throw new Error("Generate master password is not clickable in Android WebView.");
+    await waitForUiCondition(cdp,
+      `document.querySelector(${JSON.stringify(generated)})?.textContent?.length === 43`,
+      "generated master password visible", 5_000);
+    // Never read or log the generated secret itself.
+    const tappedSkip = await cdp.evaluate(`(() => {
+      const button = document.querySelector("[data-testid='onboarding-skip']");
+      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    if (!tappedSkip) throw new Error("Skip setup is not clickable in Android WebView.");
+    await waitForUiCondition(cdp,
+      `document.querySelector(${JSON.stringify(dialog)}) === null`,
+      "Skip closes onboarding", 5_000);
+    const openedDevices = await cdp.evaluate(`(() => {
+      const button = document.querySelector("[data-testid='tab-devices']");
+      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    if (!openedDevices) throw new Error("Devices tab button did not accept activation.");
+    await waitForUiCondition(cdp,
+      `document.querySelector("[data-testid='tab-devices']")?.classList.contains("active") === true`,
+      "Devices tab becomes selected", 5_000);
+    const errors = runAdb(["logcat", "-d", "-s", "Tauri/Console:E"]);
+    if (errors.includes("effect_update_depth_exceeded")) {
+      throw new Error("Svelte effect update loop reappeared in the Android WebView.");
+    }
+    console.log("Android WebView onboarding heartbeat, generate, skip, and navigation smoke passed.");
+  } finally {
+    cdp.close();
+  }
+};
+
 const main = async () => {
   runAdb(["wait-for-device"], 60_000);
 
@@ -2662,6 +2719,10 @@ const main = async () => {
 
   if (legacySmoke) {
     await runLegacyAndroidSmoke();
+    return;
+  }
+  if (hasArgument("--onboarding-smoke")) {
+    await runAndroidOnboardingSmoke();
     return;
   }
   if (hasArgument("--startup-smoke")) {

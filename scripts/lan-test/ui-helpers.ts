@@ -8,6 +8,11 @@ export type TauriBrowser = WdioBrowser & BrowserExtension;
 
 /** Open space/device controls through the existing general Settings section. */
 export async function openGeneralSettings(peer: WebdriverIO.Browser) {
+  if (await peer.$("[data-testid='personal-space-onboarding']").isExisting()) {
+    await clickButtonByText(peer, "Join or restore an existing space");
+    await peer.$("[data-testid='general-settings-page']").waitForExist({ timeout: 30_000 });
+    return;
+  }
   await peer.$("[data-testid='tab-devices']").waitForExist({ timeout: 30_000 });
   await peer.execute(() => {
     (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();

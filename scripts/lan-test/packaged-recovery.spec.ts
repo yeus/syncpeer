@@ -61,7 +61,9 @@ describe("Packaged desktop offline recovery", () => {
     await Promise.all([owner, joiner].map(async peer => {
       const devices = peer.$("[data-testid='tab-devices']");
       await devices.waitForExist({ timeout: 60_000 });
-      await devices.click();
+      await peer.execute(() => {
+        (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
+      });
       const identity = peer.$("[data-testid='current-device-id']");
       await identity.waitForExist({ timeout: 60_000 });
       await peer.waitUntil(async () => /^[A-Z2-7-]{40,}$/.test(await identity.getText()),

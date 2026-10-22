@@ -329,7 +329,9 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
   private fun summary(): String = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
     "Android document access requires API 26 or newer."
   } else {
-    runtime?.status()?.getNow(null)?.summary ?: runtimeSummary
+    // queryRoots must never throw: DocumentsUI drops a provider whose root query
+    // fails, which would hide the whole Shared-storage entry from every picker.
+    runCatching { runtime?.status()?.getNow(null)?.summary }.getOrNull() ?: runtimeSummary
   }
 
   companion object {

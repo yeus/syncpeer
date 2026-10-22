@@ -18,7 +18,8 @@ export type SessionLogItem = {
 
 /** Portable save/share port; only platforms with a file handoff provide it. */
 export type SessionLogFilePort = {
-  save: (fileName: string, text: string) => Promise<string>;
+  /** Resolves with the saved file name, or null when the user cancels the picker. */
+  save: (fileName: string, text: string) => Promise<string | null>;
   share: (fileName: string, text: string) => Promise<void>;
 };
 

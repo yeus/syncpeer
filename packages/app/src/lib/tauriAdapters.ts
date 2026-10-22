@@ -12,8 +12,8 @@ import type {
   FileDownloadSink,
 } from "@syncpeer/core/browser";
 import { createNativeDiscoveryFetch } from "@syncpeer/core/browser";
-import { createDocumentCache, createDocumentFilesystem, createNativeFilesystem,
-  dispatchDocumentCommandWithSessionConfiguration } from "@syncpeer/core/filesystem";
+import { changesSessionConfiguration, createDocumentCache, createDocumentFilesystem,
+  createNativeFilesystem, dispatchDocumentCommandWithSessionConfiguration } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
 import { createWorkerPasswordKdf } from "./passwordKdf.ts";
 import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
@@ -190,9 +190,16 @@ const createLoggedInvoke = (
   } catch (error) {
     if (command === "syncpeer_discovery_fetch" &&
       /^(?:Error: )?Discovery request cancelled(?: or unavailable)?\.?$/.test(String(error))) throw error;
-    console.error("[syncpeer-ui] tauri.invoke.error", { command });
-    emitLog(options, "error", "tauri.invoke.error", { command });
-    void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", { command });
+    // Operation names are stable identifiers, not payloads: without them a failed
+    // document command cannot be told apart from any other.
+    const operation = command === "syncpeer_document_command"
+      ? (args as { request?: { operation?: unknown } } | undefined)?.request?.operation
+      : undefined;
+    const details = typeof operation === "string" && /^[A-Za-z]{1,64}$/.test(operation)
+      ? { command, operation } : { command };
+    console.error("[syncpeer-ui] tauri.invoke.error", details);
+    emitLog(options, "error", "tauri.invoke.error", details);
+    void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", details);
     throw error;
   }
 };
@@ -348,6 +355,10 @@ class TauriAdapters {
   private configurationRevision = 0;
   private readonly sessionConfigurationListeners = new Set<() => void>();
   private documentsOwner: Promise<ReturnType<typeof createDocumentFilesystem>> | undefined;
+  /** Trust roster from the vault; only membership commands may change it. */
+  private ownedDevicesCache: Awaited<
+    ReturnType<NonNullable<SyncpeerPlatformAdapter["ownedDevices"]>>
+  > | null = null;
 
   constructor(options?: CreateTauriAdaptersOptions) {
     this.options = options;
@@ -388,6 +399,8 @@ class TauriAdapters {
   }
 
   private invalidateSessionConfiguration() {
+    // A membership or folder change also invalidates the cached trust roster.
+    this.ownedDevicesCache = null;
     this.configurationRevision++;
     for (const listener of this.sessionConfigurationListeners) listener();
   }
@@ -452,6 +465,11 @@ class TauriAdapters {
         return done as T;
       }
       const response = await this.invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
+      // Android owns document access in its service, so the mutation hook that the
+      // desktop path gets from dispatchDocumentCommandWithSessionConfiguration has
+      // to run here as well; without it a live session kept stale folder and trust
+      // views after pairing, revocation or credential changes.
+      if (changesSessionConfiguration(request.operation)) this.invalidateSessionConfiguration();
       return response.result;
     }
     const documents = await this.desktopDocuments();
@@ -766,17 +784,27 @@ class TauriAdapters {
   }
 
   /** Android clipboard/share handoff for large exports such as session logs. */
-  private async saveAndroidTextFile(fileName: string, text: string): Promise<string> {
+  private async saveAndroidTextFile(fileName: string, text: string): Promise<string | null> {
     const remembered = window.localStorage.getItem(ANDROID_LOG_FOLDER_KEY);
-    const treeUri = remembered ?? await this.rememberAndroidLogFolder();
+    let treeUri = remembered;
+    if (!treeUri) {
+      try {
+        treeUri = await this.rememberAndroidLogFolder();
+      } catch (error) {
+        // Closing the folder picker is a normal choice, not a failure.
+        if (/cancelled/i.test(String(error))) return null;
+        throw error;
+      }
+    }
     try {
       await this.invokeWithLogging("syncpeer_android_save_text_file", {
         request: { fileName, text, mimeType: "text/plain", treeUri },
       });
       return fileName;
     } catch (error) {
-      // A revoked SAF grant must not keep failing forever; the next attempt re-picks.
-      if (remembered) window.localStorage.removeItem(ANDROID_LOG_FOLDER_KEY);
+      // A revoked SAF grant must not keep failing forever; the next attempt re-picks,
+      // including the grant this call just picked.
+      window.localStorage.removeItem(ANDROID_LOG_FOLDER_KEY);
       throw error;
     }
   }
@@ -996,9 +1024,23 @@ class TauriAdapters {
 
   api() {
     const documents = this.documents();
-    const platformAdapter = this.platform === "android"
-      ? { ...documents.platformAdapter, sessionSharedFolders: async () => [], incomingSessionOwnedByService: true }
-      : documents.platformAdapter;
+    const basePlatformAdapter = documents.platformAdapter;
+    const platformAdapter: SyncpeerPlatformAdapter = {
+      ...basePlatformAdapter,
+      ...(this.platform === "android"
+        ? { sessionSharedFolders: async () => [], incomingSessionOwnedByService: true }
+        : {}),
+      // The trust roster changes only on membership commands, which invalidate this
+      // cache. Reading it on every connect queued behind the Android document worker.
+      ownedDevices: async () => {
+        if (this.ownedDevicesCache) return this.ownedDevicesCache;
+        const devices = basePlatformAdapter.ownedDevices
+          ? await basePlatformAdapter.ownedDevices()
+          : [];
+        this.ownedDevicesCache = devices;
+        return devices;
+      },
+    };
     return {
       hostAdapter: this.hostAdapter(),
       platformAdapter,

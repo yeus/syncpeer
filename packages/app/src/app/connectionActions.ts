@@ -535,7 +535,11 @@ const saveSessionLogs = async (args: ConnectionActionArgs) => {
   try {
     const fileName = sessionLogFileName(new Date());
     const saved = await logFile.save(fileName, exportedSessionLogs(args));
-    pushSessionLog(state, "info", "logs.saved", `Session logs saved as ${fileName}.`, { fileName: saved });
+    if (saved === null) {
+      pushSessionLog(state, "info", "logs.save.cancelled", "Saving session logs was cancelled.");
+      return;
+    }
+    pushSessionLog(state, "info", "logs.saved", `Session logs saved as ${saved}.`, { fileName: saved });
   } catch (error) {
     reportActionError(state, "logs.save.failed", error);
   }

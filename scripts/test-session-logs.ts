@@ -100,6 +100,17 @@ test("copying a normal log keeps the same text as save and share", async () => {
   assert.match(calls.shared[0]![1], /logs\.saved/);
 });
 
+test("cancelling the save folder picker is not an error", async () => {
+  const { state, actions } = createFixture({
+    save: async () => null,
+    share: async () => undefined,
+  });
+  await actions.saveSessionLogs();
+  assert.equal(state.ui.recentError, null, "Cancelling the picker must not raise a UI error.");
+  assert.ok(state.logs.items.some(item => item.event === "logs.save.cancelled"));
+  assert.equal(state.logs.items.some(item => item.level === "error"), false);
+});
+
 test("log file names are filesystem-safe and sortable", () => {
   const name = sessionLogFileName(new Date("2026-10-22T04:08:29.065Z"));
   assert.equal(name, "syncpeer-logs-2026-10-22T04-08-29-065Z.txt");

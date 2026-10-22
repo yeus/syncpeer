@@ -191,6 +191,8 @@ const main = async (): Promise<void> => {
         "scripts/test-app-diagnostics.ts",
         "scripts/test-encrypted-ui-state.ts",
         "scripts/test-session-logs.ts",
+        "scripts/test-log-file-android.ts",
+        "scripts/test-owned-devices-cache.ts",
       ],
     },
     {

@@ -39,7 +39,9 @@ data class DocumentRuntimeStatus(
 @RequiresApi(26)
 class DocumentRuntimeService : Service() {
   private val mainHandler = Handler(Looper.getMainLooper())
-  private val worker = Executors.newSingleThreadExecutor()
+  // Single-threaded by contract; teardown work jumps the queue so a busy worker
+  // cannot delay a session stop or the resume that follows it.
+  private val worker = PriorityWorker("SyncpeerDocumentsWorker")
   private val storageWorker = Executors.newSingleThreadExecutor()
   // A BEP session keeps one blocking read active while writes and closes must
   // continue independently through the same native transport.
@@ -185,6 +187,7 @@ class DocumentRuntimeService : Service() {
     code: String,
     input: ByteArray,
     timeoutMs: Long? = null,
+    highPriority: Boolean = false,
   ): CompletableFuture<String> {
     require(input.size <= 1024 * 1024) { "Document runtime input is too large." }
     val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
@@ -206,7 +209,9 @@ class DocumentRuntimeService : Service() {
         result.completeExceptionally(error)
       } finally { data.fill(0) }
     }
-    try { worker.execute(task) } catch (error: Exception) {
+    try {
+      if (highPriority) worker.executeHighPriority(task) else worker.execute(task)
+    } catch (error: Exception) {
       data.fill(0)
       result.completeExceptionally(error)
     }
@@ -272,7 +277,7 @@ class DocumentRuntimeService : Service() {
       evaluateRuntime("""
         if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
         return JSON.stringify({result: {phase: "idle"}});
-      """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS)
+      """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS, highPriority = true)
     }
   }
 
@@ -457,16 +462,16 @@ class DocumentRuntimeService : Service() {
     sessionError = null
     val result = CompletableFuture<JSONObject>()
     try {
-      worker.execute {
+      worker.executeHighPriority {
         if (persist) runCatching { backgroundSessions.clear() }
         if (!documentsStarted || runtimeHost == null) {
           finishSessionStop(generation, result)
-          return@execute
+          return@executeHighPriority
         }
         evaluateRuntime("""
           if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
           return JSON.stringify({result: {phase: "idle"}});
-        """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS).whenComplete { _, error ->
+        """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS, highPriority = true).whenComplete { _, error ->
           if (error != null && applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             Log.w("SyncpeerRuntime", "session stop gave up after ${SESSION_STOP_TIMEOUT_MS}ms")
           }
@@ -784,7 +789,7 @@ class DocumentRuntimeService : Service() {
       networkWorker.shutdown()
       storageWorker.shutdown()
     }
-    worker.shutdown()
+    worker.shutdownNow()
     super.onDestroy()
   }
 

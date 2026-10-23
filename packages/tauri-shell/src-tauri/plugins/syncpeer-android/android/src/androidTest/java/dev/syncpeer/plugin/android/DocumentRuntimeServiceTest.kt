@@ -24,6 +24,20 @@ import java.io.File
 /** Starts the runtime from an application Context; no Activity or visible interface is created. */
 @RunWith(AndroidJUnit4::class)
 class DocumentRuntimeServiceTest {
+  /** Independent of the document runtime: DocumentsUI draws no icon for icon resource 0. */
+  @Test fun providerRootReusesTheLauncherIcon() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val roots = DocumentsContract.buildRootsUri("${context.packageName}.documents")
+    context.contentResolver.query(roots, null, null, null, null)!!.use { cursor ->
+      assertTrue(cursor.moveToFirst())
+      assertEquals("Syncpeer", cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_TITLE)))
+      val icon = cursor.getInt(cursor.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_ICON))
+      // Single icon source: the launcher icon generated from icon.svg, never a second copy.
+      assertEquals("the root must reuse the application icon", context.applicationInfo.icon, icon)
+      if (icon != 0) assertNotNull(context.resources.getDrawable(icon, null))
+    }
+  }
+
   @Test fun pickerUsesRegisteredEncryptedFilesAndKeystoreWithoutAnActivity() {
     val context = InstrumentationRegistry.getInstrumentation().targetContext
     val client = connect(context)
@@ -372,6 +386,12 @@ class DocumentRuntimeServiceTest {
       context.contentResolver.query(roots, null, null, null, null)!!.use { cursor ->
         assertTrue(cursor.moveToFirst())
         assertEquals(expected, cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_SUMMARY)))
+        // DocumentsUI renders no icon for resource 0; the root reuses the application icon.
+        // The library test APK declares no icon of its own, so only compare the source.
+        val icon = cursor.getInt(cursor.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_ICON))
+        assertEquals("the document root must reuse the application icon",
+          context.applicationInfo.icon, icon)
+        if (icon != 0) assertNotNull(context.resources.getDrawable(icon, null))
       }
     } finally {
       context.contentResolver.unregisterContentObserver(observer)

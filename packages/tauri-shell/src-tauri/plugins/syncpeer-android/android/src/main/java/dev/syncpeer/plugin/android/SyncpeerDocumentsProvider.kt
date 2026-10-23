@@ -128,7 +128,7 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_IS_CHILD)
       add(Root.COLUMN_MIME_TYPES, "*/*")
       add(Root.COLUMN_AVAILABLE_BYTES, null)
-      add(Root.COLUMN_ICON, 0)
+      add(Root.COLUMN_ICON, applicationIcon())
     }
     return cursor
   }
@@ -325,6 +325,13 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     Document.COLUMN_LAST_MODIFIED,
     Document.COLUMN_SUMMARY,
   )
+
+  /**
+   * DocumentsUI draws nothing for icon resource 0. Reuse the launcher icon, which the
+   * build generates from icon.svg, so the artwork stays in one place.
+   */
+  private fun applicationIcon(): Int =
+    runCatching { context?.applicationInfo?.icon ?: 0 }.getOrDefault(0)
 
   private fun summary(): String = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
     "Android document access requires API 26 or newer."

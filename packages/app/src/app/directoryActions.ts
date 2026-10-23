@@ -18,6 +18,7 @@ import {
   connectionDetails,
   directoryTotalPages,
   folderIsLocked,
+  pushSessionLog,
   type AppState,
 } from "./state.ts";
 import {
@@ -110,7 +111,15 @@ class DirectoryActionsRuntime {
       this.state.session.isLocalDirectory = false;
       await this.sessionStore.actions.goToPath(folderId, normalizedPath, connectionDetails(this.state));
       applySessionState(this.state, this.sessionStore.getState());
-      await loadDirectorySideEffects(this.state, this.client);
+      try {
+        await loadDirectorySideEffects(this.state, this.client);
+      } catch (error) {
+        // The directory opened; caching its listing is best-effort and must not turn
+        // a successful navigation into a failure banner.
+        pushSessionLog(this.state, "warning", "folder.side_effects.failed",
+          "Directory opened, but its offline listing could not be saved.",
+          { message: error instanceof Error ? error.message : String(error) });
+      }
     };
 
     private openFolderRoot = async (folderId: string) => {

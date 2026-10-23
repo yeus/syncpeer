@@ -698,11 +698,11 @@ export const isSavedDeviceAwaitingRemoteApproval = (
 
 export const connectionDetails = (state: AppState) => ({
   ...buildConnectionDetails(state.connection, activeFolderPasswords(state)),
-  ...(import.meta.env.SYNCPEER_LAN_E2E === true && state.connection.relayPoolUrl
+  ...(import.meta.env?.SYNCPEER_LAN_E2E === true && state.connection.relayPoolUrl
     ? { relayPoolUrl: state.connection.relayPoolUrl }
     : {}),
   relayOnly:
-    import.meta.env.SYNCPEER_LAN_E2E === true &&
+    import.meta.env?.SYNCPEER_LAN_E2E === true &&
     state.connection.discoveryMode === "global",
 });
 

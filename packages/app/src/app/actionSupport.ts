@@ -104,7 +104,7 @@ export const copyText = async (text: string) => {
 
 export const ensureClientName = (state: AppState) => {
   const currentName = state.connection.deviceName.trim();
-  if (import.meta.env.SYNCPEER_LAN_E2E === true && currentName === "syncpeer-ui") {
+  if (import.meta.env?.SYNCPEER_LAN_E2E === true && currentName === "syncpeer-ui") {
     state.connection.deviceName = "syncpeer-ui-e2e";
     state.ui.deviceNameConfirmed = true;
     return true;
@@ -214,6 +214,9 @@ export const loadDirectorySideEffects = async (
   );
   state.session.lastUpdatedAt = nowTime();
   saveOfflineDirectorySnapshot(state, activeSourceDeviceId(state));
+  // Only a folder with local document storage can hold a snapshot. Browsing a
+  // remote-only folder must not try to write one (it fails with "folder unavailable").
+  if (!state.localFolders.some(folder => folder.id === state.session.currentFolderId)) return;
   await client.saveDirectorySnapshot(state.session.currentFolderId, activeSourceDeviceId(state),
     state.session.currentPath, { entries: state.session.entries,
       versionKey: state.session.currentFolderVersionKey, loadedAtMs: Date.now() });

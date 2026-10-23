@@ -193,6 +193,7 @@ const main = async (): Promise<void> => {
         "scripts/test-session-logs.ts",
         "scripts/test-log-file-android.ts",
         "scripts/test-owned-devices-cache.ts",
+        "scripts/test-directory-side-effects.ts",
       ],
     },
     {

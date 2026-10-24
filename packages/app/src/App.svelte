@@ -258,9 +258,10 @@
     persistState(app, true);
     const knownFolders = Object.values(app.offline.snapshots).flatMap(snapshot => snapshot.folders)
       .map(folder => ({ ...folder, needsPassword: true }));
-    app.localFolders = (await syncDocumentFolders(knownFolders, {})).map(folder => ({ ...folder, readOnly: false }));
-    app.localFolders = (await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)))
-      .map(folder => ({ ...folder, readOnly: false }));
+    app.localFolders = localDocumentFolders(await syncDocumentFolders(knownFolders, {}));
+    app.localFolders = localDocumentFolders(
+      await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)),
+    );
   }
 
   function applyProfileSettings(settings: SyncpeerProfileSettings) {
@@ -309,8 +310,9 @@
       const folder = app.session.folders.find(value => value.id === folderId) ?? app.localFolders.find(value => value.id === folderId);
       await connectDocumentFolder({ id: folderId, label: folder?.label ?? folderId, password: activeFolderPasswords(app)[folderId] });
     } else await disconnectDocumentFolder(folderId);
-    app.localFolders = (await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)))
-      .map(folder => ({ ...folder, readOnly: false }));
+    app.localFolders = localDocumentFolders(
+      await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)),
+    );
   }
 
   const unsubscribe = sessionStore.subscribe((next) => {
@@ -322,7 +324,7 @@
       const issue = documentStoragePreparationIssue(next.folders.length, error);
       app.ui.recentError = issue.message;
       privateStorageRecoveryMessage = issue.canResetPrivateStorage ? issue.message : null;
-      try { app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false })); }
+      try { app.localFolders = localDocumentFolders(await syncDocumentFolders([], {})); }
       catch { /* Keep the last known roots if the service itself is unavailable. */ }
     });
     actions.syncNavigationRoute();
@@ -996,7 +998,7 @@
       await connectDocumentFolder({ id, label });
       app.favorites.items = await client.upsertFavorite({ key: `folder:${id}:`, folderId: id,
         path: "", name: label, kind: "folder" });
-      app.localFolders = (await syncDocumentFolders([], {})).map(folder => ({ ...folder, readOnly: false }));
+      app.localFolders = localDocumentFolders(await syncDocumentFolders([], {}));
       await actions.starredSync();
     }} />
 {:else if app.currentPage === "versions"}

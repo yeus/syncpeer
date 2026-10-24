@@ -214,9 +214,10 @@ export const loadDirectorySideEffects = async (
   );
   state.session.lastUpdatedAt = nowTime();
   saveOfflineDirectorySnapshot(state, activeSourceDeviceId(state));
-  // Only a folder with local document storage can hold a snapshot. Browsing a
-  // remote-only folder must not try to write one (it fails with "folder unavailable").
-  if (!state.localFolders.some(folder => folder.id === state.session.currentFolderId)) return;
+  // A registered browse-only folder has no writable local replica. Only
+  // download-attached/local document folders can persist offline snapshots.
+  const local = state.localFolders.find(folder => folder.id === state.session.currentFolderId);
+  if (!local || local.browseOnly) return;
   await client.saveDirectorySnapshot(state.session.currentFolderId, activeSourceDeviceId(state),
     state.session.currentPath, { entries: state.session.entries,
       versionKey: state.session.currentFolderVersionKey, loadedAtMs: Date.now() });

@@ -56,6 +56,7 @@
     persistState,
     pushClientLog,
     pushSessionLog,
+    localDocumentFolders,
     visibleBreadcrumbs,
     createInitialState,
     applySensitiveAppState,
@@ -313,7 +314,7 @@
   const unsubscribe = sessionStore.subscribe((next) => {
     applySessionState(app, next);
     void syncDocumentFolders(next.folders, activeFolderPasswords(app)).then(folders => {
-      app.localFolders = folders.map(folder => ({ id: folder.id, label: folder.label, readOnly: false }));
+      app.localFolders = localDocumentFolders(folders);
       privateStorageRecoveryMessage = null;
     }).catch(async error => {
       const issue = documentStoragePreparationIssue(next.folders.length, error);

@@ -219,6 +219,10 @@ export const readLegacyFolderPasswords = (): Record<string, string> => {
   return passwords;
 };
 
+/** Preserve local storage flags (including browse-only) across UI session updates. */
+export const localDocumentFolders = <T extends { id: string; label: string }>(folders: readonly T[]) =>
+  folders.map(folder => ({ ...folder, readOnly: false }));
+
 export const createInitialState = (persisted = loadPersistedState()) => {
   const initialConnection = fromConnectionSettings(persisted?.connection
     ? { ...persisted.connection, key: "" } as StoredConnectionSettingsLike : null);
@@ -228,7 +232,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
     : initialConnection.deviceName;
   const savedDevices = normalizeSavedDevices(persisted?.savedDevices);
   return {
-    localFolders: [] as FolderInfo[],
+    localFolders: [] as (FolderInfo & { browseOnly?: boolean })[],
     activeTab:
       persisted?.activeTab === "devices" ||
       persisted?.activeTab === "folders" ||

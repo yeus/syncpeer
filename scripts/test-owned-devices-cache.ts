@@ -213,3 +213,35 @@ test("a locked vault does not pin metered networking off", async () => {
   assert.deepEqual(requests.map(request => request?.allowMetered), [false, true],
     "The locked-vault fallback must not be cached as the permanent policy.");
 });
+
+test("Android folder sharing mutations invalidate prepared peer views after success", async () => {
+  installFakeTauri(() => ({ result: null }));
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  const revision = adapters.platformAdapter.sessionConfigurationRevision!();
+
+  await adapters.documentCommand({ operation: "register", id: "synthetic", label: "Synthetic folder" });
+  await adapters.documentCommand({ operation: "attachDownloads", id: "synthetic" });
+
+  // register publishes folder credentials and attachDownloads changes the
+  // exported folder set: suppressing either invalidation would be unsafe.
+  assert.equal(adapters.platformAdapter.sessionConfigurationRevision!(), revision + 2);
+  await adapters.documentCommand({ operation: "status" });
+  await adapters.documentCommand({ operation: "cachedStatuses", folderId: "synthetic", paths: [] });
+  assert.equal(adapters.platformAdapter.sessionConfigurationRevision!(), revision + 2,
+    "Read-only document operations must not reconnect the peer.");
+});
+
+test("failed Android folder mutation must not invalidate a live session", async () => {
+  installFakeTauri(({ args }) => {
+    if ((args?.request as { operation?: string } | undefined)?.operation === "attachDownloads") {
+      throw new Error("Synthetic storage failure.");
+    }
+    return { result: null };
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  const revision = adapters.platformAdapter.sessionConfigurationRevision!();
+  await assert.rejects(adapters.documentCommand({ operation: "attachDownloads", id: "synthetic" }),
+    /Synthetic storage failure/);
+  assert.equal(adapters.platformAdapter.sessionConfigurationRevision!(), revision,
+    "A rejected mutation cannot change advertised peer folders.");
+});

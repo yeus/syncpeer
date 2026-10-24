@@ -418,6 +418,49 @@ const initialFolderState = await fakeSession.remoteFs.getFolderSyncState("docume
 assert.equal(initialFolderState?.indexReceived, true);
 await fakeSession.close();
 
+// Connection readiness must not wait for an initial replica receive that can
+// block on a remote file request. The receive may continue after BEP handshake.
+let releaseReceive!: () => void;
+const receiveGate = new Promise<void>(resolve => { releaseReceive = resolve; });
+let signalReceive!: () => void;
+const receiveStarted = new Promise<void>(resolve => { signalReceive = resolve; });
+const slowReceiveSocket = createFakeTlsSocket();
+const slowReceiveClient = createSyncpeerCoreClient({
+  connectTls: async () => slowReceiveSocket.socket,
+  sha256: data => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: length => new Uint8Array(length),
+  discoveryFetch: async () => { throw new Error("Direct-only slow replica fixture."); },
+});
+const slowReceiveOpen = slowReceiveClient.openSession({
+  host: "127.0.0.1", port: 22000, certPem: fakeCertificate, keyPem: fakeCertificate,
+  deviceName: "syncpeer-slow-replica", discoveryMode: "direct",
+  sharedFolders: [{
+    id: "documents", label: "Documents", encryption: { mode: "plaintext" },
+    replica: {
+      scan: async () => [],
+      readBlock: async () => new Uint8Array(0),
+      receive: async () => { signalReceive(); await receiveGate; return false; },
+    },
+  }],
+});
+const started = await Promise.race([
+  receiveStarted.then(() => true),
+  new Promise<false>(resolve => setTimeout(() => resolve(false), 1500)),
+]);
+const readiness = started
+  ? await Promise.race([
+      slowReceiveOpen.then(() => "ready" as const),
+      new Promise<"blocked">(resolve => setTimeout(() => resolve("blocked"), 200)),
+    ])
+  : "receive-not-started";
+releaseReceive();
+const slowReceiveSession = await slowReceiveOpen;
+assert.equal(started, true, "The fake peer must deliver an index into the receive callback.");
+assert.equal(readiness, "ready",
+  "BEP connection readiness must not be blocked by pending replica synchronization.");
+await slowReceiveSession.close();
+
+
 let closeReason = "";
 const closeParser = new FrameParser((type, message) => {
   if (type === MessageTypeValues.CLOSE) {

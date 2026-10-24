@@ -1725,7 +1725,8 @@ class BepSession {
   private async finishClusterConfig(cfg: BepClusterConfig) {
     if (!this.echoedClusterConfig) await this.echoClusterConfig(cfg);
     await this.sendSharedFolderIndexes();
-    if (this.indexTasks.size) await Promise.allSettled([...this.indexTasks]);
+    // Inbound index tasks remain tracked independently. Replica receive may wait
+    // on remote block I/O and must not hold the BEP handshake in Connecting.
     if (this.readyState === "pending") {
       this.readyState = "ready";
       this.readyResolve();

@@ -36,6 +36,28 @@ async function freePort(): Promise<number> {
   await new Promise<void>(resolve => server.close(() => resolve()));
   return address.port;
 }
+// Android 16 restricts netlink-based `ss` output. Instead, probe the ADB
+// forwarded port: a missing Android listener accepts at the ADB endpoint but
+// immediately closes, while a real TLS listener keeps an idle TCP handshake open.
+async function isForwardedListenerActive(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (active: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
+      socket.destroy();
+      resolve(active);
+    };
+    const watchdog = setTimeout(() => finish(false), 2000);
+    socket.once("connect", () => { setTimeout(() => finish(true), 350); });
+    socket.once("close", () => finish(false));
+    socket.once("end", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
 async function startRelayDiscovery(relayAddress: string, root: string) {
   const identity = generateSyncthingIdentity(path.join(root, "discovery"));
   const addresses = new Map<string, string[]>();
@@ -172,19 +194,27 @@ async function attachSharedFolder() {
   const desktopState = async () => browser.execute((id: string) => {
     const probe = (window as typeof window & { __syncpeerFolderProbe?: (folderId: string) => unknown })
       .__syncpeerFolderProbe?.(id);
-    const settingsRow = [...document.querySelectorAll("li")].find(row =>
-      [...row.querySelectorAll("span")].some(span => span.textContent?.trim() === id));
-    return { probe, settingsRowVisible: Boolean(settingsRow),
-      attachControlVisible: [...settingsRow?.querySelectorAll("button") ?? []]
-        .some(button => button.textContent?.includes("Reattach encrypted")),
-      attachedControlVisible: [...settingsRow?.querySelectorAll("button") ?? []]
-        .some(button => button.textContent?.includes("Move to plaintext")),
+    const page = document.querySelector("[data-testid='folder-settings-page']");
+    const pageVisible = page?.getAttribute("data-folder-id") === id;
+    const buttons = [...page?.querySelectorAll("button") ?? []];
+    return { probe, pageVisible,
+      attachControlVisible: buttons.some(button => button.textContent?.includes("Reattach encrypted")),
+      attachedControlVisible: buttons.some(button => button.textContent?.includes("Move to plaintext")),
       rootView: !document.querySelector(".breadcrumbs .crumb-button"),
       rootRowCount: document.querySelectorAll(".list .item-title").length,
       visibleRoot: [...document.querySelectorAll(".list .item-title")]
         .some(element => element.textContent?.trim() === id),
-      error: document.querySelector("p.error, p[role='alert']")?.textContent?.trim() ?? "",
+      error: page?.querySelector("[role='alert']")?.textContent?.trim() ?? "",
     };
+  }, folderId);
+  const documentProbe = async () => browser.execute(async (id: string) => {
+    const probe = (window as typeof window & {
+      __syncpeerDocumentProbe?: (folderId: string) => Promise<{
+        registered: boolean; downloads: boolean; signedCredential: boolean; conflictCount: number;
+      }>;
+    }).__syncpeerDocumentProbe;
+    if (!probe) throw new Error("Desktop document owner test probe is missing.");
+    return probe(id);
   }, folderId);
   const deadline = Date.now() + 90_000;
   for (let attempt = 0; attempt < 20 && Date.now() < deadline; attempt += 1) {
@@ -195,12 +225,13 @@ async function attachSharedFolder() {
       tab.click();
     });
     await openFolderSettings(browser, folderId);
-    const row = $(`//li[./span[normalize-space()=${JSON.stringify(folderId)}]]`);
-    if (await row.isExisting()) {
+    const registration = await documentProbe();
+    if (registration.registered && registration.signedCredential) {
       const received = await desktopState();
-      console.log("Desktop received folder registration:", JSON.stringify({ ...received,
+      console.log("Desktop received folder registration:", JSON.stringify({ ...received, registration,
         error: safeNativeFailureText(received.error) }));
-      const attach = row.$("button=Reattach encrypted local storage");
+      assert.ok(received.pageVisible, "The selected folder settings page is unavailable.");
+      const attach = $("button=Reattach encrypted local storage");
       if (await attach.isExisting()) {
         await clickButtonByText(browser, "Reattach encrypted local storage");
         await browser.waitUntil(async () => {
@@ -260,9 +291,23 @@ async function attachSharedFolder() {
     await clickButtonByText(browser, "Back");
     await browser.pause(2_000);
   }
+  const syncTrace = await browser.execute(() => {
+    const probe = (window as typeof window & {
+      __syncpeerStateProbe?: () => {
+        syncTrace: Array<{ event: string; timestampMs: number }>;
+      };
+    }).__syncpeerStateProbe?.();
+    return probe?.syncTrace ?? [];
+  }).catch(() => []);
   const events = await readSessionEventNames(browser).catch(() => []);
-  throw new Error(`The approved Android folder credential did not reach the packaged desktop. ` +
-    `Recent event names: ${events.slice(-25).join(",") || "unavailable"}.`);
+  // Never return the materialized settings themselves: they contain folder
+  // credentials. Only inspect their IDs and transport/session status.
+  const diagnostic = await documentProbe().catch(error =>
+    ({ probeError: error instanceof Error ? error.message : String(error) }));
+  throw new Error("The Android-signed folder did not become attachable on the packaged desktop. " +
+    `Desktop document status: ${JSON.stringify(diagnostic)}; ` +
+    `recent events: ${events.slice(-25).join(",") || "unavailable"}; ` +
+    `sync trace: ${JSON.stringify(syncTrace)}.`);
 }
 
 describe("Packaged desktop to Android pairing", () => {
@@ -270,12 +315,17 @@ describe("Packaged desktop to Android pairing", () => {
     const expected = process.env.SYNCPEER_LAN_EXPECT_DEV_URL;
     if (expected) assert.equal(await browser.execute(() => location.origin), expected,
       "The desktop test is not using the dedicated Syncpeer Vite dev server.");
-  });
-  it("enrolls a fresh Android device in the desktop personal space through a local relay", async () => {
     const serial = process.env.SYNCPEER_ANDROID_SERIAL;
     assert.ok(serial?.startsWith("emulator-"), "An explicit emulator serial is required.");
     assert.equal(execFileSync("adb", ["-s", serial, "shell", "getprop", "ro.kernel.qemu"],
       { encoding: "utf8" }).trim(), "1", "The selected Android target is not an emulator.");
+    assert.equal(execFileSync("adb", ["-s", serial, "emu", "avd", "name"],
+      { encoding: "utf8" }).trim().split(/\r?\n/)[0], "syncpeer-unified-e2e",
+      "The cross-app suite must use the dedicated disposable Syncpeer test AVD.");
+  });
+  it("enrolls a fresh Android device in the desktop personal space through a local relay", async () => {
+    const serial = process.env.SYNCPEER_ANDROID_SERIAL;
+    assert.ok(serial?.startsWith("emulator-"), "An explicit emulator serial is required.");
     const relay = await startLocalRelay();
     const relayPort = Number(new URL(relay.relayAddress).port);
     assert.ok(relayPort > 0);
@@ -284,8 +334,10 @@ describe("Packaged desktop to Android pairing", () => {
       execFileSync("adb", ["-s", serial, "reverse", `tcp:${relayPort}`, `tcp:${relayPort}`]);
       await createFreshEncryptedProfile(browser);
       await browser.execute(() => { window.confirm = () => true; });
-      await $("//label[contains(., 'LAN host/IP or relay:// URL')]/input")
-        .setValue(relay.relayAddress);
+      const relayField = $("//label[contains(., 'LAN host/IP or relay:// URL')]/input");
+      await relayField.scrollIntoView({ block: "center" });
+      await relayField.waitForDisplayed({ timeout: 10_000 });
+      await relayField.setValue(relay.relayAddress);
       const create = $("button=Create pairing invitation");
       await create.waitForEnabled({ timeout: 30_000 });
       await clickButtonByText(browser, "Create pairing invitation");
@@ -363,12 +415,11 @@ describe("Packaged desktop to Android pairing", () => {
           : reject(new Error(`Android connection failed: ${code}`)));
       });
 
-      const listeners = execFileSync("adb", ["-s", serial, "shell", "ss", "-ltn"], {
-        encoding: "utf8", timeout: 30_000,
+      await browser.waitUntil(() => isForwardedListenerActive(forwardedPort), {
+        timeout: 30_000, interval: 1_000,
+        timeoutMsg: `No TCP listener on Android port ${androidListenPort} via ADB forwarding.`,
       });
-      assert.match(listeners, new RegExp(`:${androidListenPort}\\b`),
-        "Packaged Android did not listen on its configured non-default incoming port.");
-      console.log(`Packaged Android listener honored configured port ${androidListenPort}.`);
+      console.log(`Android TCP listener accepted an idle connection on configured port ${androidListenPort}.`);
 
       android(serial, ["--verify-received-folder"], {
         SYNCPEER_DEV_SERVER_DEVICE_ID: ownerId,
@@ -512,8 +563,18 @@ describe("Packaged desktop to Android pairing", () => {
         } catch (cause) {
           const status = await $("[data-testid='connection-status']").getText().catch(() => "unavailable");
           const events = await readSessionEventNames(browser).catch(() => []);
-          throw new Error(`Packaged desktop relay connection failed: status=${status}; announcements=${JSON.stringify(discovery.announcements())}; events=${events.slice(0, 80).join(",") || "unavailable"}`,
-            { cause });
+          const phases = await browser.execute(() => {
+            const probe = window as typeof window & {
+              __syncpeerStateProbe?: () => { isConnected: boolean; isRefreshing: boolean };
+              __syncpeerStoreStateProbe?: () => { phase: string; hasRemoteFs: boolean;
+                directoryStatus: string; requestEpoch: number };
+            };
+            return { ui: probe.__syncpeerStateProbe?.(),
+              store: probe.__syncpeerStoreStateProbe?.() };
+          }).catch(() => null);
+          throw new Error(`Packaged desktop relay connection failed: status=${status}; ` +
+            `phases=${JSON.stringify(phases)}; announcements=${JSON.stringify(discovery.announcements())}; ` +
+            `events=${events.slice(0, 80).join(",") || "unavailable"}`, { cause });
         }
         await browser.waitUntil(async () => (await browser.getPageSource()).includes("Path: relay"),
           { timeout: 30_000, interval: 500,

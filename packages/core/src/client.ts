@@ -1468,7 +1468,8 @@ class BepSession {
     if (replica) this.sentReplicaSequences.set(folderId, sequence);
     this.log("shared_folder.index.sent", {
       folderId,
-      fileCount: folder.files.size,
+      fileCount: advertisedFiles.length,
+      sequence,
       bytes: frame.length,
     });
   }

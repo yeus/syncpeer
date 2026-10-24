@@ -106,6 +106,7 @@
       uploadMessage: string;
       uploadProgressActive: boolean;
       logs: Array<{ event: string; message: string }>;
+      syncTrace: Array<{ event: string; timestampMs: number; fileCount?: number; changed?: boolean }>;
     };
     __syncpeerStoreStateProbe?: () => {
       currentFolderId: string;
@@ -116,6 +117,7 @@
       requestEpoch: number;
     };
     __syncpeerReadCachedDocument?: (folderId: string, path: string) => Promise<number[] | null>;
+    __syncpeerDocumentProbe?: (folderId: string) => Promise<{ registered: boolean; downloads: boolean; signedCredential: boolean; conflictCount: number }>;
     __syncpeerSetRelayPoolUrl?: (url: string) => void;
   };
   let app = $state(createInitialState());
@@ -535,6 +537,21 @@
         if (matches.length !== 1 || !platformAdapter.digestCachedFiles) return null;
         return (await platformAdapter.digestCachedFiles([{ folderId: matches[0].folderId, path }]))[0]?.hash ?? null;
       };
+      testWindow.__syncpeerDocumentProbe = async folderId => {
+        // Read through the desktop/Android-independent document owner, not the
+        // Android-only native command. Never expose signed settings or secrets.
+        const status = await documentCommand<{
+          folders: Array<{ id: string; downloads: boolean }>;
+        }>({ operation: "status" });
+        const shared = await documentCommand<{
+          settings: { folders?: Record<string, { credential?: unknown }> } | null;
+          conflicts: unknown[];
+        }>({ operation: "sharedPersonalSpaceSettings" });
+        const folder = status.folders.find(item => item.id === folderId);
+        return { registered: Boolean(folder), downloads: Boolean(folder?.downloads),
+          signedCredential: Boolean(shared.settings?.folders?.[folderId]?.credential),
+          conflictCount: shared.conflicts.length };
+      };
       testWindow.__syncpeerStateProbe = () => ({
         currentFolderId: app.session.currentFolderId,
         currentPath: app.session.currentPath,
@@ -543,6 +560,15 @@
         uploadMessage: app.ui.uploadMessage,
         uploadProgressActive: app.ui.uploadProgressActive,
         logs: app.logs.items.slice(0, 20).map(({ event, message }) => ({ event, message })),
+        // E2E-only diagnostic metadata: event, time, count/boolean, never file names or secrets.
+        syncTrace: app.logs.items.filter(({ event }) =>
+          /^(core\.(request\.|replica\.|incoming\.|index\.|bep\.|cluster\.|shared_folder\.index\.sent)|client\.session\.|document\.(settings_refresh\.|session_folders\.))/.test(event))
+          .slice(0, 320).map(({ event, timestampMs, details }) => {
+            const value = details && typeof details === "object" ? details as Record<string, unknown> : {};
+            return { event, timestampMs,
+              ...(typeof value.fileCount === "number" ? { fileCount: value.fileCount } : {}),
+              ...(typeof value.changed === "boolean" ? { changed: value.changed } : {}) };
+          }),
       });
       testWindow.__syncpeerStoreStateProbe = () => {
         const state = sessionStore.getState();
@@ -582,6 +608,7 @@
         delete testWindow.__syncpeerDigestCachedFile;
         delete testWindow.__syncpeerReadCachedDocument;
         delete testWindow.__syncpeerStateProbe;
+        delete testWindow.__syncpeerDocumentProbe;
         delete testWindow.__syncpeerStoreStateProbe;
       }
       if (import.meta.env.DEV) {

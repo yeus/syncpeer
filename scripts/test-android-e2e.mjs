@@ -2407,25 +2407,27 @@ const verifyReceivedFolderCredential = async () => {
   const launcher = await launchAndroidApp(true);
   launcher.close();
   const deadline = Date.now() + 120_000;
-  let attached = false;
-  let lastError = "";
+  let signedCredentialReceived = false;
+  let sharedFolderIds = [];
   while (Date.now() < deadline) {
-    try {
-      await freshDocumentCommand({ operation: "attachDownloads", id });
-      attached = true;
+    const shared = await freshDocumentCommand({ operation: "sharedPersonalSpaceSettings" });
+    sharedFolderIds = Object.keys(shared?.settings?.folders ?? {});
+    const credential = shared?.settings?.folders?.[id]?.credential;
+    if (credential?.label === label && typeof credential.password === "string" &&
+      credential.password.length > 0) {
+      signedCredentialReceived = true;
       break;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      if (lastError !== "Folder is not registered.") throw error;
-      await wait(500);
     }
+    await wait(500);
   }
-  if (!attached) {
-    const shared = await freshDocumentCommand({ operation: "sharedPersonalSpaceSettings" }).catch(() => null);
-    throw new Error(`Desktop-originated encrypted folder credential did not auto-register on Android: ${JSON.stringify({
-      sharedFolderIds: Object.keys(shared?.settings?.folders ?? {}), lastError,
-    })}`);
+  if (!signedCredentialReceived) {
+    throw new Error("Desktop-originated signed credential did not reach Android personal-space settings: " +
+      JSON.stringify({ sharedFolderIds }));
   }
+  // A remembered folder can be attached before receiving its credential;
+  // wait for the signed setting first, then trigger the normal registration refresh.
+  await freshDocumentCommand({ operation: "status" });
+  await freshDocumentCommand({ operation: "attachDownloads", id });
   const wrongPasswordCdp = await connectCdp();
   try {
     await expectDocumentCommandFailure(wrongPasswordCdp, { operation: "register", id, label,
@@ -2461,6 +2463,25 @@ const prepareWholeFolder = async () => {
   const status = await freshDocumentCommand({ operation: "status" });
   const verifiedSettings = await freshDocumentCommand({ operation: "profileSettings" });
   const credentials = await freshDocumentCommand({ operation: "connectionPasswords" });
+  // Check credential publication at its source, before testing replication.
+  // Report only folder IDs and booleans; shared settings contain secrets.
+  const shared = await freshDocumentCommand({ operation: "sharedPersonalSpaceSettings" });
+  const published = shared.settings?.folders?.[id]?.credential;
+  const offered = await freshDocumentCommand({ operation: "sessionSharedFolders",
+    remoteDeviceId });
+  const offeredIds = offered.map(folder => folder.id);
+  console.log("Android shared-folder publication:", JSON.stringify({
+    signedCredential: published?.label === id && published?.password === password,
+    settingsFolderOffered: offeredIds.length > 0,
+    syntheticFolderOffered: offeredIds.includes(id),
+    folderCount: offeredIds.length,
+  }));
+  if (!published || published.password !== password || published.label !== id) {
+    throw new Error("Android registered a local folder but did not sign its credential into personal-space settings.");
+  }
+  if (!offeredIds.includes(id)) {
+    throw new Error("Android local folder is not offered to the enrolled desktop peer.");
+  }
   const registered = status.folders.find(folder => folder.id === id);
   console.log("Android outgoing folder state:", JSON.stringify({
     registered: Boolean(registered), downloads: registered?.downloads === true,
@@ -2545,6 +2566,10 @@ const runWholeFolderConnection = async () => {
   try {
     console.log("Android cross-app phase: opening the direct peer link.");
     if (!await openAndroidConnection(cdp)) throw new Error("Whole-folder peer did not connect.");
+    const publicationTrace = await cdp.evaluate(
+      'window.__syncpeerStateProbe?.()?.syncTrace?.filter(entry => /index\\.sent|index\\.received|replica\\.index|client\\.session|handshake\\.ready/.test(entry.event)).slice(0, 80) ?? []',
+    ).catch(() => []);
+    console.log("Android foreground sync trace:", JSON.stringify(publicationTrace));
     console.log("Android cross-app phase: direct peer link connected; handing off to background service.");
     runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
     await waitForSessionService(true, 30_000);

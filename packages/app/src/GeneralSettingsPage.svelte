@@ -278,7 +278,7 @@
       <p>Paste the short-lived invitation from an already unlocked Syncpeer device. Both devices must confirm the same six-digit code.</p>
       <label>Pairing invitation <textarea rows="6" bind:value={pairingInvitation}></textarea></label>
       <PasswordInput label="New local master password" secretLabel="master password"
-        bind:value={masterPassword} autocomplete="new-password" minlength={16} />
+        testId="pairing-new-master-password" bind:value={masterPassword} autocomplete="new-password" minlength={16} />
       <label><input type="checkbox" bind:checked={rememberMaster} /> Remember on this device</label>
       <button class="primary" disabled={busy || masterPassword.length < 16 || !pairingInvitation.trim()} onclick={() => void joinDevice()}>Join personal space</button>
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}

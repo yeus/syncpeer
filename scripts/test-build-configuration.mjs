@@ -100,6 +100,17 @@ test("packaged pairing spec parses with the TypeScript loader before acceptance"
     sourcefile: "scripts/lan-test/packaged-pairing.spec.ts",
   }));
 });
+test("packaged pairing targets the joiner's actual password input", () => {
+  const settings = fs.readFileSync("packages/app/src/GeneralSettingsPage.svelte", "utf8");
+  const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
+  assert.match(settings,
+    /<PasswordInput label="New local master password"[\s\S]*?testId="pairing-new-master-password"/);
+  assert.ok(spec.includes("[data-testid='pairing-new-master-password']"),
+    "The packaged pairing test must use the input's stable test ID.");
+  assert.doesNotMatch(spec, /label\[contains\(\., 'New local master password'\)\]\/input/,
+    "A PasswordInput renders its label and input as siblings, not nested elements.");
+});
+
 
 test("packaged screenshots use focused-window capture in screenshot environments", () => {
   const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");

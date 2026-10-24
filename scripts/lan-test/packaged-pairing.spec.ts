@@ -803,9 +803,9 @@ describe("Two isolated packaged desktop apps", () => {
     await joiner
       .$("//label[contains(., 'Pairing invitation')]/textarea")
       .setValue(invitation);
-    await joiner
-      .$("//label[contains(., 'New local master password')]/input")
-      .setValue("synthetic-joining-master-password");
+    const joinerPassword = joiner.$("[data-testid='pairing-new-master-password']");
+    await joinerPassword.waitForDisplayed({ timeout: 30_000 });
+    await joinerPassword.setValue("synthetic-joining-master-password");
     const confirmationPeers = [
       { peer: owner, label: "owner" },
       { peer: joiner, label: "joiner" },

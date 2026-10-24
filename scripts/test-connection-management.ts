@@ -25,7 +25,7 @@ import {
 } from "../packages/core/dist/transfer/stream.js";
 import { createRecoveringRemoteFs } from "../packages/core/dist/ui/recoveringRemoteFs.js";
 import { RemoteFs } from "../packages/core/dist/core/model/remoteFs.js";
-import { sanitizeDiagnosticArtifact } from "../packages/shared/modules/diagnosticSanitizer.ts";
+import { sanitizeDiagnosticArtifact, sanitizeDiagnosticText } from "../packages/shared/modules/diagnosticSanitizer.ts";
 
 const remoteFs = {} as SyncpeerSessionHandle["remoteFs"];
 
@@ -1137,4 +1137,47 @@ test("generated diagnostics redact peer and filesystem metadata", () => {
     output: "[redacted]",
     nested: { path: "[redacted]", count: 2 },
   });
+});
+
+test("generated diagnostics redact prefixed identifiers, hosts and folder secrets", () => {
+  assert.deepEqual(sanitizeDiagnosticArtifact({
+    remoteDeviceId: "REMOTE-DEVICE",
+    localDeviceId: "LOCAL-DEVICE",
+    connectedHost: "192.0.2.2",
+    deviceName: "personal-phone",
+    relayAddress: "192.0.2.3",
+    folderPasswords: { camera: "synthetic-folder-password" },
+    connectionPasswords: { camera: "synthetic-folder-password" },
+    signedCredential: "synthetic-credential",
+    passwordToken: "synthetic-password-token",
+    needsPassword: true,
+    hasFolderPassword: false,
+    folderPasswordCount: 1,
+    passwordError: null,
+    tokenValid: true,
+  }), {
+    remoteDeviceId: "[redacted]",
+    localDeviceId: "[redacted]",
+    connectedHost: "[redacted]",
+    deviceName: "[redacted]",
+    relayAddress: "[redacted]",
+    folderPasswords: "[redacted]",
+    connectionPasswords: "[redacted]",
+    signedCredential: "[redacted]",
+    passwordToken: "[redacted]",
+    needsPassword: true,
+    hasFolderPassword: false,
+    folderPasswordCount: 1,
+    passwordError: null,
+    tokenValid: true,
+  });
+});
+
+test("diagnostic text redacts candidate addresses, paths and long identifiers", () => {
+  assert.equal(
+    sanitizeDiagnosticText(`tcp://192.0.2.10:22000 closed; relay://192.0.2.11:22067/?id=${'A'.repeat(56)} timed out; ` +
+      "quic://[fda4:0:0:0:1]:22000 refused; saved to /home/synthetic/file.txt; " +
+      "device 55KM6B52CSRRQAU2L3GEFJBAE6MLYK4BH25GIQW3ULKGAZYHKTGA"),
+    "[redacted] closed; [redacted] timed out; [redacted] refused; saved to [path]; device [redacted]",
+  );
 });

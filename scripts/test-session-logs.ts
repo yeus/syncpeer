@@ -67,11 +67,46 @@ test("formatted logs keep messages and sanitized metadata", () => {
   assert.match(text, /"port": 22000/);
 });
 
+test("exported logs redact folder secrets, device identifiers and candidate addresses", () => {
+  const state = createInitialState(null);
+  const deviceId = "55KM6B52CSRRQAU2L3GEFJBAE6MLYK4BH25GIQW3ULKGAZYHKTGA";
+  pushSessionLog(state, "error", "refresh_overview.failed",
+    "Could not connect using discovered candidates. " +
+    "tcp://192.0.2.10:22000: Connection closed | " +
+    "relay://192.0.2.11:22067/?id=ABCDEFG-HIJKLMN-OPQRSTU-VWXYZ23-4567890-ABCDEFG-HIJKLMN-OPQRSTU: closed | " +
+    "quic://[fda4:0:0:0:1]:22000: timeout | " +
+    `peer ${deviceId}`);
+  pushSessionLog(state, "info", "core.untrusted.folder.state", "Folder requires a password.", {
+    remoteDeviceId: deviceId,
+    connectedHost: "192.0.2.12",
+    deviceName: "personal-phone",
+    folderPasswords: { camera: "synthetic-folder-password" },
+    needsPassword: true,
+    hasFolderPassword: false,
+    folderPasswordCount: 1,
+    passwordError: null,
+  });
+  const text = formatSessionLogs(appInfo, state.logs.items);
+  assert.doesNotMatch(text, /192\.0\.2\.(?:10|11|12)/);
+  assert.doesNotMatch(text, /fda4:0:0:0:1/);
+  assert.doesNotMatch(text, /ABCDEFG-HIJKLMN/);
+  assert.doesNotMatch(text, new RegExp(deviceId));
+  assert.doesNotMatch(text, /synthetic-folder-password/);
+  assert.doesNotMatch(text, /personal-phone/);
+  assert.match(text, /Connection closed/);
+  assert.match(text, /"needsPassword": true/);
+  assert.match(text, /"hasFolderPassword": false/);
+  assert.match(text, /"folderPasswordCount": 1/);
+  assert.match(text, /"passwordError": null/);
+});
+
 test("copying an oversized log is refused instead of breaking the clipboard", async () => {
   const copied = clipboard();
   const { state, actions } = createFixture();
+  // Real messages keep their words: diagnostic text redaction only collapses
+  // address/path/token runs, so ordinary prose still exceeds the clipboard guard.
   pushSessionLog(state, "info", "app.personal_space.required",
-    "x".repeat(CLIPBOARD_SESSION_LOG_LIMIT_BYTES + 1024));
+    "oversized diagnostic text ".repeat(Math.ceil(CLIPBOARD_SESSION_LOG_LIMIT_BYTES / 25) + 64));
   await actions.copySessionLogs();
   assert.equal(copied.length, 0, "The clipboard must not receive a payload larger than the guard.");
   assert.match(state.ui.recentError ?? "", /too large for the clipboard/);

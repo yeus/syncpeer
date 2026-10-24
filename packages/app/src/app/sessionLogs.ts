@@ -1,5 +1,5 @@
 import { formatAppBuildInfo, type AppBuildInfo } from "@syncpeer/core/browser";
-import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
+import { sanitizeDiagnosticArtifact, sanitizeDiagnosticText } from "../../../shared/modules/diagnosticSanitizer.ts";
 
 /**
  * Clipboard writes travel through Android's per-process Binder buffer, which is
@@ -40,7 +40,9 @@ export const formatSessionLogs = (
       ];
       // Client-log entries fall back to the event name as their message; only real
       // messages carry information the event name does not already contain.
-      if (item.message && item.message !== item.event) lines.push(item.message);
+      if (item.message && item.message !== item.event) {
+        lines.push(sanitizeDiagnosticText(item.message));
+      }
       if (item.details !== undefined) {
         lines.push(JSON.stringify(sanitizeDiagnosticArtifact(item.details), null, 2));
       }

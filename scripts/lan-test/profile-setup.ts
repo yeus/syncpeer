@@ -17,16 +17,39 @@ const createThroughOnboarding = async (peer: WebdriverIO.Browser) => {
     document.querySelectorAll("[data-testid='onboarding-recovery-phrase'] span").length), 12);
   await peer.$("[data-testid='onboarding-kit-confirm']").click();
   await clickButtonByText(peer, "Create personal space");
-  await peer.$("[data-testid='personal-space-onboarding']")
-    .waitForExist({ reverse: true, timeout: 60_000 });
+  try {
+    await peer.$("[data-testid='personal-space-onboarding']")
+      .waitForExist({ reverse: true, timeout: 60_000 });
+  } catch (cause) {
+    // Include only shape and error text, never passwords, recovery words or kit.
+    const state = await peer.execute(() => ({
+      heading: document.querySelector("[data-testid='personal-space-onboarding'] h2")?.textContent?.trim() ?? "",
+      error: document.querySelector("[data-testid='personal-space-onboarding'] [role='alert']")
+        ?.textContent?.trim().slice(0, 200) ?? "",
+      busy: document.querySelector<HTMLButtonElement>("[data-testid='onboarding-create']")?.disabled ?? null,
+      createPresent: Boolean(document.querySelector("[data-testid='onboarding-create']")),
+      kitPresent: Boolean(document.querySelector("[data-testid='onboarding-kit-download']")),
+      kitAcknowledged: document.querySelector("[data-testid='onboarding-kit-confirm']")
+        ?.textContent?.includes("saved") ?? false,
+    })).catch(() => ({ probeUnavailable: true }));
+    throw new Error("Packaged encrypted space creation failed: " + JSON.stringify(state), { cause });
+  }
   await openGeneralSettings(peer);
   return encodedKit;
 };
 
 export async function createFreshEncryptedProfile(peer: WebdriverIO.Browser) {
-  const onboarding = peer.$("[data-testid='personal-space-onboarding']");
-  const firstRunVisible = await onboarding.waitForExist({ timeout: 8_000 }).then(() => true).catch(() => false);
-  if (firstRunVisible) return createThroughOnboarding(peer);
+  // Startup includes native vault initialization and may exceed the old 8s
+  // heuristic. Do not fall through to the removed legacy form before the
+  // first-run onboarding is actually ready.
+  const page = await peer.waitUntil(async () => peer.execute(() => {
+    if (document.querySelector("[data-testid='personal-space-onboarding']")) return "onboarding";
+    if ([...document.querySelectorAll("label")].some(label =>
+      label.textContent?.includes("Master password (at least 16 characters)"))) return "legacy";
+    return null;
+  }), { timeout: 90_000, interval: 500,
+    timeoutMsg: "Neither first-run onboarding nor the legacy profile form appeared." });
+  if (page === "onboarding") return createThroughOnboarding(peer);
   await openGeneralSettings(peer);
   await peer.$("//label[contains(., 'Master password (at least 16 characters)')]/input")
     .setValue("synthetic-release-smoke-master-password");

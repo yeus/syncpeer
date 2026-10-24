@@ -437,6 +437,7 @@ EOF
             gdk-pixbuf
             atk
             mesa
+            dbus
           ]);
           shellHook = ''
             export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"

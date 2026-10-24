@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "noEmit": true,
+    "types": ["node", "mocha", "@wdio/globals/types"]
+  },
+  "files": [
+    "shared-onboarding.spec.ts",
+    "wdio-shared-desktop.conf.ts",
+    "wdio-shared-android.conf.ts"
+  ]
+}

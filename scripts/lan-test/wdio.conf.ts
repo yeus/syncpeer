@@ -1,7 +1,9 @@
 import path from "node:path";
 import type { Options } from "@wdio/types";
 
-const driverProvider = process.env.SYNCPEER_LAN_DRIVER ?? "embedded";
+// Linux's external tauri-driver is the verified provider; embedded /wdio/eval
+// currently returns 404. Preserve embedded for platforms without tauri-driver.
+const driverProvider = process.env.SYNCPEER_LAN_DRIVER ?? (process.platform === "linux" ? "external" : "embedded");
 const captureLogs = process.env.SYNCPEER_LAN_CAPTURE_LOGS === "1";
 
 if (driverProvider !== "embedded" && driverProvider !== "external") {
@@ -36,6 +38,10 @@ export const config = {
     browserName: "tauri",
     "tauri:options": {
       application: process.env.SYNCPEER_LAN_APP_BINARY,
+    },
+    // Launcher and worker must agree; defaulting to embedded causes 404s.
+    "wdio:tauriServiceOptions": {
+      driverProvider, appBinaryPath: process.env.SYNCPEER_LAN_APP_BINARY,
     },
   }],
   framework: "mocha",

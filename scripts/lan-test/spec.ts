@@ -9,7 +9,6 @@ import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.
 import { coordinatorRequest } from "./coordinator.ts";
 import type { LanFixture } from "./protocol.ts";
 import {
-  openGeneralSettings,
   openFolderSettings,
   clickDownloadButton,
   clickItemTitle,
@@ -24,6 +23,7 @@ import {
   waitForDisconnected,
   waitForText,
 } from "./ui-helpers.ts";
+import { createFreshEncryptedProfile } from "./profile-setup.js";
 
 type LanBrowser = WdioBrowser & BrowserExtension;
 const lanBrowser = browser as unknown as LanBrowser;
@@ -86,28 +86,6 @@ const appErrorCategory = (issue: string): string =>
     : /storage|directory|folder/i.test(issue) ? "local storage"
     : /transport|connection|socket/i.test(issue) ? "transport"
     : issue ? "other app error" : "no app error shown";
-const createFreshProfile = async (): Promise<void> => {
-  await openGeneralSettings(browser);
-  const master = $("//label[contains(., 'Master password (at least 16 characters)')]/input");
-  await master.waitForExist();
-  await master.setValue("synthetic-desktop-master-password");
-  await $("//label[contains(., 'Offline kit password')]/input")
-    .setValue("synthetic-offline-kit-password");
-  await $("button=Generate encrypted offline kit").click();
-  const kit = $("a[download='syncpeer-offline-signing-kit.json']");
-  await kit.waitForExist();
-  const encoded = await $("textarea[readonly]").getValue();
-  assert.ok(JSON.parse(encoded).publicKey, "The generated synthetic kit must have a public key.");
-  await $("//label[contains(., 'I saved the kit')]/input").click();
-  await $("button=Create encrypted profile").click();
-  try {
-    await $("button=Create encrypted profile").waitForExist({ reverse: true, timeout: 30_000 });
-  } catch (error) {
-    const issue = await $("p[role='alert']").getText().catch(() => "No profile error was shown.");
-    throw new Error(`Fresh profile setup did not complete: ${issue}`, { cause: error });
-  }
-  await $("button=Back").click();
-};
 const connect = async (
   currentFixture: LanFixture,
   mode: "automatic" | "direct" | "lan" | "global",
@@ -196,6 +174,9 @@ describe("Syncpeer LAN integration", () => {
   let currentFixture: LanFixture;
 
   it("registers the real Tauri identity", async () => {
+    // Complete real onboarding before accessing the main device tabs.
+    await createFreshEncryptedProfile(lanBrowser);
+    await $("button=Back").click();
     await clickTestId("tab-devices");
     await waitForText(lanBrowser, "This Device", 60_000);
     const deviceId = await readCurrentDeviceId(lanBrowser);
@@ -203,7 +184,6 @@ describe("Syncpeer LAN integration", () => {
     if (process.env.SYNCPEER_LAN_MANUAL_IDS !== "1") {
       await request("POST", "/v1/register", { profile: "trusted", deviceId });
     }
-    await createFreshProfile();
     currentFixture = await fixture();
   });
 

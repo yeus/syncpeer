@@ -6,7 +6,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
-import { isAndroidProjectInitialized, patchManifest } from "./prepare-android-legacy-launcher.mjs";
+import { patchManifest } from "./prepare-android-legacy-launcher.mjs";
+import { isAndroidProjectInitialized, ensureAndroidProjectInitialized } from "./android-project-init.mjs";
 import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -45,23 +46,86 @@ test("Android builds keep the unsupported launcher separate from the Tauri activ
   assert.match(modern, /syncpeer_modern_activity">true/);
 });
 
-test("Android init cannot be skipped by a partial generated directory or signing files", (t) => {
+const writeSyntheticAndroidProject = (android) => {
+  for (const [name, content] of [
+    ["app/src/main/AndroidManifest.xml", "<manifest />"],
+    ["app/build.gradle.kts", "plugins {}"],
+    ["app/src/main/java/dev/syncpeer/app/MainActivity.kt", "class MainActivity"],
+    ["gradlew", "#!/bin/sh"],
+  ]) {
+    const file = path.join(android, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  }
+};
+
+test("Android init requires MainActivity and Gradle wrapper, not just signing directories", (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-init-"));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
   const android = path.join(temp, "gen/android");
-  const manifest = path.join(android, "app/src/main/AndroidManifest.xml");
-  const gradle = path.join(android, "app/build.gradle.kts");
+  const mainActivity = path.join(android, "app/src/main/java/dev/syncpeer/app/MainActivity.kt");
   assert.equal(isAndroidProjectInitialized(android), false);
   fs.mkdirSync(path.join(android, "app"), { recursive: true });
   fs.writeFileSync(path.join(android, "keystore.properties"), "synthetic signing data");
   assert.equal(isAndroidProjectInitialized(android), false);
-  fs.mkdirSync(path.dirname(manifest), { recursive: true });
-  fs.writeFileSync(manifest, "<manifest />");
-  assert.equal(isAndroidProjectInitialized(android), false);
-  fs.writeFileSync(gradle, "plugins {}");
+  writeSyntheticAndroidProject(android);
   assert.equal(isAndroidProjectInitialized(android), true);
-  fs.rmSync(manifest);
+  fs.rmSync(mainActivity);
   assert.equal(isAndroidProjectInitialized(android), false);
+  fs.writeFileSync(mainActivity, "class MainActivity");
+  fs.rmSync(path.join(android, "gradlew"));
+  assert.equal(isAndroidProjectInitialized(android), false);
+});
+
+test("partial Android init preserves existing files when regenerated", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-recovery-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const android = path.join(temp, "gen/android");
+  fs.mkdirSync(path.join(android, "app"), { recursive: true });
+  fs.writeFileSync(path.join(android, "custom.txt"), "user content");
+  fs.writeFileSync(path.join(android, "keystore.properties"), "existing signing property");
+  let calls = 0;
+  const archive = ensureAndroidProjectInitialized(android, () => {
+    calls += 1;
+    assert.equal(fs.existsSync(android), false,
+      "Tauri must initialize without an incomplete gen/android directory");
+    writeSyntheticAndroidProject(android);
+  });
+  assert.equal(calls, 1);
+  assert.equal(isAndroidProjectInitialized(android), true);
+  assert.ok(archive);
+  assert.equal(fs.readFileSync(path.join(archive, "custom.txt"), "utf8"), "user content");
+  assert.equal(fs.readFileSync(path.join(archive, "keystore.properties"), "utf8"), "existing signing property");
+  assert.equal(ensureAndroidProjectInitialized(android, () => { throw Error("Should not reinitialize"); }), null);
+});
+
+test("failed Android init restores the incomplete original without discarding new data", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-rollback-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const android = path.join(temp, "gen/android");
+  fs.mkdirSync(android, { recursive: true });
+  fs.writeFileSync(path.join(android, "custom.txt"), "keep me");
+  assert.throws(() => ensureAndroidProjectInitialized(android, () => {
+    fs.mkdirSync(android, { recursive: true });
+    fs.writeFileSync(path.join(android, "partial-init.txt"), "new work");
+    throw Error("Synthetic Tauri initialization failure");
+  }), /Synthetic Tauri initialization failure/);
+  assert.equal(fs.readFileSync(path.join(android, "custom.txt"), "utf8"), "keep me");
+  const [backup] = fs.readdirSync(path.join(temp, "gen"))
+    .filter(name => name.startsWith("android-incomplete-"));
+  assert.ok(backup, "Failed init files must be preserved outside the restored original");
+  assert.equal(fs.readFileSync(path.join(temp, "gen", backup, "failed-init/partial-init.txt"), "utf8"), "new work");
+  assert.throws(() => ensureAndroidProjectInitialized(android, () => undefined), /did not generate a complete project/);
+  assert.equal(fs.readFileSync(path.join(android, "custom.txt"), "utf8"), "keep me");
+});
+
+test("Android bootstrap refuses to move a non-directory project path", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-file-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const android = path.join(temp, "android");
+  fs.writeFileSync(android, "user file");
+  assert.throws(() => ensureAndroidProjectInitialized(android, () => undefined), /Refusing to replace/);
+  assert.equal(fs.readFileSync(android, "utf8"), "user file");
 });
 
 test("Android build hooks initialize before manifest patching and temporary signing files", () => {
@@ -70,7 +134,7 @@ test("Android build hooks initialize before manifest patching and temporary sign
     assert.match(scripts[name], /^npm run icons:ensure:android && node .*prepare-android-legacy-launcher\.mjs$/);
   }
   const icons = fs.readFileSync("scripts/ensure-tauri-icons.mjs", "utf8");
-  assert.match(icons, /if \(isAndroidProjectInitialized\(androidRoot\)\) return/);
+  assert.match(icons, /ensureAndroidProjectInitialized\(androidRoot, \(\) =>/);
   const signing = fs.readFileSync("scripts/build-android-prod-with-secrets.sh", "utf8");
   const bootstrap = signing.indexOf("npm run icons:ensure:android");
   const signingFiles = signing.indexOf('create_gradle_keystore_properties "$path"');

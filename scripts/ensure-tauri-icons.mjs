@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { isAndroidProjectInitialized } from "./prepare-android-legacy-launcher.mjs";
+import { ensureAndroidProjectInitialized } from "./android-project-init.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, "..");
@@ -55,14 +55,13 @@ const run = (cmd, cmdArgs, description) => {
   }
 };
 
-const ensureAndroidProjectInitialized = () => {
+const ensureAndroidProject = () => {
   const androidRoot = path.join(root, "packages/tauri-shell/src-tauri/gen/android");
-  if (isAndroidProjectInitialized(androidRoot)) return;
-  console.log("Android project not initialized; running `npm run build:android:init`.");
-  run("npm", ["run", "build:android:init"], "Android init");
-  if (!isAndroidProjectInitialized(androidRoot)) {
-    throw new Error("Android init completed without generating AndroidManifest.xml and app/build.gradle.kts.");
-  }
+  const backup = ensureAndroidProjectInitialized(androidRoot, () => {
+    console.log("Android project not initialized; running `npm run build:android:init`.");
+    run("npm", ["run", "build:android:init"], "Android init");
+  });
+  if (backup) console.warn(`Preserved incomplete Android project at ${backup}. Review before removing it.`);
 };
 
 const ensureAndroidAdaptiveIconInset = () => {
@@ -93,7 +92,7 @@ const ensureAndroidAdaptiveIconInset = () => {
 
 const missingDesktop = desktopRequired.filter((item) => !exists(item));
 if (checkAndroid) {
-  ensureAndroidProjectInitialized();
+  ensureAndroidProject();
 }
 const missingAndroid = checkAndroid
   ? androidRequired.filter((item) => !exists(item))

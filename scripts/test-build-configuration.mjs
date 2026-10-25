@@ -111,6 +111,19 @@ test("packaged pairing targets the joiner's actual password input", () => {
     "A PasswordInput renders its label and input as siblings, not nested elements.");
 });
 
+test("packaged attachment waits for the folder-settings control, preserving failure diagnostics", () => {
+  const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
+  const helper = spec.split("async function attachAndFavoriteSharedFolder(")[1]
+    ?.split('describe("Two isolated packaged desktop apps"')[0];
+  assert.ok(helper, "The packaged shared-folder helper must exist.");
+  assert.match(helper, /\$\("\[data-testid='folder-settings-page'\]"\)\s*\.\$\("button=Reattach encrypted local storage"\)/);
+  assert.match(helper, /await attach\.waitForExist\(/);
+  assert.doesNotMatch(helper, /\/\/li\[\.\/span\[/,
+    "FolderSettingsPage has no legacy li/span folder-name row.");
+  assert.doesNotMatch(helper, /\[data-testid='tab-devices'\]/,
+    "The Devices tab is not mounted while folder settings are displayed.");
+});
+
 
 test("packaged screenshots use focused-window capture in screenshot environments", () => {
   const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");

@@ -615,17 +615,17 @@ async function captureReconnectDiagnostics(
 async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
   await peer.$("[data-testid='tab-folders']").click();
   await openFolderSettings(peer, folderName);
-  const row = peer.$(
-    `//li[./span[normalize-space()=${JSON.stringify(folderName)}]]`,
-  );
+  const attach = peer
+    .$("[data-testid='folder-settings-page']")
+    .$("button=Reattach encrypted local storage");
   try {
-    // Keep the settings page mounted while its onMount refresh serializes behind
-    // any in-flight settings-replica work. Repeatedly leaving/reopening this page
-    // used to cancel the UI that owned the result and enqueue overlapping status calls.
-    await row.waitForExist({
+    // The folder settings page renders the attachment control only after its
+    // asynchronous native status refresh has registered the received folder.
+    // Keep the page mounted while that refresh waits behind replica work.
+    await attach.waitForExist({
       timeout: 30_000,
       timeoutMsg:
-        "The received shared folder did not appear after the settings refresh completed.",
+        "The received shared folder did not become attachable after the settings refresh completed.",
     });
   } catch (error) {
     const lastAlert = await peer
@@ -642,7 +642,8 @@ async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
     const hasSharedConflict = await peer
       .$("//h2[normalize-space()='Shared settings need a choice']")
       .isExisting();
-    await peer.$("[data-testid='tab-devices']").click();
+    // Bottom navigation is not mounted on FolderSettingsPage. Preserve the
+    // original refresh timeout instead of masking it with a navigation error.
     const events = await peer.execute(
       () =>
         (
@@ -700,11 +701,8 @@ async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
     );
   }
 
-  const attach = row.$("button=Reattach encrypted local storage");
-  if (await attach.isExisting()) {
-    await clickButtonByText(peer, "Reattach encrypted local storage");
-    await attach.waitForExist({ reverse: true, timeout: 30_000 });
-  }
+  await clickButtonByText(peer, "Reattach encrypted local storage");
+  await attach.waitForExist({ reverse: true, timeout: 30_000 });
   await peer.$("button=Back").click();
   const root = peer.$(
     `//li[.//*[contains(@class,'item-title') and normalize-space()=${JSON.stringify(folderName)}]]`,

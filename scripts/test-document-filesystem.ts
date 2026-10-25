@@ -14,10 +14,11 @@ import { defaultFolderSettings, defaultProfileSettings } from "../packages/core/
 import { purgePrivateReplicaContents } from "../packages/core/dist/sync/replicaPurge.js";
 test("listener snapshots are invalidated by sharing changes, not ordinary document edits", () => {
   for (const operation of ["lock", "unlock", "saveProfileSettings", "savePersonalSpaceSetting",
-    "revokeOwnedDevice", "register", "attachDownloads", "saveConnectionPasswords"]) {
+    "revokeOwnedDevice", "register", "attachDownloads"]) {
     assert.equal(changesSessionConfiguration(operation), true, operation);
   }
-  for (const operation of ["status", "sessionSharedFolders", "read", "write", "flush", "remove", "rename"]) {
+  for (const operation of ["status", "sessionSharedFolders", "read", "write", "flush", "remove", "rename",
+    "saveConnectionPasswords", "mergeConnectionPasswords"]) {
     assert.equal(changesSessionConfiguration(operation), false, operation);
   }
   assert.equal(changesSessionConfiguration("savePersonalSpaceSetting", ["folders", "photos", "retention"]), false);

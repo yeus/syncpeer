@@ -492,8 +492,8 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   quicOnly: options.quicOnly === true,
   folderPasswords: Object.fromEntries(
     Object.entries(options.folderPasswords ?? {})
-      .map(([folderId, password]) => [folderId.trim(), password.trim()])
-      .filter(([folderId, password]) => folderId !== "" && password !== ""),
+      .map(([folderId, password]) => [folderId.trim(), password])
+      .filter(([folderId, password]) => folderId !== "" && password.length > 0),
   ),
   sharedFolders: options.sharedFolders?.map((folder) => folder.ciphertextReplica ? {
     ...folder,
@@ -552,7 +552,7 @@ const serializeConnectionKey = (
     keyPem,
     relayOnly: options.relayOnly === true,
     quicOnly: options.quicOnly === true,
-    folderPasswords: options.folderPasswords ?? {},
+    // Decryption credentials do not determine TLS session identity.
     sharedFolders: options.sharedFolders ?? [],
     // The shared-folder set and credentials are resolved from the document
     // owner at session-open time. Incrementing this revision when the owner
@@ -693,6 +693,27 @@ type PairingSession = {
 const backgroundSessionOptions = (connectOptions: ConnectOptions | null) => connectOptions
   ? Object.fromEntries(Object.entries(connectOptions).filter(([key]) => key !== "sharedFolders")) as Omit<ConnectOptions, "sharedFolders">
   : null;
+
+const sameFolderPasswords = (left?: Record<string, string>, right?: Record<string, string>) =>
+  Object.keys(left ?? {}).length === Object.keys(right ?? {}).length &&
+  Object.entries(left ?? {}).every(([folderId, password]) => right?.[folderId] === password);
+
+/**
+ * Folder passwords are local decryption secrets, not transport identity. A
+ * refresh can carry credentials loaded after the session opened; keep the next
+ * background handoff in step even when that refresh cannot open a session.
+ */
+function rememberLocalFolderPasswords(ctx: SessionContext, connectOptions: ConnectOptions) {
+  const resolved = ctx.state.activeResolvedConnectOptions;
+  if (!resolved || sameFolderPasswords(resolved.folderPasswords, connectOptions.folderPasswords)) return;
+  const next = { ...resolved, folderPasswords: connectOptions.folderPasswords ?? {} };
+  ctx.state.activeResolvedConnectOptions = next;
+  void prepareBackgroundHandoff(ctx.platformAdapter, next).catch((error) => {
+    ctx.coreAdapter.log?.("core.background.prepare.failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
+}
 
 async function prepareBackgroundHandoff(
   platformAdapter: SyncpeerPlatformAdapter,
@@ -1600,7 +1621,11 @@ function withSessionOperation<TResult>(
 ) {
   return withMetadataSession(
     connectOptions,
-    (options) => lifecycle.ensureSession(options),
+    async (options) => {
+      const session = await lifecycle.ensureSession(options);
+      await session.updateFolderPasswords?.(normalizeConnectOptions(options).folderPasswords ?? {});
+      return session;
+    },
     ctx.state.focusedFolderId,
     operation,
   );
@@ -1714,6 +1739,7 @@ async function connectAndGetOverviewImpl(
   lifecycle: ConnectionLifecycle<ConnectOptions>,
   connectOptions: ConnectOptions,
 ) {
+  rememberLocalFolderPasswords(ctx, connectOptions);
   const overview = await withSessionOperation(
     ctx,
     lifecycle,
@@ -1729,6 +1755,7 @@ async function connectAndGetFolderVersionsImpl(
   lifecycle: ConnectionLifecycle<ConnectOptions>,
   connectOptions: ConnectOptions,
 ) {
+  rememberLocalFolderPasswords(ctx, connectOptions);
   const versions = await withSessionOperation(
     ctx,
     lifecycle,

@@ -8,7 +8,7 @@
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
   import { activeDownloadForFile, type AppState } from "../app/state.ts";
-  import { folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
+  import { connectedFolderStatus, folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -248,7 +248,12 @@
 
   let folderViewStatus = $derived.by(() => {
     if (app.session.isConnected && !app.session.isOfflineSnapshot) {
-      return { tone: "online" as const, label: "Live · in sync" };
+      return { tone: "online" as const, label: connectedFolderStatus(
+        rootFolders.map(folder => ({
+          locked: isFolderLocked(folder.id),
+          indexReceived: folder.stats?.indexReceived === true,
+        })),
+      ) };
     }
     const seen = app.session.offlineLastSeenAtMs;
     return {

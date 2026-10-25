@@ -371,10 +371,15 @@ test("the synthetic document editor is a separate test-only APK", () => {
   assert.match(editorTheme, /Theme\.Translucent\.NoTitleBar/);
   assert.doesNotMatch(manifest, /Theme\.NoDisplay/);
   assert.doesNotMatch(editorProvider, /readNBytes/);
-  assert.doesNotMatch(
-    fs.readFileSync("packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts", "utf8"),
-    /syncpeer-document-editor/,
-  );
+});
+
+test("generated Android Gradle project excludes the synthetic editor", (t) => {
+  const generated = "packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts";
+  if (!fs.existsSync(generated)) {
+    t.skip("Android Gradle project has not been generated in this checkout");
+    return;
+  }
+  assert.doesNotMatch(fs.readFileSync(generated, "utf8"), /syncpeer-document-editor/);
 });
 
 test("the combined Android workflow provisions WebView without Play Store interaction", () => {

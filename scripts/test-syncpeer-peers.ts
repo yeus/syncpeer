@@ -712,3 +712,126 @@ test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { 
   }
 });
 }
+
+// Regression for short-lived Android foreground sessions browsing a Syncthing folder.
+// A remote-only folder must not publish a phantom empty Index or rotate its identity.
+test("remote-only folder reconnects do not publish empty indexes or rotate local IDs",
+  { timeout: 15000 }, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-index-reconnect-"));
+    let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
+    const accepted: SyncpeerSessionHandle[] = [];
+    const advertisedIds: string[] = [];
+    const publishedIndexes: BepIndex[] = [];
+    try {
+      const [source, browser] = await Promise.all([
+        createTestPeerIdentity(root, "source"), createTestPeerIdentity(root, "browser"),
+      ]);
+      listener = await listenNodePeer({ ...source, host: "127.0.0.1", port: 0,
+        expectedDeviceId: browser.deviceId, timeoutMs: 3000,
+        sharedFolders: [{ id: "fixture-camera", encryption: { mode: "plaintext" } }],
+        onSession: session => { accepted.push(session); },
+      });
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const adapter = createNodeHostAdapter();
+        const client = createSyncpeerCoreClient({ ...adapter, connectTls: async options => {
+          const socket = await adapter.connectTls(options);
+          let firstWrite = true;
+          const frames = new FrameParser((type, message) => {
+            if (type === MessageTypeValues.CLUSTER_CONFIG) {
+              const folder = (message as BepClusterConfig).folders?.find(item => item.id === "fixture-camera");
+              assert.ok(folder, "Browser must acknowledge the remote folder in ClusterConfig");
+              const local = folder.devices?.find(device => device.name === "synthetic-browser");
+              assert.ok(local, "Browser identity must be present in the folder");
+              advertisedIds.push(String(local.index_id ?? 0));
+              assert.equal(Number(local.max_sequence ?? 0), 0,
+                "Browse-only peers must not claim the source's sequence as their own");
+            }
+            if (type === MessageTypeValues.INDEX && (message as BepIndex).folder === "fixture-camera") {
+              publishedIndexes.push(message as BepIndex);
+            }
+          });
+          return { close: () => socket.close(), read: size => socket.read(size),
+            peerCertificateDer: () => socket.peerCertificateDer(),
+            write: async bytes => { if (firstWrite) firstWrite = false;
+              else frames.feed(bytes); await socket.write(bytes); } };
+        } });
+        const session = await client.openSession({ ...browser, host: "127.0.0.1",
+          port: listener.port, expectedDeviceId: source.deviceId,
+          deviceName: "synthetic-browser", discoveryMode: "direct", timeoutMs: 3000 });
+        try {
+          assert.ok((await session.remoteFs.listFolders()).some(folder => folder.id === "fixture-camera"));
+          await session.remoteFs.requestFolderIndex("fixture-camera");
+        } finally { await session.close(); }
+      }
+      assert.equal(advertisedIds.length, 2);
+      assert.equal(advertisedIds[0], advertisedIds[1],
+        "Remote-only folder identity must survive reconnects");
+      assert.equal(publishedIndexes.length, 0,
+        "A browsing-only peer must not send a phantom Index to Syncthing");
+    } finally {
+      await Promise.allSettled(accepted.map(session => session.close()));
+      await listener?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+// Regression for credentials arriving after the initial encrypted BEP index.
+test("locked encrypted folders unlock from cached indexes without a reconnect",
+  { timeout: 15000 }, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-late-credential-"));
+    let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
+    let outgoing: SyncpeerSessionHandle | undefined;
+    const accepted: SyncpeerSessionHandle[] = [];
+    try {
+      const [source, browser] = await Promise.all([
+        createTestPeerIdentity(root, "source"), createTestPeerIdentity(root, "browser"),
+      ]);
+      const folderPassword = " synthetic-camera-password ";
+      const directory = path.join(root, "encrypted-source");
+      await mkdir(directory);
+      await writeFile(path.join(directory, "camera-test.txt"), "synthetic-camera-content");
+      const replica = await createNodeFolderReplica(directory, "1");
+      listener = await listenNodePeer({ ...source, host: "127.0.0.1", port: 0,
+        expectedDeviceId: browser.deviceId, timeoutMs: 3000,
+        sharedFolders: [{ id: "fixture-camera", encryption: { mode: "encrypted",
+          password: folderPassword }, replica }],
+        onSession: session => { accepted.push(session); },
+      });
+      outgoing = await createNodeSyncpeerClient().openSession({ ...browser,
+        host: "127.0.0.1", port: listener.port, expectedDeviceId: source.deviceId,
+        discoveryMode: "direct", deviceName: "synthetic-browser", timeoutMs: 3000 });
+      const deadline = Date.now() + 3000;
+      while (!(await outgoing.remoteFs.listFolderSyncStates?.() ?? [])
+        .some(folder => folder.folderId === "fixture-camera" && folder.indexReceived)) {
+        assert.ok(Date.now() < deadline, "Encrypted index was not received");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal((await outgoing.remoteFs.listFolders())[0]?.needsPassword, true);
+      await assert.rejects(outgoing.remoteFs.listFiles("fixture-camera"), /unavailable|locked/i);
+      assert.ok(outgoing.updateFolderPasswords, "Session must support in-place credential hydration");
+      await outgoing.updateFolderPasswords({ "fixture-camera": folderPassword });
+      assert.equal((await outgoing.remoteFs.listFolders())[0]?.needsPassword, false);
+      assert.deepEqual((await outgoing.remoteFs.listFiles("fixture-camera")).map(file => file.path),
+        ["camera-test.txt"]);
+      assert.equal(new TextDecoder().decode(await outgoing.remoteFs.readFileFully("fixture-camera", "camera-test.txt")),
+        "synthetic-camera-content");
+      // Whitespace is part of the encryption secret, not presentation formatting.
+      await outgoing.updateFolderPasswords({ "fixture-camera": folderPassword.trim() });
+      assert.equal((await outgoing.remoteFs.listFolders())[0]?.needsPassword, true,
+        "Removing spaces from a password must not silently unlock the folder");
+      await outgoing.updateFolderPasswords({ "fixture-camera": folderPassword });
+      assert.equal((await outgoing.remoteFs.listFolders())[0]?.needsPassword, false);
+      await outgoing.updateFolderPasswords({ "fixture-camera": "synthetic-wrong-password" });
+      assert.equal((await outgoing.remoteFs.listFolders())[0]?.needsPassword, true);
+      await outgoing.updateFolderPasswords({ "fixture-camera": folderPassword });
+      assert.deepEqual((await outgoing.remoteFs.listFiles("fixture-camera")).map(file => file.path),
+        ["camera-test.txt"], "Correcting a wrong password must replay retained encrypted metadata");
+      assert.equal(outgoing.isClosed(), false);
+      assert.equal(outgoing.isClosed(), false, "Credential hydration must not tear down the TLS session");
+    } finally {
+      await outgoing?.close();
+      await Promise.allSettled(accepted.map(session => session.close()));
+      await listener?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });

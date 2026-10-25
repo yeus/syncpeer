@@ -411,3 +411,61 @@ test("background handoff arms one service session and stops it once on resume", 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("late folder credentials update the handoff without replacing a healthy session", { timeout: 45000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-background-secrets-"));
+  const adapter = createNodeHostAdapter();
+  const preparedPasswords: Array<Record<string, string> | undefined> = [];
+  let port = 0;
+  const [ownerIdentity, joiningIdentity] = (await Promise.all([
+    identity(root, "owner"), identity(root, "joining"),
+  ])).sort((a, b) => b.deviceId.replaceAll("-", "").localeCompare(a.deviceId.replaceAll("-", "")));
+  const owner = createSyncpeerBrowserClient({ hostAdapter: { ...adapter,
+    connectTls: async () => { throw new Error("Synthetic outbound failure"); },
+    listenTls: async options => {
+      const listener = await adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 });
+      port = listener.port;
+      return listener;
+    },
+  }, platformAdapter: {
+    readDefaultIdentity: async () => ownerIdentity,
+    prepareBackgroundSession: async options => { preparedPasswords.push(options.folderPasswords); },
+    ownedDevices: async () => [
+      { id: "owner-slot", syncthingId: ownerIdentity.deviceId, state: "active" as const, signingKey: "owner-key" },
+      { id: "joining-slot", syncthingId: joiningIdentity.deviceId, state: "active" as const, signingKey: "joining-key" },
+    ],
+  } });
+  const connected = Promise.withResolvers<void>();
+  const unsubscribe = owner.subscribeLifecycle(state => {
+    if (state.phase === "connected") connected.resolve();
+  });
+  let outgoing: SyncpeerSessionHandle | undefined;
+  try {
+    await assert.rejects(owner.connectAndSync({ host: "127.0.0.1", port: 1, listenPort: 22997,
+      remoteId: joiningIdentity.deviceId, deviceName: "synthetic-owner",
+      discoveryMode: "direct", timeoutMs: 1000 }));
+    outgoing = await createSyncpeerCoreClient(adapter).openSession({ ...joiningIdentity,
+      host: "127.0.0.1", port, expectedDeviceId: ownerIdentity.deviceId,
+      deviceName: "synthetic-joining", discoveryMode: "direct", timeoutMs: 2000,
+    });
+    await connected.promise;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.ok(preparedPasswords.length >= 1, "The incoming adoption must arm the background handoff.");
+    assert.deepEqual(preparedPasswords.at(-1) ?? {},
+      {}, "The initial handoff must reflect the options that opened the session.");
+    const overview = await owner.connectAndGetOverview({ host: "127.0.0.1", port: 1,
+      listenPort: 22997, remoteId: joiningIdentity.deviceId, deviceName: "synthetic-owner",
+      discoveryMode: "direct", timeoutMs: 1000,
+      folderPasswords: { camera: "synthetic-folder-password" } });
+    assert.equal(overview.device?.id, joiningIdentity.deviceId);
+    assert.equal(outgoing.isClosed(), false, "Credential hydration must not break the peer's TLS session");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(preparedPasswords.at(-1), { camera: "synthetic-folder-password" },
+      "Newly loaded credentials must reach the next background handoff.");
+  } finally {
+    unsubscribe();
+    await outgoing?.close();
+    await owner.disconnect();
+    await rm(root, { recursive: true, force: true });
+  }
+});

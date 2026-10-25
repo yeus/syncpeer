@@ -148,7 +148,7 @@ export const migrateActiveLegacyFolderPasswords = (state: AppState) => {
   for (const [storedKey, password] of Object.entries(state.passwords.saved)) {
     if (storedKey.includes(FOLDER_PASSWORD_SCOPE_SEPARATOR)) continue;
     const folderId = storedKey.trim();
-    if (!folderId || !password.trim()) continue;
+    if (!folderId || !password.length) continue;
     const scopedKey = folderPasswordScopedKey(normalizedSource, folderId);
     if (!scopedKey) continue;
     if (!next[scopedKey]) {

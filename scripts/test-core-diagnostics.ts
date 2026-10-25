@@ -482,6 +482,7 @@ const secondaryHandshake = new Uint8Array([
     { folders: [], secondary: true },
   ),
 ]);
+let promotedIndexSent = false;
 let promotionWriteCount = 0;
 let promotedIndexHandlerReady = false;
 const promotionParser = new FrameParser((type, message) => {
@@ -498,27 +499,23 @@ const promotionSocket = createFakeTlsSocket(
     promotionWriteCount += 1;
     if (promotionWriteCount === 1) return;
     const peerParser = new FrameParser((type) => {
-      if (type !== MessageTypeValues.INDEX) return;
-      enqueue(
-        promotedIndexHandlerReady
-          ? encodeMessageFrame(
-              MessageTypeValues.INDEX,
-              Index,
-              {
-                folder: "documents",
-                files: [{ name: "example.txt", type: 0, size: 1 }],
-                last_sequence: 1,
-              },
-            )
-          : encodeMessageFrame(
-              MessageTypeValues.CLOSE,
-              Close,
-              { reason: "handling index for documents: documents: folder is not running" },
-            ),
-      );
+      // An unsolicited Index before promotion is a protocol error. An
+      // ordinary browsing peer instead waits for the primary ClusterConfig.
+      if (type === MessageTypeValues.INDEX && !promotedIndexHandlerReady) {
+        enqueue(encodeMessageFrame(MessageTypeValues.CLOSE, Close,
+          { reason: "handling index for documents: documents: folder is not running" }));
+      }
     });
-    promotionParser.feed(data);
     peerParser.feed(data);
+    promotionParser.feed(data);
+    if (promotedIndexHandlerReady && !promotedIndexSent) {
+      promotedIndexSent = true;
+      enqueue(encodeMessageFrame(MessageTypeValues.INDEX, Index, {
+        folder: "documents",
+        files: [{ name: "example.txt", type: 0, size: 1 }],
+        last_sequence: 1,
+      }));
+    }
   },
 );
 const promotionClient = createSyncpeerCoreClient({

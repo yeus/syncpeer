@@ -11,7 +11,8 @@ export const changesSessionConfiguration = (operation: unknown, path?: unknown):
     "register", "attachDownloads", "detachDownloads", "saveProfileSettings",
     "savePersonalSpaceSetting", "resolvePersonalSpaceConflict", "appendPersonalSpaceChange",
     "importPairingTransfer", "revokeOwnedDevice", "recoverOwnedDevice",
-    "saveConnectionPasswords", "mergeConnectionPasswords",
+    // Updating local decryption passwords does not alter peer membership or
+    // published folder structure; the foreground session hydrates them live.
   ].includes(operation);
 
 /** Apply a document command, then invalidate prepared/live peer views only after the mutation succeeds. */

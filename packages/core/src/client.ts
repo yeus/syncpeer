@@ -257,6 +257,8 @@ export interface SyncpeerSessionHandle {
   /** Identity verified from the peer certificate during the TLS handshake. */
   remoteDeviceId: string;
   remoteFs: RemoteFs;
+  /** Hydrate newly loaded local folder secrets without replacing an active TLS session. */
+  updateFolderPasswords?: (passwords: Record<string, string>) => Promise<void>;
   connectedVia: string;
   transportKind: "direct-tcp" | "direct-quic" | "relay";
   connectionScope?: ConnectionScope;
@@ -946,11 +948,13 @@ class BepSession {
   readonly closurePromise: Promise<SyncpeerSessionClosure>;
   private closed = false;
   private echoedClusterConfig = false;
-  private localIndexId: string;
+  private localIndexId = "1";
   private localIndexIdsByFolder = new Map<string, string>();
   private localSequencesByFolder = new Map<string, number>();
   private pendingIndexByFolder = new Map<string, PendingIndexFrame>();
   private indexApplyInFlight = new Set<string>();
+  private lockedEncryptedIndexes = new Map<string, Map<string, BepFileInfo>>();
+  private announcedTokens = new Map<string, Uint8Array>();
   private stateTasks = new Set<Promise<void>>();
   private readonly indexTasks = new Set<Promise<void>>();
   private clusterFoldersTask: Promise<void> = Promise.resolve();
@@ -967,7 +971,6 @@ class BepSession {
   >();
   private readonly localVersionCounterId: string;
   private activeFolderIds = new Set<string>();
-  private sentIndexBootstrapFolderIds = new Set<string>();
   private socket: SyncpeerTlsSocket;
   private adapter: SyncpeerHostAdapter;
   private kdf: PasswordKdf;
@@ -1013,12 +1016,11 @@ class BepSession {
     this.readyPromise = new Promise<void>((resolve) => {
       this.readyResolve = resolve;
     });
-    this.localIndexId = "1";
     this.localVersionCounterId = versionCounterId(this.localDeviceId);
     this.folderPasswords = new Map(
       Object.entries(folderPasswords ?? {})
-        .map(([folderId, password]) => [folderId.trim(), password.trim()] as const)
-        .filter(([folderId, password]) => folderId !== "" && password !== ""),
+        .map(([folderId, password]) => [folderId.trim(), password] as const)
+        .filter(([folderId, password]) => folderId !== "" && password.length > 0),
     );
     this.configureSharedFolders(sharedFolders);
   }
@@ -1044,7 +1046,7 @@ class BepSession {
     }
     if (folder.ciphertextReplica) throw new Error("Ciphertext replica requires explicit ciphertext sharing.");
     if (folder.encryption.mode === "encrypted") {
-      const password = folder.encryption.password.trim();
+      const password = folder.encryption.password;
       if (!password) throw new Error(`Encrypted shared folder ${id} requires a password.`);
       this.folderPasswords.set(id, password);
       this.sharedFolders.set(id, {
@@ -1066,15 +1068,13 @@ class BepSession {
   }
 
   async initialize(leftover: Uint8Array): Promise<void> {
-    await this.initializeSharedFolders();
+    // The local replica has no persisted BEP index epoch yet. Assign a fresh
+    // epoch for each session so a wiped/rebuilt index is never mistaken for
+    // the old one. Remote-only browsers advertise index ID zero separately.
     const random = await this.adapter.randomBytes(8);
-    const view = new DataView(
-      random.buffer,
-      random.byteOffset,
-      random.byteLength,
-    );
-    const value = view.getBigUint64(0, false);
-    this.localIndexId = value === 0n ? "1" : value.toString();
+    const raw = new DataView(random.buffer, random.byteOffset, random.byteLength).getBigUint64(0, false);
+    this.localIndexId = (raw === 0n ? 1n : raw).toString();
+    await this.initializeSharedFolders();
     if (leftover.length > 0) {
       this.parser.feed(leftover);
     }
@@ -1085,6 +1085,44 @@ class BepSession {
       () => void this.checkKeepalive(),
       Math.max(1, Math.floor(this.pingIntervalMs / 2)),
     );
+  }
+
+  async updateFolderPasswords(passwords: Record<string, string>): Promise<void> {
+    const updated = new Map(Object.entries(passwords)
+      .map(([id, password]) => [id.trim(), password] as const)
+      .filter(([id, password]) => !!id && password.length > 0));
+    const changed = [...new Set([...this.folderPasswords.keys(), ...updated.keys()])]
+      .filter(id => this.folderPasswords.get(id) !== updated.get(id));
+    if (!changed.length) return;
+    this.folderPasswords.clear();
+    for (const [id, password] of updated) this.folderPasswords.set(id, password);
+    for (const folderId of changed) {
+      const state = this.folders.get(folderId);
+      if (!state?.encrypted || this.sharedFolders.has(folderId)) continue;
+      state.files.clear();
+      state.folderCrypto = undefined;
+      state.needsPassword = true;
+      state.passwordError = undefined;
+      const password = updated.get(folderId);
+      if (!password) continue;
+      try {
+        const crypto = await deriveUntrustedFolderCrypto(folderId, password, this.kdf);
+        if (!await verifyUntrustedPasswordToken(crypto, this.announcedTokens.get(folderId))) {
+          state.passwordError = "Encryption password does not match this folder.";
+          continue;
+        }
+        state.folderCrypto = crypto;
+        state.needsPassword = false;
+        const pending = this.lockedEncryptedIndexes.get(folderId);
+        if (pending) {
+          const applied = await this.applyIndexFiles(state, folderId, [...pending.values()]);
+          this.log("untrusted.folder.hydrated", { count: applied.decryptedStored });
+        }
+      } catch (error) {
+        state.needsPassword = true;
+        state.passwordError = error instanceof Error ? error.message : String(error);
+      }
+    }
   }
 
   async advertiseSharedFolders(): Promise<void> {
@@ -1354,32 +1392,14 @@ class BepSession {
   private async requestFolderIndex(folderId: string): Promise<void> {
     const normalizedFolderId = String(folderId ?? "").trim();
     if (!normalizedFolderId) return;
-    this.activeFolderIds = new Set([normalizedFolderId]);
-    if (this.sentIndexBootstrapFolderIds.has(normalizedFolderId)) return;
     const folder = this.folders.get(normalizedFolderId);
     if (!folder) throw new Error(`Unknown folder: ${normalizedFolderId}`);
-    const stopReason = Number(folder.stopReason ?? 0);
-    if (stopReason !== 0) {
-      this.log("index.bootstrap.skipped", {
-        folderId: normalizedFolderId,
-        stopReason,
-        reason: "folder_stopped_by_peer",
-      });
-      return;
-    }
-    const indexFrame = encodeMessageFrame(
-      MessageTypeValues.INDEX,
-      Index,
-      { folder: normalizedFolderId, files: [], last_sequence: 0 },
-      0,
-    );
-    await this.writeFrame(indexFrame);
-    this.sentIndexBootstrapFolderIds.add(normalizedFolderId);
-    this.log("index.bootstrap.sent", {
-      folderId: normalizedFolderId,
-      bytes: indexFrame.length,
-      mode: "lazy",
-    });
+    this.activeFolderIds = new Set([normalizedFolderId]);
+    // BEP has no request-index operation. Empty Index is a publication, not
+    // a request, and Syncthing may reject it for a browse-only folder.
+    // Our ClusterConfig already advertises a zero remote index/sequence to
+    // request a full remote inventory on connection.
+    this.log("index.bootstrap.skipped", { reason: "passive_remote_index" });
   }
 
   private sharedFolderConfig(folderId: string) {
@@ -1582,6 +1602,7 @@ class BepSession {
     const preserveIndexState = previousState &&
       previousState.remoteIndexId === ctx.remoteIndexId &&
       previousState.remoteMaxSequence === ctx.remoteMaxSequence;
+    if (ctx.announcedToken?.length) this.announcedTokens.set(ctx.folderId, ctx.announcedToken.slice());
     const state: FolderState = {
       id: ctx.folderId,
       label: folder.label || ctx.folderId,
@@ -1599,10 +1620,6 @@ class BepSession {
       files: preserveIndexState ? previousState.files : new Map(),
     };
     this.folders.set(ctx.folderId, state);
-    const knownSequence = Number.isFinite(Number(ctx.remoteMaxSequence)) ? Number(ctx.remoteMaxSequence) : 0;
-    if (knownSequence > (this.localSequencesByFolder.get(ctx.folderId) ?? 0)) {
-      this.localSequencesByFolder.set(ctx.folderId, knownSequence);
-    }
     if (ctx.encrypted) {
       this.log("untrusted.folder.state", {
         folderId: ctx.folderId,
@@ -1661,7 +1678,7 @@ class BepSession {
       name: this.localDeviceName,
       addresses: ["dynamic"],
       compression: 0,
-      max_sequence: this.localSequencesByFolder.get(String(folder.id ?? "")) ?? 0,
+      max_sequence: 0,
       index_id: localFolderIndexId,
       encryption_password_token: incomingLocalToken,
     });
@@ -1672,7 +1689,7 @@ class BepSession {
     const folderId = String(folder.id ?? "");
     if (this.sharedFolders.has(folderId)) return this.sharedFolderConfig(folderId);
     const state = this.folders.get(folderId);
-    const localFolderIndexId = this.localIndexIdForFolder(folderId);
+    const localFolderIndexId = "0";
     const devices = this.echoFolderDevices(folder, localFolderIndexId);
     const sourceType = Number(folder.type ?? 0);
     const echoedType = state?.encrypted ? 3 : sourceType;
@@ -1853,6 +1870,13 @@ class BepSession {
     if (shared?.ciphertextReplica && shared.encryption.mode === "ciphertext") {
       await this.handleCiphertextIndex(folderId, state, files, shared);
       return;
+    }
+    // Keep encrypted wire metadata even after unlock so replacing or correcting
+    // a credential does not require another TLS connection or lose an index.
+    if (state.encrypted && !shared) {
+      const queued = this.lockedEncryptedIndexes.get(folderId) ?? new Map<string, BepFileInfo>();
+      for (const file of files) queued.set(String(file.name ?? ""), file);
+      this.lockedEncryptedIndexes.set(folderId, queued);
     }
     this.log("index.received", {
       folderId,
@@ -2822,6 +2846,7 @@ function bepSessionHandle(
       clientName: String(hello.client_name ?? "unknown"),
       clientVersion: String(hello.client_version ?? "unknown"),
     }),
+    updateFolderPasswords: passwords => session.updateFolderPasswords(passwords),
     connectedVia,
     transportKind,
     connectionScope,

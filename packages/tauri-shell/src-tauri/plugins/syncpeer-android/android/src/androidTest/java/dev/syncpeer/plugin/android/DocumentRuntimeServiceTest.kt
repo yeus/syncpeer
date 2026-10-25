@@ -11,6 +11,7 @@ import android.provider.DocumentsContract
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.*
 import org.junit.Test
@@ -200,6 +201,31 @@ class DocumentRuntimeServiceTest {
       first.get(20, TimeUnit.SECONDS)
       second.get(20, TimeUnit.SECONDS)
     } finally {
+      context.unbindService(client.first)
+    }
+  }
+
+  @Test fun supersededBackgroundSessionStartsStillSettle() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    val release = CountDownLatch(1)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      assertTrue(runtime.blockSessionWorkerForTesting(release).await(3, TimeUnit.SECONDS))
+      val first = runtime.startBackgroundSession(JSONObject().put("operation", "connect")
+        .put("options", JSONObject().put("host", "synthetic-first.invalid").put("port", 22000)))
+      val second = runtime.startBackgroundSession(JSONObject().put("operation", "connect")
+        .put("options", JSONObject().put("host", "synthetic-second.invalid").put("port", 22000)))
+      val stopped = runtime.stopBackgroundSession()
+      // Supersession must complete both futures before the blocked worker executes.
+      first.get(3, TimeUnit.SECONDS)
+      second.get(3, TimeUnit.SECONDS)
+      release.countDown()
+      stopped.get(20, TimeUnit.SECONDS)
+      assertNull(BackgroundSessionStore(context).load())
+    } finally {
+      release.countDown()
       context.unbindService(client.first)
     }
   }

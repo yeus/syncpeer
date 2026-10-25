@@ -12,6 +12,17 @@ export const shouldRenderFolderRootList = (
   rootFolderCount: number,
 ) => isConnected || rootFolderCount > 0;
 
+/** Network connectivity does not prove metadata or bytes are synchronized. */
+export const connectedFolderStatus = (
+  folders: readonly { locked: boolean; indexReceived: boolean }[],
+): string => {
+  if (!folders.length) return "Connected · no folders advertised";
+  const locked = folders.filter(folder => folder.locked).length;
+  if (locked) return `Connected · encrypted folder${locked === 1 ? "" : "s"} locked`;
+  if (folders.some(folder => !folder.indexReceived)) return "Connected · waiting for file indexes";
+  return "Connected · file index available";
+};
+
 export const localDiscoveryUnavailableNotice = (rawError: unknown): string | null => {
   const message = rawError instanceof Error ? rawError.message : String(rawError);
   const normalized = message.toLowerCase();

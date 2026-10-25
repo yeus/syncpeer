@@ -21,6 +21,7 @@ import androidx.annotation.RequiresApi
 import androidx.javascriptengine.JavaScriptSandbox
 import org.json.JSONObject
 import android.provider.DocumentsContract
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -52,6 +53,7 @@ class DocumentRuntimeService : Service() {
   @Volatile private var sessionStarted = false
   @Volatile private var sessionRequest: String? = null
   @Volatile private var sessionGeneration = 0L
+  private var pendingSessionStart: CompletableFuture<JSONObject>? = null
   @Volatile private var sessionPhase = "idle"
   @Volatile private var sessionError: String? = null
   @Volatile private var foregroundStarted = false
@@ -126,6 +128,17 @@ class DocumentRuntimeService : Service() {
     }
 
     internal fun backgroundSessionStatus(): JSONObject = sessionStatus()
+    /** Instrumentation-only deterministic scheduling barrier; never exposed to application code. */
+    internal fun blockSessionWorkerForTesting(release: CountDownLatch): CountDownLatch {
+      check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+      val entered = CountDownLatch(1)
+      worker.execute {
+        entered.countDown()
+        release.await(8, TimeUnit.SECONDS)
+      }
+      return entered
+    }
+
 
     fun command(input: JSONObject): CompletableFuture<JSONObject> {
       return evaluate("""
@@ -219,8 +232,13 @@ class DocumentRuntimeService : Service() {
   }
 
   @Synchronized
-  private fun nextSessionGeneration(): Long {
+  private fun nextSessionGeneration(start: CompletableFuture<JSONObject>? = null): Long {
+    // Every superseded start must settle, even if its task never reaches the
+    // single-threaded worker (e.g. a queued start overtaken by priority stop).
+    val previous = pendingSessionStart
+    pendingSessionStart = start
     sessionGeneration += 1
+    previous?.complete(sessionStatus())
     return sessionGeneration
   }
 
@@ -346,17 +364,31 @@ class DocumentRuntimeService : Service() {
         result.complete(sessionStatus())
         return result
       }
-      val generation = nextSessionGeneration()
+      val generation = nextSessionGeneration(result)
+      result.whenComplete { _, _ ->
+        synchronized(this@DocumentRuntimeService) {
+          if (pendingSessionStart === result) pendingSessionStart = null
+        }
+      }
       sessionRequest = request
       sessionError = null
       ensureForeground()
       sessionPhase = "starting"
       worker.execute {
+        // A high-priority stop can overtake a queued start. Do not resurrect a
+        // stopped session by persisting that obsolete request afterwards.
+        if (generation != sessionGeneration || sessionRequest != request) {
+          result.complete(sessionStatus())
+          return@execute
+        }
         try {
           if (persist) backgroundSessions.save(request)
           val reason = backgroundPauseReason(input)
           if (reason != null) {
-            if (generation != sessionGeneration) return@execute
+            if (generation != sessionGeneration) {
+              result.complete(sessionStatus())
+              return@execute
+            }
             sessionPhase = "waiting"
             sessionError = reason
             SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", reason)
@@ -364,7 +396,10 @@ class DocumentRuntimeService : Service() {
             return@execute
           }
           initialized.whenComplete { initialStatus, initializationError ->
-            if (generation != sessionGeneration || sessionRequest != request) return@whenComplete
+            if (generation != sessionGeneration || sessionRequest != request) {
+              result.complete(sessionStatus())
+              return@whenComplete
+            }
             if (initializationError != null) {
               sessionPhase = "error"
               sessionError = initializationError.message ?: "Document runtime unavailable."
@@ -383,7 +418,10 @@ class DocumentRuntimeService : Service() {
             }
           }
         } catch (error: Exception) {
-          if (generation != sessionGeneration) return@execute
+          if (generation != sessionGeneration) {
+            result.complete(sessionStatus())
+            return@execute
+          }
           sessionPhase = "error"
           sessionError = error.message ?: "Background session could not start."
           result.completeExceptionally(error)
@@ -404,7 +442,10 @@ class DocumentRuntimeService : Service() {
       const value = await globalThis.syncpeerSession.command(input);
       return JSON.stringify({result: value === undefined ? null : value});
     """.trimIndent(), request.toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
-      if (generation != sessionGeneration || sessionRequest != request) return@whenComplete
+      if (generation != sessionGeneration || sessionRequest != request) {
+        result.complete(sessionStatus())
+        return@whenComplete
+      }
       if (error != null) {
         sessionPhase = "error"
         sessionError = error.message ?: "Background session could not connect."

@@ -346,6 +346,8 @@ const createTlsSocket = (
     });
   },
 });
+const SLOW_DOCUMENT_COMMAND_MS = 2000;
+
 class TauriAdapters {
   private readonly options?: CreateTauriAdaptersOptions;
   private readonly platform: ReturnType<typeof detectRuntimePlatform>;
@@ -467,7 +469,16 @@ class TauriAdapters {
         }
         return done as T;
       }
+      const startedAtMs = Date.now();
       const response = await this.invokeWithLogging<{ result: T }>("syncpeer_document_command", { request });
+      const durationMs = Date.now() - startedAtMs;
+      if (durationMs >= SLOW_DOCUMENT_COMMAND_MS) {
+        // The operation name is static; never include folder ids or paths here.
+        logUi(this.options, "core.document.command.slow", {
+          operation: request.operation,
+          durationMs,
+        });
+      }
       // Android owns document access in its service, so the mutation hook that the
       // desktop path gets from dispatchDocumentCommandWithSessionConfiguration has
       // to run here as well; without it a live session kept stale folder and trust

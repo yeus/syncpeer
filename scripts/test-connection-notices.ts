@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  connectedFolderStatus,
   folderRootEmptyNotice,
   localDiscoveryUnavailableNotice,
   shouldRenderFolderRootList,
@@ -21,6 +22,24 @@ test("renders attached local folder roots after the peer disconnects", () => {
   assert.equal(shouldRenderFolderRootList(false, 1), true);
   assert.equal(shouldRenderFolderRootList(false, 0), false);
   assert.equal(shouldRenderFolderRootList(true, 0), true);
+});
+
+test("connected folder status does not claim synchronization before indexes and unlock", () => {
+  assert.equal(connectedFolderStatus([]), "Connected · no folders advertised");
+  assert.equal(connectedFolderStatus([{ locked: false, indexReceived: false }]),
+    "Connected · waiting for file indexes");
+  assert.equal(connectedFolderStatus([{ locked: true, indexReceived: true }]),
+    "Connected · encrypted folder locked");
+  assert.equal(connectedFolderStatus([{ locked: false, indexReceived: true }]),
+    "Connected · file index available");
+  assert.equal(connectedFolderStatus([
+    { locked: false, indexReceived: true },
+    { locked: true, indexReceived: false },
+  ]), "Connected · encrypted folder locked");
+  assert.equal(connectedFolderStatus([
+    { locked: true, indexReceived: true },
+    { locked: true, indexReceived: false },
+  ]), "Connected · encrypted folders locked");
 });
 
 test("explains local discovery port contention without implying connection failure", () => {

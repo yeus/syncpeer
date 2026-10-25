@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
-import { patchManifest } from "./prepare-android-legacy-launcher.mjs";
+import { isAndroidProjectInitialized, patchManifest } from "./prepare-android-legacy-launcher.mjs";
 import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -43,6 +43,39 @@ test("Android builds keep the unsupported launcher separate from the Tauri activ
   const modern = fs.readFileSync("scripts/android-legacy-launcher/values-v26/launcher.xml", "utf8");
   assert.match(legacy, /syncpeer_legacy_activity">true/);
   assert.match(modern, /syncpeer_modern_activity">true/);
+});
+
+test("Android init cannot be skipped by a partial generated directory or signing files", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-init-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const android = path.join(temp, "gen/android");
+  const manifest = path.join(android, "app/src/main/AndroidManifest.xml");
+  const gradle = path.join(android, "app/build.gradle.kts");
+  assert.equal(isAndroidProjectInitialized(android), false);
+  fs.mkdirSync(path.join(android, "app"), { recursive: true });
+  fs.writeFileSync(path.join(android, "keystore.properties"), "synthetic signing data");
+  assert.equal(isAndroidProjectInitialized(android), false);
+  fs.mkdirSync(path.dirname(manifest), { recursive: true });
+  fs.writeFileSync(manifest, "<manifest />");
+  assert.equal(isAndroidProjectInitialized(android), false);
+  fs.writeFileSync(gradle, "plugins {}");
+  assert.equal(isAndroidProjectInitialized(android), true);
+  fs.rmSync(manifest);
+  assert.equal(isAndroidProjectInitialized(android), false);
+});
+
+test("Android build hooks initialize before manifest patching and temporary signing files", () => {
+  const scripts = json("packages/tauri-shell/package.json").scripts;
+  for (const name of ["preandroid:dev", "prebuild:android:dev", "prebuild:android:e2e", "prebuild:android:prod"]) {
+    assert.match(scripts[name], /^npm run icons:ensure:android && node .*prepare-android-legacy-launcher\.mjs$/);
+  }
+  const icons = fs.readFileSync("scripts/ensure-tauri-icons.mjs", "utf8");
+  assert.match(icons, /if \(isAndroidProjectInitialized\(androidRoot\)\) return/);
+  const signing = fs.readFileSync("scripts/build-android-prod-with-secrets.sh", "utf8");
+  const bootstrap = signing.indexOf("npm run icons:ensure:android");
+  const signingFiles = signing.indexOf('create_gradle_keystore_properties "$path"');
+  assert.ok(bootstrap >= 0 && signingFiles > bootstrap,
+    "Generated Android project initialization must precede temporary signing properties.");
 });
 
 test("API 29 waits for the provisioned WebView to become current", () => {

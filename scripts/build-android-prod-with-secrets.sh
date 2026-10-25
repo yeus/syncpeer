@@ -448,13 +448,15 @@ for path in "${properties_candidates[@]}"; do
     exit 1
   fi
 done
+# Initialize before creating temporary signing properties: the mere presence
+# of gen/android is not evidence that Tauri generated the Android manifest.
+npm run icons:ensure:android
 for path in "${properties_candidates[@]}"; do
   create_gradle_keystore_properties "$path"
   temp_keystore_properties_paths+=("$path")
 done
 echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
 ensure_gradle_release_signing_config
-npm run icons:ensure:android
 ensure_apksigner_on_path
 npm run build:android:prod -w @syncpeer/tauri-shell
 sign_unsigned_release_apk_if_needed "$repo_root"

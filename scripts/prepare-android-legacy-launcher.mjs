@@ -8,6 +8,11 @@ const templates = path.join(root, "scripts/android-legacy-launcher");
 const mainMarker = 'android:name=".MainActivity"';
 const legacyMarker = 'android:name=".UnsupportedAndroidActivity"';
 
+/** A signing properties file or icon directory alone is not an initialized Tauri project. */
+export const isAndroidProjectInitialized = (androidRoot) =>
+  fs.existsSync(path.join(androidRoot, "app/src/main/AndroidManifest.xml")) &&
+  fs.existsSync(path.join(androidRoot, "app/build.gradle.kts"));
+
 export const patchManifest = (manifest) => {
   const mainStart = manifest.indexOf(mainMarker);
   if (mainStart < 0) throw new Error("Generated Android manifest has no Syncpeer main activity.");

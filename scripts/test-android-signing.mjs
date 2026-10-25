@@ -285,7 +285,7 @@ test('failed packaging restores the generated Gradle file and removes temporary 
     fs.copyFileSync(path.join(root, 'scripts', script), path.join(copyScripts, script))
   }
   fs.writeFileSync(gradle, 'original-gradle-file\n')
-  fs.writeFileSync(path.join(setup.dir, 'bin/npm'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+  fs.writeFileSync(path.join(setup.dir, 'bin/npm'), '#!/bin/sh\ncase "$*" in\n  *icons:ensure:android*) exit 0 ;;\n  *) exit 1 ;;\nesac\n', { mode: 0o755 })
   fs.writeFileSync(path.join(setup.dir, 'bin/apksigner'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
   const result = spawnSync('bash', [path.join(copyScripts, 'build-android-prod-with-secrets.sh')], {
     cwd: copyRoot,
@@ -300,6 +300,8 @@ test('failed packaging restores the generated Gradle file and removes temporary 
     timeout: 5000,
   })
   assert.notEqual(result.status, 0)
+  assert.match(result.stdout, /Prepared temporary Gradle keystore\.properties/,
+    'The fixture must exercise failure after creating temporary signing files.')
   assert.equal(fs.readFileSync(gradle, 'utf8'), 'original-gradle-file\n')
   assert.equal(fs.existsSync(path.join(android, 'keystore.properties')), false)
   assert.equal(fs.existsSync(path.join(android, 'app/keystore.properties')), false)

@@ -128,6 +128,15 @@ export { createDuplexChannel, createStream } from "./transfer/frpBus.js";
 export { createPortFromTransport } from "./transfer/frpTransport.js";
 export type { DuplexChannel, Port, Stream } from "./transfer/frpBus.js";
 export type { DuplexTransport } from "./transfer/frpTransport.js";
+export { createStreamRpcRequest, createRpcScopeStore } from "./transfer/frpRpc.js";
+export type { RpcMessagePort, RpcResponseResult, RpcScopeStore } from "./transfer/frpRpc.js";
+export { createServiceSessionRpcClient } from "./sync/serviceSessionRpc.js";
+export { parseServiceSessionStatusEvent, serviceSessionStatusIsTerminal,
+  serviceSessionStatusMessage } from "./sync/serviceSessionStatus.js";
+export { SERVICE_PROTOCOL_VERSION, parseServiceCommand, parseServiceResponse,
+  serviceCommandSchema, downloadFrameSchema, uploadFrameSchema } from "./sync/serviceProtocol.js";
+export type { ServiceCommand } from "./sync/serviceProtocol.js";
+export type { ServiceSessionPhase, ServiceSessionStatusEvent } from "./sync/serviceSessionStatus.js";
 export type {
   DownloadCheckpoint,
   FileDownloadMetadata,

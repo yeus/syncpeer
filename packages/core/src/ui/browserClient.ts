@@ -2,6 +2,9 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
   type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerSessionHandle,
   type SyncpeerTlsSocket,
   withMetadataSession } from "../client.js";
+import { createServiceOwnedSession } from "../sync/serviceRemoteFs.js";
+import { parseServiceSessionStatusEvent,
+  type ServiceSessionStatusEvent } from "../sync/serviceSessionStatus.js";
 import { startIncomingPeerService } from "../sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../sync/peerSessionManager.js";
 import { createConnectionLifecycle, type ConnectionLifecycle,
@@ -221,6 +224,10 @@ export interface SyncpeerPlatformAdapter {
   prepareBackgroundSession?: (options: Omit<ConnectOptions, "sharedFolders">) => Promise<void>;
   startBackgroundSession?: (options: Omit<ConnectOptions, "sharedFolders">) => Promise<void>;
   stopBackgroundSession?: () => Promise<void>;
+  /** Private typed RPC transport to the Android service-owned TypeScript peer runtime. */
+  serviceSessionCommand?: (request: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
+  /** Push subscription for service-owned peer status; replay must start at the latest revision. */
+  subscribeServiceSessionEvents?: (listener: (event: unknown) => void) => Promise<() => void>;
   acknowledgeCachedSync?: (folderId: string, path: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) => Promise<boolean>;
   readTextFile?: (path: string) => Promise<string>;
   readBinaryFile?: (path: string) => Promise<Uint8Array>;
@@ -353,6 +360,8 @@ export interface SyncpeerBrowserClient {
   joinPairingInvitation: (options: { invitation: PairingInvitation; password: string; remember: boolean;
     confirm: (code: string) => boolean | Promise<boolean> }) => Promise<{ remoteDeviceId: string }>;
   subscribeLifecycle: (listener: (state: ConnectionLifecycleState) => void) => () => void;
+  /** Android service-owned peer status push; no-op on platforms without it. */
+  subscribePeerStatus: (listener: (event: ServiceSessionStatusEvent) => void) => () => void;
   setOnline: (online: boolean) => Promise<void>;
   setForeground: (foreground: boolean) => Promise<void>;
   setTransferActive: (active: boolean) => Promise<void>;
@@ -665,6 +674,7 @@ type SessionRuntime = {
     | "releaseLocalCopy"
     | "setForeground"
     | "subscribeLifecycle"
+    | "subscribePeerStatus"
     | "setOnline"
     | "setTransferActive"
     | "acknowledgeCachedSync">;
@@ -1533,6 +1543,14 @@ async function openSessionImpl(
   signal: AbortSignal,
 ): Promise<SyncpeerSessionHandle> {
   const { normalized, credentials, coreOptions } = await prepareSession(ctx, connectOptions);
+  if (ctx.platformAdapter.serviceSessionCommand) {
+    const resolved = { ...normalized, cert: credentials.certPem, key: credentials.keyPem };
+    const session = await createServiceOwnedSession(ctx.platformAdapter.serviceSessionCommand,
+      resolved, signal, undefined, ctx.platformAdapter.subscribeServiceSessionEvents);
+    ctx.state.activeResolvedConnectOptions = resolved;
+    await prepareBackgroundHandoff(ctx.platformAdapter, resolved);
+    return session;
+  }
   const listener = await prepareIncomingListener(ctx, connectOptions, coreOptions);
   const preferred = await waitForPreferredIncoming(
     ctx,
@@ -1663,6 +1681,22 @@ async function setSessionForegroundImpl(
   lifecycle: ConnectionLifecycle<ConnectOptions>,
   foreground: boolean,
 ) {
+  if (ctx.platformAdapter.serviceSessionCommand) {
+    if (foreground) {
+      // The service owns the socket throughout Activity visibility changes.
+      ctx.state.backgroundSessionStarted = false;
+      await lifecycle.setForeground(true);
+      await ctx.platformAdapter.serviceSessionCommand({ operation: "uiVisible" });
+      await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
+      return;
+    }
+    const options = backgroundSessionOptions(ctx.state.activeResolvedConnectOptions);
+    if (options) await ctx.platformAdapter.startBackgroundSession?.(options);
+    await lifecycle.setTransferActive(false);
+    // Only detach the WebView's proxy; service socket ownership does not change.
+    await lifecycle.setForeground(false);
+    return;
+  }
   if (foreground) {
     // Resuming must not wait for the native stop: the service worker also runs
     // document I/O, so a busy or stalled stop delayed the lifecycle for seconds
@@ -1703,7 +1737,7 @@ async function releaseLocalCopyImpl(
   if (!ctx.platformAdapter.releaseLocalCopy) {
     throw new Error("Local copy release is unavailable on this platform.");
   }
-  const handoff = mode === "safe" && !!ctx.platformAdapter.startBackgroundSession;
+  const handoff = mode === "safe" && !!ctx.platformAdapter.startBackgroundSession && !ctx.platformAdapter.serviceSessionCommand;
   if (handoff && !ctx.state.activeResolvedConnectOptions) {
     throw new Error("Connect to a peer before verifying online copies.");
   }
@@ -1773,9 +1807,15 @@ async function disconnectSessionImpl(
   ctx.state.activeConnectOptions = null;
   ctx.state.activeResolvedConnectOptions = null;
   ctx.state.focusedFolderId = null;
+  // The native stop both clears the prepared Android background request and
+  // closes its one peer socket. Never race a separate RPC disconnect against it.
   if (!ctx.state.backgroundListenerActive) {
     ctx.state.backgroundSessionStarted = false;
-    await stopBackgroundHandoff(ctx);
+    if (ctx.platformAdapter.serviceSessionCommand) {
+      await ctx.platformAdapter.stopBackgroundSession?.();
+    } else {
+      await stopBackgroundHandoff(ctx);
+    }
   }
   await lifecycle.disconnect();
   if (ctx.state.backgroundListenerActive) {
@@ -1785,6 +1825,29 @@ async function disconnectSessionImpl(
   } else {
     await ctx.incoming.stopIncomingService();
   }
+}
+
+function subscribePeerStatusImpl(
+  ctx: SessionContext,
+  listener: (event: ServiceSessionStatusEvent) => void,
+): () => void {
+  const subscribe = ctx.platformAdapter.subscribeServiceSessionEvents;
+  if (!subscribe) return () => undefined;
+  let active = true;
+  let unsubscribe: () => void = () => undefined;
+  void subscribe(value => {
+    if (!active) return;
+    const event = parseServiceSessionStatusEvent(value);
+    if (event) listener(event);
+  }).then(cleanup => {
+    if (active) unsubscribe = cleanup;
+    else cleanup();
+  }, () => undefined);
+  return () => {
+    active = false;
+    unsubscribe();
+    unsubscribe = () => undefined;
+  };
 }
 
 function createSessionController(ctx: SessionContext): SessionRuntime {
@@ -1805,6 +1868,7 @@ function createSessionController(ctx: SessionContext): SessionRuntime {
         releaseLocalCopyImpl(ctx, lifecycle, folderId, mode, confirmedText),
       setForeground: (foreground) => setSessionForegroundImpl(ctx, lifecycle, foreground),
       subscribeLifecycle: lifecycle.subscribe,
+      subscribePeerStatus: listener => subscribePeerStatusImpl(ctx, listener),
       setOnline: lifecycle.setOnline,
       setTransferActive: lifecycle.setTransferActive,
       acknowledgeCachedSync: ctx.platformAdapter.acknowledgeCachedSync,

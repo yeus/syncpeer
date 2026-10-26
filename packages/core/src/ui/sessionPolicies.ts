@@ -44,6 +44,7 @@ export const createInitialSessionState = (): SessionState => ({
   nextRetryAtMs: null,
   closureReason: null,
   upgradeStatus: "idle",
+  peerStatus: null,
 });
 
 export const resolveOverviewSourceDeviceId = (

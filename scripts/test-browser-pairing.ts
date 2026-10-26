@@ -76,6 +76,53 @@ test("a service-owned Android session does not start a competing UI listener", a
   }
 });
 
+test("Android UI browses through the one service session across visibility changes", { timeout: 30000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-unified-service-"));
+  const localIdentity = await identity(root, "local");
+  const remoteIdentity = await identity(root, "remote");
+  let socketCount = 0, stops = 0, opens = 0;
+  const commands: string[] = [];
+  const client = createSyncpeerBrowserClient({ hostAdapter: { ...createNodeHostAdapter(),
+    listenTls: async () => { socketCount++; throw Error("UI must not listen."); },
+    connectTls: async () => { socketCount++; throw Error("UI must not dial."); },
+  }, platformAdapter: {
+    readDefaultIdentity: async () => localIdentity,
+    incomingSessionOwnedByService: true,
+    prepareBackgroundSession: async () => undefined,
+    startBackgroundSession: async () => undefined,
+    stopBackgroundSession: async () => { stops++; },
+    serviceSessionCommand: async request => {
+      commands.push(String(request.operation));
+      if (request.operation === "connect") { opens++; return { phase: "connected" }; }
+      if (request.operation === "overview") return {
+        folders: [{ id: "folder", label: "Folder", readOnly: true }],
+        device: { id: remoteIdentity.deviceId, deviceName: "synthetic", clientName: "test", clientVersion: "1" },
+        folderSyncStates: [], connectedVia: "service-owned", transportKind: "direct-tcp",
+      };
+      if (request.operation === "listFolders") return [{ id: "folder", label: "Folder", readOnly: true }];
+      if (request.operation === "disconnect") return { phase: "idle" };
+      if (request.operation === "uiVisible") return { visible: true };
+      throw Error("Unexpected service command " + String(request.operation));
+    },
+  } });
+  try {
+    const options = { host: "127.0.0.1", port: 22000, remoteId: remoteIdentity.deviceId,
+      discoveryMode: "direct" as const, timeoutMs: 1000 };
+    const remote = await client.connectAndSync(options);
+    assert.deepEqual((await remote.listFolders()).map(folder => folder.id), ["folder"]);
+    await client.setForeground(false);
+    await client.setForeground(true);
+    assert.equal(socketCount, 0, "UI must never create a competing peer connection.");
+    assert.equal(stops, 0, "Returning to the foreground must not stop the service connection.");
+    assert.ok(opens >= 1);
+  } finally {
+    await client.disconnect();
+    await rm(root, { recursive: true, force: true });
+  }
+  assert.equal(stops, 1, "Explicit disconnect must invoke exactly one native service stop, clearing the armed background request.");
+  assert.equal(commands.includes("disconnect"), false, "Do not independently stop the service through both the UI RPC and native handoff.");
+});
+
 test("a reused browser listener advertises current folders and adopts current connection options", { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-listener-refresh-"));
   const adapter = createNodeHostAdapter();

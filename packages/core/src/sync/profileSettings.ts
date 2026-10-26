@@ -18,6 +18,7 @@ export interface SyncpeerProfileSettings {
     cache: { percent: number; minimumBytes: number; maximumBytes: number; overrideBytes?: number };
     allowMetered: boolean;
     autoMount: boolean;
+    keepSyncingInBackground: boolean;
   };
   folders: Record<string, SyncpeerFolderSettings>;
   devices: Record<string, { allowMetered?: boolean }>;
@@ -39,6 +40,7 @@ export const defaultProfileSettings = (): SyncpeerProfileSettings => ({
     cache: { percent: 5, minimumBytes: 512 * 1024 * 1024, maximumBytes: 5 * 1024 * 1024 * 1024 },
     allowMetered: false,
     autoMount: false,
+    keepSyncingInBackground: false,
   },
   folders: {},
   devices: {},
@@ -85,7 +87,9 @@ export function normalizeProfileSettings(value: unknown): SyncpeerProfileSetting
     Object.keys(settings.folders).length > 10000 || Object.keys(settings.devices).length > 1000 ||
     !["disabled", "trash", "simple", "staggered"].includes(String(profile.versioning)) ||
     typeof profile.preserveLocalChanges !== "boolean" || typeof profile.allowMetered !== "boolean" ||
-    typeof profile.autoMount !== "boolean" || !profile.cache || typeof profile.cache !== "object") {
+    typeof profile.autoMount !== "boolean" ||
+    (profile.keepSyncingInBackground !== undefined && typeof profile.keepSyncingInBackground !== "boolean") ||
+    !profile.cache || typeof profile.cache !== "object") {
     throw new Error("Invalid profile settings.");
   }
   const cache = profile.cache;
@@ -106,7 +110,7 @@ export function normalizeProfileSettings(value: unknown): SyncpeerProfileSetting
   }));
   return { format: 1, profile: { versioning: profile.versioning as FolderVersioningMode,
     preserveLocalChanges: profile.preserveLocalChanges, cache: { ...cache }, allowMetered: profile.allowMetered,
-    autoMount: profile.autoMount }, folders, devices };
+    autoMount: profile.autoMount, keepSyncingInBackground: profile.keepSyncingInBackground === true }, folders, devices };
 }
 
 /** Missing local keys inherit global settings; favorites and exclusions belong to each device. */

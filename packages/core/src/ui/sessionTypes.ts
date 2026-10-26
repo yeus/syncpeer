@@ -2,6 +2,7 @@ import type { FileEntry, FolderInfo, FolderSyncState, RemoteDeviceInfo } from ".
 import type { ConnectOptions, ConnectionOverview, RemoteFsLike } from "./browserClient.js";
 import type { ConnectionScope } from "../client.js";
 import type { ConnectionLifecycleState } from "./connectionLifecycle.js";
+import type { ServiceSessionPhase, ServiceSessionStatusEvent } from "../sync/serviceSessionStatus.js";
 
 export type SessionPhase = "idle" | "connecting" | "connected" | "waiting" | "reconnecting" | "suspended" | "stopping" | "refreshing" | "error";
 export type DirectoryStatus = "idle" | "loading" | "ready" | "stale" | "locked" | "error";
@@ -55,6 +56,12 @@ export interface SessionState {
   nextRetryAtMs: number | null;
   closureReason: string | null;
   upgradeStatus: "idle" | "probing" | "switching";
+  peerStatus: {
+    phase: ServiceSessionPhase;
+    revision: number;
+    error: string | null;
+    foreground: boolean;
+  } | null;
 }
 
 export interface SessionTraceEvent {
@@ -71,6 +78,7 @@ export interface SessionTransport {
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   disconnect?: () => Promise<void>;
   subscribeLifecycle?: (listener: (state: ConnectionLifecycleState) => void) => () => void;
+  subscribePeerStatus?: (listener: (event: ServiceSessionStatusEvent) => void) => () => void;
   setOnline?: (online: boolean) => Promise<void>;
   setForeground?: (foreground: boolean) => Promise<void>;
   setTransferActive?: (active: boolean) => Promise<void>;

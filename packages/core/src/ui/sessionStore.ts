@@ -72,6 +72,7 @@ const cloneState = (state: SessionState): SessionState => ({
   entries: [...state.entries],
   snapshot: { ...state.snapshot },
   pending: { ...state.pending },
+  peerStatus: state.peerStatus ? { ...state.peerStatus } : null,
   connectOptions: state.connectOptions ? { ...state.connectOptions } : null,
 });
 
@@ -721,6 +722,8 @@ const applyLifecycleState = (
       nextRetryAtMs: lifecycle.nextRetryAtMs,
       closureReason: lifecycle.closureReason,
       upgradeStatus: lifecycle.upgradeStatus,
+      peerStatus: lifecycle.phase === "idle" || lifecycle.phase === "stopping" ||
+        lifecycle.phase === "error" ? null : current.peerStatus,
       remoteFs: current.remoteFs,
       pending: {
         ...current.pending,
@@ -780,6 +783,25 @@ const subscribeToLifecycle = (ctx: SessionActionContext): void => {
       // overview would leave file operations attached to the retired session.
       recover({ ...ctx.getState().connectOptions! });
     }
+  });
+};
+
+const subscribeToPeerStatus = (ctx: SessionActionContext): void => {
+  const subscribe = ctx.deps.transport.subscribePeerStatus;
+  if (!subscribe) return;
+  subscribe(event => {
+    ctx.setState(current => {
+      if (current.peerStatus && event.revision < current.peerStatus.revision) return current;
+      return {
+        ...current,
+        peerStatus: {
+          phase: event.peerPhase ?? event.phase,
+          revision: event.revision,
+          error: event.peerError ?? event.error ?? null,
+          foreground: event.foreground,
+        },
+      };
+    });
   });
 };
 
@@ -877,6 +899,7 @@ export const createSyncpeerSessionStore = (
   });
   const actions = createSessionActions(context);
   subscribeToLifecycle(context);
+  subscribeToPeerStatus(context);
   return {
     getState: () => cloneState(store.getState()),
     subscribe: store.subscribe,

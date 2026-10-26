@@ -53,7 +53,7 @@
     "android:emulator:modern": "node scripts/android-emulator.mjs start modern",
     "android:install:e2e": "adb install --no-streaming -r packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk",
     "test:android": "node scripts/test-android.mjs",
-    "test:android:legacy-smoke": "npm run build:android:e2e && node scripts/test-android.mjs --legacy-smoke-only",
+    "test:android:minimum-smoke": "npm run build:android:e2e && node scripts/test-android.mjs --minimum-smoke-only",
     "test:android:compat-startup": "npm run build:android:e2e && node scripts/test-android.mjs --compat-startup-only",
     "test:android:compat": "npm run build:android:e2e && npm run android:install:e2e && node scripts/test-android-e2e.mjs --expect-sdk 29 --reboot",
     "test:android:onboarding-smoke": "node scripts/test-android-e2e.mjs --onboarding-smoke",
@@ -65,7 +65,9 @@
     "icons:ensure": "node scripts/ensure-tauri-icons.mjs",
     "icons:ensure:android": "node scripts/ensure-tauri-icons.mjs --android",
     "build:dev": "npm run build && npm run dev",
-    "dev": "npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log"
+    "dev": "npm run dev -w @syncpeer/tauri-shell 2>&1 | tee output.log",
+    "test:android:signed-upgrade": "node scripts/test-android-signed-upgrade.mjs",
+    "test:android:device-readiness": "node scripts/android-device-readiness.mjs"
   },
   "overrides": {
     "@wdio/utils": {

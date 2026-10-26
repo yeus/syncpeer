@@ -6,44 +6,56 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
-import { patchManifest } from "./prepare-android-legacy-launcher.mjs";
 import { isAndroidProjectInitialized, ensureAndroidProjectInitialized } from "./android-project-init.mjs";
 import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 
-test("the Android release matrix names API 24, 29, and 36 emulator profiles", () => {
-  assert.match(profile("legacy").systemImage, /android-24/);
+test("Android 0.7.0 supports API 26, 29 and 36 only", () => {
+  assert.equal(json("packages/tauri-shell/src-tauri/tauri.conf.json").bundle.android.minSdkVersion, 26,
+    "Tauri must regenerate an API-26 Android project rather than reverting to its API-24 default.");
+  assert.match(profile("minimum").systemImage, /android-26/);
+  assert.equal(profile("minimum").systemImage, "system-images;android-26;google_apis;x86_64");
+  const flake = fs.readFileSync("flake.nix", "utf8");
+  assert.match(flake, /minimumPlatformVersion = "26"/);
+  assert.match(flake, /systemImageTypes = \[ "google_apis_playstore" "google_apis" \]/);
+  assert.match(flake, /android\.minimumPlatformVersion/);
   assert.match(profile("compat").systemImage, /android-29/);
   assert.match(profile("modern").systemImage, /android-36/);
+  assert.throws(() => profile("legacy"), /Unknown Android emulator profile/);
   const runner = fs.readFileSync("scripts/test-android.mjs", "utf8");
-  assert.match(runner, /runProfile\("legacy"/);
-  const editor = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build.gradle.kts", "utf8");
-  assert.match(editor, /minSdk = 24/);
+  assert.match(runner, /runProfile\("minimum"/);
+  assert.doesNotMatch(runner, /runProfile\("legacy"/);
+  for (const file of [
+    "packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts",
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/build.gradle.kts",
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build.gradle.kts",
+  ]) assert.match(fs.readFileSync(file, "utf8"), /minSdk = 26/);
+});
+
+test("Android minimum WebView build target stays Chrome 69 compatible", () => {
+  assert.match(fs.readFileSync("packages/app/vite.config.ts", "utf8"), /target: "chrome69"/);
+  const documentRuntime = fs.readFileSync("scripts/build-document-runtime.mjs", "utf8");
+  assert.match(documentRuntime, /target: "chrome69"/);
+  assert.match(documentRuntime, /window\.globalThis = window/);
+  assert.match(fs.readFileSync("packages/app/index.html", "utf8"), /window\.globalThis = window/);
 });
 
 test("Android release validation can use isolated emulator names", () => {
-  assert.equal(profile("legacy", "syncpeer-release").avdName, "syncpeer-release-api24");
+  assert.equal(profile("minimum", "syncpeer-release").avdName, "syncpeer-release-api26");
   assert.equal(profile("compat", "syncpeer-release").avdName, "syncpeer-release-api29");
   assert.equal(profile("modern", "syncpeer-release").avdName, "syncpeer-release-api36-play");
-  assert.throws(() => profile("legacy", "../other"), /AVD prefix/);
+  assert.throws(() => profile("minimum", "../other"), /AVD prefix/);
 });
 
-test("Android builds keep the unsupported launcher separate from the Tauri activity", () => {
-  const source = '<manifest><application><activity android:name=".MainActivity">' +
-    '<intent-filter /></activity></application></manifest>';
-  const patched = patchManifest(source);
-  assert.match(patched, /MainActivity"[\s\S]*syncpeer_modern_activity/);
-  assert.match(patched, /UnsupportedAndroidActivity"[\s\S]*syncpeer_legacy_activity/);
-  assert.equal(patchManifest(patched), patched);
+test("Android builds use one launcher and bootstrap generated files first", () => {
   const scripts = json("packages/tauri-shell/package.json").scripts;
-  for (const name of ["prebuild:android:dev", "prebuild:android:e2e", "prebuild:android:prod"]) {
-    assert.match(scripts[name], /prepare-android-legacy-launcher/);
+  for (const name of ["preandroid:dev", "prebuild:android:dev", "prebuild:android:e2e", "prebuild:android:prod"]) {
+    assert.equal(scripts[name], "npm run icons:ensure:android");
   }
-  const legacy = fs.readFileSync("scripts/android-legacy-launcher/values/launcher.xml", "utf8");
-  const modern = fs.readFileSync("scripts/android-legacy-launcher/values-v26/launcher.xml", "utf8");
-  assert.match(legacy, /syncpeer_legacy_activity">true/);
-  assert.match(modern, /syncpeer_modern_activity">true/);
+  assert.equal(scripts["postandroid:init"], undefined);
+  const manifest = fs.readFileSync("packages/tauri-shell/src-tauri/gen/android/app/src/main/AndroidManifest.xml", "utf8");
+  assert.doesNotMatch(manifest, /UnsupportedAndroidActivity|syncpeer_modern_activity/);
 });
 
 const writeSyntheticAndroidProject = (android) => {
@@ -131,7 +143,7 @@ test("Android bootstrap refuses to move a non-directory project path", (t) => {
 test("Android build hooks initialize before manifest patching and temporary signing files", () => {
   const scripts = json("packages/tauri-shell/package.json").scripts;
   for (const name of ["preandroid:dev", "prebuild:android:dev", "prebuild:android:e2e", "prebuild:android:prod"]) {
-    assert.match(scripts[name], /^npm run icons:ensure:android && node .*prepare-android-legacy-launcher\.mjs$/);
+    assert.equal(scripts[name], "npm run icons:ensure:android");
   }
   const icons = fs.readFileSync("scripts/ensure-tauri-icons.mjs", "utf8");
   assert.match(icons, /ensureAndroidProjectInitialized\(androidRoot, \(\) =>/);
@@ -392,14 +404,15 @@ test("Android compatibility testing has one explicit API 29 owner", () => {
   );
 });
 
-test("the combined Android workflow owns all three emulator profiles", () => {
+test("the combined Android workflow covers API 26, 29 and 36", () => {
   const scripts = json("package.json").scripts;
   const runner = fs.readFileSync("scripts/test-android.mjs", "utf8");
   assert.equal(scripts["test:android"], "node scripts/test-android.mjs");
   assert.match(runner, /build:android:e2e/);
   assert.match(runner, /compat/);
   assert.match(runner, /modern/);
-  assert.match(runner, /legacy/);
+  assert.match(runner, /minimum/);
+  assert.doesNotMatch(runner, /runProfile\("legacy"/);
   assert.match(runner, /test-android-e2e\.mjs/);
   assert.match(runner, /--skip-network/);
   assert.match(runner, /uninstallIfPresent\("dev\.syncpeer\.app"\)/);
@@ -407,6 +420,78 @@ test("the combined Android workflow owns all three emulator profiles", () => {
   assert.match(runner, /dev\.syncpeer\.synthetic\.editor/);
   assert.match(runner, /editorProject, "assembleDebug"/);
 });
+
+test("Android service exposes same-UID private session commands without opening a second peer", () => {
+  const base = "packages/tauri-shell/src-tauri/plugins/syncpeer-android";
+  const provider = fs.readFileSync(base + "/android/src/main/java/dev/syncpeer/plugin/android/SyncpeerDocumentsProvider.kt", "utf8");
+  const plugin = fs.readFileSync(base + "/android/src/main/java/dev/syncpeer/plugin/android/SyncpeerAndroidPlugin.kt", "utf8");
+  const mobile = fs.readFileSync(base + "/src/mobile.rs", "utf8");
+  const app = fs.readFileSync("packages/tauri-shell/src-tauri/src/lib.rs", "utf8");
+  assert.match(provider, /method != "syncpeerSessionCommand"/);
+  assert.match(provider, /Binder.getCallingUid\(\) == context!!\.applicationInfo\.uid/);
+  assert.match(provider, /owner\.sessionCommand\(request\)/);
+  assert.match(plugin, /fun sessionCommand\(invoke: Invoke\)/);
+  assert.match(mobile, /pub fn session_command\(/);
+  assert.match(app, /async fn syncpeer_android_session_command\(/);
+  assert.match(app, /\s+syncpeer_android_session_command,/);
+});
+test("Android visibility demotes the existing service without disconnecting its peer socket", () => {
+  const path = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt";
+  const kotlin = fs.readFileSync(path, "utf8");
+  const marker = 'if (input.optString("operation") == "uiVisible") {';
+  const offset = kotlin.indexOf(marker);
+  const uiVisible = offset < 0 ? null : kotlin.slice(offset, kotlin.indexOf("return result", offset));
+  assert.ok(uiVisible, "Service must implement a native UI-visible lifecycle command.");
+  assert.match(uiVisible, /stopForeground/);
+  assert.doesNotMatch(uiVisible, /stopSession\(|disconnect/);
+  const schedule = kotlin.slice(kotlin.indexOf("private fun scheduleBackgroundSession"), kotlin.indexOf("if (sessionRequest == request"));
+  assert.ok(schedule);
+  assert.match(schedule, /ensureForeground\(\)/);
+});
+test("Android session stop cannot report idle after a transport shutdown timeout", () => {
+  const kotlin = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
+  const start = kotlin.indexOf("private fun stopSession(");
+  const end = kotlin.indexOf("private fun ensureForeground()", start);
+  const stop = kotlin.slice(start, end);
+  assert.match(stop, /finishSessionStop\(generation, result, error\)/);
+  assert.match(stop, /if \(error != null\)/);
+  assert.match(stop, /result\.completeExceptionally/);
+  assert.match(stop, /sessionPhase = "error"/);
+  assert.match(stop, /sessionPhase = "idle"/);
+});
+test("Android UI connect and disconnect update the service-owned session inventory", () => {
+  const kotlin = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
+  const handler = kotlin.slice(kotlin.indexOf("fun sessionCommand(input:"), kotlin.indexOf("internal fun startBackgroundSession("));
+  assert.match(handler, /operation == "disconnect"/);
+  assert.match(handler, /stopSession\(persist = true\)/);
+  assert.match(handler, /sessionStarted = true/);
+  assert.match(handler, /sessionPhase =/);
+});
+
+
+test("disabling background persistence clears native handoff but preserves foreground peer", () => {
+  const base = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android";
+  const service = fs.readFileSync(base + "/DocumentRuntimeService.kt", "utf8");
+  const plugin = fs.readFileSync(base + "/SyncpeerAndroidPlugin.kt", "utf8");
+  const scope = service.slice(service.indexOf("fun sessionCommand(input:"), service.indexOf("internal fun startBackgroundSession("));
+  assert.match(scope, /operation == "disarmBackground"/);
+  assert.match(scope, /backgroundSessions\.clear\(\)/);
+  assert.doesNotMatch(scope.slice(scope.indexOf('operation == "disarmBackground"'),
+    scope.indexOf('operation == "disconnect"')), /stopSession\(/);
+  const bridge = plugin.slice(plugin.indexOf("fun sessionCommand(invoke:"), plugin.indexOf("fun releaseLocalCopy(invoke:"));
+  assert.match(bridge, /backgroundSessionHandoff\.clear\(\)/);
+});
+test("Android loss of service binder during stop is not reported as a confirmed shutdown", () => {
+  const plugin = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/SyncpeerAndroidPlugin.kt", "utf8");
+  const stop = plugin.slice(plugin.indexOf("fun stopBackgroundSession(invoke:"), plugin.indexOf("fun updateTransferNotification(invoke:"));
+  assert.match(stop, /override fun onServiceDisconnected/);
+  assert.doesNotMatch(stop, /override fun onServiceDisconnected[^}]*finish\(null\)/s);
+  assert.match(stop, /finish\("Background synchronization shutdown was not confirmed/);
+});
+
+
+
+
 
 test("the packaged desktop-to-Android gate requires an explicit disposable emulator", () => {
   const runner = fs.readFileSync("scripts/test-tauri-deb.mjs", "utf8");

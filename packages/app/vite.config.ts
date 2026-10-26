@@ -73,7 +73,8 @@ export default defineConfig(({ mode }) => ({
   },
   build: {
     outDir: "dist",
-    target: "chrome74",
+    // Minimal supported Android WebView on API 26 (Android 8.0) is Chrome 69.
+    target: "chrome69",
     sourcemap: mode === "development",
     emptyOutDir: true,
   },

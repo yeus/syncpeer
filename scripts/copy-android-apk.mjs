@@ -60,8 +60,9 @@ if (!src) {
 const outDir = path.join(root, "dist");
 fs.mkdirSync(outDir, { recursive: true });
 
-const dst = path.join(root, `syncpeer-android-${mode}-arm64-v8a.apk`);
-const dstInDist = path.join(outDir, `syncpeer-android-${mode}-arm64-v8a.apk`);
+const abiLabel = process.env.SYNCPEER_ANDROID_TARGET === "x86_64" ? "x86_64" : "arm64-v8a";
+const dst = path.join(root, `syncpeer-android-${mode}-${abiLabel}.apk`);
+const dstInDist = path.join(outDir, `syncpeer-android-${mode}-${abiLabel}.apk`);
 
 fs.copyFileSync(src, dst);
 fs.copyFileSync(src, dstInDist);

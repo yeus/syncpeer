@@ -2,6 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <script>
+      // Android 8.0's stock WebView (Chrome 69) predates globalThis.
+      if (typeof globalThis === "undefined") window.globalThis = window;
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Syncpeer UI</title>
   </head>

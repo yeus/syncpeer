@@ -19,11 +19,13 @@ const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
 const appApk = "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk";
 const editorApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk";
-const peerApiLevel = 29;
+const peerApiLevel = Number(process.env.SYNCPEER_ANDROID_PEER_API || 29);
 type RunningEmulator = { child: ChildProcess; serial: string };
 
+const peerProfile = peerApiLevel === 26 ? "minimum" : peerApiLevel === 36 ? "modern" : "compat";
+
 const startEmulator = async (): Promise<RunningEmulator> => {
-  const selected = profile("compat");
+  const selected = profile(peerProfile);
   create(selected);
   const knownSerials = listDeviceTransports();
   const child = spawn("emulator", emulatorArguments(selected, ["-no-window", "-no-snapshot"]), {
@@ -32,6 +34,18 @@ const startEmulator = async (): Promise<RunningEmulator> => {
   try {
     const serial = await waitForBoot(child, selected.avdName, knownSerials);
     process.env.ANDROID_SERIAL = serial;
+    if (peerApiLevel < 29) {
+      // The API 26/29 google_apis images allow adb root. Wi-Fi cannot be
+      // disabled as the shell user on API 26, and the session-policy test needs
+      // a real loss of the active default network.
+      try {
+        adb(["root"]);
+        await new Promise(resolve => setTimeout(resolve, 2_000));
+        adb(["wait-for-device"], { timeout: 30_000 });
+      } catch {
+        // The policy phase reports the exact unsupported transition.
+      }
+    }
     return { child, serial };
   } catch (error) {
     child.kill("SIGTERM");
@@ -182,7 +196,12 @@ const main = async (): Promise<void> => {
       SYNCPEER_PEER_API_KEY: fixture.apiKey,
     };
 
+    if (process.env.SYNCPEER_ANDROID_PEER_POLICY_ONLY === "1") {
+      runPhase("--session-policy-transition", env);
+      return;
+    }
     runPhase("--peer-cross-app", env);
+    runPhase("--session-policy-transition", env);
     const startingPeerOutBytes = await peerOutBytes(fixture.syncGuiUrl, fixture.apiKey);
     const largeFile = Buffer.allocUnsafe(largeFileSize);
     for (let index = 0; index < largeFile.length; index += 1) largeFile[index] = index % 251;
@@ -237,6 +256,24 @@ const main = async (): Promise<void> => {
         }));
       } catch { console.error("Synthetic Syncthing failure state could not be read."); }
     }
+    if (process.env.SYNCPEER_ANDROID_FAILURE_DIAGNOSTICS === "1") {
+      try {
+        console.error("Android process:", adb(["shell", "pidof", appPackage]).trim());
+        console.error("Android focus:", adb(["shell", "dumpsys", "activity", "activities"])
+          .split("\n").filter(line => /mResumedActivity|mCurrentFocus|mFocusedApp/.test(line)).join(" | "));
+        console.error("Android WebView:", adb(["shell", "dumpsys", "webviewupdate"])
+          .split("\n").filter(line => /Current WebView package/.test(line)).join(" | "));
+        const runtimeLog = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"]).split("\n")
+          .slice(-60).join("\n");
+        console.error("Android SyncpeerRuntime log:", runtimeLog);
+        const failureLog = adb(["logcat", "-d"]).split("\n")
+          .filter(line => /AndroidRuntime|FATAL EXCEPTION|chromium|Tauri\/Console|WebViewFactory|crash/i.test(line))
+          .slice(-60).join("\n");
+        console.error("Android failure log:", failureLog);
+      } catch (diagnosticError) {
+        console.error("Android failure diagnostics unavailable.", diagnosticError);
+      }
+    }
     try {
       const runtimeEvents = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"])
         .split("\n")
@@ -257,7 +294,9 @@ const main = async (): Promise<void> => {
       try { adb(["forward", "--remove", `tcp:${forwardedPort}`]); }
       catch { /* The emulator may already have been abruptly terminated. */ }
     }
-    if (emulator) await stopEmulator(emulator.child, emulator.serial);
+    if (emulator && process.env.SYNCPEER_KEEP_ANDROID_EMULATOR !== "1") {
+      await stopEmulator(emulator.child, emulator.serial);
+    }
     if (previousSerial === undefined) delete process.env.ANDROID_SERIAL;
     else process.env.ANDROID_SERIAL = previousSerial;
     if (fixture) await fixture.stop();

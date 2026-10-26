@@ -19,6 +19,7 @@
 
         android = {
           platformVersion = "36";
+          minimumPlatformVersion = "26";
           compatibilityPlatformVersion = "29";
           buildToolsVersion = "35.0.0";
           ndkVersion = "26.3.11579264";
@@ -29,9 +30,10 @@
         androidComposition = pkgs.androidenv.composeAndroidPackages {
           cmdLineToolsVersion = android.cmdLineToolsVersion;
           buildToolsVersions = [ android.buildToolsVersion ];
-          platformVersions = [ android.platformVersion android.compatibilityPlatformVersion ];
+          platformVersions = [ android.platformVersion android.compatibilityPlatformVersion android.minimumPlatformVersion ];
           includeSystemImages = true;
-          systemImageTypes = [ "google_apis_playstore" ];
+          # API 26 has no x86_64 Play Store image; the minimum smoke uses google_apis.
+          systemImageTypes = [ "google_apis_playstore" "google_apis" ];
           abiVersions = [ "x86_64" ];
           includeEmulator = "if-supported";
           includeNDK = true;

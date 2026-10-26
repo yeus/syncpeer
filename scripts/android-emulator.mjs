@@ -31,9 +31,9 @@ export const create = ({ avdName, systemImage }) => {
 
 export const profile = (name, avdPrefix = process.env.SYNCPEER_ANDROID_AVD_PREFIX || "syncpeer") => {
   if (!/^[A-Za-z0-9_-]+$/.test(avdPrefix)) throw new Error("Invalid Android AVD prefix.");
-  if (name === "legacy") return {
-    avdName: `${avdPrefix}-api24`,
-    systemImage: "system-images;android-24;google_apis;x86_64",
+  if (name === "minimum") return {
+    avdName: `${avdPrefix}-api26`,
+    systemImage: "system-images;android-26;google_apis;x86_64",
   };
   if (name === "compat") return {
     avdName: `${avdPrefix}-api29`,
@@ -68,7 +68,7 @@ const main = (args) => {
     return;
   }
   if (command !== "start") {
-    throw new Error("Usage: android-emulator.mjs <create|start> [legacy|compat|modern]");
+    throw new Error("Usage: android-emulator.mjs <create|start> [minimum|compat|modern]");
   }
   create(selected);
   start(selected, emulatorArguments);

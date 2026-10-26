@@ -141,6 +141,32 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "scripts/test-connection-management.ts"],
     },
     {
+      name: "Android service protocol and transfer framing diagnostics",
+      command: process.execPath,
+      args: [
+        "--import", "tsx/esm", "--test",
+        "scripts/test-base64.ts",
+        "scripts/test-service-protocol.ts",
+        "scripts/test-frp-rpc.ts",
+        "scripts/test-service-session-rpc.ts",
+        "scripts/test-service-remote-commands.ts",
+        "scripts/test-service-download-bridge.ts",
+        "scripts/test-service-upload-bridge.ts",
+        "scripts/test-service-remote-fs.ts",
+        "scripts/test-background-sync-policy.ts",
+        "scripts/test-session-peer-status.ts",
+      ],
+    },
+    {
+      name: "Application connection status diagnostics",
+      command: process.execPath,
+      args: [
+        "--import", "tsx/esm", "--test",
+        "scripts/test-connection-status.ts",
+        "scripts/test-browser-compatibility.ts",
+      ],
+    },
+    {
       name: "Transfer notification diagnostics",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-transfer-notifications.ts"],

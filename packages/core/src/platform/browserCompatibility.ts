@@ -9,6 +9,46 @@ export const installWebViewCompatibility = (scope: typeof globalThis): void => {
     scope.structuredClone = polyfillStructuredClone as typeof scope.structuredClone;
   }
 
+  if (typeof objectConstructor.fromEntries !== "function") objectConstructor.defineProperty(
+    objectConstructor,
+    "fromEntries",
+    {
+      configurable: true,
+      writable: true,
+      value: <T>(entries: Iterable<readonly [PropertyKey, T]>) => {
+        const result: Record<PropertyKey, T> = {};
+        for (const entry of entries) {
+          const pair = arrayConstructor.from(entry as ArrayLike<PropertyKey | T>);
+          if (pair.length !== 2) throw new scope.TypeError("Iterator value is not an entry object.");
+          result[pair[0] as PropertyKey] = pair[1] as T;
+        }
+        return result;
+      },
+    },
+  );
+
+  if (typeof scope.queueMicrotask !== "function") objectConstructor.defineProperty(scope, "queueMicrotask", {
+    configurable: true,
+    writable: true,
+    value: (callback: () => void) => { void promiseConstructor.resolve().then(callback); },
+  });
+
+  const cryptoInstance = (scope as typeof globalThis & { crypto?: Crypto }).crypto;
+  if (cryptoInstance && typeof cryptoInstance.randomUUID !== "function") {
+    objectConstructor.defineProperty(cryptoInstance, "randomUUID", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        const bytes = new Uint8Array(16);
+        cryptoInstance.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = arrayConstructor.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      },
+    });
+  }
+
   if (typeof objectConstructor.hasOwn !== "function") objectConstructor.defineProperty(objectConstructor, "hasOwn", {
     configurable: true,
     writable: true,

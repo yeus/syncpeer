@@ -201,24 +201,6 @@ const installWebViewFixture = async (fixture) => {
   throw new Error(`API 29 did not select the provisioned WebView ${fixture.version} within 30 seconds.`);
 };
 
-const legacyCrashFrames = (serial) => {
-  try {
-    const log = adb(["-s", serial, "logcat", "-d", "-s", "AndroidRuntime:E"], { timeout: 10_000 });
-    const crash = log.slice(log.lastIndexOf("Process: dev.syncpeer.app"));
-    if (crash === log) return { frames: [], missingTypes: [] };
-    const frames = crash.split("\n").flatMap(line => {
-      const exception = line.match(/\b(?:java|kotlin)\.[\w.$]*(?:Error|Exception)\b/);
-      const frame = line.match(/\bat ([\w.$]+)\(/);
-      return exception ? [exception[0]] : frame ? [frame[1]] : [];
-    }).slice(0, 25);
-    const missingTypes = [...new Set([...crash.matchAll(/L(?:java|javax|android|com|kotlin)\/[\w/$]+;/g)]
-      .map(match => match[0].slice(1, -1).replaceAll("/", ".")))].slice(0, 5);
-    return { frames, missingTypes };
-  } catch {
-    return { frames: [], missingTypes: [] };
-  }
-};
-
 const runProfile = async (profileName, testArguments, prepareDevice,
   installEditor = false, allowOtherDevices = false) => {
   if (!allowOtherDevices) assertNoDevices();
@@ -239,14 +221,7 @@ const runProfile = async (profileName, testArguments, prepareDevice,
     await prepareDevice?.();
     run("npm", ["run", "android:install:e2e"]);
     if (installEditor) run("adb", ["install", "-r", editorApk]);
-    try {
-      run(process.execPath, ["scripts/test-android-e2e.mjs", ...testArguments]);
-    } catch (error) {
-      if (profileName === "legacy") {
-        console.error("API 24 startup crash classes:", JSON.stringify(legacyCrashFrames(serial)));
-      }
-      throw error;
-    }
+    run(process.execPath, ["scripts/test-android-e2e.mjs", ...testArguments]);
   } finally {
     if (serial) await stopEmulator(child, serial);
     else child.kill("SIGTERM");
@@ -258,9 +233,9 @@ const runProfile = async (profileName, testArguments, prepareDevice,
 const main = async () => {
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-webview-"));
   try {
-    if (process.argv.includes("--legacy-smoke-only")) {
-      if (!fs.existsSync(appApk)) throw new Error("Build the Android E2E APK before the API 24 smoke.");
-      await runProfile("legacy", ["--expect-sdk", "24", "--legacy-smoke"], undefined, false, true);
+    if (process.argv.includes("--minimum-smoke-only")) {
+      if (!fs.existsSync(appApk)) throw new Error("Build the Android E2E APK before the API 26 smoke.");
+      await runProfile("minimum", ["--expect-sdk", "26", "--startup-smoke"], undefined, false, true);
       return;
     }
     if (process.argv.includes("--compat-startup-only")) {
@@ -283,8 +258,8 @@ const main = async () => {
       if (!webViewFixture) throw new Error("Modern WebView fixture was not captured.");
       await installWebViewFixture(webViewFixture);
     }, true);
-    await runProfile("legacy", [
-      "--expect-sdk", "24", "--legacy-smoke",
+    await runProfile("minimum", [
+      "--expect-sdk", "26", "--startup-smoke",
     ]);
     run(process.execPath, [
       "--experimental-strip-types",

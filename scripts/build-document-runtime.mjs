@@ -26,6 +26,7 @@ if (outputs.length !== 1 || outputs[0].type !== "chunk") throw new Error("Docume
 await fs.mkdir(outDir, { recursive: true });
 // BEP schema loading is asynchronous. Script evaluation supports promises but
 // not ES modules, so wrap the bundled, import-free entry in an async function.
-const bundled = `globalThis.syncpeerCoreReady = (async () => {\n${outputs[0].code}\nreturn "ready";\n})();\nglobalThis.syncpeerCoreReady`;
-const compatible = await transformWithEsbuild(bundled, "syncpeer-documents.js", { target: "chrome74" });
+const bundled = `if (typeof globalThis === "undefined") { window.globalThis = window; }\nglobalThis.syncpeerCoreReady = (async () => {\n${outputs[0].code}\nreturn "ready";\n})();\nglobalThis.syncpeerCoreReady`;
+// API 26's stock Android WebView is Chrome 69.
+const compatible = await transformWithEsbuild(bundled, "syncpeer-documents.js", { target: "chrome69" });
 await fs.writeFile(path.join(outDir, "syncpeer-documents.js"), compatible.code);

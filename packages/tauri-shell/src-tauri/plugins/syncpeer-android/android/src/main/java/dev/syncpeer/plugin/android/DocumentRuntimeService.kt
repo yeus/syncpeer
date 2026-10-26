@@ -56,6 +56,9 @@ class DocumentRuntimeService : Service() {
   private var pendingSessionStart: CompletableFuture<JSONObject>? = null
   @Volatile private var sessionPhase = "idle"
   @Volatile private var sessionError: String? = null
+  @Volatile private var peerPhase: String? = null
+  @Volatile private var peerError: String? = null
+  @Volatile private var statusRevision = 0L
   @Volatile private var foregroundStarted = false
   private val backgroundSessions by lazy { BackgroundSessionStore(applicationContext) }
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -163,12 +166,85 @@ class DocumentRuntimeService : Service() {
     }
 
     fun sessionCommand(input: JSONObject): CompletableFuture<JSONObject> {
+      if (input.optString("operation") == "uiVisible") {
+        val result = CompletableFuture<JSONObject>()
+        mainHandler.post {
+          if (foregroundStarted) {
+            foregroundStarted = false
+            ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
+            publishSessionStatus()
+          }
+          result.complete(JSONObject().put("result", JSONObject().put("visible", true)))
+        }
+        return result
+      }
+      val operation = input.optString("operation")
+      if (operation == "disarmBackground") {
+        // Clearing opt-in must never tear down the visible WebView's shared
+        // connection. Invalidate queued background starts and forget persistence.
+        val result = CompletableFuture<JSONObject>()
+        try {
+          worker.executeHighPriority {
+            try {
+              nextSessionGeneration()
+              sessionRequest = null
+              backgroundSessions.clear()
+              stopFavoriteSyncSchedule()
+              runOnMain {
+                if (foregroundStarted) {
+                  foregroundStarted = false
+                  ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                  SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
+                }
+                publishSessionStatus()
+                result.complete(JSONObject().put("result", JSONObject().put("disarmed", true)))
+              }
+            } catch (error: Exception) {
+              result.completeExceptionally(error)
+            }
+          }
+        } catch (error: Exception) {
+          result.completeExceptionally(error)
+        }
+        return result
+      }
+      if (operation == "disconnect") {
+        return stopSession(persist = true).thenApply { status ->
+          JSONObject().put("result", JSONObject().put("phase", status.optString("phase")))
+        }
+      }
+      if (operation == "connect") {
+        sessionPhase = "starting"
+        sessionError = null
+        peerPhase = null
+        peerError = null
+        publishSessionStatus()
+      }
       return evaluate("""
         if (!globalThis.syncpeerDocuments) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
         if (!globalThis.syncpeerSession) globalThis.syncpeerSession = await globalThis.syncpeerDocumentsCore.startSession(android, globalThis.syncpeerDocuments);
-        const result = await globalThis.syncpeerSession.command(input);
+        const result = await globalThis.syncpeerSession.command({
+          protocolVersion: ${SESSION_PROTOCOL_VERSION}, ...input,
+        });
         return JSON.stringify({result: result === undefined ? null : result});
-      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8)).thenApply { JSONObject(it) }
+      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8))
+        .thenApply { raw ->
+          JSONObject(raw).also { reply ->
+            if (operation == "connect") {
+              sessionStarted = true
+              sessionPhase = reply.optJSONObject("result")?.optString("phase", "connected") ?: "connected"
+              sessionError = null
+              publishSessionStatus()
+            }
+          }
+        }.whenComplete { _, error ->
+          if (operation == "connect" && error != null) {
+            sessionPhase = "error"
+            sessionError = "Peer connection could not be established."
+            publishSessionStatus()
+          }
+        }
     }
 
     internal fun startBackgroundSession(input: JSONObject): CompletableFuture<JSONObject> {
@@ -260,6 +336,25 @@ class DocumentRuntimeService : Service() {
     .put("phase", sessionPhase)
     .put("active", sessionStarted)
     .put("error", sessionError ?: JSONObject.NULL)
+    .put("revision", statusRevision)
+    .put("foreground", foregroundStarted)
+    .put("peerPhase", peerPhase ?: JSONObject.NULL)
+    .put("peerError", peerError ?: JSONObject.NULL)
+
+  @Synchronized
+  private fun publishSessionStatus() {
+    statusRevision += 1
+    SessionStatusBus.publish(SessionStatusSnapshot(
+      revision = statusRevision,
+      phase = sessionPhase,
+      active = sessionStarted,
+      foreground = foregroundStarted,
+      error = sessionError,
+      peerPhase = peerPhase,
+      peerError = peerError,
+      updatedAtMs = System.currentTimeMillis(),
+    ))
+  }
 
   private fun backgroundPauseReason(input: JSONObject): String? {
     val options = input.optJSONObject("options") ?: input
@@ -271,20 +366,33 @@ class DocumentRuntimeService : Service() {
       networkAvailable = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true,
       networkMetered = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true,
       powerSave = power?.isPowerSaveMode == true,
+      deviceIdle = power?.isDeviceIdleMode == true,
       allowMetered = options.optBoolean("allowMetered", false),
       allowPowerSave = options.optBoolean("allowPowerSave", false),
+      allowDeviceIdle = options.optBoolean("allowDeviceIdle", false),
     )
   }
 
+  private fun debugNetworkEvent(message: String) {
+    if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+      Log.w("SyncpeerRuntime", message)
+    }
+  }
+
   private fun pauseForPolicy(reason: String) {
+    debugNetworkEvent("policy pause: $reason")
     if (sessionPhase == "waiting" && sessionError == reason) return
     val request = sessionRequest
-    if (request == null) return
+    if (request == null) {
+      debugNetworkEvent("policy pause ignored: no session request")
+      return
+    }
     val generation = nextSessionGeneration()
     val wasStarted = sessionStarted && documentsStarted && runtimeHost != null
     sessionStarted = false
     sessionPhase = "waiting"
     sessionError = reason
+    publishSessionStatus()
     runOnMain {
       if (generation == sessionGeneration) {
         SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", reason)
@@ -293,7 +401,9 @@ class DocumentRuntimeService : Service() {
     if (wasStarted) {
       // A policy pause also may not hold the shared worker behind a dead network.
       evaluateRuntime("""
-        if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
+        if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({
+          protocolVersion: ${SESSION_PROTOCOL_VERSION}, operation: "disconnect",
+        });
         return JSON.stringify({result: {phase: "idle"}});
       """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS, highPriority = true)
     }
@@ -315,18 +425,27 @@ class DocumentRuntimeService : Service() {
     val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     if (manager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
       val callback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) = resumePersistedSessionIfAllowed()
-        override fun onLost(network: Network) { pauseForPolicy("Waiting for a network connection.") }
+        override fun onAvailable(network: Network) {
+          debugNetworkEvent("network available")
+          resumePersistedSessionIfAllowed()
+        }
+        override fun onLost(network: Network) {
+          debugNetworkEvent("network lost")
+          pauseForPolicy("Waiting for a network connection.")
+        }
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
           val request = sessionRequest ?: return
           val input = parseSessionRequest(request) ?: return
           val options = sessionOptions(input)
+          val power = getSystemService(Context.POWER_SERVICE) as? PowerManager
           val reason = BackgroundSessionPolicy.pauseReason(
             networkAvailable = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
             networkMetered = !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
-            powerSave = (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isPowerSaveMode == true,
+            powerSave = power?.isPowerSaveMode == true,
+            deviceIdle = power?.isDeviceIdleMode == true,
             allowMetered = options.optBoolean("allowMetered", false),
             allowPowerSave = options.optBoolean("allowPowerSave", false),
+            allowDeviceIdle = options.optBoolean("allowDeviceIdle", false),
           )
           if (reason == null) resumePersistedSessionIfAllowed() else pauseForPolicy(reason)
         }
@@ -334,9 +453,15 @@ class DocumentRuntimeService : Service() {
       runCatching { manager.registerDefaultNetworkCallback(callback); networkCallback = callback }
     }
     val receiver = object : BroadcastReceiver() {
-      override fun onReceive(context: Context?, intent: Intent?) = resumePersistedSessionIfAllowed()
+      override fun onReceive(context: Context?, intent: Intent?) {
+        val request = sessionRequest ?: return
+        val input = parseSessionRequest(request) ?: return
+        val reason = backgroundPauseReason(input)
+        if (reason == null) resumePersistedSessionIfAllowed() else pauseForPolicy(reason)
+      }
     }
     val filter = IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED).apply {
+      addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
       addAction(Intent.ACTION_USER_UNLOCKED)
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -360,7 +485,16 @@ class DocumentRuntimeService : Service() {
     try {
       val input = parseSessionRequest(request)
         ?: throw IllegalArgumentException("Background session requires a valid connect request.")
+      // A previously active service may have been demoted while the UI was visible.
+      // Promote the same service on the next background transition without re-dialing.
+      ensureForeground()
       if (sessionRequest == request && sessionPhase in listOf("starting", "connected")) {
+        // Re-promoting a still-connected service must replace the "preparing"
+        // notification instead of leaving it stale for the whole session.
+        if (sessionPhase == "connected") {
+          SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization",
+            "Peer session connected; selected sync is ready.")
+        }
         result.complete(sessionStatus())
         return result
       }
@@ -372,8 +506,11 @@ class DocumentRuntimeService : Service() {
       }
       sessionRequest = request
       sessionError = null
+      peerPhase = null
+      peerError = null
       ensureForeground()
       sessionPhase = "starting"
+      publishSessionStatus()
       worker.execute {
         // A high-priority stop can overtake a queued start. Do not resurrect a
         // stopped session by persisting that obsolete request afterwards.
@@ -391,6 +528,7 @@ class DocumentRuntimeService : Service() {
             }
             sessionPhase = "waiting"
             sessionError = reason
+            publishSessionStatus()
             SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", reason)
             result.complete(sessionStatus())
             return@execute
@@ -403,6 +541,7 @@ class DocumentRuntimeService : Service() {
             if (initializationError != null) {
               sessionPhase = "error"
               sessionError = initializationError.message ?: "Document runtime unavailable."
+              publishSessionStatus()
               result.completeExceptionally(initializationError)
             } else if (!documentRuntimeCanStartSession(
                 terminalStatus ?: initialStatus,
@@ -411,6 +550,7 @@ class DocumentRuntimeService : Service() {
               val retrying = recoveryIsPending()
               sessionPhase = if (retrying) "waiting" else "error"
               sessionError = (terminalStatus ?: initialStatus).summary
+              publishSessionStatus()
               if (retrying) result.complete(sessionStatus())
               else result.completeExceptionally(IllegalStateException(sessionError))
             } else {
@@ -424,6 +564,7 @@ class DocumentRuntimeService : Service() {
           }
           sessionPhase = "error"
           sessionError = error.message ?: "Background session could not start."
+          publishSessionStatus()
           result.completeExceptionally(error)
         }
       }
@@ -439,7 +580,9 @@ class DocumentRuntimeService : Service() {
     evaluateRuntime("""
       if (!globalThis.syncpeerDocuments) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
       if (!globalThis.syncpeerSession) globalThis.syncpeerSession = await globalThis.syncpeerDocumentsCore.startSession(android, globalThis.syncpeerDocuments);
-      const value = await globalThis.syncpeerSession.command(input);
+      const value = await globalThis.syncpeerSession.command({
+        protocolVersion: ${SESSION_PROTOCOL_VERSION}, ...input,
+      });
       return JSON.stringify({result: value === undefined ? null : value});
     """.trimIndent(), request.toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
       if (generation != sessionGeneration || sessionRequest != request) {
@@ -449,6 +592,7 @@ class DocumentRuntimeService : Service() {
       if (error != null) {
         sessionPhase = "error"
         sessionError = error.message ?: "Background session could not connect."
+        publishSessionStatus()
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
           Log.w("SyncpeerRuntime", "session connect failed")
         }
@@ -459,6 +603,7 @@ class DocumentRuntimeService : Service() {
         sessionStarted = true
         sessionPhase = reply.optJSONObject("result")?.optString("phase", "connected") ?: "connected"
         sessionError = null
+        publishSessionStatus()
         SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", "Peer session connected; selected sync is ready.")
         result.complete(reply)
         startFavoriteSyncSchedule()
@@ -470,7 +615,9 @@ class DocumentRuntimeService : Service() {
   private fun requestFavoriteSync() {
     if (sessionPhase != "connected" || !favoriteSyncPending.compareAndSet(false, true)) return
     evaluateRuntime("""
-      const value = await globalThis.syncpeerSession.command({operation: "syncFavorites"});
+      const value = await globalThis.syncpeerSession.command({
+        protocolVersion: ${SESSION_PROTOCOL_VERSION}, operation: "syncFavorites",
+      });
       return JSON.stringify({result: value});
     """.trimIndent(), "{}".toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
       favoriteSyncPending.set(false)
@@ -498,9 +645,12 @@ class DocumentRuntimeService : Service() {
     val generation = nextSessionGeneration()
     stopFavoriteSyncSchedule()
     sessionRequest = null
-    sessionStarted = false
+    // Keep the last confirmed activity state until transport teardown completes.
     sessionPhase = "stopping"
     sessionError = null
+    peerPhase = null
+    peerError = null
+    publishSessionStatus()
     val result = CompletableFuture<JSONObject>()
     try {
       worker.executeHighPriority {
@@ -510,13 +660,15 @@ class DocumentRuntimeService : Service() {
           return@executeHighPriority
         }
         evaluateRuntime("""
-          if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({operation: "disconnect"});
+          if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command({
+            protocolVersion: ${SESSION_PROTOCOL_VERSION}, operation: "disconnect",
+          });
           return JSON.stringify({result: {phase: "idle"}});
         """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS, highPriority = true).whenComplete { _, error ->
           if (error != null && applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             Log.w("SyncpeerRuntime", "session stop gave up after ${SESSION_STOP_TIMEOUT_MS}ms")
           }
-          finishSessionStop(generation, result)
+          finishSessionStop(generation, result, error)
         }
       }
     } catch (error: Exception) {
@@ -527,18 +679,33 @@ class DocumentRuntimeService : Service() {
 
   /**
    * Settle every stop request. Only the current generation may reset the service state;
-   * a superseded stop still has to complete its future, because the WebView foreground
-   * handoff awaits it before it resumes the session.
+   * a superseded stop still completes, but failed teardown must never be
+   * reported as idle while the old peer transport may still be alive.
    */
-  private fun finishSessionStop(generation: Long, result: CompletableFuture<JSONObject>) {
+  private fun finishSessionStop(generation: Long, result: CompletableFuture<JSONObject>, error: Throwable? = null) {
     if (generation != sessionGeneration) {
       result.complete(sessionStatus())
       return
     }
     runOnMain {
+      if (error != null) {
+        sessionPhase = "error"
+        sessionError = "Peer shutdown could not be confirmed; a connection may still be active."
+        publishSessionStatus()
+        SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", sessionError!!)
+        result.completeExceptionally(IllegalStateException(sessionError, error))
+        // Never reopen a runtime whose old peer transport may still be live.
+        // Recovery destroys the isolate and native network handles before the
+        // next connect can create another socket for the same identity.
+        startRecovery()
+        return@runOnMain
+      }
       sessionStarted = false
       sessionPhase = "idle"
+      peerPhase = null
+      peerError = null
       foregroundStarted = false
+      publishSessionStatus()
       ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
       SyncpeerSessionNotifications.cancel(this)
       result.complete(sessionStatus())
@@ -556,7 +723,8 @@ class DocumentRuntimeService : Service() {
     val notification = SyncpeerSessionNotifications.build(
       this,
       "Syncpeer background synchronization",
-      "Preparing selected folders…",
+      if (sessionPhase == "connected") "Peer session connected; selected sync is ready."
+        else "Preparing selected folders…",
       true,
     )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -569,6 +737,7 @@ class DocumentRuntimeService : Service() {
       startForeground(SyncpeerSessionConstants.NOTIFICATION_ID, notification)
     }
     foregroundStarted = true
+    publishSessionStatus()
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -680,6 +849,18 @@ class DocumentRuntimeService : Service() {
   private fun executeNetworkRequest(raw: String): String {
     val request = JSONObject(raw)
     val reply = JSONObject().put("id", request.getLong("id"))
+    if (request.optString("operation") == "sessionPeerStatus") {
+      val phase = request.optString("phase")
+      val allowed = setOf("idle", "connecting", "starting", "connected", "waiting",
+        "reconnecting", "suspended", "stopping", "error")
+      if (phase !in allowed) {
+        return reply.put("error", "Invalid peer session phase.").toString()
+      }
+      peerPhase = if (phase == "connecting") "starting" else phase
+      peerError = request.optString("error").ifBlank { null }
+      publishSessionStatus()
+      return reply.put("result", JSONObject.NULL).toString()
+    }
     if (request.optString("operation") == "diagnostic") {
       if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
         Log.w("SyncpeerRuntime", "${request.optString("event")}: ${request.optString("message")}")
@@ -744,6 +925,7 @@ class DocumentRuntimeService : Service() {
       sessionPhase = if (decision.retryDelayMs == null || destroying) "error" else "waiting"
       sessionError = status.summary
     }
+    publishSessionStatus()
     if (decision.retryDelayMs != null && !destroying) {
       lateinit var retry: Runnable
       retry = Runnable {
@@ -773,6 +955,7 @@ class DocumentRuntimeService : Service() {
     sessionStarted = false
     sessionPhase = if (sessionRequest == null) "idle" else "waiting"
     sessionError = if (sessionRequest == null) null else terminalStatus?.summary
+    publishSessionStatus()
     closeRuntimeHost()
     contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
     try {
@@ -791,10 +974,12 @@ class DocumentRuntimeService : Service() {
           task.complete(status)
           if (status.phase == "locked") sessionRequest?.let { request ->
             sessionPhase = "starting"
+            publishSessionStatus()
             evaluateSession(request, sessionGeneration, CompletableFuture())
           } else if (sessionRequest != null) {
             sessionPhase = "error"
             sessionError = status.summary
+            publishSessionStatus()
           }
         } catch (error: Exception) {
           closeRuntimeHost()
@@ -818,6 +1003,12 @@ class DocumentRuntimeService : Service() {
     cancelPendingRecoveryRetry()
     stopFavoriteSyncSchedule()
     unregisterBackgroundSignals()
+    sessionStarted = false
+    sessionPhase = "idle"
+    peerPhase = null
+    peerError = null
+    foregroundStarted = false
+    publishSessionStatus()
     // Serialize teardown after initialization; shutdown drains the already queued work.
     worker.execute {
       runCatching {
@@ -835,6 +1026,7 @@ class DocumentRuntimeService : Service() {
   }
 
   private companion object {
+    const val SESSION_PROTOCOL_VERSION = 1
     const val FAVORITE_SYNC_INTERVAL_MS = 15_000L
     /** A session teardown may not hold the shared document worker behind a dead network. */
     const val SESSION_STOP_TIMEOUT_MS = 10_000L

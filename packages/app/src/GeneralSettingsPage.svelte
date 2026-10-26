@@ -391,6 +391,12 @@
         <label><input type="checkbox" checked={settings.profile.allowMetered}
           onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
             allowMetered: event.currentTarget.checked } })} /> Allow background sync on metered/mobile networks</label>
+        {#if biometric}
+          <label><input type="checkbox" checked={settings.profile.keepSyncingInBackground}
+            onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
+              keepSyncingInBackground: event.currentTarget.checked } })} />
+            Keep syncing in background on this Android device</label>
+        {/if}
         <label>Cache override (MiB, blank for adaptive 5%)
           <input type="number" min="0" value={settings.profile.cache.overrideBytes === undefined ? "" : settings.profile.cache.overrideBytes / 1048576}
             onchange={event => { const value = event.currentTarget.value.trim(); void saveSettings({ ...settings!, profile: {

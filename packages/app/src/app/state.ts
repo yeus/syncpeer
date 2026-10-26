@@ -273,6 +273,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       nextRetryAtMs: null as number | null,
       closureReason: null as string | null,
       upgradeStatus: "idle" as SessionState["upgradeStatus"],
+      peerStatus: null as SessionState["peerStatus"],
       remoteDevice: null as RemoteDeviceInfo | null,
       connectionPath: "",
       connectionTransport: "" as "direct-tcp" | "direct-quic" | "relay" | "",
@@ -565,6 +566,7 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.nextRetryAtMs = next.nextRetryAtMs;
   state.session.closureReason = next.closureReason;
   state.session.upgradeStatus = next.upgradeStatus;
+  state.session.peerStatus = next.peerStatus;
   state.session.folders = keepOfflineSnapshotView ? state.session.folders : next.folders;
   state.session.folderSyncStates = keepOfflineSnapshotView
     ? state.session.folderSyncStates

@@ -4059,6 +4059,23 @@ async fn syncpeer_android_start_background_session(
 }
 
 #[tauri::command]
+async fn syncpeer_android_session_command(
+    app: tauri::AppHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app.syncpeer_android().session_command(request)
+            .map_err(|error| format!("Android service session unavailable: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android service session is unavailable on this platform.".to_string())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_release_local_copy(
     app: tauri::AppHandle,
     request: serde_json::Value,
@@ -5094,6 +5111,7 @@ pub fn run() {
             syncpeer_android_start_transfer_service,
             syncpeer_android_prepare_background_session,
             syncpeer_android_start_background_session,
+            syncpeer_android_session_command,
             syncpeer_android_release_local_copy,
             syncpeer_android_biometric_status,
             syncpeer_android_biometric_set_enabled,

@@ -1,31 +1,25 @@
 <script lang="ts">
-  import type { SessionState } from "@syncpeer/core/browser";
+  import type { ServiceSessionPhase, SessionState } from "@syncpeer/core/browser";
+  import { connectionStatusLabel, connectionStatusTone } from "../lib/connectionStatus.ts";
   import ChevronDown from "lucide-svelte/icons/chevron-down";
   import appIcon from "../../../../icon.svg?url";
 
   interface Props {
     phase: SessionState["phase"];
     connected: boolean;
+    peerPhase?: ServiceSessionPhase | null;
+    peerError?: string | null;
     paused: boolean;
     expanded: boolean;
     onToggleDetails: () => void;
   }
 
-  let { phase, connected, paused, expanded, onToggleDetails }: Props = $props();
+  let { phase, connected, peerPhase = null, peerError = null, paused, expanded,
+    onToggleDetails }: Props = $props();
 
-  let label = $derived.by(() => {
-    if (connected) return "Connected";
-    if (paused) return "Paused";
-    if (phase === "connecting") return "Connecting";
-    if (phase === "reconnecting") return "Reconnecting";
-    if (phase === "waiting") return "Retry scheduled";
-    if (phase === "suspended") return "Suspended";
-    if (phase === "stopping") return "Stopping";
-    if (phase === "error") return "Connection error";
-    return "Disconnected";
-  });
+  let label = $derived.by(() => connectionStatusLabel({ phase, connected, peerPhase, paused }));
 
-  let tone = $derived(connected ? "online" : phase === "error" ? "error" : "offline");
+  let tone = $derived(connectionStatusTone({ phase, connected, peerPhase, paused }));
 </script>
 
 <header class="app-header">
@@ -38,6 +32,8 @@
     class="connection-status"
     data-testid="connection-status-toggle"
     data-phase={phase}
+    data-peer-phase={peerPhase ?? "none"}
+    title={peerError ?? undefined}
     aria-expanded={expanded}
     aria-controls="connection-details"
     onclick={onToggleDetails}

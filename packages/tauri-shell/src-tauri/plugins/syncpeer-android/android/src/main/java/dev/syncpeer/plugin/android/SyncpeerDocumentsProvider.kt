@@ -183,9 +183,19 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
 
   /** Configuration is private to Syncpeer; a document URI grant never grants vault control. */
   override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
-    if (method != "syncpeerDocumentCommand" && method != "syncpeerReleaseLocalCopy") return super.call(method, arg, extras)
+    if (method != "syncpeerDocumentCommand" && method != "syncpeerReleaseLocalCopy" && method != "syncpeerSessionCommand") return super.call(method, arg, extras)
     check(Binder.getCallingUid() == context!!.applicationInfo.uid) { "Vault control is private to Syncpeer." }
-    val result = if (method == "syncpeerReleaseLocalCopy") {
+    val result = if (method == "syncpeerSessionCommand") {
+      val raw = checkNotNull(arg)
+      check(raw.length <= 1024 * 1024) { "Session request exceeds the IPC limit." }
+      val request = JSONObject(raw)
+      ensureRuntime()
+      if (!bound) throw FileNotFoundException(summary())
+      // Same-UID caller only. Delegate to the already-running TypeScript session,
+      // not another socket opened in the Activity's WebView.
+      ready.get(30, TimeUnit.SECONDS).sessionCommand(request)
+        .get(75, TimeUnit.SECONDS).opt("result").takeUnless { it == JSONObject.NULL }
+    } else if (method == "syncpeerReleaseLocalCopy") {
       val request = JSONObject(checkNotNull(arg))
       check(request.optString("operation") == "releaseLocalCopy") { "Invalid local release operation." }
       ensureRuntime()

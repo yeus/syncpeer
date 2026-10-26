@@ -230,6 +230,46 @@ class DocumentRuntimeServiceTest {
     }
   }
 
+  @Test fun sessionStatusBusReplaysLatestSnapshotWithMonotonicRevisions() {
+    val events = java.util.concurrent.CopyOnWriteArrayList<SessionStatusSnapshot>()
+    val unsubscribe = SessionStatusBus.subscribe { events.add(it) }
+    try {
+      val revision = (events.lastOrNull()?.revision ?: 0L) + 1
+      SessionStatusBus.publish(SessionStatusSnapshot(
+        revision = revision,
+        phase = "connected",
+        active = true,
+        foreground = true,
+        error = null,
+        peerPhase = "reconnecting",
+        peerError = "Peer is reconnecting.",
+        updatedAtMs = System.currentTimeMillis(),
+      ))
+      assertEquals(revision, events.last().revision)
+      assertEquals("reconnecting", events.last().peerPhase)
+      assertEquals("Peer is reconnecting.", SessionStatusBus.current()?.peerError)
+    } finally {
+      unsubscribe()
+    }
+  }
+
+  @Test fun sessionStatusRevisionsAdvanceWhenTheServiceChangesPhase() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      val before = runtime.backgroundSessionStatus().getLong("revision")
+      runtime.sessionCommand(JSONObject().put("operation", "disarmBackground"))
+        .get(20, TimeUnit.SECONDS)
+      val after = runtime.backgroundSessionStatus()
+      assertTrue("service status revisions must advance", after.getLong("revision") > before)
+      assertTrue(after.getBoolean("foreground") == false)
+    } finally {
+      context.unbindService(client.first)
+    }
+  }
+
   @Test fun vaultReopensAfterProcessRestart() {
     val phase = InstrumentationRegistry.getArguments().getString("documentsRestartPhase") ?: return
     val context = InstrumentationRegistry.getInstrumentation().targetContext

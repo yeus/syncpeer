@@ -661,6 +661,8 @@
     <AppHeader
       phase={app.session.lifecyclePhase}
       connected={app.session.isConnected}
+      peerPhase={app.session.peerStatus?.phase ?? null}
+      peerError={app.session.peerStatus?.error ?? null}
       paused={app.ui.autoConnectPaused}
       expanded={app.ui.isConnectionDetailsExpanded}
       onToggleDetails={() => {
@@ -677,10 +679,16 @@
           {#if currentConnectTargetLabel}
             <span>Target: {currentConnectTargetLabel}</span>
           {/if}
+          {#if app.session.peerStatus && app.session.peerStatus.phase !== "connected"}
+            <span data-testid="peer-session-status">Peer: {app.session.peerStatus.phase}</span>
+          {/if}
         </div>
         {#if app.ui.expertView}
           <div class="connection-details-expert" data-testid="connection-expert-details">
             <span>Phase: {app.session.lifecyclePhase}</span>
+            {#if app.session.peerStatus}
+              <span>Peer phase: {app.session.peerStatus.phase}</span>
+            {/if}
             <span>Attempt: {app.session.reconnectAttempt}</span>
             {#if app.session.nextRetryAtMs}
               <span>Next retry: {new Date(app.session.nextRetryAtMs).toLocaleTimeString()}</span>

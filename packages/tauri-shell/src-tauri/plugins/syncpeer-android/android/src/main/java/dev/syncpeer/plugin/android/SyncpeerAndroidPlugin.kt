@@ -19,6 +19,7 @@ import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.app.Activity
 import android.app.ActivityManager
+import androidx.appcompat.app.AppCompatActivity
 import android.content.Context
 import android.content.ServiceConnection
 import android.os.IBinder
@@ -221,6 +222,55 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }.start()
   }
 
+  /** UI-facing command bridge to the service's one TypeScript peer-session owner. */
+  @Command
+  fun sessionCommand(invoke: Invoke) {
+    val args = invoke.parseArgs(DocumentCommandArgs::class.java)
+    if (args.request.length > 1024 * 1024) {
+      invoke.reject("Session command exceeds the IPC limit."); return
+    }
+    Thread {
+      try {
+        // Explicit opt-out also disarms the Activity pause callback, without
+        // stopping the foreground service-owned peer socket.
+        if (JSONObject(args.request).optString("operation") == "disarmBackground") {
+          backgroundSessionHandoff.clear()
+        }
+        val uri = Uri.parse("content://${activity.packageName}.documents")
+        val response = activity.applicationContext.contentResolver.call(
+          uri, "syncpeerSessionCommand", args.request, null)
+        invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(response?.getString("result"))))
+      } catch (error: Exception) {
+        invoke.reject(privateStorageFailureMessage(error)
+          ?: sessionFailureMessage(error)
+          ?: "The Android peer session is unavailable.")
+      }
+    }.start()
+  }
+
+  /** Keeps actionable session errors while hiding raw transport and credential details. */
+  private fun sessionFailureMessage(error: Throwable): String? {
+    val safe = listOf(
+      "No service-owned peer session",
+      "Peer is no longer connected",
+      "Peer was removed from the trusted device list",
+      "Unknown remote session command",
+      "Invalid remote",
+      "Invalid service",
+      "Invalid upload",
+      "Invalid focused",
+      "Remote directory entry is too large",
+      "Android service could not establish a peer session",
+    )
+    var current: Throwable? = error
+    while (current != null) {
+      val message = current.message
+      if (message != null && message.length <= 512 && safe.any(message::contains)) return message
+      current = current.cause
+    }
+    return null
+  }
+
   @Command
   fun releaseLocalCopy(invoke: Invoke) {
     val args = invoke.parseArgs(DocumentCommandArgs::class.java)
@@ -301,6 +351,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (error: Exception) { invoke.reject("Biometric authentication is unavailable.") }
   }
   private var multicastLock: WifiManager.MulticastLock? = null
+  private var sessionStatusSubscription: (() -> Unit)? = null
   private var notificationCancellationPending = false
   private val backgroundSessionHandoff = BackgroundSessionHandoff()
   @Volatile private var backgroundActivityPaused = false
@@ -338,10 +389,23 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       activity.application.registerActivityLifecycleCallbacks(backgroundLifecycleCallbacks)
       backgroundLifecycleRegistered = true
     }
+    if (sessionStatusSubscription == null) {
+      sessionStatusSubscription = SessionStatusBus.subscribe { snapshot ->
+        runCatching { activity.runOnUiThread {
+          runCatching { triggerObject("sessionStatus", snapshot.toEvent()) }
+        } }
+      }
+    }
     if (activity.intent?.action == SyncpeerTransferConstants.ACTION_CANCEL) {
       handleTransferCancellation()
     }
   }
+  override fun onDestroy(activity: AppCompatActivity) {
+    sessionStatusSubscription?.invoke()
+    sessionStatusSubscription = null
+    super.onDestroy(activity)
+  }
+
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     if (intent.action == SyncpeerTransferConstants.ACTION_CANCEL) {
@@ -444,7 +508,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
           }
         }
         override fun onServiceDisconnected(name: ComponentName) {
-          finish(null)
+          finish("Background synchronization shutdown was not confirmed; the service disconnected.")
         }
       }
       if (!app.bindService(Intent(app, DocumentRuntimeService::class.java), connection, Context.BIND_AUTO_CREATE)) {

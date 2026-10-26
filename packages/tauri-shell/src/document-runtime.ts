@@ -15,17 +15,25 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
   type SyncpeerSessionHandle } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
 import { createConnectionLifecycle, waitForLifecyclePhase,
-  type ConnectionLifecycle } from "../../core/src/ui/connectionLifecycle.js";
+  type ConnectionLifecycle, type ConnectionLifecycleState } from "../../core/src/ui/connectionLifecycle.js";
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
 import { sameDeviceId } from "../../core/src/ui/helpers.js";
 import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
+import { executeServiceRemoteCommand } from "../../core/src/sync/serviceRemoteCommands.js";
+import { createServiceDownloadBridge } from "../../core/src/sync/serviceDownloadBridge.js";
+import { createServiceUploadBridge } from "../../core/src/sync/serviceUploadBridge.js";
+import { decodeBase64 } from "../../core/src/transfer/base64.js";
+import { parseServiceCommand } from "../../core/src/sync/serviceProtocol.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
+type AndroidRuntimeRequest = (input: object) => Promise<unknown>;
 
-const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<SyncpeerHostAdapter> => {
+const createAndroidSessionAdapter = async (
+  android: AndroidRuntime,
+): Promise<{ adapter: SyncpeerHostAdapter; request: AndroidRuntimeRequest }> => {
   const request = createPortRequest(await android.getNamedPort("network"));
   const socket = (sessionId: number, peerCertificateDer: Uint8Array, transport: "tls" | "quic" = "tls"): SyncpeerTlsSocket => ({
     peerCertificateDer: async () => peerCertificateDer,
@@ -66,7 +74,7 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
       },
     };
   };
-  return {
+  const adapter: SyncpeerHostAdapter = {
     log: (event, details) => {
       if (!event.startsWith("core.session.connect.") &&
         !["core.upload.request.failed", "core.replica.receive.failed"].includes(event)) return;
@@ -120,6 +128,7 @@ const createAndroidSessionAdapter = async (android: AndroidRuntime): Promise<Syn
       }));
     },
   };
+  return { adapter, request };
 };
 
 async function startDocuments(android: AndroidRuntime) {
@@ -181,21 +190,46 @@ class AndroidSessionRuntime {
   private incomingServiceKey = "";
   private incomingServiceClosing: Promise<unknown> = Promise.resolve();
   private readonly lifecycle: ConnectionLifecycle<ConnectOptions>;
+  private readonly downloads = createServiceDownloadBridge(async (folderId, path, sink, signal) => {
+    const session = this.lifecycle.getSession();
+    if (!session || session.isClosed()) throw new Error("Peer is no longer connected.");
+    await session.remoteFs.readFileToSink(folderId, path, sink, undefined, signal);
+  });
+  private readonly uploads = createServiceUploadBridge(async (folderId, path, source, options) => {
+    const session = this.lifecycle.getSession();
+    if (!session || session.isClosed()) throw new Error("Peer is no longer connected.");
+    await session.remoteFs.writeFileStream(folderId, path, source, options);
+  });
+
+  private peerStatusUnsubscribe: (() => void) | null = null;
 
   private constructor(
     private readonly documents: Documents,
     private readonly adapter: SyncpeerHostAdapter,
     private readonly core: ReturnType<typeof createSyncpeerCoreClient>,
+    private readonly nativeRequest: AndroidRuntimeRequest,
   ) {
     this.lifecycle = this.createLifecycle();
   }
 
   static async create(android: AndroidRuntime, documents: Documents): Promise<AndroidSessionRuntime> {
-    const adapter = await createAndroidSessionAdapter(android);
-    return new AndroidSessionRuntime(documents, adapter, createSyncpeerCoreClient(adapter));
+    const { adapter, request } = await createAndroidSessionAdapter(android);
+    return new AndroidSessionRuntime(documents, adapter, createSyncpeerCoreClient(adapter), request);
   }
 
+  private reportPeerStatus = (state: ConnectionLifecycleState) => {
+    void this.nativeRequest({
+      operation: "sessionPeerStatus",
+      phase: state.phase,
+      attempt: state.attempt,
+      error: state.closureReason ?? undefined,
+    }).catch(() => undefined);
+  };
+
   start() {
+    // Push the TypeScript lifecycle to the native service so UI status events
+    // distinguish waiting/reconnecting from a confirmed connected socket.
+    this.peerStatusUnsubscribe = this.lifecycle.subscribe(this.reportPeerStatus);
     this.documents.onSessionConfigurationChange(() => {
       setTimeout(() => {
         void (async () => {
@@ -437,6 +471,8 @@ class AndroidSessionRuntime {
   };
 
   private disconnectCommand = async () => {
+    this.downloads.cancelAll();
+    this.uploads.cancelAll();
     this.activeOptions = null;
     this.sharedFolderIds = [];
     await this.lifecycle.disconnect();
@@ -467,6 +503,8 @@ class AndroidSessionRuntime {
       if (!sessions.length) throw new Error("No peer connected to the Android background service for safe release.");
       result = await this.documents.releaseLocalCopy(request.folderId, { mode: "safe", sessions });
     }
+    this.downloads.cancelAll();
+    this.uploads.cancelAll();
     await this.lifecycle.disconnect();
     await this.stopIncomingService();
     this.sharedFolderIds = [];
@@ -477,18 +515,103 @@ class AndroidSessionRuntime {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new Error("Session request must be an object.");
     }
-    const request = input as Record<string, unknown>;
+    // Versioned schema is authoritative at the service boundary. The switch
+    // below still performs operation-specific checks and resource ownership.
+    const request = parseServiceCommand(input) as unknown as Record<string, unknown>;
     switch (request.operation) {
       case "connect": return this.connectCommand(request);
       case "disconnect": return this.disconnectCommand();
+      case "downloadStart": {
+        if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096 ||
+          typeof request.path !== "string" || !request.path || request.path.length > 4096 ||
+          request.path.startsWith("/") || request.path.split("/").some(part => part === ".." || part === ".")) {
+          throw new Error("Invalid remote download path.");
+        }
+        const session = this.lifecycle.getSession();
+        if (!session || session.isClosed()) throw new Error("No service-owned peer session is connected.");
+        return { transferId: this.downloads.start(request.folderId, request.path) };
+      }
+      case "downloadPull": {
+        if (typeof request.transferId !== "string") throw new Error("Missing service download handle.");
+        return this.downloads.pull(request.transferId);
+      }
+      case "downloadCancel": {
+        if (typeof request.transferId !== "string") throw new Error("Missing service download handle.");
+        this.downloads.cancel(request.transferId);
+        return { cancelled: true };
+      }
+      case "uploadStart": {
+        if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096 ||
+          typeof request.path !== "string" || !request.path || request.path.length > 4096 ||
+          request.path.startsWith("/") || request.path.split("/").some(part => part === ".." || part === ".") ||
+          typeof request.size !== "number" || !Number.isSafeInteger(request.size) || request.size < 0) {
+          throw new Error("Invalid remote upload parameters.");
+        }
+        const session = this.lifecycle.getSession();
+        if (!session || session.isClosed()) throw new Error("No service-owned peer session is connected.");
+        const opts = (request.options ?? {}) as Record<string, unknown>;
+        if (typeof opts !== "object" || Array.isArray(opts) ||
+          (opts.waitForRemote !== undefined && typeof opts.waitForRemote !== "boolean") ||
+          (opts.expectedHash !== undefined && (typeof opts.expectedHash !== "string" || opts.expectedHash.length > 256)) ||
+          (opts.modifiedMs !== undefined && (!Number.isSafeInteger(opts.modifiedMs) || Number(opts.modifiedMs) < 0))) {
+          throw new Error("Invalid remote upload options.");
+        }
+        return { uploadId: this.uploads.start(request.folderId, request.path, request.size, {
+          ...(typeof opts.waitForRemote === "boolean" ? { waitForRemote: opts.waitForRemote } : {}),
+          ...(typeof opts.expectedHash === "string" ? { expectedHash: opts.expectedHash } : {}),
+          ...(typeof opts.modifiedMs === "number" ? { modifiedMs: opts.modifiedMs } : {}),
+        }) };
+      }
+      case "uploadPoll": {
+        if (typeof request.uploadId !== "string") throw new Error("Missing service upload handle.");
+        return this.uploads.poll(request.uploadId);
+      }
+      case "uploadProvide": {
+        if (typeof request.uploadId !== "string" || typeof request.requestId !== "string" ||
+          typeof request.bytes !== "string" || request.bytes.length > 90 * 1024) {
+          throw new Error("Invalid service upload chunk.");
+        }
+        let bytes: Uint8Array;
+        try { bytes = decodeBase64(request.bytes, 64 * 1024); }
+        catch { throw new Error("Invalid service upload chunk."); }
+        this.uploads.provide(request.uploadId, request.requestId, bytes);
+        return { accepted: true };
+      }
+      case "uploadCancel": {
+        if (typeof request.uploadId !== "string") throw new Error("Missing service upload handle.");
+        this.uploads.cancel(request.uploadId);
+        return { cancelled: true };
+      }
+      case "deleteFile": {
+        const session = this.lifecycle.getSession();
+        if (!session || session.isClosed()) throw new Error("No service-owned peer session is connected.");
+        if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096 ||
+          typeof request.path !== "string" || !request.path || request.path.length > 4096 ||
+          request.path.startsWith("/") || request.path.split("/").some(part => part === ".." || part === ".")) {
+          throw new Error("Invalid remote deletion path.");
+        }
+        await session.remoteFs.deleteFile(request.folderId, request.path,
+          { waitForRemote: request.waitForRemote === true });
+        return { deleted: true };
+      }
       case "syncFavorites": return this.syncFavoritesCommand();
       case "releaseLocalCopy": return this.releaseLocalCopyCommand(request);
       case "status": return { ...this.lifecycle.getState(), active: !!this.lifecycle.getSession(), hasOptions: !!this.activeOptions };
-      default: throw new Error(`Unknown session operation: ${String(request.operation)}`);
+      default: {
+        const session = this.lifecycle.getSession();
+        if (!session || session.isClosed()) {
+          throw new Error("No service-owned peer session is connected.");
+        }
+        return executeServiceRemoteCommand(session, request);
+      }
     }
   };
 
   private close = async () => {
+    this.peerStatusUnsubscribe?.();
+    this.peerStatusUnsubscribe = null;
+    this.downloads.cancelAll();
+    this.uploads.cancelAll();
     this.activeOptions = null;
     this.sharedFolderIds = [];
     await this.lifecycle.disconnect();

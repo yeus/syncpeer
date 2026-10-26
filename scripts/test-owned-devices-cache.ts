@@ -151,7 +151,7 @@ test("the background session request reads profile settings once", async () => {
   const calls = installFakeTauri(({ command, args }) => {
     const operation = (args?.request as { operation?: string } | undefined)?.operation;
     if (command === "syncpeer_document_command" && operation === "profileSettings") {
-      return { result: { profile: { allowMetered: true } } };
+      return { result: { profile: { allowMetered: true, keepSyncingInBackground: true } } };
     }
     if (command === "syncpeer_android_prepare_background_session") return null;
     return { result: null };
@@ -173,7 +173,7 @@ test("changing profile settings refreshes the metered policy", async () => {
   const calls = installFakeTauri(({ command, args }) => {
     const operation = (args?.request as { operation?: string } | undefined)?.operation;
     if (command === "syncpeer_document_command" && operation === "profileSettings") {
-      return { result: { profile: { allowMetered } } };
+      return { result: { profile: { allowMetered, keepSyncingInBackground: true } } };
     }
     if (command === "syncpeer_document_command" && operation === "saveProfileSettings") {
       allowMetered = false;
@@ -184,7 +184,7 @@ test("changing profile settings refreshes the metered policy", async () => {
   const adapters = createTauriAdapters({ runtimePlatform: "android" });
   const options = { host: "127.0.0.1", port: 22000, deviceName: "synthetic" } as never;
   await adapters.platformAdapter.prepareBackgroundSession!(options);
-  await adapters.documentCommand({ operation: "saveProfileSettings", settings: {} });
+  await adapters.documentCommand({ operation: "saveProfileSettings", settings: { profile: { keepSyncingInBackground: true } } });
   await adapters.platformAdapter.prepareBackgroundSession!(options);
   assert.equal(documentOperations(calls).filter(operation => operation === "profileSettings").length, 2,
     "Saving profile settings must force the next request to re-read the policy.");
@@ -198,7 +198,7 @@ test("a locked vault does not pin metered networking off", async () => {
     const operation = (args?.request as { operation?: string } | undefined)?.operation;
     if (command === "syncpeer_document_command" && operation === "profileSettings") {
       if (locked) throw new Error("Vault is locked.");
-      return { result: { profile: { allowMetered: true } } };
+      return { result: { profile: { allowMetered: true, keepSyncingInBackground: true } } };
     }
     return { result: null };
   });
@@ -210,8 +210,8 @@ test("a locked vault does not pin metered networking off", async () => {
   const requests = calls
     .filter(call => call.command === "syncpeer_android_prepare_background_session")
     .map(call => (call.args?.request as { options?: { allowMetered?: boolean } } | undefined)?.options);
-  assert.deepEqual(requests.map(request => request?.allowMetered), [false, true],
-    "The locked-vault fallback must not be cached as the permanent policy.");
+  assert.deepEqual(requests.map(request => request?.allowMetered), [true],
+    "A locked vault must not opt into background sync; after unlock it respects the saved policy.");
 });
 
 test("Android folder sharing mutations invalidate prepared peer views after success", async () => {
@@ -244,4 +244,56 @@ test("failed Android folder mutation must not invalidate a live session", async 
     /Synthetic storage failure/);
   assert.equal(adapters.platformAdapter.sessionConfigurationRevision!(), revision,
     "A rejected mutation cannot change advertised peer folders.");
+});
+
+test("Android UI can query its service-owned peer without dialing another peer", async () => {
+  const calls = installFakeTauri(({ command, args }) => {
+    if (command === "syncpeer_android_session_command") {
+      return { result: { phase: (args?.request as { operation: string }).operation } };
+    }
+    throw new Error("Unexpected native command: " + command);
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  const service = adapters.platformAdapter.serviceSessionCommand!;
+  assert.deepEqual(await service({ operation: "status" }), { phase: "status" });
+  assert.deepEqual(await service({ operation: "overview" }), { phase: "overview" });
+  assert.deepEqual(calls.map(call => call.command),
+    ["syncpeer_android_session_command", "syncpeer_android_session_command"]);
+});
+test("background opt-out stops the single native session without restarting a peer", async () => {
+  const calls = installFakeTauri(({ command, args }) => {
+    if (command === "syncpeer_document_command" &&
+      (args?.request as { operation?: string })?.operation === "profileSettings") {
+      return { result: { profile: { allowMetered: false, keepSyncingInBackground: false } } };
+    }
+    if (command === "syncpeer_android_session_command") return { result: { phase: "idle" } };
+    if (command === "syncpeer_android_start_background_session") {
+      throw Error("Background service must not be started without opt-in.");
+    }
+    return { result: null };
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  await adapters.platformAdapter.startBackgroundSession!({
+    host: "127.0.0.1", port: 22000, remoteId: LAN_PEER,
+  });
+  assert.ok(calls.some(call => call.command === "syncpeer_android_stop_background_session"));
+  assert.ok(!calls.some(call => call.command === "syncpeer_android_start_background_session"));
+});
+test("turning off background sync disarms restart without interrupting the visible peer", async () => {
+  const calls = installFakeTauri(({ command, args }) => {
+    if (command === "syncpeer_document_command" &&
+      (args?.request as { operation?: string })?.operation === "saveProfileSettings") {
+      return { result: null };
+    }
+    if (command === "syncpeer_android_session_command") return { result: { disarmed: true } };
+    if (command === "syncpeer_android_stop_background_session") {
+      throw Error("Saving the preference must not disconnect the visible peer.");
+    }
+    return { result: null };
+  });
+  const adapters = createTauriAdapters({ runtimePlatform: "android" });
+  await adapters.documentCommand({ operation: "saveProfileSettings",
+    settings: { profile: { keepSyncingInBackground: false } } });
+  assert.equal(calls.filter(call => call.command === "syncpeer_android_session_command" &&
+    (call.args?.request as { operation?: string })?.operation === "disarmBackground").length, 1);
 });

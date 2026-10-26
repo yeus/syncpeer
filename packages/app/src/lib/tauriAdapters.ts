@@ -11,7 +11,8 @@ import type {
   SyncpeerProfileSettings,
   FileDownloadSink,
 } from "@syncpeer/core/browser";
-import { createNativeDiscoveryFetch } from "@syncpeer/core/browser";
+import { createNativeDiscoveryFetch, createServiceSessionRpcClient } from "@syncpeer/core/browser";
+import { addPluginListener } from "@tauri-apps/api/core";
 import { changesSessionConfiguration, createDocumentCache, createDocumentFilesystem,
   createNativeFilesystem, dispatchDocumentCommandWithSessionConfiguration } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
@@ -363,6 +364,8 @@ class TauriAdapters {
   > | null = null;
   /** Profile network policy; refreshed when profile settings change. */
   private allowMeteredCache: boolean | null = null;
+  private keepSyncingInBackgroundCache: boolean | null = null;
+  private serviceSessionRpc: ReturnType<typeof createServiceSessionRpcClient> | null = null;
 
   constructor(options?: CreateTauriAdaptersOptions) {
     this.options = options;
@@ -406,6 +409,7 @@ class TauriAdapters {
     // Membership, folder and profile changes also invalidate the cached vault reads.
     this.ownedDevicesCache = null;
     this.allowMeteredCache = null;
+    this.keepSyncingInBackgroundCache = null;
     this.configurationRevision++;
     for (const listener of this.sessionConfigurationListeners) listener();
   }
@@ -483,6 +487,14 @@ class TauriAdapters {
       // desktop path gets from dispatchDocumentCommandWithSessionConfiguration has
       // to run here as well; without it a live session kept stale folder and trust
       // views after pairing, revocation or credential changes.
+      if (request.operation === "saveProfileSettings") {
+        this.allowMeteredCache = null;
+        this.keepSyncingInBackgroundCache = null;
+        const next = request.settings as SyncpeerProfileSettings | undefined;
+        if (next?.profile?.keepSyncingInBackground !== true) {
+          await this.serviceCommand({ operation: "disarmBackground" });
+        }
+      }
       if (changesSessionConfiguration(request.operation)) this.invalidateSessionConfiguration();
       return response.result;
     }
@@ -626,17 +638,17 @@ class TauriAdapters {
   }
 
   private async androidBackgroundSessionRequest(options: Omit<ConnectOptions, "sharedFolders">) {
-    if (this.allowMeteredCache === null) {
+    if (this.keepSyncingInBackgroundCache === null || this.allowMeteredCache === null) {
       try {
         const settings = await this.documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
         this.allowMeteredCache = settings.profile.allowMetered === true;
+        this.keepSyncingInBackgroundCache = settings.profile.keepSyncingInBackground === true;
       } catch {
-        // A locked vault keeps the safer default: background sessions wait for Wi-Fi.
-        // The fallback is deliberately not cached, so a transient vault failure does
-        // not pin metered networking off for the rest of the session.
-        return { operation: "connect", options: { ...options, allowMetered: false } };
+        // A locked vault may not reveal the policy: do not opt into background work.
+        return null;
       }
     }
+    if (!this.keepSyncingInBackgroundCache) return null;
     return { operation: "connect", options: { ...options, allowMetered: this.allowMeteredCache } };
   }
 
@@ -653,16 +665,29 @@ class TauriAdapters {
     this.invalidateSessionConfiguration();
   }
 
-  private async prepareBackgroundSession(options: Omit<ConnectOptions, "sharedFolders">) {
-    await this.invokeWithLogging("syncpeer_android_prepare_background_session", {
-      request: await this.androidBackgroundSessionRequest(options),
+  private serviceCommand(request: Record<string, unknown>, signal?: AbortSignal) {
+    this.serviceSessionRpc ??= createServiceSessionRpcClient(async command => {
+      const response = await this.invokeWithLogging<{ result: unknown }>(
+        "syncpeer_android_session_command", { request: command });
+      return response.result;
     });
+    return this.serviceSessionRpc.call(request, signal);
+  }
+
+  private async prepareBackgroundSession(options: Omit<ConnectOptions, "sharedFolders">) {
+    const request = await this.androidBackgroundSessionRequest(options);
+    if (!request) return;
+    await this.invokeWithLogging("syncpeer_android_prepare_background_session", { request });
   }
 
   private async startBackgroundSession(options: Omit<ConnectOptions, "sharedFolders">) {
-    await this.invokeWithLogging("syncpeer_android_start_background_session", {
-      request: await this.androidBackgroundSessionRequest(options),
-    });
+    const request = await this.androidBackgroundSessionRequest(options);
+    if (!request) {
+      // Opt-out must also clear a previously armed native Activity callback.
+      await this.stopBackgroundSession();
+      return;
+    }
+    await this.invokeWithLogging("syncpeer_android_start_background_session", { request });
   }
 
   private async stopBackgroundSession() {
@@ -1046,7 +1071,13 @@ class TauriAdapters {
     const platformAdapter: SyncpeerPlatformAdapter = {
       ...basePlatformAdapter,
       ...(this.platform === "android"
-        ? { sessionSharedFolders: async () => [], incomingSessionOwnedByService: true }
+        ? { sessionSharedFolders: async () => [], incomingSessionOwnedByService: true,
+            serviceSessionCommand: (request: Record<string, unknown>, signal?: AbortSignal) =>
+              this.serviceCommand(request, signal),
+            subscribeServiceSessionEvents: async listener => {
+              const handle = await addPluginListener("syncpeer-android", "sessionStatus", listener);
+              return () => { void handle.unregister(); };
+            } }
         : {}),
       // The trust roster changes only on membership commands, which invalidate this
       // cache. Reading it on every connect queued behind the Android document worker.

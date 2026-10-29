@@ -2,6 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer } from "node:https";
+import type { TLSSocket } from "node:tls";
+import { normalizeDeviceId } from "../packages/core/src/ui/helpers.ts";
 
 import { create, emulatorArguments, profile } from "./android-emulator.mjs";
 import {
@@ -13,7 +16,7 @@ import {
   uninstallIfPresent,
   waitForBoot,
 } from "./test-android.mjs";
-import { createLanFixture, freePort } from "./lan-test/syncthing.ts";
+import { createLanFixture, freePort, generateSyncthingIdentity } from "./lan-test/syncthing.ts";
 
 const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
@@ -23,6 +26,54 @@ const peerApiLevel = Number(process.env.SYNCPEER_ANDROID_PEER_API || 29);
 type RunningEmulator = { child: ChildProcess; serial: string };
 
 const peerProfile = peerApiLevel === 26 ? "minimum" : peerApiLevel === 36 ? "modern" : "compat";
+const requestedDiscoveryMode = process.env.SYNCPEER_ANDROID_PEER_DISCOVERY_MODE;
+const discoveryMode = requestedDiscoveryMode === "automatic" || requestedDiscoveryMode === "global"
+  ? requestedDiscoveryMode : "direct";
+
+/** Pinned, disposable Syncthing discovery endpoint. No public discovery or real credentials. */
+const startSyntheticDiscovery = async (root: string, remoteId: string, peerPort: number) => {
+  const identity = generateSyncthingIdentity(path.join(root, "discovery"));
+  let lookups = 0;
+  let handshakes = 0;
+  const server = createServer({
+    cert: fs.readFileSync(identity.certPath, "utf8"),
+    key: fs.readFileSync(identity.keyPath, "utf8"),
+    requestCert: true,
+    rejectUnauthorized: false,
+  }, (request, response) => {
+    if (request.method === "POST") {
+      response.writeHead((request.socket as TLSSocket).getPeerCertificate()?.raw ? 204 : 403).end();
+      return;
+    }
+    const device = normalizeDeviceId(new URL(request.url ?? "/", "https://localhost")
+      .searchParams.get("device") ?? "");
+    if (request.method !== "GET" || device !== normalizeDeviceId(remoteId)) {
+      console.warn("Synthetic discovery unexpected query", {
+        method: request.method, device, expectedDevice: normalizeDeviceId(remoteId),
+      });
+      response.writeHead(404).end();
+      return;
+    }
+    lookups += 1;
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ addresses: [`tcp://127.0.0.1:${peerPort}`] }));
+  });
+  server.on("secureConnection", () => { handshakes += 1; });
+  server.on("tlsClientError", error => console.warn(`Synthetic discovery TLS rejected: ${error.message}`));
+  await new Promise<void>((resolve, reject) =>
+    server.listen(0, "127.0.0.1", resolve).once("error", reject));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Synthetic discovery failed to bind.");
+  return {
+    port: address.port,
+    // Use the per-emulator ADB reverse listener with a DNS hostname, so the
+    // HTTP client also exercises the TLS SNI path rather than an IP literal.
+    url: `https://localhost:${address.port}/v2/?id=${identity.deviceId}`,
+    lookupCount: () => lookups,
+    handshakeCount: () => handshakes,
+    close: () => new Promise<void>(resolve => server.close(() => resolve())),
+  };
+};
 
 const startEmulator = async (): Promise<RunningEmulator> => {
   const selected = profile(peerProfile);
@@ -70,8 +121,19 @@ const killEmulatorAbruptly = async (emulator: RunningEmulator): Promise<void> =>
   throw new Error("Abruptly terminated emulator remained visible to adb.");
 };
 
-const runPhase = (phase: string, env: NodeJS.ProcessEnv): void => {
-  run(process.execPath, ["scripts/test-android-e2e.mjs", "--expect-sdk", String(peerApiLevel), phase], { env });
+/** Do not block the parent event loop: it owns the synthetic HTTPS discovery
+ * server that the Android subprocess must contact during acceptance tests. */
+const runPhase = async (phase: string, env: NodeJS.ProcessEnv): Promise<void> => {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath,
+      ["scripts/test-android-e2e.mjs", "--expect-sdk", String(peerApiLevel), phase],
+      { env, stdio: "inherit" });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Android E2E ${phase} failed with ${code === null ? `signal ${signal}` : `exit ${code}`}.`));
+    });
+  });
 };
 
 const waitForHostIndex = async (guiUrl: string, apiKey: string, folderId: string, minimumBytes: number) => {
@@ -133,13 +195,60 @@ const setPeerPaused = async (guiUrl: string, apiKey: string, paused: boolean): P
   if (!response.ok) throw new Error(`Host Syncthing peer ${operation} failed: ${response.status}.`);
 };
 
+/** Serialise real-peer emulator acceptance across independent invocations.
+ * Android 36 E2E is particularly sensitive to competing emulator boots and
+ * shared adb state. Recover a lock left by a killed test process. */
+const acquirePeerE2ELock = async (): Promise<() => void> => {
+  // Nix shells often assign a distinct TMPDIR to each invocation, so a lock
+  // inside os.tmpdir() would NOT protect separate E2E emulator processes.
+  // The user's home directory remains stable across those shells.
+  const lockPath = path.join(os.homedir(), ".syncpeer-android-peer-e2e.lock");
+  const deadline = Date.now() + 10 * 60_000;
+  let announcedWait = false;
+  while (Date.now() < deadline) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx", mode: 0o600 });
+      return () => {
+        try {
+          if (fs.readFileSync(lockPath, "utf8").trim() === String(process.pid)) fs.unlinkSync(lockPath);
+        } catch { /* The lock can already be gone after a forced process kill. */ }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    let ownerPid = 0;
+    try { ownerPid = Number(fs.readFileSync(lockPath, "utf8").trim()); }
+    catch { /* Previous owner may be exiting. */ }
+    if (Number.isSafeInteger(ownerPid) && ownerPid > 1) {
+      try { process.kill(ownerPid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          try { fs.unlinkSync(lockPath); } catch { /* Another contender recovered it. */ }
+          continue;
+        }
+      }
+    }
+    if (!announcedWait) {
+      console.log("Waiting for another real-peer Android E2E test to release the emulator lock.");
+      announcedWait = true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+  }
+  throw new Error("Timed out waiting for the shared Android real-peer E2E emulator lock.");
+};
+
 const main = async (): Promise<void> => {
+  const releasePeerLock = await acquirePeerE2ELock();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-peer-"));
   const previousSerial = process.env.ANDROID_SERIAL;
   let emulator: RunningEmulator | null = null;
   let fixture: Awaited<ReturnType<typeof createLanFixture>> | null = null;
   let forwardedPort: number | null = null;
-  const outboundOnly = process.env.SYNCPEER_ANDROID_PEER_OUTBOUND_ONLY === "1";
+  let discovery: Awaited<ReturnType<typeof startSyntheticDiscovery>> | null = null;
+  // In the discovery regression Android MUST initiate the peer transport: a
+  // host-initiated connection would produce a misleading green result.
+  const outboundOnly = discoveryMode !== "direct" ||
+    process.env.SYNCPEER_ANDROID_PEER_OUTBOUND_ONLY === "1";
   try {
     emulator = await startEmulator();
     uninstallIfPresent(editorPackage);
@@ -176,6 +285,10 @@ const main = async (): Promise<void> => {
       includeBlob: false,
     });
     run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
+    if (discoveryMode !== "direct") {
+      discovery = await startSyntheticDiscovery(root, fixture.fixture.remoteDeviceId, fixture.fixture.directPort);
+      run("adb", ["reverse", `tcp:${discovery.port}`, `tcp:${discovery.port}`]);
+    }
     // The ordinary Android transfer suite covers 128 MiB. This fixture stays
     // smaller so it can prove multi-block journal recovery plus a full
     // DocumentsProvider hash within emulator time limits.
@@ -183,7 +296,8 @@ const main = async (): Promise<void> => {
     const env = {
       ...process.env,
       SYNCPEER_DEV_SERVER_DEVICE_ID: fixture.fixture.remoteDeviceId,
-      SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
+      SYNCPEER_ANDROID_DISCOVERY_MODE: discoveryMode,
+      ...(discovery ? { SYNCPEER_LAN_DISCOVERY_SERVER: discovery.url } : {}),
       SYNCPEER_ANDROID_DIRECT_HOST: "127.0.0.1",
       SYNCPEER_ANDROID_DIRECT_PORT: String(fixture.fixture.directPort),
       SYNCPEER_E2E_FOLDER_ID: fixture.fixture.encryptedFolderId,
@@ -196,12 +310,30 @@ const main = async (): Promise<void> => {
       SYNCPEER_PEER_API_KEY: fixture.apiKey,
     };
 
-    if (process.env.SYNCPEER_ANDROID_PEER_POLICY_ONLY === "1") {
-      runPhase("--session-policy-transition", env);
+    if (process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1") {
+      await runPhase("--peer-connect-smoke", env);
+      if (discovery && discovery.lookupCount() === 0) {
+        throw new Error("Automatic Android connection never queried pinned synthetic discovery.");
+      }
+      console.log(`Android ${discoveryMode} real-peer connection E2E passed.`);
       return;
     }
-    runPhase("--peer-cross-app", env);
-    runPhase("--session-policy-transition", env);
+    if (process.env.SYNCPEER_ANDROID_PEER_POLICY_ONLY === "1") {
+      await runPhase("--session-policy-transition", env);
+      return;
+    }
+    if (process.env.SYNCPEER_ANDROID_PEER_CROSSAPP_ONLY === "1") {
+      await runPhase("--peer-cross-app", env);
+      console.log("Android real-peer cross-app E2E passed.");
+      return;
+    }
+    const powerCutOnly = process.env.SYNCPEER_ANDROID_PEER_POWER_CUT_ONLY === "1";
+    if (powerCutOnly) {
+      await runPhase("--peer-power-cut-setup", env);
+    } else {
+      await runPhase("--peer-cross-app", env);
+      await runPhase("--session-policy-transition", env);
+    }
     const startingPeerOutBytes = await peerOutBytes(fixture.syncGuiUrl, fixture.apiKey);
     const largeFile = Buffer.allocUnsafe(largeFileSize);
     for (let index = 0; index < largeFile.length; index += 1) largeFile[index] = index % 251;
@@ -217,7 +349,7 @@ const main = async (): Promise<void> => {
       fixture.fixture.encryptedFolderId,
       largeFileSize,
     );
-    runPhase("--prepare-transfer-power-cut", env);
+    await runPhase("--prepare-transfer-power-cut", env);
     await waitForPeerTransfer(
       fixture.syncGuiUrl,
       fixture.apiKey,
@@ -227,17 +359,19 @@ const main = async (): Promise<void> => {
     emulator = await startEmulator();
     if (forwardedPort !== null) run("adb", ["forward", `tcp:${forwardedPort}`, "tcp:22000"]);
     run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
-    runPhase("--verify-transfer-power-cut", env);
+    await runPhase("--verify-transfer-power-cut", env);
 
     await setPeerPaused(fixture.syncGuiUrl, fixture.apiKey, true);
-    runPhase("--prepare-edit-power-cut", env);
+    await runPhase("--prepare-edit-power-cut", env);
     await killEmulatorAbruptly(emulator);
     emulator = await startEmulator();
     if (forwardedPort !== null) run("adb", ["forward", `tcp:${forwardedPort}`, "tcp:22000"]);
     run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
     await setPeerPaused(fixture.syncGuiUrl, fixture.apiKey, false);
-    runPhase("--verify-edit-power-cut", env);
-    console.log("Android real-peer, cross-app, and abrupt-termination acceptance passed.");
+    await runPhase("--verify-edit-power-cut", env);
+    console.log(powerCutOnly
+      ? "Android real-peer abrupt-termination recovery E2E passed."
+      : "Android real-peer, cross-app, and abrupt-termination acceptance passed.");
   } catch (error) {
     if (fixture) {
       try {
@@ -256,6 +390,8 @@ const main = async (): Promise<void> => {
         }));
       } catch { console.error("Synthetic Syncthing failure state could not be read."); }
     }
+    if (discovery) console.error("Synthetic discovery observations:",
+      { lookups: discovery.lookupCount(), tlsHandshakes: discovery.handshakeCount() });
     if (process.env.SYNCPEER_ANDROID_FAILURE_DIAGNOSTICS === "1") {
       try {
         console.error("Android process:", adb(["shell", "pidof", appPackage]).trim());
@@ -266,7 +402,9 @@ const main = async (): Promise<void> => {
         const runtimeLog = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"]).split("\n")
           .slice(-60).join("\n");
         console.error("Android SyncpeerRuntime log:", runtimeLog);
-        const failureLog = adb(["logcat", "-d"]).split("\n")
+        // Bound the logcat output: the complete emulator buffer can exceed
+        // Node's execFileSync maxBuffer and hide the original test failure.
+        const failureLog = adb(["logcat", "-d", "-t", "700"]).split("\n")
           .filter(line => /AndroidRuntime|FATAL EXCEPTION|chromium|Tauri\/Console|WebViewFactory|crash/i.test(line))
           .slice(-60).join("\n");
         console.error("Android failure log:", failureLog);
@@ -286,6 +424,10 @@ const main = async (): Promise<void> => {
     } catch { console.error("Android runtime event names unavailable."); }
     throw error;
   } finally {
+    if (discovery) {
+      try { adb(["reverse", "--remove", `tcp:${discovery.port}`]); } catch { /* Emulator stopped. */ }
+      await discovery.close();
+    }
     if (fixture) {
       try { adb(["reverse", "--remove", `tcp:${fixture.fixture.directPort}`]); }
       catch { /* The emulator may already have been abruptly terminated. */ }
@@ -301,6 +443,7 @@ const main = async (): Promise<void> => {
     else process.env.ANDROID_SERIAL = previousSerial;
     if (fixture) await fixture.stop();
     fs.rmSync(root, { recursive: true, force: true });
+    releasePeerLock();
   }
 };
 

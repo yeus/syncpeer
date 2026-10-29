@@ -270,10 +270,23 @@ const waitForCdpPage = async (port = 9222) => {
 };
 
 const connectCdp = async () => {
-  const port = Number(process.env.SYNCPEER_ANDROID_CDP_PORT || 9222);
+  let port = Number(process.env.SYNCPEER_ANDROID_CDP_PORT || 9222);
   const pid = runAdb(["shell", "pidof", packageName]).trim().split(/\s+/)[0];
   if (!pid) throw new Error(`Could not find the Android process for ${packageName}.`);
-  runAdb(["forward", `tcp:${port}`, `localabstract:webview_devtools_remote_${pid}`]);
+  const target = `localabstract:webview_devtools_remote_${pid}`;
+  try {
+    runAdb(["forward", `tcp:${port}`, target]);
+  } catch (error) {
+    // Test runs sometimes inherit a stale forward after an emulator crash.
+    // Ask adb for an ephemeral local port rather than retrying the occupied
+    // port or attaching to the wrong test's WebView.
+    if (!/cannot bind listener|Address already in use/i.test(String(error))) throw error;
+    port = Number(runAdb(["forward", "tcp:0", target]).trim());
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+      throw new Error("adb did not allocate a valid WebView debugging port.", { cause: error });
+    }
+    console.warn(`Android CDP requested port occupied; using adb-assigned port ${port}.`);
+  }
   const page = await waitForCdpPage(port);
   const socket = new globalThis.WebSocket(page.webSocketDebuggerUrl);
   let nextId = 0;
@@ -298,6 +311,9 @@ const connectCdp = async () => {
   socket.addEventListener("error", () => {
     rejectPending(new Error("Android WebView CDP connection failed."));
   });
+  socket.addEventListener("close", () => {
+    rejectPending(new Error("Android WebView CDP connection closed."));
+  });
   await new Promise((resolve, reject) => {
     socket.addEventListener("open", resolve, { once: true });
     socket.addEventListener("error", () => reject(new Error("Could not open Android WebView CDP.")), { once: true });
@@ -313,6 +329,7 @@ const connectCdp = async () => {
   });
   const expressionCache = new Map();
   const client = {
+    pid,
     evaluate: async (expression, timeout = 30_000) => {
       let result;
       try {
@@ -352,6 +369,8 @@ const connectCdp = async () => {
     close: () => {
       rejectPending(new Error("Android WebView CDP client closed."));
       socket.close();
+      try { runAdb(["forward", "--remove", `tcp:${port}`]); }
+      catch { /* The emulator can disappear during crash-recovery acceptance. */ }
     },
   };
   const deadline = Date.now() + 30_000;
@@ -371,6 +390,24 @@ const connectCdp = async () => {
   }
   client.close();
   throw new Error("Timed out waiting for the Tauri invoke bridge in the Android WebView.");
+};
+
+/** Only retry a read-only observation after CDP disconnection. Never replay
+ * clicks, Tauri mutations or transfers, since those could duplicate actions. */
+const observeCdp = async (cdp, expression) => {
+  try { return await cdp.evaluate(expression); }
+  catch (error) {
+    if (!/Android WebView CDP (?:connection|command timed out)/.test(String(error))) throw error;
+    const currentPid = runAdb(["shell", "pidof", packageName]).trim().split(/\s+/)[0];
+    if (!currentPid || currentPid !== cdp.pid) {
+      throw new Error("Android app process exited or restarted during the E2E observation.", { cause: error });
+    }
+    const replacement = await connectCdp();
+    cdp.close();
+    Object.assign(cdp, replacement);
+    console.warn("Android CDP observation reattached to the existing app process.");
+    return cdp.evaluate(expression);
+  }
 };
 
 const waitForUiCondition = async (cdp, expression, label, timeout = 60_000) => {
@@ -422,7 +459,7 @@ const runAndroidDocumentsProviderChecks = async () => {
   throw new Error("Android document picker did not offer the Syncpeer provider.");
 };
 
-const readUiDownloadState = async (cdp, name) => cdp.evaluate(`(() => {
+const readUiDownloadState = async (cdp, name) => observeCdp(cdp, `(() => {
   const text = document.body?.innerText || "";
   if (text.includes(${JSON.stringify(`Download cancelled: ${name}`)})) return "cancelled";
   if (text.includes(${JSON.stringify(`Download failed: ${name}`)})) return "failed";
@@ -585,10 +622,23 @@ const hierarchyContentDescriptionBounds = (xml, description) => {
   return node ? nodeBounds(node) : null;
 };
 
+// Cold Android 36 emulator images can briefly show a Pixel Launcher/System UI
+// ANR over the document picker. Choosing Wait permits the system process to
+// recover without silently abandoning the actual DocumentsProvider assertion.
+const recoverEmulatorAnr = (xml) => {
+  if (!xml.includes("isn't responding")) return false;
+  const bounds = hierarchyTextBounds(xml, "Wait");
+  if (!bounds) return false;
+  console.warn("Android emulator system app became unresponsive; requesting Wait.");
+  runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
+  return true;
+};
+
 const tapDocumentUiContentDescription = async (description, timeout = 30_000) => {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const xml = await captureUiHierarchy("/sdcard/syncpeer-editor-picker.xml");
+    if (recoverEmulatorAnr(xml)) { await wait(1_000); continue; }
     const bounds = hierarchyContentDescriptionBounds(xml, description);
     if (bounds) {
       runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
@@ -607,20 +657,11 @@ const hierarchyResourceBounds = (xml, resourceId) => {
 
 const tapDocumentUiText = async (text, timeout = 30_000) => {
   const deadline = Date.now() + timeout;
-  let systemUiRecovered = false;
   let lastXml = "";
   while (Date.now() < deadline) {
     const xml = await captureUiHierarchy("/sdcard/syncpeer-editor-picker.xml");
     lastXml = xml;
-    const waitButton = xml.includes("System UI isn't responding")
-      ? hierarchyTextBounds(xml, "Wait") : null;
-    if (waitButton) {
-      if (!systemUiRecovered) console.warn("Android emulator System UI stalled; waiting for picker recovery.");
-      systemUiRecovered = true;
-      runAdb(["shell", "input", "tap", String(waitButton.x), String(waitButton.y)]);
-      await wait(1_000);
-      continue;
-    }
+    if (recoverEmulatorAnr(xml)) { await wait(1_000); continue; }
     const bounds = hierarchyTextBounds(xml, text);
     if (bounds) {
       runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
@@ -637,6 +678,7 @@ const tapDocumentUiResource = async (resourceId, timeout = 30_000) => {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const xml = await captureUiHierarchy("/sdcard/syncpeer-editor-picker.xml");
+    if (recoverEmulatorAnr(xml)) { await wait(1_000); continue; }
     const bounds = hierarchyResourceBounds(xml, resourceId);
     if (bounds) {
       runAdb(["shell", "input", "tap", String(bounds.x), String(bounds.y)]);
@@ -680,7 +722,9 @@ const editorCommand = (method, name = "", extras = {}) => {
   for (const [key, value] of Object.entries(extras)) {
     args.push("--extra", `${key}:s:${value}`);
   }
-  const output = runAdb(args).trim();
+  // Reading a multi-MiB file through the Android proxy descriptor requires
+  // multiple native/TypeScript round trips; do not use the metadata timeout.
+  const output = runAdb(args, method === "digest" ? 150_000 : 30_000).trim();
   const result = output.match(/result=([^}]*)/)?.[1];
   if (result === undefined) throw new Error(`Synthetic editor ${method} returned ${output}.`);
   return result;
@@ -835,6 +879,51 @@ const runSessionPolicyTransition = async () => {
   }
 };
 
+/** Initialize only the real-peer foreground service prerequisites for the
+ * isolated power-cut acceptance case; policy/CRUD run in separate tests. */
+const preparePeerPowerCutSession = async () => {
+  let cdp = await launchAndroidApp(true);
+  try {
+    await ensurePeerDocumentVault(cdp);
+    await enableBackgroundSyncOptIn(cdp);
+    cdp.close();
+    cdp = await launchAndroidApp(true);
+    if (!await openAndroidConnection(cdp)) throw new Error("Power-cut setup did not connect.");
+    // The standalone test must initialize the same encrypted folder,
+    // background favorite and independent DocumentsProvider grant that the
+    // full cross-app acceptance initializes in its earlier phase.
+    await openAndroidFolder(cdp, false);
+    await favoriteWholeFolder(cdp, targetFolderId);
+    await startAndroidFileDownload(cdp, targetFileName);
+    await disconnectAndroidSession(cdp);
+    await waitForSessionService(false, 30_000);
+    await grantEditorFolder();
+    await waitForEditorGrant();
+    if (!await openAndroidConnection(cdp)) throw new Error("Power-cut setup did not reconnect after editor grant.");
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 30_000);
+    await waitForSessionNotificationText("Peer session connected; selected sync is ready.", 120_000);
+    console.log("Android headless peer session established for power-cut acceptance.");
+  } finally {
+    cdp.close();
+  }
+};
+
+/** True packaged Android-to-Syncthing smoke: discovery, TLS/BEP and remote folder index. */
+const runPeerConnectSmoke = async () => {
+  const cdp = await launchAndroidApp(true);
+  try {
+    await ensurePeerDocumentVault(cdp);
+    if (!await openAndroidConnection(cdp)) throw new Error("Android real-peer connection did not open.");
+    await openAndroidFolder(cdp, false, false);
+    const folder = await readAndroidFolderState(cdp);
+    if (folder.ui?.connection !== "Connected") {
+      throw new Error(`Android peer disconnected while browsing: ${JSON.stringify(folder)}`);
+    }
+    console.log(`Android ${discoveryMode} real-peer connection and remote folder index passed.`);
+  } finally { cdp.close(); }
+};
+
 const runPeerCrossAppWorkflow = async () => {
   if (!peerHostFolder) throw new Error("SYNCPEER_PEER_HOST_FOLDER is required.");
   let cdp = await launchAndroidApp(true);
@@ -914,19 +1003,27 @@ const verifyPeerTransferPowerCut = async () => {
     );
     cdp.close();
     const deadline = Date.now() + downloadTimeoutMs;
+    const expectedDigest = `${targetLargeFileSize}:${fixtureBlobHash()}`;
     let summary = "";
     let lastError = "";
+    let seenCommitted = false;
     while (Date.now() < deadline) {
       try {
-        summary = editorCommand("digest", targetLargeFileName);
-        if (summary === `${targetLargeFileSize}:${fixtureBlobHash()}`) break;
+        // Probe metadata first; opening an uncommitted large file repeatedly
+        // can stall the proxy descriptor after an abrupt process restart.
+        if (editorCommand("stat", targetLargeFileName) === "true") {
+          seenCommitted = true;
+          summary = editorCommand("digest", targetLargeFileName);
+          if (summary === expectedDigest) break;
+        }
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         // The provider exposes only committed files, never an interrupted draft.
       }
       await wait(500);
     }
-    if (summary !== `${targetLargeFileSize}:${fixtureBlobHash()}`) {
+    if (!seenCommitted) console.error("Android recovery: large file never became visible to DocumentsProvider.");
+    if (summary !== expectedDigest) {
       throw new Error(`abrupt emulator termination recovery produced an invalid document: ${summary || "missing"}` +
         `${lastError ? ` (${lastError})` : ""}`);
     }
@@ -1341,10 +1438,19 @@ const launchAndroidAppAfterPowerLoss = async () => {
   try {
     return await launchAndroidApp();
   } catch {
-    console.log("Android WebView did not reattach after power loss; retrying from a cold process.");
+    console.log("Android WebView did not reattach after power loss; relaunching the explicit Activity.");
     runAdb(["shell", "am", "force-stop", packageName]);
     await waitForPackageStopped();
-    return await launchAndroidApp();
+    // After an abrupt emulator shutdown the input/monkey framework may still
+    // be unavailable even when PackageManager and the app are ready. Launch
+    // the known debug Activity directly instead of relying on monkey twice.
+    const packagePath = runAdb(["shell", "pm", "path", packageName]).trim();
+    if (!packagePath.startsWith("package:")) {
+      throw new Error("Android package disappeared across the emulator power cut.");
+    }
+    runAdb(["shell", "am", "start", "-W", "-n", `${packageName}/.MainActivity`], 60_000);
+    await assertForeground();
+    return connectCdp();
   }
 };
 
@@ -1565,6 +1671,12 @@ const openAndroidConnection = async (cdp) => {
   }
   await setUiValue(cdp, "connection-saved-device", "");
   await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
+  if (discoveryMode !== "direct") {
+    const host = await cdp.evaluate(
+      'document.querySelector("[data-testid=connection-host]")?.value ?? ""',
+    );
+    if (host !== "") throw new Error("Automatic discovery E2E must not use a fixed host.");
+  }
   await setUiValue(cdp, "connection-timeout", String(connectionTimeoutMs));
   await setUiValue(cdp, "connection-listen-port", androidListenPort);
   if (discoveryMode === "direct") {
@@ -1585,7 +1697,7 @@ const openAndroidConnection = async (cdp) => {
   const deadline = Date.now() + connectionTimeoutMs;
   let lastError = "";
   while (Date.now() < deadline) {
-    const state = await cdp.evaluate(`(() => {
+    const state = await observeCdp(cdp, `(() => {
       return {
         label: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() || "",
         error: document.querySelector("p.error")?.textContent?.trim() || "",
@@ -1695,11 +1807,23 @@ const ensureAndroidFolderAttached = async (cdp) => {
   });
   if (status.result?.folders?.some(folder => folder.id === targetFolderId && folder.downloads)) return;
   await openFolderSettings(cdp);
-  await waitForUiCondition(cdp, `([...document.querySelectorAll("li")]
-    .some(row => row.querySelector("span")?.textContent?.trim() === ${JSON.stringify(targetFolderTitle)}
-      && [...row.querySelectorAll("button")]
-        .some(button => button.textContent?.trim() === "Reattach encrypted local storage")))`,
-  "browse-only folder reattach control", 30_000);
+  // The local copy can attach asynchronously while folder settings is opening.
+  // Do not wait for a reattach button that disappears once downloads is true.
+  const controlDeadline = Date.now() + 30_000;
+  let reattachVisible = false;
+  while (Date.now() < controlDeadline) {
+    const current = await tauriInvoke(cdp, "syncpeer_document_command", {
+      request: { operation: "status" },
+    });
+    if (current.result?.folders?.some(folder => folder.id === targetFolderId && folder.downloads)) return;
+    reattachVisible = await cdp.evaluate(`([...document.querySelectorAll("li")]
+      .some(row => row.querySelector("span")?.textContent?.trim() === ${JSON.stringify(targetFolderTitle)}
+        && [...row.querySelectorAll("button")]
+          .some(button => button.textContent?.trim() === "Reattach encrypted local storage")))`);
+    if (reattachVisible) break;
+    await wait(250);
+  }
+  if (!reattachVisible) throw new Error("Neither local folder attachment nor reattach control became available.");
   const requested = await cdp.evaluate(`(() => {
     const row = [...document.querySelectorAll("li")]
       .find(element => element.querySelector("span")?.textContent?.trim() === ${JSON.stringify(targetFolderTitle)});
@@ -1807,16 +1931,21 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
           90_000,
         );
         await ensureAndroidFolderAttached(cdp);
-        await cdp.evaluate(`(() => {
-          const back = [...document.querySelectorAll("button")].find(button => button.textContent?.trim() === "Back");
-          back?.click();
-        })()`);
-        await waitForUiCondition(cdp, 'document.querySelector("[data-testid=tab-folders]") !== null', "folder browser after unlock");
+        // The route is synchronized through hash navigation; on slower Android
+        // WebViews a click may be superseded by a late settings refresh.
+        // Reattempt navigation only while still on this exact settings page.
+        await waitForUiCondition(cdp, `(() => {
+          if (document.querySelector("[data-testid=tab-folders]")) return true;
+          const page = document.querySelector('[data-testid="folder-settings-page"]');
+          const back = page?.querySelector("button");
+          if (back?.textContent?.trim() === "Back") back.click();
+          return false;
+        })()`, "folder browser after unlock", 30_000);
       } catch (cause) {
         const state = await readAndroidFolderState(cdp);
         const events = await readAndroidSessionEvents(cdp);
         throw new Error(`Encrypted document folder attachment failed: ` +
-          JSON.stringify({ ...state, events }), { cause });
+          JSON.stringify({ ...state, events, reason: String(cause) }), { cause });
       }
     }
   }
@@ -2939,17 +3068,29 @@ const main = async () => {
   if (runtimeProbePath) {
     const cdp = await launchAndroidApp(true);
     let supported = false;
+    let lastFailure = "";
     try {
-      await tauriInvoke(cdp, "syncpeer_document_command", {
-        request: { operation: "status" },
-      }, 60_000);
-      supported = true;
-    } catch {
-      // The managed image may expose JavaScriptSandbox without every feature
-      // required by the service-owned storage/network bridge.
+      // JavaScriptSandbox and the Android service can take time to initialize
+      // immediately after the first fresh install. A single failed status RPC
+      // is not evidence that the runtime is unsupported; retry but never skip
+      // real-peer acceptance if it remains unavailable.
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        try {
+          await tauriInvoke(cdp, "syncpeer_document_command", {
+            request: { operation: "status" },
+          }, 30_000);
+          supported = true;
+          break;
+        } catch (error) {
+          lastFailure = String(error).slice(0, 500);
+          await wait(1_000);
+        }
+      }
     } finally {
       cdp.close();
     }
+    if (!supported) console.error(`Android document runtime never became ready: ${lastFailure}`);
     fs.writeFileSync(runtimeProbePath, supported ? "supported\n" : "unsupported\n", { mode: 0o600 });
     return;
   }
@@ -3017,12 +3158,20 @@ const main = async () => {
     return;
   }
 
+  if (hasArgument("--peer-connect-smoke")) {
+    await runPeerConnectSmoke();
+    return;
+  }
   if (hasArgument("--peer-cross-app")) {
     await runPeerCrossAppWorkflow();
     return;
   }
   if (hasArgument("--session-policy-transition")) {
     await runSessionPolicyTransition();
+    return;
+  }
+  if (hasArgument("--peer-power-cut-setup")) {
+    await preparePeerPowerCutSession();
     return;
   }
   if (hasArgument("--prepare-transfer-power-cut")) {

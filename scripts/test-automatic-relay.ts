@@ -173,16 +173,21 @@ test("announcement throttling honors Retry-After while keeping the relay registe
   let announcements = 0;
   const times: number[] = [];
   f.adapter.discoveryFetch = async (input, init) => {
+    const isAnnouncement = init?.method === "POST";
+    // Record request start, not response completion: a correct 1000 ms timer
+    // can otherwise measure 999 ms because the first response is processed at T+1.
+    if (isAnnouncement) times.push(Date.now());
     const response = await fetch(input, init);
-    if (init?.method !== "POST") return response;
-    times.push(Date.now());
+    if (!isAnnouncement) return response;
     return ++announcements === 1 ? { ...response, ok: false, status: 429,
       headers: { "Retry-After": "1" } } : response;
   };
   const service = await startIncomingPeerService(f.adapter, f.options);
   try {
     await until(() => announcements === 2);
-    assert.ok(times[1] - times[0] >= 1000);
+    // Node timers can fire ~1 ms early relative to Date.now(); allow normal
+    // scheduling jitter while still rejecting an unthrottled immediate retry.
+    assert.ok(times[1] - times[0] >= 950);
     assert.equal(f.registrations.length, 1);
   } finally { await service.close(); }
 });

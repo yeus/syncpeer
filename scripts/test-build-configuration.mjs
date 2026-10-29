@@ -627,3 +627,31 @@ test("real-peer Android acceptance cannot skip a failed document runtime probe",
   assert.doesNotMatch(runner, /JS_FEATURE_MESSAGE_PORTS required by the document runtime/);
   assert.match(runner, /throw new Error\("Android document runtime is unavailable/);
 });
+
+test("Android automatic discovery E2E requires a real outgoing connection and remote index", () => {
+  const runner = fs.readFileSync("scripts/test-android-peer.ts", "utf8");
+  const phase = fs.readFileSync("scripts/test-android-e2e.mjs", "utf8");
+  assert.match(runner, /SYNCPEER_ANDROID_PEER_DISCOVERY_MODE/);
+  assert.match(runner, /const outboundOnly = discoveryMode !== "direct"/);
+  assert.match(runner, /discovery\.lookupCount\(\) === 0/);
+  // Syncthing reports 56-character IDs with check digits, while the client
+  // queries with normalized 52-character IDs. The fake server must compare
+  // the same canonical form or silently respond 404 to valid peer lookups.
+  assert.match(runner, /normalizeDeviceId\(remoteId\)/);
+  // The test's HTTPS server lives on the parent event loop; a synchronous
+  // child process would block every lookup and make discovery always time out.
+  assert.match(runner, /const runPhase = async/);
+  assert.match(runner, /spawn\(process\.execPath/);
+  assert.match(runner, /await runPhase\("--peer-connect-smoke"/);
+  assert.match(runner, /SYNCPEER_ANDROID_PEER_POWER_CUT_ONLY/);
+  assert.match(runner, /await runPhase\("--peer-power-cut-setup"/);
+  assert.match(runner, /acquirePeerE2ELock/);
+  // Preserve real-device assertions while recovering transient emulator UI and
+  // WebView debugger failures without making a pass out of an application error.
+  assert.match(phase, /recoverEmulatorAnr/);
+  assert.match(phase, /"forward", "tcp:0", target/);
+  assert.match(phase, /"forward", "--remove", `tcp:\$\{port\}`/);
+  assert.match(phase, /--peer-connect-smoke/);
+  assert.match(phase, /await openAndroidFolder\(cdp, false, false\)/);
+  assert.match(phase, /Automatic discovery E2E must not use a fixed host/);
+});

@@ -3194,6 +3194,12 @@ class ConnectionAttempt {
   }
 
   private logDiscovery(outcome: DiscoveryOutcome, localCandidates: DiscoveredCandidate[]) {
+    if (outcome.global.status === "rejected") {
+      this.adapter.log?.("core.discovery.global_failed", {
+        message: outcome.global.reason instanceof Error
+          ? outcome.global.reason.message : String(outcome.global.reason),
+      });
+    }
     if (localCandidates.length > 0) {
       this.adapter.log?.("core.discovery.local_response", {
         timeoutMs: this.localDiscoveryTimeoutMs,

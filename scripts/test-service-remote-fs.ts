@@ -52,6 +52,33 @@ test("service-owned session browses, downloads and uploads without a second peer
   assert.deepEqual(supplied, [4, 5, 6]);
   await session.close();
 });
+test("transient service RPC unavailability does not permanently detach a recovering peer proxy", async () => {
+  let reads = 0;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "connected" };
+    if (request.operation === "overview") return {
+      folders: [], folderSyncStates: [], connectedVia: "service", transportKind: "direct-tcp",
+    };
+    if (request.operation === "status") return { active: true, phase: "reconnecting" };
+    if (request.operation === "readDir") {
+      if (reads++ === 0) throw new Error("Android service session unavailable");
+      return { entries: [], nextOffset: null, total: 0 };
+    }
+    throw new Error(`Unexpected operation: ${String(request.operation)}`);
+  };
+  const session = await createServiceOwnedSession(rpc, {
+    host: "127.0.0.1", port: 22000, remoteId: "peer",
+  } as never);
+  try {
+    await assert.rejects(session.remoteFs.readDir("folder", ""), /session unavailable/);
+    assert.equal(session.isClosed(), false);
+    assert.deepEqual(await session.remoteFs.readDir("folder", ""), []);
+    assert.equal(session.isClosed(), false);
+  } finally {
+    await session.close();
+  }
+});
+
 test("service-owned UI notices a dead background peer and emits a transport closure", async () => {
   let active = true, checks = 0;
   const rpc = async (request: Record<string, unknown>) => {
@@ -77,6 +104,39 @@ test("service-owned UI notices a dead background peer and emits a transport clos
     assert.equal(closure.kind, "transport");
     assert.equal(session.isClosed(), true);
     assert.ok(checks > 0);
+  } finally {
+    await session.close();
+  }
+});
+
+test("service-owned UI remains attached while the active peer temporarily reconnects", async () => {
+  let phase = "connected";
+  let checks = 0;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "connected" };
+    if (request.operation === "overview") return {
+      folders: [], folderSyncStates: [], connectedVia: "service", transportKind: "direct-tcp",
+    };
+    if (request.operation === "status") {
+      checks++;
+      return { active: true, phase };
+    }
+    throw Error("Unexpected operation.");
+  };
+  const session = await createServiceOwnedSession(rpc, {
+    host: "127.0.0.1", port: 22000, remoteId: "peer",
+  } as never, undefined, 20);
+  try {
+    for (const next of ["starting", "reconnecting", "waiting", "connected"]) {
+      phase = next;
+      const before = checks;
+      const deadline = Date.now() + 200;
+      while (checks === before && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      assert.ok(checks > before, `Heartbeat did not observe ${next}.`);
+      assert.equal(session.isClosed(), false, `Transient ${next} detached a live service proxy.`);
+    }
   } finally {
     await session.close();
   }
@@ -213,7 +273,13 @@ test("service proxy uses pushed status revisions and ignores stale replay", asyn
     listener!({ type: "sessionStatus", revision: 6, phase: "connected", active: true,
       foreground: true, peerPhase: "reconnecting", peerError: "Peer is reconnecting." });
     assert.equal(session.isClosed(), false);
-    listener!({ type: "sessionStatus", revision: 7, phase: "error", active: false,
+    listener!({ type: "sessionStatus", revision: 7, phase: "waiting", active: true,
+      foreground: true, peerPhase: "idle" });
+    assert.equal(session.isClosed(), false, "Transient idle peer during service recovery must not detach.");
+    listener!({ type: "sessionStatus", revision: 8, phase: "reconnecting", active: true,
+      foreground: true, peerPhase: "error", peerError: "Retrying peer session." });
+    assert.equal(session.isClosed(), false, "Transient peer error during service recovery must not detach.");
+    listener!({ type: "sessionStatus", revision: 9, phase: "error", active: false,
       foreground: false, error: "Peer session failed." });
     const closure = await session.closed;
     assert.equal(closure.kind, "transport");

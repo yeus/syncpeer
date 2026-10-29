@@ -228,7 +228,11 @@ export async function createServiceOwnedSession(
       if (Number.isSafeInteger(status.revision) && Number(status.revision) > lastStatusRevision) {
         lastStatusRevision = Number(status.revision);
       }
-      if (status.active !== true || status.phase !== "connected") {
+      // The service can legitimately report waiting/reconnecting/starting
+      // while retaining the same owned peer session. Treat only terminal
+      // phases or a truly inactive service as a detached UI proxy.
+      if (status.active !== true || status.phase === "idle" ||
+        status.phase === "stopping" || status.phase === "error") {
         markClosed("transport", "Android service peer session is no longer connected.");
       }
     }, () => {
@@ -245,16 +249,11 @@ export async function createServiceOwnedSession(
     validateResponse = true) => {
     await focusBarrier.catch(() => undefined);
     if (detached) throw new Error("Android service session is detached.");
-    let result: unknown;
-    try {
-      result = await rpc(withServiceProtocol(command), userSignal);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (/peer session is (unavailable|not connected)|service-owned peer session is connected|Android service session unavailable/i.test(message)) {
-        markClosed("transport", "Android service session disconnected.");
-      }
-      throw error;
-    }
+    // A command can race with a service-owned peer reconnect while the native
+    // service and its RPC proxy remain alive. Do not turn that transient
+    // command failure into a permanent UI detachment. Terminal pushed status
+    // events and the heartbeat still close genuinely dead service sessions.
+    const result = await rpc(withServiceProtocol(command), userSignal);
     if (!validateResponse) return result;
     try {
       return parseServiceResponse(String(command.operation), result);

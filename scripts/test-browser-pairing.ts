@@ -13,6 +13,7 @@ import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";
 import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
 
+import { parseServiceCommand } from "../packages/core/dist/sync/serviceProtocol.js";
 useTemporaryMetadataRoot();
 
 const identity = async (root: string, name: string) => {
@@ -93,7 +94,16 @@ test("Android UI browses through the one service session across visibility chang
     stopBackgroundSession: async () => { stops++; },
     serviceSessionCommand: async request => {
       commands.push(String(request.operation));
-      if (request.operation === "connect") { opens++; return { phase: "connected" }; }
+      if (request.operation === "connect") {
+        // Exercise the actual UI -> Android service protocol with no fixed host.
+        const parsed = parseServiceCommand(request);
+        assert.equal(parsed.operation, "connect");
+        if (parsed.operation !== "connect") throw new Error("Expected connect command.");
+        assert.equal(parsed.options.host, "");
+        assert.equal(parsed.options.discoveryMode, "automatic");
+        opens++;
+        return { phase: "connected" };
+      }
       if (request.operation === "overview") return {
         folders: [{ id: "folder", label: "Folder", readOnly: true }],
         device: { id: remoteIdentity.deviceId, deviceName: "synthetic", clientName: "test", clientVersion: "1" },
@@ -106,8 +116,8 @@ test("Android UI browses through the one service session across visibility chang
     },
   } });
   try {
-    const options = { host: "127.0.0.1", port: 22000, remoteId: remoteIdentity.deviceId,
-      discoveryMode: "direct" as const, timeoutMs: 1000 };
+    const options = { host: "", port: 22000, remoteId: remoteIdentity.deviceId,
+      deviceName: "synthetic", discoveryMode: "automatic" as const, timeoutMs: 1000 };
     const remote = await client.connectAndSync(options);
     assert.deepEqual((await remote.listFolders()).map(folder => folder.id), ["folder"]);
     await client.setForeground(false);

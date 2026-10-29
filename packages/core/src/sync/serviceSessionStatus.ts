@@ -65,9 +65,12 @@ export const parseServiceSessionStatusEvent = (
   };
 };
 
+// A peer runtime can briefly report idle/error while the owning native service
+// is starting or reconnecting. The native service phase and active flag are
+// authoritative for whether the UI must detach its still-live RPC proxy.
 export const serviceSessionStatusIsTerminal = (event: ServiceSessionStatusEvent): boolean =>
   !event.active || event.phase === "idle" || event.phase === "stopping" ||
-  event.phase === "error" || event.peerPhase === "idle" || event.peerPhase === "error";
+  event.phase === "error";
 
 export const serviceSessionStatusMessage = (event: ServiceSessionStatusEvent): string =>
   event.peerError ?? event.error ??

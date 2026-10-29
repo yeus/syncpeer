@@ -19,6 +19,16 @@ test("service commands are versioned and reject unsafe paths", () => {
     /command/i);
 });
 
+test("service connect accepts an empty host for automatic and discovery-only pairing", () => {
+  for (const discoveryMode of ["automatic", "global", "lan"] as const) {
+    const command = parseServiceCommand(withServiceProtocol({ operation: "connect",
+      options: { host: "", port: 22000, deviceName: "synthetic", discoveryMode } }));
+    assert.equal(command.options.host, "");
+  }
+  assert.throws(() => parseServiceCommand(withServiceProtocol({ operation: "connect",
+    options: { host: "", port: 22000, deviceName: "synthetic", discoveryMode: "direct" } })), /host/i);
+});
+
 test("service responses validate overviews, pages, status and transfer frames", () => {
   const overview = parseServiceResponse("overview", withServiceProtocol({ operation: "overview" }).protocolVersion
     ? { folders: [{ id: "f", label: "F", readOnly: false }], folderSyncStates: [],

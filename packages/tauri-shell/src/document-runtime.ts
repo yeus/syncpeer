@@ -77,7 +77,8 @@ const createAndroidSessionAdapter = async (
   const adapter: SyncpeerHostAdapter = {
     log: (event, details) => {
       if (!event.startsWith("core.session.connect.") &&
-        !["core.upload.request.failed", "core.replica.receive.failed"].includes(event)) return;
+        !["core.discovery.global_failed", "core.upload.request.failed",
+          "core.replica.receive.failed"].includes(event)) return;
       void request({ operation: "diagnostic", event,
         message: typeof details?.message === "string" ? details.message : "Unknown runtime failure." });
     },

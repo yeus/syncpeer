@@ -25,7 +25,8 @@ const remoteDevice = z.looseObject({ id: z.string(), deviceName: z.string(),
 const connectionScope = z.enum(["lan", "wan", "unknown"]);
 
 const connectOptions = z.looseObject({
-  host: z.string().min(1).max(4096), port: z.number().int().min(1).max(65535),
+  // Automatic/LAN/global discovery legitimately starts without a fixed host.
+  host: z.string().max(4096), port: z.number().int().min(1).max(65535),
   listenPort: z.number().int().min(1).max(65535).optional(),
   discoveryMode: z.enum(["automatic", "global", "lan", "direct"]).optional(),
   discoveryServer: z.string().max(4096).optional(), relayPoolUrl: z.string().max(4096).optional(),
@@ -35,6 +36,10 @@ const connectOptions = z.looseObject({
   relayOnly: z.boolean().optional(), quicOnly: z.boolean().optional(),
   folderPasswords: z.record(z.string(), z.string()).optional(),
   sharedFolders: z.array(z.unknown()).optional(),
+}).superRefine((options, ctx) => {
+  if (options.discoveryMode === "direct" && options.host.trim() === "") {
+    ctx.addIssue({ code: "custom", path: ["host"], message: "Direct connections require a host." });
+  }
 });
 
 const uploadOptions = z.looseObject({
@@ -79,7 +84,7 @@ export const servicePhase = z.enum(["idle", "starting", "connected", "waiting",
   "reconnecting", "suspended", "stopping", "error"]);
 
 export const serviceStatusResponseSchema = z.looseObject({
-  phase: z.enum(["idle", "connecting", "connected", "waiting", "reconnecting",
+  phase: z.enum(["idle", "connecting", "starting", "connected", "waiting", "reconnecting",
     "suspended", "stopping", "error"]),
   attempt: z.number().int().min(0).optional(), nextRetryAtMs: z.number().int().nullable().optional(),
   closureReason: z.string().nullable().optional(),

@@ -21,6 +21,7 @@ test("changing settings cancels an unfinished connection before waiting for it",
   state.connection.deviceName = "fixture-client";
   state.connection.discoveryMode = "direct";
   state.connection.remoteId = "A".repeat(52);
+  state.devices.savedDevices = [{ id: state.connection.remoteId, name: "Synthetic peer", isIntroducer: false, createdAtMs: Date.now() }];
   state.connection.cert = "synthetic-certificate";
   state.connection.key = "synthetic-private-key";
   const errors: unknown[][] = [];

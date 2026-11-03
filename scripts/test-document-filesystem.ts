@@ -57,6 +57,31 @@ test("session configuration invalidates only after the document mutation succeed
   assert.deepEqual(events, ["attach:start", "attach:done", "invalidate"]);
 });
 
+test("a device-protected local vault saves profile settings without Personal Space", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  let remembered: string | null = null;
+  const documents = createDocumentFilesystem({
+    profileId: "device-only-settings-fixture", deviceCounterId: "58", openStorage,
+    profile: await openStorage("profile"), randomBytes,
+    rememberedSecret: {
+      isDeviceUnlocked: async () => true,
+      save: async (secret: string) => { remembered = secret; },
+      load: async () => remembered,
+      remove: async () => { remembered = null; },
+    },
+  });
+  await documents.initialize();
+  await documents.createLocalVault();
+  const initial = await documents.profileSettings();
+  assert.equal(initial.profile.keepSyncingInBackground, false);
+  await documents.saveProfileSettings({
+    ...initial, profile: { ...initial.profile, keepSyncingInBackground: true },
+  });
+  assert.equal((await documents.profileSettings()).profile.keepSyncingInBackground, true);
+  assert.equal((await documents.status()).vault.phase, "unlocked");
+  await documents.close();
+});
+
 test("an ordinary Syncthing peer can receive an explicitly selected folder without a personal space", async () => {
   const { openStorage } = memoryDocumentStorage();
   const preparationStages: string[] = [];

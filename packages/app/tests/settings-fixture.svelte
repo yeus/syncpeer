@@ -5,6 +5,7 @@
   import { createInitialState } from "../src/app/state.ts";
   import GeneralSettingsPage from "../src/GeneralSettingsPage.svelte";
   import PersonalSpaceOnboarding from "../src/components/PersonalSpaceOnboarding.svelte";
+  import DeviceNameOnboarding from "../src/components/DeviceNameOnboarding.svelte";
   import FolderSettingsPage from "../src/FolderSettingsPage.svelte";
   import NewFolderPage from "../src/NewFolderPage.svelte";
   import DeviceTab from "../src/components/DeviceTab.svelte";
@@ -12,12 +13,12 @@
 
   let app = $state(createInitialState(null));
   let page = $state("main"), phase = $state("unlocked");
+  let personalSpaceEnabled = $state(false);
   let managedStorage = $state(true), selectedFolderId = $state("photos");
   let password = $state("synthetic-folder-password");
   let diagnosticsCopied = $state(false);
   let generationLoggerBroken = $state(false);
   let biometricStatusChecks = $state(0);
-  let promptDismissed = $state(false);
   let calls = $state<Record<string, unknown>[]>([]);
   let profile = $state({ ...defaultProfileSettings(), folders: {
     photos: { ...defaultFolderSettings(), ignorePatterns: ["photos-only"] },
@@ -29,7 +30,7 @@
   async function command<T>(request: Record<string, unknown>): Promise<T> {
     record(request);
     switch (request.operation) {
-      case "status": return { vault: { phase }, folders: [
+      case "status": return { vault: { phase, personalSpaceEnabled }, folders: [
         { id: "photos", label: "Photos", downloads: true },
         { id: "documents", label: "Documents", downloads: true },
       ], pendingLocalReleases: [] } as T;
@@ -47,7 +48,7 @@
       case "localReleaseHistory": return [] as T;
       case "saveProfileSettings": profile = request.settings as typeof profile; break;
       case "savePersonalSpaceSetting": minimumCopies = (request.value as { minimumCopies: number }).minimumCopies; break;
-      case "createVault": phase = "unlocked"; break;
+      case "createVault": phase = "unlocked"; personalSpaceEnabled = true; break;
       case "unlock": phase = "unlocked"; break;
     }
     return undefined as T;
@@ -55,29 +56,29 @@
 </script>
 
 <button data-testid="lock-fixture" onclick={() => { phase = "locked"; }}>Lock fixture</button>
-<button data-testid="uninitialized-fixture" onclick={() => { phase = "uninitialized"; }}>Reset fixture</button>
+<button data-testid="uninitialized-fixture" onclick={() => { phase = "uninitialized"; personalSpaceEnabled = false; }}>Reset fixture</button>
+<button data-testid="personal-space-enabled-fixture" onclick={() => { personalSpaceEnabled = true; }}>Enable Personal Space fixture</button>
 <button data-testid="browser-fixture" onclick={() => { managedStorage = false; }}>Browser fixture</button>
 <button data-testid="onboarding-fixture" onclick={() => { page = "onboarding"; }}>Onboarding fixture</button>
 <button data-testid="break-generation-logger-fixture" onclick={() => { generationLoggerBroken = true; }}>Break diagnostic logger</button>
 <button data-testid="reset-local-name-fixture" onclick={() => {
-  app.connection.deviceName = ""; app.ui.deviceNameConfirmed = false; promptDismissed = false;
+  app.connection.deviceName = ""; app.ui.deviceNameConfirmed = false;
 }}>Reset device name fixture</button>
 <output data-testid={diagnosticsCopied ? "synthetic-diagnostics-copied" : "synthetic-diagnostics-idle"} hidden></output>
 <output data-testid="calls" hidden>{JSON.stringify(calls)}</output>
 <output data-testid="synthetic-biometric-status-checks" hidden>{biometricStatusChecks}</output>
-{#if page === "main"}
-  <DeviceTab {app} advertisedDevices={[]} currentSourceIsIntroducer={false}
-    showDeviceNamePrompt={!promptDismissed && !app.ui.deviceNameConfirmed}
-    suggestedDeviceName="synthetic-device"
-    onSaveDeviceName={name => { app.connection.deviceName = name; app.ui.deviceNameConfirmed = true; }}
-    onDismissDeviceNamePrompt={() => { promptDismissed = true; }}
-    isSavedDeviceConnected={() => false} isSavedDeviceAwaitingRemoteApproval={() => false} isLanDiscoveredDevice={() => false}
+{#if page === "main" && !app.ui.deviceNameConfirmed}
+  <DeviceNameOnboarding suggestedName="synthetic-device"
+    onSave={name => { app.connection.deviceName = name; app.ui.deviceNameConfirmed = true; }} />
+{:else if page === "main"}
+  <DeviceTab {app} advertisedDevices={[]}
+    isSavedDeviceAwaitingRemoteApproval={() => false} isLanDiscoveredDevice={() => false}
     onUseSavedDevice={() => {}} onResetDiscoveryServer={() => {}} onClearAllCache={() => {}} onClearOfflineFolderState={() => {}}
     onOpenDiagnosticsPage={() => {}} onOpenAboutPage={() => {}} onCopyCurrentDeviceId={() => {}} onCopySessionLogs={() => {}}
     onEditLocalDeviceName={() => {}} onRegenerateDeviceId={() => {}} onCopyIdentityBackupSecret={() => {}}
     onRestoreIdentityRecovery={() => {}} onAddSavedDevice={() => {}} onApproveAdvertisedDevice={() => {}}
     onEditSavedDeviceName={() => {}} onSetSavedDeviceIntroducer={() => {}} onRemoveSavedDevice={() => {}}
-    onConnectLocalCandidate={() => {}} onConnectionSettingsChanged={() => {}} onOpenGeneralSettings={() => { page = "general"; }} />
+    onConnectionSettingsChanged={() => {}} onOpenGeneralSettings={() => { page = "general"; }} />
   <button data-testid="new-folder" onclick={() => { page = "new"; }}>New folder</button>
   <ul><FileSystemListItem item={{ kind: "root-folder", folderId: "photos", name: "Photos", readOnly: false,
     encrypted: true, lockLabel: "unlocked", passwordError: "", locked: false, isFavorite: false,

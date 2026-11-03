@@ -13,6 +13,8 @@ import {
 } from "../packages/core/dist/core/protocol/bep.js";
 import {
   createSyncpeerCoreClient,
+  deviceIdFromCertificate,
+  resolveGlobalDiscovery,
   withSessionTransportProgress,
   withRecoveringSession,
 } from "../packages/core/dist/client.js";
@@ -604,6 +606,54 @@ assert.equal(
 );
 assert.equal(raceSession.isClosed(), false);
 await raceSession.close();
+
+// Automatic discovery must use a valid global answer even when the optional
+// Android LAN lookup never responds (e.g. a saturated native network worker).
+const stalledLanSocket = createFakeTlsSocket();
+let globalConnects = 0;
+const stalledLanAdapter = {
+  connectTls: async () => { globalConnects += 1; return stalledLanSocket.socket; },
+  sha256: async (data: Uint8Array) => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: async (length: number) => new Uint8Array(length),
+  discoveryFetch: async () => ({
+    ok: true, status: 200, headers: {},
+    text: async () => JSON.stringify({ addresses: ["tcp://primary.test:22000"] }),
+    json: async () => ({ addresses: ["tcp://primary.test:22000"] }),
+  }),
+  discoverLocalCandidates: async (): Promise<never> => new Promise(() => undefined),
+};
+const remoteCertId = await deviceIdFromCertificate(stalledLanAdapter, new Uint8Array([4, 5, 6]));
+const stalledLanStarted = Date.now();
+const stalledLanSession = await createSyncpeerCoreClient(stalledLanAdapter).openSession({
+  host: "",
+  port: 22000,
+  certPem: fakeCertificate,
+  keyPem: fakeCertificate,
+  expectedDeviceId: remoteCertId,
+  deviceName: "stalled-lan-regression",
+  discoveryMode: "automatic",
+  timeoutMs: 2_000,
+});
+assert.equal(globalConnects, 1, "global candidate must connect despite a hung LAN query");
+assert.ok(Date.now() - stalledLanStarted < 1_800, "optional LAN discovery must have a hard deadline");
+await stalledLanSession.close();
+
+const parsedGlobal = await resolveGlobalDiscovery({
+  ...stalledLanAdapter,
+  discoveryFetch: async () => ({
+    ok: true, status: 200, headers: {},
+    text: async () => "",
+    json: async () => ({ addresses: [
+      "tcp://[::invalid]:22000", "tcp://example.test:99999",
+      "relay://[invalid:::]:22000", "tcp://127.0.0.1:22000",
+      "tcp4://example.test:80", "quic://[::1]:443",
+    ] }),
+  }),
+}, { expectedDeviceId: remoteCertId, discoveryServer: "https://discovery.test/v2/" });
+assert.deepEqual(parsedGlobal.candidates.map(candidate =>
+  [candidate.protocol, candidate.host, candidate.port]), [
+  ["tcp", "127.0.0.1", 22000], ["tcp", "example.test", 80], ["quic", "::1", 443],
+]);
 
 const timeoutSocket = createFakeTlsSocket();
 const timeoutClient = createSyncpeerCoreClient({

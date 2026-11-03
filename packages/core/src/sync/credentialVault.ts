@@ -20,6 +20,8 @@ export interface CredentialVaultRecord {
   format: 1 | 2;
   manualLocked: boolean;
   remember: boolean;
+  /** Generated unlock secret exists only in OS-protected storage, not known to the user. */
+  deviceProtected?: boolean;
   ciphertext: number[];
 }
 
@@ -86,6 +88,7 @@ const decodeRecord = (value: unknown): CredentialVaultRecord | null => {
   if (value === null) return null;
   const record = value as CredentialVaultRecord;
   if (!record || (record.format !== 1 && record.format !== 2) || typeof record.manualLocked !== "boolean" || typeof record.remember !== "boolean" ||
+    (record.deviceProtected !== undefined && typeof record.deviceProtected !== "boolean") ||
     !Array.isArray(record.ciphertext) || !record.ciphertext.length || record.ciphertext.length > 2 * 1024 * 1024 ||
     record.ciphertext.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid credential vault record.");
   return record;
@@ -174,6 +177,7 @@ class CredentialVault {
     return {
       phase: this.closed ? "closed" as const : this.key ? "unlocked" as const
         : this.initialized ? "locked" as const : "uninitialized" as const,
+      personalSpaceEnabled: Boolean(this.personalSpace),
       remembered: this.remembered,
       ...(this.issue ? { issue: this.issue } : {}),
     };
@@ -211,7 +215,7 @@ class CredentialVault {
   private async encrypt(
     data: VaultData,
     secret: Uint8Array,
-    record: Pick<CredentialVaultRecord, "format" | "manualLocked" | "remember">,
+    record: Pick<CredentialVaultRecord, "format" | "manualLocked" | "remember" | "deviceProtected">,
   ) {
     const bytes = new TextEncoder().encode(JSON.stringify(data));
     let ciphertext = new Uint8Array();
@@ -234,7 +238,7 @@ class CredentialVault {
   private async save(
     data: VaultData,
     secret: Uint8Array,
-    record: Pick<CredentialVaultRecord, "format" | "manualLocked" | "remember">,
+    record: Pick<CredentialVaultRecord, "format" | "manualLocked" | "remember" | "deviceProtected">,
   ) {
     const result = await this.encrypt(data, secret, record);
     await this.options.storage.save(result);
@@ -373,7 +377,7 @@ class CredentialVault {
         }
         derived = await deriveUntrustedFolderCrypto(this.vaultId, secret, this.kdf);
         await this.save({ format: 1, defaultPassword: null, folders: {} }, derived.folderKey,
-          { format: 1, manualLocked: false, remember: true });
+          { format: 1, manualLocked: false, remember: true, deviceProtected: true });
         this.key = derived.folderKey;
         this.initialized = true;
         this.remembered = true;
@@ -410,6 +414,63 @@ class CredentialVault {
 
   create(masterPassword: string, remember = true, localSyncthingId?: string, recoveryKey?: string) {
     return this.run(() => this.createVault(masterPassword, remember, localSyncthingId, recoveryKey));
+  }
+
+
+  /** Promote an already protected local vault to an opt-in shared Personal Space. */
+  upgradeToPersonalSpace(masterPassword: string, localSyncthingId: string,
+    recoveryKey: string, remember = true) {
+    return this.run(async () => {
+      if (!this.options.bootstrapStorage) throw new Error("Personal-space storage is unavailable.");
+      if (!localSyncthingId || !recoveryKey) throw new Error("Device identity and offline recovery kit are required.");
+      const { record, data } = await this.unlocked();
+      if (record.format !== 1 || this.personalSpace) throw new Error("Personal Space is already configured.");
+      if (await this.options.bootstrapStorage.load() !== null) {
+        throw new Error("Existing recovery data requires review before upgrading Personal Space.");
+      }
+      const { record: bootstrap, space } = await createPersonalSpaceBootstrap(
+        password(masterPassword), this.options.randomBytes, this.kdf);
+      const next = await this.prepareOwnedDevice(space, data, localSyncthingId, recoveryKey);
+      return this.installSpaceOverLocal(space, bootstrap, next, masterPassword, remember);
+    });
+  }
+  private async installSpaceOverLocal(
+    space: PersonalSpace, bootstrap: PersonalSpaceBootstrap, data: VaultData,
+    masterPassword: string, remember: boolean,
+  ) {
+    const key = personalVaultKey(space);
+    let committed = false;
+    try {
+      const encrypted = await this.encrypt(data, key,
+        { format: 2, manualLocked: false, remember });
+      await this.options.bootstrapStorage!.save(bootstrap);
+      await this.options.storage.save(encrypted);
+      committed = true;
+      this.key?.fill(0);
+      this.key = key;
+      this.personalSpace = space;
+      this.remembered = remember;
+      if (remember) await this.rememberSecret(masterPassword);
+      else await this.options.rememberedSecret?.remove().catch(() => {
+        this.issue = "Old local unlock secret could not be removed from protected storage.";
+      });
+      return this.status();
+    } catch (error) {
+      if (!committed) {
+        const latest = decodeRecord(await this.options.storage.load().catch(() => null));
+        if (latest?.format === 1) {
+          await this.options.bootstrapStorage!.remove().catch(() => undefined);
+        } else if (latest?.format === 2) {
+          // The replacement may have committed before a storage flush failed.
+          // Fail closed: do not continue using the old local key on new ciphertext.
+          await this.revoke().catch(() => undefined);
+          this.initialized = true;
+        }
+        key.fill(0);
+        space.rootKey.fill(0);
+      }
+      throw error;
+    }
   }
 
   private async createVault(
@@ -698,12 +759,23 @@ class CredentialVault {
     remember: boolean,
   ) {
     if (!this.options.bootstrapStorage) throw new Error("Personal-space recovery storage is unavailable.");
-    if (this.key || this.initialized || decodeRecord(await this.options.storage.load()) ||
-      await this.options.bootstrapStorage.load() !== null) {
-      throw new Error("Local profile already exists; pairing cannot replace it.");
+    const stored = decodeRecord(await this.options.storage.load());
+    const localUpgrade = stored?.format === 1 && Boolean(this.key) && !this.personalSpace &&
+      await this.options.bootstrapStorage.load() === null;
+    if (!localUpgrade && (this.key || this.initialized || stored ||
+      await this.options.bootstrapStorage.load() !== null)) {
+      throw new Error("Existing Personal Space cannot be replaced by pairing.");
     }
     const space = pairingSpace(transfer);
     await this.verifyPairingEnrollment(identity, transfer.trust);
+    if (localUpgrade) {
+      const { data } = await this.unlocked();
+      const bootstrap = await wrapPersonalSpaceBootstrap(
+        space, password(localMasterPassword), this.options.randomBytes, this.kdf);
+      return this.installSpaceOverLocal(space, bootstrap,
+        { ...data, ownedDevice: identity, trustedRoster: transfer.trust },
+        localMasterPassword, remember);
+    }
     await this.installPairing(space, identity, transfer, localMasterPassword, remember);
     if (remember) await this.rememberSecret(localMasterPassword);
     return this.status();
@@ -875,8 +947,11 @@ class CredentialVault {
 
   lock() {
     return this.run(async () => {
+      const record = decodeRecord(await this.options.storage.load());
+      if (record?.deviceProtected) {
+        throw new Error("This local vault has no user master password. Lock the device or enable Personal Space before manually locking its data.");
+      }
       try {
-        const record = decodeRecord(await this.options.storage.load());
         if (record) await this.options.storage.save({ ...record, manualLocked: true });
       } finally {
         await this.revoke();

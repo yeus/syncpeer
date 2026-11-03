@@ -92,6 +92,10 @@ export {
   reportClientError,
 } from "./ui/browserClient.js";
 export { createSyncpeerSessionStore } from "./ui/sessionStore.js";
+export { observePeer, expirePeerDiscovery, normalizePeerDiscovery, peerRegistryViews,
+  PEER_DISCOVERY_RETENTION_MS } from "./peerRegistry.js";
+export type { PeerDiscoveryRecord, PeerDiscoveryEvidence, PeerDiscoveryRegistry,
+  PeerRegistryView } from "./peerRegistry.js";
 export { createConnectionLifecycle, retryDelayMs } from "./ui/connectionLifecycle.js";
 export type { ConnectionLifecycle, ConnectionLifecyclePhase, ConnectionLifecycleState } from "./ui/connectionLifecycle.js";
 export {

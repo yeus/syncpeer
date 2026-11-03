@@ -9,6 +9,7 @@ import {
 import { buildConnectionDetails, fromConnectionSettings, toConnectionSettings } from
   "../packages/core/dist/ui/connectionState.js";
 import { createSyncpeerSessionStore } from "../packages/core/dist/ui/sessionStore.js";
+import { serializeConnectionKey } from "../packages/core/dist/ui/connectionKey.js";
 import {
   createSyncpeerCoreClient,
   candidateCooldownMs,
@@ -53,6 +54,26 @@ const session = (sessionRemoteFs = remoteFs) => {
     finish,
   };
 };
+
+test("transport configuration changes invalidate browser and Android service session keys", () => {
+  const options = { host: "", port: 22000, remoteId: "synthetic-peer",
+    deviceName: "Android test device", discoveryMode: "automatic" as const,
+    discoveryServer: "https://localhost:12345/v2/?id=server-device",
+    enableRelayFallback: true };
+  const key = (overrides: Partial<typeof options> = {}, revision = 0) =>
+    serializeConnectionKey({ ...options, ...overrides }, "cert", "key", revision);
+  assert.equal(key(), key({}));
+  assert.equal(key({ discoveryServer: "https://localhost:12345/v2/?id=server-device" }), key());
+  for (const overrides of [
+    { discoveryMode: "direct" as const },
+    { discoveryServer: "https://localhost:12346/v2/?id=server-device" },
+    { host: "127.0.0.1" },
+    { port: 22400 },
+    { enableRelayFallback: false },
+  ]) assert.notEqual(key(overrides), key(), JSON.stringify(overrides));
+  assert.notEqual(key({}, 1), key());
+  assert.notEqual(serializeConnectionKey(options, "other-cert", "key"), key());
+});
 
 test("a lifecycle retry waiter unsubscribes if connect finishes during subscription", async () => {
   let unsubscribeCalls = 0;

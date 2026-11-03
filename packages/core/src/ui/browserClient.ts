@@ -13,6 +13,7 @@ import { createRecoveringRemoteFs } from "./recoveringRemoteFs.js";
 import type { ConnectionScope } from "../client.js";
 import type { SharedFolder } from "../client.js";
 import { normalizeDiscoveryServer } from "./discoveryServer.js";
+import { serializeConnectionKey } from "./connectionKey.js";
 export { getDefaultDiscoveryServer, normalizeDiscoveryServer } from "./discoveryServer.js";
 import type {
   FileDownloadProgress,
@@ -541,35 +542,6 @@ const resolvePemValue = async (
   return platformAdapter.readTextFile(value);
 };
 
-const serializeConnectionKey = (
-  options: ConnectOptions,
-  certPem: string,
-  keyPem: string,
-  sessionConfigurationRevision = 0,
-): string =>
-  JSON.stringify({
-    host: options.host,
-    port: options.port,
-    listenPort: options.listenPort ?? 22000,
-    discoveryMode: options.discoveryMode ?? "automatic",
-    discoveryServer: normalizeDiscoveryServer(options.discoveryServer),
-    relayPoolUrl: options.relayPoolUrl,
-    enableRelayFallback: options.enableRelayFallback !== false,
-    remoteId: options.remoteId ?? "",
-    deviceName: options.deviceName,
-    certPem,
-    keyPem,
-    relayOnly: options.relayOnly === true,
-    quicOnly: options.quicOnly === true,
-    // Decryption credentials do not determine TLS session identity.
-    sharedFolders: options.sharedFolders ?? [],
-    // The shared-folder set and credentials are resolved from the document
-    // owner at session-open time. Incrementing this revision when the owner
-    // changes (folder attach, favorite, credential) makes the live session
-    // stale so it reopens with the current selection instead of silently
-    // dropping a peer index for a folder it opened without.
-    sessionConfigurationRevision,
-  });
 
 const toConnectionOverview = async (
   session: SyncpeerSessionHandle,
@@ -1240,6 +1212,8 @@ function startIncomingPeer(
     onPairingSocket: async (accepted) => {
       await accepted.socket.close().catch(() => undefined);
     },
+    onUnapprovedPeer: (deviceId) => logClient(ctx.options.onLog,
+      "client.incoming.pending_device", { deviceId }),
     onError: (error) => ctx.coreAdapter.log?.("core.incoming.failed", {
       message: error instanceof Error ? error.message : String(error),
     }),
@@ -1361,7 +1335,7 @@ function assertTrustedPeer(normalized: ConnectOptions, trustedDevices: OwnedSpac
     !resolveApprovedPeerDeviceIds(normalized.remoteId, trustedDevices)
       .some((id) => sameDeviceId(id, normalized.remoteId!))
   ) {
-    throw new Error("This peer was removed from the trusted device list.");
+    throw new Error("Peer identity is revoked, retired, or not authorized for this connection.");
   }
 }
 

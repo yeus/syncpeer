@@ -230,6 +230,26 @@ class DocumentRuntimeServiceTest {
     }
   }
 
+  @Test fun pendingPeerConnectionDoesNotStarveDocumentStatus() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      runtime.command(JSONObject().put("operation", "status")).get(30, TimeUnit.SECONDS)
+      val entered = CountDownLatch(1)
+      val pending = runtime.pendingSessionEvaluationForTesting(entered)
+      assertTrue("The network evaluation must start", entered.await(10, TimeUnit.SECONDS))
+      val reply = runtime.command(JSONObject().put("operation", "status"))
+        .get(3, TimeUnit.SECONDS)
+      assertTrue(reply.getJSONObject("result").has("vault"))
+      assertFalse("Network evaluation should still be pending", pending.isDone)
+      assertEquals("completed", pending.get(8, TimeUnit.SECONDS))
+    } finally {
+      context.unbindService(client.first)
+    }
+  }
+
   @Test fun sessionStatusBusReplaysLatestSnapshotWithMonotonicRevisions() {
     val events = java.util.concurrent.CopyOnWriteArrayList<SessionStatusSnapshot>()
     val unsubscribe = SessionStatusBus.subscribe { events.add(it) }

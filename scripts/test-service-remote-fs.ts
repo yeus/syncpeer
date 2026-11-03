@@ -52,6 +52,42 @@ test("service-owned session browses, downloads and uploads without a second peer
   assert.deepEqual(supplied, [4, 5, 6]);
   await session.close();
 });
+test("Android session forwards new folder credentials to the live BEP peer without reconnecting", async () => {
+  let connected = 0;
+  let passwords: Record<string, string> = {};
+  const folder = () => ({
+    id: "camera", label: "Camera", readOnly: true, encrypted: true,
+    needsPassword: passwords.camera !== "synthetic-correct-password",
+    passwordError: passwords.camera && passwords.camera !== "synthetic-correct-password"
+      ? "Encryption password does not match this folder." : null,
+  });
+  const rpc = async (request: Record<string, unknown>) => {
+    switch (request.operation) {
+      case "connect": connected++; return { phase: "connected" };
+      case "status": return { phase: "connected", active: true };
+      case "overview": return { folders: [folder()], folderSyncStates: [],
+        connectedVia: "native", transportKind: "direct-tcp" };
+      case "listFolders": return [folder()];
+      case "updateFolderPasswords":
+        passwords = { ...(request.folderPasswords as Record<string, string>) };
+        return { updated: true };
+      default: throw new Error("Unexpected operation " + request.operation);
+    }
+  };
+  const session = await createServiceOwnedSession(rpc, {
+    host: "127.0.0.1", port: 22000, remoteId: "peer",
+  } as never);
+  try {
+    assert.equal((await session.remoteFs.listFolders())[0].needsPassword, true);
+    await session.updateFolderPasswords?.({ camera: "synthetic-wrong-password" });
+    assert.equal((await session.remoteFs.listFolders())[0].passwordError,
+      "Encryption password does not match this folder.");
+    await session.updateFolderPasswords?.({ camera: "synthetic-correct-password" });
+    assert.equal((await session.remoteFs.listFolders())[0].needsPassword, false);
+    assert.equal(connected, 1, "password changes must not reconnect or wait for app restart");
+  } finally { await session.close(); }
+});
+
 test("transient service RPC unavailability does not permanently detach a recovering peer proxy", async () => {
   let reads = 0;
   const rpc = async (request: Record<string, unknown>) => {

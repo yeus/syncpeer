@@ -16,7 +16,7 @@ import {
   activeSourceDeviceId,
   type AppState,
 } from "./state.ts";
-import { isConfiguredDeviceName, suggestedClientName } from "./suggestedNames.ts";
+import { isConfiguredDeviceName } from "./suggestedNames.ts";
 import {
   clearDirectoryViewState,
   resetRuntimeSessionState,
@@ -114,25 +114,8 @@ export const ensureClientName = (state: AppState) => {
     state.ui.deviceNameConfirmed = true;
     return true;
   }
-  const chosen =
-    typeof window !== "undefined"
-      ? window.prompt(
-          "Name this Syncpeer client (shown to remote devices):",
-          suggestedClientName(),
-        )
-      : suggestedClientName();
-  if (chosen === null) {
-    state.ui.recentError = "Connection cancelled. Client name is required.";
-    return false;
-  }
-  const normalized = chosen.trim();
-  if (!normalized) {
-    state.ui.recentError = "Client name is required.";
-    return false;
-  }
-  state.connection.deviceName = normalized;
-  state.ui.deviceNameConfirmed = true;
-  return true;
+  state.ui.recentError = "Name this device before connecting to peers.";
+  return false;
 };
 
 export const remoteHasUnapprovedFolderShare = (

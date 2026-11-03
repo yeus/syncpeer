@@ -4,6 +4,7 @@ import {
   getDefaultDiscoveryServer,
   isValidSyncthingDeviceId,
   normalizeDeviceId,
+  observePeer,
   sameDeviceId,
   type SyncpeerBrowserClient,
   type SyncpeerSessionStore,
@@ -16,7 +17,6 @@ import {
   type advertisedFolders,
   applySessionState,
   connectionDetails,
-  folderIsLocked,
   pushSessionLog,
   type AppState,
 } from "./state.ts";
@@ -24,6 +24,7 @@ import {
   clearDirectoryView,
   copyText,
   loadDirectorySideEffects,
+  saveCurrentOfflineState,
 } from "./actionSupport.ts";
 import { restoreOfflineSnapshot, setRemoteApprovalPending } from "./syncPolicies.ts";
 import { suggestedClientName } from "./suggestedNames.ts";
@@ -36,6 +37,8 @@ type DeviceActionArgs = {
   readonly refreshOverview: () => Promise<void>;
   readonly refreshActiveView: () => Promise<void>;
   readonly refreshCurrentDeviceId: () => Promise<void>;
+  readonly connectToDevice: (deviceId: string) => Promise<void>;
+  readonly disconnectPeer?: () => Promise<void>;
   readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
 };
 
@@ -47,6 +50,8 @@ class DeviceActionsRuntime {
     private readonly refreshOverview: () => Promise<void>,
     private readonly refreshActiveView: () => Promise<void>,
     private readonly refreshCurrentDeviceId: () => Promise<void>,
+    private readonly connectToDevice: (deviceId: string) => Promise<void>,
+    private readonly disconnectPeer?: () => Promise<void>,
     private readonly savePasswords?: (values: Record<string, string>) => Promise<void>,
   ) {}
 
@@ -58,31 +63,58 @@ class DeviceActionsRuntime {
   };
 
   private changeFolderPassword = async (folderId: string, password: string) => {
-    const scopedKey = folderPasswordScopedKey(
-      activeFolderPasswordScopeDeviceId(this.state),
-      folderId,
-    );
+    const scope = activeFolderPasswordScopeDeviceId(this.state);
+    const scopedKey = folderPasswordScopedKey(scope, folderId);
+    const statusKey = `${scope}:${folderId}`;
+    this.state.passwords.unlockStatusByFolder = {
+      ...this.state.passwords.unlockStatusByFolder,
+      [statusKey]: { phase: password ? "unlocking" : "waiting-for-peer", message: "" },
+    };
     const next = { ...this.state.passwords.saved };
     delete next[folderId];
     if (scopedKey) delete next[scopedKey];
-    if (password) {
-      next[scopedKey || folderId] = password;
-    }
+    if (password) next[scopedKey || folderId] = password;
     try {
-      await this.savePasswords?.(next);
+      if (!this.savePasswords) throw new Error("Protected credential storage is unavailable.");
+      await this.savePasswords(next);
       this.state.passwords.saved = next;
       if (!password) this.state.passwords.drafts = { ...this.state.passwords.drafts, [folderId]: "" };
       await this.sessionStore.actions.setFolderPasswords(activeFolderPasswords(this.state));
-      if (this.state.session.isConnected) {
-        await this.refreshOverview();
-        if (password && !folderIsLocked(this.state, folderId) && this.state.session.currentFolderId === folderId) {
-          await this.sessionStore.actions.reloadCurrentDirectory(connectionDetails(this.state));
-          applySessionState(this.state, this.sessionStore.getState());
-          await loadDirectorySideEffects(this.state, this.client);
-        }
+      if (!this.state.session.isConnected) {
+        this.state.passwords.unlockStatusByFolder[statusKey] = {
+          phase: "waiting-for-peer", message: "Password saved. Connect to the peer to verify it.",
+        };
+        return;
+      }
+      // A new credential must be verified against a fresh BEP folder overview,
+      // not against the cached 'needsPassword' flag from the previous session.
+      await this.sessionStore.actions.refreshOverview(connectionDetails(this.state));
+      applySessionState(this.state, this.sessionStore.getState());
+      saveCurrentOfflineState(this.state, scope);
+      const folder = this.state.session.folders.find(item => item.id === folderId);
+      if (password && (!folder || folder.needsPassword || folder.passwordError)) {
+        // Only an explicit BEP token mismatch proves that the supplied password is wrong.
+        // A stale overview or disconnected service does not.
+        throw new Error(folder?.passwordError ||
+          (folder
+            ? "Folder unlock could not be verified. The password was saved, but the peer still reports this folder locked. Reconnect and retry verification."
+            : "The connected peer no longer offers this folder."));
+      }
+      this.state.passwords.unlockStatusByFolder[statusKey] = {
+        phase: password ? "unlocked" : "waiting-for-peer", message: "",
+      };
+      if (password && this.state.session.currentFolderId === folderId) {
+        await this.sessionStore.actions.reloadCurrentDirectory(connectionDetails(this.state));
+        applySessionState(this.state, this.sessionStore.getState());
+        await loadDirectorySideEffects(this.state, this.client);
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.state.passwords.unlockStatusByFolder[statusKey] = {
+        phase: "error", message,
+      };
       reportActionError(this.state, "folder_password.save.failed", error, { folderId });
+      throw error;
     }
   };
 
@@ -110,6 +142,11 @@ class DeviceActionsRuntime {
     this.state.devices.newSavedDeviceCustomName = "";
     this.state.devices.newSavedDeviceIsIntroducer = false;
     this.state.ui.recentError = null;
+    this.state.devices.peerDiscovery = observePeer(this.state.devices.peerDiscovery, normalized,
+      { kind: "manual", lastSeenAtMs: Date.now() });
+    pushSessionLog(this.state, "info", "peer.added", "Peer saved locally; attempting first authenticated connection.", { peerId: normalized });
+    void this.connectToDevice(normalized).catch(error =>
+      reportActionError(this.state, "device.add.failed", error));
   };
 
   private editSavedDeviceName = (deviceId: string) => {
@@ -130,15 +167,27 @@ class DeviceActionsRuntime {
   };
 
   private useSavedDevice = (deviceId: string) => {
-    this.state.devices.selectedSavedDeviceId = deviceId;
-    this.state.connection.remoteId = deviceId;
+    const normalized = normalizeDeviceId(deviceId);
+    if (!normalized || !isValidSyncthingDeviceId(normalized)) return;
+    if (!this.state.devices.savedDevices.some(device => sameDeviceId(device.id, normalized))) {
+      // Add peer explicitly, regardless of which discovery source found it.
+      if (!this.state.devices.peerDiscovery[normalized] &&
+        !this.state.devices.lanDiscoveryByDeviceId[normalized]) return;
+      upsertSavedDevice(this.state, normalized, suggestedSavedDeviceName(this.state, normalized));
+      this.state.devices.peerDiscovery = observePeer(this.state.devices.peerDiscovery, normalized,
+        { kind: "manual", lastSeenAtMs: Date.now() });
+    }
+    this.state.devices.selectedSavedDeviceId = normalized;
+    this.state.connection.remoteId = normalized;
     this.state.connection.discoveryMode = "automatic";
     this.state.connection.host = "";
     if (!this.state.session.isConnected) {
-      restoreOfflineSnapshot(this.state, clearDirectoryView, deviceId, "use_saved_device");
-      return;
+      restoreOfflineSnapshot(this.state, clearDirectoryView, normalized, "use_saved_device");
     }
-    void this.refreshActiveView();
+    // Use is an explicit connect intent, even if an earlier attempt is pending.
+    void this.connectToDevice(normalized).catch(error => {
+      reportActionError(this.state, "device.use.failed", error);
+    });
   };
 
   private setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean) => {
@@ -152,6 +201,8 @@ class DeviceActionsRuntime {
 
   private removeSavedDevice = (deviceId: string) => {
     const normalized = normalizeDeviceId(deviceId);
+    const active = sameDeviceId(this.state.session.remoteDevice?.id ||
+      this.state.session.activeConnectDeviceId || this.state.connection.remoteId, normalized);
     setRemoteApprovalPending(this.state, normalized, false);
     if (sameDeviceId(this.state.approvals.pendingApprovalPromptDeviceId, normalized)) {
       this.state.approvals.pendingApprovalPromptDeviceId = "";
@@ -159,8 +210,20 @@ class DeviceActionsRuntime {
     this.state.devices.savedDevices = this.state.devices.savedDevices.filter(
       (item) => !sameDeviceId(item.id, normalized),
     );
+    this.state.devices.confirmedPeerIds = new Set(
+      [...this.state.devices.confirmedPeerIds].filter(id => !sameDeviceId(id, normalized)));
+    const observed = this.state.devices.peerDiscovery[normalized];
+    if (observed) this.state.devices.peerDiscovery = {
+      ...this.state.devices.peerDiscovery,
+      [normalized]: { ...observed, sources: observed.sources.filter(source => source.kind !== "manual") },
+    };
     if (sameDeviceId(this.state.connection.remoteId, normalized)) {
       this.state.connection.remoteId = "";
+    }
+    if (active) {
+      this.state.ui.autoConnectPaused = true;
+      void (this.disconnectPeer?.() ?? this.sessionStore.actions.disconnect()).catch(error =>
+        reportActionError(this.state, "device.remove.disconnect_failed", error));
     }
     this.state.approvals.syncApprovedFolderKeys = new Set(
       [...this.state.approvals.syncApprovedFolderKeys].filter(
@@ -191,6 +254,10 @@ class DeviceActionsRuntime {
     this.state.connection.discoveryMode = "automatic";
     this.state.connection.host = "";
     this.state.ui.recentError = null;
+    this.state.devices.peerDiscovery = observePeer(this.state.devices.peerDiscovery, device.id,
+      { kind: "manual", lastSeenAtMs: Date.now() });
+    void this.connectToDevice(device.id).catch(error =>
+      reportActionError(this.state, "device.approve.failed", error));
   };
 
   private approveFolderSync = (folder: ReturnType<typeof advertisedFolders>[number]) => {
@@ -331,5 +398,7 @@ export const createDeviceActions = (args: DeviceActionArgs) =>
     args.refreshOverview,
     args.refreshActiveView,
     args.refreshCurrentDeviceId,
+    args.connectToDevice,
+    args.disconnectPeer,
     args.savePasswords,
   ).api();

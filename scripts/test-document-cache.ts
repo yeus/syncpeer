@@ -30,7 +30,7 @@ test("password actions publish changes only after secure storage succeeds", asyn
     refreshOverview: async () => {}, refreshActiveView: async () => {}, refreshCurrentDeviceId: async () => {},
     savePasswords: async () => { if (failSave) throw new Error("Synthetic secure storage failure"); },
   });
-  await actions.saveFolderPassword("photos");
+  await assert.rejects(actions.saveFolderPassword("photos"), /Synthetic secure storage failure/);
   assert.deepEqual(state.passwords.saved, { photos: "synthetic-old" });
   assert.equal(sessionUpdates, 0);
   failSave = false;
@@ -38,7 +38,7 @@ test("password actions publish changes only after secure storage succeeds", asyn
   assert.deepEqual(state.passwords.saved, { photos: "synthetic-new" });
   assert.equal(sessionUpdates, 1);
   failSave = true;
-  await actions.clearFolderPassword("photos");
+  await assert.rejects(actions.clearFolderPassword("photos"), /Synthetic secure storage failure/);
   assert.deepEqual(state.passwords.saved, { photos: "synthetic-new" });
   assert.equal(sessionUpdates, 1);
 });

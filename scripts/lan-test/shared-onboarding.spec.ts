@@ -1,39 +1,30 @@
-// One real-input test for desktop Tauri WebDriver and Android Appium WebView.
-// Do not replace click() with execute(DOM click): that bypasses input dispatch.
+// Real UI input shared by desktop Tauri WebDriver and Android Appium WebView.
 import assert from "node:assert/strict";
 import { browser } from "@wdio/globals";
 
 describe("Shared Tauri first-run onboarding", () => {
-  it("generates a password, skips onboarding and opens Devices", async () => {
-    const dialog = browser.$("[data-testid='personal-space-onboarding']");
-    await dialog.waitForDisplayed({ timeout: 60_000 });
-
-    const generate = browser.$("[data-testid='onboarding-generate-password']");
-    await generate.waitForClickable({ timeout: 20_000 });
-    await generate.click();
-    await browser.waitUntil(async () => browser.execute(() =>
-      (document.querySelector<HTMLInputElement>("[data-testid='onboarding-master-password']")
-        ?.value.length ?? 0) === 43), {
-      timeout: 20_000,
-      timeoutMsg: "Real UI click did not generate a password.",
+  it("shows only a full-screen device-name step and accepts a real click/touch", async () => {
+    const onboarding = browser.$("[data-testid='device-name-onboarding']");
+    await onboarding.waitForDisplayed({ timeout: 60_000 });
+    const geometry = await browser.execute(() => {
+      const area = document.querySelector<HTMLElement>("[data-testid='device-name-onboarding']")!
+        .getBoundingClientRect();
+      return { fullScreen: area.width >= innerWidth && area.height >= innerHeight,
+        otherControls: Boolean(document.querySelector("[data-testid='tab-devices'], [data-testid='personal-space-onboarding'], [data-testid='general-settings-page']")) };
     });
-    // The WebView WebDriver click above is shared. On Android also inject a
-    // genuine UiAutomator2 touch at the same element in native screen pixels.
-    // The dedicated fixture has no user credentials; never print password values.
+    assert.equal(geometry.fullScreen, true);
+    assert.equal(geometry.otherControls, false);
+
+    await browser.$("[data-testid='local-name-entry']").setValue("Syncpeer acceptance device");
+    const continueButton = browser.$("[data-testid='save-local-device-name']");
+    await continueButton.waitForClickable({ timeout: 20_000 });
     if (browser.capabilities.platformName === "Android") {
-      const input = browser.$("[data-testid='onboarding-master-password']");
-      await input.setValue("synthetic-temporary-android-input");
-      await browser.waitUntil(async () => browser.execute(() =>
-        document.querySelector<HTMLInputElement>(
-          "[data-testid='onboarding-master-password']")?.value.length === 33), {
-        timeout: 10_000,
-      });
       const rect = await browser.execute("mobile: viewportElementRect", {
-        elementId: (await generate).elementId,
+        elementId: (await continueButton).elementId,
       }) as { x: number; y: number; width: number; height: number };
       const context = await browser.getContext();
       if (typeof context !== "string" || !context.startsWith("WEBVIEW_")) {
-        throw new Error("Native pointer test requires an attached application WebView.");
+        throw new Error("A live Android WebView is required for the native-touch acceptance test.");
       }
       await browser.switchContext("NATIVE_APP");
       try {
@@ -44,90 +35,30 @@ describe("Shared Tauri first-run onboarding", () => {
       } finally {
         await browser.switchContext(context);
       }
-      await browser.waitUntil(async () => browser.execute(() =>
-        (document.querySelector<HTMLInputElement>(
-          "[data-testid='onboarding-master-password']")?.value.length ?? 0) === 43), {
-        timeout: 20_000, timeoutMsg: "Native Android touch did not regenerate the password.",
-      });
+    } else {
+      await continueButton.click();
     }
-    // Do not log the generated secret.
-    const skip = browser.$("[data-testid='onboarding-skip']");
-    await skip.waitForClickable({ timeout: 20_000 });
-    await skip.click();
-    await dialog.waitForExist({ reverse: true, timeout: 20_000 });
-
+    await onboarding.waitForExist({ reverse: true, timeout: 20_000 });
     const devices = browser.$("[data-testid='tab-devices']");
-    await devices.waitForClickable({ timeout: 20_000 });
-    await devices.click();
-    await browser.waitUntil(async () => (await devices.getAttribute("class"))?.includes("active") === true, {
-      timeout: 20_000,
-      timeoutMsg: "Devices tab did not respond to real UI click.",
-    });
-    assert.ok(await devices.isDisplayed());
+    await devices.waitForDisplayed({ timeout: 20_000 });
+    assert.equal((await devices.getAttribute("class"))?.includes("active"), true);
   });
-  it("resumes setup, generates recovery keys and creates an encrypted personal space", async () => {
-    const resume = browser.$("[data-testid='resume-personal-space-setup']");
-    await resume.waitForClickable({ timeout: 20_000 });
-    await resume.click();
-    const dialog = browser.$("[data-testid='personal-space-onboarding']");
-    await dialog.waitForDisplayed({ timeout: 20_000 });
 
-    const generate = browser.$("[data-testid='onboarding-generate-password']");
-    await generate.waitForClickable({ timeout: 20_000 });
-    await generate.click();
-    try {
-      await browser.waitUntil(async () => browser.execute(() =>
-        (document.querySelector<HTMLInputElement>("[data-testid='onboarding-master-password']")
-          ?.value.length ?? 0) === 43), {
-        timeout: 20_000, timeoutMsg: "Password generation failed after resuming setup.",
-      });
-    } catch (cause) {
-      // Diagnose input delivery without exposing the generated secret.
-      const state = await browser.execute(() => ({
-        heading: document.querySelector("[data-testid='personal-space-onboarding'] h2")?.textContent?.trim(),
-        passwordLength: document.querySelector<HTMLInputElement>(
-          "[data-testid='onboarding-master-password']")?.value.length ?? -1,
-        buttonDisabled: document.querySelector<HTMLButtonElement>(
-          "[data-testid='onboarding-generate-password']")?.disabled ?? null,
-        traceAction: document.querySelector("[data-testid='onboarding-trace-action']")?.textContent?.trim(),
-        traceTarget: document.querySelector("[data-testid='onboarding-trace-target']")?.textContent?.trim(),
-        traceEvents: document.querySelector("[data-testid='onboarding-trace-events']")?.textContent?.trim(),
-        errors: Array.from(document.querySelectorAll("[role='alert']"))
-          .map(value => value.textContent?.slice(0, 150)),
-      })).catch(() => ({ probeUnavailable: true }));
-      throw new Error("Resumed password generation failed: " + JSON.stringify(state), { cause });
-    }
-
-
-    const next = browser.$("[data-testid='onboarding-continue']");
-    await next.waitForClickable({ timeout: 20_000 });
-    await next.click();
-    const confirm = browser.$("[data-testid='onboarding-confirm-password']");
-    await confirm.waitForClickable({ timeout: 20_000 });
-    await confirm.click();
-
-    const recovery = browser.$("[data-testid='onboarding-generate-kit']");
-    await recovery.waitForClickable({ timeout: 20_000 });
-    await recovery.click();
-    await browser.$("[data-testid='onboarding-kit-download']").waitForExist({ timeout: 120_000 });
-    // Validate shape only. Neither mnemonic, kit data nor password may appear in test logs.
-    const validKit = await browser.execute(() => {
-      const phrase = document.querySelectorAll("[data-testid='onboarding-recovery-phrase'] span");
-      const raw = document.querySelector<HTMLTextAreaElement>("[data-testid='onboarding-kit-json']")?.value;
-      if (phrase.length !== 12 || !raw) return false;
-      const kit = JSON.parse(raw) as { publicKey?: unknown };
-      return typeof kit.publicKey === "string" && kit.publicKey.length > 0;
-    });
-    assert.equal(validKit, true, "A 12-word recovery phrase and valid encrypted kit must be generated.");
-    const acknowledged = browser.$("[data-testid='onboarding-kit-confirm']");
-    await acknowledged.waitForClickable({ timeout: 20_000 });
-    await acknowledged.click();
-
-    const create = browser.$("[data-testid='onboarding-create']");
-    await create.waitForClickable({ timeout: 20_000 });
-    await create.click();
-    await dialog.waitForExist({ reverse: true, timeout: 120_000 });
-    assert.equal(await browser.$("[data-testid='setup-skipped-notice']").isExisting(), false);
+  it("keeps Personal Space setup optional and accessible only through Settings", async () => {
+    assert.equal(await browser.$("[data-testid='personal-space-onboarding']").isExisting(), false);
+    const toggle = browser.$("[data-testid='connection-settings-toggle']");
+    await toggle.waitForClickable({ timeout: 20_000 });
+    await toggle.click();
+    const open = browser.$("[data-testid='general-settings']");
+    await open.waitForClickable({ timeout: 20_000 });
+    await open.click();
+    await browser.$("[data-testid='general-settings-page']").waitForDisplayed({ timeout: 20_000 });
+    const optional = browser.$("[data-testid='optional-personal-space-setup']");
+    await optional.waitForExist({ timeout: 20_000 });
+    await optional.$("summary").click();
+    assert.equal(await optional.$("form input[autocomplete='new-password']").isDisplayed(), true);
+    await browser.$("[data-testid='general-settings-page'] > button").click();
+    await browser.$("[data-testid='tab-devices']").waitForDisplayed({ timeout: 20_000 });
   });
 
   it("creates an encrypted folder through the actual UI", async () => {

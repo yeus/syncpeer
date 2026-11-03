@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build, transformWithEsbuild } from "vite";
 import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
+import { normalizeDeviceId } from "@syncpeer/core/browser";
 import { createBrowserBepSchemaPlugin } from "./vite-plugins/browserBepSchema.mjs";
 
 const cliArguments = process.argv.slice(2);
@@ -915,14 +916,127 @@ const runPeerConnectSmoke = async () => {
   try {
     await ensurePeerDocumentVault(cdp);
     if (!await openAndroidConnection(cdp)) throw new Error("Android real-peer connection did not open.");
-    await openAndroidFolder(cdp, false, false);
+    await openAndroidFolder(cdp, false, process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1");
+    // Saving a folder password changes the service session configuration.
+    // The active BEP session is intentionally replaced; assert that the
+    // replacement reaches Connected rather than sampling a transient phase.
+    await waitForUiCondition(
+      cdp,
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+      "connected session after folder password reconfiguration",
+      45_000,
+    );
     const folder = await readAndroidFolderState(cdp);
-    if (folder.ui?.connection !== "Connected") {
-      throw new Error(`Android peer disconnected while browsing: ${JSON.stringify(folder)}`);
+    if (process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1") {
+      if (!folder.status?.registered || !folder.status?.downloads) {
+        throw new Error(`Encrypted folder was not attached after password entry: ${JSON.stringify(folder)}`);
+      }
+      await waitForAndroidFileRow(cdp, targetFileName);
+      console.log("Android encrypted peer folder unlocked, attached, and remote file indexed.");
     }
     console.log(`Android ${discoveryMode} real-peer connection and remote folder index passed.`);
   } finally { cdp.close(); }
 };
+const runPeerSwitchApproval = async () => {
+  const secondDeviceId = process.env.SYNCPEER_PEER_SECOND_DEVICE_ID?.trim();
+  const continuePath = process.env.SYNCPEER_PEER_SWITCH_CONTINUE_PATH?.trim();
+  if (!serverDeviceId || !secondDeviceId || !continuePath || !discoveryServer) {
+    throw new Error("Two-peer acceptance requires two IDs, a pinned discovery URL, and a synchronization marker.");
+  }
+  const cdp = await launchAndroidApp(true);
+  const initialPid = cdp.pid;
+  try {
+    await ensurePeerDocumentVault(cdp);
+    await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=device-name-onboarding]") !== null || document.querySelector("[data-testid=tab-devices]") !== null',
+      "two-peer initial device UI", 30_000);
+    await completeAndroidDeviceNaming(cdp, "Two-peer Android test");
+    await clickUiTestId(cdp, "tab-devices");
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
+      "encrypted peer state restored before adding peer A", 90_000);
+    if (!await cdp.evaluate(
+      'document.querySelector("[data-testid=connection-discovery-mode]") !== null')) {
+      await clickUiTestId(cdp, "connection-settings-toggle");
+    }
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-discovery-server]") !== null',
+      "automatic discovery settings", 20_000);
+    await setUiValue(cdp, "connection-discovery-mode", "automatic");
+    await setUiValue(cdp, "connection-timeout", String(connectionTimeoutMs));
+    await setUiValue(cdp, "connection-discovery-server", discoveryServer);
+    await setUiValue(cdp, "connection-remote-id", serverDeviceId);
+
+    const addPeer = async (remoteId) => {
+      const added = await cdp.evaluate(`(() => {
+        const editor = document.querySelector(".saved-device-editor");
+        const input = editor?.querySelector('input[type="text"]');
+        const button = [...(editor?.querySelectorAll("button") || [])]
+          .find(element => element.textContent?.trim() === "Add Device");
+        if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return false;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setter?.call(input, ${JSON.stringify(remoteId)});
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        button.click();
+        return true;
+      })()`);
+      if (!added) throw new Error("Could not add the next Android peer.");
+      await waitForUiCondition(cdp,
+        `[...document.querySelectorAll('[data-testid="connection-saved-device"] option')]
+          .some(option => option.value === ${JSON.stringify(normalizeDeviceId(remoteId))})`,
+        "peer saved locally", 20_000);
+    };
+
+    await addPeer(serverDeviceId);
+    await waitForUiCondition(cdp,
+      'document.querySelectorAll("[data-testid=peer-first-connection-guidance]").length >= 1',
+      "peer A pending first authenticated connection", 15_000);
+    if (await cdp.evaluate(
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"')) {
+      throw new Error("Peer A unexpectedly connected without remote approval.");
+    }
+    console.log("Peer A added locally; awaiting confirmation of first remote request.");
+    const markerDeadline = Date.now() + 110_000;
+    while (!fs.existsSync(continuePath) && Date.now() < markerDeadline) await wait(150);
+    if (!fs.existsSync(continuePath)) {
+      throw new Error("Host never observed peer A's incoming request.");
+    }
+
+    await addPeer(secondDeviceId);
+    try {
+      await waitForUiCondition(cdp,
+        'document.querySelectorAll("[data-testid=peer-first-connection-guidance]").length >= 2',
+        "both unconfirmed peers remain visible", 20_000);
+    } catch (error) {
+      const ui = await observeCdp(cdp, `(() => ({
+        status: document.querySelector("[data-testid=connection-status]")?.textContent?.trim(),
+        selected: document.querySelector("[data-testid=connection-saved-device]")?.value,
+        remoteId: document.querySelector("[data-testid=connection-remote-id]")?.value,
+        saved: [...document.querySelectorAll("[data-testid=connection-saved-device] option")].map(option => option.value),
+        guidance: document.querySelectorAll("[data-testid=peer-first-connection-guidance]").length,
+        chips: [...document.querySelectorAll(".item-title-row")].slice(-8).map(row => row.innerText?.slice(0, 160)),
+        error: document.querySelector("p.error")?.textContent?.trim(),
+      }))()`);
+      const events = await readAndroidSessionEvents(cdp);
+      throw new Error(`Two-peer UI state mismatch: ${JSON.stringify({ ui, events })}`, { cause: error });
+    }
+    console.log("Peer B added while peer A is still awaiting remote approval.");
+    await waitForUiCondition(cdp,
+      `(() => {
+        const status = document.querySelector("[data-testid=connection-status]")?.textContent?.trim();
+        const selected = document.querySelector("[data-testid=connection-saved-device]")?.value;
+        return status === "Connected" && selected === ${JSON.stringify(normalizeDeviceId(secondDeviceId))};
+      })()`, "peer B connected and selected", connectionTimeoutMs);
+    const currentPids = runAdb(["shell", "pidof", packageName]).trim().split(/\s+/);
+    if (!currentPids.includes(initialPid)) {
+      throw new Error("Android process restarted during the pending-peer switch.");
+    }
+    await openAndroidFolder(cdp, false, false);
+    console.log("Peer B remote folder index visible; peer A still unapproved in the same app process.");
+  } finally { cdp.close(); }
+};
+
 
 const runPeerCrossAppWorkflow = async () => {
   if (!peerHostFolder) throw new Error("SYNCPEER_PEER_HOST_FOLDER is required.");
@@ -1608,6 +1722,29 @@ const setAndroidAutomaticConnectionPaused = async (cdp, paused) => {
   })()`, `${paused ? "pausing" : "resuming"} automatic connection`, 30_000);
 };
 
+const completeAndroidDeviceNaming = async (cdp, name) => {
+  const screen = "[data-testid='device-name-onboarding']";
+  const visible = await cdp.evaluate(
+    `document.querySelector(${JSON.stringify(screen)}) !== null`,
+  );
+  if (!visible) return false;
+  const submitted = await cdp.evaluate(`(() => {
+    const input = document.querySelector("[data-testid='local-name-entry']");
+    const button = document.querySelector("[data-testid='save-local-device-name']");
+    if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return false;
+    input.value = ${JSON.stringify(name)};
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    button.click();
+    return true;
+  })()`);
+  if (!submitted) throw new Error("Device name could not be entered in the Android WebView.");
+  await waitForUiCondition(cdp,
+    `document.querySelector(${JSON.stringify(screen)}) === null &&
+      document.querySelector("[data-testid='tab-devices']")?.classList.contains("active") === true`,
+    "name submission opens the Devices tab", 10_000);
+  return true;
+};
+
 const openAndroidConnection = async (cdp) => {
   if (!serverDeviceId) {
     console.log("Android network UI workflow skipped: no server device ID configured.");
@@ -1615,13 +1752,15 @@ const openAndroidConnection = async (cdp) => {
   }
   await tauriInvoke(cdp, "syncpeer_get_default_device_id");
   console.log("Android E2E client identity ready.");
-  await waitForUiCondition(
-    cdp,
-    'document.querySelector("[data-testid=tab-devices]") !== null',
-    "device tab",
-    30_000,
-  );
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=device-name-onboarding]") !== null || document.querySelector("[data-testid=tab-devices]") !== null',
+    "device naming or Devices tab", 30_000);
+  await completeAndroidDeviceNaming(cdp, "Android E2E device");
+  await waitForUiCondition(cdp, 'document.querySelector("[data-testid=tab-devices]") !== null', "device tab", 30_000);
   await clickUiTestId(cdp, "tab-devices");
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
+    "encrypted peer state restored", 90_000);
   const settingsVisible = await cdp.evaluate(
     "document.querySelector('[data-testid=\"connection-discovery-mode\"]') !== null",
   );
@@ -1629,37 +1768,18 @@ const openAndroidConnection = async (cdp) => {
     await clickUiTestId(cdp, "connection-settings-toggle");
     await waitForUiText(cdp, "Remote Device ID", 10_000);
   }
+  // Add Device connects immediately. Configure the pinned server before
+  // adding a device, rather than racing an old default-server attempt.
+  // Only an existing active session needs an explicit disconnect; pausing a
+  // fresh session here used to abort its first legitimate connect attempt.
+  const initiallyConnected = await cdp.evaluate(
+    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+  );
+  if (initiallyConnected) await setAndroidAutomaticConnectionPaused(cdp, true);
   const peerSaved = await cdp.evaluate(
     `Array.from(document.querySelectorAll('[data-testid="connection-saved-device"] option'))` +
     `.some(option => option.value === ${JSON.stringify(serverDeviceId)})`,
   );
-  if (!peerSaved) {
-    const added = await cdp.evaluate(`(() => {
-      const button = [...document.querySelectorAll("button")]
-        .find(element => element.textContent?.trim() === "Add Device");
-      const panel = button?.closest("section");
-      const input = panel?.querySelector('input[type="text"]');
-      if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return false;
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-      setter?.call(input, ${JSON.stringify(serverDeviceId)});
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      button.click();
-      return true;
-    })()`);
-    if (!added) throw new Error("Android UI could not save the managed Syncthing peer.");
-  }
-  const initiallyConnected = await cdp.evaluate(
-    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
-  );
-  if (initiallyConnected) {
-    await setAndroidAutomaticConnectionPaused(cdp, true);
-    await waitForUiCondition(
-      cdp,
-      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() !== "Connected"',
-      "disconnecting stale Android session",
-      30_000,
-    );
-  }
   if (relayPoolUrl) {
     const configured = await cdp.evaluate(`(() => {
       const setter = window.__syncpeerSetRelayPoolUrl;
@@ -1669,7 +1789,9 @@ const openAndroidConnection = async (cdp) => {
     })()`);
     if (!configured) throw new Error("Android E2E relay-pool override is unavailable.");
   }
-  await setUiValue(cdp, "connection-saved-device", "");
+  // Direct mode also requires an explicitly saved peer; entering the ID alone
+  // does not authorize auto-connection under the current peer policy.
+  if (peerSaved) await setUiValue(cdp, "connection-saved-device", "");
   await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
   if (discoveryMode !== "direct") {
     const host = await cdp.evaluate(
@@ -1693,6 +1815,39 @@ const openAndroidConnection = async (cdp) => {
     "persisting Android server device ID",
     5_000,
   );
+  if (!peerSaved) {
+    const added = await cdp.evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find(element => element.textContent?.trim() === "Add Device");
+      const panel = button?.closest("section");
+      const input = panel?.querySelector('input[type="text"]');
+      if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, ${JSON.stringify(serverDeviceId)});
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      button.click();
+      return true;
+    })()`);
+    if (!added) throw new Error("Android UI could not save the managed Syncthing peer.");
+  if (discoveryMode === "direct") {
+    // Add Device intentionally selects automatic discovery. Restore the
+    // explicitly requested direct transport after saving the peer.
+    await setUiValue(cdp, "connection-discovery-mode", "direct");
+    await setUiValue(cdp, "connection-host", directHost);
+    await setUiValue(cdp, "connection-port", directPort);
+  }
+  }
+  const appliedSettings = await cdp.evaluate(`(() => ({
+    mode: document.querySelector("[data-testid=connection-discovery-mode]")?.value,
+    server: document.querySelector("[data-testid=connection-discovery-server]")?.value,
+    host: document.querySelector("[data-testid=connection-host]")?.value,
+    remoteId: document.querySelector("[data-testid=connection-remote-id]")?.value,
+  }))()`);
+  if (appliedSettings.mode !== discoveryMode ||
+      (discoveryServer && appliedSettings.server !== discoveryServer) ||
+      normalizeDeviceId(appliedSettings.remoteId ?? "") !== normalizeDeviceId(serverDeviceId)) {
+    throw new Error(`Android connection settings did not survive setup: ${JSON.stringify(appliedSettings)}`);
+  }
   await setAndroidAutomaticConnectionPaused(cdp, false);
   const deadline = Date.now() + connectionTimeoutMs;
   let lastError = "";
@@ -1920,19 +2075,16 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
       await setUiValue(cdp, passwordInput, targetFolderPassword);
       await clickUiTestId(cdp, `unlock-folder-${targetFolderId}`);
       try {
-        await waitForUiCondition(
-          cdp,
-          `document.querySelector(${JSON.stringify(`[data-testid="unlock-folder-${targetFolderId}"]`)})
-            ?.closest("section")?.querySelector("button[aria-label='Forget saved folder password']")
-            ?.disabled === false`,
-          "encrypted folder credential save",
-          // Cold disposable emulators spend well over 30s deriving the folder key
-          // while the peer session is also active.
-          90_000,
-        );
+        // Saving a password now navigates immediately back to Folders. The old
+        // test expected a 'Forget password' button on the settings page, which
+        // is no longer the intended UX.
+        await waitForUiCondition(cdp,
+          'document.querySelector("[data-testid=tab-folders]") !== null',
+          "folder overview after password submission", 30_000);
+        await waitForUiCondition(cdp,
+          `document.body?.innerText?.includes("receive-encrypted | unlocked") === true`,
+          "encrypted folder verified as unlocked", 90_000);
         await ensureAndroidFolderAttached(cdp);
-        // The route is synchronized through hash navigation; on slower Android
-        // WebViews a click may be superseded by a late settings refresh.
         // Reattempt navigation only while still on this exact settings page.
         await waitForUiCondition(cdp, `(() => {
           if (document.querySelector("[data-testid=tab-folders]")) return true;
@@ -2946,63 +3098,42 @@ const runWholeFolderSafeRelease = async () => {
   } finally { cdp.close(); }
 };
 
-// For disposable fresh-install emulators. This checks the real Android
-// WebView/Svelte lifecycle, not only simulated browser event dispatch.
+// For a disposable fresh-install emulator: the only required first-run screen
+// asks for a device name. Personal Space remains optional under Settings.
 const runAndroidOnboardingSmoke = async () => {
   runAdb(["logcat", "-c"]);
   const cdp = await launchAndroidApp(true);
   try {
-    const dialog = "[data-testid='personal-space-onboarding']";
-    const generate = "[data-testid='onboarding-generate-password']";
-    // The generated secret is rendered inside the password input; only its
-    // length is inspected so the secret is never read or logged.
-    const generated = "[data-testid='onboarding-master-password']";
+    const screen = "[data-testid='device-name-onboarding']";
     await waitForUiCondition(cdp,
-      `document.querySelector(${JSON.stringify(generate)}) instanceof HTMLButtonElement`,
-      "new-profile onboarding (install into a disposable fresh emulator)", 45_000);
-    await waitForUiCondition(cdp,
-      `Number(document.querySelector("[data-testid='onboarding-trace-heartbeat']")
-        ?.textContent?.match(/\\d+/)?.[0]) >= 1`,
-      "onboarding JS heartbeat (Svelte onMount must complete)", 10_000);
-    const tappedGenerate = await cdp.evaluate(`(() => {
-      const button = document.querySelector(${JSON.stringify(generate)});
-      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
-      button.click();
-      return true;
+      `document.querySelector(${JSON.stringify(screen)}) instanceof HTMLElement`,
+      "full-screen device naming on a fresh installation", 45_000);
+    const geometry = await cdp.evaluate(`(() => {
+      const root = document.querySelector(${JSON.stringify(screen)});
+      if (!root) return { missing: true };
+      const rect = root.getBoundingClientRect();
+      return {
+        x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+        innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height,
+        computedMinHeight: getComputedStyle(root).minHeight,
+        computedWidth: getComputedStyle(root).width,
+        tabs: Boolean(document.querySelector("[data-testid='tab-devices']")),
+        personalSpace: Boolean(document.querySelector("[data-testid='personal-space-onboarding']")),
+        parentWidth: root.parentElement?.getBoundingClientRect().width,
+        bodyHeight: document.body.getBoundingClientRect().height,
+      };
     })()`);
-    if (!tappedGenerate) throw new Error("Generate master password is not clickable in Android WebView.");
-    await waitForUiCondition(cdp,
-      `document.querySelector(${JSON.stringify(generated)})?.value?.length === 43`,
-      "generated master password length", 10_000);
-    // Never read or log the generated secret itself.
-    const tappedSkip = await cdp.evaluate(`(() => {
-      const button = document.querySelector("[data-testid='onboarding-skip']");
-      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
-      button.click();
-      return true;
-    })()`);
-    if (!tappedSkip) throw new Error("Skip setup is not clickable in Android WebView.");
-    await waitForUiCondition(cdp,
-      `document.querySelector(${JSON.stringify(dialog)}) === null`,
-      "Skip closes onboarding", 5_000);
-    const openedDevices = await cdp.evaluate(`(() => {
-      const button = document.querySelector("[data-testid='tab-devices']");
-      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
-      button.click();
-      return true;
-    })()`);
-    if (!openedDevices) throw new Error("Devices tab button did not accept activation.");
-    await waitForUiCondition(cdp,
-      `document.querySelector("[data-testid='tab-devices']")?.classList.contains("active") === true`,
-      "Devices tab becomes selected", 5_000);
+    if (geometry.missing || geometry.tabs || geometry.personalSpace ||
+      geometry.width < geometry.innerWidth - 1 || geometry.height < geometry.innerHeight - 1) {
+      throw new Error(`Fresh Android onboarding is not a standalone full-screen name step: ${JSON.stringify(geometry)}`);
+    }
+    await completeAndroidDeviceNaming(cdp, "Android smoke device");
     const errors = runAdb(["logcat", "-d", "-s", "Tauri/Console:E"]);
     if (errors.includes("effect_update_depth_exceeded")) {
       throw new Error("Svelte effect update loop reappeared in the Android WebView.");
     }
-    console.log("Android WebView onboarding heartbeat, generate, skip, and navigation smoke passed.");
-  } finally {
-    cdp.close();
-  }
+    console.log("Android WebView full-screen name-only onboarding and navigation smoke passed.");
+  } finally { cdp.close(); }
 };
 
 const main = async () => {
@@ -3160,6 +3291,10 @@ const main = async () => {
 
   if (hasArgument("--peer-connect-smoke")) {
     await runPeerConnectSmoke();
+    return;
+  }
+  if (hasArgument("--peer-switch-approval")) {
+    await runPeerSwitchApproval();
     return;
   }
   if (hasArgument("--peer-cross-app")) {

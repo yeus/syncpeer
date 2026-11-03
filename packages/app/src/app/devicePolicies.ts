@@ -1,11 +1,10 @@
 import {
-  isValidSyncthingDeviceId,
+  observePeer,
   normalizeDeviceId,
   sameDeviceId,
 } from "@syncpeer/core/browser";
 import {
   advertisedDevices,
-  isIntroducerDevice,
   type AppState,
 } from "./state.ts";
 import { temporarySavedDeviceName } from "./suggestedNames.ts";
@@ -120,23 +119,16 @@ export const syncConnectedDeviceSavedName = (
   upsertSavedDevice(state, normalized, nextName, { customName: false });
 };
 
-export const applyAutoApprovals = (
-  state: AppState,
-  sourceDeviceId: string,
-  advertisedFolders: Array<{ key: string }>,
-) => {
-  const sourceIsIntroducer = isIntroducerDevice(state, sourceDeviceId);
-  if (state.connection.autoAcceptNewDevices) {
-    for (const device of advertisedDevices(state)) {
-      if (device.accepted || !isValidSyncthingDeviceId(device.id)) continue;
-      upsertSavedDevice(state, device.id, device.name);
-    }
+/** A peer's cluster configuration is discovery evidence, not consent. */
+export const recordAdvertisedPeerSuggestions = (state: AppState, sourceDeviceId: string) => {
+  if (!sourceDeviceId) return;
+  let discovery = state.devices.peerDiscovery;
+  for (const device of advertisedDevices(state)) {
+    if (device.id === sourceDeviceId || device.id === state.devices.currentDeviceId) continue;
+    discovery = observePeer(discovery, device.id, {
+      kind: "introduced", sourceDeviceId, folderIds: device.sourceFolderIds,
+      lastSeenAtMs: Date.now(),
+    });
   }
-  if (state.connection.autoAcceptIntroducedFolders && sourceIsIntroducer) {
-    const next = new Set(state.approvals.syncApprovedFolderKeys);
-    for (const folder of advertisedFolders) {
-      next.add(folder.key);
-    }
-    state.approvals.syncApprovedFolderKeys = next;
-  }
+  state.devices.peerDiscovery = discovery;
 };

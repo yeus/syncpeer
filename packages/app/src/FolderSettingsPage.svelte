@@ -47,12 +47,20 @@
 
   async function changePassword(mode: "save" | "forget") {
     busy = true; error = "";
+    if (mode === "save") {
+      // The action sets per-folder 'unlocking' synchronously before its first await.
+      // Return to the folder overview immediately; completion is reported there.
+      const operation = onSavePassword(folderId);
+      onBack();
+      void operation.catch(() => undefined);
+      return;
+    }
     try {
-      if (mode === "save") await onSavePassword(folderId);
-      else await onClearPassword(folderId);
+      await onClearPassword(folderId);
       if (managedStorage) await refresh();
-    } catch { error = "Folder password could not be saved."; }
-    finally { busy = false; }
+    } catch (failure) {
+      error = failure instanceof Error ? failure.message : String(failure);
+    } finally { busy = false; }
   }
 
   async function refresh() {

@@ -145,11 +145,9 @@ export const applyOfflineDirectory = (
 };
 
 export const hasAutoConnectTarget = (state: AppState) => {
-  const remoteTarget = normalizeDeviceId(state.connection.remoteId);
-  if (remoteTarget) return true;
-  const selected = normalizeDeviceId(state.devices.selectedSavedDeviceId);
-  if (!selected) return false;
-  return !state.devices.lanDiscoveredDeviceIds.has(selected);
+  const target = normalizeDeviceId(state.connection.remoteId || state.devices.selectedSavedDeviceId);
+  return Boolean(target && state.devices.savedDevices.some(device =>
+    normalizeDeviceId(device.id) === target));
 };
 
 export const setRemoteApprovalPending = (

@@ -283,18 +283,20 @@ async function waitForSessionFolder(
 }
 
 async function acceptPendingApproval(peer: WebdriverIO.Browser) {
+  const nameScreen = peer.$("[data-testid='device-name-onboarding']");
+  if (await nameScreen.isExisting()) {
+    await peer.$("[data-testid='local-name-entry']").setValue("synthetic-packaged-peer");
+    await peer.$("[data-testid='save-local-device-name']").click();
+    await nameScreen.waitForExist({ reverse: true, timeout: 20_000 });
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     const message = await peer.getAlertText().catch(() => "");
     if (!message) return;
-    if (message === "Name this Syncpeer client (shown to remote devices):") {
-      await peer.sendAlertText("synthetic-packaged-peer");
-      await peer.acceptAlert();
-      continue;
-    }
     assert.match(message, /Confirm that both devices display pairing code/);
     await peer.acceptAlert();
   }
 }
+
 
 async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
   await peer.execute(() => {

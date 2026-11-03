@@ -360,6 +360,8 @@ test("rotates the local master password and allows an authorized remembered unlo
       save: async value => { remembered = value; }, remove: async () => { remembered = null; } }, revokeAccess: async () => {} };
   const vault = createCredentialVault(options);
   await vault.createDeviceProtected();
+  await assert.rejects(vault.lock(), /has no user master password/);
+  assert.equal(vault.status().phase, "unlocked");
   await vault.changeMasterPassword("synthetic-user-master");
   assert.equal(remembered, "synthetic-user-master");
   await vault.lock();
@@ -371,6 +373,42 @@ test("rotates the local master password and allows an authorized remembered unlo
   await vault.close();
 });
 
+
+test("device-protected local vault can opt into Personal Space without losing encrypted records", async () => {
+  let stored: unknown = null, bootstrap: unknown = null, remembered: string | null = null;
+  const options = {
+    profileId: "opt-in-personal-space", randomBytes,
+    storage: { load: async () => structuredClone(stored),
+      save: async (value: unknown) => { stored = structuredClone(value); },
+      withLock: async <T>(operation: () => Promise<T>) => operation() },
+    bootstrapStorage: { load: async () => structuredClone(bootstrap),
+      save: async (value: unknown) => { bootstrap = structuredClone(value); },
+      remove: async () => { bootstrap = null; } },
+    rememberedSecret: { isDeviceUnlocked: async () => true,
+      load: async () => remembered,
+      save: async (value: string) => { remembered = value; },
+      remove: async () => { remembered = null; } },
+    revokeAccess: async () => {},
+  };
+  const vault = createCredentialVault(options);
+  await vault.createDeviceProtected();
+  assert.equal(vault.status().personalSpaceEnabled, false);
+  await vault.saveConnectionPasswords({ photos: "synthetic-folder-credential" });
+  await vault.saveUiState({ peers: ["synthetic-peer"] });
+  const kit = await createOwnedRecoveryKit(crypto.subtle, randomBytes, "synthetic-offline-kit-password");
+  await vault.upgradeToPersonalSpace("synthetic-space-master", "OWNER", kit.publicKey, true);
+  assert.equal(vault.status().personalSpaceEnabled, true);
+  assert.deepEqual(await vault.connectionPasswords(), { photos: "synthetic-folder-credential" });
+  assert.deepEqual(await vault.uiState(), { peers: ["synthetic-peer"] });
+  assert.deepEqual((await vault.spaceDeviceMembership())?.devices.map(d => d.syncthingId), ["OWNER"]);
+  await assert.rejects(vault.upgradeToPersonalSpace("another", "OWNER", kit.publicKey), /already configured/);
+  await vault.close();
+  const reopened = createCredentialVault(options);
+  await reopened.initialize();
+  assert.equal(reopened.status().personalSpaceEnabled, true);
+  assert.deepEqual(await reopened.uiState(), { peers: ["synthetic-peer"] });
+  await reopened.close();
+});
 test("failed master-password rotation restores the old encrypted record and remembered secret", async () => {
   let record: unknown = null;
   let remembered: string | null = null;

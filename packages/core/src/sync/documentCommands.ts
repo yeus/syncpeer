@@ -7,7 +7,7 @@ export const changesSessionConfiguration = (operation: unknown, path?: unknown):
     Array.isArray(path) && path.length === 3 && path[0] === "folders" &&
     typeof path[1] === "string" && path[2] === "retention"
   ) && [
-    "createVault", "unlock", "unlockRemembered", "lock", "restoreRecoveryBackup",
+    "createVault", "createLocalVault", "upgradeToPersonalSpace", "unlock", "unlockRemembered", "lock", "restoreRecoveryBackup",
     "register", "attachDownloads", "detachDownloads", "saveProfileSettings",
     "savePersonalSpaceSetting", "resolvePersonalSpaceConflict", "appendPersonalSpaceChange",
     "importPairingTransfer", "revokeOwnedDevice", "recoverOwnedDevice",
@@ -319,6 +319,10 @@ const commandHandlers: Record<string, CommandHandler> = {
   rename: ({ documents, text }) => documents.rename(text("id"), text("name")),
   setSyncBaseline: ({ documents, text, integer }) => documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") }),
   createVault,
+  createLocalVault: ({ documents }) => documents.createLocalVault(),
+  upgradeToPersonalSpace: ({ documents, text, command }) =>
+    documents.upgradeToPersonalSpace(text("password"), text("localDeviceId"), text("recoveryKey"),
+      command.remember !== false),
   unlock: ({ documents, text }) => documents.unlock(text("password")),
   unlockRemembered: ({ documents }) => documents.unlockRemembered(),
   changeMasterPassword: ({ documents, text }) => documents.changeMasterPassword(text("password")),

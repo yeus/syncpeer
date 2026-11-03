@@ -632,12 +632,12 @@ test("Android automatic discovery E2E requires a real outgoing connection and re
   const runner = fs.readFileSync("scripts/test-android-peer.ts", "utf8");
   const phase = fs.readFileSync("scripts/test-android-e2e.mjs", "utf8");
   assert.match(runner, /SYNCPEER_ANDROID_PEER_DISCOVERY_MODE/);
-  assert.match(runner, /const outboundOnly = discoveryMode !== "direct"/);
+  assert.match(runner, /const outboundOnly = approvalOnly \|\| switchApproval \|\| discoveryMode !== "direct"/);
   assert.match(runner, /discovery\.lookupCount\(\) === 0/);
   // Syncthing reports 56-character IDs with check digits, while the client
   // queries with normalized 52-character IDs. The fake server must compare
   // the same canonical form or silently respond 404 to valid peer lookups.
-  assert.match(runner, /normalizeDeviceId\(remoteId\)/);
+  assert.match(runner, /normalizeDeviceId\(peer\.remoteId\)/);
   // The test's HTTPS server lives on the parent event loop; a synchronous
   // child process would block every lookup and make discovery always time out.
   assert.match(runner, /const runPhase = async/);
@@ -652,6 +652,15 @@ test("Android automatic discovery E2E requires a real outgoing connection and re
   assert.match(phase, /"forward", "tcp:0", target/);
   assert.match(phase, /"forward", "--remove", `tcp:\$\{port\}`/);
   assert.match(phase, /--peer-connect-smoke/);
-  assert.match(phase, /await openAndroidFolder\(cdp, false, false\)/);
+  assert.match(phase, /await openAndroidFolder\(cdp, false, process\.env\.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1"\)/);
   assert.match(phase, /Automatic discovery E2E must not use a fixed host/);
+  const scripts = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts;
+  assert.match(scripts["test:android:peer:approval"], /SYNCPEER_ANDROID_PEER_APPROVAL_ONLY=1/);
+  assert.match(runner, /Unapproved Android pairing request arrived before any restart/);
+  assert.match(runner, /Android connected after remote approval without restarting the app/);
+  assert.match(scripts["test:android:peer:two-pending"], /SYNCPEER_ANDROID_PEER_SWITCH_APPROVAL=1/);
+  assert.match(runner, /Peer B pairing request received while peer A is still unapproved/);
+  assert.match(phase, /--peer-switch-approval/);
+  assert.match(phase, /both unconfirmed peers remain visible/);
+  assert.match(phase, /Android process restarted during the pending-peer switch/);
 });

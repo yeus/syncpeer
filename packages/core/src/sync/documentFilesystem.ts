@@ -1413,7 +1413,11 @@ const effectiveProfileSettings = async (runtime: DocumentRuntime): Promise<Syncp
 
 const saveEffectiveProfileSettings = async (runtime: DocumentRuntime, next: SyncpeerProfileSettings) => {
   const previous = await effectiveProfileSettings(runtime);
-  const membership = await reconcileSpaceDeviceMembership(runtime);
+  // Personal Space is optional. A local-only profile must be able to save
+  // its own settings without a shared settings replica or membership journal.
+  const membership = runtime.settingsFolder
+    ? await reconcileSpaceDeviceMembership(runtime)
+    : null;
   if (membership?.localDeviceId) {
     for (const id of new Set([...Object.keys(previous.folders), ...Object.keys(next.folders)])) {
       const old = previous.folders[id] ?? defaultFolderSettings();
@@ -1502,6 +1506,11 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
     return unlockAfterVaultChange(runtime,
       () => runtime.vault.create(password, remember, localDeviceId, recoveryKey));
   }),
+  createLocalVault: () => runQueued(runtime, () =>
+    unlockAfterVaultChange(runtime, () => runtime.vault.createDeviceProtected())),
+  upgradeToPersonalSpace: (password: string, localDeviceId: string, recoveryKey: string,
+    remember = true) => runQueued(runtime, () => unlockAfterVaultChange(runtime,
+      () => runtime.vault.upgradeToPersonalSpace(password, localDeviceId, recoveryKey, remember))),
   unlock: (password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.unlock(password))),
   unlockRemembered: () =>

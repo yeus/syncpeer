@@ -21,6 +21,7 @@ export interface IncomingPeerServiceOptions {
     SyncpeerConnectOptions | Promise<SyncpeerConnectOptions>;
   onSession: (session: SyncpeerSessionHandle, remoteDeviceId: string) => void;
   onPairingSocket?: (socket: SyncpeerAcceptedTlsSocket, remoteDeviceId: string) => Promise<void>;
+  onUnapprovedPeer?: (deviceId: string) => void;
   onError?: (error: unknown) => void;
 }
 
@@ -93,7 +94,10 @@ export async function startIncomingPeerService(adapter: SyncpeerHostAdapter,
         throw new Error(`Incoming peer negotiated unsupported ALPN '${accepted.alpn || "none"}'.`);
       }
       const approvedDeviceId = approved.get(remoteDeviceId);
-      if (!approvedDeviceId) throw new Error(`Incoming peer device ID mismatch: ${remoteDeviceId} is not approved.`);
+      if (!approvedDeviceId) {
+        options.onUnapprovedPeer?.(remoteDeviceId);
+        throw new Error(`Incoming peer device ID mismatch: ${remoteDeviceId} is not approved.`);
+      }
       const endpoint = { host: accepted.remoteAddress || options.host, port: accepted.remotePort };
       const handlers = sessionHandlers;
       adapter.log?.("core.incoming.trace.options_start", {});

@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
-  import { isConfiguredDeviceName } from "../app/suggestedNames.ts";
-  import type { AdvertisedDeviceItem } from "@syncpeer/core/browser";
+  import { peerRegistryViews, type AdvertisedDeviceItem } from "@syncpeer/core/browser";
   import PasswordInput from "./PasswordInput.svelte";
   import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
@@ -13,15 +11,9 @@
 
   interface Props {
     app: AppState;
-    showDeviceNamePrompt: boolean;
-    suggestedDeviceName: string;
-    onSaveDeviceName: (name: string) => void;
-    onDismissDeviceNamePrompt: () => void;
     advertisedDevices: AdvertisedDeviceItem[];
-    isSavedDeviceConnected: (deviceId: string) => boolean;
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
     isLanDiscoveredDevice: (deviceId: string) => boolean;
-    currentSourceIsIntroducer: boolean;
     onUseSavedDevice: (deviceId: string) => void;
     onResetDiscoveryServer: () => void;
     onClearAllCache: () => void;
@@ -42,21 +34,14 @@
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
-    onConnectLocalCandidate: (candidateId: string) => void;
     onConnectionSettingsChanged: () => void;
   }
 
   let {
     app,
-    showDeviceNamePrompt,
-    suggestedDeviceName,
-    onSaveDeviceName,
-    onDismissDeviceNamePrompt,
     advertisedDevices,
-    isSavedDeviceConnected,
     isSavedDeviceAwaitingRemoteApproval,
     isLanDiscoveredDevice,
-    currentSourceIsIntroducer,
     onUseSavedDevice,
     onResetDiscoveryServer,
     onClearAllCache,
@@ -77,23 +62,10 @@
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
-    onConnectLocalCandidate,
     onConnectionSettingsChanged,
   }: Props = $props();
 
   const appInfo = getAppBuildInfo();
-  let nameDraft = $state(untrack(() => suggestedDeviceName));
-  let nameError = $state("");
-  const submitLocalName = (event: SubmitEvent) => {
-    event.preventDefault();
-    const name = nameDraft.trim();
-    if (!isConfiguredDeviceName(name)) {
-      nameError = "Choose a device name other than the default placeholder.";
-      return;
-    }
-    nameError = "";
-    onSaveDeviceName(name);
-  };
 
   const buildTimeLocalLabel = formatBuildTimeLocal(appInfo.buildTimeUtc);
 
@@ -104,76 +76,64 @@
   ));
 
   let deviceRows = $derived.by(() => {
-    const savedRows = app.devices.savedDevices.map((device) => {
-      const isConnected = isSavedDeviceConnected(device.id);
-      const isLanDetected = isLanDiscoveredDevice(device.id);
-      const lanMeta =
-        app.devices.lanDiscoveryByDeviceId?.[device.id]?.addresses?.length > 0
-          ? `LAN: ${app.devices.lanDiscoveryByDeviceId[device.id].addresses.join(", ")}`
-          : "";
-      const clientName = String(app.session.remoteDevice?.clientName ?? "").trim();
-      const clientVersion = String(app.session.remoteDevice?.clientVersion ?? "").trim();
-      const clientLabel = `${clientName} ${clientVersion}`.trim();
-      const metaLines = isConnected
-        ? [
-            clientLabel ? `Client: ${clientLabel}` : "",
-            app.session.connectionPath
-              ? `Connected via ${downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}: ${app.session.connectionPath}`
-              : "",
-            lanMeta,
-          ].filter((line: string) => line !== "")
-        : [lanMeta].filter((line: string) => line !== "");
-      return {
-        kind: "saved" as const,
-        id: `saved:${device.id}`,
-        name: device.name,
-        deviceId: device.id,
-        isConnected,
-        isLanDetected,
-        isIntroducer: device.isIntroducer === true,
-        awaitingApproval: isSavedDeviceAwaitingRemoteApproval(device.id),
-        metaLines,
-      };
+    const connectedDeviceId = app.session.isConnected
+      ? (app.session.remoteDevice?.id ?? app.connection.remoteId)
+      : "";
+    const views = peerRegistryViews({
+      saved: app.devices.savedDevices,
+      discovery: app.devices.peerDiscovery,
+      advertised: advertisedDevices,
+      connectedDeviceId,
+      confirmedDeviceIds: app.devices.confirmedPeerIds,
+      awaitingRemoteApproval: app.approvals.remoteApprovalPendingIds,
     });
-
-    const connected = savedRows
-      .filter((row) => row.isConnected)
-      .sort((left, right) => left.name.localeCompare(right.name));
-    const savedNotConnected = savedRows
-      .filter((row) => !row.isConnected)
-      .sort((left, right) => left.name.localeCompare(right.name));
-
-    const notApproved = advertisedDevices
-      .filter((device) => !device.accepted)
-      .sort((left, right) => left.name.localeCompare(right.name))
-      .map((device) => ({
-        kind: "advertised" as const,
-        id: `advertised:${device.id}`,
-        name: device.name,
-        deviceId: device.id,
-        sourceFolderIds: device.sourceFolderIds,
-        metaLines: [`Seen in folders: ${device.sourceFolderIds.join(", ")}`],
-      }));
-
-    const localCandidates = app.devices.lanAnonymousCandidates.map((candidate) => {
-      const firstAddress = String(candidate.addresses?.[0] ?? "");
-      const isLocalHost =
-        firstAddress.includes("127.0.0.1") || firstAddress.includes("localhost");
-      return {
-        kind: "local-candidate" as const,
-        id: `local-candidate:${candidate.id}`,
-        name: isLocalHost ? "Local Syncthing/Peer on this device" : "Local LAN peer candidate",
-        deviceId: candidate.id,
-        metaLines: [
-          candidate.addresses?.length > 0
-            ? `Addresses: ${candidate.addresses.join(", ")}`
-            : "",
-          "No device ID advertised. You can still try direct connect.",
-        ].filter((line: string) => line !== ""),
+    const rows = views.map(view => {
+      const saved = app.devices.savedDevices.find(device => device.id === view.deviceId);
+      const metaLines = view.sources.map(source => {
+        const lastSeen = new Date(source.lastSeenAtMs).toLocaleString();
+        if (source.kind === "manual") return "Manually added";
+        if (source.kind === "incoming") return `Incoming connection request (last seen ${lastSeen})`;
+        if (source.kind === "lan") {
+          return `LAN (last seen ${lastSeen})${source.addresses?.length ? ": " + source.addresses.join(", ") : ""}`;
+        }
+        const origin = app.devices.savedDevices.find(device => device.id === source.sourceDeviceId);
+        const via = origin?.name ?? formatSyncthingDeviceId(source.sourceDeviceId ?? "");
+        return `Advertised by ${via} (last seen ${lastSeen})${source.folderIds?.length ? " via " + source.folderIds.join(", ") : ""}`;
+      });
+      if (view.connected && app.session.connectionPath) {
+        metaLines.unshift(`Connected via ${downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}: ${app.session.connectionPath}`);
+      }
+      if (saved) return {
+        kind: "saved" as const, id: view.deviceId, name: view.name,
+        confirmed: view.confirmed,
+        deviceId: view.deviceId, isConnected: view.connected,
+        isConnecting: app.session.activeConnectDeviceId === view.deviceId && !view.connected,
+        connectError: app.devices.connectionErrors[view.deviceId] ?? "",
+        isLanDetected: isLanDiscoveredDevice(view.deviceId),
+        isIntroducer: saved.isIntroducer,
+        awaitingApproval: isSavedDeviceAwaitingRemoteApproval(view.deviceId), metaLines,
       };
+      const advertised = advertisedById.get(view.deviceId);
+      if (advertised) return {
+        kind: "advertised" as const, id: view.deviceId, name: view.name,
+        deviceId: view.deviceId, sourceFolderIds: advertised.sourceFolderIds, metaLines,
+      };
+      return { kind: "candidate" as const, id: view.deviceId, name: view.name,
+        deviceId: view.deviceId,
+        incomingRequest: view.sources.some(source => source.kind === "incoming"),
+        metaLines };
     });
-
-    return [...connected, ...savedNotConnected, ...notApproved, ...localCandidates];
+    const localCandidates = app.devices.lanAnonymousCandidates.map(candidate => ({
+      kind: "local-candidate" as const,
+      id: `anonymous:${candidate.id}`,
+      name: "Unidentified LAN candidate",
+      deviceId: candidate.id,
+      metaLines: [
+        `Addresses: ${candidate.addresses.join(", ")}`,
+        "A verified Syncthing device ID is required before adding a peer.",
+      ],
+    }));
+    return [...rows, ...localCandidates];
   });
 
   const addAdvertisedDevice = (deviceId: string) => {
@@ -207,25 +167,6 @@
     >About</button>
   </div>
 
-  {#if showDeviceNamePrompt}
-    <section class="name-prompt" data-testid="device-name-prompt" aria-labelledby="name-prompt-title">
-      <div>
-        <h3 id="name-prompt-title">Name this device</h3>
-        <p class="hint">Other devices will recognize it by this name. You can do this later.</p>
-      </div>
-      <form onsubmit={submitLocalName}>
-        <label for="local-name-entry">Device name</label>
-        <div class="name-prompt-actions">
-          <input id="local-name-entry" data-testid="local-name-entry" bind:value={nameDraft}
-            maxlength="64" autocomplete="off" spellcheck="false" />
-          <button type="submit" class="primary" data-testid="save-local-device-name">Save name</button>
-          <button type="button" class="ghost" data-testid="dismiss-local-name-prompt"
-            onclick={onDismissDeviceNamePrompt}>Not now</button>
-        </div>
-      </form>
-      {#if nameError}<p role="alert" class="name-prompt-error">{nameError}</p>{/if}
-    </section>
-  {/if}
 
   <div class="this-device-summary">
     <div class="item-title-row">
@@ -520,21 +461,7 @@
           <span>Enable relay fallback (Syncthing relay://)</span>
         </label>
 
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.connection.autoAcceptNewDevices}
-          />
-          <span>Auto-accept newly advertised devices</span>
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            type="checkbox"
-            bind:checked={app.connection.autoAcceptIntroducedFolders}
-          />
-          <span>Auto-approve folder sync for introduced folders</span>
-        </label>
+        <p class="hint">New devices and offered folders always require explicit approval.</p>
 
         <div class="hint version-meta">
           Version: <strong>{appInfo.appVersion}</strong> | Commit: <code>{appInfo.buildCommit}</code> | Built (local): {buildTimeLocalLabel} | Mode: {appInfo.buildMode} | Runtime: {appInfo.runtimeEnvironment}/{appInfo.runtimeSurface}
@@ -549,7 +476,7 @@
           onclick={() => onUseSavedDevice(app.devices.selectedSavedDeviceId)}
           disabled={app.devices.selectedSavedDeviceId === ""}
         >
-          Use Selected Device
+          Connect to Selected Peer
         </button>
         <button
           type="button"
@@ -619,13 +546,8 @@
 </Panel>
 
 <Panel title="Peers">
+  <p class="hint">Discovery does not grant access. Add a peer explicitly, then approve its offered folders. Sources are retained for 24 hours after last seen.</p>
   <ul class="list">
-    {#if app.session.isConnected && !currentSourceIsIntroducer}
-      <p class="hint">
-        Introductions are only trusted from introducer peers. Mark this
-        connected device as introducer to review/accept advertised devices.
-      </p>
-    {/if}
 
     {#if deviceRows.length === 0}
       <li class="empty">No peers yet. Add a saved device or wait for introductions.</li>
@@ -633,13 +555,11 @@
       {#each deviceRows as row (row.id)}
         <DeviceListItem
           {row}
-          disableActions={app.session.isConnecting}
           onUseSavedDevice={onUseSavedDevice}
           onEditSavedDeviceName={onEditSavedDeviceName}
           onSetSavedDeviceIntroducer={onSetSavedDeviceIntroducer}
           onRemoveSavedDevice={onRemoveSavedDevice}
           onAddAdvertisedDevice={addAdvertisedDevice}
-          onConnectLocalCandidate={onConnectLocalCandidate}
         />
       {/each}
     {/if}
@@ -747,20 +667,6 @@
     font-size: 0.8rem;
   }
 
-  .name-prompt {
-    display: grid;
-    gap: 0.55rem;
-    padding: 0.7rem;
-    margin-bottom: 0.7rem;
-    background: var(--bg-surface-muted);
-    border-radius: var(--radius-md);
-  }
-  .name-prompt h3 { margin: 0 0 0.25rem; font-size: 0.96rem; }
-  .name-prompt .hint { margin: 0; }
-  .name-prompt-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; }
-  .name-prompt-actions input { flex: 1 1 12rem; min-width: 0; min-height: 44px; }
-  .name-prompt-actions button { min-height: 44px; }
-  .name-prompt-error { margin: 0; color: var(--state-danger-text); }
 
   .this-device-summary {
     border: 0;

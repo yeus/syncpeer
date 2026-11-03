@@ -68,6 +68,8 @@ export const createAppActions = (args: {
     refreshOverview: connection.refreshOverview,
     refreshActiveView: connection.refreshActiveView,
     refreshCurrentDeviceId: connection.refreshCurrentDeviceId,
+    connectToDevice: connection.connect,
+    disconnectPeer: connection.disconnect,
   });
   const page = createPageActions({
     state,

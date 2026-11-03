@@ -172,8 +172,11 @@
     if (!masterPassword || !kitText || !kitSaved || (generatedPassword && !generatedSaved)) return;
     busy = true; error = "";
     try {
-      await command({ operation: "createVault", password: masterPassword, remember: rememberMaster,
-        localDeviceId: await getDefaultDeviceId(), recoveryKey: JSON.parse(kitText).publicKey });
+      await command({
+        operation: status?.vault.phase === "unlocked" ? "upgradeToPersonalSpace" : "createVault",
+        password: masterPassword, remember: rememberMaster,
+        localDeviceId: await getDefaultDeviceId(), recoveryKey: JSON.parse(kitText).publicKey,
+      });
       kitText = ""; kitSaved = false;
       generatedPassword = ""; generatedSaved = false; masterPassword = "";
       await onUnlock(); await refresh();
@@ -228,16 +231,13 @@
 <main class="panel settings-page" data-testid="general-settings-page">
   <button onclick={onBack}>Back</button>
   <h1>Settings</h1>
-  {#if status && status.vault.phase !== "unlocked"}
-    <p class="hint" data-testid="personal-space-required">
-      Encrypted shared folders need a master password on this device. Create a new personal space
-      below, or join or restore an existing one before opening them.
-    </p>
+  {#if status?.vault.phase === "locked"}
+    <p class="hint">Your private storage is locked. Unlock it to manage local credentials or Personal Space.</p>
   {/if}
   {#if error}<p role="alert">{error}</p>{/if}
   <section data-testid="personal-space-settings">
     <h2>Personal space</h2>
-    <p>Your approved devices share an encrypted settings folder containing folder credentials and shared policies. Each device keeps its own local master password.</p>
+    <p>Optional encrypted Syncthing folder for settings, credentials and policy synchronization. Local device-protected storage works without Personal Space.</p>
   {#if status?.vault.phase === "locked"}
     <form onsubmit={event => { event.preventDefault(); void unlock(); }}>
       <PasswordInput label="Unlock personal space" secretLabel="personal-space master password"
@@ -249,7 +249,9 @@
         Unlock with biometrics
       </button>
     {/if}
-  {:else if status?.vault.phase === "uninitialized"}
+  {:else if status?.vault.phase === "uninitialized" || (status?.vault.phase === "unlocked" && !status.vault.personalSpaceEnabled)}
+    <details data-testid="optional-personal-space-setup">
+      <summary>Set up Personal Space</summary>
     <form onsubmit={event => { event.preventDefault(); void createProfile(); }}>
       <PasswordInput label="Master password (at least 16 characters)" secretLabel="master password"
         bind:value={masterPassword} autocomplete="new-password" minlength={16} required />
@@ -271,7 +273,7 @@
       {:else}
         <button type="button" disabled={busy || kitPassword.length < 16} onclick={() => void prepareRecoveryKit()}>Generate encrypted offline kit</button>
       {/if}
-      <button class="primary" disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>Create encrypted profile</button>
+      <button class="primary" disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>{status?.vault.phase === "unlocked" ? "Enable Personal Space" : "Create Personal Space"}</button>
     </form>
     <section>
       <h2>Join an existing personal space</h2>
@@ -283,6 +285,7 @@
       <button class="primary" disabled={busy || masterPassword.length < 16 || !pairingInvitation.trim()} onclick={() => void joinDevice()}>Join personal space</button>
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
     </section>
+    </details>
   {:else if status?.vault.phase === "unlocked"}
     {#if conflictedFolders.length}
       <section>
@@ -340,7 +343,7 @@
       <button disabled={busy || !masterPassword}>Change master password</button>
     </form>
   {/if}
-  {#if status?.vault.phase === "unlocked" || status?.vault.phase === "uninitialized"}
+  {#if status?.vault.personalSpaceEnabled || status?.vault.phase === "uninitialized"}
     <section>
       <h2>Personal-space backup</h2>
       <p>This password-encrypted backup contains folder credentials and settings. It contains neither downloaded documents nor device identity keys. Keep its recovery password separately.</p>

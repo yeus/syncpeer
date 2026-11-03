@@ -17,12 +17,24 @@ import {
 } from "../packages/app/src/app/state.ts";
 import { isConfiguredDeviceName } from "../packages/app/src/app/suggestedNames.ts";
 import { generateMasterPassword } from "../packages/app/src/app/passwords.ts";
+import { observePeer } from "../packages/core/src/peerRegistry.ts";
+const PEER_ID = "RXB676UZHQX3SONXROHZ7M3DY2VEMB6LCGQCAG5QJ2VIEDX4RIUQ";
 import { createPageActions } from "../packages/app/src/app/pageActions.ts";
 
 test("stability warning appears on first run and stays dismissed", () => {
   assert.equal(createInitialState(null).ui.showStabilityNotice, true);
   assert.equal(createInitialState({ stabilityNoticeAcknowledged: true }).ui.showStabilityNotice, false);
 });
+test("a fresh installation requires explicit name confirmation, restored name skips first-run", () => {
+  const fresh = createInitialState(null);
+  assert.equal(fresh.connection.deviceName, "syncpeer-ui");
+  assert.equal(fresh.ui.deviceNameConfirmed, false);
+  const restored = createInitialState({ deviceName: "My Tablet", activeTab: "folders" });
+  assert.equal(restored.connection.deviceName, "My Tablet");
+  assert.equal(restored.ui.deviceNameConfirmed, true);
+  assert.equal(restored.activeTab, "folders");
+});
+
 
 test("stability warning dismissal is persisted without storing private state", t => {
   let written = "";
@@ -114,6 +126,35 @@ test("sensitive UI state round-trips through the encrypted payload", () => {
   assert.equal(applySensitiveAppState(restored, "invalid"), false);
 });
 
+test("peer provenance and authenticated peer confirmation persist only in encrypted state", () => {
+  const state = createInitialState(null);
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Desktop", isIntroducer: false,
+    createdAtMs: Date.now(), customName: true }];
+  state.devices.peerDiscovery = observePeer({}, PEER_ID, {
+    kind: "introduced", sourceDeviceId: PEER_ID, lastSeenAtMs: Date.now(),
+    folderIds: ["shared"],
+  });
+  state.devices.confirmedPeerIds = new Set([PEER_ID]);
+  const stored = sensitiveAppState(state);
+  assert.deepEqual(stored.confirmedPeerIds, [PEER_ID]);
+  const recovered = createInitialState(null);
+  assert.equal(applySensitiveAppState(recovered, JSON.parse(JSON.stringify(stored))), true);
+  assert.equal(recovered.devices.confirmedPeerIds.has(PEER_ID), true);
+  assert.deepEqual(recovered.devices.peerDiscovery[PEER_ID].sources.map(s => s.kind),
+    ["introduced", "manual"]);
+});
+
+test("legacy auto-approval settings are disabled on encrypted restore", () => {
+  const state = createInitialState(null);
+  const saved = sensitiveAppState(state);
+  const restored = createInitialState(null);
+  assert.equal(applySensitiveAppState(restored, {
+    ...saved, connection: { ...saved.connection, autoAcceptNewDevices: true,
+      autoAcceptIntroducedFolders: true },
+  }), true);
+  assert.equal(restored.connection.autoAcceptNewDevices, false);
+  assert.equal(restored.connection.autoAcceptIntroducedFolders, false);
+});
 test("legacy plaintext UI state is discoverable for one-time migration", (t) => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", { configurable: true, value: { localStorage: { getItem: () => JSON.stringify({
@@ -372,6 +413,7 @@ test("a restored saved peer is dialed after the app returns to the foreground", 
   const state = createInitialState(null);
   const peerId = "DPNAVCUNBE5A5HUY4AN5YALD4RILEIXAJCYRGJBAGNLHYXFBWDKA";
   const stored = createInitialState(null);
+  stored.connection.deviceName = "Restored desktop";
   stored.devices.savedDevices = [{
     id: peerId, name: "Saved peer", createdAtMs: 1, isIntroducer: false, customName: true,
   }];
@@ -389,8 +431,21 @@ test("a restored saved peer is dialed after the app returns to the foreground", 
     "Unlocking restores saved peers first, then the foreground pass must dial the selected one.");
 });
 
-test("a foreground pass without a restored peer does not dial anything", async () => {
+test("first-run foreground pass does not discover or connect before naming", async () => {
   const state = createInitialState(null);
+  const calls: string[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => undefined } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); },
+    connect: async () => { calls.push("connect"); },
+  });
+  await actions.onAppForeground();
+  assert.deepEqual(calls, []);
+});
+
+test("after confirming the device name, foreground discovery runs without dialing unknown peers", async () => {
+  const state = createInitialState({ deviceName: "Named device" });
   const calls: string[] = [];
   const actions = createPageActions({
     state,

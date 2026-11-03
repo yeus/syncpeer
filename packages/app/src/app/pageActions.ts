@@ -38,7 +38,7 @@ const setAppVisibility = (isVisible: boolean) => {
 
 const onNetworkOnline = async () => {
   await sessionStore.actions.setOnline(true);
-  if (state.ui.autoConnectPaused) return;
+  if (state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed) return;
   await discoverLocalDevices({ timeoutMs: 1200 });
   if (!hasAutoConnectTarget(state)) return;
   if (state.session.isConnected || state.session.isConnecting) return;
@@ -46,7 +46,7 @@ const onNetworkOnline = async () => {
 };
 
 const onAppForeground = async () => {
-  if (state.ui.autoConnectPaused) return;
+  if (state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed) return;
   await discoverLocalDevices({ timeoutMs: 1200 });
   if (!hasAutoConnectTarget(state)) return;
   if (state.session.isConnected || state.session.isConnecting) return;

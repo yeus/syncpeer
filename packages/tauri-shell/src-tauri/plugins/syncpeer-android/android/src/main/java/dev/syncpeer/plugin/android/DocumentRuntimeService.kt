@@ -142,6 +142,16 @@ class DocumentRuntimeService : Service() {
       return entered
     }
 
+    /** Deterministic regression: an in-flight peer handshake may not starve document commands. */
+    internal fun pendingSessionEvaluationForTesting(entered: CountDownLatch): CompletableFuture<String> {
+      check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+      return evaluateRuntime("""
+        await new Promise(resolve => setTimeout(resolve, 4500));
+        return "completed";
+      """.trimIndent(), ByteArray(0), releaseWorkerWhilePending = true,
+        onDispatched = { entered.countDown() })
+    }
+
 
     fun command(input: JSONObject): CompletableFuture<JSONObject> {
       return evaluate("""
@@ -221,14 +231,15 @@ class DocumentRuntimeService : Service() {
         peerError = null
         publishSessionStatus()
       }
-      return evaluate("""
+      return evaluateRuntime("""
         if (!globalThis.syncpeerDocuments) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
         if (!globalThis.syncpeerSession) globalThis.syncpeerSession = await globalThis.syncpeerDocumentsCore.startSession(android, globalThis.syncpeerDocuments);
         const result = await globalThis.syncpeerSession.command({
           protocolVersion: ${SESSION_PROTOCOL_VERSION}, ...input,
         });
         return JSON.stringify({result: result === undefined ? null : result});
-      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8))
+      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8),
+        releaseWorkerWhilePending = operation == "connect")
         .thenApply { raw ->
           JSONObject(raw).also { reply ->
             if (operation == "connect") {
@@ -277,26 +288,47 @@ class DocumentRuntimeService : Service() {
     input: ByteArray,
     timeoutMs: Long? = null,
     highPriority: Boolean = false,
+    releaseWorkerWhilePending: Boolean = false,
+    onDispatched: () -> Unit = {},
   ): CompletableFuture<String> {
     require(input.size <= 1024 * 1024) { "Document runtime input is too large." }
+    require(!releaseWorkerWhilePending || timeoutMs == null) {
+      "Nonblocking session evaluation uses its caller's deadline."
+    }
     val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
     val result = CompletableFuture<String>()
     val task = Runnable {
+      var handedOff = false
       try {
         if (result.isCancelled) return@Runnable
         check(terminalStatus == null && runtimeHost != null) { "Document runtime unavailable." }
-        // Trusted core publication is bounded by file size, not a fixed startup deadline.
-        // Killing the runtime after 15 seconds made large-file fsync impossible.
         val evaluation = checkNotNull(runtimeHost).evaluate(code, data)
-        result.complete(
-          if (timeoutMs == null) evaluation.get()
-          else evaluation.get(timeoutMs, TimeUnit.MILLISECONDS),
-        )
+        onDispatched()
+        if (releaseWorkerWhilePending) {
+          // A network connect can wait minutes for TLS/BEP. It must not monopolize
+          // the worker and starve vault status, folder settings, or cancellation.
+          evaluation.whenComplete { value, error ->
+            try {
+              if (error != null) result.completeExceptionally(error)
+              else result.complete(value)
+            } finally { data.fill(0) }
+          }
+          handedOff = true
+        } else {
+          // Trusted core publication is bounded by file size, not a fixed
+          // deadline; large-file fsync may take longer than 15 seconds.
+          result.complete(
+            if (timeoutMs == null) evaluation.get()
+            else evaluation.get(timeoutMs, TimeUnit.MILLISECONDS),
+          )
+        }
       } catch (error: Exception) {
         // A host-level timeout means the runtime is wedged; a caller bound does not.
         if (error is TimeoutException && timeoutMs == null) startRecovery()
         result.completeExceptionally(error)
-      } finally { data.fill(0) }
+      } finally {
+        if (!handedOff) data.fill(0)
+      }
     }
     try {
       if (highPriority) worker.executeHighPriority(task) else worker.execute(task)
@@ -584,7 +616,8 @@ class DocumentRuntimeService : Service() {
         protocolVersion: ${SESSION_PROTOCOL_VERSION}, ...input,
       });
       return JSON.stringify({result: value === undefined ? null : value});
-    """.trimIndent(), request.toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
+    """.trimIndent(), request.toByteArray(Charsets.UTF_8),
+      releaseWorkerWhilePending = true).whenComplete { value, error ->
       if (generation != sessionGeneration || sessionRequest != request) {
         result.complete(sessionStatus())
         return@whenComplete

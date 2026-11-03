@@ -659,32 +659,30 @@ export function normalizeDiscoveryServerUrl(rawUrl: string | undefined): URL {
 function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
   if (typeof address !== "string" || address.trim() === "") return null;
   const value = address.trim();
-  if (/^tcp(?:4|6)?:\/\//.test(value)) {
-    const parsed = new URL(value);
-    if (!parsed.hostname || !parsed.port) return null;
+  const direct = /^(tcp(?:4|6)?|quic(?:4|6)?):\/\/(.+)$/.exec(value);
+  if (direct) {
+    // Android WebView URL implementations need not assign a host/port to
+    // non-standard URL schemes. Parse the authority with a standard scheme
+    // while preserving the original Syncthing address.
+    let parsed: URL;
+    try { parsed = new URL(`http://${direct[2]}`); }
+    catch { return null; }
+    const port = Number(/:(\d{1,5})\/?$/.exec(direct[2]!)?.[1]);
+    if (!parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535 ||
+      parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/") return null;
     return {
       address: value,
-      protocol: "tcp",
+      protocol: direct[1]!.startsWith("tcp") ? "tcp" : "quic",
       host: parsed.hostname.replace(/^\[|\]$/g, ""),
-      port: Number(parsed.port),
-      scope: connectionScopeForHost(parsed.hostname),
-      source: "global",
-    };
-  }
-  if (/^quic(?:4|6)?:\/\//.test(value)) {
-    const parsed = new URL(value);
-    if (!parsed.hostname || !parsed.port) return null;
-    return {
-      address: value,
-      protocol: "quic",
-      host: parsed.hostname.replace(/^\[|\]$/g, ""),
-      port: Number(parsed.port),
+      port,
       scope: connectionScopeForHost(parsed.hostname),
       source: "global",
     };
   }
   if (value.startsWith("relay://")) {
-    const parsed = new URL(value);
+    let parsed: URL;
+    try { parsed = new URL(value); }
+    catch { return null; }
     return {
       address: value,
       protocol: "relay",
@@ -3189,8 +3187,24 @@ class ConnectionAttempt {
             signal: this.signal,
           })
         : Promise.resolve([]);
-    const [globalResult, localResult] = await Promise.allSettled([global, local]);
-    return { global: globalResult, local: localResult };
+    // An Android LAN lookup can be delayed by native network work. A healthy
+    // global-discovery answer must not be held hostage by that optional path.
+    // LAN-only mode still respects its full requested discovery window.
+    let localTimeout: ReturnType<typeof setTimeout> | undefined;
+    const boundedLocal = this.discoveryMode === "automatic"
+      ? Promise.race([local, new Promise<never>((_resolve, reject) => {
+          localTimeout = setTimeout(
+            () => reject(new Error("LAN discovery exceeded its bounded lookup window.")),
+            Math.min(this.totalTimeout, this.localDiscoveryTimeoutMs + 250),
+          );
+        })])
+      : local;
+    try {
+      const [globalResult, localResult] = await Promise.allSettled([global, boundedLocal]);
+      return { global: globalResult, local: localResult };
+    } finally {
+      if (localTimeout !== undefined) clearTimeout(localTimeout);
+    }
   }
 
   private logDiscovery(outcome: DiscoveryOutcome, localCandidates: DiscoveredCandidate[]) {

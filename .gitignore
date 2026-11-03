@@ -6,6 +6,7 @@ dist/
 .tools/
 .flatpak-builder/
 .tmp/
+.winx/
 .code-analysis/reports/
 /.screenshots/
 .ci-logs/

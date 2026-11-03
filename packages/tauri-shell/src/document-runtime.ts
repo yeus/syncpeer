@@ -14,6 +14,7 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
   type SyncpeerConnectOptions, type SyncpeerHostAdapter, type SyncpeerTlsSocket,
   type SyncpeerSessionHandle } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
+import { serializeConnectionKey } from "../../core/src/ui/connectionKey.js";
 import { createConnectionLifecycle, waitForLifecyclePhase,
   type ConnectionLifecycle, type ConnectionLifecycleState } from "../../core/src/ui/connectionLifecycle.js";
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
@@ -77,10 +78,17 @@ const createAndroidSessionAdapter = async (
   const adapter: SyncpeerHostAdapter = {
     log: (event, details) => {
       if (!event.startsWith("core.session.connect.") &&
-        !["core.discovery.global_failed", "core.upload.request.failed",
+        !["core.discovery.global_failed", "core.discovery.retry", "core.discovery.full_response",
+          "core.discovery.candidate.failed", "core.discovery.connect_strategy", "core.upload.request.failed",
           "core.replica.receive.failed"].includes(event)) return;
-      void request({ operation: "diagnostic", event,
-        message: typeof details?.message === "string" ? details.message : "Unknown runtime failure." });
+      const addresses = (details?.payload as { addresses?: unknown } | undefined)?.addresses;
+      const message = event === "core.discovery.connect_strategy"
+        ? `direct=${details?.directCandidateCount ?? 0}, relay=${details?.relayCandidateCount ?? 0}`
+        : event === "core.discovery.full_response"
+          ? `candidates=${Array.isArray(details?.candidates) ? details.candidates.length : "?"}, addresses=${
+            Array.isArray(addresses) ? addresses.length : "?"}`
+        : typeof details?.message === "string" ? details.message : "No further details";
+      void request({ operation: "diagnostic", event, message });
     },
     connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal, alpnProtocols }) => {
       const value = await request({ operation: "tlsOpen", host, port, certPem, keyPem, caPem: caPem ?? null,
@@ -246,12 +254,9 @@ class AndroidSessionRuntime {
   private createLifecycle(): ConnectionLifecycle<ConnectOptions> {
     return createConnectionLifecycle<ConnectOptions>({
       open: (options, signal) => this.openSession(options, signal),
-      keyFor: options => JSON.stringify({ host: options.host, port: options.port, remoteId: options.remoteId ?? "", deviceName: options.deviceName,
-        // Shared-folder credentials and the replica receiver are resolved from
-        // the document owner when the session opens. A later folder attach,
-        // favorite or credential change must invalidate the live session so it
-        // reopens with the current selection.
-        sessionConfigurationRevision: this.documents.sessionConfigurationRevision() }),
+      keyFor: options => serializeConnectionKey(options,
+        options.cert ?? "default-cert", options.key ?? "default-key",
+        this.documents.sessionConfigurationRevision()),
     });
   }
 
@@ -376,11 +381,17 @@ class AndroidSessionRuntime {
     const trustedDevices = (await this.documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
     if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices)
       .some(id => sameDeviceId(id, options.remoteId!))) {
-      throw new Error("This peer was removed from the trusted device list.");
+      throw new Error("Peer identity is revoked, retired, or not authorized for this connection.");
     }
+    // Lifecycle retries can carry the original connection object. Prefer the
+    // most recent live credentials, including intentional password removals.
+    const latestPasswords = this.activeOptions &&
+      sameDeviceId(this.activeOptions.remoteId ?? "", options.remoteId ?? "")
+        ? this.activeOptions.folderPasswords
+        : options.folderPasswords;
     const folderPasswords = {
       ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
-      ...options.folderPasswords,
+      ...latestPasswords,
     };
     const sharedFolders = await this.documents.sessionSharedFolders(options.remoteId ?? "");
     return {
@@ -411,8 +422,18 @@ class AndroidSessionRuntime {
     try { service = await this.ensureIncomingService(options, coreOptions); }
     catch (error) { listenerFailure = error; }
     let session;
-    try { session = await this.core.openSession(coreOptions, signal); }
-    catch (error) {
+    this.adapter.log?.("core.session.connect.outbound_start", {
+      message: `${coreOptions.discoveryMode ?? "automatic"} via ${
+        (() => { try { return new URL(coreOptions.discoveryServer ?? "https://discovery-lookup.syncthing.net").host; }
+          catch { return "invalid URL"; } })()}`,
+    });
+    try {
+      session = await this.core.openSession(coreOptions, signal);
+      this.adapter.log?.("core.session.connect.outbound_ready", { message: session.transportKind });
+    } catch (error) {
+      this.adapter.log?.("core.session.connect.outbound_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
       if (listenerFailure) throw new AggregateError([error, listenerFailure],
         `Could not connect to the peer or start the incoming LAN listener on TCP port ${options.listenPort ?? 22000}.`,
         { cause: error });
@@ -441,13 +462,19 @@ class AndroidSessionRuntime {
       // rejection, so wait for the lifecycle's own retry to connect.
       const phase = this.lifecycle.getState().phase;
       if (phase !== "waiting" && phase !== "reconnecting" && phase !== "connecting") {
-        this.adapter.log?.("core.session.connect.failed", { message: phase });
+        this.adapter.log?.("core.session.connect.failed", {
+          message: `${phase}: ${error instanceof Error ? error.message : String(error)}`,
+        });
         throw error;
       }
-      this.adapter.log?.("core.session.connect.retrying", { message: phase });
+      this.adapter.log?.("core.session.connect.retrying", {
+        message: `${phase}: ${error instanceof Error ? error.message : String(error)}`,
+      });
       const connected = await waitForLifecyclePhase(this.lifecycle, "connected", 60_000);
       if (!connected) {
-        this.adapter.log?.("core.session.connect.failed", { message: this.lifecycle.getState().phase });
+        this.adapter.log?.("core.session.connect.failed", {
+          message: `${this.lifecycle.getState().phase}: ${error instanceof Error ? error.message : String(error)}`,
+        });
         throw error;
       }
       this.adapter.log?.("core.session.connect.recovered", {});
@@ -462,10 +489,13 @@ class AndroidSessionRuntime {
     const options = request.options as ConnectOptions;
     this.activeOptions = options;
     const session = await this.connectSession(options);
+    this.adapter.log?.("core.session.connect.session_ready", { message: session.transportKind });
+    const folders = await session.remoteFs.listFolders();
+    this.adapter.log?.("core.session.connect.folders_ready", { message: String(folders.length) });
     // Remember newly advertised roots. Folders already attached to the
     // DocumentsProvider are supplied above as explicit full replicas;
     // unattached folders remain metadata-only until selected.
-    for (const folder of await session.remoteFs.listFolders()) {
+    for (const folder of folders) {
       await this.documents.rememberFolder({ id: folder.id, label: folder.label || folder.id });
     }
     return { phase: this.lifecycle.getState().phase };
@@ -594,6 +624,17 @@ class AndroidSessionRuntime {
         await session.remoteFs.deleteFile(request.folderId, request.path,
           { waitForRemote: request.waitForRemote === true });
         return { deleted: true };
+      }
+      case "updateFolderPasswords": {
+        const session = this.lifecycle.getSession();
+        if (!session || session.isClosed()) throw new Error("No service-owned peer session is connected.");
+        if (!session.updateFolderPasswords) {
+          throw new Error("The active peer session cannot update folder credentials.");
+        }
+        const folderPasswords = request.folderPasswords as Record<string, string>;
+        await session.updateFolderPasswords(folderPasswords);
+        if (this.activeOptions) this.activeOptions = { ...this.activeOptions, folderPasswords: { ...folderPasswords } };
+        return { updated: true };
       }
       case "syncFavorites": return this.syncFavoritesCommand();
       case "releaseLocalCopy": return this.releaseLocalCopyCommand(request);

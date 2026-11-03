@@ -11,6 +11,9 @@ import {
   fromConnectionSettings,
   normalizeDeviceId,
   normalizeSavedDevices,
+  observePeer,
+  normalizePeerDiscovery,
+  type PeerDiscoveryRegistry,
   normalizeSyncApprovedIntroducedFolderKeys,
   resolvePreferredSourceDeviceId,
   resolveFolderPasswordsForDevice,
@@ -139,6 +142,8 @@ export interface SensitiveAppState {
   connection?: StoredConnectionSettingsLike;
   savedDevices?: SavedDeviceLike[];
   selectedSavedDeviceId?: string;
+  peerDiscovery?: PeerDiscoveryRegistry;
+  confirmedPeerIds?: string[];
   approvals: string[];
   offlineFolderSnapshots: Record<string, OfflineFolderSnapshot>;
   pim: PersistedPimState;
@@ -161,6 +166,8 @@ export const sensitiveAppState = (state: AppState): SensitiveAppState => ({
   connection: { ...toConnectionSettings(state.connection), key: "" },
   savedDevices: state.devices.savedDevices,
   selectedSavedDeviceId: state.devices.selectedSavedDeviceId,
+  peerDiscovery: state.devices.peerDiscovery,
+  confirmedPeerIds: [...state.devices.confirmedPeerIds].sort(),
   approvals: [...state.approvals.syncApprovedFolderKeys].sort(),
   offlineFolderSnapshots: Object.fromEntries(Object.entries(state.offline.snapshots).map(([deviceId, snapshot]) =>
     [deviceId, { ...snapshot, directories: undefined, activeDirectoryKey: undefined }])),
@@ -175,9 +182,26 @@ export const applySensitiveAppState = (state: AppState, value: unknown) => {
   const confirmedLocalName = state.ui.deviceNameConfirmed && isConfiguredDeviceName(state.connection.deviceName)
     ? state.connection.deviceName.trim() : "";
   if (record.connection) Object.assign(state.connection, fromConnectionSettings({ ...record.connection, key: "" }));
+  state.connection.autoAcceptNewDevices = false;
+  state.connection.autoAcceptIntroducedFolders = false;
   if (confirmedLocalName) state.connection.deviceName = confirmedLocalName;
   else if (isConfiguredDeviceName(state.connection.deviceName)) state.ui.deviceNameConfirmed = true;
   if (record.savedDevices) state.devices.savedDevices = normalizeSavedDevices(record.savedDevices);
+  state.devices.peerDiscovery = normalizePeerDiscovery(record.peerDiscovery);
+  // Pre-provenance saved peers were all explicitly configured by the user.
+  for (const saved of state.devices.savedDevices) {
+    if (!state.devices.peerDiscovery[saved.id]?.sources.some(source => source.kind === "manual")) {
+      state.devices.peerDiscovery = observePeer(state.devices.peerDiscovery, saved.id,
+        { kind: "manual", lastSeenAtMs: saved.createdAtMs || Date.now() });
+    }
+  }
+  state.devices.confirmedPeerIds = new Set(
+    (Array.isArray(record.confirmedPeerIds)
+      ? record.confirmedPeerIds
+      : Object.keys(record.offlineFolderSnapshots ?? {}))
+      .filter((id): id is string => typeof id === "string")
+      .map(normalizeDeviceId).filter(id => /^[A-Z2-7]{52}$/.test(id)),
+  );
   state.devices.selectedSavedDeviceId = record.selectedSavedDeviceId ?? "";
   state.approvals.syncApprovedFolderKeys = normalizeSyncApprovedIntroducedFolderKeys(
     record.approvals.filter((key): key is string => typeof key === "string"));
@@ -254,9 +278,9 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       quicOnly: initialConnection.quicOnly === true,
       discoveryServer: initialConnection.discoveryServer,
       enableRelayFallback: initialConnection.enableRelayFallback,
-      autoAcceptNewDevices: initialConnection.autoAcceptNewDevices,
-      autoAcceptIntroducedFolders:
-        initialConnection.autoAcceptIntroducedFolders,
+      // Migrate legacy auto-approval settings to manual review.
+      autoAcceptNewDevices: false,
+      autoAcceptIntroducedFolders: false,
       relayPoolUrl: "",
     },
     session: {
@@ -332,6 +356,9 @@ export const createInitialState = (persisted = loadPersistedState()) => {
     },
     devices: {
       savedDevices: savedDevices as SavedDeviceLike[],
+      confirmedPeerIds: new Set<string>(),
+      connectionErrors: {} as Record<string, string>,
+      peerDiscovery: {} as PeerDiscoveryRegistry,
       selectedSavedDeviceId: normalizeDeviceId(
         persisted?.selectedSavedDeviceId || savedDevices[0]?.id || "",
       ),
@@ -367,6 +394,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       secureStorage: false,
       saved: {} as Record<string, string>,
       drafts: {} as Record<string, string>,
+      unlockStatusByFolder: {} as Record<string, { phase: "unlocking" | "unlocked" | "error" | "waiting-for-peer"; message: string }>,
     },
     offline: {
       snapshots: {} as Record<string, OfflineFolderSnapshot>,
@@ -660,18 +688,54 @@ export const rootFolderEntries = (state: AppState) =>
     .sort((left, right) => left.name.localeCompare(right.name));
 
 export const folderState = (state: AppState, folderId: string) =>
-  state.session.folders.find((folder) => folder.id === folderId);
+  state.session.folders.find((folder) => folder.id === folderId) ??
+  state.localFolders.find((folder) => folder.id === folderId);
 
 export const folderIsLocked = (state: AppState, folderId: string) => {
   const folder = folderState(state, folderId);
   return Boolean(folder?.encrypted && folder?.needsPassword);
 };
 
+export const folderUnlockStatus = (state: AppState, folderId: string) => {
+  const source = activeFolderPasswordScopeDeviceId(state);
+  return state.passwords.unlockStatusByFolder[`${source}:${folderId}`];
+};
+export const folderUnlockError = (state: AppState, folderId: string) =>
+  folderUnlockStatus(state, folderId)?.phase === "error"
+    ? folderUnlockStatus(state, folderId)?.message ?? ""
+    : folderState(state, folderId)?.passwordError ?? "";
 export const folderLockLabel = (state: AppState, folderId: string) => {
   const folder = folderState(state, folderId);
   if (!folder?.encrypted) return "";
-  if (folder.passwordError) return "password error";
-  return folder.needsPassword ? "locked" : "unlocked";
+  const status = folderUnlockStatus(state, folderId);
+  if (status?.phase === "unlocking") return "unlocking…";
+  if (status?.phase === "error" || folder.passwordError) return "unlock error";
+  if (folder.needsPassword) return status?.phase === "waiting-for-peer" ? "awaiting verification" : "locked";
+  return "unlocked";
+};
+
+export const reconcileFolderUnlockStatuses = (state: AppState) => {
+  const scope = activeFolderPasswordScopeDeviceId(state);
+  const next = { ...state.passwords.unlockStatusByFolder };
+  let changed = false;
+  for (const folder of state.session.folders) {
+    if (!folder.encrypted) continue;
+    const key = `${scope}:${folder.id}`;
+    const existing = next[key];
+    if (!existing || existing.phase === "unlocking") continue;
+    const replacement = folder.passwordError
+      ? { phase: "error" as const, message: folder.passwordError }
+      : !folder.needsPassword
+        ? { phase: "unlocked" as const, message: "" }
+        : existing.phase === "unlocked"
+          ? { phase: "waiting-for-peer" as const, message: "The folder requires an encryption password." }
+          : existing;
+    if (existing.phase !== replacement.phase || existing.message !== replacement.message) {
+      next[key] = replacement;
+      changed = true;
+    }
+  }
+  if (changed) state.passwords.unlockStatusByFolder = next;
 };
 
 export const advertisedDevices = (state: AppState) =>

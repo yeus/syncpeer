@@ -31,8 +31,18 @@ const discoveryMode = requestedDiscoveryMode === "automatic" || requestedDiscove
   ? requestedDiscoveryMode : "direct";
 
 /** Pinned, disposable Syncthing discovery endpoint. No public discovery or real credentials. */
-const startSyntheticDiscovery = async (root: string, remoteId: string, peerPort: number) => {
+const startSyntheticDiscovery = async (
+  root: string,
+  remoteId: string,
+  peerPort: number,
+  additionalPeers: ReadonlyArray<{ remoteId: string; peerPort: number }> = [],
+) => {
   const identity = generateSyncthingIdentity(path.join(root, "discovery"));
+  const addresses = new Map(
+    [{ remoteId, peerPort }, ...additionalPeers].map(peer =>
+      [normalizeDeviceId(peer.remoteId), peer.peerPort]),
+  );
+  const lookupsByDevice = new Map<string, number>();
   let lookups = 0;
   let handshakes = 0;
   const server = createServer({
@@ -47,16 +57,18 @@ const startSyntheticDiscovery = async (root: string, remoteId: string, peerPort:
     }
     const device = normalizeDeviceId(new URL(request.url ?? "/", "https://localhost")
       .searchParams.get("device") ?? "");
-    if (request.method !== "GET" || device !== normalizeDeviceId(remoteId)) {
+    const port = addresses.get(device);
+    if (request.method !== "GET" || !port) {
       console.warn("Synthetic discovery unexpected query", {
-        method: request.method, device, expectedDevice: normalizeDeviceId(remoteId),
+        method: request.method, device, expectedDevices: [...addresses.keys()],
       });
       response.writeHead(404).end();
       return;
     }
     lookups += 1;
+    lookupsByDevice.set(device, (lookupsByDevice.get(device) ?? 0) + 1);
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ addresses: [`tcp://127.0.0.1:${peerPort}`] }));
+    response.end(JSON.stringify({ addresses: [`tcp://127.0.0.1:${port}`] }));
   });
   server.on("secureConnection", () => { handshakes += 1; });
   server.on("tlsClientError", error => console.warn(`Synthetic discovery TLS rejected: ${error.message}`));
@@ -70,6 +82,7 @@ const startSyntheticDiscovery = async (root: string, remoteId: string, peerPort:
     // HTTP client also exercises the TLS SNI path rather than an IP literal.
     url: `https://localhost:${address.port}/v2/?id=${identity.deviceId}`,
     lookupCount: () => lookups,
+    lookupCountFor: (deviceId: string) => lookupsByDevice.get(normalizeDeviceId(deviceId)) ?? 0,
     handshakeCount: () => handshakes,
     close: () => new Promise<void>(resolve => server.close(() => resolve())),
   };
@@ -123,11 +136,11 @@ const killEmulatorAbruptly = async (emulator: RunningEmulator): Promise<void> =>
 
 /** Do not block the parent event loop: it owns the synthetic HTTPS discovery
  * server that the Android subprocess must contact during acceptance tests. */
-const runPhase = async (phase: string, env: NodeJS.ProcessEnv): Promise<void> => {
+const runPhase = async (phase: string, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<void> => {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(process.execPath,
       ["scripts/test-android-e2e.mjs", "--expect-sdk", String(peerApiLevel), phase],
-      { env, stdio: "inherit" });
+      { env, stdio: "inherit", signal });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) resolve();
@@ -243,11 +256,14 @@ const main = async (): Promise<void> => {
   const previousSerial = process.env.ANDROID_SERIAL;
   let emulator: RunningEmulator | null = null;
   let fixture: Awaited<ReturnType<typeof createLanFixture>> | null = null;
+  let secondFixture: Awaited<ReturnType<typeof createLanFixture>> | null = null;
   let forwardedPort: number | null = null;
   let discovery: Awaited<ReturnType<typeof startSyntheticDiscovery>> | null = null;
-  // In the discovery regression Android MUST initiate the peer transport: a
-  // host-initiated connection would produce a misleading green result.
-  const outboundOnly = discoveryMode !== "direct" ||
+  const approvalOnly = process.env.SYNCPEER_ANDROID_PEER_APPROVAL_ONLY === "1";
+  const switchApproval = process.env.SYNCPEER_ANDROID_PEER_SWITCH_APPROVAL === "1";
+  // Host-initiated connections could make acceptance pass without Android
+  // dispatching the outbound pairing request.
+  const outboundOnly = approvalOnly || switchApproval || discoveryMode !== "direct" ||
     process.env.SYNCPEER_ANDROID_PEER_OUTBOUND_ONLY === "1";
   try {
     emulator = await startEmulator();
@@ -277,7 +293,7 @@ const main = async (): Promise<void> => {
     fixture = await createLanFixture({
       root: path.join(root, "host"),
       serverHost: "10.0.2.2",
-      untrustedDeviceId: deviceId,
+      untrustedDeviceId: approvalOnly || switchApproval ? undefined : deviceId,
       untrustedDeviceAddress: outboundOnly ? "tcp://127.0.0.1:9" : `tcp://127.0.0.1:${forwardedPort}`,
       mode: "direct",
       publicNetwork: false,
@@ -285,8 +301,23 @@ const main = async (): Promise<void> => {
       includeBlob: false,
     });
     run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
+    if (switchApproval) {
+      secondFixture = await createLanFixture({
+        root: path.join(root, "second-host"),
+        serverHost: "10.0.2.2",
+        mode: "direct",
+        publicNetwork: false,
+        encryptedFolderType: "sendreceive",
+        includeBlob: false,
+      });
+      run("adb", ["reverse",
+        `tcp:${secondFixture.fixture.directPort}`, `tcp:${secondFixture.fixture.directPort}`]);
+    }
     if (discoveryMode !== "direct") {
-      discovery = await startSyntheticDiscovery(root, fixture.fixture.remoteDeviceId, fixture.fixture.directPort);
+      discovery = await startSyntheticDiscovery(root, fixture.fixture.remoteDeviceId,
+        fixture.fixture.directPort, secondFixture
+          ? [{ remoteId: secondFixture.fixture.remoteDeviceId, peerPort: secondFixture.fixture.directPort }]
+          : []);
       run("adb", ["reverse", `tcp:${discovery.port}`, `tcp:${discovery.port}`]);
     }
     // The ordinary Android transfer suite covers 128 MiB. This fixture stays
@@ -309,8 +340,93 @@ const main = async (): Promise<void> => {
       SYNCPEER_PEER_GUI_URL: fixture.syncGuiUrl,
       SYNCPEER_PEER_API_KEY: fixture.apiKey,
     };
+    if (switchApproval) {
+      if (!secondFixture || !discovery) {
+        throw new Error("Two-peer approval requires two fixtures and pinned automatic discovery.");
+      }
+      const secondId = secondFixture.fixture.remoteDeviceId;
+      const continuePath = path.join(root, "first-peer-observed");
+      const controller = new AbortController();
+      let phaseError: unknown;
+      let phaseCompleted = false;
+      const phase = runPhase("--peer-switch-approval", {
+        ...env,
+        SYNCPEER_PEER_SECOND_DEVICE_ID: secondId,
+        SYNCPEER_PEER_SWITCH_CONTINUE_PATH: continuePath,
+      }, controller.signal).catch(error => { phaseError = error; })
+        .finally(() => { phaseCompleted = true; });
+      const awaitRequest = async (peerFixture: NonNullable<typeof fixture>, name: string) => {
+        const deadline = Date.now() + 90_000;
+        while (Date.now() < deadline && !phaseCompleted) {
+          const pending = await peerFixture.listPendingDevices();
+          if (pending.some(peer => normalizeDeviceId(peer.deviceId) === normalizeDeviceId(deviceId))) return;
+          await new Promise(resolve => setTimeout(resolve, 350));
+        }
+        throw phaseError ?? new Error(`Peer ${name} did not receive a pairing request without restart.`);
+      };
+      try {
+        await awaitRequest(fixture, "A");
+        console.log("Peer A pairing request received while unapproved.");
+        fs.writeFileSync(continuePath, "continue", { mode: 0o600 });
+        await awaitRequest(secondFixture, "B");
+        console.log("Peer B pairing request received while peer A is still unapproved.");
+        if (!(await fixture.listPendingDevices()).some(peer =>
+          normalizeDeviceId(peer.deviceId) === normalizeDeviceId(deviceId))) {
+          throw new Error("Peer A is unexpectedly no longer pending before B approval.");
+        }
+        await secondFixture.approveDevice({ deviceId, untrusted: true });
+        await phase;
+        if (phaseError) throw phaseError;
+        if (!(await fixture.listPendingDevices()).some(peer =>
+          normalizeDeviceId(peer.deviceId) === normalizeDeviceId(deviceId))) {
+          throw new Error("Peer A was unexpectedly approved or removed after B connected.");
+        }
+        if (discovery.lookupCountFor(fixture.fixture.remoteDeviceId) === 0 ||
+            discovery.lookupCountFor(secondId) === 0) {
+          throw new Error("Both peers must independently use pinned discovery.");
+        }
+        console.log("Peer B connected after approval, peer A remained unapproved, no restart.");
+        return;
+      } finally {
+        if (!phaseCompleted) controller.abort();
+        await phase;
+      }
+    }
+    if (approvalOnly) {
+      const controller = new AbortController();
+      let phaseError: unknown;
+      let phaseCompleted = false;
+      const phase = runPhase("--peer-connect-smoke", env, controller.signal)
+        .catch(error => { phaseError = error; })
+        .finally(() => { phaseCompleted = true; });
+      try {
+        const deadline = Date.now() + 90_000;
+        let arrived = false;
+        while (Date.now() < deadline && !phaseCompleted) {
+          const pending = await fixture.listPendingDevices();
+          if (pending.some(peer => normalizeDeviceId(peer.deviceId) === normalizeDeviceId(deviceId))) {
+            arrived = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        if (!arrived) {
+          throw phaseError ?? new Error("New Android peer request never reached Syncthing before restart.");
+        }
+        console.log("Unapproved Android pairing request arrived before any restart.");
+        await fixture.approveDevice({ deviceId, untrusted: true });
+        await phase;
+        if (phaseError) throw phaseError;
+        console.log("Android connected after remote approval without restarting the app.");
+        return;
+      } finally {
+        if (!phaseCompleted) controller.abort();
+        await phase;
+      }
+    }
 
-    if (process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1") {
+    if (process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1" ||
+      process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1") {
       await runPhase("--peer-connect-smoke", env);
       if (discovery && discovery.lookupCount() === 0) {
         throw new Error("Automatic Android connection never queried pinned synthetic discovery.");
@@ -428,6 +544,10 @@ const main = async (): Promise<void> => {
       try { adb(["reverse", "--remove", `tcp:${discovery.port}`]); } catch { /* Emulator stopped. */ }
       await discovery.close();
     }
+    if (secondFixture) {
+      try { adb(["reverse", "--remove", `tcp:${secondFixture.fixture.directPort}`]); }
+      catch { /* Emulator may already be stopped. */ }
+    }
     if (fixture) {
       try { adb(["reverse", "--remove", `tcp:${fixture.fixture.directPort}`]); }
       catch { /* The emulator may already have been abruptly terminated. */ }
@@ -442,6 +562,7 @@ const main = async (): Promise<void> => {
     if (previousSerial === undefined) delete process.env.ANDROID_SERIAL;
     else process.env.ANDROID_SERIAL = previousSerial;
     if (fixture) await fixture.stop();
+    if (secondFixture) await secondFixture.stop();
     fs.rmSync(root, { recursive: true, force: true });
     releasePeerLock();
   }

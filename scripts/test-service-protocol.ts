@@ -29,6 +29,19 @@ test("service connect accepts an empty host for automatic and discovery-only pai
     options: { host: "", port: 22000, deviceName: "synthetic", discoveryMode: "direct" } })), /host/i);
 });
 
+test("service validates local folder-secret updates without logging or echoing secrets", () => {
+  const updated = parseServiceCommand(withServiceProtocol({
+    operation: "updateFolderPasswords", folderPasswords: { photos: "synthetic-long-passphrase" },
+  }));
+  assert.equal(updated.operation, "updateFolderPasswords");
+  assert.deepEqual(updated.folderPasswords, { photos: "synthetic-long-passphrase" });
+  assert.throws(() => parseServiceCommand(withServiceProtocol({
+    operation: "updateFolderPasswords", folderPasswords: { photos: 42 },
+  })), /command/i);
+  assert.deepEqual(parseServiceResponse("updateFolderPasswords", { updated: true }), { updated: true });
+  assert.throws(() => parseServiceResponse("updateFolderPasswords", { updated: false }), /response/i);
+});
+
 test("service responses validate overviews, pages, status and transfer frames", () => {
   const overview = parseServiceResponse("overview", withServiceProtocol({ operation: "overview" }).protocolVersion
     ? { folders: [{ id: "f", label: "F", readOnly: false }], folderSyncStates: [],

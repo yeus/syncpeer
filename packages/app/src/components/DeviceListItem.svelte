@@ -12,6 +12,9 @@ export interface SavedDeviceRow {
     name: string;
     deviceId: string;
     isConnected: boolean;
+    isConnecting: boolean;
+    connectError: string;
+    confirmed: boolean;
     isLanDetected: boolean;
     isIntroducer: boolean;
     awaitingApproval: boolean;
@@ -35,28 +38,33 @@ export interface SavedDeviceRow {
     metaLines: string[];
   }
 
-  export type DeviceListRow = SavedDeviceRow | AdvertisedDeviceRow | LocalCandidateRow;
+  export interface LanDiscoveredRow {
+    kind: "candidate";
+    id: string;
+    name: string;
+    deviceId: string;
+    incomingRequest: boolean;
+    metaLines: string[];
+  }
+
+  export type DeviceListRow = SavedDeviceRow | AdvertisedDeviceRow | LocalCandidateRow | LanDiscoveredRow;
 
   interface Props {
     row: DeviceListRow;
-    disableActions?: boolean;
     onUseSavedDevice: (deviceId: string) => void;
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
     onAddAdvertisedDevice: (deviceId: string) => void;
-    onConnectLocalCandidate: (candidateId: string) => void;
   }
 
   let {
     row,
-    disableActions = false,
     onUseSavedDevice,
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
     onAddAdvertisedDevice,
-    onConnectLocalCandidate,
   }: Props = $props();
 </script>
 
@@ -80,24 +88,42 @@ export interface SavedDeviceRow {
       <StatusChip small>introducer</StatusChip>
     {/if}
     {#if row.kind === "saved" && row.isConnected}
-      <StatusChip tone="online" small>online</StatusChip>
+      <StatusChip tone="online" small>connected</StatusChip>
+    {:else if row.kind === "saved" && !row.confirmed}
+      <StatusChip small title="Added on this device only. The remote device must also authorize this device.">not yet connected</StatusChip>
+    {:else if row.kind === "saved" && row.isConnecting}
+      <StatusChip small>connecting…</StatusChip>
+    {:else if row.kind === "saved"}
+      <StatusChip small>offline</StatusChip>
     {/if}
     {#if row.kind === "saved" && row.isLanDetected}
       <StatusChip small>lan</StatusChip>
     {/if}
+    {#if row.kind === "saved" && row.connectError && !row.isConnected}
+      <StatusChip tone="offline" small>connection error</StatusChip>
+    {/if}
     {#if row.kind === "saved" && row.awaitingApproval}
-      <StatusChip tone="offline" small title="This peer may still need to approve your device on their Syncthing side.">
-        not approved yet
-      </StatusChip>
+      <StatusChip tone="offline" small>remote approval may be pending</StatusChip>
     {/if}
     {#if row.kind === "advertised"}
       <StatusChip tone="offline" small>not approved</StatusChip>
     {/if}
-    {#if row.kind === "local-candidate"}
-      <StatusChip small>local candidate</StatusChip>
+    {#if row.kind === "candidate" && row.incomingRequest}
+      <StatusChip tone="offline" small>approval requested</StatusChip>
+    {:else if row.kind === "candidate" || row.kind === "local-candidate"}
+      <StatusChip small>{row.kind === "candidate" ? "discovered" : "unidentified"}</StatusChip>
     {/if}
   </div>
 
+  {#if row.kind === "saved" && !row.confirmed}
+    <div class="item-meta" data-testid="peer-first-connection-guidance">
+      Added locally. On the other device, add this device's ID or approve its incoming request.
+      {#if row.isConnecting} Connection attempt in progress; remote approval is not yet confirmed.{:else} A connection request may not have reached the other device yet.{/if}
+    </div>
+  {/if}
+  {#if row.kind === "saved" && row.connectError && !row.isConnected}
+    <div class="item-meta" role="alert">{row.connectError}</div>
+  {/if}
   <div class="item-meta">{formatSyncthingDeviceId(row.deviceId)}</div>
 
   {#each row.metaLines as line, index (index)}
@@ -107,27 +133,28 @@ export interface SavedDeviceRow {
   {/each}
 
   <svelte:fragment slot="actions">
-    {#if row.kind === "saved"}
+    {#if row.kind === "saved" || row.kind === "candidate"}
       <button
         class="primary"
         onclick={() => onUseSavedDevice(row.deviceId)}
-        disabled={disableActions}
       >
-        Use
+        {row.kind === "candidate" ? row.incomingRequest ? "Approve peer" : "Add peer" : row.isConnected ? "Reconnect" : "Connect"}
       </button>
-      <button
-        class="ghost"
-        onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}
-      >
-        {row.isIntroducer ? "Intro On" : "Intro Off"}
-      </button>
-      <button
-        class="icon icon-only"
-        onclick={() => onRemoveSavedDevice(row.deviceId)}
-        aria-label="Remove saved device"
-      >
-        <Trash2 size={16} />
-      </button>
+      {#if row.kind === "saved"}
+        <button
+          class="ghost"
+          onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}
+        >
+          {row.isIntroducer ? "Introducer (review)" : "Mark introducer"}
+        </button>
+        <button
+          class="icon icon-only"
+          onclick={() => onRemoveSavedDevice(row.deviceId)}
+          aria-label="Remove saved device"
+        >
+          <Trash2 size={16} />
+        </button>
+      {/if}
     {:else if row.kind === "advertised"}
       <button
         class="primary icon icon-only"
@@ -138,13 +165,7 @@ export interface SavedDeviceRow {
         <Plus size={16} />
       </button>
     {:else}
-      <button
-        class="primary"
-        onclick={() => onConnectLocalCandidate(row.deviceId)}
-        disabled={disableActions}
-      >
-        Connect
-      </button>
+      <!-- An anonymous LAN endpoint is not a verifiable Syncthing peer identity. -->
     {/if}
   </svelte:fragment>
 </ListRow>

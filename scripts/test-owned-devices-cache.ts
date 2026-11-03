@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createConnectionActions } from "../packages/app/src/app/connectionActions.ts";
+import { createDeviceActions } from "../packages/app/src/app/deviceActions.ts";
 import { createInitialState, isLanDiscoveredDevice } from "../packages/app/src/app/state.ts";
+import { hasAutoConnectTarget } from "../packages/app/src/app/syncPolicies.ts";
+import { createInitialSessionState } from "../packages/core/src/ui/sessionPolicies.ts";
 
 const LAN_PEER = "RXB676UZHQX3SONXROHZ7M3DY2VEMB6LCGQCAG5QJ2VIEDX4RIUQ";
 const OWNED_PEER = "55KM6B52CSRRQAU2L3GEFJBAE6MLYK4BH25GIQW3ULKGAZYHKTGA";
@@ -123,15 +126,16 @@ test("LAN announcements are still discovered while the roster is cached", async 
   assert.equal(calls.some(call => call.command === "syncpeer_discovery_local"), true);
 });
 
-test("a device announcing itself on the LAN still reaches the device list", async () => {
+test("LAN discovery does not create saved or auto-connect targets, even when announcements disappear", async () => {
   const state = createInitialState(null);
+  let discoveryRound = 0;
   const actions = createConnectionActions({
     state,
     client: {
-      discoverLocalDevices: async () => [
+      discoverLocalDevices: async () => ++discoveryRound === 1 ? [
         { deviceId: LAN_PEER, addresses: ["tcp://192.0.2.7:22000"] },
         { deviceId: "LAN-ANONYMOUS-1", addresses: ["tcp://192.0.2.8:22000"], anonymous: true },
-      ],
+      ] : [],
     } as never,
     sessionStore: {} as never,
     transfers: { transferInProgress: () => false } as never,
@@ -142,9 +146,169 @@ test("a device announcing itself on the LAN still reaches the device list", asyn
   await actions.discoverLocalDevices({ timeoutMs: 10 });
   assert.equal(isLanDiscoveredDevice(state, LAN_PEER), true,
     "A discovered peer must stay visible even though it is not in the trusted roster yet.");
-  assert.ok(state.devices.savedDevices.some(device => device.id === LAN_PEER),
-    "A discovered peer must be offerable as a device to add.");
+  assert.ok(state.devices.lanDiscoveryByDeviceId[LAN_PEER],
+    "An observed LAN peer must remain available as a selectable candidate.");
+  assert.ok(!state.devices.savedDevices.some(device => device.id === LAN_PEER),
+    "Observing an unauthenticated LAN advertisement must not save the device.");
+  assert.equal(hasAutoConnectTarget(state), false,
+    "A fresh installation must not begin connecting just because a peer announces itself.");
   assert.equal(state.devices.lanAnonymousCandidates.length, 1);
+  await actions.discoverLocalDevices({ timeoutMs: 10 });
+  assert.equal(state.devices.lanDiscoveredDeviceIds.size, 0);
+  assert.deepEqual(state.devices.savedDevices, []);
+  assert.equal(hasAutoConnectTarget(state), false,
+    "A temporarily missing LAN broadcast must not turn a candidate into an auto-connect target.");
+});
+
+test("Use explicitly selects a discovered device even while a connect is pending", () => {
+  const state = createInitialState(null);
+  state.session.isConnecting = true;
+  state.devices.lanDiscoveryByDeviceId[LAN_PEER] = {
+    addresses: ["tcp://192.0.2.7:22000"], lastSeenAtMs: 0,
+  };
+  const selected: string[] = [];
+  const actions = createDeviceActions({
+    state,
+    client: {} as never,
+    sessionStore: {} as never,
+    refreshOverview: async () => undefined,
+    refreshActiveView: async () => undefined,
+    refreshCurrentDeviceId: async () => undefined,
+    connectToDevice: async id => { selected.push(id); },
+  });
+  actions.useSavedDevice(LAN_PEER);
+  assert.deepEqual(selected, [LAN_PEER]);
+  assert.equal(state.devices.selectedSavedDeviceId, LAN_PEER);
+  assert.equal(state.connection.remoteId, LAN_PEER);
+  assert.equal(hasAutoConnectTarget(state), true);
+  assert.ok(state.devices.savedDevices.some(device => device.id === LAN_PEER));
+});
+
+
+test("removing an active peer drops confirmed trust and stops its connection", async () => {
+  const state = createInitialState(null);
+  state.devices.savedDevices = [{
+    id: LAN_PEER, name: "Synthetic peer", isIntroducer: false, createdAtMs: Date.now(),
+  }];
+  state.devices.confirmedPeerIds.add(LAN_PEER);
+  state.connection.remoteId = LAN_PEER;
+  state.session.isConnected = true;
+  let disconnected = 0;
+  const actions = createDeviceActions({
+    state, client: {} as never, sessionStore: {} as never,
+    refreshOverview: async () => undefined, refreshActiveView: async () => undefined,
+    refreshCurrentDeviceId: async () => undefined,
+    connectToDevice: async () => undefined,
+    disconnectPeer: async () => { disconnected += 1; },
+  });
+  actions.removeSavedDevice(LAN_PEER);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(disconnected, 1);
+  assert.equal(state.connection.remoteId, "");
+  assert.equal(state.devices.confirmedPeerIds.has(LAN_PEER), false);
+  assert.equal(hasAutoConnectTarget(state), false);
+});
+
+test("only explicitly configured devices qualify for automatic reconnection", () => {
+  const state = createInitialState(null);
+  state.connection.remoteId = LAN_PEER;
+  assert.equal(hasAutoConnectTarget(state), false);
+  state.devices.savedDevices = [{
+    id: OWNED_PEER, name: "Another peer", isIntroducer: false, createdAtMs: Date.now(),
+  }];
+  assert.equal(hasAutoConnectTarget(state), false);
+  state.devices.selectedSavedDeviceId = OWNED_PEER;
+  state.connection.remoteId = "";
+  assert.equal(hasAutoConnectTarget(state), true);
+});
+test("a new peer selection cancels an in-flight connection before switching", async () => {
+  const state = createInitialState(null);
+  state.connection.deviceName = "Synthetic Android peer";
+  state.ui.deviceNameConfirmed = true;
+  const attempted: string[] = [];
+  let cancelFirst: (() => void) | null = null;
+  const sessionStore = {
+    actions: {
+      setFolderPasswords: async () => undefined,
+      disconnect: async () => { cancelFirst?.(); },
+      connect: async ({ remoteId }: { remoteId?: string }) => {
+        attempted.push(remoteId ?? "");
+        if (attempted.length === 1) {
+          await new Promise<void>((_resolve, reject) => {
+            cancelFirst = () => reject(new Error("Connection attempt was cancelled."));
+          });
+        }
+      },
+    },
+    getState: () => ({ ...createInitialSessionState(), phase: "connected", remoteFs: {} }),
+  };
+  const actions = createConnectionActions({
+    state, client: {} as never, sessionStore: sessionStore as never,
+    transfers: { transferInProgress: () => false } as never,
+    syncStarredFiles: async () => undefined, loadFavoriteSyncStates: async () => undefined,
+    appInfo: { appName: "Syncpeer" } as never,
+  });
+  const first = actions.connect(OWNED_PEER);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(attempted, [OWNED_PEER]);
+  await actions.connect(LAN_PEER);
+  await first;
+  assert.deepEqual(attempted, [OWNED_PEER, LAN_PEER]);
+  assert.equal(state.connection.remoteId, LAN_PEER);
+});
+
+test("second peer dials after disconnect even if the first native connect promise never settled", async () => {
+  const state = createInitialState({ deviceName: "Device" });
+  const attempts: string[] = [];
+  let finishFirst!: () => void;
+  let disconnects = 0;
+  const sessionStore = {
+    actions: {
+      setFolderPasswords: async () => undefined,
+      disconnect: async () => { disconnects++; },
+      connect: async ({ remoteId }: { remoteId?: string }) => {
+        attempts.push(remoteId ?? "");
+        if (attempts.length === 1) await new Promise<void>(resolve => { finishFirst = resolve; });
+      },
+    },
+    getState: () => ({ ...createInitialSessionState(), phase: "connected", remoteFs: {} }),
+  };
+  const actions = createConnectionActions({
+    state, client: {} as never, sessionStore: sessionStore as never,
+    transfers: { transferInProgress: () => false } as never,
+    syncStarredFiles: async () => undefined, loadFavoriteSyncStates: async () => undefined,
+    appInfo: { appName: "Syncpeer" } as never,
+  });
+  const first = actions.connect(OWNED_PEER);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await actions.connect(LAN_PEER);
+  assert.deepEqual(attempts, [OWNED_PEER, LAN_PEER]);
+  assert.equal(disconnects, 1);
+  finishFirst();
+  await first;
+  assert.equal(state.connection.remoteId, LAN_PEER,
+    "A stale response must not overwrite the later peer selection.");
+});
+
+test("an unpaired peer fails safely without repeated automatic reconnects", async () => {
+  const state = createInitialState(null);
+  state.connection.deviceName = "Synthetic Android peer";
+  state.ui.deviceNameConfirmed = true;
+  const actions = createConnectionActions({
+    state, client: {} as never,
+    sessionStore: {
+      actions: {
+        setFolderPasswords: async () => undefined,
+        connect: async () => { throw new Error("This peer is not paired. Pair it in General settings."); },
+      },
+    } as never,
+    transfers: { transferInProgress: () => false } as never,
+    syncStarredFiles: async () => undefined, loadFavoriteSyncStates: async () => undefined,
+    appInfo: { appName: "Syncpeer" } as never,
+  });
+  await actions.connect(LAN_PEER);
+  assert.equal(state.ui.autoConnectPaused, true);
+  assert.match(state.ui.recentError ?? "", /not paired/);
 });
 
 test("the background session request reads profile settings once", async () => {

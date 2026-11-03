@@ -43,19 +43,25 @@ async function runSettingsUiTest(browser) {
     await waitFor("[data-testid='folder-settings-photos']");
   };
 
-  await waitFor("[data-testid='folder-settings-photos']");
-  await waitFor("[data-testid='device-name-prompt']");
-  assert.equal(await browser.$("[data-testid='device-name-onboarding']").isExisting(), false);
+  await waitFor("[data-testid='device-name-onboarding']");
   assert.equal(await browser.$("[data-testid='personal-space-onboarding']").isExisting(), false);
+  assert.equal(await browser.$("[data-testid='connection-settings-toggle']").isExisting(), false);
+  assert.equal(await browser.$("[data-testid='new-folder']").isExisting(), false);
+  const fullScreen = await browser.execute(() => {
+    const rect = document.querySelector("[data-testid='device-name-onboarding']").getBoundingClientRect();
+    return rect.height >= innerHeight && rect.width >= innerWidth;
+  });
+  assert.equal(fullScreen, true, "First-run naming must occupy the whole screen.");
   await browser.$("[data-testid='local-name-entry']").setValue("Synthetic Laptop");
   await click("[data-testid='save-local-device-name']");
-  await browser.$("[data-testid='device-name-prompt']").waitForExist({ reverse: true });
+  await browser.$("[data-testid='device-name-onboarding']").waitForExist({ reverse: true });
   assert.match(await text(), /Advertised name: Synthetic Laptop/);
   await click("[data-testid='reset-local-name-fixture']");
-  await waitFor("[data-testid='device-name-prompt']");
-  await click("[data-testid='dismiss-local-name-prompt']");
-  await browser.$("[data-testid='device-name-prompt']").waitForExist({ reverse: true });
-  console.log("Passed: missing-name fallback is inline, saves a name, and can be dismissed without another onboarding modal.");
+  await waitFor("[data-testid='device-name-onboarding']");
+  await browser.$("[data-testid='local-name-entry']").setValue("Renamed Laptop");
+  await click("[data-testid='save-local-device-name']");
+  await browser.$("[data-testid='device-name-onboarding']").waitForExist({ reverse: true });
+  console.log("Passed: device naming is a full-screen first-run step with no other app controls.");
   await browser.execute(() => {
     const detail = [...document.querySelectorAll("summary")]
       .find(element => element.textContent.trim() === "This Device Details");
@@ -110,7 +116,8 @@ async function runSettingsUiTest(browser) {
   await click("[data-testid='general-settings']");
   await waitFor("[data-testid='device-settings'] select");
   assert.match(await text(), /Personal space/);
-  assert.match(await text(), /Personal-space backup/);
+  assert.match(await text(), /Set up Personal Space/);
+  assert.doesNotMatch(await text(), /Personal-space backup/);
   assert.match(await text(), /This device/);
   assert.doesNotMatch(await text(), /Ignored patterns|Whole-folder retention|Reattach encrypted local storage/);
   await browser.execute(() => {
@@ -120,6 +127,11 @@ async function runSettingsUiTest(browser) {
   });
   await browser.waitUntil(async () => (await calls()).findLast(call => call.operation === "saveProfileSettings")
     ?.settings.profile.versioning === "simple");
+  await back();
+  await click("[data-testid='personal-space-enabled-fixture']");
+  await click("[data-testid='general-settings']");
+  await waitFor("[data-testid='device-settings'] select");
+  assert.match(await text(), /Personal-space backup/);
   await clickText("Open settings for Documents");
   await waitFor("textarea");
   assert.equal(await browser.$("textarea").getValue(), "documents-only");
@@ -151,7 +163,8 @@ async function runSettingsUiTest(browser) {
   await click("[data-testid='new-folder']");
   await browser.$("button=Open general settings").waitForExist();
   await clickText("Open general settings");
-  await browser.$("button=Create encrypted profile").waitForExist();
+  await click("[data-testid='optional-personal-space-setup'] summary");
+  await browser.$("button=Create Personal Space").waitForExist();
   assert.match(await text(), /Join an existing personal space/);
   assert.equal(await browser.$("button=Create folder").isExisting(), false);
   console.log("Passed: fresh-profile setup and joining live in personal-space settings.");
@@ -340,13 +353,14 @@ async function main() {
     response.end(file ?? "Not found");
   });
   const port = await unusedPort();
-  const driver = spawn("WebKitWebDriver", [`--port=${port}`], { stdio: "ignore" });
-  driver.on("error", () => {});
+  const driver = spawn("WebKitWebDriver", [`--port=${port}`], { stdio: "inherit" });
+  driver.on("error", error => console.error("WebKitWebDriver failed to start:", error));
   let browser;
   try {
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     await waitForDriver(port, driver);
     browser = await remote({ hostname: "127.0.0.1", port, logLevel: "error",
+      connectionRetryTimeout: 15_000, connectionRetryCount: 0,
       capabilities: { browserName: "MiniBrowser", "wdio:enforceWebDriverClassic": true } });
     await browser.url(`http://127.0.0.1:${server.address().port}/`);
     await runSettingsUiTest(browser);

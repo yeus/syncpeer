@@ -1,5 +1,7 @@
 import {
   normalizeDeviceId,
+  observePeer,
+  expirePeerDiscovery,
   sameDeviceId,
   type AppBuildInfo,
   type SyncpeerBrowserClient,
@@ -22,8 +24,8 @@ import {
 } from "./cacheStatusActions.ts";
 import {
   activeFolderPasswords,
-  advertisedFolders,
   applySessionState,
+  reconcileFolderUnlockStatuses,
   connectionDetails,
   currentSourceDeviceId,
   activeSourceDeviceId,
@@ -35,13 +37,10 @@ import {
 } from "./state.ts";
 import { localDiscoveryUnavailableNotice } from "./connectionNotices.ts";
 import {
-  applyAutoApprovals,
+  recordAdvertisedPeerSuggestions,
   normalizeCandidateAddresses,
   normalizeCandidateDeviceId,
-  parseTcpAddress,
-  suggestedSavedDeviceName,
   syncConnectedDeviceSavedName,
-  upsertSavedDevice,
 } from "./devicePolicies.ts";
 import {
   hasAutoConnectTarget,
@@ -54,7 +53,6 @@ import {
   loadDirectorySideEffects,
   migrateActiveLegacyFolderPasswords,
   nowTime,
-  remoteHasUnapprovedFolderShare,
   resetRuntimeState,
   restoreAfterTransportFailure,
   saveCurrentOfflineState,
@@ -76,6 +74,7 @@ type ConnectionActionArgs = {
 
 type ConnectionActionControl = {
   connectInFlight: Promise<void> | null;
+  connectRequestGeneration: number;
   connectionSettingsTimer: ReturnType<typeof setTimeout> | null;
   connectionSettingsGeneration: number;
 };
@@ -84,6 +83,7 @@ export const createConnectionActions = (args: ConnectionActionArgs) => {
   const control: ConnectionActionControl = {
     connectInFlight: null,
     connectionSettingsTimer: null,
+    connectRequestGeneration: 0,
     connectionSettingsGeneration: 0,
   };
   return {
@@ -98,8 +98,6 @@ export const createConnectionActions = (args: ConnectionActionArgs) => {
     refreshCurrentDeviceId: () => refreshCurrentDeviceId(args),
     discoverLocalDevices: (options?: { timeoutMs?: number }) =>
       discoverLocalDevices(args, options),
-    connectViaLanAnonymousCandidate: (candidateId: string) =>
-      connectViaLanAnonymousCandidate(args, control, candidateId),
     copyCurrentDeviceId: () => copyCurrentDeviceId(args),
     copySessionLogs: () => copySessionLogs(args),
     saveSessionLogs: () => saveSessionLogs(args),
@@ -117,9 +115,22 @@ const connect = async (
   control.connectionSettingsGeneration += 1;
   if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
   control.connectionSettingsTimer = null;
-  if (control.connectInFlight) {
+  if (control.connectInFlight && (!targetDeviceId ||
+    sameDeviceId(targetDeviceId, state.session.activeConnectDeviceId))) {
     await control.connectInFlight;
     return;
+  }
+  const generation = ++control.connectRequestGeneration;
+  if (control.connectInFlight) {
+    const previous = control.connectInFlight;
+    pushSessionLog(state, "info", "peer.connect.switch_requested",
+      "A newer peer selection is replacing an in-flight connection attempt.",
+      { peerId: normalizeDeviceId(targetDeviceId ?? "") });
+    // Cancel the underlying session before starting another. Do not await a stale
+    // WebView/native connect promise: it may remain pending after socket cancellation.
+    await sessionStore.actions.disconnect();
+    if (generation !== control.connectRequestGeneration) return;
+    if (control.connectInFlight === previous) control.connectInFlight = null;
   }
   control.connectInFlight = (async () => {
   state.ui.recentError = null;
@@ -140,20 +151,28 @@ const connect = async (
   const attemptedDeviceId = normalizeDeviceId(
     targetDeviceId || state.connection.remoteId || state.devices.selectedSavedDeviceId,
   );
+  if (attemptedDeviceId) delete state.devices.connectionErrors[attemptedDeviceId];
+  pushSessionLog(state, "info", "peer.connect.attempt_started",
+    "Attempting an authenticated peer connection; this does not confirm remote approval.",
+    { peerId: attemptedDeviceId });
   restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_start");
   try {
     migrateActiveLegacyFolderPasswords(state);
     await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
+    if (generation !== control.connectRequestGeneration) return;
     await sessionStore.actions.connect(connectionDetails(state));
+    if (generation !== control.connectRequestGeneration) return;
     const session = sessionStore.getState();
     applySessionState(state, session);
     migrateActiveLegacyFolderPasswords(state);
     await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
+    if (generation !== control.connectRequestGeneration) return;
     await refreshFolderRootCachedStatuses(
       state,
       client,
       session.folders.map((folder) => folder.id),
     );
+    if (generation !== control.connectRequestGeneration) return;
     const sourceDeviceId = normalizeDeviceId(
       session.remoteDevice?.id ?? state.connection.remoteId,
     );
@@ -164,8 +183,13 @@ const connect = async (
     );
     setRemoteApprovalPending(state, attemptedDeviceId, false);
     setRemoteApprovalPending(state, sourceDeviceId, false);
-    if (remoteHasUnapprovedFolderShare(session.folders)) {
-      setRemoteApprovalPending(state, sourceDeviceId, true);
+    if (sourceDeviceId) delete state.devices.connectionErrors[sourceDeviceId];
+    // A completed authenticated BEP session proves mutual device admission.
+    pushSessionLog(state, "info", "peer.connect.authenticated",
+      "The remote peer accepted an authenticated BEP session.",
+      { peerId: sourceDeviceId });
+    if (state.session.isConnected && sourceDeviceId) {
+      state.devices.confirmedPeerIds = new Set([...state.devices.confirmedPeerIds, sourceDeviceId]);
     }
     if (
       state.approvals.pendingApprovalPromptDeviceId &&
@@ -175,11 +199,21 @@ const connect = async (
       state.approvals.pendingApprovalPromptDeviceId = "";
     }
     saveCurrentOfflineState(state, sourceDeviceId);
-    applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
+    recordAdvertisedPeerSuggestions(state, currentSourceDeviceId(state));
+    if (session.folders.length === 0) state.ui.autoConnectPaused = true;
     state.session.lastUpdatedAt = nowTime();
   } catch (error) {
+    if (generation !== control.connectRequestGeneration) return;
     const message = error instanceof Error ? error.message : String(error);
+    pushSessionLog(state, "warning", "peer.connect.attempt_failed",
+      "Peer connection did not complete; remote approval or reachability may be required.",
+      { peerId: attemptedDeviceId, reason: message });
+    if (attemptedDeviceId) state.devices.connectionErrors[attemptedDeviceId] = message;
     state.ui.recentError = message;
+    // A revoked or explicitly disallowed identity must not enter a retry loop.
+    if (/not authorized|revoked|retired|not paired|removed from (?:the )?trusted device list/i.test(message)) {
+      state.ui.autoConnectPaused = true;
+    }
     if (
       attemptedDeviceId &&
       !hasSuccessfulConnectionHistory(state, attemptedDeviceId) &&
@@ -195,13 +229,14 @@ const connect = async (
     resetRuntimeState(state);
     restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_failed");
   } finally {
-    state.session.activeConnectDeviceId = "";
+    if (generation === control.connectRequestGeneration) state.session.activeConnectDeviceId = "";
   }
   })();
+  const current = control.connectInFlight;
   try {
-    await control.connectInFlight;
+    await current;
   } finally {
-    control.connectInFlight = null;
+    if (control.connectInFlight === current) control.connectInFlight = null;
   }
 };
 
@@ -250,6 +285,7 @@ const refreshOverview = async (args: ConnectionActionArgs) => {
     await sessionStore.actions.refreshOverview(connectionDetails(state));
     const session = sessionStore.getState();
     applySessionState(state, session);
+    reconcileFolderUnlockStatuses(state);
     await refreshFolderRootCachedStatuses(
       state,
       client,
@@ -263,13 +299,12 @@ const refreshOverview = async (args: ConnectionActionArgs) => {
       sourceDeviceId,
       session.remoteDevice?.deviceName,
     );
-    if (remoteHasUnapprovedFolderShare(session.folders)) {
-      setRemoteApprovalPending(state, sourceDeviceId, true);
-    } else {
-      setRemoteApprovalPending(state, sourceDeviceId, false);
+    setRemoteApprovalPending(state, sourceDeviceId, false);
+    if (state.session.isConnected && sourceDeviceId) {
+      state.devices.confirmedPeerIds = new Set([...state.devices.confirmedPeerIds, sourceDeviceId]);
     }
     saveCurrentOfflineState(state, sourceDeviceId);
-    applyAutoApprovals(state, currentSourceDeviceId(state), advertisedFolders(state));
+    recordAdvertisedPeerSuggestions(state, currentSourceDeviceId(state));
     if (
       state.activeTab === "folders" &&
       state.session.currentFolderId &&
@@ -409,6 +444,7 @@ const discoverLocalDevices = async (
       timeoutMs: options?.timeoutMs ?? 1400,
     });
     const nextSeenIds = new Set<string>();
+    let discovery = state.devices.peerDiscovery;
     const nextByDeviceId: Record<
       string,
       { addresses: string[]; lastSeenAtMs: number }
@@ -434,17 +470,12 @@ const discoverLocalDevices = async (
       if (!candidateDeviceId) continue;
       if (candidateDeviceId === localDeviceId) continue;
       nextSeenIds.add(candidateDeviceId);
-      nextByDeviceId[candidateDeviceId] = {
-        addresses,
-        lastSeenAtMs: Date.now(),
-      };
-      upsertSavedDevice(
-        state,
-        candidateDeviceId,
-        suggestedSavedDeviceName(state, candidateDeviceId),
-        { customName: false },
-      );
+      const lastSeenAtMs = Date.now();
+      nextByDeviceId[candidateDeviceId] = { addresses, lastSeenAtMs };
+      discovery = observePeer(discovery, candidateDeviceId, { kind: "lan", addresses, lastSeenAtMs });
     }
+    state.devices.peerDiscovery = expirePeerDiscovery(discovery, Date.now(),
+      state.devices.savedDevices.map(device => device.id));
     state.devices.lanDiscoveredDeviceIds = nextSeenIds;
     state.devices.lanDiscoveryByDeviceId = nextByDeviceId;
     state.devices.lanAnonymousCandidates = nextAnonymous;
@@ -464,34 +495,6 @@ const discoverLocalDevices = async (
   } finally {
     state.devices.isDiscoveringLanDevices = false;
   }
-};
-
-const connectViaLanAnonymousCandidate = async (
-  args: ConnectionActionArgs,
-  control: ConnectionActionControl,
-  candidateId: string,
-) => {
-  const { state } = args;
-  const candidate = state.devices.lanAnonymousCandidates.find(
-    (entry) => entry.id === candidateId,
-  );
-  if (!candidate) {
-    state.ui.recentError = "LAN candidate not found.";
-    return;
-  }
-  const parsed = candidate.addresses
-    .map((entry) => parseTcpAddress(entry))
-    .find((entry): entry is { host: string; port: number } => !!entry);
-  if (!parsed) {
-    state.ui.recentError = "LAN candidate has no usable tcp:// address.";
-    return;
-  }
-  state.connection.discoveryMode = "direct";
-  state.connection.host = parsed.host;
-  state.connection.port = parsed.port;
-  state.connection.remoteId = "";
-  state.devices.selectedSavedDeviceId = "";
-  await connect(args, control);
 };
 
 const copyCurrentDeviceId = async (args: ConnectionActionArgs) => {

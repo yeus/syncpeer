@@ -254,6 +254,8 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       "No service-owned peer session",
       "Peer is no longer connected",
       "Peer was removed from the trusted device list",
+      "Peer identity is revoked, retired, or not authorized for this connection",
+      "This peer is not paired or has been removed from this personal space",
       "Unknown remote session command",
       "Invalid remote",
       "Invalid service",

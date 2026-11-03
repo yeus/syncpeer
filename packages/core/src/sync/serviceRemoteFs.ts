@@ -413,6 +413,10 @@ export async function createServiceOwnedSession(
     remoteFs: remoteFs as unknown as SyncpeerSessionHandle["remoteFs"],
     connectedVia: overview.connectedVia,
     transportKind: overview.transportKind,
+    updateFolderPasswords: async (folderPasswords: Record<string, string>) => {
+      const result = requireResult(await call({ operation: "updateFolderPasswords", folderPasswords }));
+      if (result.updated !== true) throw new Error("Android service did not apply folder credentials.");
+    },
     connectionScope: overview.connectionScope,
     isClosed: () => detached,
     close: async () => markClosed("manual", "WebView detached from Android service session."),

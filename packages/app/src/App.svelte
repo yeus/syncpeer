@@ -7,11 +7,16 @@
     createSyncpeerSessionStore,
     cachedFileKey,
     folderPasswordScopedKey,
+    observePeer,
+    isValidSyncthingDeviceId,
+    normalizeDeviceId,
+    type UiLogEntry,
     type SyncpeerProfileSettings,
   } from "@syncpeer/core/browser";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
   import AppHeader from "./components/AppHeader.svelte";
   import DeviceTab from "./components/DeviceTab.svelte";
+  import DeviceNameOnboarding from "./components/DeviceNameOnboarding.svelte";
   import FavoritesTab from "./components/FavoritesTab.svelte";
   import FoldersTab from "./components/FoldersTab.svelte";
   import PimTab from "./components/PimTab.svelte";
@@ -43,7 +48,6 @@
     directoryCurrentPage,
     directoryTotalPages,
     connectionModeLabel,
-    currentSourceIsIntroducer,
     downloadButtonLabel,
     favoriteKeys,
     folderIsLocked,
@@ -51,7 +55,6 @@
     folderState,
     isLanDiscoveredDevice,
     isSavedDeviceAwaitingRemoteApproval,
-    isSavedDeviceConnected,
     paginatedDirectoryEntries,
     persistState,
     pushClientLog,
@@ -73,7 +76,6 @@
   import { applyTheme } from "./app/theme.ts";
   import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
   import { isConfiguredDeviceName, suggestedClientName } from "./app/suggestedNames.ts";
-  import PersonalSpaceOnboarding from "./components/PersonalSpaceOnboarding.svelte";
   import { requestLocalDataReset } from "./app/localReset.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
@@ -126,17 +128,9 @@
   let privateStorageRecoveryMessage = $state<string | null>(null);
   let privateStorageResetPending = $state(false);
   let privateStorageResetError = $state("");
-  let startupReady = $state(false);
-  let vaultOnboardingMode = $state<"create" | "unlock" | null>(null);
-  let skippedVaultOnboarding = $state(false);
-  let skippedDeviceNamePrompt = $state(false);
-  const showDeviceNamePrompt = $derived(
-    startupReady &&
-    app.currentPage === "main" &&
-    !vaultOnboardingMode &&
-    !skippedDeviceNamePrompt &&
-    !app.ui.deviceNameConfirmed &&
-    !isConfiguredDeviceName(app.connection.deviceName)
+  let localStorageInitializing = $state(false);
+  const showDeviceNameOnboarding = $derived(
+    !app.ui.deviceNameConfirmed || !isConfiguredDeviceName(app.connection.deviceName)
   );
   const onboardingSuggestedName = $derived(
     isConfiguredDeviceName(app.connection.deviceName)
@@ -160,13 +154,22 @@
     }
   }
 
+  const handlePeerLog = (entry: UiLogEntry) => {
+    pushClientLog(app, entry);
+    if (entry.event !== "client.incoming.pending_device") return;
+    const detail = entry.details as { deviceId?: unknown } | null;
+    const id = normalizeDeviceId(typeof detail?.deviceId === "string" ? detail.deviceId : "");
+    if (!isValidSyncthingDeviceId(id) || id === app.devices.currentDeviceId) return;
+    app.devices.peerDiscovery = observePeer(app.devices.peerDiscovery, id,
+      { kind: "incoming", lastSeenAtMs: Date.now() });
+  };
   const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric, logFile } = createTauriAdapters({
     onLog: (entry) => pushClientLog(app, entry),
   });
   const client = createSyncpeerBrowserClient({
     hostAdapter,
     platformAdapter,
-    onLog: (entry) => pushClientLog(app, entry),
+    onLog: handlePeerLog,
   });
   const sessionStore = createSyncpeerSessionStore({
     transport: client,
@@ -206,6 +209,9 @@
   const pimDependencies = { state: app, client, sessionStore };
 
   let uiStateLoaded = false;
+  // Never expose mutable peer controls before encrypted peer state is hydrated:
+  // a late vault read could otherwise overwrite peers added during startup.
+  let peerStateInitializing = $state(Boolean(folderCredentials));
 
   const encryptedUiState = createEncryptedUiStateStore({
     command: documentCommand,
@@ -232,7 +238,10 @@
   const saveDeviceName = (name: string) => {
     app.connection.deviceName = name;
     app.ui.deviceNameConfirmed = true;
+    app.currentPage = "main";
+    app.activeTab = "devices";
     persistState(app);
+    void actions.onAppForeground();
     persistSensitiveState();
   };
 
@@ -445,31 +454,35 @@
     void (async () => {
       const initialVault = await documentCommand<{ vault: { phase: string } }>({ operation: "status" })
         .catch(() => null);
-      if (initialVault?.vault.phase === "unlocked") await loadFolderCredentials();
-      else if (initialVault?.vault.phase === "locked" && biometric &&
+      if (initialVault?.vault.phase === "uninitialized") {
+        // Show the name-only first-run prompt without waiting on the encrypted-store KDF.
+        localStorageInitializing = true;
+        try {
+          await documentCommand({ operation: "createLocalVault" });
+          await loadFolderCredentials();
+        } catch (error) {
+          pushSessionLog(app, "warning", "app.local_vault.setup_failed",
+            "Device-protected local storage could not be initialized; changes cannot be securely persisted.",
+            { message: error instanceof Error ? error.message : String(error) });
+          app.ui.recentError = "Protected local storage is unavailable. Check the secure storage provider in Settings.";
+        } finally {
+          localStorageInitializing = false;
+        }
+      } else if (initialVault?.vault.phase === "unlocked") {
+        await loadFolderCredentials();
+      } else if (initialVault?.vault.phase === "locked" && biometric &&
         await biometric.status().then(status => status.enabled).catch(() => false)) {
         await unlockWithBiometric().catch(() => undefined);
       }
-      await Promise.all([
-        actions.hydrate(),
-        actions.refreshCurrentDeviceId(),
-      ]);
+      await Promise.all([actions.hydrate(), actions.refreshCurrentDeviceId()]);
       actions.restoreOfflineSnapshot(undefined, "startup");
       await actions.restoreNavigationRoute(false);
       await actions.onAppForeground();
       await actions.restoreNavigationRoute(true);
-      const finalVault = await documentCommand<{ vault: { phase: string } }>({ operation: "status" })
-        .catch(() => null);
-      if (finalVault && finalVault.vault.phase !== "unlocked") {
-        pushSessionLog(app, "info", "app.personal_space.required",
-          "Personal space must be created or unlocked.", { phase: finalVault.vault.phase });
-        vaultOnboardingMode = finalVault.vault.phase === "locked" ? "unlock" : "create";
-      }
-    })().catch(() => {
-      app.ui.recentError = "Unlock your personal space in Settings to restore saved passwords.";
-    }).finally(() => {
-      startupReady = true;
-    });
+      persistSensitiveState();
+    })().catch(error => {
+      app.ui.recentError = error instanceof Error ? error.message : "Private local storage could not be initialized.";
+    }).finally(() => { peerStateInitializing = false; });
 
     const handleOnline = () => {
       void actions.onNetworkOnline();
@@ -656,7 +669,9 @@
   onDestroy(cleanupAppRuntime);
 </script>
 
-{#if app.currentPage === "main"}
+{#if showDeviceNameOnboarding}
+  <DeviceNameOnboarding suggestedName={onboardingSuggestedName} onSave={saveDeviceName} />
+{:else if app.currentPage === "main"}
   <div class="app-shell">
     <AppHeader
       phase={app.session.lifecyclePhase}
@@ -716,18 +731,9 @@
       </section>
     {/if}
     <main class="content" data-testid="app-content" bind:this={contentElement}>
-      {#if skippedVaultOnboarding}
-        <section class="panel" data-testid="setup-skipped-notice">
-          <p><strong>Personal space not set up.</strong> You can inspect devices and copy session logs. Encrypted shared folders require setup or unlock.</p>
-          <div class="actions">
-            <button class="primary" type="button" data-testid="resume-personal-space-setup" onclick={async () => {
-              const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" }).catch(() => null);
-              if (!status) { app.ui.recentError = "Personal-space status is unavailable."; return; }
-              skippedVaultOnboarding = false;
-              if (status.vault.phase !== "unlocked") vaultOnboardingMode = status.vault.phase === "locked" ? "unlock" : "create";
-            }}>Resume setup</button>
-            <button type="button" onclick={() => void actions.copySessionLogs()}>Copy Logs</button>
-          </div>
+      {#if localStorageInitializing}
+        <section class="panel" role="status" data-testid="local-storage-initializing">
+          Preparing device-protected local storage… You can name this device now.
         </section>
       {/if}
       {#if app.ui.showStabilityNotice}
@@ -759,9 +765,10 @@
       {#if app.approvals.pendingApprovalPromptDeviceId}
         <section class="panel">
           <p class="hint">
-            Waiting for remote approval for <strong>{app.approvals.pendingApprovalPromptDeviceId}</strong>.
-            The remote peer device should now show a prompt to accept this client. Once
-            accepted, Syncpeer will retry automatically.
+            This peer has not completed an authenticated connection.
+            On the other device, add this device's ID or approve its incoming request.
+            An approval prompt is not guaranteed to appear: the peer must be reachable
+            and accepting incoming connections. Retry Connect after approving it.
           </p>
           <div class="item-meta">{app.approvals.pendingApprovalPromptDeviceId}</div>
           <div class="actions">
@@ -779,21 +786,17 @@
       {/if}
 
       {#if app.activeTab === "devices"}
+        {#if peerStateInitializing}
+          <section class="panel" role="status" data-testid="peer-state-initializing">
+            Restoring saved peers from protected storage…
+          </section>
+        {:else}
         <DeviceTab
           {app}
-          showDeviceNamePrompt={showDeviceNamePrompt}
-          suggestedDeviceName={onboardingSuggestedName}
-          onSaveDeviceName={saveDeviceName}
-          onDismissDeviceNamePrompt={() => {
-            skippedDeviceNamePrompt = true;
-            pushSessionLog(app, "info", "app.device_name.deferred", "Device naming deferred for this session.");
-          }}
           advertisedDevices={currentAdvertisedDevices}
-          isSavedDeviceConnected={(deviceId) => isSavedDeviceConnected(app, deviceId)}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
             isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
           isLanDiscoveredDevice={(deviceId) => isLanDiscoveredDevice(app, deviceId)}
-          currentSourceIsIntroducer={currentSourceIsIntroducer(app)}
           onUseSavedDevice={actions.useSavedDevice}
           onResetDiscoveryServer={actions.resetDiscoveryServer}
           onClearAllCache={actions.clearAllCache}
@@ -814,9 +817,9 @@
           onEditSavedDeviceName={actions.editSavedDeviceName}
           onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
           onRemoveSavedDevice={actions.removeSavedDevice}
-          onConnectLocalCandidate={actions.connectViaLanAnonymousCandidate}
           onConnectionSettingsChanged={actions.scheduleConnectionSettingsApply}
         />
+        {/if}
       {/if}
 
       {#if app.activeTab === "pim"}
@@ -1017,50 +1020,6 @@
   <AboutPage onBack={actions.closeAboutPage} />
 {/if}
 
-{#if vaultOnboardingMode}
-  <PersonalSpaceOnboarding
-    mode={vaultOnboardingMode}
-    suggestedName={onboardingSuggestedName}
-    initialDeviceName={app.connection.deviceName}
-    command={documentCommand}
-    getDefaultDeviceId={() => client.getDefaultDeviceId()}
-    biometric={biometric}
-    onDeviceNameSaved={saveDeviceName}
-    onSkip={() => {
-      skippedVaultOnboarding = true;
-      vaultOnboardingMode = null;
-      try { pushSessionLog(app, "info", "app.personal_space.skipped", "Setup skipped for this session."); } catch { /* Do not block dismissal. */ }
-    }}
-    onCopyDiagnostics={async () => {
-      pushSessionLog(app, "info", "app.personal_space.diagnostics", "Onboarding diagnostics requested.", {
-        secureContext: window.isSecureContext,
-        secureRandomAvailable: typeof globalThis.crypto?.getRandomValues === "function",
-      });
-      await actions.copySessionLogs();
-    }}
-    onGenerationEvent={(stage, reason) => {
-      try {
-        pushSessionLog(app, stage.endsWith("-failed") ? "warning" : "info",
-          "app.personal_space.password_generation", "Password generation state changed.", { stage, reason });
-      } catch { /* Diagnostics must not block setup. */ }
-    }}
-    onReady={async () => {
-      skippedVaultOnboarding = false;
-      vaultOnboardingMode = null;
-      await loadFolderCredentials().catch(error => {
-        app.ui.recentError = error instanceof Error ? error.message : String(error);
-      });
-      // Restored peers only exist after unlock; the startup foreground pass ran
-      // before the vault was unlocked, so resume discovery and auto-connect here.
-      void actions.onAppForeground();
-    }}
-    onOpenSettings={() => {
-      skippedVaultOnboarding = false;
-      vaultOnboardingMode = null;
-      actions.openGeneralSettings();
-    }}
-  />
-{/if}
 
 
 <style>

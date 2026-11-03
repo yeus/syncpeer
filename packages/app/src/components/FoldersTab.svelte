@@ -7,7 +7,7 @@
     FolderInfo,
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
-  import { activeDownloadForFile, type AppState } from "../app/state.ts";
+  import { activeDownloadForFile, folderUnlockError, type AppState } from "../app/state.ts";
   import { connectedFolderStatus, folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
@@ -164,7 +164,7 @@
         readOnly: folder.readOnly,
         encrypted: Boolean(folderState(folder.id)?.encrypted),
         lockLabel: folderLockLabel(folder.id),
-        passwordError: folderState(folder.id)?.passwordError ?? "",
+        passwordError: folderUnlockError(app, folder.id),
         locked: isFolderLocked(folder.id),
         canBrowseLocally: app.localFolders.some(local => local.id === folder.id),
         isFavorite: favoriteKeys.has(`folder:${folder.id}:`),

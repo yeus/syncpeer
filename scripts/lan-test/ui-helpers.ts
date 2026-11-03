@@ -6,14 +6,28 @@ import type { BrowserExtension } from "@wdio/native-types";
 
 export type TauriBrowser = WdioBrowser & BrowserExtension;
 
-/** Open space/device controls through the existing general Settings section. */
-export async function openGeneralSettings(peer: WebdriverIO.Browser) {
-  if (await peer.$("[data-testid='personal-space-onboarding']").isExisting()) {
-    await clickButtonByText(peer, "Join or restore an existing space");
-    await peer.$("[data-testid='general-settings-page']").waitForExist({ timeout: 30_000 });
-    return;
+/** Finish the name-only first-run screen before the navigation tabs can appear. */
+export async function completeFirstRunDeviceName(
+  peer: WebdriverIO.Browser, name = "Synthetic desktop device",
+) {
+  const initial = await peer.waitUntil(async () => peer.execute(() => {
+    if (document.querySelector("[data-testid='device-name-onboarding']")) return "name";
+    if (document.querySelector("[data-testid='tab-devices']")) return "ready";
+    return null;
+  }), { timeout: 60_000, interval: 500, timeoutMsg: "Neither device naming nor the main navigation appeared." });
+  if (initial === "name") {
+    await peer.$("[data-testid='local-name-entry']").setValue(name);
+    await peer.$("[data-testid='save-local-device-name']").click();
+    await peer.$("[data-testid='device-name-onboarding']")
+      .waitForExist({ reverse: true, timeout: 30_000 });
   }
   await peer.$("[data-testid='tab-devices']").waitForExist({ timeout: 30_000 });
+}
+
+/** Open space/device controls through the existing general Settings section. */
+export async function openGeneralSettings(peer: WebdriverIO.Browser) {
+  if (await peer.$("[data-testid='general-settings-page']").isExisting()) return;
+  await completeFirstRunDeviceName(peer);
   await peer.execute(() => {
     (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
   });
@@ -22,12 +36,21 @@ export async function openGeneralSettings(peer: WebdriverIO.Browser) {
     const toggle = document.querySelector("[data-testid='connection-settings-toggle']") as HTMLButtonElement;
     if (toggle.getAttribute("aria-expanded") !== "true") toggle.click();
   });
-  const settings = peer.$("[data-testid='general-settings']");
-  await settings.waitForExist({ timeout: 30_000 });
+  await peer.$("[data-testid='general-settings']").waitForExist({ timeout: 30_000 });
   await peer.execute(() => {
     (document.querySelector("[data-testid='general-settings']") as HTMLButtonElement).click();
   });
   await peer.$("[data-testid='general-settings-page']").waitForExist({ timeout: 30_000 });
+}
+
+/** Personal Space is optional and its creation/join forms start collapsed. */
+export async function openOptionalPersonalSpaceSetup(peer: WebdriverIO.Browser) {
+  await openGeneralSettings(peer);
+  const setup = peer.$("[data-testid='optional-personal-space-setup']");
+  await setup.waitForExist({ timeout: 60_000 });
+  if (await setup.getAttribute("open") === null) await setup.$("summary").click();
+  await setup.$("form input[autocomplete='new-password']").waitForDisplayed({ timeout: 30_000 });
+  return setup;
 }
 
 /** Choose an actual folder row, then open its settings without browsing it. */

@@ -9,7 +9,8 @@ import type * as Tauri from "@tauri-apps/api";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 import {
-  openGeneralSettings,
+  completeFirstRunDeviceName,
+  openOptionalPersonalSpaceSetup,
   openFolderSettings,
   clickButtonByText,
   setAutomaticConnectionPaused,
@@ -740,6 +741,10 @@ async function attachAndFavoriteSharedFolder(peer: WebdriverIO.Browser) {
 describe("Two isolated packaged desktop apps", () => {
   it("start with distinct protected device identities", async () => {
     const { owner, joiner } = peers();
+    await Promise.all([
+      completeFirstRunDeviceName(owner, "Synthetic owner"),
+      completeFirstRunDeviceName(joiner, "Synthetic joiner"),
+    ]);
     await Promise.all(
       [owner, joiner].map(async (peer) => {
         await peer
@@ -777,13 +782,13 @@ describe("Two isolated packaged desktop apps", () => {
   it("pairs with one matching confirmation code", async () => {
     const { owner, joiner } = peers();
     await createFreshEncryptedProfile(owner);
-    await openGeneralSettings(joiner);
+    await openOptionalPersonalSpaceSetup(joiner);
     await owner
       .$("//label[contains(., 'LAN host/IP or relay:// URL')]/input")
       .setValue("127.0.0.1");
     const createInvitation = owner.$("button=Create pairing invitation");
     await createInvitation.waitForEnabled({ timeout: 30_000 });
-    await createInvitation.click();
+    await clickButtonByText(owner, "Create pairing invitation");
     const invitationInput = owner.$(
       "//label[contains(., 'Invitation')]/textarea[@readonly]",
     );

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { browser } from "@wdio/globals";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
-import { clickButtonByText, openGeneralSettings } from "./ui-helpers.js";
+import { clickButtonByText, completeFirstRunDeviceName, openGeneralSettings } from "./ui-helpers.js";
 
 async function importBackup(peer: WebdriverIO.Browser, backup: string, password: string) {
   await peer.$("//label[contains(., 'Or paste encrypted backup')]/textarea").setValue(backup);
@@ -58,6 +58,10 @@ describe("Packaged desktop offline recovery", () => {
 
   it("exports a backup and separate kit from a protected identity", async () => {
     const { owner, joiner } = peers();
+    await Promise.all([
+      completeFirstRunDeviceName(owner, "Synthetic recovery owner"),
+      completeFirstRunDeviceName(joiner, "Synthetic recovery joiner"),
+    ]);
     await Promise.all([owner, joiner].map(async peer => {
       const devices = peer.$("[data-testid='tab-devices']");
       await devices.waitForExist({ timeout: 60_000 });

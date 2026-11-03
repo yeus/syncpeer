@@ -220,6 +220,12 @@ test("packaged pairing targets the joiner's actual password input", () => {
     "A PasswordInput renders its label and input as siblings, not nested elements.");
 });
 
+test("packaged pairing invitation uses the reliable WebKit DOM click", () => {
+  const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
+  assert.match(spec, /await clickButtonByText\(owner, "Create pairing invitation"\)/);
+  assert.doesNotMatch(spec, /await createInvitation\.click\(\)/);
+});
+
 test("packaged attachment waits for the folder-settings control, preserving failure diagnostics", () => {
   const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
   const helper = spec.split("async function attachAndFavoriteSharedFolder(")[1]
@@ -233,6 +239,16 @@ test("packaged attachment waits for the folder-settings control, preserving fail
     "The Devices tab is not mounted while folder settings are displayed.");
 });
 
+
+test("packaged smoke follows device-name onboarding and optional Personal Space setup", () => {
+  const smoke = fs.readFileSync("scripts/lan-test/release-smoke.spec.ts", "utf8");
+  const profile = fs.readFileSync("scripts/lan-test/profile-setup.ts", "utf8");
+  const helpers = fs.readFileSync("scripts/lan-test/ui-helpers.ts", "utf8");
+  assert.match(smoke, /completeFirstRunDeviceName\(browser/);
+  assert.doesNotMatch(smoke, /personal-space-onboarding/);
+  assert.match(profile, /optional-personal-space-setup/);
+  assert.match(helpers, /device-name-onboarding/);
+});
 
 test("packaged screenshots use focused-window capture in screenshot environments", () => {
   const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");

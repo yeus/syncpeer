@@ -73,6 +73,9 @@ test("high-frequency storage and socket operations do not flood the visible sess
   assert.equal(shouldLogInvokeLifecycle("syncpeer_replica_storage"), false);
   assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_read"), false);
   assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_write"), false);
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_document_command"), false);
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_android_session_command"), false);
+  assert.equal(shouldLogInvokeLifecycle("syncpeer_get_cached_statuses"), false);
   assert.equal(shouldLogInvokeLifecycle("syncpeer_tls_listen"), true);
 });
 

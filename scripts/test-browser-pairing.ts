@@ -138,6 +138,43 @@ test("Android UI browses through the one service session across visibility chang
   assert.equal(commands.includes("disconnect"), false, "Do not independently stop the service through both the UI RPC and native handoff.");
 });
 
+test("Android service diagnostics classify terminal failures without exposing native messages", async () => {
+  const logs: Array<{ event: string; details?: unknown }> = [];
+  let emitStatus: ((value: unknown) => void) | undefined;
+  const client = createSyncpeerBrowserClient({
+    hostAdapter: {
+      ...createNodeHostAdapter(),
+      log: (event, details) => { logs.push({ event, details }); },
+    },
+    platformAdapter: {
+      subscribeServiceSessionEvents: async listener => {
+        emitStatus = listener;
+        return () => { emitStatus = undefined; };
+      },
+    },
+  });
+  const unsubscribe = client.subscribePeerStatus(() => undefined);
+  try {
+    await Promise.resolve();
+    assert.ok(emitStatus);
+    emitStatus({ type: "sessionStatus", revision: 1, phase: "connected",
+      active: true, foreground: true });
+    emitStatus({ type: "sessionStatus", revision: 2, phase: "error",
+      active: false, foreground: false,
+      error: "Connection to 192.0.2.1 timed out, secret=synthetic-password" });
+    const statusLogs = logs.filter(entry => entry.event === "core.android.service.status");
+    assert.equal(statusLogs.length, 2);
+    assert.deepEqual(statusLogs.map(entry => (entry.details as { phase: string }).phase),
+      ["connected", "error"]);
+    assert.equal((statusLogs[1]?.details as { errorCategory: string }).errorCategory, "timeout");
+    assert.ok(!JSON.stringify(statusLogs).includes("192.0.2.1"));
+    assert.ok(!JSON.stringify(statusLogs).includes("synthetic-password"));
+  } finally {
+    unsubscribe();
+    await client.disconnect();
+  }
+});
+
 test("a reused browser listener advertises current folders and adopts current connection options", { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-listener-refresh-"));
   const adapter = createNodeHostAdapter();

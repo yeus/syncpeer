@@ -1612,6 +1612,20 @@ async function refreshSessionConfiguration(
   }
 }
 
+/** Stable diagnostics categories avoid copying remote error text, addresses or credentials. */
+const classifySessionIssue = (message?: string | null): string | null => {
+  if (!message) return null;
+  const categories = [
+    ["authorization", /not authorized|revoked|not paired|trusted device|approval/i],
+    ["timeout", /timeout|timed out|deadline/i],
+    ["credentials", /password|credential|decrypt/i],
+    ["network", /network|offline|unreachable|refused/i],
+    ["service", /service|worker|binder|runtime unavailable|webview/i],
+    ["closed", /closed|disconnected|stopped|cancelled|suspended/i],
+  ] as const;
+  return categories.find(([, pattern]) => pattern.test(message))?.[0] ?? "other";
+};
+
 function createSessionLifecycle(
   ctx: SessionContext,
   open: (connectOptions: ConnectOptions, signal: AbortSignal) => Promise<SyncpeerSessionHandle>,
@@ -1624,6 +1638,15 @@ function createSessionLifecycle(
       connectOptions.key ?? "default-key",
       ctx.platformAdapter.sessionConfigurationRevision?.() ?? 0,
     ),
+  });
+  let previousPhase: string | undefined;
+  lifecycle.subscribe(state => {
+    if (state.phase === previousPhase) return;
+    ctx.coreAdapter.log?.("core.session.lifecycle.transition", {
+      from: previousPhase ?? "initial", to: state.phase,
+      attempt: state.attempt, closureCategory: classifySessionIssue(state.closureReason),
+    });
+    previousPhase = state.phase;
   });
   ctx.platformAdapter.onSessionConfigurationChange?.(() => {
     const requestedRevision = ctx.platformAdapter.sessionConfigurationRevision?.();
@@ -1694,6 +1717,9 @@ async function setSessionForegroundImpl(
   lifecycle: ConnectionLifecycle<ConnectOptions>,
   foreground: boolean,
 ) {
+  ctx.coreAdapter.log?.("core.session.visibility.changed", {
+    foreground, lifecyclePhase: lifecycle.getState().phase,
+  });
   if (ctx.platformAdapter.serviceSessionCommand) {
     if (foreground) {
       // The service owns the socket throughout Activity visibility changes.
@@ -1817,6 +1843,9 @@ async function disconnectSessionImpl(
   ctx: SessionContext,
   lifecycle: ConnectionLifecycle<ConnectOptions>,
 ) {
+  ctx.coreAdapter.log?.("core.session.disconnect.requested", {
+    lifecyclePhase: lifecycle.getState().phase,
+  });
   ctx.state.activeConnectOptions = null;
   ctx.state.activeResolvedConnectOptions = null;
   ctx.state.focusedFolderId = null;
@@ -1848,10 +1877,24 @@ function subscribePeerStatusImpl(
   if (!subscribe) return () => undefined;
   let active = true;
   let unsubscribe: () => void = () => undefined;
+  let previousStatus = "";
   void subscribe(value => {
     if (!active) return;
     const event = parseServiceSessionStatusEvent(value);
-    if (event) listener(event);
+    if (!event) return;
+    const errorCategory = classifySessionIssue(event.error);
+    const peerErrorCategory = classifySessionIssue(event.peerError);
+    const status = [event.phase, event.active, event.foreground,
+      event.peerPhase, errorCategory, peerErrorCategory].join(":");
+    if (status !== previousStatus) {
+      ctx.coreAdapter.log?.("core.android.service.status", {
+        phase: event.phase, active: event.active, foreground: event.foreground,
+        peerPhase: event.peerPhase ?? null,
+        errorCategory, peerErrorCategory, revision: event.revision,
+      });
+      previousStatus = status;
+    }
+    listener(event);
   }).then(cleanup => {
     if (active) unsubscribe = cleanup;
     else cleanup();

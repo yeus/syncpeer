@@ -173,7 +173,8 @@ const tryForwardUiErrorToCli = async (
 
 export const shouldLogInvokeLifecycle = (command: string): boolean =>
   !/^(?:syncpeer_tls|syncpeer_quic)_(?:read|write)(?:_binary)?$/.test(command) &&
-  command !== "syncpeer_replica_storage" &&
+  !["syncpeer_replica_storage", "syncpeer_document_command",
+    "syncpeer_android_session_command", "syncpeer_get_cached_statuses"].includes(command) &&
   !/^syncpeer_replica_storage_(?:read|write|read_file|write_file|read_files|write_files)_binary$/.test(command);
 const createLoggedInvoke = (
   invoke: InvokeFn,
@@ -184,8 +185,15 @@ const createLoggedInvoke = (
   if (shouldLogLifecycle) logUi(options, "tauri.invoke.start", { command });
   try {
     const result = await invoke<T>(command, args);
+    const durationMs = Date.now() - startedAt;
     if (shouldLogLifecycle) {
-      logUi(options, "tauri.invoke.success", { command, durationMs: Date.now() - startedAt });
+      logUi(options, "tauri.invoke.success", { command, durationMs });
+    } else if (command === "syncpeer_android_session_command" && durationMs >= 2000) {
+      const operation = (args as { request?: { operation?: unknown } } | undefined)?.request?.operation;
+      logUi(options, "tauri.invoke.slow", {
+        command, durationMs,
+        ...(typeof operation === "string" && /^[A-Za-z]{1,64}$/.test(operation) ? { operation } : {}),
+      });
     }
     return result;
   } catch (error) {
@@ -193,7 +201,7 @@ const createLoggedInvoke = (
       /^(?:Error: )?Discovery request cancelled(?: or unavailable)?\.?$/.test(String(error))) throw error;
     // Operation names are stable identifiers, not payloads: without them a failed
     // document command cannot be told apart from any other.
-    const operation = command === "syncpeer_document_command"
+    const operation = ["syncpeer_document_command", "syncpeer_android_session_command"].includes(command)
       ? (args as { request?: { operation?: unknown } } | undefined)?.request?.operation
       : undefined;
     const details = typeof operation === "string" && /^[A-Za-z]{1,64}$/.test(operation)

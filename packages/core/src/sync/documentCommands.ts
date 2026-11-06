@@ -8,9 +8,11 @@ export const changesSessionConfiguration = (operation: unknown, path?: unknown):
     typeof path[1] === "string" && path[2] === "retention"
   ) && [
     "createVault", "createLocalVault", "upgradeToPersonalSpace", "unlock", "unlockRemembered", "lock", "restoreRecoveryBackup",
-    "register", "attachDownloads", "detachDownloads", "saveProfileSettings",
+    "register", "attachDownloads", "detachDownloads",
     "savePersonalSpaceSetting", "resolvePersonalSpaceConflict", "appendPersonalSpaceChange",
     "importPairingTransfer", "revokeOwnedDevice", "recoverOwnedDevice",
+    // Profile settings and favorites are device-local behavior; they do not
+    // change peer membership or the folders advertised by the listener.
     // Updating local decryption passwords does not alter peer membership or
     // published folder structure; the foreground session hydrates them live.
   ].includes(operation);

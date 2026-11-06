@@ -163,11 +163,11 @@ async function runSettingsUiTest(browser) {
   await click("[data-testid='new-folder']");
   await browser.$("button=Open general settings").waitForExist();
   await clickText("Open general settings");
-  await click("[data-testid='optional-personal-space-setup'] summary");
-  await browser.$("button=Create Personal Space").waitForExist();
-  assert.match(await text(), /Join an existing personal space/);
+  assert.match(await text(), /Syncpeer creates it automatically/);
+  assert.equal(await browser.$("[data-testid='optional-personal-space-setup']").isExisting(), false);
+  assert.equal(await browser.$("button=Create Personal Space").isExisting(), false);
   assert.equal(await browser.$("button=Create folder").isExisting(), false);
-  console.log("Passed: fresh-profile setup and joining live in personal-space settings.");
+  console.log("Passed: uninitialized device storage cannot bypass automatic local-vault setup.");
   await back();
   await click("[data-testid='browser-fixture']");
   const priorCalls = (await calls()).length;

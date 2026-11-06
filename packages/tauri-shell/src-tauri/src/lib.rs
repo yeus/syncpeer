@@ -1124,6 +1124,11 @@ fn secure_app_data_root(root: &Path) -> Result<(), String> {
 }
 
 fn prepare_app_data_root(root: &Path) -> Result<(), String> {
+    // Concurrent first-launch commands must not see each other's unfinished marker.
+    // Keep the unknown-data rejection strict after initialization completes.
+    static INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = INITIALIZATION_LOCK.lock()
+        .map_err(|_| "Private storage initialization lock was poisoned".to_string())?;
     match fs::symlink_metadata(root) {
         Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
             return Err(private_storage_unrecognized(
@@ -5626,6 +5631,26 @@ mod tests {
         prepare_app_data_root(root.path()).unwrap();
         prepare_app_data_root(root.path()).unwrap();
         assert!(root.path().join(APP_STORAGE_FORMAT_FILE).is_file());
+    }
+
+    #[test]
+    fn private_storage_first_use_is_safe_with_concurrent_initializers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        let gate = Arc::new(std::sync::Barrier::new(32));
+        std::thread::scope(|scope| {
+            let workers = (0..32).map(|_| {
+                let gate = Arc::clone(&gate);
+                scope.spawn(move || {
+                    gate.wait();
+                    prepare_app_data_root(path)
+                })
+            }).collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+        });
+        assert!(path.join(APP_STORAGE_FORMAT_FILE).is_file());
     }
 
     #[test]

@@ -13,12 +13,12 @@ import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } fro
 import { defaultFolderSettings, defaultProfileSettings } from "../packages/core/dist/sync/profileSettings.js";
 import { purgePrivateReplicaContents } from "../packages/core/dist/sync/replicaPurge.js";
 test("listener snapshots are invalidated by sharing changes, not ordinary document edits", () => {
-  for (const operation of ["lock", "unlock", "saveProfileSettings", "savePersonalSpaceSetting",
+  for (const operation of ["lock", "unlock", "savePersonalSpaceSetting",
     "revokeOwnedDevice", "register", "attachDownloads"]) {
     assert.equal(changesSessionConfiguration(operation), true, operation);
   }
   for (const operation of ["status", "sessionSharedFolders", "read", "write", "flush", "remove", "rename",
-    "saveConnectionPasswords", "mergeConnectionPasswords"]) {
+    "saveConnectionPasswords", "mergeConnectionPasswords", "saveProfileSettings"]) {
     assert.equal(changesSessionConfiguration(operation), false, operation);
   }
   assert.equal(changesSessionConfiguration("savePersonalSpaceSetting", ["folders", "photos", "retention"]), false);
@@ -72,6 +72,8 @@ test("a device-protected local vault saves profile settings without Personal Spa
   });
   await documents.initialize();
   await documents.createLocalVault();
+  assert.deepEqual(await documents.ownedDevices(), { localDeviceId: null, devices: [] },
+    "Local-only profiles have no Personal Space trust roster.");
   const initial = await documents.profileSettings();
   assert.equal(initial.profile.keepSyncingInBackground, false);
   await documents.saveProfileSettings({
@@ -80,6 +82,60 @@ test("a device-protected local vault saves profile settings without Personal Spa
   assert.equal((await documents.profileSettings()).profile.keepSyncingInBackground, true);
   assert.equal((await documents.status()).vault.phase, "unlocked");
   await documents.close();
+});
+
+test("document status reads the encrypted vault once without caching plaintext secrets", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const bytes = await openStorage("profile");
+  let vaultReads = 0;
+  const profile = { ...bytes, readRange: async (path: string, offset: number, size: number) => {
+    if (path === ".syncpeer-vault-record") vaultReads++;
+    return bytes.readRange(path, offset, size);
+  } };
+  let remembered: string | null = null;
+  const documents = createDocumentFilesystem({ profileId: "status-read-fixture", deviceCounterId: "42",
+    openStorage, profile, randomBytes, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => remembered,
+      save: async value => { remembered = value; }, remove: async () => { remembered = null; },
+    } });
+  try {
+    await documents.initialize();
+    await documents.createLocalVault();
+    await documents.register({ id: "folder", label: "Folder", password: "synthetic-password" });
+    vaultReads = 0;
+    const state = await documents.status();
+    assert.deepEqual(state.folders.map(folder => folder.id), ["folder"]);
+    assert.deepEqual(state.pendingLocalReleases, []);
+    assert.equal(vaultReads, 1, "Status must not decrypt identical vault contents twice");
+  } finally { await documents.close(); }
+});
+
+test("merging existing peer passwords skips redundant encrypted vault rewrites", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const bytes = await openStorage("profile");
+  let writes = 0;
+  const profile = { ...bytes, createSink: async (path: string, size: number) => {
+    if (path === ".syncpeer-vault-record") writes++;
+    return bytes.createSink(path, size);
+  } };
+  let remembered: string | null = null;
+  const documents = createDocumentFilesystem({ profileId: "merge-idempotent-fixture", deviceCounterId: "42",
+    openStorage, profile, randomBytes, rememberedSecret: {
+      isDeviceUnlocked: async () => true, load: async () => remembered,
+      save: async value => { remembered = value; }, remove: async () => { remembered = null; },
+    } });
+  try {
+    await documents.initialize();
+    await documents.createLocalVault();
+    await documents.mergeConnectionPasswords({ peer: "first-secret" });
+    const firstWriteCount = writes;
+    await documents.mergeConnectionPasswords({ peer: "first-secret" });
+    await documents.mergeConnectionPasswords({ peer: "ignored-duplicate" });
+    assert.equal(writes, firstWriteCount, "Existing peer credentials must not trigger another fsync");
+    await documents.mergeConnectionPasswords({ secondPeer: "second-secret" });
+    assert.equal(writes, firstWriteCount + 1, "New peer credentials still require durable persistence");
+    assert.deepEqual(await documents.connectionPasswords(), { peer: "first-secret", secondPeer: "second-secret" });
+  } finally { await documents.close(); }
 });
 
 test("an ordinary Syncthing peer can receive an explicitly selected folder without a personal space", async () => {
@@ -453,6 +509,27 @@ test("directory catalogs stay encrypted and cache eviction preserves favorites a
     assert.equal(Buffer.from(entry.bytes).includes(Buffer.from("remote-only.txt")), false);
   }
   await documents.close();
+});
+
+test("DocumentsProvider can recreate deleted files and directories over replica tombstones", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "recreate-tombstones", deviceCounterId: "42",
+    openStorage, profile: await openStorage("profile"), randomBytes });
+  try {
+    await documents.initialize();
+    await documents.createVault("synthetic-master", false);
+    await documents.register({ id: "folder", label: "Folder", password: "synthetic-folder-password" });
+    const [root] = await documents.list("syncpeer-root");
+    for (const [name, directory] of [["reused.txt", false], ["reused-directory", true]] as const) {
+      const original = await documents.create(root.id, name, directory);
+      assert.equal(await documents.remove(original.id), true);
+      assert.equal((await documents.list(root.id)).some(entry => entry.name === name), false);
+      const recreated = await documents.create(root.id, name, directory);
+      assert.equal(recreated.name, name);
+      assert.equal(recreated.directory, directory);
+      await assert.rejects(documents.create(root.id, name, directory), /changed|exists/i);
+    }
+  } finally { await documents.close(); }
 });
 
 test("registered encrypted documents reopen with remembered credentials, and lock revokes handles", async () => {

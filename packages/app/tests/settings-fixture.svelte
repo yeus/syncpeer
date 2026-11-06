@@ -48,7 +48,7 @@
       case "localReleaseHistory": return [] as T;
       case "saveProfileSettings": profile = request.settings as typeof profile; break;
       case "savePersonalSpaceSetting": minimumCopies = (request.value as { minimumCopies: number }).minimumCopies; break;
-      case "createVault": phase = "unlocked"; personalSpaceEnabled = true; break;
+      case "upgradeToPersonalSpace": phase = "unlocked"; personalSpaceEnabled = true; break;
       case "unlock": phase = "unlocked"; break;
     }
     return undefined as T;
@@ -71,12 +71,13 @@
   <DeviceNameOnboarding suggestedName="synthetic-device"
     onSave={name => { app.connection.deviceName = name; app.ui.deviceNameConfirmed = true; }} />
 {:else if page === "main"}
-  <DeviceTab {app} advertisedDevices={[]}
+  <DeviceTab {app} advertisedDevices={[]} advertisedFolders={[]}
     isSavedDeviceAwaitingRemoteApproval={() => false} isLanDiscoveredDevice={() => false}
     onUseSavedDevice={() => {}} onResetDiscoveryServer={() => {}} onClearAllCache={() => {}} onClearOfflineFolderState={() => {}}
     onOpenDiagnosticsPage={() => {}} onOpenAboutPage={() => {}} onCopyCurrentDeviceId={() => {}} onCopySessionLogs={() => {}}
     onEditLocalDeviceName={() => {}} onRegenerateDeviceId={() => {}} onCopyIdentityBackupSecret={() => {}}
     onRestoreIdentityRecovery={() => {}} onAddSavedDevice={() => {}} onApproveAdvertisedDevice={() => {}}
+    onApproveFolderSync={() => {}} onRevokeFolderSync={() => {}}
     onEditSavedDeviceName={() => {}} onSetSavedDeviceIntroducer={() => {}} onRemoveSavedDevice={() => {}}
     onConnectionSettingsChanged={() => {}} onOpenGeneralSettings={() => { page = "general"; }} />
   <button data-testid="new-folder" onclick={() => { page = "new"; }}>New folder</button>

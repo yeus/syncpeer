@@ -28,11 +28,36 @@ export const createEncryptedUiStateStore = (deps: {
   const saveDelayMs = deps.saveDelayMs ?? 500;
   let loaded = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let lastSaved: string | null = null;
+  let queued: { key: string; payload: SensitiveAppState } | null = null;
+  let saving = false;
+
+  const flush = async (): Promise<void> => {
+    if (saving) return;
+    saving = true;
+    try {
+      while (queued) {
+        const current = queued;
+        queued = null;
+        if (current.key === lastSaved) continue;
+        try {
+          await deps.command({ operation: "saveUiState", state: current.payload });
+          lastSaved = current.key;
+        } catch (error) {
+          deps.onFailure("app.ui_state.save_failed", error);
+        }
+      }
+    } finally {
+      saving = false;
+    }
+  };
+
 
   const load = async (): Promise<boolean> => {
     if (loaded) return true;
     const stored = await deps.command<unknown>({ operation: "uiState" });
     if (stored !== null && deps.apply(stored)) {
+      lastSaved = JSON.stringify(stored);
       loaded = true;
       return true;
     }
@@ -48,17 +73,21 @@ export const createEncryptedUiStateStore = (deps: {
       throw new Error("Encrypted UI state migration could not be verified.");
     }
     deps.apply(legacy);
+    lastSaved = JSON.stringify(legacy);
     loaded = true;
     return true;
   };
 
   const scheduleSave = (payload: SensitiveAppState) => {
     if (!loaded) return;
+    const key = JSON.stringify(payload);
+    if (key === lastSaved && !queued) return;
+    if (queued?.key === key) return;
+    queued = { key, payload };
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
-      void deps.command({ operation: "saveUiState", state: payload })
-        .catch((error) => deps.onFailure("app.ui_state.save_failed", error));
+      void flush();
     }, saveDelayMs);
   };
 
@@ -66,6 +95,7 @@ export const createEncryptedUiStateStore = (deps: {
     load,
     scheduleSave,
     cancelPendingSave: () => {
+      queued = null;
       if (timer === undefined) return;
       clearTimeout(timer);
       timer = undefined;

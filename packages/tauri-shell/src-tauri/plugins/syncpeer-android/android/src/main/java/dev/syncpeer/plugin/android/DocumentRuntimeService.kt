@@ -16,6 +16,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.javascriptengine.JavaScriptSandbox
@@ -159,12 +160,29 @@ class DocumentRuntimeService : Service() {
 
 
     fun command(input: JSONObject): CompletableFuture<JSONObject> {
-      return evaluate("""
-        if (!globalThis.syncpeerDocuments) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
+      return evaluateRuntime("""
+        const initializeStarted = Date.now();
+        const wasInitialized = !!globalThis.syncpeerDocuments;
+        if (!wasInitialized) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
+        const initializationMs = Date.now() - initializeStarted;
+        const commandStarted = Date.now();
         const result = await globalThis.syncpeerDocuments.command(input);
-        return JSON.stringify({result: result === undefined ? null : result});
-      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8)).thenApply { value ->
+        return JSON.stringify({result: result === undefined ? null : result,
+          __documentTimings: {initializationMs: wasInitialized ? 0 : initializationMs,
+            commandMs: Date.now() - commandStarted}});
+      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8),
+        diagnosticOperation = input.optString("operation")).thenApply { value ->
         val reply = JSONObject(value)
+        val timing = reply.optJSONObject("__documentTimings")
+        reply.remove("__documentTimings") // Never expose diagnostic metadata through the document-command API.
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 && timing != null) {
+          val startupMs = timing.optLong("initializationMs")
+          val commandMs = timing.optLong("commandMs")
+          if (startupMs >= 1_000 || commandMs >= 1_000) {
+            val operation = input.optString("operation").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other"
+            Log.w("SyncpeerRuntime", "document.runtime.stage_slow operation=$operation initializationMs=$startupMs commandMs=$commandMs")
+          }
+        }
         val phase = reply.optJSONObject("result")?.optJSONObject("vault")
           ?.optString("phase")?.takeIf { it.isNotBlank() }
         if (phase != null) vaultSummary = when (phase) {
@@ -341,8 +359,18 @@ class DocumentRuntimeService : Service() {
     }
     val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
     val result = CompletableFuture<String>()
+    val queuedAtMs = SystemClock.elapsedRealtime()
+    // Only operation names are logged, never paths, names, keys or payloads.
+    val safeOperation = diagnosticOperation?.takeIf { it.matches(Regex("[A-Za-z]{1,48}")) }
+    fun reportLatency(phase: String, durationMs: Long) {
+      if (safeOperation == null || durationMs < 2000 ||
+        applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+      Log.w("SyncpeerRuntime", "document.runtime.$phase operation=$safeOperation durationMs=$durationMs")
+    }
     val task = Runnable {
       var handedOff = false
+      val startedAtMs = SystemClock.elapsedRealtime()
+      reportLatency("queue_slow", startedAtMs - queuedAtMs)
       try {
         if (result.isCancelled) return@Runnable
         check(terminalStatus == null && runtimeHost != null) { "Document runtime unavailable." }
@@ -353,6 +381,7 @@ class DocumentRuntimeService : Service() {
           // the worker and starve vault status, folder settings, or cancellation.
           evaluation.whenComplete { value, error ->
             try {
+              reportLatency("async_slow", SystemClock.elapsedRealtime() - startedAtMs)
               if (error != null) result.completeExceptionally(error)
               else result.complete(value)
             } finally { data.fill(0) }
@@ -371,7 +400,10 @@ class DocumentRuntimeService : Service() {
         if (error is TimeoutException && timeoutMs == null) startRecovery()
         result.completeExceptionally(error)
       } finally {
-        if (!handedOff) data.fill(0)
+        if (!handedOff) {
+          reportLatency("execution_slow", SystemClock.elapsedRealtime() - startedAtMs)
+          data.fill(0)
+        }
       }
     }
     try {

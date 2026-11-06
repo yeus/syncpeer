@@ -71,6 +71,7 @@
   } from "./app/state.ts";
   import { createEncryptedUiStateStore } from "./app/encryptedUiState.ts";
   import { createLatestDistinctTask } from "./app/latestDistinctTask.ts";
+  import { readInitialVaultStatus } from "./app/initialVault.ts";
   import AboutPage from "./AboutPage.svelte";
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
   import GeneralSettingsPage from "./GeneralSettingsPage.svelte";
@@ -223,6 +224,7 @@
   // Never expose mutable peer controls before encrypted peer state is hydrated:
   // a late vault read could otherwise overwrite peers added during startup.
   let peerStateInitializing = $state(Boolean(folderCredentials));
+  let firstPeerInviteReady = $state(!folderCredentials);
 
   const encryptedUiState = createEncryptedUiStateStore({
     command: documentCommand,
@@ -254,6 +256,18 @@
     persistState(app);
     void actions.onAppForeground();
     persistSensitiveState();
+  };
+
+  const dismissFirstPeerInvitation = () => {
+    app.ui.firstPeerInvitationDismissed = true;
+    persistState(app);
+  };
+  const openFirstPeerSetup = async (manual: boolean) => {
+    dismissFirstPeerInvitation();
+    actions.switchTab("devices");
+    if (!manual) void actions.discoverLocalDevices();
+    await tick();
+    if (manual) document.querySelector<HTMLInputElement>('[data-testid="new-peer-device-id"]')?.focus();
   };
 
   async function loadFolderCredentials() {
@@ -501,8 +515,11 @@
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
     void (async () => {
-      const initialVault = await documentCommand<{ vault: { phase: string } }>({ operation: "status" })
-        .catch(() => null);
+      // Do not treat a transient Android service startup error as an absent vault:
+      // that silently skipped device-protected local storage provisioning.
+      const initialVault = folderCredentials
+        ? await readInitialVaultStatus(() => documentCommand<{ vault: { phase: string } }>({ operation: "status" }))
+        : null;
       if (initialVault?.vault.phase === "uninitialized") {
         // Show the name-only first-run prompt without waiting on the encrypted-store KDF.
         localStorageInitializing = true;
@@ -523,15 +540,24 @@
         await biometric.status().then(status => status.enabled).catch(() => false)) {
         await unlockWithBiometric().catch(() => undefined);
       }
-      await Promise.all([actions.hydrate(), actions.refreshCurrentDeviceId()]);
+      // Verified peer controls are interactive independently of document-cache
+      // hydration. Start one foreground attempt without a duplicate late dial.
+      peerStateInitializing = false;
       actions.restoreOfflineSnapshot(undefined, "startup");
+      const foregroundConnection = actions.onAppForeground().catch(error => {
+        pushSessionLog(app, "warning", "app.foreground.connect_failed",
+          "Automatic foreground connection could not be established.",
+          { message: error instanceof Error ? error.message : String(error) });
+      });
+      await Promise.all([actions.hydrate(), actions.refreshCurrentDeviceId()]);
+      firstPeerInviteReady = true;
       await actions.restoreNavigationRoute(false);
-      await actions.onAppForeground();
+      await foregroundConnection;
       await actions.restoreNavigationRoute(true);
       persistSensitiveState();
     })().catch(error => {
       app.ui.recentError = error instanceof Error ? error.message : "Private local storage could not be initialized.";
-    }).finally(() => { peerStateInitializing = false; });
+    }).finally(() => { peerStateInitializing = false; firstPeerInviteReady = true; });
 
     const handleOnline = () => {
       void actions.onNetworkOnline();
@@ -800,6 +826,17 @@
       {#if localStorageInitializing}
         <section class="panel" role="status" data-testid="local-storage-initializing">
           Preparing device-protected local storage… You can name this device now.
+        </section>
+      {/if}
+      {#if firstPeerInviteReady && !peerStateInitializing && !app.ui.firstPeerInvitationDismissed && app.devices.savedDevices.length === 0}
+        <section class="panel" role="dialog" aria-modal="false" aria-labelledby="first-peer-invitation-heading" data-testid="first-peer-invitation">
+          <h2 id="first-peer-invitation-heading">Add your first peer</h2>
+          <p>No other device is configured yet. Choose a device discovered on your LAN, or enter its Syncthing device ID and an optional name. The remote device must also approve the connection.</p>
+          <div class="actions">
+            <button type="button" class="primary" data-testid="first-peer-scan" onclick={() => void openFirstPeerSetup(false)}>Find nearby peers</button>
+            <button type="button" class="ghost" data-testid="first-peer-manual" onclick={() => void openFirstPeerSetup(true)}>Enter device ID</button>
+            <button type="button" class="ghost" data-testid="first-peer-dismiss" onclick={dismissFirstPeerInvitation}>Not now</button>
+          </div>
         </section>
       {/if}
       {#if app.ui.showStabilityNotice}

@@ -298,7 +298,8 @@ class CredentialVault {
   private update(transform: (data: VaultData) => VaultData | Promise<VaultData>) {
     return this.run(async () => {
       const { record, data } = await this.unlocked();
-      await this.save(await transform(data), this.key!, record);
+      const next = await transform(data);
+      if (next !== data) await this.save(next, this.key!, record);
     });
   }
 
@@ -984,6 +985,8 @@ class CredentialVault {
   mergeConnectionPasswords(values: Record<string, string>) {
     return this.update(data => {
       validateConnectionPasswords(data, values);
+      // Stored passwords win over incoming candidates. Re-encrypt only when new keys arrive.
+      if (Object.keys(values).every(id => Object.hasOwn(data.connectionPasswords ?? {}, id))) return data;
       return { ...data, connectionPasswords: { ...values, ...data.connectionPasswords } };
     });
   }
@@ -1018,6 +1021,14 @@ class CredentialVault {
       }
       return { ...data, registrations: after,
         localReleases: [...data.localReleases ?? [], { record, pending: true }] };
+    });
+  }
+
+  registrationStatus() {
+    return this.run(async () => {
+      const { data } = await this.unlocked();
+      return { registrations: data.registrations ?? null,
+        pendingLocalReleases: data.localReleases?.filter(entry => entry.pending).map(entry => entry.record) ?? [] };
     });
   }
 

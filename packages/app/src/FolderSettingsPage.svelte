@@ -185,7 +185,7 @@
     </section>
   {/if}
   {#if managedStorage && status && status.vault.phase !== "unlocked"}
-    <p>Unlock or create your personal space in general settings to manage this folder.</p>
+    <p>Unlock protected local storage in general settings to manage this folder. Personal Space is optional.</p>
     <button onclick={onOpenGeneralSettings}>Open general settings</button>
   {:else if managedStorage && status?.vault.phase === "unlocked"}
     {#if sharedConflicts.length}

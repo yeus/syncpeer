@@ -169,11 +169,12 @@
   }
 
   async function createProfile() {
-    if (!masterPassword || !kitText || !kitSaved || (generatedPassword && !generatedSaved)) return;
+    if (status?.vault.phase !== "unlocked" || status.vault.personalSpaceEnabled ||
+      !masterPassword || !kitText || !kitSaved || (generatedPassword && !generatedSaved)) return;
     busy = true; error = "";
     try {
       await command({
-        operation: status?.vault.phase === "unlocked" ? "upgradeToPersonalSpace" : "createVault",
+        operation: "upgradeToPersonalSpace",
         password: masterPassword, remember: rememberMaster,
         localDeviceId: await getDefaultDeviceId(), recoveryKey: JSON.parse(kitText).publicKey,
       });
@@ -249,7 +250,9 @@
         Unlock with biometrics
       </button>
     {/if}
-  {:else if status?.vault.phase === "uninitialized" || (status?.vault.phase === "unlocked" && !status.vault.personalSpaceEnabled)}
+  {:else if status?.vault.phase === "uninitialized"}
+    <p role="status">Device-protected local storage is still being prepared. Syncpeer creates it automatically; no vault password is needed.</p>
+  {:else if status?.vault.phase === "unlocked" && !status.vault.personalSpaceEnabled}
     <details data-testid="optional-personal-space-setup">
       <summary>Set up Personal Space</summary>
     <form onsubmit={event => { event.preventDefault(); void createProfile(); }}>
@@ -273,7 +276,7 @@
       {:else}
         <button type="button" disabled={busy || kitPassword.length < 16} onclick={() => void prepareRecoveryKit()}>Generate encrypted offline kit</button>
       {/if}
-      <button class="primary" disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>{status?.vault.phase === "unlocked" ? "Enable Personal Space" : "Create Personal Space"}</button>
+      <button class="primary" disabled={busy || !masterPassword || !kitSaved || Boolean(generatedPassword && !generatedSaved)}>Enable Personal Space</button>
     </form>
     <section>
       <h2>Join an existing personal space</h2>

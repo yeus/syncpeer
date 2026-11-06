@@ -381,6 +381,10 @@ class AndroidSessionRuntime {
     return this.incomingService;
   };
 
+  /** Peer metadata can connect while device-protected document storage is unavailable. */
+  private documentFoldersAvailable = async () =>
+    (await this.documents.status().catch(() => null))?.vault.phase === "unlocked";
+
   private resolveCoreOptions = async (options: ConnectOptions): Promise<SyncpeerConnectOptions> => {
     let passwords: Record<string, string> = {};
     try {
@@ -406,7 +410,8 @@ class AndroidSessionRuntime {
       ...resolveFolderPasswordsForDevice(passwords, options.remoteId ?? ""),
       ...latestPasswords,
     };
-    const sharedFolders = await this.documents.sessionSharedFolders(options.remoteId ?? "");
+    const sharedFolders = await this.documentFoldersAvailable()
+      ? await this.documents.sessionSharedFolders(options.remoteId ?? "") : [];
     return {
       host: options.host,
       port: options.port,

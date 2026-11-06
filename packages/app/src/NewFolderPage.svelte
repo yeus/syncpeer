@@ -30,9 +30,9 @@
       <label>New folder name <input bind:value={label} required /></label>
       <button class="primary" disabled={busy || !label.trim()}>Create folder</button>
     </form>
-    <p>New folders use encrypted local storage. Approved devices receive the folder credential through your personal space.</p>
+    <p>New folders use encrypted local storage. Share them explicitly with approved peers; Personal Space is optional.</p>
   {:else if phase}
-    <p>Unlock or create your personal space in general settings before creating a folder.</p>
+    <p>Protected local storage must be available before creating a folder. Personal Space is not required.</p>
     <button onclick={onOpenGeneralSettings}>Open general settings</button>
   {/if}
 </main>

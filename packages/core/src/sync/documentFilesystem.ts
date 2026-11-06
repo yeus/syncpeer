@@ -199,9 +199,9 @@ const settingsStorageId = (folderId: string) =>
     .map(byte => byte.toString(16).padStart(2, "0")).join("");
 
 const reconcileSpaceDeviceMembership = async (runtime: DocumentRuntime) => {
-  if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
   let local = await runtime.vault.spaceDeviceMembership();
   if (!local) return null;
+  if (!runtime.settingsFolder) throw new Error("Personal-space settings storage is unavailable.");
   const journal = createSpaceMembershipJournal(runtime.settingsFolder.replica, runtime.settingsFolder.id);
   const remote = await journal.load();
   for (let index = 0; index < Math.min(remote.length, local.trust.updates.length); index++) {
@@ -374,14 +374,17 @@ const openRegisteredFolders = async (runtime: DocumentRuntime): Promise<void> =>
   }
 };
 
-const documentStatus = async (runtime: DocumentRuntime) => ({
-  vault: runtime.vault.status(),
-  folders: runtime.vault.status().phase === "unlocked" ? await runtime.configs.load() : [],
-  pendingLocalReleases: runtime.vault.status().phase === "unlocked"
-    ? (await runtime.vault.pendingLocalReleases()).map(record => record.kind === "safe"
-      ? record.proposal.folderId : record.exception.folderId) : [],
-  recoveryIssues: [...runtime.recoveryIssues.values()].flat(),
-});
+const documentStatus = async (runtime: DocumentRuntime) => {
+  const vault = runtime.vault.status();
+  const snapshot = vault.phase === "unlocked" ? await runtime.configs.status() : null;
+  return {
+    vault,
+    folders: snapshot?.folders ?? [],
+    pendingLocalReleases: snapshot?.pendingLocalReleases.map(record => record.kind === "safe"
+      ? record.proposal.folderId : record.exception.folderId) ?? [],
+    recoveryIssues: [...runtime.recoveryIssues.values()].flat(),
+  };
+};
 
 const initializeFilesystem = async (runtime: DocumentRuntime) => {
   await runtime.options.profile.initializeReplica();
@@ -813,8 +816,12 @@ const createEntryAction = async (
   assertReplicaPath(name); if (name.includes("/")) throw new Error("Expected one document name.");
   const parent = resolveDocument(runtime, parentId), path = parent.path ? parent.path + "/" + name : name;
   if (!(await documentStat(runtime, parentId)).directory) throw new Error("Parent is not a directory.");
-  await parent.replica.edit!({ folderId: parent.folder.id, path, modifiedMs: Date.now(), expectedVersion: null,
-    ...(directory ? { method: "mkdir" as const } : { method: "write" as const, source: { size: 0, readRange: async () => new Uint8Array() } }) });
+  const previous = (await parent.replica.scan()).find(info => info.name === path);
+  if (previous && !previous.deleted) throw new Error("A document with that name already exists.");
+  await parent.replica.edit!({ folderId: parent.folder.id, path, modifiedMs: Date.now(),
+    expectedVersion: previous?.version ?? null,
+    ...(directory ? { method: "mkdir" as const } : { method: "write" as const,
+      source: { size: 0, readRange: async () => new Uint8Array() } }) });
   return documentStat(runtime, JSON.stringify([parent.folder.storageId, path]));
 };
 

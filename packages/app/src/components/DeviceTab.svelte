@@ -522,6 +522,7 @@
     <label>
       Device ID
       <input
+        data-testid="new-peer-device-id"
         type="text"
         bind:value={app.devices.newSavedDeviceId}
         placeholder="ABCD123-..."

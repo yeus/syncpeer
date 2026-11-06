@@ -25,6 +25,8 @@ private fun markerIsCurrent(marker: File): Boolean {
   return currentMarker.matches(value)
 }
 
+// Document runtime and vault secret initialization can race during first launch.
+@Synchronized
 internal fun preparePrivateStorageRoot(root: File): File {
   if (root.exists()) {
     if (!root.isDirectory || isSymbolicLink(root)) {

@@ -70,6 +70,7 @@ export interface PersistedAppState {
   directorySortMode?: FileEntrySortMode;
   theme?: Partial<ThemePreferences>;
   expertView?: boolean;
+  firstPeerInvitationDismissed?: boolean;
   stabilityNoticeAcknowledged?: boolean;
   deviceName?: string;
 }
@@ -85,6 +86,7 @@ export const loadPersistedState = (): PersistedAppState | null => {
     directorySortMode: persisted.directorySortMode,
     theme: persisted.theme,
     expertView: persisted.expertView,
+    firstPeerInvitationDismissed: persisted.firstPeerInvitationDismissed === true,
     stabilityNoticeAcknowledged: persisted.stabilityNoticeAcknowledged,
     deviceName: typeof persisted.deviceName === "string" ? persisted.deviceName : undefined,
   };
@@ -119,6 +121,7 @@ export const persistState = (state: AppState, migrated = false) => {
       directorySortMode: state.ui.directorySortMode,
       theme: state.ui.theme,
       expertView: state.ui.expertView,
+      firstPeerInvitationDismissed: state.ui.firstPeerInvitationDismissed,
       stabilityNoticeAcknowledged: !state.ui.showStabilityNotice,
       deviceName: isConfiguredDeviceName(state.connection.deviceName)
         ? state.connection.deviceName.trim() : undefined,
@@ -423,6 +426,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       theme: normalizeThemePreferences(persisted?.theme),
       expertView: persisted?.expertView === true,
       showStabilityNotice: persisted?.stabilityNoticeAcknowledged !== true,
+      firstPeerInvitationDismissed: persisted?.firstPeerInvitationDismissed === true,
       deviceNameConfirmed: isConfiguredDeviceName(initialDeviceName),
     },
     sync: {

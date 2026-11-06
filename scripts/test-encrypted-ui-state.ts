@@ -96,3 +96,58 @@ test("legacy plaintext UI state migrates and is verified before use", async () =
   assert.deepEqual(stored, JSON.parse(JSON.stringify(legacy)));
   assert.equal(store.isLoaded(), true);
 });
+
+test("unchanged sensitive state is not written again on session notifications", async () => {
+  const writes: string[] = [];
+  const store = createEncryptedUiStateStore({
+    command: async <T>(request: Record<string, unknown>) => {
+      if (request.operation === "saveUiState") writes.push(JSON.stringify(request.state));
+      return null as T;
+    },
+    readLegacy: () => null, apply: () => false, onFailure: () => undefined, saveDelayMs: 0,
+  });
+  await store.load();
+  const payload = storedPayload();
+  for (let index = 0; index < 20; index += 1) store.scheduleSave(storedPayload());
+  await settle();
+  assert.equal(writes.length, 1);
+  store.scheduleSave(payload);
+  await settle();
+  assert.equal(writes.length, 1);
+});
+
+test("newer sensitive state is saved after an in-flight write, without concurrent writes", async () => {
+  let finishFirst!: () => void;
+  let saves = 0;
+  let active = 0;
+  let maxActive = 0;
+  const written: string[] = [];
+  const store = createEncryptedUiStateStore({
+    command: async <T>(request: Record<string, unknown>) => {
+      if (request.operation === "saveUiState") {
+        saves++;
+        active++;
+        maxActive = Math.max(maxActive, active);
+        if (saves === 1) await new Promise<void>(resolve => { finishFirst = resolve; });
+        written.push(JSON.stringify(request.state));
+        active--;
+      }
+      return null as T;
+    },
+    readLegacy: () => null, apply: () => false, onFailure: () => undefined, saveDelayMs: 0,
+  });
+  await store.load();
+  const initial = storedPayload();
+  const latest = { ...storedPayload(), selectedSavedDeviceId: "" };
+  store.scheduleSave(initial);
+  await settle();
+  store.scheduleSave(latest);
+  store.scheduleSave(latest);
+  await settle();
+  assert.equal(maxActive, 1);
+  finishFirst();
+  await settle();
+  assert.equal(saves, 2);
+  assert.equal(maxActive, 1);
+  assert.equal(written.at(-1), JSON.stringify(latest));
+});

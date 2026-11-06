@@ -46,6 +46,31 @@ class PrivateStorageFormatTest {
     } finally { root.deleteRecursively() }
   }
 
+  @Test fun parallelFirstUsePublishesOneFormatMarker() {
+    val androidRoot = Files.createTempDirectory("syncpeer-parallel-no-backup").toFile()
+    val executor = java.util.concurrent.Executors.newFixedThreadPool(16)
+    try {
+      val ready = java.util.concurrent.CountDownLatch(16)
+      val go = java.util.concurrent.CountDownLatch(1)
+      val tasks = (0 until 16).map {
+        executor.submit(java.util.concurrent.Callable {
+          ready.countDown()
+          go.await()
+          prepareSyncpeerPrivateStorageRoot(androidRoot)
+        })
+      }
+      assertTrue(ready.await(10, java.util.concurrent.TimeUnit.SECONDS))
+      go.countDown()
+      tasks.forEach {
+        assertEquals(androidRoot.resolve("syncpeer"), it.get(20, java.util.concurrent.TimeUnit.SECONDS))
+      }
+      assertTrue(androidRoot.resolve("syncpeer").resolve(PRIVATE_STORAGE_FORMAT_FILE).isFile)
+    } finally {
+      executor.shutdownNow()
+      androidRoot.deleteRecursively()
+    }
+  }
+
   @Test fun rejectsAndPreservesUnrecognizedData() {
     val root = Files.createTempDirectory("syncpeer-private-storage").toFile()
     try {

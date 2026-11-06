@@ -12,12 +12,15 @@ import {
   downloadButtonLabel,
   readLegacySensitiveState,
   rootFolderEntries,
+  consentedRemoteFolders,
+  connectionDetails,
   persistState,
   sensitiveAppState,
 } from "../packages/app/src/app/state.ts";
 import { isConfiguredDeviceName } from "../packages/app/src/app/suggestedNames.ts";
 import { generateMasterPassword } from "../packages/app/src/app/passwords.ts";
 import { observePeer } from "../packages/core/src/peerRegistry.ts";
+import { readInitialVaultStatus } from "../packages/app/src/app/initialVault.ts";
 const PEER_ID = "RXB676UZHQX3SONXROHZ7M3DY2VEMB6LCGQCAG5QJ2VIEDX4RIUQ";
 import { createPageActions } from "../packages/app/src/app/pageActions.ts";
 
@@ -25,6 +28,51 @@ test("stability warning appears on first run and stays dismissed", () => {
   assert.equal(createInitialState(null).ui.showStabilityNotice, true);
   assert.equal(createInitialState({ stabilityNoticeAcknowledged: true }).ui.showStabilityNotice, false);
 });
+test("first peer invitation is initially visible and dismissal persists without sensitive data", t => {
+  assert.equal(createInitialState(null).ui.firstPeerInvitationDismissed, false);
+  assert.equal(createInitialState({ firstPeerInvitationDismissed: true }).ui.firstPeerInvitationDismissed, true);
+  let saved = "";
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    localStorage: { setItem: (_key: string, value: string) => { saved = value; } },
+  } });
+  t.after(() => { if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window"); });
+  const state = createInitialState(null);
+  state.ui.firstPeerInvitationDismissed = true;
+  state.devices.newSavedDeviceId = "synthetic-sensitive-draft";
+  persistState(state);
+  assert.equal(JSON.parse(saved).firstPeerInvitationDismissed, true);
+  assert.ok(!saved.includes("synthetic-sensitive-draft"));
+});
+
+test("only saved peers, not LAN advertisements, enter the incoming TLS allowlist", () => {
+  const state = createInitialState(null);
+  state.devices.lanDiscoveredDeviceIds.add(PEER_ID);
+  assert.deepEqual(connectionDetails(state).configuredPeerIds, []);
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Explicit peer", createdAtMs: 1, isIntroducer: false }];
+  assert.deepEqual(connectionDetails(state).configuredPeerIds, [PEER_ID]);
+});
+
+test("introducer folder offers remain unregistered and unbrowsable until individually approved", () => {
+  const state = createInitialState(null);
+  state.session.isConnected = true;
+  state.session.remoteDevice = { id: PEER_ID, deviceName: "Synthetic introducer", clientName: "Syncpeer", clientVersion: "test" };
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Introducer", isIntroducer: true, createdAtMs: 1 }];
+  state.session.folders = [{ id: "one", label: "One", readOnly: false },
+    { id: "two", label: "Two", readOnly: false }] as typeof state.session.folders;
+  state.connection.remoteId = PEER_ID;
+  assert.deepEqual(connectionDetails(state).consentedFolderIds, []);
+  assert.deepEqual(consentedRemoteFolders(state, state.session.folders), []);
+  assert.deepEqual(rootFolderEntries(state).map(folder => folder.id), []);
+  state.approvals.syncApprovedFolderKeys.add(`${PEER_ID}:one`);
+  assert.deepEqual(connectionDetails(state).consentedFolderIds, ["one"]);
+  assert.deepEqual(consentedRemoteFolders(state, state.session.folders).map(folder => folder.id), ["one"]);
+  assert.deepEqual(rootFolderEntries(state).map(folder => folder.id), ["one"]);
+  state.approvals.syncApprovedFolderKeys.clear();
+  assert.deepEqual(rootFolderEntries(state), []);
+});
+
 test("a fresh installation requires explicit name confirmation, restored name skips first-run", () => {
   const fresh = createInitialState(null);
   assert.equal(fresh.connection.deviceName, "syncpeer-ui");
@@ -35,6 +83,26 @@ test("a fresh installation requires explicit name confirmation, restored name sk
   assert.equal(restored.activeTab, "folders");
 });
 
+test("initial Android vault status retries transient service startup failures", async () => {
+  let attempts = 0;
+  const delays: number[] = [];
+  const result = await readInitialVaultStatus(async () => {
+    if (++attempts < 3) throw new Error("Document runtime starting.");
+    return { vault: { phase: "uninitialized" } };
+  }, async ms => { delays.push(ms); });
+  assert.equal(result.vault.phase, "uninitialized");
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [250, 500]);
+});
+
+test("unavailable Android vault status fails startup rather than silently skipping provisioning", async () => {
+  let attempts = 0;
+  await assert.rejects(readInitialVaultStatus(async () => {
+    attempts += 1;
+    throw new Error("Document runtime unavailable.");
+  }, async () => {}), /Document runtime unavailable/);
+  assert.equal(attempts, 4);
+});
 
 test("stability warning dismissal is persisted without storing private state", t => {
   let written = "";
@@ -454,5 +522,27 @@ test("after confirming the device name, foreground discovery runs without dialin
     connect: async () => { calls.push("connect"); },
   });
   await actions.onAppForeground();
+  assert.deepEqual(calls, ["discover"]);
+});
+
+test("foreground discovery cannot start a connection for a peer added while discovery was pending", async () => {
+  const state = createInitialState({ deviceName: "Named device" });
+  const calls: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => undefined } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); await gate; },
+    connect: async () => { calls.push("connect"); },
+  });
+  const pending = actions.onAppForeground();
+  state.devices.savedDevices = [{
+    id: PEER_ID, name: "new peer", createdAtMs: 1, isIntroducer: false,
+  }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  release();
+  await pending;
   assert.deepEqual(calls, ["discover"]);
 });

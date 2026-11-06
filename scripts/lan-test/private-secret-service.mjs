@@ -19,6 +19,7 @@ export async function runWithPrivateSecretService(command, args, extraEnv = {}) 
       process.execPath, fileURLToPath(import.meta.url), "--private-bus-child", command, ...args], {
       stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, ...extraEnv,
         XDG_DATA_HOME: path.join(root, "data"), XDG_CONFIG_HOME: path.join(root, "config"),
+        XDG_CACHE_HOME: path.join(root, "cache"),
         GNOME_KEYRING_CONTROL: path.join(root, "control"), SYNCPEER_PRIVATE_KEYRING_ROOT: root,
         DBUS_SESSION_BUS_ADDRESS: "",
       },

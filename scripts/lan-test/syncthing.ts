@@ -57,6 +57,10 @@ export const syncthingListenAddresses = (
 };
 
 export const ensureSyncthingTools = (): void => {
+  // E2E suites generate several identities per worker. Repeated synchronous
+  // npm invocations when the binaries are already cached starve concurrent
+  // relay handshakes and make wall-clock deadlines nondeterministic.
+  if (fs.existsSync(binaryPath("syncthing")) && fs.existsSync(binaryPath("strelaysrv"))) return;
   execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "download:syncthing"], {
     stdio: "inherit",
   });

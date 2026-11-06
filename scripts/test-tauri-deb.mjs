@@ -14,6 +14,12 @@ const artifact = path.resolve(artifactArg);
 assert.ok((await stat(artifact)).isFile(), "The .deb artifact must be a file.");
 const serial = process.env.SYNCPEER_ANDROID_SERIAL?.trim();
 const crossAppOnly = process.argv.includes("--cross-app-only");
+const resetOnly = process.argv.includes("--reset-only");
+const smokeOnly = process.argv.includes("--smoke-only");
+if (smokeOnly) assert.ok(!resetOnly && !crossAppOnly && !serial,
+  "--smoke-only runs solely the isolated packaged Linux startup gate.");
+if (resetOnly) assert.ok(!crossAppOnly && !serial,
+  "--reset-only runs solely the isolated packaged Linux reset gate.");
 const skipAndroidRecovery = process.argv.includes("--skip-android-recovery");
 if (crossAppOnly) assert.ok(serial, "--cross-app-only requires SYNCPEER_ANDROID_SERIAL.");
 if (serial) {
@@ -30,18 +36,19 @@ try {
   assert.equal(extracted.status, 0, "The .deb payload could not be extracted.");
   const binary = path.join(packageRoot, "usr", "bin", "tauri-shell");
   assert.ok((await stat(binary)).isFile(), "The .deb payload has no Tauri executable.");
-  if (!crossAppOnly) {
+  if (!crossAppOnly && !resetOnly) {
     const code = await runWithPrivateSecretService("bash", [virtualDesktop, process.execPath,
       "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
       "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {
       SYNCPEER_LAN_SPEC: "scripts/lan-test/release-smoke.spec.ts",
       SYNCPEER_LAN_APP_BINARY: binary,
       SYNCPEER_LAN_DRIVER: "external",
-      SYNCPEER_LAN_MOCHA_TIMEOUT: "300000",
+      SYNCPEER_LAN_MOCHA_TIMEOUT: process.env.SYNCPEER_LAN_MOCHA_TIMEOUT ?? "300000",
       SYNCPEER_LAN_LOG_LEVEL: "error",
       XDG_DATA_DIRS: process.env.SYNCPEER_DEB_XDG_DATA_DIRS ?? "/usr/share",
     });
     assert.equal(code, 0, "The packaged fresh-profile smoke test failed.");
+    if (!smokeOnly) {
     const pairing = spawnSync("bash", [virtualDesktop, process.execPath, "--import", "tsx",
       path.resolve("node_modules/@wdio/cli/bin/wdio.js"), "run",
       path.resolve("scripts/lan-test/wdio-pairing.conf.ts")], {
@@ -50,6 +57,20 @@ try {
     });
     if (pairing.error) throw pairing.error;
     assert.equal(pairing.status, 0, "The two-instance packaged pairing test failed.");
+    }
+  }
+  if (!crossAppOnly && !smokeOnly) {
+    const reset = await runWithPrivateSecretService("bash", [virtualDesktop, process.execPath,
+      "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
+      "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {
+      SYNCPEER_LAN_SPEC: "scripts/lan-test/packaged-local-reset.spec.ts",
+      SYNCPEER_LAN_APP_BINARY: binary,
+      SYNCPEER_LAN_DRIVER: "external",
+      SYNCPEER_LAN_MOCHA_TIMEOUT: "120000",
+      SYNCPEER_LAN_LOG_LEVEL: "error",
+      XDG_DATA_DIRS: process.env.SYNCPEER_DEB_XDG_DATA_DIRS ?? "/usr/share",
+    });
+    assert.equal(reset, 0, "The packaged Linux local-reset and restart acceptance failed.");
   }
   if (serial) {
     const target = spawnSync("adb", ["-s", serial, "shell", "getprop", "ro.kernel.qemu"],

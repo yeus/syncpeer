@@ -17,7 +17,12 @@ export async function completeFirstRunDeviceName(
   }), { timeout: 60_000, interval: 500, timeoutMsg: "Neither device naming nor the main navigation appeared." });
   if (initial === "name") {
     await peer.$("[data-testid='local-name-entry']").setValue(name);
-    await peer.$("[data-testid='save-local-device-name']").click();
+    // Avoid headless WebKit/Xvfb window-focus races while preserving real form validation.
+    await peer.execute(() => {
+      const form = document.querySelector("[data-testid='device-name-onboarding'] form");
+      if (!(form instanceof HTMLFormElement)) throw new Error("Device-name form is unavailable.");
+      form.requestSubmit();
+    });
     await peer.$("[data-testid='device-name-onboarding']")
       .waitForExist({ reverse: true, timeout: 30_000 });
   }

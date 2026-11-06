@@ -30,6 +30,7 @@ const alias = "syncpeer-upgrade";
 const originalTauriConfig = fs.readFileSync(tauriConfigPath, "utf8");
 let emulator = null;
 let emulatorLog = null;
+let emulatorSerial = null;
 
 const fail = message => { throw new Error(message); };
 const run = (command, args, options = {}) => {
@@ -54,13 +55,16 @@ const requireTool = (value, label) => {
 
 const stopEmulator = async () => {
   if (!emulator) return;
-  try { adbRaw("emu", "kill"); } catch { /* Best effort. */ }
+  if (emulatorSerial) {
+    try { adbRaw("-s", emulatorSerial, "emu", "kill"); } catch { /* Best effort. */ }
+  }
   const deadline = Date.now() + 30_000;
-  while (emulator.exitCode === null && Date.now() < deadline) await sleep(250);
-  if (emulator.exitCode === null) emulator.kill("SIGTERM");
+  while (emulator.exitCode === null && emulator.signalCode === null && Date.now() < deadline) await sleep(250);
+  if (emulator.exitCode === null && emulator.signalCode === null) emulator.kill("SIGTERM");
   emulator = null;
+  emulatorSerial = null;
   if (emulatorLog !== null) { try { fs.closeSync(emulatorLog); } catch { /* Best effort. */ } emulatorLog = null; }
-  try { adbRaw("kill-server"); } catch { /* Best effort. */ }
+  // Do not reset the shared adb server; unrelated test devices may be active.
 };
 
 const waitForBoot = async () => {
@@ -90,10 +94,18 @@ const startEmulator = async () => {
   emulator = spawn(emulatorPath, ["-avd", avdName, "-no-window", "-no-audio", "-no-metrics",
     "-no-snapshot", "-gpu", "swiftshader_indirect", "-no-boot-anim"],
   { cwd: root, stdio: ["ignore", emulatorLog, emulatorLog] });
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline && !emulatorSerial) {
+    const candidate = listSerials().find(value => value.startsWith("emulator-") && !knownSerials.has(value));
+    if (candidate) {
+      const avd = capture(adbPath, ["-s", candidate, "emu", "avd", "name"]).split(/\r?\n/)[0].trim();
+      if (avd === avdName) emulatorSerial = candidate;
+    }
+    if (!emulatorSerial) await sleep(500);
+  }
+  if (!emulatorSerial) fail("Signed-upgrade emulator did not appear as a new, matching AVD.");
+  process.env.ANDROID_SERIAL = emulatorSerial;
   await waitForBoot();
-  const serial = listSerials().find(value => value.startsWith("emulator-") && !knownSerials.has(value));
-  if (!serial) fail("Signed-upgrade emulator did not appear as a new emulator device.");
-  process.env.ANDROID_SERIAL = serial;
   // The google_apis image is userdebug; root is required only for the private
   // app-data marker and for deterministic Wi-Fi state.
   adb("root");

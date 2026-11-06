@@ -650,14 +650,17 @@
         uploadMessage: app.ui.uploadMessage,
         uploadProgressActive: app.ui.uploadProgressActive,
         logs: app.logs.items.slice(0, 20).map(({ event, message }) => ({ event, message })),
-        // E2E-only diagnostic metadata: event, time, count/boolean, never file names or secrets.
+        // E2E-only: bounded failure diagnostics, never credentials or payloads.
         syncTrace: app.logs.items.filter(({ event }) =>
-          /^(core\.(request\.|replica\.|incoming\.|index\.|bep\.|cluster\.|shared_folder\.index\.sent)|client\.session\.|document\.(settings_refresh\.|session_folders\.))/.test(event))
+          /^(core\.(request\.|replica\.|incoming\.|index\.|bep\.|cluster\.|shared_folder\.index\.sent|discovery\.relay\.|socket\.closed|session\.)|client\.session\.|document\.(settings_refresh\.|session_folders\.)|session\.|folder\.open_)/.test(event))
           .slice(0, 320).map(({ event, timestampMs, details }) => {
             const value = details && typeof details === "object" ? details as Record<string, unknown> : {};
+            const diagnosticError = /(?:failed|error|socket\.closed)$/.test(event);
             return { event, timestampMs,
               ...(typeof value.fileCount === "number" ? { fileCount: value.fileCount } : {}),
-              ...(typeof value.changed === "boolean" ? { changed: value.changed } : {}) };
+              ...(typeof value.changed === "boolean" ? { changed: value.changed } : {}),
+              ...(diagnosticError && typeof value.message === "string"
+                ? { reason: value.message.slice(0, 240) } : {}) };
           }),
       });
       testWindow.__syncpeerStoreStateProbe = () => {
@@ -669,6 +672,12 @@
           hasRemoteFs: state.remoteFs !== null,
           directoryStatus: state.directory.status,
           requestEpoch: state.requestEpoch,
+          lastError: state.lastError?.slice(0, 180),
+          directoryError: state.directory.error?.slice(0, 180),
+          pending: state.pending,
+          closureReason: state.closureReason?.slice(0, 180),
+          connectionTransport: state.connectionTransport,
+          folderSyncCount: state.folderSyncStates.length,
         };
       };
     }

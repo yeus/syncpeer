@@ -203,7 +203,11 @@ const installWebViewFixture = async (fixture) => {
 
 const runProfile = async (profileName, testArguments, prepareDevice,
   installEditor = false, allowOtherDevices = false) => {
-  if (!allowOtherDevices) assertNoDevices();
+  // Opt-in coexistence is safe only because waitForBoot matches both a newly
+  // created adb transport and the expected AVD name, then pins ANDROID_SERIAL
+  // for every installation, probe and child test process.
+  const allowConcurrentDevices = process.env.SYNCPEER_ANDROID_ALLOW_CONCURRENT_DEVICES === "1";
+  if (!allowOtherDevices && !allowConcurrentDevices) assertNoDevices();
   const knownTransports = listDeviceTransports();
   const selected = profile(profileName);
   create(selected);

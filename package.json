@@ -61,6 +61,7 @@
     "test:android:syncpeer-peers": "node --experimental-strip-types scripts/test-android-syncpeer-peers.ts",
     "test:android:peer:e2e": "node --import tsx scripts/test-android-peer.ts",
     "test:android:peer:automatic": "SYNCPEER_ANDROID_PEER_DISCOVERY_MODE=automatic SYNCPEER_ANDROID_PEER_CONNECTION_ONLY=1 node --import tsx scripts/test-android-peer.ts",
+    "test:android:peer:local-vault": "SYNCPEER_ANDROID_PEER_DISCOVERY_MODE=automatic SYNCPEER_ANDROID_PEER_CONNECTION_ONLY=1 SYNCPEER_ANDROID_PEER_LOCAL_VAULT_ONLY=1 node --import tsx scripts/test-android-peer.ts",
     "test:android:peer:approval": "SYNCPEER_ANDROID_PEER_DISCOVERY_MODE=automatic SYNCPEER_ANDROID_PEER_APPROVAL_ONLY=1 node --import tsx scripts/test-android-peer.ts",
     "test:android:peer:two-pending": "SYNCPEER_ANDROID_PEER_DISCOVERY_MODE=automatic SYNCPEER_ANDROID_PEER_SWITCH_APPROVAL=1 node --import tsx scripts/test-android-peer.ts",
     "test:android:peer:recovery": "SYNCPEER_ANDROID_PEER_POWER_CUT_ONLY=1 node --import tsx scripts/test-android-peer.ts",

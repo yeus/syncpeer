@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
+import { once } from "node:events";
 import { createHash } from "node:crypto";
 import { configureSyncthingNetwork } from "./lan-test/syncthing.ts";
 
@@ -375,12 +376,12 @@ async function waitForFolderDeviceAdvertisement(options) {
   );
 }
 
-async function waitForCliDownload(args, outPath, expectedContent, timeoutMs) {
+async function waitForCliDownload(args, outPath, expectedContent, timeoutMs, env) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = null;
   while (Date.now() < deadline) {
     try {
-      execCli(args, { stdio: "inherit" });
+      execCli(args, { stdio: "inherit", ...(env ? { env } : {}) });
       const actual = fs.readFileSync(outPath, "utf8");
       if (actual === expectedContent) {
         return;
@@ -633,8 +634,11 @@ function prepareFixture() {
   return { ...files, ...identities };
 }
 
-function stopProcess(child) {
-  if (child) child.kill("SIGTERM");
+async function stopProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit", { signal: AbortSignal.timeout(15_000) });
+  child.kill("SIGTERM");
+  await exited;
 }
 
 async function waitForInitialSync({ expectedA }) {
@@ -909,15 +913,17 @@ function downloadArgs(baseArgs, relativePath, outputPath) {
 async function runRepeatedDownloads({ trustedArgs, env, expectedA }) {
   for (let iteration = 1; iteration <= downloadIterations; iteration += 1) {
     const outputPath = path.join(root, `downloaded-nested-${iteration}.txt`);
-    execCli(downloadArgs(trustedArgs, "a.txt", outputPath), {
-      stdio: "inherit",
+    // The fixture deliberately stops Syncthing A immediately before this phase.
+    // Syncthing B can briefly close a new connection while the old peer
+    // sessions drain. Retry the entire CLI request, never partial block data,
+    // and require exactly the same downloaded content on every iteration.
+    await waitForCliDownload(
+      downloadArgs(trustedArgs, "a.txt", outputPath),
+      outputPath,
+      expectedA,
+      20_000,
       env,
-    });
-    const downloaded = fs.readFileSync(outputPath, "utf8");
-    if (downloaded !== expectedA)
-      throw new Error(
-        `Downloaded content mismatch on iteration ${iteration}: got "${downloaded}"`,
-      );
+    );
   }
 }
 
@@ -1092,8 +1098,7 @@ async function runLocalUploadCheck({ trustedArgs }) {
 
 async function runCliChecks(fixture, services) {
   console.log("\n=== Running syncpeer CLI checks ===");
-  stopProcess(services.a);
-  await sleep(1500);
+  await stopProcess(services.a);
   const context = { ...createCliContext(fixture), ...fixture };
   await runListChecks(context);
   await runDownloadChecks(context);
@@ -1122,9 +1127,7 @@ function logSuccess({ aId, bId, cliNodeId, cliUntrustedId, cliObserverId }) {
 }
 
 async function cleanupServices(services) {
-  stopProcess(services?.a);
-  stopProcess(services?.b);
-  await sleep(1000);
+  await Promise.all([services?.a, services?.b].map(stopProcess));
   if (!keep) {
     fs.rmSync(root, { recursive: true, force: true });
     console.log("Cleaned up test files and stopped Syncthing processes.");

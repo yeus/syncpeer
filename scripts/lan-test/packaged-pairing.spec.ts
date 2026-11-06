@@ -5,7 +5,6 @@ import { mkdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { browser } from "@wdio/globals";
-import type * as Tauri from "@tauri-apps/api";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 import {
@@ -27,12 +26,44 @@ const folderName = "Synthetic desktop folder";
 const screenshotDir = process.env.SYNCPEER_SCREENSHOT_DIR?.trim();
 
 async function focusPeer(peer: WebdriverIO.Browser) {
-  await peer.execute(async () => {
-    const tauri = (window as typeof window & {
-      __TAURI__: typeof Tauri;
-    }).__TAURI__;
-    await tauri.window.getCurrentWindow().setFocus();
+  // WebKitWebDriver uses page UUIDs, not X11 window IDs, and packaged Tauri
+  // correctly denies a WebView-driven native-focus command. Locate the window
+  // by moving only this WebDriver session to a distinct X11 position.
+  await peer.switchToWindow(await peer.getWindowHandle());
+  await peer.setWindowRect(peer === peers().owner ? 30 : 730, 65, 500, 450);
+  const { x } = await peer.getWindowRect();
+  const clients = spawnSync("xprop", ["-root", "_NET_CLIENT_LIST"], { encoding: "utf8" });
+  assert.equal(clients.status, 0, "Cannot enumerate packaged X11 windows");
+  const matching = (clients.stdout.match(/0x[0-9a-f]+/gi) ?? []).filter(id => {
+    const name = spawnSync("xprop", ["-id", id, "WM_NAME"], { encoding: "utf8" }).stdout;
+    if (!/Syncpeer/.test(name)) return false;
+    const info = spawnSync("xwininfo", ["-id", id], { encoding: "utf8" }).stdout;
+    const actualX = Number(info.match(/Absolute upper-left X:\s*(-?\d+)/)?.[1]);
+    return Number.isFinite(actualX) && Math.abs(actualX - x) <= 2;
   });
+  assert.equal(matching.length, 1, "Could not uniquely map the WebDriver peer to its X11 window");
+
+  const focus = spawnSync("python3", ["-c", String.raw`
+import ctypes, re, shutil, subprocess, sys
+dependencies = subprocess.check_output(["ldd", shutil.which("xprop")], text=True)
+lib_path = re.search(r"libX11\.so\.6\s+=>\s+(\S+)", dependencies)
+assert lib_path, "libX11 dependency was not found"
+x11 = ctypes.CDLL(lib_path.group(1))
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+x11.XFlush.argtypes = [ctypes.c_void_p]
+x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+display = x11.XOpenDisplay(None)
+assert display, "X11 display is unavailable"
+window = int(sys.argv[1], 16)
+x11.XRaiseWindow(display, window)
+x11.XSetInputFocus(display, window, 1, 0)
+x11.XFlush(display)
+x11.XCloseDisplay(display)
+`, matching[0]], { encoding: "utf8" });
+  assert.equal(focus.status, 0, `Could not focus the packaged X11 window: ${focus.stderr}`);
   await peer.waitUntil(() => peer.execute(() => document.hasFocus()), {
     timeout: 5_000,
     timeoutMsg: "The target desktop window did not gain focus.",

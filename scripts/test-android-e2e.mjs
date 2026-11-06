@@ -523,6 +523,7 @@ const setUiValue = async (cdp, testId, value) => {
   const updated = await cdp.evaluate(`(() => {
   const element = document.querySelector(${JSON.stringify(`[data-testid="${testId}"]`)});
   if (!(element instanceof HTMLInputElement || element instanceof HTMLSelectElement)) return false;
+  if (element.value === String(${JSON.stringify(value)})) return true;
   const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value")?.set;
   setter?.call(element, ${JSON.stringify(value)});
   element.dispatchEvent(new Event("input", { bubbles: true }));
@@ -562,17 +563,29 @@ const clickUiCancelDownload = (cdp, title) => cdp.evaluate(`(() => {
 })()`);
 
 const waitForUiDownloadButton = async (cdp, title, timeout = 30_000) => {
-  await waitForUiCondition(
-    cdp,
-    `(() => {
+  try {
+    await waitForUiCondition(
+      cdp,
+      `(() => {
+        const item = [...document.querySelectorAll(".item-title")]
+          .find((element) => element.textContent?.trim() === ${JSON.stringify(title)});
+        const button = item?.closest("li")?.querySelector("button[aria-label^='Download']");
+        return button instanceof HTMLButtonElement && !button.disabled;
+      })()`,
+      `enabled download button for ${title}`,
+      timeout,
+    );
+  } catch (cause) {
+    const buttons = await cdp.evaluate(`(() => {
       const item = [...document.querySelectorAll(".item-title")]
         .find((element) => element.textContent?.trim() === ${JSON.stringify(title)});
-      const button = item?.closest("li")?.querySelector("button[aria-label^='Download']");
-      return button instanceof HTMLButtonElement && !button.disabled;
-    })()`,
-    `enabled download button for ${title}`,
-    timeout,
-  );
+      return [...(item?.closest("li")?.querySelectorAll("button") ?? [])]
+        .map(button => ({ action: button.getAttribute("aria-label"), disabled: button.disabled }));
+    })()`).catch(() => []);
+    const folder = await readAndroidFolderState(cdp);
+    const download = await readUiDownloadState(cdp, title);
+    throw new Error(`Download action unavailable: ${JSON.stringify({ buttons, folder, download })}`, { cause });
+  }
 };
 
 const tauriInvoke = (cdp, command, args = undefined, timeout = 30_000) => cdp.evaluate(`(async () => {
@@ -778,19 +791,22 @@ const ensurePeerDocumentVault = async (cdp) => {
     const response = await tauriInvoke(cdp, "syncpeer_document_command", { request }, 60_000);
     return response.result;
   };
-  const status = await command({ operation: "status" });
-  if (status.vault.phase === "uninitialized") {
-    await command({
-      operation: "createVault",
-      password: "synthetic-android-vault",
-      remember: true,
-    });
-  } else if (status.vault.phase === "locked") {
+  // Production first-run creates a device-protected vault automatically.
+  // Do not race that initialization with a second, password-based createVault.
+  let status = await command({ operation: "status" });
+  const deadline = Date.now() + 60_000;
+  while (status.vault.phase === "uninitialized" && Date.now() < deadline) {
+    await wait(250);
+    status = await command({ operation: "status" });
+  }
+  if (status.vault.phase === "locked") {
     try {
       await command({ operation: "unlockRemembered" });
     } catch {
       await command({ operation: "unlock", password: "synthetic-android-vault" });
     }
+  } else if (status.vault.phase !== "unlocked") {
+    throw new Error(`Automatic device-local vault did not initialize: ${status.vault.phase}`);
   }
   if (targetFolderPassword) {
     await command({
@@ -894,8 +910,10 @@ const preparePeerPowerCutSession = async () => {
     // background favorite and independent DocumentsProvider grant that the
     // full cross-app acceptance initializes in its earlier phase.
     await openAndroidFolder(cdp, false);
-    await favoriteWholeFolder(cdp, targetFolderId);
+    // Request this file explicitly before the whole-folder favorite starts
+    // automatic caching; a cached file intentionally has no Download action.
     await startAndroidFileDownload(cdp, targetFileName);
+    await favoriteWholeFolder(cdp, targetFolderId);
     await disconnectAndroidSession(cdp);
     await waitForSessionService(false, 30_000);
     await grantEditorFolder();
@@ -914,8 +932,26 @@ const preparePeerPowerCutSession = async () => {
 const runPeerConnectSmoke = async () => {
   const cdp = await launchAndroidApp(true);
   try {
-    await ensurePeerDocumentVault(cdp);
+    const localOnly = process.env.SYNCPEER_ANDROID_PEER_LOCAL_VAULT_ONLY === "1";
+    // Test first-run automatic device protection separately from explicit password-vault setup.
+    if (!localOnly) await ensurePeerDocumentVault(cdp);
     if (!await openAndroidConnection(cdp)) throw new Error("Android real-peer connection did not open.");
+    if (localOnly) {
+      const status = await documentCommand(cdp, { operation: "status" });
+      if (status.vault.phase !== "unlocked") throw new Error("Automatic local vault did not unlock.");
+      const owned = await documentCommand(cdp, { operation: "ownedDevices" });
+      if (owned.devices.length || owned.localDeviceId) {
+        throw new Error("A fresh local-only profile unexpectedly has Personal Space membership.");
+      }
+      await openAndroidFolder(cdp);
+      await waitForAndroidFileRow(cdp, targetFileName);
+      const folder = await readAndroidFolderState(cdp);
+      if (!folder.status?.registered || !folder.status.downloads) {
+        throw new Error(`Automatic local vault did not attach the encrypted Syncthing folder: ${JSON.stringify(folder)}`);
+      }
+      console.log("Android automatic local vault connected, unlocked and indexed a Syncthing folder without Personal Space.");
+      return;
+    }
     await openAndroidFolder(cdp, false, process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1");
     // Saving a folder password changes the service session configuration.
     // The active BEP session is intentionally replaced; assert that the
@@ -1050,8 +1086,8 @@ const runPeerCrossAppWorkflow = async () => {
     cdp = await launchAndroidApp(true);
     if (!await openAndroidConnection(cdp)) throw new Error("Peer workflow did not connect.");
     await openAndroidFolder(cdp, false);
-    await favoriteWholeFolder(cdp, targetFolderId);
     await startAndroidFileDownload(cdp, targetFileName);
+    await favoriteWholeFolder(cdp, targetFolderId);
     await disconnectAndroidSession(cdp);
     await waitForSessionService(false, 30_000);
     await grantEditorFolder();
@@ -1745,6 +1781,24 @@ const completeAndroidDeviceNaming = async (cdp, name) => {
   return true;
 };
 
+const awaitAndroidConnection = async (cdp) => {
+  const deadline = Date.now() + connectionTimeoutMs;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    const state = await observeCdp(cdp, `(() => ({
+      label: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() || "",
+      error: document.querySelector("p.error")?.textContent?.trim() || "",
+    }))()`);
+    if (state?.label === "Connected") return true;
+    if (state?.error) lastError = state.error;
+    await wait(10_000);
+  }
+  const state = await readAndroidFolderState(cdp);
+  const events = await readAndroidSessionEvents(cdp);
+  throw new Error("Timed out waiting for Android UI connection approval: " +
+    JSON.stringify({ ...state, lastError, events }));
+};
+
 const openAndroidConnection = async (cdp) => {
   if (!serverDeviceId) {
     console.log("Android network UI workflow skipped: no server device ID configured.");
@@ -1772,10 +1826,6 @@ const openAndroidConnection = async (cdp) => {
   // adding a device, rather than racing an old default-server attempt.
   // Only an existing active session needs an explicit disconnect; pausing a
   // fresh session here used to abort its first legitimate connect attempt.
-  const initiallyConnected = await cdp.evaluate(
-    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
-  );
-  if (initiallyConnected) await setAndroidAutomaticConnectionPaused(cdp, true);
   const peerSaved = await cdp.evaluate(
     `Array.from(document.querySelectorAll('[data-testid="connection-saved-device"] option'))` +
     `.some(option => option.value === ${JSON.stringify(serverDeviceId)})`,
@@ -1789,6 +1839,31 @@ const openAndroidConnection = async (cdp) => {
     })()`);
     if (!configured) throw new Error("Android E2E relay-pool override is unavailable.");
   }
+  const storedSettings = await cdp.evaluate(`(() => ({
+    mode: document.querySelector("[data-testid=connection-discovery-mode]")?.value,
+    server: document.querySelector("[data-testid=connection-discovery-server]")?.value,
+    host: document.querySelector("[data-testid=connection-host]")?.value,
+    port: document.querySelector("[data-testid=connection-port]")?.value,
+    listenPort: document.querySelector("[data-testid=connection-listen-port]")?.value,
+    remoteId: document.querySelector("[data-testid=connection-remote-id]")?.value,
+  }))()`);
+  const restoredTarget = peerSaved && !relayPoolUrl &&
+    storedSettings.mode === discoveryMode &&
+    normalizeDeviceId(storedSettings.remoteId ?? "") === normalizeDeviceId(serverDeviceId) &&
+    (!discoveryServer || storedSettings.server === discoveryServer) &&
+    Number(storedSettings.listenPort) === Number(androidListenPort) &&
+    (discoveryMode !== "direct" ||
+      (storedSettings.host === directHost && Number(storedSettings.port) === Number(directPort)));
+  if (restoredTarget) {
+    // A power-cut restart must resume from persisted settings. Re-applying
+    // unchanged controls here would create synthetic disconnect/cancel races.
+    await setAndroidAutomaticConnectionPaused(cdp, false);
+    return await awaitAndroidConnection(cdp);
+  }
+  const initiallyConnected = await cdp.evaluate(
+    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+  );
+  if (initiallyConnected) await setAndroidAutomaticConnectionPaused(cdp, true);
   // Direct mode also requires an explicitly saved peer; entering the ID alone
   // does not authorize auto-connection under the current peer policy.
   if (peerSaved) await setUiValue(cdp, "connection-saved-device", "");
@@ -1829,13 +1904,13 @@ const openAndroidConnection = async (cdp) => {
       return true;
     })()`);
     if (!added) throw new Error("Android UI could not save the managed Syncthing peer.");
-  if (discoveryMode === "direct") {
-    // Add Device intentionally selects automatic discovery. Restore the
-    // explicitly requested direct transport after saving the peer.
-    await setUiValue(cdp, "connection-discovery-mode", "direct");
-    await setUiValue(cdp, "connection-host", directHost);
-    await setUiValue(cdp, "connection-port", directPort);
-  }
+    // Saving a new peer selects automatic discovery. Restore whichever transport
+    // this scenario requested, not only direct mode (the relay test uses global).
+    await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
+    if (discoveryMode === "direct") {
+      await setUiValue(cdp, "connection-host", directHost);
+      await setUiValue(cdp, "connection-port", directPort);
+    }
   }
   const appliedSettings = await cdp.evaluate(`(() => ({
     mode: document.querySelector("[data-testid=connection-discovery-mode]")?.value,
@@ -1849,23 +1924,7 @@ const openAndroidConnection = async (cdp) => {
     throw new Error(`Android connection settings did not survive setup: ${JSON.stringify(appliedSettings)}`);
   }
   await setAndroidAutomaticConnectionPaused(cdp, false);
-  const deadline = Date.now() + connectionTimeoutMs;
-  let lastError = "";
-  while (Date.now() < deadline) {
-    const state = await observeCdp(cdp, `(() => {
-      return {
-        label: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() || "",
-        error: document.querySelector("p.error")?.textContent?.trim() || "",
-      };
-    })()`);
-    if (state?.label === "Connected") return true;
-    if (state?.error) lastError = state.error;
-    await wait(10_000);
-  }
-  const state = await readAndroidFolderState(cdp);
-  const events = await readAndroidSessionEvents(cdp);
-  throw new Error(`Timed out waiting for Android UI connection approval: ` +
-    JSON.stringify({ ...state, lastError, events }));
+  return await awaitAndroidConnection(cdp);
 };
 
 const runAndroidBackgroundSessionLifecycle = async (cdp) => {
@@ -1937,7 +1996,7 @@ const readAndroidSessionEvents = async (cdp) => {
       .map(row => {
         const event = row.querySelector(".item-meta")?.textContent?.split("|").at(-1)?.trim();
         if (!/^(core|client|document|session|cluster|untrusted)\\./.test(event ?? "")) return null;
-        if (!/^(core\\.cluster|core\\.index|core\\.replica\\.index|core\\.untrusted\\.folder|client\\.shared_folders|cluster\\.folder|untrusted\\.folder)/.test(event)) return event;
+        if (!/^(core\\.cluster|core\\.index|core\\.replica\\.index|core\\.untrusted\\.folder|core\\.document\\.command\\.slow|client\\.shared_folders|cluster\\.folder|untrusted\\.folder)/.test(event)) return event;
         let details = {};
         try { details = JSON.parse(row.querySelector(".log-details")?.textContent ?? "{}"); }
         catch { /* Only public flags and counts are included below. */ }
@@ -1949,6 +2008,14 @@ const readAndroidSessionEvents = async (cdp) => {
           "remoteTokenLengthFromPeer", "localTokenLength", "tokenValid",
           "needsPassword", "hasFolderCrypto", "stopReason", "sourceType", "echoedType",
         ].filter(key => Object.hasOwn(details, key)).map(key => [key, details[key]]));
+        if (event === "core.document.command.slow") {
+          if (typeof details.operation === "string" && /^[a-zA-Z]{1,64}$/.test(details.operation)) {
+            safe.operation = details.operation;
+          }
+          if (Number.isSafeInteger(details.durationMs) && details.durationMs >= 0) {
+            safe.durationMs = details.durationMs;
+          }
+        }
         return Object.keys(safe).length ? { event, ...safe } : event;
       })
       .filter(Boolean)
@@ -2543,12 +2610,22 @@ const openFolderSettings = async (cdp, folderId = targetFolderId) => {
 
 const openGeneralSettings = async (cdp) => {
   await waitForUiCondition(cdp,
-    'document.querySelector("[data-testid=tab-devices]") !== null', "devices tab");
+    'document.querySelector("[data-testid=device-name-onboarding]") !== null || document.querySelector("[data-testid=tab-devices]") !== null',
+    "device onboarding or navigation", 60_000);
+  await completeAndroidDeviceNaming(cdp, "Syncpeer pairing test device");
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=tab-devices]") !== null', "devices tab", 60_000);
   await clickUiTestId(cdp, "tab-devices");
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
+    "device controls after protected-state hydration", 90_000);
   await cdp.evaluate(`(() => {
     const toggle = document.querySelector("[data-testid=connection-settings-toggle]");
     if (toggle?.getAttribute("aria-expanded") !== "true") toggle?.click();
   })()`);
+  await waitForUiCondition(cdp,
+    'document.querySelector("[data-testid=general-settings]") !== null',
+    "personal-space settings button", 60_000);
   await clickUiTestId(cdp, "general-settings");
   await waitForUiCondition(cdp,
     'document.querySelector("[data-testid=general-settings-page]") !== null', "general settings page");
@@ -2600,17 +2677,15 @@ const runPairingInvitation = async (outputPath) => {
   if (!advertisedHost) throw new Error("SYNCPEER_PAIRING_ADVERTISED_HOST is required.");
   const cdp = await launchAndroidApp(true);
   try {
-    const status = await tauriInvoke(cdp, "syncpeer_document_command", {
-      request: { operation: "status" },
-    }, 60_000);
-    if (status.result.vault.phase === "uninitialized") {
+    await ensurePeerDocumentVault(cdp);
+    const status = await documentCommand(cdp, { operation: "status" });
+    if (!status.vault.personalSpaceEnabled) {
       const kit = await createOwnedRecoveryKit(crypto.subtle,
         size => crypto.getRandomValues(new Uint8Array(size)), "synthetic-offline-kit-password");
-      const deviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id", {}, 60_000);
-      await tauriInvoke(cdp, "syncpeer_document_command", { request: {
-        operation: "createVault", password: "synthetic-owner-master-password", remember: true,
-        localDeviceId: deviceId, recoveryKey: kit.publicKey,
-      } }, 60_000);
+      const localDeviceId = await tauriInvoke(cdp, "syncpeer_get_default_device_id", {}, 60_000);
+      await documentCommand(cdp, { operation: "upgradeToPersonalSpace",
+        password: "synthetic-owner-master-password", remember: true,
+        localDeviceId, recoveryKey: kit.publicKey });
     }
     await openGeneralSettings(cdp);
     await cdp.evaluate("window.confirm = () => true");
@@ -3002,8 +3077,12 @@ const runWholeFolderVerify = async () => {
 };
 
 const runWholeFolderConnection = async () => {
-  const cdp = await launchAndroidApp(true);
+  let cdp = await launchAndroidApp(true);
   try {
+    // Background syncing is explicitly opt-in. Restart to refresh the adapter policy cache.
+    await enableBackgroundSyncOptIn(cdp);
+    cdp.close();
+    cdp = await launchAndroidApp(true);
     console.log("Android cross-app phase: opening the direct peer link.");
     if (!await openAndroidConnection(cdp)) throw new Error("Whole-folder peer did not connect.");
     const publicationTrace = await cdp.evaluate(
@@ -3128,12 +3207,69 @@ const runAndroidOnboardingSmoke = async () => {
       throw new Error(`Fresh Android onboarding is not a standalone full-screen name step: ${JSON.stringify(geometry)}`);
     }
     await completeAndroidDeviceNaming(cdp, "Android smoke device");
+    await waitForUiCondition(cdp,
+      `Boolean(document.querySelector("[data-testid='first-peer-invitation']"))`,
+      "first peer invitation after device-name confirmation", 60_000);
+    await cdp.evaluate(`(() => {
+      const button = document.querySelector("[data-testid='first-peer-manual']");
+      if (!(button instanceof HTMLButtonElement)) throw new Error("Manual first-peer action is unavailable.");
+      button.click();
+      return true;
+    })()`);
+    await waitForUiCondition(cdp,
+      `document.activeElement?.getAttribute('data-testid') === 'new-peer-device-id'`,
+      "manual peer ID entry focused without automatic authorization", 30_000);
+    if (await cdp.evaluate(`document.querySelector("[data-testid='new-peer-device-id']")?.value`) !== "") {
+      throw new Error("A new peer was implicitly configured before entering its device ID.");
+    }
     const errors = runAdb(["logcat", "-d", "-s", "Tauri/Console:E"]);
     if (errors.includes("effect_update_depth_exceeded")) {
       throw new Error("Svelte effect update loop reappeared in the Android WebView.");
     }
     console.log("Android WebView full-screen name-only onboarding and navigation smoke passed.");
   } finally { cdp.close(); }
+};
+
+const runAndroidLocalResetAcceptance = async () => {
+  if (process.env.SYNCPEER_ANDROID_RESET_EMULATOR !== "1" ||
+    runAdb(["shell", "getprop", "ro.kernel.qemu"]).trim() !== "1") {
+    throw new Error("Local reset acceptance requires an explicitly authorized disposable Android emulator.");
+  }
+  const outside = "/sdcard/Download/syncpeer-reset-acceptance-fixture.txt";
+  runAdb(["shell", "touch", outside]);
+  let cdp = await launchAndroidApp(true);
+  try {
+    await ensurePeerDocumentVault(cdp);
+    const original = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+    if (typeof original !== "string" || !original) throw new Error("Reset fixture identity was not created.");
+    // clearApplicationUserData kills the invoking process, often tearing down
+    // the DevTools connection before evaluate() can receive its return value.
+    try {
+      await cdp.evaluate(`(() => {
+        const invoke = globalThis.__TAURI__?.core?.invoke ?? globalThis.__TAURI_INTERNALS__?.invoke;
+        if (typeof invoke !== "function") throw new Error("Native reset command is unavailable.");
+        void invoke("syncpeer_reset_local_data", { confirmation: "RESET LOCAL DATA" }).catch(() => {});
+        return "issued";
+      })()`);
+    } catch (error) {
+      if (!/CDP connection failed|WebSocket.*closed|Target closed/i.test(String(error))) throw error;
+    }
+    await waitForPackageStopped(45_000);
+    cdp.close();
+    cdp = await launchAndroidApp();
+    await waitForUiCondition(cdp,
+      `Boolean(document.querySelector("[data-testid='device-name-onboarding']"))`,
+      "fresh device-name onboarding after native local reset", 90_000);
+    const replacement = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+    if (!replacement || replacement === original) throw new Error("Native local reset retained the previous app-managed identity.");
+    if (!runAdb(["shell", "ls", outside]).includes("syncpeer-reset-acceptance-fixture.txt")) {
+      throw new Error("Native local reset affected an external storage fixture.");
+    }
+    console.log("Android native local reset passed: process cleared, fresh onboarding and identity, external data retained.");
+  } finally {
+    cdp.close();
+    runAdb(["shell", "rm", "-f", outside]);
+  }
 };
 
 const main = async () => {
@@ -3171,6 +3307,10 @@ const main = async () => {
     await runAndroidOnboardingSmoke();
     return;
   }
+  if (hasArgument("--local-reset-acceptance")) {
+    await runAndroidLocalResetAcceptance();
+    return;
+  }
   if (hasArgument("--startup-smoke")) {
     const cdp = await launchAndroidApp(true);
     try {
@@ -3182,6 +3322,47 @@ const main = async () => {
     } finally { cdp.close(); }
     return;
   }
+  if (hasArgument("--status-latency-smoke") || hasArgument("--status-contention-smoke")) {
+    const cdp = await launchAndroidApp(true);
+    try {
+      const coldStarted = performance.now();
+      const initial = await documentCommand(cdp, { operation: "status" });
+      const coldStartStatusMs = Math.round(performance.now() - coldStarted);
+      if (!initial?.vault) throw new Error("Android cold-start status did not return vault state.");
+      await ensurePeerDocumentVault(cdp);
+      const samples = [];
+      for (const operation of ["status", "cacheRegistrations", "status", "cacheRegistrations",
+        "status", "cacheRegistrations", "status", "cacheRegistrations"]) {
+        const started = performance.now();
+        const result = await documentCommand(cdp, { operation });
+        if (result?.vault?.phase !== "unlocked") throw new Error(`Android ${operation} returned a locked vault.`);
+        samples.push({ operation, durationMs: Math.round(performance.now() - started) });
+      }
+      const concurrent = hasArgument("--status-contention-smoke")
+        ? await Promise.all(Array.from({ length: 24 }, async (_, index) => {
+          const operation = ["status", "cacheRegistrations", "ownedDevices", "connectionPasswords"][index % 4];
+          const started = performance.now();
+          const result = await documentCommand(cdp, { operation });
+          if (operation === "status" || operation === "cacheRegistrations") {
+            if (result?.vault?.phase !== "unlocked") throw new Error(`Concurrent ${operation} lost vault state.`);
+          } else if (operation === "ownedDevices" && !Array.isArray(result?.devices)) {
+            throw new Error("Concurrent ownedDevices returned invalid membership.");
+          } else if (operation === "connectionPasswords" && (!result || typeof result !== "object")) {
+            throw new Error("Concurrent connectionPasswords failed.");
+          }
+          return { operation, durationMs: Math.round(performance.now() - started) };
+        })) : [];
+      const maxDurationMs = Math.max(coldStartStatusMs, ...samples.map(sample => sample.durationMs),
+        ...concurrent.map(sample => sample.durationMs));
+      console.log(`Android document status latency (API ${sdkVersion}): ${JSON.stringify({ coldStartStatusMs, samples, concurrent, maxDurationMs })}`);
+      const budgetMs = Number(process.env.SYNCPEER_ANDROID_STATUS_BUDGET_MS ?? 10_000);
+      if (!Number.isFinite(budgetMs) || budgetMs <= 0 || maxDurationMs > budgetMs) {
+        throw new Error(`Android status latency ${maxDurationMs}ms exceeded budget ${budgetMs}ms.`);
+      }
+    } finally { cdp.close(); }
+    return;
+  }
+
 
   const deviceIdPath = argumentValue("--write-device-id");
   if (deviceIdPath) {

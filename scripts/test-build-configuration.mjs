@@ -437,6 +437,18 @@ test("the combined Android workflow covers API 26, 29 and 36", () => {
   assert.match(runner, /editorProject, "assembleDebug"/);
 });
 
+test("Android session status listener commands are permitted in the Tauri capability", () => {
+  const plugin = "packages/tauri-shell/src-tauri/plugins/syncpeer-android";
+  const build = fs.readFileSync(plugin + "/build.rs", "utf8");
+  const permissions = fs.readFileSync(plugin + "/permissions/default.toml", "utf8");
+  const capability = JSON.parse(fs.readFileSync("packages/tauri-shell/src-tauri/capabilities/default.json", "utf8"));
+  assert.match(build, /"registerListener"/);
+  assert.match(build, /"removeListener"/);
+  assert.match(permissions, /allow-registerListener/);
+  assert.match(permissions, /allow-removeListener/);
+  assert.ok(capability.permissions.includes("syncpeer-android:default"));
+});
+
 test("Android service exposes same-UID private session commands without opening a second peer", () => {
   const base = "packages/tauri-shell/src-tauri/plugins/syncpeer-android";
   const provider = fs.readFileSync(base + "/android/src/main/java/dev/syncpeer/plugin/android/SyncpeerDocumentsProvider.kt", "utf8");
@@ -475,12 +487,61 @@ test("Android session stop cannot report idle after a transport shutdown timeout
   assert.match(stop, /sessionPhase = "error"/);
   assert.match(stop, /sessionPhase = "idle"/);
 });
+test("Android metadata-only connections do not depend on an unlocked document vault", () => {
+  const runtime = fs.readFileSync("packages/tauri-shell/src/document-runtime.ts", "utf8");
+  assert.match(runtime, /private documentFoldersAvailable = async/);
+  assert.match(runtime, /const sharedFolders = await this\.documentFoldersAvailable\(\)/);
+  assert.match(runtime, /deferDiscoveredFolderRegistration\(this\.documents, eligible/);
+  assert.match(runtime, /consentedDiscoveredFolders\(folders, options\.consentedFolderIds\)/);
+  assert.doesNotMatch(runtime, /if \(await this\.documentFoldersAvailable\(\)\) \{\s*for \(const folder of folders\)/);
+});
+
+test("Android debug runtime reports bounded queue vs execution delays without payloads", () => {
+  const service = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
+  assert.match(service, /SystemClock\.elapsedRealtime\(\)/);
+  assert.match(service, /document\.runtime\.\$phase operation=\$safeOperation durationMs=\$durationMs/);
+  assert.match(service, /ApplicationInfo\.FLAG_DEBUGGABLE/);
+  assert.match(service, /diagnosticOperation\?\.takeIf/);
+  const harness = fs.readFileSync("scripts/test-android-peer.ts", "utf8");
+  assert.match(harness, /SYNCPEER_ANDROID_RUNTIME_PROFILE/);
+  assert.match(harness, /document\\\.runtime/);
+});
+
+test("Android config refresh does not preemptively close the active peer listener", () => {
+  const runtime = fs.readFileSync("packages/tauri-shell/src/document-runtime.ts", "utf8");
+  const begin = runtime.indexOf("this.documents.onSessionConfigurationChange(() =>");
+  const end = runtime.indexOf("  private createLifecycle()", begin);
+  const callback = runtime.slice(begin, end);
+  assert.ok(begin > 0 && end > begin);
+  assert.match(callback, /this.lifecycle.ensureSession\(this.activeOptions\)/);
+  assert.doesNotMatch(callback, /stopIncomingService\(/);
+  assert.match(runtime, /this.incomingService.updateSessionHandlers\(sessionHandlers\)/);
+});
+
+test("Android pending connect becomes native-connected only after matching authenticated peer status", () => {
+  const runtime = fs.readFileSync("packages/tauri-shell/src/document-runtime.ts", "utf8");
+  const bridge = fs.readFileSync("packages/core/src/sync/serviceRemoteFs.ts", "utf8");
+  const kotlin = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
+  assert.match(runtime, /remoteDeviceId: active && !active\.isClosed\(\) \? active\.remoteDeviceId : null/);
+  assert.match(runtime, /core\.session\.connect\.confirmation_pending/);
+  assert.match(runtime, /return \{ phase: "reconnecting" \}/);
+  assert.match(bridge, /Android service did not confirm its peer connection/);
+  assert.match(kotlin, /uiConnectExpectedPeer/);
+  assert.match(kotlin, /verifiedPeer == uiConnectExpectedPeer/);
+  assert.match(kotlin, /sessionPhase != "stopping"/);
+  assert.match(kotlin, /sessionStarted = true/);
+});
+
 test("Android UI connect and disconnect update the service-owned session inventory", () => {
   const kotlin = fs.readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
   const handler = kotlin.slice(kotlin.indexOf("fun sessionCommand(input:"), kotlin.indexOf("internal fun startBackgroundSession("));
   assert.match(handler, /operation == "disconnect"/);
   assert.match(handler, /stopSession\(persist = true\)/);
-  assert.match(handler, /sessionStarted = true/);
+  assert.match(handler, /sessionStarted = phase == "connected"/);
+  assert.match(handler, /uiConnectPending/);
+  assert.match(handler, /generation == uiConnectGeneration/);
   assert.match(handler, /sessionPhase =/);
 });
 

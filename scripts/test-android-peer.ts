@@ -540,6 +540,17 @@ const main = async (): Promise<void> => {
     } catch { console.error("Android runtime event names unavailable."); }
     throw error;
   } finally {
+    if (process.env.SYNCPEER_ANDROID_RUNTIME_PROFILE === "1" && emulator) {
+      try {
+        const timing = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"])
+          .split("\n")
+          .flatMap(line => {
+            const match = /document\.runtime\.(queue_slow|execution_slow|async_slow) operation=([A-Za-z]{1,48}) durationMs=(\d+)/.exec(line);
+            return match ? [{ phase: match[1], operation: match[2], durationMs: Number(match[3]) }] : [];
+          }).slice(-80);
+        console.log("Android document worker latency:", JSON.stringify(timing));
+      } catch { console.log("Android document worker latency was unavailable."); }
+    }
     if (discovery) {
       try { adb(["reverse", "--remove", `tcp:${discovery.port}`]); } catch { /* Emulator stopped. */ }
       await discovery.close();

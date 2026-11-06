@@ -34,6 +34,18 @@ const selectedSerials = () => {
     serial => adb(serial, ["shell", "getprop", "ro.kernel.qemu"]).trim() === "1");
 };
 
+const waitForBoot = async (serial: string) => {
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    try {
+      if (adb(serial, ["shell", "getprop", "sys.boot_completed"]).trim() === "1" &&
+        adb(serial, ["shell", "pm", "path", "android"]).includes("package:")) return;
+    } catch { /* Android may advertise ADB before PackageManager is ready. */ }
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`Android emulator ${serial} did not finish booting.`);
+};
+
 const phaseEnvironment = (serial: string, remoteDeviceId = "") => ({
   ...process.env,
   ANDROID_SERIAL: serial,
@@ -69,15 +81,17 @@ const spawnPhase = (serial: string, args: string[], extra: NodeJS.ProcessEnv = {
   };
 };
 
-const waitForFile = async (file: string) => {
-  const deadline = Date.now() + 30_000;
+const waitForFile = async (file: string, owner: ChildProcess) => {
+  const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
     if (fs.existsSync(file) && fs.statSync(file).size > 0) return;
+    if (owner.exitCode !== null || owner.signalCode !== null) {
+      throw new Error("Android pairing owner exited before producing an invitation.");
+    }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  throw new Error("Android pairing owner did not produce an invitation.");
+  throw new Error("Android pairing owner did not produce an invitation within 120 seconds.");
 };
-
 const readDeviceId = (serial: string, directory: string) => {
   const output = path.join(directory, `${serial}-device-id`);
   runPhase(serial, ["--write-device-id", output]);
@@ -143,7 +157,9 @@ const main = async () => {
   const [firstSerial, secondSerial] = selectedSerials();
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-two-android-"));
   const invitation = path.join(directory, "pairing-invitation.json");
+  let owner: ReturnType<typeof spawnPhase> | undefined;
   try {
+    await Promise.all([firstSerial, secondSerial].map(waitForBoot));
     for (const serial of [firstSerial, secondSerial]) {
       try { adb(serial, ["uninstall", appPackage], true); } catch { /* Fresh install is best-effort. */ }
       try { adb(serial, ["uninstall", editorPackage], true); } catch { /* Fresh install is best-effort. */ }
@@ -161,11 +177,12 @@ const main = async () => {
     }
     adb(secondSerial, ["emu", "redir", "add", "tcp:23001:22000"], true);
 
-    const owner = spawnPhase(firstSerial,
+    owner = spawnPhase(firstSerial,
       ["--pairing-owner", "--pairing-invitation", invitation], {
         SYNCPEER_PAIRING_ADVERTISED_HOST: "10.0.2.2:23000",
       });
-    await waitForFile(invitation);
+    void owner.completed.catch(() => undefined);
+    await waitForFile(invitation, owner.child);
     const appUid = Number(adb(firstSerial, ["shell", "run-as", appPackage, "id", "-u"]).trim());
     const pairingPort = androidSingleListeningPort(
       adb(firstSerial, ["shell", "cat", "/proc/net/tcp"]), appUid);
@@ -222,6 +239,7 @@ const main = async () => {
     });
     console.log("Two packaged Android Syncpeer peers passed pairing, whole-folder CRUD, safe and unsafe local release.");
   } finally {
+    if (owner?.child.exitCode === null && owner.child.signalCode === null) owner.child.kill("SIGTERM");
     fs.rmSync(directory, { recursive: true, force: true });
   }
 };

@@ -74,12 +74,16 @@ const main = async (): Promise<void> => {
     {
       name: "Syncpeer peer TLS interoperability",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-peer-session-manager.ts", "scripts/test-incoming-peer-service.ts", "scripts/test-android-peer-targets.ts", "scripts/test-syncpeer-peers.ts"],
+      // Socket-heavy peer test files share timing-sensitive handshakes. Keep files isolated;
+      // the tests within each file still exercise concurrent peer connections.
+      args: ["--experimental-strip-types", "--test", "--test-concurrency=1", "scripts/test-peer-session-manager.ts", "scripts/test-incoming-peer-service.ts", "scripts/test-android-peer-targets.ts", "scripts/test-syncpeer-peers.ts"],
     },
     {
       name: "Standard Syncthing relay pairing and peer transport",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-relay-service.ts", "scripts/test-automatic-relay.ts", "scripts/test-native-discovery.ts", "scripts/test-relay-retry.ts", "scripts/test-relay-sync.ts"],
+      // Local Syncthing relay instances have overlapping process/socket lifetimes.
+      // Keep test files isolated; the explicit concurrent-invitation test still stresses parallel peers.
+      args: ["--experimental-strip-types", "--test", "--test-concurrency=1", "scripts/test-relay-service.ts", "scripts/test-automatic-relay.ts", "scripts/test-native-discovery.ts", "scripts/test-relay-retry.ts", "scripts/test-relay-sync.ts"],
     },
     {
       name: "Durable folder replica indexes",
@@ -89,7 +93,7 @@ const main = async (): Promise<void> => {
     {
       name: "Folder replica pause and status controls",
       command: process.execPath,
-      args: ["--experimental-strip-types", "--test", "scripts/test-replica-control.ts", "scripts/test-folder-registry.ts", "scripts/test-document-filesystem.ts", "scripts/test-document-drafts.ts", "scripts/test-document-cache.ts", "scripts/test-encrypted-scratch.ts", "scripts/test-document-runtime.mjs"],
+      args: ["--experimental-strip-types", "--test", "scripts/test-replica-control.ts", "scripts/test-folder-registry.ts", "scripts/test-document-filesystem.ts", "scripts/test-document-drafts.ts", "scripts/test-document-cache.ts", "scripts/test-encrypted-scratch.ts", "scripts/test-discovered-folder-registration.ts", "scripts/test-document-runtime.mjs"],
     },
     {
       name: "Shared replica storage ownership",
@@ -153,6 +157,7 @@ const main = async (): Promise<void> => {
         "scripts/test-service-download-bridge.ts",
         "scripts/test-service-upload-bridge.ts",
         "scripts/test-service-remote-fs.ts",
+        "scripts/test-connected-session-confirmation.ts",
         "scripts/test-background-sync-policy.ts",
         "scripts/test-session-peer-status.ts",
       ],
@@ -216,6 +221,7 @@ const main = async (): Promise<void> => {
         "scripts/test-app-connection-settings.ts",
         "scripts/test-app-diagnostics.ts",
         "scripts/test-encrypted-ui-state.ts",
+        "scripts/test-latest-distinct-task.ts",
         "scripts/test-session-logs.ts",
         "scripts/test-log-file-android.ts",
         "scripts/test-owned-devices-cache.ts",

@@ -479,3 +479,58 @@ test("a lifecycle replacement rebinds remoteFs while preserving the selected fol
   assert.equal(connectionCalls, callsAtStop,
     "Queued recovery must not reconnect after the lifecycle stops.");
 });
+
+test("a late folder index cannot invalidate an authenticated reconnect", async () => {
+  let clock = 0;
+  let indexReceived = true;
+  const folder = {
+    id: "late-index", label: "Late index", readOnly: false,
+    encrypted: false, needsPassword: false,
+  };
+  const remoteFs: RemoteFsLike = {
+    listFolders: async () => [folder],
+    requestFolderIndex: async () => undefined,
+    setFocusedFolder: () => undefined,
+    readDir: async () => [],
+    readFileFully: async () => new Uint8Array(),
+    writeFileFully: async () => undefined,
+  };
+  const versions = () => [{
+    folderId: folder.id, remoteIndexId: "1", remoteMaxSequence: "1", indexReceived,
+  }];
+  const store = createSyncpeerSessionStore({
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; },
+    transport: {
+      connectAndSync: async () => remoteFs,
+      connectAndGetOverview: async () => ({
+        folders: [folder], device: null, folderSyncStates: versions(),
+        connectedVia: "fixture", transportKind: "direct-tcp" as const,
+      }),
+      connectAndGetFolderVersions: async () => versions(),
+    },
+  });
+  const options = {
+    host: "127.0.0.1", port: 22000, deviceName: "late-index-fixture",
+    discoveryMode: "direct" as const,
+  };
+  await store.actions.connect(options);
+  await store.actions.openFolder(folder.id, options);
+  indexReceived = false;
+  await store.actions.connect(options);
+  assert.equal(store.getState().phase, "connected");
+  assert.equal(store.getState().remoteFs, remoteFs);
+  assert.equal(store.getState().directory.status, "error");
+  indexReceived = true;
+  await store.actions.reloadCurrentDirectory(options);
+  assert.equal(store.getState().directory.status, "ready");
+  indexReceived = false;
+  await store.actions.refreshOverview(options);
+  assert.equal(store.getState().phase, "connected",
+    "A late folder index during refresh must not mark the authenticated session failed.");
+  assert.equal(store.getState().remoteFs, remoteFs);
+  assert.equal(store.getState().directory.status, "error");
+  indexReceived = true;
+  await store.actions.reloadCurrentDirectory(options);
+  assert.equal(store.getState().directory.status, "ready");
+});

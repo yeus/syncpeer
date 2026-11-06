@@ -155,8 +155,17 @@ async function waitForDesktopFile(name: string, expected: string | null) {
     }
     await browser.pause(500);
   }
+  const diagnostics = await browser.execute(async (id: string) => {
+    const test = window as typeof window & {
+      __syncpeerStateProbe?: () => unknown;
+      __syncpeerStoreStateProbe?: () => unknown;
+      __syncpeerDocumentProbe?: (folderId: string) => Promise<unknown>;
+    };
+    return { ui: test.__syncpeerStateProbe?.(), store: test.__syncpeerStoreStateProbe?.(),
+      folder: await test.__syncpeerDocumentProbe?.(id) };
+  }, folderId).catch(error => ({ probeError: String(error) }));
   throw new Error(`Desktop did not converge ${name} to the expected synthetic state. ` +
-    `Last observation: ${observation}`);
+    `Last observation: ${observation}; diagnostics=${JSON.stringify(diagnostics)}`);
 }
 
 
@@ -529,9 +538,6 @@ describe("Packaged desktop to Android pairing", () => {
         if (!relayFallback) throw new Error("Relay fallback control is unavailable.");
         if (!relayFallback.checked) relayFallback.click();
       }, { remoteId: androidId, discoveryServer: discovery.discoveryServer });
-      if ((await connectionControl.getText()).includes("Resume automatic connection")) {
-        await connectionControl.click();
-      }
 
 
       const androidRelay = spawn(process.execPath,
@@ -548,13 +554,25 @@ describe("Packaged desktop to Android pairing", () => {
             SYNCPEER_LAN_RELAY_POOL_URL: discovery.relayPoolUrl,
           },
         });
+      const relayFinished = new Promise<void>((resolve, reject) => {
+        androidRelay.once("error", reject);
+        androidRelay.once("exit", code => code === 0
+          ? resolve()
+          : reject(new Error(`Android relay connection failed: ${code}`)));
+      });
+      // Install handlers before waiting for the relay advertisement.
+      void relayFinished.catch(() => undefined);
       try {
-        await new Promise<void>((resolve, reject) => {
-          androidRelay.once("error", reject);
-          androidRelay.once("exit", code => code === 0
-            ? resolve()
-            : reject(new Error(`Android relay connection failed: ${code}`)));
-        });
+        // Avoid racing a discovery lookup against the relay fixture's first
+        // announcement. The Android connection attempt is already active.
+        await browser.waitUntil(() => Boolean(
+          discovery.announcements()[androidId.replaceAll("-", "")]?.length,
+        ), { timeout: 60_000, interval: 500,
+          timeoutMsg: "Android relay endpoint was not announced to local discovery." });
+        if ((await connectionControl.getText()).includes("Resume automatic connection")) {
+          await connectionControl.click();
+        }
+        await relayFinished;
         try {
           await browser.waitUntil(async () =>
             (await $("[data-testid='connection-status']").getText()).includes("Connected"),

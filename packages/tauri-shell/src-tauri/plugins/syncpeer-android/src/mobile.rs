@@ -91,6 +91,11 @@ impl<R: Runtime> SyncpeerAndroid<R> {
       .map_err(Into::into)
   }
 
+  pub fn disarm_background_session(&self) -> crate::Result<()> {
+    self.0.run_mobile_plugin::<serde_json::Value>("disarmBackgroundSession", json!({}))
+      .map(|_| ()).map_err(Into::into)
+  }
+
   pub fn stop_background_session(&self) -> crate::Result<()> {
     self
       .0

@@ -492,7 +492,7 @@ class TauriAdapters {
         this.keepSyncingInBackgroundCache = null;
         const next = request.settings as SyncpeerProfileSettings | undefined;
         if (next?.profile?.keepSyncingInBackground !== true) {
-          await this.serviceCommand({ operation: "disarmBackground" });
+          await this.disarmBackgroundSession();
         }
       }
       if (changesSessionConfiguration(request.operation)) this.invalidateSessionConfiguration();
@@ -683,14 +683,21 @@ class TauriAdapters {
   private async startBackgroundSession(options: Omit<ConnectOptions, "sharedFolders">) {
     const request = await this.androidBackgroundSessionRequest(options);
     if (!request) {
-      // Opt-out must also clear a previously armed native Activity callback.
-      await this.stopBackgroundSession();
+      // Disarm the callback and persisted policy, never the visible peer socket.
+      await this.disarmBackgroundSession();
       return;
     }
     await this.invokeWithLogging("syncpeer_android_start_background_session", { request });
   }
 
+  private async disarmBackgroundSession() {
+    await this.invokeWithLogging("syncpeer_android_disarm_background_session");
+    await this.serviceCommand({ operation: "disarmBackground" });
+    logUi(this.options, "core.android.background.disarmed");
+  }
+
   private async stopBackgroundSession() {
+    logUi(this.options, "core.android.session.stop_requested", { reason: "explicit_disconnect" });
     await this.invokeWithLogging("syncpeer_android_stop_background_session");
   }
 

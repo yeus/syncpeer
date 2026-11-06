@@ -502,6 +502,13 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.reject(error.message ?: "Could not start background synchronization.")
     }
   }
+  /** Cancel only scheduled background starts; the foreground peer remains connected. */
+  @Command
+  fun disarmBackgroundSession(invoke: Invoke) {
+    backgroundSessionHandoff.clear()
+    invoke.resolveObject(mapOf("disarmed" to true))
+  }
+
   @Command
   fun stopBackgroundSession(invoke: Invoke) {
     try {

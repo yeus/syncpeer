@@ -4176,6 +4176,22 @@ async fn syncpeer_android_stop_transfer_service(app: tauri::AppHandle) -> Result
 }
 
 #[tauri::command]
+async fn syncpeer_android_disarm_background_session(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return app
+            .syncpeer_android()
+            .disarm_background_session()
+            .map_err(|error| format!("Could not disarm background synchronization: {error}"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_stop_background_session(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
@@ -5123,6 +5139,7 @@ pub fn run() {
             syncpeer_android_biometric_authenticate,
             syncpeer_android_stop_transfer_service,
             syncpeer_android_stop_background_session,
+            syncpeer_android_disarm_background_session,
             syncpeer_android_update_transfer_notification,
             syncpeer_android_write_saf_file,
             syncpeer_android_save_text_file,

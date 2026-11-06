@@ -121,11 +121,15 @@ test("Android UI browses through the one service session across visibility chang
       deviceName: "synthetic", discoveryMode: "automatic" as const, timeoutMs: 1000 };
     const remote = await client.connectAndSync(options);
     assert.deepEqual((await remote.listFolders()).map(folder => folder.id), ["folder"]);
+    await client.startTransfer("synthetic-download");
     await client.setForeground(false);
+    assert.deepEqual((await remote.listFolders()).map(folder => folder.id), ["folder"],
+      "An in-flight download must keep the service proxy usable when Android briefly hides the Activity.");
     await client.setForeground(true);
+    await client.stopTransfer();
     assert.equal(socketCount, 0, "UI must never create a competing peer connection.");
+    assert.equal(opens, 1, "Visibility changes during a transfer must not reconnect.");
     assert.equal(stops, 0, "Returning to the foreground must not stop the service connection.");
-    assert.ok(opens >= 1);
   } finally {
     await client.disconnect();
     await rm(root, { recursive: true, force: true });

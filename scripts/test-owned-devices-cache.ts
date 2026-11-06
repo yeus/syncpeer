@@ -424,7 +424,7 @@ test("Android UI can query its service-owned peer without dialing another peer",
   assert.deepEqual(calls.map(call => call.command),
     ["syncpeer_android_session_command", "syncpeer_android_session_command"]);
 });
-test("background opt-out stops the single native session without restarting a peer", async () => {
+test("background opt-out disarms scheduling without disconnecting the active foreground peer", async () => {
   const calls = installFakeTauri(({ command, args }) => {
     if (command === "syncpeer_document_command" &&
       (args?.request as { operation?: string })?.operation === "profileSettings") {
@@ -440,7 +440,11 @@ test("background opt-out stops the single native session without restarting a pe
   await adapters.platformAdapter.startBackgroundSession!({
     host: "127.0.0.1", port: 22000, remoteId: LAN_PEER,
   });
-  assert.ok(calls.some(call => call.command === "syncpeer_android_stop_background_session"));
+  assert.equal(calls.filter(call => call.command === "syncpeer_android_disarm_background_session").length, 1);
+  assert.equal(calls.filter(call => call.command === "syncpeer_android_session_command" &&
+    (call.args?.request as { operation?: string })?.operation === "disarmBackground").length, 1);
+  assert.equal(calls.filter(call => call.command === "syncpeer_android_stop_background_session").length, 0,
+    "An opt-out must never terminate the foreground service-owned socket.");
   assert.ok(!calls.some(call => call.command === "syncpeer_android_start_background_session"));
 });
 test("turning off background sync disarms restart without interrupting the visible peer", async () => {
@@ -460,4 +464,6 @@ test("turning off background sync disarms restart without interrupting the visib
     settings: { profile: { keepSyncingInBackground: false } } });
   assert.equal(calls.filter(call => call.command === "syncpeer_android_session_command" &&
     (call.args?.request as { operation?: string })?.operation === "disarmBackground").length, 1);
+  assert.equal(calls.filter(call => call.command === "syncpeer_android_disarm_background_session").length, 1,
+    "Saving the opt-out must also cancel the native Activity callback.");
 });

@@ -1705,8 +1705,8 @@ async function setSessionForegroundImpl(
     }
     const options = backgroundSessionOptions(ctx.state.activeResolvedConnectOptions);
     if (options) await ctx.platformAdapter.startBackgroundSession?.(options);
-    await lifecycle.setTransferActive(false);
-    // Only detach the WebView's proxy; service socket ownership does not change.
+    // Preserve an active transfer across transient Activity visibility changes.
+    // Its completion clears transferActive; only then may the proxy suspend.
     await lifecycle.setForeground(false);
     return;
   }

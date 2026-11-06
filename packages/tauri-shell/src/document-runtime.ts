@@ -6,6 +6,7 @@ import { automaticRelayConfiguration } from "../../core/src/sync/automaticRelayP
 import { installAndroidTimers } from "./document-runtime-polyfills.js";
 import { createPortRequest } from "./document-runtime-port.js";
 import { createDocumentFilesystem } from "../../core/src/sync/documentFilesystem.js";
+import { deferDiscoveredFolderRegistration, consentedDiscoveredFolders } from "../../core/src/sync/discoveredFolderRegistration.js";
 import { confirmConnectedSession } from "../../core/src/sync/connectedSessionConfirmation.js";
 import { dispatchDocumentCommandWithSessionConfiguration } from "../../core/src/sync/documentCommands.js";
 import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js";
@@ -504,13 +505,27 @@ class AndroidSessionRuntime {
     this.adapter.log?.("core.session.connect.session_ready", { message: session.transportKind });
     const folders = await session.remoteFs.listFolders();
     this.adapter.log?.("core.session.connect.folders_ready", { message: String(folders.length) });
-    // Remember newly advertised roots. Folders already attached to the
-    // DocumentsProvider are supplied above as explicit full replicas;
-    // unattached folders remain metadata-only until selected.
-    for (const folder of folders) {
-      await this.documents.rememberFolder({ id: folder.id, label: folder.label || folder.id });
+    // Persist browse-only metadata after acknowledging the BEP session. The
+    // Android document queue can be busy with first-run vault operations; never
+    // make that storage queue a prerequisite for reporting a healthy socket.
+    const eligible = consentedDiscoveredFolders(folders, options.consentedFolderIds);
+    deferDiscoveredFolderRegistration(this.documents, eligible, () => {
+      this.adapter.log?.("core.session.connect.folder_registration_failed", {
+        message: "Deferred local folder registration failed.",
+      });
+    });
+    // Return a pending phase when arbitration supersedes this socket before
+    // the lifecycle's retry completes. The UI observes an authenticated
+    // service-owned session via native push events rather than relying on
+    // the timing of this original connect RPC.
+    try {
+      const confirmed = confirmConnectedSession(session, this.lifecycle.getSession(), options.remoteId);
+      this.adapter.log?.("core.session.connect.confirmed", { message: confirmed.transportKind });
+      return { phase: "connected" };
+    } catch {
+      this.adapter.log?.("core.session.connect.confirmation_pending", {});
+      return { phase: "reconnecting" };
     }
-    return { phase: this.lifecycle.getState().phase };
   };
 
   private disconnectCommand = async () => {

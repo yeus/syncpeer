@@ -265,6 +265,13 @@ class DeviceActionsRuntime {
     this.state.approvals.syncApprovedFolderKeys = next;
     this.state.ui.recentError = null;
   };
+  private revokeFolderSync = (folder: ReturnType<typeof advertisedFolders>[number]) => {
+    const next = new Set(this.state.approvals.syncApprovedFolderKeys);
+    next.delete(folder.key);
+    this.state.approvals.syncApprovedFolderKeys = next;
+    if (this.state.session.currentFolderId === folder.folderId) this.state.session.currentFolderId = "";
+  };
+
 
   private resetDiscoveryServer = () => {
     this.state.connection.discoveryServer = getDefaultDiscoveryServer();
@@ -379,6 +386,7 @@ class DeviceActionsRuntime {
       removeSavedDevice: this.removeSavedDevice,
       approveAdvertisedDevice: this.approveAdvertisedDevice,
       approveFolderSync: this.approveFolderSync,
+      revokeFolderSync: this.revokeFolderSync,
       resetDiscoveryServer: this.resetDiscoveryServer,
       clearOfflineFolderState: this.clearOfflineFolderState,
       regenerateDeviceId: this.regenerateDeviceId,

@@ -41,6 +41,8 @@
     activeFolderPasswords,
     connectionDetails,
     advertisedDevices,
+    advertisedFolders,
+    consentedRemoteFolders,
     applySessionState,
     activeDownloadProgressPercent as downloadProgressPercent,
     activeDownloadSummary as downloadSummary,
@@ -68,6 +70,7 @@
     sensitiveAppState,
   } from "./app/state.ts";
   import { createEncryptedUiStateStore } from "./app/encryptedUiState.ts";
+  import { createLatestDistinctTask } from "./app/latestDistinctTask.ts";
   import AboutPage from "./AboutPage.svelte";
   import FolderSettingsPage from "./FolderSettingsPage.svelte";
   import GeneralSettingsPage from "./GeneralSettingsPage.svelte";
@@ -273,12 +276,28 @@
     app.passwords.drafts = { ...merged };
     app.passwords.secureStorage = true;
     persistState(app, true);
-    const knownFolders = Object.values(app.offline.snapshots).flatMap(snapshot => snapshot.folders)
-      .map(folder => ({ ...folder, needsPassword: true }));
-    app.localFolders = localDocumentFolders(await syncDocumentFolders(knownFolders, {}));
-    app.localFolders = localDocumentFolders(
-      await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)),
-    );
+    const restoreRegistrations = async () => {
+      const knownFolders = Object.values(app.offline.snapshots).flatMap(snapshot => snapshot.folders)
+        .map(folder => ({ ...folder, needsPassword: true }));
+      app.localFolders = localDocumentFolders(await syncDocumentFolders(knownFolders, {}));
+      if (app.session.folders.length > 0) {
+        app.localFolders = localDocumentFolders(
+          await syncDocumentFolders(consentedSessionFolders(app.session.folders), activeFolderPasswords(app)),
+        );
+      }
+    };
+    if (peerStateInitializing) {
+      // The protected peer roster and credentials are already verified.
+      // Registry/cache work can run after the controls become available.
+      peerStateInitializing = false;
+      void restoreRegistrations().catch(error => {
+        pushSessionLog(app, "warning", "app.folder_registration.deferred_failed",
+          "Local document registrations will be retried when the folder state changes.",
+          { message: error instanceof Error ? error.message : String(error) });
+      });
+    } else {
+      await restoreRegistrations();
+    }
   }
 
   function applyProfileSettings(settings: SyncpeerProfileSettings) {
@@ -322,28 +341,49 @@
     await sessionStore.actions.refreshOverview(connectionDetails(app));
   }
 
+  const consentedSessionFolders = (folders: ReturnType<typeof sessionStore.getState>["folders"]) =>
+    consentedRemoteFolders(app, folders);
+
   async function migrateDocumentFolder(folderId: string, target: "encrypted" | "plaintext") {
     if (target === "encrypted") {
       const folder = app.session.folders.find(value => value.id === folderId) ?? app.localFolders.find(value => value.id === folderId);
       await connectDocumentFolder({ id: folderId, label: folder?.label ?? folderId, password: activeFolderPasswords(app)[folderId] });
     } else await disconnectDocumentFolder(folderId);
     app.localFolders = localDocumentFolders(
-      await syncDocumentFolders(app.session.folders, activeFolderPasswords(app)),
+      await syncDocumentFolders(consentedSessionFolders(app.session.folders), activeFolderPasswords(app)),
     );
   }
 
-  const unsubscribe = sessionStore.subscribe((next) => {
-    applySessionState(app, next);
-    void syncDocumentFolders(next.folders, activeFolderPasswords(app)).then(folders => {
+  type FolderSyncRequest = {
+    folders: ReturnType<typeof sessionStore.getState>["folders"];
+    passwords: Record<string, string>;
+  };
+  const queueFolderSync = createLatestDistinctTask({
+    keyOf: ({ folders, passwords }: FolderSyncRequest) => JSON.stringify([
+      folders.map(folder => [folder.id, folder.label, folder.encrypted, folder.needsPassword]),
+      passwords,
+    ]),
+    run: ({ folders, passwords }: FolderSyncRequest) => syncDocumentFolders(folders, passwords),
+    onSuccess: folders => {
       app.localFolders = localDocumentFolders(folders);
       privateStorageRecoveryMessage = null;
-    }).catch(async error => {
-      const issue = documentStoragePreparationIssue(next.folders.length, error);
+    },
+    onError: (error, input) => {
+      const issue = documentStoragePreparationIssue(input.folders.length, error);
       app.ui.recentError = issue.message;
       privateStorageRecoveryMessage = issue.canResetPrivateStorage ? issue.message : null;
-      try { app.localFolders = localDocumentFolders(await syncDocumentFolders([], {})); }
-      catch { /* Keep the last known roots if the service itself is unavailable. */ }
-    });
+      void syncDocumentFolders([], {}).then(folders => {
+        app.localFolders = localDocumentFolders(folders);
+      }).catch(() => { /* Retain known roots while native storage is unavailable. */ });
+    },
+  });
+  const scheduleFolderSync = (folders: FolderSyncRequest["folders"]) =>
+    queueFolderSync({ folders: consentedSessionFolders(folders), passwords: activeFolderPasswords(app) });
+
+
+  const unsubscribe = sessionStore.subscribe((next) => {
+    applySessionState(app, next);
+    scheduleFolderSync(next.folders);
     actions.syncNavigationRoute();
     if (
       next.phase === "connected" &&
@@ -356,6 +396,7 @@
 
   let activePasswords = $derived(activeFolderPasswords(app));
   let currentAdvertisedDevices = $derived(advertisedDevices(app));
+  let currentAdvertisedFolders = $derived(advertisedFolders(app));
   let currentFavoriteKeys = $derived(favoriteKeys(app));
   let currentBreadcrumbs = $derived(visibleBreadcrumbs(app));
   let currentRootFolders = $derived(rootFolderEntries(app));
@@ -819,6 +860,7 @@
         <DeviceTab
           {app}
           advertisedDevices={currentAdvertisedDevices}
+          advertisedFolders={currentAdvertisedFolders}
           isSavedDeviceAwaitingRemoteApproval={(deviceId) =>
             isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
           isLanDiscoveredDevice={(deviceId) => isLanDiscoveredDevice(app, deviceId)}
@@ -839,6 +881,8 @@
           onRestoreIdentityRecovery={actions.restoreIdentityRecovery}
           onAddSavedDevice={actions.addSavedDevice}
           onApproveAdvertisedDevice={actions.approveAdvertisedDevice}
+          onApproveFolderSync={folder => { actions.approveFolderSync(folder); scheduleFolderSync(app.session.folders); }}
+          onRevokeFolderSync={folder => { actions.revokeFolderSync(folder); scheduleFolderSync(app.session.folders); }}
           onEditSavedDeviceName={actions.editSavedDeviceName}
           onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
           onRemoveSavedDevice={actions.removeSavedDevice}

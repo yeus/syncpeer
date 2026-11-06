@@ -15,6 +15,8 @@ import { reportActionError } from "./actionErrors.ts";
 import {
   applySessionState,
   activeSourceDeviceId,
+  consentedRemoteFolders,
+  currentSourceIsIntroducer,
   connectionDetails,
   directoryTotalPages,
   folderIsLocked,
@@ -57,6 +59,12 @@ class DirectoryActionsRuntime {
   ): Promise<boolean> => {
     const normalizedPath = normalizePath(path);
     this.state.ui.uploadMessage = "";
+    if (currentSourceIsIntroducer(this.state) &&
+      this.state.session.folders.some(folder => folder.id === folderId) &&
+      !consentedRemoteFolders(this.state, this.state.session.folders).some(folder => folder.id === folderId)) {
+      this.state.ui.recentError = "Approve this folder from the introducer before browsing it.";
+      return false;
+    }
     try {
       if (await this.tryLocalLocation(folderId, normalizedPath)) return true;
       if (folderIsLocked(this.state, folderId)) return false;

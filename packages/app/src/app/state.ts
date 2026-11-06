@@ -678,15 +678,22 @@ export const visibleBreadcrumbs = (state: AppState) =>
     MAX_VISIBLE_CRUMBS,
   );
 
-export const rootFolderEntries = (state: AppState) =>
-  [...new Map([...state.localFolders, ...state.session.folders].map(folder => [folder.id, folder])).values()]
-    .map((folder) => ({
-      id: folder.id,
-      name: folderDisplayName(folder),
-      readOnly: folder.readOnly,
-      stats: folder.stats,
-    }))
+export const consentedRemoteFolders = (state: AppState, folders: AppState["session"]["folders"]) => {
+  if (!currentSourceIsIntroducer(state)) return folders;
+  const source = currentSourceDeviceId(state);
+  return folders.filter(folder => state.approvals.syncApprovedFolderKeys.has(`${source}:${folder.id.trim()}`));
+};
+
+export const rootFolderEntries = (state: AppState) => {
+  const offered = consentedRemoteFolders(state, state.session.folders);
+  const blocked = new Set(state.session.folders.filter(folder => !offered.some(approved => approved.id === folder.id))
+    .map(folder => folder.id));
+  const local = state.localFolders.filter(folder => !blocked.has(folder.id));
+  return [...new Map([...local, ...offered].map(folder => [folder.id, folder])).values()]
+    .map(folder => ({ id: folder.id, name: folderDisplayName(folder),
+      readOnly: folder.readOnly, stats: folder.stats }))
     .sort((left, right) => left.name.localeCompare(right.name));
+};
 
 export const folderState = (state: AppState, folderId: string) =>
   state.session.folders.find((folder) => folder.id === folderId) ??
@@ -767,8 +774,18 @@ export const isSavedDeviceAwaitingRemoteApproval = (
   deviceId: string,
 ) => state.approvals.remoteApprovalPendingIds.has(normalizeDeviceId(deviceId));
 
+const introducerFolderConsent = (state: AppState) => {
+  const target = normalizeDeviceId(state.connection.remoteId || state.devices.selectedSavedDeviceId);
+  if (!state.devices.savedDevices.some(device => device.isIntroducer && sameDeviceId(device.id, target))) return {};
+  const prefix = `${target}:`;
+  return { consentedFolderIds: [...state.approvals.syncApprovedFolderKeys]
+    .filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length)).sort() };
+};
+
 export const connectionDetails = (state: AppState) => ({
   ...buildConnectionDetails(state.connection, activeFolderPasswords(state)),
+  configuredPeerIds: state.devices.savedDevices.map(device => device.id),
+  ...introducerFolderConsent(state),
   ...(import.meta.env?.SYNCPEER_LAN_E2E === true && state.connection.relayPoolUrl
     ? { relayPoolUrl: state.connection.relayPoolUrl }
     : {}),

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { peerRegistryViews, type AdvertisedDeviceItem } from "@syncpeer/core/browser";
+  import { peerRegistryViews, type AdvertisedDeviceItem, type AdvertisedFolderItem } from "@syncpeer/core/browser";
   import PasswordInput from "./PasswordInput.svelte";
   import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
@@ -12,6 +12,7 @@
   interface Props {
     app: AppState;
     advertisedDevices: AdvertisedDeviceItem[];
+    advertisedFolders: AdvertisedFolderItem[];
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
     isLanDiscoveredDevice: (deviceId: string) => boolean;
     onUseSavedDevice: (deviceId: string) => void;
@@ -31,6 +32,8 @@
     onRestoreIdentityRecovery: () => void;
     onAddSavedDevice: () => void;
     onApproveAdvertisedDevice: (device: AdvertisedDeviceItem) => void;
+    onApproveFolderSync: (folder: AdvertisedFolderItem) => void;
+    onRevokeFolderSync: (folder: AdvertisedFolderItem) => void;
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
@@ -40,6 +43,7 @@
   let {
     app,
     advertisedDevices,
+    advertisedFolders,
     isSavedDeviceAwaitingRemoteApproval,
     isLanDiscoveredDevice,
     onUseSavedDevice,
@@ -59,6 +63,8 @@
     onRestoreIdentityRecovery,
     onAddSavedDevice,
     onApproveAdvertisedDevice,
+    onApproveFolderSync,
+    onRevokeFolderSync,
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
@@ -573,6 +579,25 @@
     {/if}
   </ul>
 </Panel>
+
+{#if advertisedFolders.length}
+  <Panel title="Folders offered by introducer">
+    <p class="hint">These folders are suggestions only. Nothing is subscribed or made available for browsing until you approve that folder explicitly.</p>
+    <ul class="list" data-testid="introduced-folder-offers">
+      {#each advertisedFolders as folder (folder.key)}
+        <li class="list-item">
+          <span>{folder.label}</span>
+          {#if folder.syncApproved}
+            <span class="hint">Approved</span>
+            <button type="button" class="ghost" onclick={() => onRevokeFolderSync(folder)}>Remove approval</button>
+          {:else}
+            <button type="button" class="ghost" onclick={() => onApproveFolderSync(folder)}>Approve folder</button>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+  </Panel>
+{/if}
 
 <Panel title="Session Logs">
   <div class="actions">

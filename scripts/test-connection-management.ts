@@ -235,6 +235,31 @@ test("socket closure updates state and reconnects without polling", async () => 
   await lifecycle.disconnect();
 });
 
+test("a manually closed active socket retries if the peer is still desired", async () => {
+  const first = session();
+  const second = session();
+  const opened = [first, second];
+  const sleeps: Array<() => void> = [];
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => opened.shift()!,
+    keyFor: value => value,
+    sleep: () => new Promise<void>(resolve => sleeps.push(resolve)),
+    random: () => 0.5,
+  });
+  await lifecycle.connect("peer");
+  first.finish({ kind: "manual", message: "BEP connection superseded by peer arbitration" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(lifecycle.getState().phase, "waiting");
+  assert.equal(lifecycle.getSession(), null);
+  sleeps.shift()?.();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(lifecycle.getSession(), second);
+  assert.equal(lifecycle.getState().phase, "connected");
+  await lifecycle.disconnect();
+});
+
 test("manual disconnect cancels a pending retry", async () => {
   const first = session();
   let opens = 0;
@@ -278,6 +303,33 @@ test("an authenticated incoming session can satisfy the desired connection", asy
   assert.equal(await lifecycle.adopt("different-peer", wrongPeer), false);
   assert.equal(wrongPeer.isClosed(), true);
   await lifecycle.disconnect();
+});
+
+test("preferred outgoing wins after an adopted incoming socket is superseded", async () => {
+  const opening = deferred<ReturnType<typeof session>>();
+  const incoming = session();
+  const outgoing = session();
+  const sleeps: Array<() => void> = [];
+  const lifecycle = createConnectionLifecycle<string>({
+    open: async () => opening.promise,
+    keyFor: value => value,
+    sleep: () => new Promise<void>(resolve => sleeps.push(resolve)),
+    random: () => 0.5,
+  });
+
+  const connecting = lifecycle.connect("peer");
+  await Promise.resolve();
+  assert.equal(await lifecycle.adopt("peer", incoming), true);
+  incoming.finish({ kind: "manual", message: "Incoming superseded by preferred outgoing" });
+  await Promise.resolve();
+  await Promise.resolve();
+  opening.resolve(outgoing);
+  assert.equal(await connecting, outgoing);
+  assert.equal(lifecycle.getSession(), outgoing);
+  assert.equal(outgoing.isClosed(), false);
+  assert.equal(lifecycle.getState().phase, "connected");
+  await lifecycle.disconnect();
+  for (const release of sleeps) release();
 });
 
 test("an opening keeps the same incoming session that was adopted before it resolved", async () => {
@@ -629,6 +681,76 @@ test("a connected lifecycle never reports connected without a runtime session", 
   assert.equal(store.getState().remoteFs, remoteFs);
   assert.equal(store.getState().phase, "connected");
   assert.equal(store.getState().pending.connecting, false);
+});
+
+test("an aborted opening recovers when the transport authenticated before the rejection", async () => {
+  let rejectOpening: ((error: Error) => void) | undefined;
+  let onLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
+  let attempts = 0;
+  let elapsedMs = 0;
+  const store = createSyncpeerSessionStore({
+    now: () => elapsedMs,
+    sleep: async ms => { elapsedMs += ms; },
+    transport: {
+      connectAndSync: () => {
+        attempts += 1;
+        return attempts === 1
+          ? new Promise<SyncpeerSessionHandle["remoteFs"]>((_resolve, reject) => { rejectOpening = reject; })
+          : Promise.resolve(remoteFs);
+      },
+      connectAndGetOverview: async () => ({
+        folders: [], device: null, folderSyncStates: [],
+        connectedVia: "redacted-test-path", transportKind: "direct-tcp",
+      }),
+      connectAndGetFolderVersions: async () => [],
+      subscribeLifecycle: listener => { onLifecycle = listener; return () => undefined; },
+    },
+  });
+  const opening = store.actions.connect({ host: "test.invalid", port: 22000, deviceName: "test" });
+  assert.equal(attempts, 1);
+  onLifecycle?.({ phase: "connected", attempt: 0, nextRetryAtMs: null,
+    closureReason: null, upgradeStatus: "idle" });
+  assert.equal(store.getState().phase, "connecting");
+  rejectOpening?.(new Error("signal is aborted without reason"));
+  await assert.rejects(opening, /aborted/);
+  for (let index = 0; index < 50 && store.getState().phase !== "connected"; index += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(attempts, 2, "A failed initial promise must rebind the already-connected transport once.");
+  assert.equal(store.getState().phase, "connected");
+  assert.equal(store.getState().remoteFs, remoteFs);
+});
+
+test("a cancelled opening cannot resurrect an explicitly disconnected or unauthorized peer", async () => {
+  for (const caseName of ["disconnect", "authorization"] as const) {
+    let rejectOpening: ((error: Error) => void) | undefined;
+    let onLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
+    let attempts = 0;
+    const store = createSyncpeerSessionStore({
+      transport: {
+        connectAndSync: () => {
+          attempts += 1;
+          return new Promise<SyncpeerSessionHandle["remoteFs"]>((_resolve, reject) => { rejectOpening = reject; });
+        },
+        connectAndGetOverview: async () => ({
+          folders: [], device: null, folderSyncStates: [],
+          connectedVia: "redacted-test-path", transportKind: "direct-tcp",
+        }),
+        connectAndGetFolderVersions: async () => [],
+        subscribeLifecycle: listener => { onLifecycle = listener; return () => undefined; },
+      },
+    });
+    const opening = store.actions.connect({ host: "test.invalid", port: 22000, deviceName: "test" });
+    onLifecycle?.({ phase: "connected", attempt: 0, nextRetryAtMs: null,
+      closureReason: null, upgradeStatus: "idle" });
+    if (caseName === "disconnect") await store.actions.disconnect();
+    rejectOpening?.(new Error(caseName === "disconnect"
+      ? "Connection attempt was cancelled." : "Peer identity is not authorized."));
+    await assert.rejects(opening);
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+    assert.equal(attempts, 1, "Cancelled or denied peers must never be redialed by recovery.");
+    assert.notEqual(store.getState().phase, "connected");
+  }
 });
 
 test("concurrent connects share one validated opening", async () => {

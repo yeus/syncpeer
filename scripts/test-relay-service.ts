@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { createNodeHostAdapter } from "../packages/core/dist/node.js";
+import { connectRelayWithRetry } from "../packages/core/dist/client.js";
 import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserClient.js";
 import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
   "../packages/core/dist/sync/personalSpaceSharing.js";
@@ -28,7 +29,7 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
       // If dialing fails, closing the listener also rejects this pending accept.
       // Observe both errors so the dial failure remains the reported root cause.
       void accepted.catch(() => undefined);
-      const connected = await adapter.connectRelay!({ relayAddress, expectedDeviceId: a.deviceId,
+      const connected = await connectRelayWithRetry(adapter, { relayAddress, expectedDeviceId: a.deviceId,
         certPem: await readFile(b.certPath, "utf8"), keyPem: await readFile(b.keyPath, "utf8") });
       const incoming = await accepted;
       assert.equal(computeDeviceId(await incoming.socket.peerCertificateDer()), b.deviceId);
@@ -84,6 +85,46 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
         await Promise.all([owner.disconnect(), joining.disconnect()]);
       }
     } finally {
+      await listener?.close().catch(() => undefined);
+      await relay.close();
+    }
+  });
+
+test("concurrent relay invitations complete separate TLS handshakes without losing bytes",
+  { timeout: 45000 }, async () => {
+    const relay = await startLocalRelay();
+    const adapter = createNodeHostAdapter();
+    let listener: Awaited<ReturnType<NonNullable<typeof adapter.listenRelay>>> | undefined;
+    const sockets: Array<{ close: () => Promise<void> }> = [];
+    try {
+      const identities = await Promise.all(["owner", "first", "second", "third"].map(async name => {
+        const identity = generateSyncthingIdentity(path.join(relay.root, name));
+        return { deviceId: identity.deviceId, certPem: await readFile(identity.certPath, "utf8"),
+          keyPem: await readFile(identity.keyPath, "utf8") };
+      }));
+      const [owner, ...peers] = identities;
+      listener = await adapter.listenRelay!({ relayAddress: relay.relayAddress,
+        certPem: owner.certPem, keyPem: owner.keyPem, alpnProtocols: ["bep/1.0"] });
+      const accepted = peers.map(() => listener!.accept());
+      for (const pending of accepted) void pending.catch(() => undefined);
+      const outgoing = await Promise.all(peers.map(peer => connectRelayWithRetry(adapter, {
+        relayAddress: relay.relayAddress, expectedDeviceId: owner.deviceId,
+        certPem: peer.certPem, keyPem: peer.keyPem,
+      })));
+      sockets.push(...outgoing.map(value => value.socket));
+      const incoming = await Promise.all(accepted);
+      sockets.push(...incoming.map(value => value.socket));
+      const byId = new Map(await Promise.all(incoming.map(async item =>
+        [computeDeviceId(await item.socket.peerCertificateDer()), item.socket] as const)));
+      for (const [index, peer] of peers.entries()) {
+        const socket = byId.get(peer.deviceId);
+        assert.ok(socket, "Relay listener must authenticate every concurrent peer");
+        const bytes = Uint8Array.of(30 + index, 40 + index, 50 + index);
+        await outgoing[index]!.socket.write(bytes);
+        assert.deepEqual((await socket.read()).slice(0, bytes.length), bytes);
+      }
+    } finally {
+      await Promise.allSettled(sockets.map(socket => socket.close()));
       await listener?.close().catch(() => undefined);
       await relay.close();
     }

@@ -93,12 +93,10 @@ export const directoryToError = (
   message: string,
 ): SessionState => ({
   ...state,
-  phase: "error",
   directory: {
     ...state.directory,
     status: "error",
     error: message,
   },
   pending: { ...state.pending, loadingDirectory: false },
-  lastError: message,
 });

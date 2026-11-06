@@ -4,6 +4,7 @@ import {
   connectedFolderStatus,
   folderRootEmptyNotice,
   localDiscoveryUnavailableNotice,
+  localDiscoveryHealthFromDiagnostics,
   shouldRenderFolderRootList,
 } from "../packages/app/src/app/connectionNotices.ts";
 import { createTauriAdapters, reportUiError, shouldLogInvokeLifecycle } from "../packages/app/src/lib/tauriAdapters.ts";
@@ -53,6 +54,19 @@ test("explains local discovery port contention without implying connection failu
 
 test("does not reclassify unrelated discovery failures", () => {
   assert.equal(localDiscoveryUnavailableNotice(new Error("Network request failed")), null);
+});
+
+test("native discovery diagnostics distinguish working, partial and unavailable LAN listeners", () => {
+  assert.deepEqual(localDiscoveryHealthFromDiagnostics({ socketsBound: 2, syncthingLanAvailable: true,
+    syncpeerLanActive: true, bindErrors: [], candidateCount: 0 }), { health: "available", notice: "" });
+  const partial = localDiscoveryHealthFromDiagnostics({ socketsBound: 1,
+    syncthingLanAvailable: false, syncpeerLanActive: true,
+    bindErrors: ["udp4 bind failed: Address already in use"] });
+  assert.equal(partial?.health, "partial");
+  assert.match(partial?.notice ?? "", /could not bind its port/i);
+  assert.equal(localDiscoveryHealthFromDiagnostics({ socketsBound: 0, syncpeerLanActive: false,
+    bindErrors: [] })?.health, "unavailable");
+  assert.equal(localDiscoveryHealthFromDiagnostics(null), null);
 });
 
 test("high-frequency storage and socket operations do not flood the visible session log", () => {

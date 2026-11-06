@@ -1124,7 +1124,8 @@ class BepSession {
   }
 
   async advertiseSharedFolders(): Promise<void> {
-    this.echoedClusterConfig = true;
+    // The initial advertisement precedes the remote configuration. Only
+    // echoClusterConfig acknowledges folders offered by the peer.
     await this.writeFrame(encodeMessageFrame(MessageTypeValues.CLUSTER_CONFIG, ClusterConfig, {
       folders: [...this.sharedFolders.keys()].map(id => this.sharedFolderConfig(id)),
     }, 0));

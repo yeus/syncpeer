@@ -6,6 +6,7 @@ import { decodeBase64, encodeBase64 } from "../transfer/base64.js";
 import { parseServiceSessionStatusEvent, serviceSessionStatusIsTerminal,
   serviceSessionStatusMessage } from "./serviceSessionStatus.js";
 import { parseServiceResponse, withServiceProtocol } from "./serviceProtocol.js";
+import { sameDeviceId } from "../ui/helpers.js";
 import type { FileDownloadProgress, FileUploadOptions, FileDeleteOptions, FileEntry } from "../core/model/remoteFs.js";
 
 type CallService = (request: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
@@ -156,6 +157,54 @@ const pagedEntries = async (
   }
 };
 
+/** A service can return a transient phase while its lifecycle is already
+ * retrying. Observe the authoritative push channel, not another peer dial.
+ */
+const awaitServiceConnection = (
+  rpc: CallService,
+  subscribe: ServiceSessionStatusSubscription,
+  signal?: AbortSignal,
+): Promise<void> => new Promise<void>((resolve, reject) => {
+  let settled = false;
+  let unsubscribe = () => {};
+  const finish = (error?: Error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
+    unsubscribe();
+    if (error) reject(error);
+    else resolve();
+  };
+  const onAbort = () => finish(new Error("Connection attempt was cancelled."));
+  const timeout = setTimeout(() =>
+    finish(new Error("Android service did not confirm its peer connection.")), 60_000);
+  if (signal?.aborted) { onAbort(); return; }
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const accept = (phase: unknown, active: unknown, error?: string) => {
+    if (phase === "connected" && active === true) finish();
+    // Initial native startup reports active=false, and a superseded idle status
+    // can replay while a newer connection is in flight. Neither is terminal.
+    else if (phase === "error" || phase === "stopping") {
+      finish(new Error(error || "Android service stopped its peer connection."));
+    }
+  };
+  void subscribe(raw => {
+    const event = parseServiceSessionStatusEvent(raw);
+    if (event) accept(event.phase, event.active, serviceSessionStatusMessage(event));
+  }).then(async stop => {
+    if (settled) { stop(); return; }
+    unsubscribe = stop;
+    // Catch a transition between the initial connect reply and installing
+    // the listener. No polling or competing session connection is needed.
+    const status = requireResult(parseServiceResponse("status",
+      await rpc(withServiceProtocol({ operation: "status" }), signal)));
+    accept(status.phase, status.active,
+      typeof status.error === "string" ? status.error : undefined);
+  }, error => finish(error instanceof Error ? error : new Error(String(error))))
+    .catch(error => finish(error instanceof Error ? error : new Error(String(error))));
+});
+
 /** UI-side view of the Android service's one peer session.
  * Closing this handle detaches a WebView client, not the actual peer socket.
  */
@@ -166,16 +215,39 @@ export async function createServiceOwnedSession(
   heartbeatIntervalMs = 15_000,
   subscribeStatus?: ServiceSessionStatusSubscription,
 ): Promise<SyncpeerSessionHandle> {
-  const connected = requireResult(parseServiceResponse("connect",
-    await rpc(withServiceProtocol({ operation: "connect", options }), signal)));
-  if (connected.phase !== "connected") {
-    throw new Error("Android service could not establish a peer session.");
+  let phase: unknown;
+  try {
+    const connected = requireResult(parseServiceResponse("connect",
+      await rpc(withServiceProtocol({ operation: "connect", options }), signal)));
+    phase = connected.phase;
+  } catch (error) {
+    // Native connect requests can be superseded by an incoming/outgoing
+    // arbitration race while the service already owns a verified replacement.
+    // A caller-initiated abort or an actual authorization/transport failure
+    // must still propagate rather than being converted into a successful dial.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!subscribeStatus || signal?.aborted || !message.includes("Connection attempt was cancelled.")) {
+      throw error;
+    }
+  }
+  if (phase !== "connected") {
+    // A stale native reply or a superseded connect RPC does not invalidate the
+    // service's active socket. Subscribe and reconcile the authoritative state.
+    if (!subscribeStatus) throw new Error("Android service could not establish a peer session.");
+    await awaitServiceConnection(rpc, subscribeStatus, signal);
   }
   const overview = requireResult(parseServiceResponse("overview",
     await rpc(withServiceProtocol({ operation: "overview" }), signal))) as Overview;
   if (!Array.isArray(overview.folders) || typeof overview.connectedVia !== "string" ||
     !["direct-tcp", "direct-quic", "relay"].includes(overview.transportKind)) {
     throw new Error("Android service returned an invalid peer overview.");
+  }
+  // A later connect to a different peer can win native arbitration while an
+  // obsolete WebView RPC is still pending. Never mislabel that live socket as
+  // the originally requested peer when accepting its status confirmation.
+  if (options.remoteId && overview.device?.id &&
+    !sameDeviceId(overview.device.id, options.remoteId)) {
+    throw new Error("Android service connected to a different authenticated peer.");
   }
   if (!Number.isSafeInteger(heartbeatIntervalMs) || heartbeatIntervalMs < 10) {
     throw new Error("Invalid Android session heartbeat interval.");

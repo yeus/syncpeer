@@ -32,3 +32,31 @@ export const localDiscoveryUnavailableNotice = (rawError: unknown): string | nul
   }
   return "Local discovery is unavailable on this system. Automatic, global, direct, and relay connections can still work.";
 };
+
+export type LocalDiscoveryHealth = "available" | "partial" | "unavailable";
+
+/** Interpret native socket diagnostics without treating an empty scan as a bind failure. */
+export const localDiscoveryHealthFromDiagnostics = (value: unknown): {
+  health: LocalDiscoveryHealth; notice: string;
+} | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const data = value as Record<string, unknown>;
+  const errors = Array.isArray(data.bindErrors)
+    ? data.bindErrors.filter((item): item is string => typeof item === "string") : [];
+  const occupied = errors.some(error => /address already in use/i.test(error));
+  const standard = data.syncthingLanAvailable === true;
+  const syncpeer = data.syncpeerLanActive === true;
+  const bound = typeof data.socketsBound === "number" ? data.socketsBound : null;
+  if (bound === 0 && !syncpeer) return {
+    health: "unavailable", notice: occupied
+      ? "LAN discovery sockets could not bind; the discovery port may already be in use by another application. Add a device ID for global, direct, or relay connectivity."
+      : "LAN discovery sockets are unavailable. You can still add a device by ID for global, direct, or relay connectivity.",
+  };
+  if ((data.syncthingLanAvailable === false && syncpeer) || (errors.length > 0 && (syncpeer || (bound !== null && bound > 0)))) {
+    return { health: "partial", notice: occupied
+      ? "Standard Syncthing LAN discovery could not bind its port, possibly because another application uses it. Other discovery paths may still work."
+      : standard ? "Some LAN discovery sockets are unavailable; other discovery paths remain active."
+      : "Standard Syncthing LAN discovery is unavailable, although another local discovery path is active." };
+  }
+  return { health: "available", notice: "" };
+};

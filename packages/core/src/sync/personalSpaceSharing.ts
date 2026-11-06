@@ -266,10 +266,15 @@ export function resolveApprovedPeerDeviceIds(selectedDeviceId: string,
 
 /** A listener accepts remote members, never this device's own certificate. */
 export function resolveIncomingPeerDeviceIds(selectedDeviceId: string, localDeviceId: string,
-  devices: readonly OwnedSpaceDevice[]): string[] {
+  devices: readonly OwnedSpaceDevice[], configuredExternalIds: readonly string[] = []): string[] {
   const local = normalizeDeviceId(localDeviceId);
-  return resolveApprovedPeerDeviceIds(selectedDeviceId, devices)
-    .filter(id => normalizeDeviceId(id) !== local);
+  const configured = resolveFolderShareDevices(configuredExternalIds
+    .filter(id => typeof id === "string" && normalizeDeviceId(id).length === 52)
+    .map(id => ({ kind: "device" as const, syncthingId: id })), devices);
+  const approved = selectedDeviceId ? resolveApprovedPeerDeviceIds(selectedDeviceId, devices)
+    : settingsFolderDevices(devices);
+  return [...new Set([...approved, ...configured]
+    .map(normalizeDeviceId).filter(id => id && id !== local))].sort();
 }
 
 /** Resolve policy at the Syncpeer boundary; BEP still sees ordinary device IDs. */

@@ -382,6 +382,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         addresses: string[];
         lastSeenAtMs: number;
       }>,
+      localDiscoveryHealth: "idle" as "idle" | "scanning" | "available" | "partial" | "unavailable",
       isDiscoveringLanDevices: false,
       localDiscoveryNotice: "",
     },

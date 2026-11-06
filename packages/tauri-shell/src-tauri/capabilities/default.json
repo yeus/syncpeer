@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "notification:default",
+    "syncpeer-android:default",
     "os:default",
     "core:webview:allow-internal-toggle-devtools",
     {

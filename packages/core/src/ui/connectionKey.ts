@@ -16,6 +16,8 @@ export const serializeConnectionKey = (
   relayPoolUrl: options.relayPoolUrl,
   enableRelayFallback: options.enableRelayFallback !== false,
   remoteId: options.remoteId ?? "",
+  configuredPeerIds: [...new Set(options.configuredPeerIds ?? [])].sort(),
+  consentedFolderIds: options.consentedFolderIds ? [...new Set(options.consentedFolderIds)].sort() : null,
   deviceName: options.deviceName,
   certPem,
   keyPem,

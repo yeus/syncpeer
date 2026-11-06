@@ -29,6 +29,19 @@ test("service connect accepts an empty host for automatic and discovery-only pai
     options: { host: "", port: 22000, deviceName: "synthetic", discoveryMode: "direct" } })), /host/i);
 });
 
+test("service connect retains the explicit incoming-peer allowlist across the Android boundary", () => {
+  const peer = "A".repeat(52);
+  const parsed = parseServiceCommand(withServiceProtocol({ operation: "connect", options: {
+    host: "", port: 22000, deviceName: "device", discoveryMode: "automatic",
+    configuredPeerIds: [peer], consentedFolderIds: [],
+  } }));
+  assert.deepEqual(parsed.options.configuredPeerIds, [peer]);
+  assert.deepEqual(parsed.options.consentedFolderIds, []);
+  assert.throws(() => parseServiceCommand(withServiceProtocol({ operation: "connect", options: {
+    host: "", port: 22000, deviceName: "device", configuredPeerIds: Array(257).fill(peer),
+  } })), /command/i);
+});
+
 test("service validates local folder-secret updates without logging or echoing secrets", () => {
   const updated = parseServiceCommand(withServiceProtocol({
     operation: "updateFolderPasswords", folderPasswords: { photos: "synthetic-long-passphrase" },

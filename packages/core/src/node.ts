@@ -274,17 +274,24 @@ async function listenNodeTls(options: SyncpeerTlsListenOptions): Promise<Syncpee
 type NodeSocket = net.Socket | tls.TLSSocket;
 
 class NodeSocketReader {
-  private chunks: Buffer[] = [];
-  private waiters: Array<{ resolve: (value: Buffer) => void; reject: (error: Error) => void }> = [];
+  private waiters: Array<{ length: number; resolve: (value: Buffer) => void; reject: (error: Error) => void }> = [];
   private error: Error | null = null;
 
-  private readonly onData = (chunk: Buffer): void => {
-    const waiter = this.waiters.shift();
-    if (waiter) waiter.resolve(chunk);
-    else this.chunks.push(chunk);
+  // A flowing 'data' listener can consume TLS handshake bytes coalesced with
+  // the relay JOIN response. Reading exactly the framed bytes leaves everything
+  // else in the socket for the subsequent TLS upgrade.
+  private readonly onReadable = (): void => {
+    while (this.waiters.length > 0) {
+      const next = this.waiters[0]!;
+      const chunk = this.socket.read(next.length) as Buffer | null;
+      if (!chunk) break;
+      this.waiters.shift();
+      next.resolve(chunk);
+    }
   };
 
   private readonly onError = (error: Error): void => {
+    if (this.error) return;
     this.error = error;
     while (this.waiters.length > 0) this.waiters.shift()?.reject(error);
   };
@@ -294,26 +301,26 @@ class NodeSocketReader {
   };
 
   constructor(private readonly socket: NodeSocket) {
-    socket.on("data", this.onData);
+    socket.pause();
+    socket.on("readable", this.onReadable);
     socket.once("error", this.onError);
+    socket.once("end", this.onClose);
     socket.once("close", this.onClose);
   }
 
-  async readExact(length: number): Promise<Buffer> {
-    let output = Buffer.alloc(0);
-    while (output.length < length) {
-      const chunk = this.chunks.shift() ?? await this.readChunk();
-      output = Buffer.concat([output, chunk]);
-    }
-    const result = output.subarray(0, length);
-    const leftover = output.subarray(length);
-    if (leftover.length > 0) this.chunks.unshift(leftover);
-    return result;
+  readExact(length: number): Promise<Buffer> {
+    if (length === 0) return Promise.resolve(Buffer.alloc(0));
+    if (this.error) return Promise.reject(this.error);
+    return new Promise<Buffer>((resolve, reject) => {
+      this.waiters.push({ length, resolve, reject });
+      this.onReadable();
+    });
   }
 
   dispose(): void {
-    this.socket.off("data", this.onData);
+    this.socket.off("readable", this.onReadable);
     this.socket.off("error", this.onError);
+    this.socket.off("end", this.onClose);
     this.socket.off("close", this.onClose);
     this.onError(new Error("Relay reader closed"));
   }
@@ -321,13 +328,6 @@ class NodeSocketReader {
   detachForTls(): void {
     this.socket.pause();
     this.dispose();
-    for (const chunk of [...this.chunks].reverse()) this.socket.unshift(chunk);
-    this.chunks = [];
-  }
-
-  private readChunk(): Promise<Buffer> {
-    if (this.error) return Promise.reject(this.error);
-    return new Promise<Buffer>((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
 }
 
@@ -447,6 +447,9 @@ function connectNodeRelayTls(
     secureSocket.once("secureConnect", () => { cleanup(); resolve(secureSocket); });
     secureSocket.once("error", (error) => { cleanup(); reject(error); });
     secureSocket.once("close", () => { cleanup(); reject(new Error("Relay TLS socket closed before handshake.")); });
+    // The relay response reader intentionally pauses the raw socket before
+    // handing it to TLS. Resume only after TLS has installed its handlers.
+    socket?.resume();
   });
 }
 
@@ -536,6 +539,9 @@ async function wrapRelaySessionTls(sessionTcp: net.Socket, invitation: ReturnTyp
     server.once("tlsClientError", fail);
     server.once("secureConnection", socket => { server.off("tlsClientError", fail); resolve(socket); });
     server.emit("connection", sessionTcp);
+    // As on the TLS client side, detachForTls() left this socket paused.
+    // Without resuming, an early ClientHello may never reach the TLS server.
+    sessionTcp.resume();
   });
 }
 

@@ -68,6 +68,25 @@ export const parseTcpAddress = (
   }
 };
 
+/** Explicit direct addresses belong to one peer; selecting a different peer
+ * returns to discovery without accidentally dialing that old endpoint.
+ */
+export const preferredConnectionForDevice = (
+  connection: AppState["connection"],
+  deviceId: string,
+): Pick<AppState["connection"], "remoteId" | "discoveryMode" | "host"> => {
+  const preserveDirect = connection.discoveryMode === "direct" &&
+    sameDeviceId(connection.remoteId, deviceId) &&
+    connection.host.trim().length > 0 &&
+    Number.isSafeInteger(Number(connection.port)) &&
+    Number(connection.port) > 0 && Number(connection.port) <= 65535;
+  return {
+    remoteId: normalizeDeviceId(deviceId),
+    discoveryMode: preserveDirect ? "direct" : "automatic",
+    host: preserveDirect ? connection.host : "",
+  };
+};
+
 export const suggestedSavedDeviceName = (state: AppState, deviceId: string) => {
   const normalized = normalizeDeviceId(deviceId);
   if (!normalized) return "";

@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
 import { createNodeHostAdapter } from "../packages/core/dist/node.js";
 import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserClient.js";
+import { createSyncpeerSessionStore } from "../packages/core/dist/ui/sessionStore.js";
 import { createSyncpeerCoreClient, type SyncpeerSessionHandle } from "../packages/core/dist/client.js";
 import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";
 import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
@@ -181,6 +182,45 @@ test("a reused browser listener advertises current folders and adopts current co
     unsubscribe();
     await outgoing?.close();
     await owner.disconnect();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("incoming fallback resolves an overlapping outbound connection attempt", { timeout: 12000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-reverse-fallback-"));
+  const adapter = createNodeHostAdapter();
+  const ids = await Promise.all([identity(root, "one"), identity(root, "two")]);
+  const [local, remote] = ids.sort((a, b) => a.deviceId.localeCompare(b.deviceId));
+  let port = 0;
+  let session: SyncpeerSessionHandle | undefined;
+  const client = createSyncpeerBrowserClient({ hostAdapter: {
+    ...adapter,
+    connectTls: async () => {
+      await new Promise(resolve => setTimeout(resolve, 450));
+      throw new Error("Outbound unavailable");
+    },
+    listenTls: async options => {
+      const listener = await adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 });
+      port = listener.port;
+      return listener;
+    },
+  }, platformAdapter: { readDefaultIdentity: async () => local } });
+  const store = createSyncpeerSessionStore({ transport: client });
+  try {
+    const connecting = store.actions.connect({ host: "127.0.0.1", port: 1,
+      remoteId: remote.deviceId, discoveryMode: "direct", timeoutMs: 1500 });
+    const listenerDeadline = Date.now() + 1500;
+    while (!port && Date.now() < listenerDeadline)
+      await new Promise(resolve => setTimeout(resolve, 20));
+    assert.ok(port > 0);
+    session = await createSyncpeerCoreClient(adapter).openSession({ ...remote,
+      host: "127.0.0.1", port, expectedDeviceId: local.deviceId,
+      discoveryMode: "direct", timeoutMs: 3000 });
+    await connecting;
+    assert.equal(store.getState().phase, "connected");
+    assert.ok(store.getState().remoteFs, "Authenticated incoming must be bound to the session store.");
+  } finally {
+    await Promise.allSettled([session?.close(), client.disconnect()]);
     await rm(root, { recursive: true, force: true });
   }
 });

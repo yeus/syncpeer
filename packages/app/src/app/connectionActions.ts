@@ -41,6 +41,7 @@ import {
   normalizeCandidateAddresses,
   normalizeCandidateDeviceId,
   syncConnectedDeviceSavedName,
+  preferredConnectionForDevice,
 } from "./devicePolicies.ts";
 import {
   hasAutoConnectTarget,
@@ -77,6 +78,7 @@ type ConnectionActionControl = {
   connectRequestGeneration: number;
   connectionSettingsTimer: ReturnType<typeof setTimeout> | null;
   connectionSettingsGeneration: number;
+  lastAttemptedConnectionSettings: string | null;
 };
 
 export const createConnectionActions = (args: ConnectionActionArgs) => {
@@ -85,6 +87,7 @@ export const createConnectionActions = (args: ConnectionActionArgs) => {
     connectionSettingsTimer: null,
     connectRequestGeneration: 0,
     connectionSettingsGeneration: 0,
+    lastAttemptedConnectionSettings: null,
   };
   return {
     connect: (targetDeviceId?: string) => connect(args, control, targetDeviceId),
@@ -142,9 +145,7 @@ const connect = async (
   }
   if (targetDeviceId) {
     state.devices.selectedSavedDeviceId = targetDeviceId;
-    state.connection.remoteId = targetDeviceId;
-    state.connection.discoveryMode = "automatic";
-    state.connection.host = "";
+    Object.assign(state.connection, preferredConnectionForDevice(state.connection, targetDeviceId));
     state.session.activeConnectDeviceId = targetDeviceId;
   }
   validateConnection(state);
@@ -160,7 +161,9 @@ const connect = async (
     migrateActiveLegacyFolderPasswords(state);
     await sessionStore.actions.setFolderPasswords(activeFolderPasswords(state));
     if (generation !== control.connectRequestGeneration) return;
-    await sessionStore.actions.connect(connectionDetails(state));
+    const requested = connectionDetails(state);
+    control.lastAttemptedConnectionSettings = JSON.stringify(requested);
+    await sessionStore.actions.connect(requested);
     if (generation !== control.connectRequestGeneration) return;
     const session = sessionStore.getState();
     applySessionState(state, session);
@@ -363,10 +366,12 @@ const disconnect = async (args: ConnectionActionArgs, control: ConnectionActionC
   if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
   control.connectionSettingsTimer = null;
   state.ui.autoConnectPaused = true;
-  const obsoleteConnect = control.connectInFlight;
+  // A cancelled native connect can remain unresolved after the service stops.
+  // Invalidate its UI generation; it must never block a user disconnect.
+  control.connectRequestGeneration += 1;
+  control.connectInFlight = null;
   try {
     await sessionStore.actions.disconnect();
-    if (obsoleteConnect) await obsoleteConnect;
   } catch (error) {
     reportActionError(state, "disconnect.failed", error);
   } finally {
@@ -386,6 +391,10 @@ const applyConnectionSettings = async (
   if (generation !== control.connectionSettingsGeneration) return;
   if (state.ui.autoConnectPaused) return;
   if (!hasAutoConnectTarget(state)) return;
+  // Some controls emit change events even when their effective value is
+  // unchanged (notably during Android WebView restoration). Such a no-op must
+  // not supersede a live or in-flight authenticated peer connection.
+  if (control.lastAttemptedConnectionSettings === JSON.stringify(connectionDetails(state))) return;
   const obsoleteConnect = control.connectInFlight;
   if (
     obsoleteConnect || (
@@ -393,8 +402,13 @@ const applyConnectionSettings = async (
       state.session.lifecyclePhase !== "error"
     )
   ) {
+    // Supersede the old UI attempt *before* disconnecting. Native disconnect
+    // cancels its transport, but the old JS promise may never settle.
+    if (obsoleteConnect) {
+      control.connectRequestGeneration += 1;
+      control.connectInFlight = null;
+    }
     await sessionStore.actions.disconnect();
-    if (obsoleteConnect) await obsoleteConnect;
     if (generation !== control.connectionSettingsGeneration || state.ui.autoConnectPaused) return;
     resetRuntimeState(state);
   }
@@ -437,6 +451,7 @@ const discoverLocalDevices = async (
   const { state, client, transfers } = args;
   if (transfers.transferInProgress()) return;
   if (state.devices.isDiscoveringLanDevices) return;
+  state.devices.localDiscoveryHealth = "scanning";
   state.devices.isDiscoveringLanDevices = true;
   try {
     const localDeviceId = normalizeDeviceId(state.devices.currentDeviceId);
@@ -479,8 +494,13 @@ const discoverLocalDevices = async (
     state.devices.lanDiscoveredDeviceIds = nextSeenIds;
     state.devices.lanDiscoveryByDeviceId = nextByDeviceId;
     state.devices.lanAnonymousCandidates = nextAnonymous;
-    state.devices.localDiscoveryNotice = "";
+    if (state.devices.localDiscoveryHealth === "scanning") state.devices.localDiscoveryHealth = "available";
+    if (state.devices.localDiscoveryHealth === "available") {
+      state.devices.localDiscoveryNotice = nextSeenIds.size || nextAnonymous.length
+        ? "" : "No nearby peers found during this scan. They may be offline or outside the local network.";
+    }
   } catch (error) {
+    state.devices.localDiscoveryHealth = "unavailable";
     const notice = localDiscoveryUnavailableNotice(error);
     if (notice) {
       const changed = state.devices.localDiscoveryNotice !== notice;
@@ -489,7 +509,7 @@ const discoverLocalDevices = async (
         pushSessionLog(state, "warning", "lan_discovery.unavailable", notice);
       }
     } else {
-      state.devices.localDiscoveryNotice = "";
+      state.devices.localDiscoveryNotice = "LAN discovery failed on this attempt. You can add a device by ID instead.";
       reportActionError(state, "lan_discovery.failed", error, options);
     }
   } finally {

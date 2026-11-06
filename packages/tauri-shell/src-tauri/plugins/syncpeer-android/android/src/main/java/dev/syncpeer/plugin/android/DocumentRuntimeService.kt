@@ -54,6 +54,11 @@ class DocumentRuntimeService : Service() {
   @Volatile private var sessionRequest: String? = null
   @Volatile private var sessionGeneration = 0L
   private var pendingSessionStart: CompletableFuture<JSONObject>? = null
+  private val uiConnectLock = Any()
+  private var uiConnectGeneration = 0L
+  private var uiConnectRequest: String? = null
+  private var uiConnectExpectedPeer: String? = null
+  private var uiConnectPending: CompletableFuture<JSONObject>? = null
   @Volatile private var sessionPhase = "idle"
   @Volatile private var sessionError: String? = null
   @Volatile private var peerPhase: String? = null
@@ -220,42 +225,80 @@ class DocumentRuntimeService : Service() {
         return result
       }
       if (operation == "disconnect") {
+        synchronized(uiConnectLock) {
+          uiConnectGeneration += 1
+          uiConnectPending = null
+          uiConnectRequest = null
+          uiConnectExpectedPeer = null
+        }
         return stopSession(persist = true).thenApply { status ->
           JSONObject().put("result", JSONObject().put("phase", status.optString("phase")))
         }
       }
-      if (operation == "connect") {
-        sessionPhase = "starting"
-        sessionError = null
-        peerPhase = null
-        peerError = null
-        publishSessionStatus()
-      }
-      return evaluateRuntime("""
+      val code = """
         if (!globalThis.syncpeerDocuments) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
         if (!globalThis.syncpeerSession) globalThis.syncpeerSession = await globalThis.syncpeerDocumentsCore.startSession(android, globalThis.syncpeerDocuments);
         const result = await globalThis.syncpeerSession.command({
           protocolVersion: ${SESSION_PROTOCOL_VERSION}, ...input,
         });
         return JSON.stringify({result: result === undefined ? null : result});
-      """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8),
-        releaseWorkerWhilePending = operation == "connect")
-        .thenApply { raw ->
-          JSONObject(raw).also { reply ->
-            if (operation == "connect") {
-              sessionStarted = true
-              sessionPhase = reply.optJSONObject("result")?.optString("phase", "connected") ?: "connected"
-              sessionError = null
-              publishSessionStatus()
+      """.trimIndent()
+      val rawInput = input.toString()
+      if (operation != "connect") {
+        return evaluateRuntime(code, rawInput.toByteArray(Charsets.UTF_8),
+          diagnosticOperation = "sessionCommand").thenApply(::JSONObject)
+      }
+      // Concurrent WebView retries must share one in-flight native command.
+      // Superseded completions may not overwrite a newer peer's phase.
+      return synchronized(uiConnectLock) {
+        val prior = uiConnectPending
+        if (uiConnectRequest == rawInput && prior != null && !prior.isDone) {
+          return@synchronized prior
+        }
+        uiConnectGeneration += 1
+        val generation = uiConnectGeneration
+        uiConnectRequest = rawInput
+        uiConnectExpectedPeer = input.optJSONObject("options")?.optString("remoteId")
+          ?.replace("-", "")?.uppercase()?.takeIf { it.isNotBlank() }
+        sessionPhase = "starting"
+        sessionError = null
+        peerPhase = null
+        peerError = null
+        publishSessionStatus()
+        val pending = evaluateRuntime(code, rawInput.toByteArray(Charsets.UTF_8),
+          releaseWorkerWhilePending = true, diagnosticOperation = "sessionConnect")
+          .thenApply { raw ->
+            JSONObject(raw).also { reply ->
+              synchronized(uiConnectLock) {
+                if (generation == uiConnectGeneration) {
+                  val phase = reply.optJSONObject("result")?.optString("phase", "connected") ?: "connected"
+                  // The authenticated lifecycle can recover through peer
+                  // arbitration while this original RPC returns a pending
+                  // snapshot. Never demote a newer confirmed push event.
+                  if (phase == "connected" || sessionPhase != "connected") {
+                    sessionStarted = phase == "connected"
+                    sessionPhase = phase
+                  }
+                  sessionError = null
+                  publishSessionStatus()
+                }
+              }
+            }
+          }.whenComplete { _, error ->
+            synchronized(uiConnectLock) {
+              if (generation == uiConnectGeneration) {
+                uiConnectPending = null
+                if (error != null && sessionPhase != "connected") {
+                  sessionPhase = "error"
+                  sessionError = "Peer connection could not be established."
+                  publishSessionStatus()
+                }
+              }
             }
           }
-        }.whenComplete { _, error ->
-          if (operation == "connect" && error != null) {
-            sessionPhase = "error"
-            sessionError = "Peer connection could not be established."
-            publishSessionStatus()
-          }
-        }
+        uiConnectPending = pending
+        pending
+      }
     }
 
     internal fun startBackgroundSession(input: JSONObject): CompletableFuture<JSONObject> {
@@ -290,6 +333,7 @@ class DocumentRuntimeService : Service() {
     highPriority: Boolean = false,
     releaseWorkerWhilePending: Boolean = false,
     onDispatched: () -> Unit = {},
+    diagnosticOperation: String? = null,
   ): CompletableFuture<String> {
     require(input.size <= 1024 * 1024) { "Document runtime input is too large." }
     require(!releaseWorkerWhilePending || timeoutMs == null) {
@@ -891,7 +935,29 @@ class DocumentRuntimeService : Service() {
       }
       peerPhase = if (phase == "connecting") "starting" else phase
       peerError = request.optString("error").ifBlank { null }
+      if (phase == "connected") {
+        // This event comes from the lifecycle-owned, TLS-authenticated socket.
+        // Require its peer identity to match the requested UI peer before
+        // promoting an earlier pending connect to native connected status.
+        val verifiedPeer = request.optString("remoteDeviceId").replace("-", "").uppercase()
+        synchronized(uiConnectLock) {
+          if (uiConnectRequest != null && verifiedPeer.isNotBlank() &&
+            (uiConnectExpectedPeer == null || verifiedPeer == uiConnectExpectedPeer) &&
+            sessionPhase != "stopping" &&
+            (sessionError == null || sessionError == "Peer connection could not be established.")) {
+            sessionStarted = true
+            sessionPhase = "connected"
+            sessionError = null
+          }
+        }
+      }
       publishSessionStatus()
+      return reply.put("result", JSONObject.NULL).toString()
+    }
+    if (request.optString("operation") == "pendingPeer") {
+      val id = request.optString("deviceId").uppercase()
+      require(id.matches(Regex("[A-Z2-7]{52}"))) { "Invalid pending peer identity." }
+      IncomingPeerBus.publish(id)
       return reply.put("result", JSONObject.NULL).toString()
     }
     if (request.optString("operation") == "diagnostic") {

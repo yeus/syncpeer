@@ -28,7 +28,7 @@ import {
 } from "./actionSupport.ts";
 import { restoreOfflineSnapshot, setRemoteApprovalPending } from "./syncPolicies.ts";
 import { suggestedClientName } from "./suggestedNames.ts";
-import { suggestedSavedDeviceName, upsertSavedDevice } from "./devicePolicies.ts";
+import { preferredConnectionForDevice, suggestedSavedDeviceName, upsertSavedDevice } from "./devicePolicies.ts";
 
 type DeviceActionArgs = {
   readonly state: AppState;
@@ -40,6 +40,7 @@ type DeviceActionArgs = {
   readonly connectToDevice: (deviceId: string) => Promise<void>;
   readonly disconnectPeer?: () => Promise<void>;
   readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
+  readonly onConfiguredPeersChanged?: () => void;
 };
 
 class DeviceActionsRuntime {
@@ -53,6 +54,7 @@ class DeviceActionsRuntime {
     private readonly connectToDevice: (deviceId: string) => Promise<void>,
     private readonly disconnectPeer?: () => Promise<void>,
     private readonly savePasswords?: (values: Record<string, string>) => Promise<void>,
+    private readonly onConfiguredPeersChanged?: () => void,
   ) {}
 
   private updateFolderPasswordDraft = (folderId: string, password: string) => {
@@ -135,9 +137,7 @@ class DeviceActionsRuntime {
       isIntroducer: this.state.devices.newSavedDeviceIsIntroducer,
     });
     this.state.devices.selectedSavedDeviceId = normalized;
-    this.state.connection.remoteId = normalized;
-    this.state.connection.discoveryMode = "automatic";
-    this.state.connection.host = "";
+    Object.assign(this.state.connection, preferredConnectionForDevice(this.state.connection, normalized));
     this.state.devices.newSavedDeviceId = "";
     this.state.devices.newSavedDeviceCustomName = "";
     this.state.devices.newSavedDeviceIsIntroducer = false;
@@ -178,9 +178,7 @@ class DeviceActionsRuntime {
         { kind: "manual", lastSeenAtMs: Date.now() });
     }
     this.state.devices.selectedSavedDeviceId = normalized;
-    this.state.connection.remoteId = normalized;
-    this.state.connection.discoveryMode = "automatic";
-    this.state.connection.host = "";
+    Object.assign(this.state.connection, preferredConnectionForDevice(this.state.connection, normalized));
     if (!this.state.session.isConnected) {
       restoreOfflineSnapshot(this.state, clearDirectoryView, normalized, "use_saved_device");
     }
@@ -241,6 +239,9 @@ class DeviceActionsRuntime {
         ([key]) => !sameDeviceId(key, normalized),
       ),
     );
+    // Rebuild the incoming allowlist when revoking an unselected peer. A socket
+    // already admitted under the old snapshot must not remain authorized.
+    if (!active && this.state.session.isConnected) this.onConfiguredPeersChanged?.();
   };
 
   private approveAdvertisedDevice = (device: ReturnType<typeof advertisedDevices>[number]) => {
@@ -250,9 +251,7 @@ class DeviceActionsRuntime {
     }
     upsertSavedDevice(this.state, device.id, device.name, { customName: false });
     this.state.devices.selectedSavedDeviceId = device.id;
-    this.state.connection.remoteId = device.id;
-    this.state.connection.discoveryMode = "automatic";
-    this.state.connection.host = "";
+    Object.assign(this.state.connection, preferredConnectionForDevice(this.state.connection, device.id));
     this.state.ui.recentError = null;
     this.state.devices.peerDiscovery = observePeer(this.state.devices.peerDiscovery, device.id,
       { kind: "manual", lastSeenAtMs: Date.now() });
@@ -401,4 +400,5 @@ export const createDeviceActions = (args: DeviceActionArgs) =>
     args.connectToDevice,
     args.disconnectPeer,
     args.savePasswords,
+    args.onConfiguredPeersChanged,
   ).api();

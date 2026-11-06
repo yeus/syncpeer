@@ -1,7 +1,7 @@
 <svelte:options runes={true} />
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, addPluginListener } from "@tauri-apps/api/core";
   import {
     createSyncpeerBrowserClient,
     createSyncpeerSessionStore,
@@ -76,6 +76,7 @@
   import { applyTheme } from "./app/theme.ts";
   import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
   import { isConfiguredDeviceName, suggestedClientName } from "./app/suggestedNames.ts";
+  import { localDiscoveryHealthFromDiagnostics } from "./app/connectionNotices.ts";
   import { requestLocalDataReset } from "./app/localReset.ts";
   import FolderOpen from "lucide-svelte/icons/folder-open";
   import Smartphone from "lucide-svelte/icons/smartphone";
@@ -164,7 +165,14 @@
       { kind: "incoming", lastSeenAtMs: Date.now() });
   };
   const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric, logFile } = createTauriAdapters({
-    onLog: (entry) => pushClientLog(app, entry),
+    onLog: entry => {
+      pushClientLog(app, entry);
+      if (entry.event !== "tauri.discovery.local.result") return;
+      const status = localDiscoveryHealthFromDiagnostics(entry.details);
+      if (!status) return;
+      app.devices.localDiscoveryHealth = status.health;
+      app.devices.localDiscoveryNotice = status.notice;
+    },
   });
   const client = createSyncpeerBrowserClient({
     hostAdapter,
@@ -664,6 +672,23 @@
       if (localDiscoveryTimer) clearInterval(localDiscoveryTimer);
       localDiscoveryTimer = null;
     };
+  });
+
+  onMount(() => {
+    if (appInfo.runtimeSurface !== "android-ui") return;
+    let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
+    void addPluginListener("syncpeer-android", "pendingPeer", event => {
+      const candidate = event as { deviceId?: unknown; payload?: { deviceId?: unknown } };
+      const deviceId = candidate.deviceId ?? candidate.payload?.deviceId;
+      if (cancelled || typeof deviceId !== "string") return;
+      handlePeerLog({ event: "client.incoming.pending_device", details: { deviceId },
+        timestampMs: Date.now(), level: "info" });
+    }).then(handle => {
+      if (cancelled) void handle.unregister();
+      else unsubscribe = () => { void handle.unregister(); };
+    }).catch(() => undefined);
+    return () => { cancelled = true; unsubscribe?.(); };
   });
 
   onDestroy(cleanupAppRuntime);

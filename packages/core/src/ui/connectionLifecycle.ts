@@ -203,7 +203,11 @@ class ConnectionLifecycleRuntime<TOptions> {
       this.active = null;
       this.activeKey = "";
       if (this.now() - this.connectedAtMs >= 30_000) this.failureStreak = 0;
-      if (closure.kind === "manual" || !this.desired) {
+      // An explicit user disconnect clears desired and increments generation,
+      // and an adopted replacement no longer owns this closure watcher.
+      // But a peer-arbitration or transport-driven local close can also be
+      // labelled "manual". If the same desired peer remains, recover it.
+      if (!this.desired) {
         this.update({ phase: "idle", nextRetryAtMs: null, closureReason: closure.message });
         return;
       }
@@ -238,16 +242,23 @@ class ConnectionLifecycleRuntime<TOptions> {
         // rather than close it because its captured revision is older.
         if (this.active === session && this.desired && this.activeKey === this.deps.keyFor(this.desired) &&
           !session.isClosed() && this.eligible()) return session;
-        await session.close().catch(() => undefined);
-        throw new Error("Connection attempt was cancelled.");
+        // An incoming socket may be adopted while this preferred outgoing
+        // handshake is pending, then lose arbitration to that outgoing socket.
+        // Keep the verified winner rather than closing the only live socket.
+        if (!this.desired || key !== this.deps.keyFor(this.desired) ||
+          !this.eligible() || session.isClosed() ||
+          (this.active && !this.active.isClosed())) {
+          await session.close().catch(() => undefined);
+          throw new Error("Connection attempt was cancelled.");
+        }
       }
       const previous = this.active;
       this.active = session;
       this.activeKey = key;
       this.connectedAtMs = this.now();
       this.update({ phase: "connected", nextRetryAtMs: null, closureReason: null });
-      this.watchClosure(session, openGeneration);
-      this.scheduleUpgrade(openGeneration);
+      this.watchClosure(session, this.generation);
+      this.scheduleUpgrade(this.generation);
       if (previous && previous !== session) await previous.close().catch(() => undefined);
       return session;
     })();

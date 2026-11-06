@@ -49,3 +49,21 @@ internal object SessionStatusBus {
 
   fun current(): SessionStatusSnapshot? = latest
 }
+/** Authenticated, unapproved incoming identities are suggestions only, never approvals. */
+internal object IncomingPeerBus {
+  private const val MAX_RECENT = 32
+  private val listeners = CopyOnWriteArrayList<(String) -> Unit>()
+  private val recent = LinkedHashSet<String>()
+
+  @Synchronized fun publish(deviceId: String) {
+    if (!recent.add(deviceId)) return
+    if (recent.size > MAX_RECENT) recent.remove(recent.first())
+    for (listener in listeners) runCatching { listener(deviceId) }
+  }
+
+  @Synchronized fun subscribe(listener: (String) -> Unit): () -> Unit {
+    listeners.add(listener)
+    for (deviceId in recent) runCatching { listener(deviceId) }
+    return { listeners.remove(listener) }
+  }
+}

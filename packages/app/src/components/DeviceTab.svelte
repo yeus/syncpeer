@@ -193,6 +193,14 @@
     {/if}
   </div>
 
+  <p class="hint" data-testid="local-discovery-health" role="status">
+    {#if app.devices.isDiscoveringLanDevices}Scanning the local network…
+    {:else if app.devices.localDiscoveryHealth === "partial"}Partial LAN discovery
+    {:else if app.devices.localDiscoveryHealth === "unavailable"}LAN discovery unavailable
+    {:else if app.devices.localDiscoveryHealth === "available"}LAN discovery available
+    {:else}LAN discovery not yet checked{/if}
+  </p>
+  <p class="hint">LAN discovery only finds reachable devices on the same multicast-capable network. For a peer outside your LAN, enter its device ID below and use automatic/global discovery or a configured direct/relay address. Discovery does not approve a peer.</p>
   {#if app.devices.localDiscoveryNotice}
     <p class="hint" data-testid="local-discovery-notice">
       {app.devices.localDiscoveryNotice}

@@ -46,6 +46,10 @@ export interface ConnectOptions {
   cert?: string;
   key?: string;
   remoteId?: string;
+  /** Explicitly user-configured external peers, never unauthenticated discovery candidates. */
+  configuredPeerIds?: string[];
+  /** Explicitly approved offered folder IDs for local registration; undefined permits ordinary peers. */
+  consentedFolderIds?: string[];
   deviceName: string;
   timeoutMs?: number;
   enableRelayFallback?: boolean;
@@ -496,6 +500,10 @@ const normalizeConnectOptions = (options: ConnectOptions): ConnectOptions => ({
   key: options.key && options.key.trim() !== "" ? options.key.trim() : undefined,
   remoteId: options.remoteId && options.remoteId.trim() !== "" ? options.remoteId.trim() : undefined,
   deviceName: options.deviceName,
+  configuredPeerIds: [...new Set((options.configuredPeerIds ?? []).filter((id): id is string =>
+    typeof id === "string").map(id => id.replace(/[^A-Z2-7]/gi, "").toUpperCase())
+    .filter(id => id.length === 52))].sort(),
+  consentedFolderIds: options.consentedFolderIds?.filter(id => typeof id === "string" && id.trim() !== ""),
   timeoutMs: options.timeoutMs,
   enableRelayFallback: options.enableRelayFallback ?? true,
   relayOnly: options.relayOnly === true,
@@ -998,6 +1006,7 @@ async function selectIncomingDevices(
   ctx: IncomingContext,
   coreOptions: SyncpeerConnectOptions,
   background: boolean,
+  connectOptions: ConnectOptions,
 ) {
   const expectedDeviceId = coreOptions.expectedDeviceId ?? "";
   if (!background && !expectedDeviceId) return null;
@@ -1016,7 +1025,8 @@ async function selectIncomingDevices(
         .filter((device) => device.state === "active")
         .map((device) => device.syncthingId)
         .filter((id) => id && !sameDeviceId(id, localDeviceId))
-    : resolveIncomingPeerDeviceIds(expectedDeviceId, localDeviceId, trustedDevices);
+    : resolveIncomingPeerDeviceIds(expectedDeviceId, localDeviceId, trustedDevices,
+      connectOptions.configuredPeerIds ?? []);
   return { expectedDeviceId, localDeviceId, approvedDeviceIds };
 }
 
@@ -1167,11 +1177,25 @@ function createIncomingSessionHandlers(
       ctx.platformAdapter,
     ),
     onSession: (session: SyncpeerSessionHandle, connectedRemoteDeviceId: string) => {
-      if (
-        sameDeviceId(connectedRemoteDeviceId, params.expectedDeviceId) &&
-        preferredPeerDirection(params.localDeviceId, connectedRemoteDeviceId) === "incoming"
-      ) {
+      // A handshake may finish after sharing or membership changes. Never
+      // adopt a session configured against a retired approval snapshot.
+      if (params.revision !== ctx.platformAdapter.sessionConfigurationRevision?.()) {
+        void session.close().catch(() => undefined);
+        return;
+      }
+      // The preferred direction chooses between duplicates, not reachability.
+      // Accept a reverse socket only until a healthy preferred session exists.
+      // Otherwise adopting the reverse socket would evict the stable winner.
+      const matchesExpected = sameDeviceId(connectedRemoteDeviceId, params.expectedDeviceId);
+      const current = ctx.getLifecycle().getSession();
+      const preferIncoming = matchesExpected &&
+        preferredPeerDirection(params.localDeviceId, connectedRemoteDeviceId) === "incoming";
+      if (matchesExpected && (preferIncoming || !current || current.isClosed())) {
         handlePreferredIncoming(ctx, { ...params, session, connectedRemoteDeviceId });
+        return;
+      }
+      if (matchesExpected) {
+        void session.close().catch(() => undefined);
         return;
       }
       if (params.background) {
@@ -1276,7 +1300,7 @@ async function ensureIncomingServiceImpl(
   if (ctx.platformAdapter.incomingSessionOwnedByService || !ctx.coreAdapter.listenTls) {
     return null;
   }
-  const devices = await selectIncomingDevices(ctx, coreOptions, background);
+  const devices = await selectIncomingDevices(ctx, coreOptions, background, connectOptions);
   if (!devices) return null;
   if (!background && !devices.approvedDeviceIds.length) {
     await stopIncomingService(ctx.state);
@@ -1535,13 +1559,23 @@ async function openSessionImpl(
     signal,
   );
   if (preferred) return preferred;
-  let session = await openCoreSession(
-    ctx,
-    coreOptions,
-    signal,
-    listener.failure,
-    connectOptions.listenPort ?? 22000,
-  );
+  let session: SyncpeerSessionHandle;
+  try {
+    session = await openCoreSession(
+      ctx, coreOptions, signal, listener.failure, connectOptions.listenPort ?? 22000,
+    );
+  } catch (error) {
+    // A reverse-direction incoming session may win while the preferred outbound
+    // dial is in flight. Surface that adopted session to the caller rather than
+    // reporting an outbound timeout and leaving the UI stuck in "connecting".
+    const incoming = getLifecycle().getSession();
+    if (!incoming || incoming.isClosed() ||
+      !normalized.remoteId || !sameDeviceId(incoming.remoteDeviceId, normalized.remoteId)) {
+      throw error;
+    }
+    logClient(ctx.options.onLog, "client.session.incoming.fallback", {});
+    return incoming;
+  }
   session = await admitOutgoingSession(session, normalized, listener.service);
   ctx.state.activeResolvedConnectOptions = {
     ...normalized,
@@ -1562,6 +1596,11 @@ async function refreshSessionConfiguration(
   requestedRevision: number | undefined,
 ) {
   if (requestedRevision !== ctx.platformAdapter.sessionConfigurationRevision?.()) return;
+  // Retire sessions already admitted by the incoming listener even if preparing
+  // the replacement configuration fails. The listener itself remains bound;
+  // its revision guard rejects stale connections until it is refreshed.
+  await Promise.allSettled((ctx.state.incomingService?.activeSessions() ?? [])
+    .map(({ session }) => session.close()));
   const currentOptions = ctx.state.activeConnectOptions ?? ctx.state.activeResolvedConnectOptions;
   if (!currentOptions) return;
   try {

@@ -6,6 +6,7 @@ import { automaticRelayConfiguration } from "../../core/src/sync/automaticRelayP
 import { installAndroidTimers } from "./document-runtime-polyfills.js";
 import { createPortRequest } from "./document-runtime-port.js";
 import { createDocumentFilesystem } from "../../core/src/sync/documentFilesystem.js";
+import { confirmConnectedSession } from "../../core/src/sync/connectedSessionConfirmation.js";
 import { dispatchDocumentCommandWithSessionConfiguration } from "../../core/src/sync/documentCommands.js";
 import { createNativeFilesystem } from "../../core/src/sync/nativeFilesystem.js";
 import { deriveUntrustedFolderCrypto } from "../../core/src/core/model/untrusted.js";
@@ -18,7 +19,6 @@ import { serializeConnectionKey } from "../../core/src/ui/connectionKey.js";
 import { createConnectionLifecycle, waitForLifecyclePhase,
   type ConnectionLifecycle, type ConnectionLifecycleState } from "../../core/src/ui/connectionLifecycle.js";
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
-import { preferredPeerDirection } from "../../core/src/sync/peerSessionManager.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
 import { sameDeviceId } from "../../core/src/ui/helpers.js";
@@ -77,6 +77,11 @@ const createAndroidSessionAdapter = async (
   };
   const adapter: SyncpeerHostAdapter = {
     log: (event, details) => {
+      if (event === "core.incoming.pending_device") {
+        const deviceId = details?.deviceId;
+        if (typeof deviceId === "string") void request({ operation: "pendingPeer", deviceId });
+        return;
+      }
       if (!event.startsWith("core.session.connect.") &&
         !["core.discovery.global_failed", "core.discovery.retry", "core.discovery.full_response",
           "core.discovery.candidate.failed", "core.discovery.connect_strategy", "core.upload.request.failed",
@@ -227,9 +232,11 @@ class AndroidSessionRuntime {
   }
 
   private reportPeerStatus = (state: ConnectionLifecycleState) => {
+    const active = state.phase === "connected" ? this.lifecycle.getSession() : null;
     void this.nativeRequest({
       operation: "sessionPeerStatus",
       phase: state.phase,
+      remoteDeviceId: active && !active.isClosed() ? active.remoteDeviceId : null,
       attempt: state.attempt,
       error: state.closureReason ?? undefined,
     }).catch(() => undefined);
@@ -241,11 +248,11 @@ class AndroidSessionRuntime {
     this.peerStatusUnsubscribe = this.lifecycle.subscribe(this.reportPeerStatus);
     this.documents.onSessionConfigurationChange(() => {
       setTimeout(() => {
-        void (async () => {
-          await this.stopIncomingService();
-          if (!this.activeOptions) return;
-          await this.lifecycle.ensureSession(this.activeOptions);
-        })().catch(() => undefined);
+        if (!this.activeOptions) return;
+        // The new opening refreshes incoming handlers via ensureIncomingService.
+        // Closing the listener first also closes live sessions, allowing a
+        // second connect to race with its own BEP teardown.
+        void this.lifecycle.ensureSession(this.activeOptions).catch(() => undefined);
       }, 0);
     });
     return { command: this.command, close: this.close };
@@ -278,7 +285,7 @@ class AndroidSessionRuntime {
       certificateDerFromPem(coreOptions.certPem));
     const trustedDevices = (await this.documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
     const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
-      localDeviceId, trustedDevices);
+      localDeviceId, trustedDevices, options.configuredPeerIds ?? []);
     if (!approvedDeviceIds.length) { await this.stopIncomingService(); return null; }
     const listenPort = options.listenPort ?? 22000;
     if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
@@ -343,8 +350,12 @@ class AndroidSessionRuntime {
         if (!ready) throw new Error("Incoming peer folder preparation is unavailable.");
         return { ...ready, ...endpoint };
       },
-      onSession: (session: SyncpeerSessionHandle) => {
-        if (preferredPeerDirection(context.localDeviceId, context.remoteDeviceId) !== "incoming") return;
+      onSession: (session: SyncpeerSessionHandle, remoteDeviceId: string) => {
+        // The session manager has already arbitrated duplicate incoming and
+        // outgoing connections. A non-preferred incoming socket can still be
+        // its only accepted live session; never leave that socket unowned by
+        // the lifecycle while the UI keeps retrying a redundant outgoing dial.
+        if (!options.remoteId || !sameDeviceId(remoteDeviceId, options.remoteId)) return;
         void this.lifecycle.adopt(options, session);
       },
     };
@@ -360,6 +371,7 @@ class AndroidSessionRuntime {
       host: "0.0.0.0", port: context.listenPort, certPem: coreOptions.certPem, keyPem: coreOptions.keyPem,
       localDeviceId: context.localDeviceId, approvedDeviceIds: context.approvedDeviceIds,
       automaticRelay: context.automaticRelay, ...sessionHandlers,
+       onUnapprovedPeer: deviceId => this.adapter.log?.("core.incoming.pending_device", { deviceId }),
       onError: error => this.adapter.log?.("core.incoming.failed", {
         message: error instanceof Error ? error.message : String(error),
       }),

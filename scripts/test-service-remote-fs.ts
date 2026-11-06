@@ -326,6 +326,180 @@ test("service proxy uses pushed status revisions and ignores stale replay", asyn
   }
 });
 
+test("a transient service reconnect is acknowledged by pushed status without redialing", async () => {
+  let listener: ((value: unknown) => void) | undefined;
+  let phase = "reconnecting", connects = 0, stopped = 0;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") { connects++; return { phase: "reconnecting" }; }
+    if (request.operation === "status") return { phase, peerPhase: phase,
+      revision: phase === "connected" ? 2 : 1, active: true, foreground: true };
+    if (request.operation === "overview") {
+      assert.equal(phase, "connected");
+      return { folders: [], folderSyncStates: [], connectedVia: "test", transportKind: "direct-tcp" };
+    }
+    throw Error("Unexpected service command.");
+  };
+  const connecting = createServiceOwnedSession(rpc, {
+    host: "127.0.0.1", port: 22000, remoteId: "peer",
+  } as never, undefined, 60_000, async handler => {
+    listener = handler;
+    return () => { stopped++; };
+  });
+  for (let i = 0; i < 10 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener);
+  assert.equal(connects, 1);
+  phase = "connected";
+  listener({ type: "sessionStatus", revision: 2, phase, peerPhase: phase,
+    active: true, foreground: true });
+  const session = await connecting;
+  try {
+    assert.equal(session.transportKind, "direct-tcp");
+    assert.equal(connects, 1, "A status transition must not create a competing peer session.");
+    assert.ok(stopped >= 1, "Temporary status subscription must be released.");
+  } finally { await session.close(); }
+});
+
+test("inactive startup and stale idle events do not reject a pending native connection", async () => {
+  let listener: ((value: unknown) => void) | undefined;
+  let phase = "starting", subscriptions = 0;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "starting" };
+    if (request.operation === "status") return { phase,
+      active: phase === "connected", revision: phase === "connected" ? 5 : 2, foreground: false };
+    if (request.operation === "overview") return { folders: [], folderSyncStates: [],
+      connectedVia: "test", transportKind: "direct-tcp" };
+    throw Error("Unexpected service operation.");
+  };
+  const connecting = createServiceOwnedSession(rpc, { remoteId: "peer" } as never,
+    undefined, 60_000, async handler => {
+      if (subscriptions++ === 0) {
+        listener = handler;
+        handler({ type: "sessionStatus", revision: 3, phase: "starting",
+          active: false, foreground: false });
+      }
+      return () => undefined;
+    });
+  for (let i = 0; i < 10 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener);
+  listener({ type: "sessionStatus", revision: 4, phase: "idle",
+    active: false, foreground: false });
+  phase = "connected";
+  listener({ type: "sessionStatus", revision: 5, phase: "connected", peerPhase: "reconnecting",
+    active: true, foreground: false });
+  const session = await connecting;
+  assert.equal(session.isClosed(), false);
+  await session.close();
+});
+
+test("stale idle connection reply reconciles with a live native reconnect", async () => {
+  let listener: ((value: unknown) => void) | undefined;
+  let phase = "reconnecting";
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "idle" };
+    if (request.operation === "status") return { phase, peerPhase: phase,
+      active: true, foreground: true, revision: 4 };
+    if (request.operation === "overview") return { folders: [], folderSyncStates: [],
+      connectedVia: "test", transportKind: "direct-tcp" };
+    throw Error("Unexpected service operation.");
+  };
+  const connecting = createServiceOwnedSession(rpc, { remoteId: "peer" } as never,
+    undefined, 60_000, async handler => {
+      listener = handler;
+      return () => undefined;
+    });
+  for (let i = 0; i < 10 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener);
+  phase = "connected";
+  listener({ type: "sessionStatus", revision: 5, phase, peerPhase: phase,
+    active: true, foreground: true });
+  const session = await connecting;
+  assert.equal(session.isClosed(), false);
+  await session.close();
+});
+
+test("native connect cancellation is reconciled against an authenticated live session", async () => {
+  let listener: ((value: unknown) => void) | undefined;
+  let phase = "reconnecting";
+  let connections = 0;
+  let subscriptionsClosed = 0;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") {
+      connections++;
+      throw new Error("Android service session unavailable: java.lang.IllegalStateException: Connection attempt was cancelled.");
+    }
+    if (request.operation === "status") return { phase, active: phase === "connected",
+      revision: phase === "connected" ? 8 : 7, foreground: true };
+    if (request.operation === "overview") {
+      assert.equal(phase, "connected");
+      return { folders: [], folderSyncStates: [], connectedVia: "test", transportKind: "direct-tcp" };
+    }
+    throw new Error("Unexpected service operation.");
+  };
+  // Attach a rejection handler before asserting the pushed status; the old
+  // implementation rejects synchronously instead of subscribing for recovery.
+  const outcome = createServiceOwnedSession(rpc, { remoteId: "peer" } as never,
+    undefined, 60_000, async handler => {
+      listener = handler;
+      return () => { subscriptionsClosed++; };
+    }).then(value => ({ value }), error => ({ error }));
+  for (let i = 0; i < 10 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener, "A cancelled opening must listen for an authenticated replacement.");
+  phase = "connected";
+  listener({ type: "sessionStatus", revision: 8, phase, active: true, foreground: true });
+  const result = await outcome;
+  if ("error" in result) throw result.error;
+  assert.equal(connections, 1, "Recovery must not issue a second peer connect.");
+  assert.equal(subscriptionsClosed, 1);
+  assert.equal(result.value.isClosed(), false);
+  await result.value.close();
+});
+
+test("a native recovery cannot acknowledge a different authenticated peer", async () => {
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "connected" };
+    if (request.operation === "overview") return { folders: [], folderSyncStates: [],
+      connectedVia: "test", transportKind: "direct-tcp",
+      device: { id: "OTHERPEER", deviceName: "Peer B", clientName: "test", clientVersion: "1" } };
+    throw new Error("Unexpected service operation.");
+  };
+  await assert.rejects(createServiceOwnedSession(rpc, {
+    remoteId: "EXPECTEDPEER",
+  } as never), /different authenticated peer/);
+});
+
+test("a genuine native service connect rejection is not converted to a retry", async () => {
+  let subscribed = false;
+  await assert.rejects(createServiceOwnedSession(async () => {
+    throw new Error("Peer identity is not authorized.");
+  }, { remoteId: "peer" } as never, undefined, 60_000, async () => {
+    subscribed = true;
+    return () => undefined;
+  }), /not authorized/);
+  assert.equal(subscribed, false);
+});
+
+test("a transient service connect rejects terminal status and cleans up listeners", async () => {
+  let listener: ((value: unknown) => void) | undefined;
+  let unsubscribed = false;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "waiting" };
+    if (request.operation === "status") return { phase: "waiting", active: true, foreground: true };
+    throw Error("Unexpected service command.");
+  };
+  const connecting = createServiceOwnedSession(rpc, {
+    host: "127.0.0.1", port: 22000, remoteId: "peer",
+  } as never, undefined, 60_000, async handler => {
+    listener = handler;
+    return () => { unsubscribed = true; };
+  });
+  for (let i = 0; i < 10 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener);
+  listener({ type: "sessionStatus", revision: 3, phase: "error", active: false,
+    foreground: true, error: "Synthetic terminal disconnect." });
+  await assert.rejects(connecting, /Synthetic terminal disconnect/);
+  assert.equal(unsubscribed, true);
+});
+
 test("service proxy orders focused-folder updates ahead of later reads", async () => {
   const calls: string[] = [];
   const rpc = async (request: Record<string, unknown>) => {

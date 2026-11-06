@@ -241,6 +241,13 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
           uri, "syncpeerSessionCommand", args.request, null)
         invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(response?.getString("result"))))
       } catch (error: Exception) {
+        if (activity.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+          val operation = runCatching { JSONObject(args.request).optString("operation") }
+            .getOrDefault("unknown").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "unknown"
+          val classes = generateSequence(error as Throwable?) { it.cause }.take(5)
+            .joinToString(">") { it.javaClass.simpleName }
+          android.util.Log.w("SyncpeerRuntime", "session.bridge.failed operation=$operation causes=$classes")
+        }
         invoke.reject(privateStorageFailureMessage(error)
           ?: sessionFailureMessage(error)
           ?: "The Android peer session is unavailable.")
@@ -263,6 +270,8 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       "Invalid focused",
       "Remote directory entry is too large",
       "Android service could not establish a peer session",
+      "Peer session was replaced during connection",
+      "Connection attempt was cancelled",
     )
     var current: Throwable? = error
     while (current != null) {
@@ -354,6 +363,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
   private var multicastLock: WifiManager.MulticastLock? = null
   private var sessionStatusSubscription: (() -> Unit)? = null
+  private var incomingPeerSubscription: (() -> Unit)? = null
   private var notificationCancellationPending = false
   private val backgroundSessionHandoff = BackgroundSessionHandoff()
   @Volatile private var backgroundActivityPaused = false
@@ -398,12 +408,21 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         } }
       }
     }
+    if (incomingPeerSubscription == null) {
+      incomingPeerSubscription = IncomingPeerBus.subscribe { deviceId ->
+        runCatching { activity.runOnUiThread {
+          runCatching { triggerObject("pendingPeer", mapOf("deviceId" to deviceId)) }
+        } }
+      }
+    }
     if (activity.intent?.action == SyncpeerTransferConstants.ACTION_CANCEL) {
       handleTransferCancellation()
     }
   }
   override fun onDestroy(activity: AppCompatActivity) {
     sessionStatusSubscription?.invoke()
+    incomingPeerSubscription?.invoke()
+    incomingPeerSubscription = null
     sessionStatusSubscription = null
     super.onDestroy(activity)
   }

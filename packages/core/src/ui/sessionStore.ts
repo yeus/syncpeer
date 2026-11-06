@@ -56,6 +56,7 @@ interface SessionActionContext {
   >;
   readonly readDirWithRetry: ReturnType<typeof makeReadDirWithRetryFlow>;
   reloadCurrentDirectory: (options?: ConnectOptions) => Promise<void>;
+  recoverCancelledOpening?: (epoch: number, error: unknown) => void;
 }
 
 const resolveErrorMessage = (error: unknown): string =>
@@ -231,10 +232,18 @@ const connectAction = async (
     applyConnectResult(ctx, nextEpoch, options, remoteFs, overview);
     if (ctx.getState().requestEpoch !== nextEpoch) return;
     await pollFoldersPopulated(ctx, nextEpoch, options);
-    await reloadConnectedDirectory(ctx, options);
   } catch (error) {
     failConnect(ctx, nextEpoch, error);
+    if (!preserveSelectedFolder) ctx.recoverCancelledOpening?.(nextEpoch, error);
     throw error;
+  }
+  // Directory indexes can arrive after an authenticated BEP session is ready.
+  // A directory load failure belongs to the folder view, not the transport.
+  if (ctx.getState().requestEpoch !== nextEpoch) return;
+  try {
+    await reloadConnectedDirectory(ctx, options);
+  } catch {
+    // reloadCurrentDirectoryAction already records the directory-specific error.
   }
 };
 
@@ -400,28 +409,34 @@ const refreshOverviewAction = async (
   if (!ctx.getState().remoteFs) return;
   const targetEpoch = ctx.getState().requestEpoch;
   beginRefresh(ctx);
+  let shouldReloadDirectory: boolean;
   try {
     const overview = preserveSelectedFolder
       ? await readReconnectOverview(ctx, resolved, targetEpoch)
       : await ctx.deps.transport.connectAndGetOverview(resolved);
-    const shouldReloadDirectory = applyRefreshedOverview(
+    shouldReloadDirectory = applyRefreshedOverview(
       ctx,
       targetEpoch,
       overview,
       resolved,
     );
-    if (ctx.getState().requestEpoch !== targetEpoch || !ctx.getState().remoteFs)
-      return;
-    if (
-      shouldReloadDirectory &&
-      ctx.getState().directory.folderId &&
-      !directoryIsLocked(ctx.getState())
-    ) {
-      await ctx.reloadCurrentDirectory(resolved);
-    }
   } catch (error) {
     failRefresh(ctx, targetEpoch, error);
     throw error;
+  }
+  if (ctx.getState().requestEpoch !== targetEpoch || !ctx.getState().remoteFs)
+    return;
+  if (
+    shouldReloadDirectory &&
+    ctx.getState().directory.folderId &&
+    !directoryIsLocked(ctx.getState())
+  ) {
+    try {
+      await ctx.reloadCurrentDirectory(resolved);
+    } catch {
+      // A folder-index/read error is already recorded on the directory.
+      // It must not invalidate an authenticated transport.
+    }
   }
 };
 
@@ -765,6 +780,18 @@ const subscribeToLifecycle = (ctx: SessionActionContext): void => {
       pendingRecoveryOptions = null;
       if (pending && previousPhase === "connected") recover(pending);
     });
+  };
+  // A connected lifecycle can arrive while an initial connect is pending.
+  // If that promise is later cancelled, its pending flag clears without a
+  // second lifecycle event. Rebind exactly once through the existing recovery
+  // owner, rather than leaving the authenticated socket invisible to the UI.
+  ctx.recoverCancelledOpening = (epoch, error) => {
+    const message = resolveErrorMessage(error);
+    if (!/Connection attempt was cancelled|signal is aborted without reason/i.test(message) ||
+      previousPhase !== "connected") return;
+    const state = ctx.getState();
+    if (state.requestEpoch !== epoch || state.remoteFs || !state.connectOptions) return;
+    recover({ ...state.connectOptions });
   };
   ctx.deps.transport.subscribeLifecycle?.((lifecycle) => {
     const transitionedToConnected =

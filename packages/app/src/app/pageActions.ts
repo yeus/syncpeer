@@ -36,22 +36,29 @@ const setAppVisibility = (isVisible: boolean) => {
   void sessionStore.actions.setForeground(isVisible);
 };
 
-const onNetworkOnline = async () => {
-  await sessionStore.actions.setOnline(true);
+const currentAutoTarget = () =>
+  hasAutoConnectTarget(state)
+    ? state.connection.remoteId || state.devices.selectedSavedDeviceId
+    : "";
+
+const discoverThenConnect = async () => {
   if (state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed) return;
+  const targetAtStart = currentAutoTarget();
   await discoverLocalDevices({ timeoutMs: 1200 });
-  if (!hasAutoConnectTarget(state)) return;
-  if (state.session.isConnected || state.session.isConnecting) return;
+  // Discovery is asynchronous. Adding or selecting a peer while it runs must
+  // not let an earlier startup/online callback dial a stale configuration.
+  if (!targetAtStart || currentAutoTarget() !== targetAtStart ||
+    state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed ||
+    state.session.isConnected || state.session.isConnecting) return;
   await connect();
 };
 
-const onAppForeground = async () => {
-  if (state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed) return;
-  await discoverLocalDevices({ timeoutMs: 1200 });
-  if (!hasAutoConnectTarget(state)) return;
-  if (state.session.isConnected || state.session.isConnecting) return;
-  await connect();
+const onNetworkOnline = async () => {
+  await sessionStore.actions.setOnline(true);
+  await discoverThenConnect();
 };
+
+const onAppForeground = discoverThenConnect;
 
 const openDiagnosticsPage = () => {
   state.currentPage = "diagnostics";

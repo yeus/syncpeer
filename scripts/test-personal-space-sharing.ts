@@ -88,6 +88,21 @@ test("incoming listeners never prepare or accept the local device", () => {
   assert.deepEqual(resolveIncomingPeerDeviceIds("EXTERNAL", "LAPTOP", membership), ["EXTERNAL", "PHONE"]);
 });
 
+test("incoming listener accepts explicitly configured external peers but excludes local, revoked and retired IDs", () => {
+  const externalA = "A".repeat(52), externalB = "B".repeat(52);
+  const retired = "C".repeat(52), local = "D".repeat(52);
+  const members = [
+    { id: "owner", syncthingId: local, state: "active" as const,
+      retiredSyncthingIds: [retired], signingKey: "owner-key" },
+    { id: "revoked", syncthingId: externalB, state: "revoked" as const, signingKey: "revoked-key" },
+  ];
+  assert.deepEqual(resolveIncomingPeerDeviceIds("", local, members,
+    [externalA, externalB, retired, local, "INVALID"]), [externalA]);
+  assert.deepEqual(resolveIncomingPeerDeviceIds(externalA, local, members,
+    [externalA, externalA]), [externalA]);
+  assert.deepEqual(resolveIncomingPeerDeviceIds("", local, members, []), []);
+});
+
 test("space device membership updates require an active signer and reject rollback", async () => {
   const first = await signingKeyPair();
   const second = await signingKeyPair();

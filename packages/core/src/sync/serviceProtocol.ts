@@ -32,6 +32,8 @@ const connectOptions = z.looseObject({
   discoveryServer: z.string().max(4096).optional(), relayPoolUrl: z.string().max(4096).optional(),
   cert: z.string().max(65536).optional(), key: z.string().max(65536).optional(),
   remoteId: z.string().max(4096).optional(), deviceName: z.string().max(4096),
+  configuredPeerIds: z.array(z.string().max(128)).max(256).optional(),
+  consentedFolderIds: z.array(z.string().min(1).max(512)).max(512).optional(),
   timeoutMs: z.number().int().min(0).optional(), enableRelayFallback: z.boolean().optional(),
   relayOnly: z.boolean().optional(), quicOnly: z.boolean().optional(),
   folderPasswords: z.record(z.string(), z.string()).optional(),

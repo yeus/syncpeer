@@ -70,6 +70,7 @@ export const createAppActions = (args: {
     refreshCurrentDeviceId: connection.refreshCurrentDeviceId,
     connectToDevice: connection.connect,
     disconnectPeer: connection.disconnect,
+    onConfiguredPeersChanged: connection.scheduleConnectionSettingsApply,
   });
   const page = createPageActions({
     state,

@@ -775,6 +775,51 @@ test("remote-only folder reconnects do not publish empty indexes or rotate local
     }
   });
 
+
+test("an incoming browse-only peer echoes offered folders after its initial empty cluster configuration",
+  { timeout: 12000 }, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "syncpeer-incoming-index-"));
+    let listener: Awaited<ReturnType<typeof startIncomingPeerService>> | undefined;
+    let outgoing: SyncpeerSessionHandle | undefined;
+    let incoming: SyncpeerSessionHandle | undefined;
+    try {
+      const [source, browser] = await Promise.all([
+        createTestPeerIdentity(root, "source"), createTestPeerIdentity(root, "browser"),
+      ]);
+      const events: string[] = [];
+      let accept!: (session: SyncpeerSessionHandle) => void;
+      const accepted = new Promise<SyncpeerSessionHandle>(resolve => { accept = resolve; });
+      const adapter = createNodeHostAdapter();
+      listener = await startIncomingPeerService({
+        ...adapter, log: event => { events.push(event); },
+      }, {
+        host: "127.0.0.1", port: 0, certPem: browser.certPem, keyPem: browser.keyPem,
+        localDeviceId: browser.deviceId, approvedDeviceIds: [source.deviceId],
+        handshakeTimeoutMs: 3000,
+        connectionOptions: (expectedDeviceId, endpoint) => ({
+          ...browser, ...endpoint, expectedDeviceId, deviceName: "incoming-browser",
+          timeoutMs: 3000, sharedFolders: [],
+        }),
+        onSession: accept,
+      });
+      outgoing = await createNodeSyncpeerClient().openSession({
+        ...source, host: "127.0.0.1", port: listener.port,
+        expectedDeviceId: browser.deviceId, deviceName: "synthetic-source",
+        timeoutMs: 3000, discoveryMode: "direct",
+        sharedFolders: [{ id: "fixture-camera", encryption: { mode: "plaintext" } }],
+      });
+      incoming = await accepted;
+      assert.ok((await incoming.remoteFs.listFolders()).some(folder => folder.id === "fixture-camera"));
+      assert.ok(events.includes("core.cluster.echo.send.done"),
+        "The incoming browse-only peer must acknowledge offered folders, not just advertise an empty initial list");
+    } finally {
+      await outgoing?.close();
+      await incoming?.close();
+      await listener?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
 // Regression for credentials arriving after the initial encrypted BEP index.
 test("locked encrypted folders unlock from cached indexes without a reconnect",
   { timeout: 15000 }, async () => {

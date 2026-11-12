@@ -1316,6 +1316,18 @@ test("generated diagnostics redact prefixed identifiers, hosts and folder secret
   });
 });
 
+test("free-text service messages stay readable but redacted", () => {
+  assert.deepEqual(sanitizeDiagnosticArtifact({
+    errorMessage: `device ${"A".repeat(56)} was not approved`,
+    peerMessage: "tcp://192.0.2.10:22000 closed",
+    message: "saved to /home/synthetic/file.txt",
+  }), {
+    errorMessage: "device [redacted] was not approved",
+    peerMessage: "[redacted] closed",
+    message: "saved to [path]",
+  });
+});
+
 test("diagnostic text redacts candidate addresses, paths and long identifiers", () => {
   assert.equal(
     sanitizeDiagnosticText(`tcp://192.0.2.10:22000 closed; relay://192.0.2.11:22067/?id=${'A'.repeat(56)} timed out; ` +

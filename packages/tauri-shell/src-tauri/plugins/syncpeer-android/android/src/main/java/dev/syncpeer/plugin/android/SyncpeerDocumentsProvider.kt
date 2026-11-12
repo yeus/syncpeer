@@ -193,8 +193,18 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       if (!bound) throw FileNotFoundException(summary())
       // Same-UID caller only. Delegate to the already-running TypeScript session,
       // not another socket opened in the Activity's WebView.
-      ready.get(30, TimeUnit.SECONDS).sessionCommand(request)
-        .get(75, TimeUnit.SECONDS).opt("result").takeUnless { it == JSONObject.NULL }
+      val owner = ready.get(30, TimeUnit.SECONDS)
+      try {
+        owner.sessionCommand(request).get(75, TimeUnit.SECONDS)
+          .opt("result").takeUnless { it == JSONObject.NULL }
+      } catch (error: Exception) {
+        // Keep the service's plain session reason instead of replacing it with
+        // an unexplained "peer session unavailable" at the plugin boundary.
+        val reason = owner.backgroundSessionStatus().optString("error")
+          .takeIf { it.isNotBlank() && it != "null" }
+          ?: "The Android peer session is unavailable."
+        throw IllegalStateException(prefixedSessionFailure(reason), error)
+      }
     } else if (method == "syncpeerReleaseLocalCopy") {
       val request = JSONObject(checkNotNull(arg))
       check(request.optString("operation") == "releaseLocalCopy") { "Invalid local release operation." }

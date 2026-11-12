@@ -82,6 +82,13 @@ const diagnosticBracketedIpv6Pattern = /\[[0-9a-f:]{2,}\]/gi;
 const diagnosticUnbracketedIpv6Pattern = /\b(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}\b/gi;
 const diagnosticLongTokenPattern = /\b[A-Za-z0-9_-]{32,}\b/g;
 
+const freeTextDiagnosticKeys = new Set(["message", "reason", "detail", "errormessage", "peermessage"]);
+
+const isFreeTextDiagnosticKey = (key: string): boolean => {
+  const normalized = normalizeDiagnosticKey(key);
+  return freeTextDiagnosticKeys.has(normalized) || normalized.endsWith("message");
+};
+
 /** Redact free text that reaches exported logs through error messages. */
 export const sanitizeDiagnosticText = (text: string): string =>
   text
@@ -100,7 +107,7 @@ export const sanitizeDiagnosticArtifact = (value: unknown): unknown => {
     Object.entries(value).map(([key, entry]) => {
       if (isSensitiveDiagnosticKey(key)) return [key, "[redacted]"];
       const sanitized = sanitizeDiagnosticArtifact(entry);
-      return [key, normalizeDiagnosticKey(key) === "message" && typeof sanitized === "string"
+      return [key, isFreeTextDiagnosticKey(key) && typeof sanitized === "string"
         ? sanitizeDiagnosticText(sanitized)
         : sanitized];
     }),

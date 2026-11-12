@@ -243,14 +243,26 @@ class DocumentRuntimeService : Service() {
         return result
       }
       if (operation == "disconnect") {
-        synchronized(uiConnectLock) {
+        val prior = synchronized(uiConnectLock) {
+          val pending = uiConnectPending
           uiConnectGeneration += 1
           uiConnectPending = null
           uiConnectRequest = null
           uiConnectExpectedPeer = null
+          pending
         }
-        return stopSession(persist = true).thenApply { status ->
-          JSONObject().put("result", JSONObject().put("phase", status.optString("phase")))
+        return stopSession(persist = true).thenCompose { status ->
+          val response = JSONObject().put("result", JSONObject().put("phase", status.optString("phase")))
+          val settled = CompletableFuture<JSONObject>()
+          if (prior == null || prior.isDone) {
+            settled.complete(response)
+          } else {
+            // Let the superseded connect evaluation settle before the next
+            // connect starts; its cancellation must not abort the new attempt.
+            mainHandler.postDelayed({ settled.complete(response) }, UI_CONNECT_SETTLE_MS)
+            prior.whenComplete { _, _ -> settled.complete(response) }
+          }
+          settled
         }
       }
       val code = """
@@ -308,7 +320,7 @@ class DocumentRuntimeService : Service() {
                 uiConnectPending = null
                 if (error != null && sessionPhase != "connected") {
                   sessionPhase = "error"
-                  sessionError = "Peer connection could not be established."
+                  sessionError = safeSessionError(error)
                   publishSessionStatus()
                 }
               }
@@ -671,14 +683,14 @@ class DocumentRuntimeService : Service() {
             return@execute
           }
           sessionPhase = "error"
-          sessionError = error.message ?: "Background session could not start."
+          sessionError = safeSessionError(error)
           publishSessionStatus()
           result.completeExceptionally(error)
         }
       }
     } catch (error: Exception) {
       sessionPhase = "error"
-      sessionError = error.message ?: "Background session could not start."
+      sessionError = safeSessionError(error)
       result.completeExceptionally(error)
     }
     return result
@@ -700,7 +712,7 @@ class DocumentRuntimeService : Service() {
       }
       if (error != null) {
         sessionPhase = "error"
-        sessionError = error.message ?: "Background session could not connect."
+        sessionError = safeSessionError(error)
         publishSessionStatus()
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
           Log.w("SyncpeerRuntime", "session connect failed")
@@ -1161,5 +1173,7 @@ class DocumentRuntimeService : Service() {
     const val FAVORITE_SYNC_INTERVAL_MS = 15_000L
     /** A session teardown may not hold the shared document worker behind a dead network. */
     const val SESSION_STOP_TIMEOUT_MS = 10_000L
+    /** Give a superseded connect a bounded moment to settle before reconnecting. */
+    const val UI_CONNECT_SETTLE_MS = 2_000L
   }
 }

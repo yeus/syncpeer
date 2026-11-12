@@ -1895,9 +1895,10 @@ function subscribePeerStatusImpl(
         phase: event.phase, active: event.active, foreground: event.foreground,
         peerPhase: event.peerPhase ?? null,
         errorCategory, peerErrorCategory, revision: event.revision,
-        // Sanitized on export; required to tell a recovery from an authorization failure.
-        ...(errorText ? { error: errorText } : {}),
-        ...(peerErrorText ? { peerError: peerErrorText } : {}),
+        // Free-text keys are sanitized on export; they distinguish a recovery
+        // from an authorization failure without exposing identifiers or paths.
+        ...(errorText ? { errorMessage: errorText } : {}),
+        ...(peerErrorText ? { peerMessage: peerErrorText } : {}),
       });
       previousStatus = status;
     }

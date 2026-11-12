@@ -280,8 +280,20 @@ test("an authorization peer error opens the remote approval prompt", () => {
     ...createInitialSessionState(),
     phase: "connecting",
     peerStatus: {
-      phase: "reconnecting",
+      phase: "waiting",
       revision: 2,
+      error: "The other device has not approved this device yet.",
+      foreground: true,
+    },
+  });
+  assert.equal(state.approvals.pendingApprovalPromptDeviceId, PEER_ID);
+  state.approvals.pendingApprovalPromptDeviceId = "";
+  applySessionState(state, {
+    ...createInitialSessionState(),
+    phase: "connecting",
+    peerStatus: {
+      phase: "reconnecting",
+      revision: 3,
       error: "network unreachable",
       foreground: true,
     },

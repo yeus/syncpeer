@@ -868,6 +868,7 @@ export const shouldHintRemoteApprovalPending = (message: string) => {
     normalized.includes("may be waiting for you to accept this device") ||
     normalized.includes("remote peer rejected this device") ||
     normalized.includes("waiting for approval of this client") ||
+    normalized.includes("not approved") ||
     normalized.includes("unknown device") ||
     normalized.includes("not configured") ||
     normalized.includes("not in config") ||

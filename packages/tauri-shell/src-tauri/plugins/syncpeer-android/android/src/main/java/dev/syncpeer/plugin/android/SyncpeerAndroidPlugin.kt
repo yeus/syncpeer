@@ -274,6 +274,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     )
     var current: Throwable? = error
     while (current != null) {
+      prefixedSessionFailureText(current.message)?.let { return it }
       val message = current.message
       if (message != null && message.length <= 512 && safe.any(message::contains)) return message
       current = current.cause

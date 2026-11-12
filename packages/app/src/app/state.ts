@@ -601,6 +601,11 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.closureReason = next.closureReason;
   state.session.upgradeStatus = next.upgradeStatus;
   state.session.peerStatus = next.peerStatus;
+  if (next.peerStatus?.error && shouldHintRemoteApprovalPending(next.peerStatus.error)) {
+    const target = normalizeDeviceId(next.remoteDevice?.id || next.sourceDeviceId ||
+      state.connection.remoteId || state.devices.selectedSavedDeviceId);
+    if (target) state.approvals.pendingApprovalPromptDeviceId = target;
+  }
   state.session.folders = keepOfflineSnapshotView ? state.session.folders : next.folders;
   state.session.folderSyncStates = keepOfflineSnapshotView
     ? state.session.folderSyncStates

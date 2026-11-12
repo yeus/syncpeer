@@ -260,6 +260,35 @@ test("local folder roots remain visible when switching peers or disconnecting", 
   assert.deepEqual(rootFolderEntries(app).map(folder => folder.name), ["Photos"]);
 });
 
+test("an authorization peer error opens the remote approval prompt", () => {
+  const state = createInitialState(null);
+  state.connection.remoteId = PEER_ID;
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  applySessionState(state, {
+    ...createInitialSessionState(),
+    phase: "connecting",
+    peerStatus: {
+      phase: "waiting",
+      revision: 1,
+      error: "waiting for approval of this client",
+      foreground: true,
+    },
+  });
+  assert.equal(state.approvals.pendingApprovalPromptDeviceId, PEER_ID);
+  state.approvals.pendingApprovalPromptDeviceId = "";
+  applySessionState(state, {
+    ...createInitialSessionState(),
+    phase: "connecting",
+    peerStatus: {
+      phase: "reconnecting",
+      revision: 2,
+      error: "network unreachable",
+      foreground: true,
+    },
+  });
+  assert.equal(state.approvals.pendingApprovalPromptDeviceId, "");
+});
+
 test("keeps restored folders visible while reconnecting before live state arrives", () => {
   const app = createInitialState(null);
   app.session.isOfflineSnapshot = true;

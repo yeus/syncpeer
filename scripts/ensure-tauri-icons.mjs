@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { ensureAndroidProjectInitialized } from "./android-project-init.mjs";
+import { ensureAndroidProjectInitialized, ensureAndroidBackupPolicy } from "./android-project-init.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, "..");
@@ -62,6 +62,8 @@ const ensureAndroidProject = () => {
     run("npm", ["run", "build:android:init"], "Android init");
   });
   if (backup) console.warn(`Preserved incomplete Android project at ${backup}. Review before removing it.`);
+  // Never let Android restore app data without the key that protects it.
+  ensureAndroidBackupPolicy(androidRoot);
 };
 
 const ensureAndroidAdaptiveIconInset = () => {

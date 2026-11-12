@@ -56,6 +56,47 @@ fn protected_metadata_exists(metadata_root: &std::path::Path) -> Result<bool, St
     Ok(false)
 }
 
+/// Whether unreadable protected metadata may be rebuilt without user recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataKeyPolicy {
+    /// Existing metadata without its key may hold user data; fail closed.
+    Preserve,
+    /// Existing metadata is disposable derived data; clear it and start over.
+    Recreate,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MissingKeyAction {
+    Create,
+    DiscardAndCreate,
+}
+
+fn missing_key_action(
+    metadata_exists: bool,
+    policy: MetadataKeyPolicy,
+) -> Result<MissingKeyAction, String> {
+    if !metadata_exists {
+        return Ok(MissingKeyAction::Create);
+    }
+    match policy {
+        MetadataKeyPolicy::Preserve => {
+            Err("Existing metadata requires its protected key or a confirmed local reset.".into())
+        }
+        MetadataKeyPolicy::Recreate => Ok(MissingKeyAction::DiscardAndCreate),
+    }
+}
+
+/// Clear a derived store whose protected key is gone. Its ciphertext cannot be
+/// decrypted again and the cache index and partial-transfer journal are
+/// rebuildable, so keeping the unreadable database has no recovery value.
+fn discard_metadata_store(metadata_root: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(metadata_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("Unreadable downloaded-file metadata could not be cleared.".into()),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn unlock_default_collection(
     collection: &secret_service::blocking::Collection,
@@ -137,7 +178,8 @@ fn desktop_secret(request: VaultSecretRequest) -> Result<Value, String> {
 pub fn load_or_create_protected_key(
     profile_id: &str,
     metadata_root: &std::path::Path,
-) -> Result<[u8; 32], String> {
+    policy: MetadataKeyPolicy,
+) -> Result<([u8; 32], bool), String> {
     let request = |operation: &str, secret: Option<String>| VaultSecretRequest {
         profile_id: profile_id.into(),
         operation: operation.into(),
@@ -151,15 +193,18 @@ pub fn load_or_create_protected_key(
                 "Protected metadata key is invalid; recovery or local reset is required."
                     .to_string()
             })?;
-        return bytes.try_into().map_err(|_| {
+        let key: [u8; 32] = bytes.try_into().map_err(|_| {
             "Protected metadata key is invalid; recovery or local reset is required.".to_string()
-        });
+        })?;
+        return Ok((key, false));
     }
-    if protected_metadata_exists(metadata_root)? {
-        return Err(
-            "Existing metadata requires its protected key or a confirmed local reset.".into(),
-        );
-    }
+    let recovered = match missing_key_action(protected_metadata_exists(metadata_root)?, policy)? {
+        MissingKeyAction::Create => false,
+        MissingKeyAction::DiscardAndCreate => {
+            discard_metadata_store(metadata_root)?;
+            true
+        }
+    };
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key)
         .map_err(|_| "Protected metadata key could not be generated.".to_string())?;
@@ -169,12 +214,14 @@ pub fn load_or_create_protected_key(
         key.fill(0);
         return Err("Protected metadata key verification failed.".into());
     }
-    Ok(key)
+    Ok((key, recovered))
 }
 
 #[cfg(target_os = "linux")]
-pub fn load_or_create_metadata_key(metadata_root: &std::path::Path) -> Result<[u8; 32], String> {
-    load_or_create_protected_key("metadata", metadata_root)
+pub fn load_or_create_metadata_key(
+    metadata_root: &std::path::Path,
+) -> Result<([u8; 32], bool), String> {
+    load_or_create_protected_key("metadata", metadata_root, MetadataKeyPolicy::Preserve)
 }
 
 #[cfg(target_os = "android")]
@@ -182,7 +229,8 @@ pub fn load_or_create_protected_key(
     app: &tauri::AppHandle,
     profile_id: &str,
     metadata_root: &std::path::Path,
-) -> Result<[u8; 32], String> {
+    policy: MetadataKeyPolicy,
+) -> Result<([u8; 32], bool), String> {
     use tauri_plugin_syncpeer_android::SyncpeerAndroidExt;
     let request = |operation: &str, secret: Option<String>| VaultSecretRequest {
         profile_id: profile_id.into(),
@@ -207,15 +255,18 @@ pub fn load_or_create_protected_key(
                 "Protected metadata key is invalid; recovery or local reset is required."
                     .to_string()
             })?;
-        return bytes.try_into().map_err(|_| {
+        let key: [u8; 32] = bytes.try_into().map_err(|_| {
             "Protected metadata key is invalid; recovery or local reset is required.".to_string()
-        });
+        })?;
+        return Ok((key, false));
     }
-    if protected_metadata_exists(metadata_root)? {
-        return Err(
-            "Existing metadata requires its protected key or a confirmed local reset.".into(),
-        );
-    }
+    let recovered = match missing_key_action(protected_metadata_exists(metadata_root)?, policy)? {
+        MissingKeyAction::Create => false,
+        MissingKeyAction::DiscardAndCreate => {
+            discard_metadata_store(metadata_root)?;
+            true
+        }
+    };
     let mut key = [0u8; 32];
     getrandom::getrandom(&mut key)
         .map_err(|_| "Protected metadata key could not be generated.".to_string())?;
@@ -225,7 +276,7 @@ pub fn load_or_create_protected_key(
         key.fill(0);
         return Err("Protected metadata key verification failed.".into());
     }
-    Ok(key)
+    Ok((key, recovered))
 }
 
 #[cfg(target_os = "linux")]
@@ -335,6 +386,48 @@ pub async fn syncpeer_vault_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reinstall_without_protected_key_fails_closed_for_user_metadata() {
+        // Reproduces the field error after reinstalling Syncpeer: the restored
+        // metadata exists, but the key that protected it is gone.
+        assert_eq!(
+            missing_key_action(true, MetadataKeyPolicy::Preserve),
+            Err("Existing metadata requires its protected key or a confirmed local reset.".into())
+        );
+    }
+
+    #[test]
+    fn reinstall_without_protected_key_rebuilds_disposable_cache_metadata() {
+        // The downloaded-file list is derived data and may be rebuilt.
+        assert_eq!(
+            missing_key_action(true, MetadataKeyPolicy::Recreate),
+            Ok(MissingKeyAction::DiscardAndCreate)
+        );
+    }
+
+    #[test]
+    fn fresh_private_storage_creates_a_key_for_both_policies() {
+        for policy in [MetadataKeyPolicy::Preserve, MetadataKeyPolicy::Recreate] {
+            assert_eq!(
+                missing_key_action(false, policy),
+                Ok(MissingKeyAction::Create)
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_disposable_cache_store_is_removed_before_a_new_key_is_created() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("native-cache-metadata");
+        std::fs::create_dir_all(store.join("folders")).unwrap();
+        std::fs::write(store.join("key-check"), b"synthetic").unwrap();
+        discard_metadata_store(&store).unwrap();
+        assert!(!store.exists());
+        // Repeating the repair must stay safe after the store is already gone.
+        discard_metadata_store(&store).unwrap();
+    }
+
     #[test]
     fn restricts_credential_namespace_and_bounds_secrets() {
         for profile_id in ["", "../outside", "personal/user", "profile.name"] {

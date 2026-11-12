@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { profile } from "./android-emulator.mjs";
-import { isAndroidProjectInitialized, ensureAndroidProjectInitialized } from "./android-project-init.mjs";
+import { isAndroidProjectInitialized, ensureAndroidProjectInitialized, ensureAndroidBackupPolicy } from "./android-project-init.mjs";
 import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -129,6 +129,33 @@ test("failed Android init restores the incomplete original without discarding ne
   assert.equal(fs.readFileSync(path.join(temp, "gen", backup, "failed-init/partial-init.txt"), "utf8"), "new work");
   assert.throws(() => ensureAndroidProjectInitialized(android, () => undefined), /did not generate a complete project/);
   assert.equal(fs.readFileSync(path.join(android, "custom.txt"), "utf8"), "keep me");
+});
+
+test("generated Android projects exclude Syncpeer data from backup and transfer", (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-android-backup-"));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const android = path.join(temp, "gen/android");
+  const manifestPath = path.join(android, "app/src/main/AndroidManifest.xml");
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, `<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="fixture">
+        <activity android:name=".MainActivity" />
+    </application>
+</manifest>
+`);
+
+  ensureAndroidBackupPolicy(android);
+  const manifest = fs.readFileSync(manifestPath, "utf8");
+  assert.match(manifest, /android:allowBackup="false"/);
+  assert.match(manifest, /android:dataExtractionRules="@xml\/syncpeer_backup_rules"/);
+  const rules = fs.readFileSync(path.join(android, "app/src/main/res/xml/syncpeer_backup_rules.xml"), "utf8");
+  assert.match(rules, /<cloud-backup>/);
+  assert.match(rules, /<device-transfer>/);
+  assert.match(rules, /<exclude domain="file" path="\." \/>/);
+
+  ensureAndroidBackupPolicy(android);
+  assert.equal(fs.readFileSync(manifestPath, "utf8"), manifest, "The backup patch must be idempotent.");
 });
 
 test("Android bootstrap refuses to move a non-directory project path", (t) => {

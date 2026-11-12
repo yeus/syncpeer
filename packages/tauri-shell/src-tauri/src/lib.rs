@@ -1215,22 +1215,41 @@ fn cache_partial_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 const CACHE_INDEX_METADATA_ID: &str = "index";
 const CACHE_PARTIAL_METADATA_PREFIX: &str = "partial/";
 
-fn native_cache_metadata(app: &tauri::AppHandle) -> Result<NativeCacheMetadata, String> {
+fn native_cache_metadata_with_recovery(
+    app: &tauri::AppHandle,
+) -> Result<(NativeCacheMetadata, bool), String> {
     let metadata_root = app_data_root(app)?.join("native-cache-metadata");
+    // Serialize key creation and repair: concurrent recoveries could otherwise
+    // save different keys or delete a store another caller just recreated.
+    static INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = INITIALIZATION_LOCK
+        .lock()
+        .map_err(|_| "Downloaded-file storage lock was poisoned".to_string())?;
     #[cfg(target_os = "linux")]
-    let mut key =
-        vault_secret::load_or_create_protected_key("native-cache-metadata", &metadata_root)?;
+    let (mut key, recovered) = vault_secret::load_or_create_protected_key(
+        "native-cache-metadata",
+        &metadata_root,
+        vault_secret::MetadataKeyPolicy::Recreate,
+    )?;
     #[cfg(target_os = "android")]
-    let mut key =
-        vault_secret::load_or_create_protected_key(app, "native-cache-metadata", &metadata_root)?;
+    let (mut key, recovered) = vault_secret::load_or_create_protected_key(
+        app,
+        "native-cache-metadata",
+        &metadata_root,
+        vault_secret::MetadataKeyPolicy::Recreate,
+    )?;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     return Err("Protected native cache metadata is unavailable on this platform.".into());
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let result = NativeCacheMetadata::open(&metadata_root, &app_cache_files_root(app)?, &key);
         key.fill(0);
-        result
+        result.map(|store| (store, recovered))
     }
+}
+
+fn native_cache_metadata(app: &tauri::AppHandle) -> Result<NativeCacheMetadata, String> {
+    native_cache_metadata_with_recovery(app).map(|(store, _)| store)
 }
 
 fn read_cache_index(app: &tauri::AppHandle) -> Result<CacheIndex, String> {
@@ -4576,6 +4595,29 @@ async fn syncpeer_set_android_saf_tree_uri(
     Ok(settings.android_saf_tree_uri)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalStorageCheck {
+    /// Leftover downloaded-file metadata from an older installation was
+    /// unreadable without its protected key and has been rebuilt.
+    recovered_previous_installation_data: bool,
+}
+
+/// Runs before the first cache read so a reinstall is explained at startup
+/// instead of surfacing as a failed peer connection later.
+#[tauri::command]
+async fn syncpeer_local_storage_check(app: tauri::AppHandle) -> Result<LocalStorageCheck, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app_data_root(&app)?;
+        let (_store, recovered) = native_cache_metadata_with_recovery(&app)?;
+        Ok(LocalStorageCheck {
+            recovered_previous_installation_data: recovered,
+        })
+    })
+    .await
+    .map_err(|error| format!("Local storage check failed: {error}"))?
+}
+
 #[tauri::command]
 async fn syncpeer_get_cached_statuses(
     app: tauri::AppHandle,
@@ -5158,6 +5200,7 @@ pub fn run() {
             syncpeer_list_cached_files,
             syncpeer_digest_cached_files,
             syncpeer_get_cached_statuses,
+            syncpeer_local_storage_check,
             syncpeer_open_cached_file,
             syncpeer_open_cached_file_directory,
             syncpeer_open_cached_directory,

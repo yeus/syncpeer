@@ -1176,17 +1176,19 @@ pub async fn syncpeer_replica_storage(
         if roots.metadata_key.is_none() {
             #[cfg(target_os = "linux")]
             {
-                roots.metadata_key = Some(crate::vault_secret::load_or_create_metadata_key(
-                    &roots.metadata_root,
-                )?);
+                let (key, _recovered) =
+                    crate::vault_secret::load_or_create_metadata_key(&roots.metadata_root)?;
+                roots.metadata_key = Some(key);
             }
             #[cfg(target_os = "android")]
             {
-                roots.metadata_key = Some(crate::vault_secret::load_or_create_protected_key(
+                let (key, _recovered) = crate::vault_secret::load_or_create_protected_key(
                     &app,
                     "metadata",
                     &roots.metadata_root,
-                )?);
+                    crate::vault_secret::MetadataKeyPolicy::Preserve,
+                )?;
+                roots.metadata_key = Some(key);
             }
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             {

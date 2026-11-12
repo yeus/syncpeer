@@ -19,7 +19,8 @@ for (const [file, label] of [[binary, "Tauri debug binary"], [apk, "Android E2E 
   assert.ok((await stat(file).catch(() => null))?.isFile(), `Build the ${label} before this test.`);
 }
 
-const sdk = process.env.ANDROID_HOME ?? "/sandbox-home/android-sdk";
+const sdk = (process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT)?.trim();
+assert.ok(sdk, "Set ANDROID_HOME or ANDROID_SDK_ROOT to the Android SDK.");
 const adb = path.join(sdk, "platform-tools", "adb");
 process.env.ANDROID_HOME = sdk;
 process.env.ANDROID_SDK_ROOT = sdk;

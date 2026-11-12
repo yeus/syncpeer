@@ -1884,13 +1884,20 @@ function subscribePeerStatusImpl(
     if (!event) return;
     const errorCategory = classifySessionIssue(event.error);
     const peerErrorCategory = classifySessionIssue(event.peerError);
+    const logText = (value?: string) => value ? value.slice(0, 512) : null;
+    const errorText = logText(event.error);
+    const peerErrorText = logText(event.peerError);
     const status = [event.phase, event.active, event.foreground,
-      event.peerPhase, errorCategory, peerErrorCategory].join(":");
+      event.peerPhase, errorCategory, peerErrorCategory,
+      errorText ?? "", peerErrorText ?? ""].join(":");
     if (status !== previousStatus) {
       ctx.coreAdapter.log?.("core.android.service.status", {
         phase: event.phase, active: event.active, foreground: event.foreground,
         peerPhase: event.peerPhase ?? null,
         errorCategory, peerErrorCategory, revision: event.revision,
+        // Sanitized on export; required to tell a recovery from an authorization failure.
+        ...(errorText ? { error: errorText } : {}),
+        ...(peerErrorText ? { peerError: peerErrorText } : {}),
       });
       previousStatus = status;
     }

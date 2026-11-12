@@ -101,3 +101,63 @@ test("a saved peer retains its explicitly configured direct endpoint but a diffe
     remoteId: "B".repeat(52), discoveryMode: "automatic", host: "",
   });
 });
+
+test("a connected peer session survives an unreadable downloaded-file index", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const { createInitialSessionState } = await import("../packages/core/dist/ui/sessionPolicies.js") as {
+    createInitialSessionState: () => Parameters<
+      Parameters<typeof createAppActions>[0]["sessionStore"]["getState"]
+    >[0];
+  };
+  const peerId = "A".repeat(52);
+  const state = createInitialState(null);
+  state.connection.deviceName = "fixture-client";
+  state.connection.discoveryMode = "direct";
+  state.connection.host = "127.0.0.1";
+  state.connection.port = 22000;
+  state.connection.remoteId = peerId;
+  state.connection.cert = "synthetic-certificate";
+  state.connection.key = "synthetic-private-key";
+  state.devices.savedDevices = [{
+    id: peerId, name: "Fixture peer", isIntroducer: false, createdAtMs: Date.now(),
+  }];
+  state.devices.selectedSavedDeviceId = peerId;
+
+  const connected = createInitialSessionState();
+  connected.phase = "connected";
+  connected.remoteFs = {} as never;
+  connected.remoteDevice = { id: peerId, deviceName: "Fixture peer" } as never;
+  connected.folders = [
+    { id: "folder-one", label: "One", encrypted: false, needsPassword: false } as never,
+    { id: "folder-two", label: "Two", encrypted: false, needsPassword: false } as never,
+  ];
+
+  const actions = createAppActions({
+    state,
+    client: {
+      getCachedStatuses: async () => {
+        throw new Error("Existing metadata requires its protected key or a confirmed local reset.");
+      },
+    } as unknown as Parameters<typeof createAppActions>[0]["client"],
+    sessionStore: {
+      actions: {
+        setFolderPasswords: async () => {},
+        connect: async () => {},
+      },
+      getState: () => connected,
+    } as unknown as Parameters<typeof createAppActions>[0]["sessionStore"],
+    transfers: { transferInProgress: () => false } as unknown as TransferRuntime,
+  });
+
+  await actions.connect();
+
+  assert.equal(state.session.isConnected, true,
+    "A missing downloaded-file index must not discard an authenticated peer session.");
+  const events = state.logs.items.map(item => item.event);
+  assert.equal(events.includes("peer.connect.attempt_failed"), false);
+  assert.ok(events.includes("peer.cached_status.failed"),
+    "The unusable cache index should be reported as a warning instead of failing the connection.");
+});

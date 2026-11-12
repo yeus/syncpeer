@@ -123,3 +123,25 @@ class PrivateStorageFormatTest {
     } finally { parent.toFile().deleteRecursively() }
   }
 }
+
+class DocumentFailureMessagesTest {
+  @Test fun mapsDocumentRuntimeRecoveryToPlainMessages() {
+    assertEquals(DOCUMENT_RUNTIME_RESTARTING_MESSAGE,
+      documentRuntimeFailureMessage("Document runtime is restarting."))
+    assertEquals(DOCUMENT_RUNTIME_RESTARTING_MESSAGE,
+      documentRuntimeFailureMessage("Document runtime is retrying (2 of 5)."))
+    assertEquals(DOCUMENT_RUNTIME_UNAVAILABLE_MESSAGE,
+      documentRuntimeFailureMessage("Document runtime could not recover. Reopen Syncpeer to retry."))
+    assertEquals("Existing metadata requires its protected key or a confirmed local reset",
+      documentRuntimeFailureMessage("Existing metadata requires its protected key or a confirmed local reset"))
+    assertEquals(DOCUMENT_RUNTIME_RESTARTING_MESSAGE,
+      documentRuntimeFailureMessage("Starting document access…"))
+  }
+
+  @Test fun preservesOnlySafeDocumentCommandFailures() {
+    assertEquals(DOCUMENT_RUNTIME_RESTARTING_MESSAGE,
+      documentCommandFailureMessage(java.io.FileNotFoundException(DOCUMENT_RUNTIME_RESTARTING_MESSAGE)))
+    assertEquals("Document operation failed. Check the vault and Android System WebView.",
+      documentCommandFailureMessage(java.io.IOException("Could not open /data/user/0/secret")))
+  }
+}

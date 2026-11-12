@@ -216,8 +216,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             generateSequence(error as Throwable?) { it.cause }.take(4)
               .joinToString(">") { it.javaClass.simpleName })
         }
-        invoke.reject(privateStorageFailureMessage(error)
-          ?: "Document operation failed. Check the vault password and Android System WebView.")
+        invoke.reject(documentCommandFailureMessage(error))
       }
     }.start()
   }

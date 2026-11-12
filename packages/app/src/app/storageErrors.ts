@@ -17,6 +17,29 @@ const privateStorageResetMessage =
   "You can reset Syncpeer's private local data and start fresh. This removes local settings, downloaded copies, " +
   "unsynced edits, and this device's identity. External folders and other devices are not changed.";
 
+/** Plain-language explanation for a reinstall that left cache data without its key. */
+export const previousInstallationStorageNotice = {
+  heading: "Syncpeer found data from a previous installation",
+  paragraphs: [
+    "Syncpeer found data from a previous installation, but not the key that protects its list of downloaded files. " +
+      "The old list could not be opened, so Syncpeer cleared it and will rebuild it the next time you download files.",
+    "This is repaired automatically, so you do not need to reset anything. " +
+      "Your shared folders and the files on your other devices are not affected. " +
+      "If the other device no longer recognizes this one, approve it again there.",
+  ],
+};
+
+const previousInstallationResetMessage =
+  "Syncpeer found data from a previous installation that it cannot unlock, because the key that protects it is missing. " +
+  "This usually happens after reinstalling Syncpeer or restoring its app data from a backup. " +
+  "Reset local Syncpeer data in About to continue. Your files on other devices are not changed.";
+
+/** Both classes have a concrete reset remedy and a plain-language explanation. */
+export const isPrivateStorageRecoveryIssue = (error: unknown) => {
+  const message = errorText(error);
+  return message.includes(privateStorageUnrecognized) || message.includes("existing metadata requires");
+};
+
 export const safeNativeFailureText = (error: unknown): string | null => {
   const message = rawErrorText(error).replace(/\s+/g, " ").trim();
   if (!message) return null;
@@ -43,7 +66,7 @@ const storageFailureReason = (error: unknown): string | null => {
     return "protected metadata is invalid and needs recovery or a local reset";
   }
   if (message.includes("existing metadata requires")) {
-    return "existing local metadata needs its protected key or a confirmed local reset";
+    return "data from a previous installation cannot be unlocked because its protected key is missing";
   }
   if (message.includes("permission denied") || message.includes("access denied") || message.includes("operation not permitted")) {
     return "the operating system denied access to Syncpeer's private app-data directory";
@@ -72,6 +95,22 @@ const storageFailureReason = (error: unknown): string | null => {
 export const documentStoragePreparationIssue = (folderCount: number, error?: unknown) => {
   if (errorText(error).includes(privateStorageUnrecognized)) {
     return { message: privateStorageResetMessage, canResetPrivateStorage: true };
+  }
+  if (errorText(error).includes("existing metadata requires")) {
+    return { message: previousInstallationResetMessage, canResetPrivateStorage: true };
+  }
+  if (errorText(error).includes("restarting its local storage service")) {
+    return {
+      message: "Syncpeer is restarting its local storage service. Wait a moment, then try again.",
+      canResetPrivateStorage: false,
+    };
+  }
+  if (errorText(error).includes("could not restart its local storage service") ||
+    errorText(error).includes("local storage service is unavailable")) {
+    return {
+      message: "Syncpeer could not restart its local storage service. Reopen Syncpeer to retry.",
+      canResetPrivateStorage: false,
+    };
   }
   const reason = storageFailureReason(error);
   const reasonText = reason ? ` Reason: ${reason.replace(/[.!?]+$/, "")}.` : "";

@@ -279,21 +279,31 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
 
   private fun command(input: JSONObject): Any? {
     ensureRuntime()
-    if (Build.VERSION.SDK_INT < 26 || !bound) throw FileNotFoundException(summary())
-    try {
-      val owner = ready.get(30, TimeUnit.SECONDS)
-      val status = owner.status().get(30, TimeUnit.SECONDS)
-      if (status.summary.contains(PRIVATE_STORAGE_UNRECOGNIZED)) throw FileNotFoundException(status.summary)
-      return owner.command(input).get().opt("result").takeUnless { it == JSONObject.NULL }
+    if (Build.VERSION.SDK_INT < 26 || !bound) {
+      throw FileNotFoundException(documentRuntimeFailureMessage(summary()))
     }
-    catch (error: Exception) {
+    val owner = try {
+      ready.get(30, TimeUnit.SECONDS)
+    } catch (error: Exception) {
+      throw FileNotFoundException(documentRuntimeFailureMessage(error.message.orEmpty()))
+    }
+    val status = try {
+      owner.status().get(30, TimeUnit.SECONDS)
+    } catch (error: Exception) {
+      throw FileNotFoundException(documentRuntimeFailureMessage(error.message.orEmpty()))
+    }
+    if (status.phase == "error" || status.summary.contains(PRIVATE_STORAGE_UNRECOGNIZED)) {
+      throw FileNotFoundException(documentRuntimeFailureMessage(status.summary))
+    }
+    return try {
+      owner.command(input).get().opt("result").takeUnless { it == JSONObject.NULL }
+    } catch (error: Exception) {
       if (context!!.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
         android.util.Log.w("SyncpeerRuntime", "provider ${input.optString("operation")} failed: " +
           generateSequence(error as Throwable?) { it.cause }.take(4)
             .joinToString(">") { it.javaClass.simpleName })
       }
-      throw FileNotFoundException(privateStorageFailureMessage(error)
-        ?: "Document operation failed. Check Folder settings in Syncpeer.")
+      throw FileNotFoundException(documentCommandFailureMessage(error))
     }
   }
 

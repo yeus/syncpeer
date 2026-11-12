@@ -427,6 +427,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       expertView: persisted?.expertView === true,
       showStabilityNotice: persisted?.stabilityNoticeAcknowledged !== true,
       firstPeerInvitationDismissed: persisted?.firstPeerInvitationDismissed === true,
+      previousInstallationNotice: false,
       deviceNameConfirmed: isConfiguredDeviceName(initialDeviceName),
     },
     sync: {

@@ -78,7 +78,7 @@
   import NewFolderPage from "./NewFolderPage.svelte";
   import VersionsPage from "./VersionsPage.svelte";
   import { applyTheme } from "./app/theme.ts";
-  import { documentStoragePreparationIssue } from "./app/storageErrors.ts";
+  import { documentStoragePreparationIssue, isPrivateStorageRecoveryIssue, previousInstallationStorageNotice } from "./app/storageErrors.ts";
   import { isConfiguredDeviceName, suggestedClientName } from "./app/suggestedNames.ts";
   import { localDiscoveryHealthFromDiagnostics } from "./app/connectionNotices.ts";
   import { requestLocalDataReset } from "./app/localReset.ts";
@@ -168,7 +168,7 @@
     app.devices.peerDiscovery = observePeer(app.devices.peerDiscovery, id,
       { kind: "incoming", lastSeenAtMs: Date.now() });
   };
-  const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric, logFile } = createTauriAdapters({
+  const { hostAdapter, platformAdapter, documentCommand, connectDocumentFolder, disconnectDocumentFolder, syncDocumentFolders, folderCredentials, biometric, checkLocalStorage, logFile } = createTauriAdapters({
     onLog: entry => {
       pushClientLog(app, entry);
       if (entry.event !== "tauri.discovery.local.result") return;
@@ -515,6 +515,20 @@
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
     void (async () => {
+      // Repair leftover downloaded-file metadata before the first cache read. A
+      // reinstall can restore app data while removing the key that protects it.
+      const storageCheck = await checkLocalStorage().catch(error => {
+        pushSessionLog(app, "warning", "app.local_storage.check_failed",
+          "Syncpeer could not check its local storage.", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        return null;
+      });
+      if (storageCheck?.recoveredPreviousInstallationData) {
+        app.ui.previousInstallationNotice = true;
+        pushSessionLog(app, "warning", "app.local_storage.recovered",
+          "Syncpeer cleared leftover downloaded-file data from a previous installation.");
+      }
       // Do not treat a transient Android service startup error as an absent vault:
       // that silently skipped device-protected local storage provisioning.
       const initialVault = folderCredentials
@@ -556,7 +570,13 @@
       await actions.restoreNavigationRoute(true);
       persistSensitiveState();
     })().catch(error => {
-      app.ui.recentError = error instanceof Error ? error.message : "Private local storage could not be initialized.";
+      if (isPrivateStorageRecoveryIssue(error)) {
+        const issue = documentStoragePreparationIssue(0, error);
+        app.ui.recentError = issue.message;
+        privateStorageRecoveryMessage = issue.canResetPrivateStorage ? issue.message : null;
+      } else {
+        app.ui.recentError = error instanceof Error ? error.message : "Private local storage could not be initialized.";
+      }
     }).finally(() => { peerStateInitializing = false; firstPeerInviteReady = true; });
 
     const handleOnline = () => {
@@ -855,6 +875,17 @@
             app.ui.showStabilityNotice = false;
             persistState(app);
           }}>I understand</button>
+        </section>
+      {/if}
+      {#if app.ui.previousInstallationNotice}
+        <section class="panel" data-testid="previous-installation-notice">
+          <h2>{previousInstallationStorageNotice.heading}</h2>
+          {#each previousInstallationStorageNotice.paragraphs as paragraph (paragraph)}
+            <p>{paragraph}</p>
+          {/each}
+          <button type="button" class="ghost" onclick={() => {
+            app.ui.previousInstallationNotice = false;
+          }}>OK</button>
         </section>
       {/if}
       {#if app.ui.recentError}

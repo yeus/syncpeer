@@ -17,7 +17,7 @@ import { changesSessionConfiguration, createDocumentCache, createDocumentFilesys
   createNativeFilesystem, dispatchDocumentCommandWithSessionConfiguration } from "@syncpeer/core/filesystem";
 import { detectRuntimeEnvironment, detectRuntimePlatform, type RuntimePlatform } from "./runtimeInfo.ts";
 import { createWorkerPasswordKdf } from "./passwordKdf.ts";
-import { sanitizeDiagnosticArtifact } from "../../../shared/modules/diagnosticSanitizer.ts";
+import { sanitizeDiagnosticArtifact, sanitizeDiagnosticText } from "../../../shared/modules/diagnosticSanitizer.ts";
 
 type InvokeArgs = Record<string, unknown> | number[] | ArrayBuffer | Uint8Array;
 type InvokeFn = <T>(command: string, args?: InvokeArgs) => Promise<T>;
@@ -204,8 +204,14 @@ const createLoggedInvoke = (
     const operation = ["syncpeer_document_command", "syncpeer_android_session_command"].includes(command)
       ? (args as { request?: { operation?: unknown } } | undefined)?.request?.operation
       : undefined;
-    const details = typeof operation === "string" && /^[A-Za-z]{1,64}$/.test(operation)
+    const details: Record<string, unknown> = typeof operation === "string" && /^[A-Za-z]{1,64}$/.test(operation)
       ? { command, operation } : { command };
+    if (operation !== undefined) {
+      // The cause is the only way to tell a transient service restart from an
+      // authorization or storage failure in an exported session log.
+      const reason = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
+      if (reason) details.reason = reason.slice(0, 240);
+    }
     console.error("[syncpeer-ui] tauri.invoke.error", details);
     emitLog(options, "error", "tauri.invoke.error", details);
     void tryForwardUiErrorToCli(invoke, "tauri.invoke.error", details);
@@ -1080,6 +1086,11 @@ class TauriAdapters {
     } : undefined;
   }
 
+  private async checkLocalStorage(): Promise<{ recoveredPreviousInstallationData: boolean } | null> {
+    if (detectRuntimeEnvironment() !== "tauri") return null;
+    return this.invokeWithLogging("syncpeer_local_storage_check");
+  }
+
   api() {
     const documents = this.documents();
     const basePlatformAdapter = documents.platformAdapter;
@@ -1114,6 +1125,7 @@ class TauriAdapters {
       syncDocumentFolders: documents.syncFolders,
       folderCredentials: this.folderCredentials(),
       biometric: this.biometric(),
+      checkLocalStorage: () => this.checkLocalStorage(),
       logFile: this.platform === "android" ? {
         save: (fileName: string, text: string) => this.saveAndroidTextFile(fileName, text),
         share: (fileName: string, text: string) => this.shareAndroidTextFile(fileName, text),

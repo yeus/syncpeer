@@ -4,6 +4,8 @@ import {
   documentStoragePreparationIssue,
   formatDocumentStoragePreparationError,
   formatProfileCreationError,
+  isPrivateStorageRecoveryIssue,
+  previousInstallationStorageNotice,
   safeNativeFailureText,
 } from "../packages/app/src/app/storageErrors.ts";
 
@@ -116,6 +118,57 @@ test("offers a private-data reset for unrecognized app-owned storage", () => {
       "You can reset Syncpeer's private local data and start fresh. This removes local settings, downloaded copies, " +
       "unsynced edits, and this device's identity. External folders and other devices are not changed.",
   );
+});
+
+test("explains leftover data from a previous installation in plain language", () => {
+  assert.deepEqual(previousInstallationStorageNotice, {
+    heading: "Syncpeer found data from a previous installation",
+    paragraphs: [
+      "Syncpeer found data from a previous installation, but not the key that protects its list of downloaded files. " +
+        "The old list could not be opened, so Syncpeer cleared it and will rebuild it the next time you download files.",
+      "This is repaired automatically, so you do not need to reset anything. " +
+        "Your shared folders and the files on your other devices are not affected. " +
+        "If the other device no longer recognizes this one, approve it again there.",
+    ],
+  });
+});
+
+test("offers a reset when restored data cannot be unlocked without its key", () => {
+  const issue = documentStoragePreparationIssue(
+    2,
+    new Error("Existing metadata requires its protected key or a confirmed local reset."),
+  );
+  assert.equal(issue.canResetPrivateStorage, true);
+  assert.equal(
+    issue.message,
+    "Syncpeer found data from a previous installation that it cannot unlock, because the key that protects it is missing. " +
+      "This usually happens after reinstalling Syncpeer or restoring its app data from a backup. " +
+      "Reset local Syncpeer data in About to continue. Your files on other devices are not changed.",
+  );
+});
+
+test("recognizes the storage issues that have a recovery path", () => {
+  assert.equal(isPrivateStorageRecoveryIssue(
+    new Error("Existing metadata requires its protected key or a confirmed local reset.")), true);
+  assert.equal(isPrivateStorageRecoveryIssue(
+    new Error("SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED: unsupported format marker")), true);
+  assert.equal(isPrivateStorageRecoveryIssue(new Error("Permission denied (os error 13)")), false);
+});
+
+test("explains a transient local storage service restart without a vault reset", () => {
+  const issue = documentStoragePreparationIssue(2,
+    new Error("Syncpeer is restarting its local storage service. Try again in a moment."));
+  assert.equal(issue.canResetPrivateStorage, false);
+  assert.equal(issue.message,
+    "Syncpeer is restarting its local storage service. Wait a moment, then try again.");
+});
+
+test("explains a failed local storage service restart", () => {
+  const issue = documentStoragePreparationIssue(2,
+    new Error("Syncpeer could not restart its local storage service. Reopen Syncpeer to retry."));
+  assert.equal(issue.canResetPrivateStorage, false);
+  assert.equal(issue.message,
+    "Syncpeer could not restart its local storage service. Reopen Syncpeer to retry.");
 });
 
 test("does not offer reset for unrelated native failures", () => {

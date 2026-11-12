@@ -161,3 +161,64 @@ test("a connected peer session survives an unreadable downloaded-file index", as
   assert.ok(events.includes("peer.cached_status.failed"),
     "The unusable cache index should be reported as a warning instead of failing the connection.");
 });
+
+test("using the peer that is already dialing does not cancel the attempt", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const { createInitialSessionState } = await import("../packages/core/dist/ui/sessionPolicies.js") as {
+    createInitialSessionState: () => Parameters<
+      Parameters<typeof createAppActions>[0]["sessionStore"]["getState"]
+    >[0];
+  };
+  const peerId = "A".repeat(52);
+  const state = createInitialState(null);
+  state.connection.deviceName = "fixture-client";
+  state.connection.discoveryMode = "direct";
+  state.connection.host = "127.0.0.1";
+  state.connection.port = 22000;
+  state.connection.remoteId = peerId;
+  state.connection.cert = "synthetic-certificate";
+  state.connection.key = "synthetic-private-key";
+  state.devices.savedDevices = [{
+    id: peerId, name: "Fixture peer", isIntroducer: false, createdAtMs: Date.now(),
+  }];
+  state.devices.selectedSavedDeviceId = peerId;
+
+  const events: string[] = [];
+  let connectCalls = 0;
+  let rejectConnect: ((error: Error) => void) | undefined;
+  const actions = createAppActions({
+    state,
+    client: {} as Parameters<typeof createAppActions>[0]["client"],
+    sessionStore: {
+      actions: {
+        setFolderPasswords: async () => {},
+        connect: async () => {
+          connectCalls += 1;
+          events.push("connect");
+          await new Promise<void>((_resolve, reject) => { rejectConnect = reject; });
+        },
+        disconnect: async () => {
+          events.push("disconnect");
+          rejectConnect?.(new Error("fixture cancellation"));
+        },
+      },
+      getState: () => createInitialSessionState(),
+    } as unknown as Parameters<typeof createAppActions>[0]["sessionStore"],
+    transfers: { transferInProgress: () => false } as unknown as TransferRuntime,
+  });
+
+  const automatic = actions.connect();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const explicit = actions.connect(peerId);
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  assert.equal(connectCalls, 1,
+    "An explicit use of the peer already being dialed must join the pending attempt.");
+  assert.deepEqual(events, ["connect"]);
+
+  rejectConnect?.(new Error("fixture cleanup"));
+  await Promise.allSettled([automatic, explicit]);
+});

@@ -146,12 +146,14 @@ const connect = async (
   if (targetDeviceId) {
     state.devices.selectedSavedDeviceId = targetDeviceId;
     Object.assign(state.connection, preferredConnectionForDevice(state.connection, targetDeviceId));
-    state.session.activeConnectDeviceId = targetDeviceId;
   }
   validateConnection(state);
   const attemptedDeviceId = normalizeDeviceId(
     targetDeviceId || state.connection.remoteId || state.devices.selectedSavedDeviceId,
   );
+  // Record the peer being dialed even for an automatic connect. Otherwise a later
+  // explicit "use" of the same peer looks like a switch and cancels this attempt.
+  state.session.activeConnectDeviceId = attemptedDeviceId;
   if (attemptedDeviceId) delete state.devices.connectionErrors[attemptedDeviceId];
   pushSessionLog(state, "info", "peer.connect.attempt_started",
     "Attempting an authenticated peer connection; this does not confirm remote approval.",

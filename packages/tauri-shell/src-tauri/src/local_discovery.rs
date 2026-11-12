@@ -6,7 +6,8 @@
 //! packets, so one runtime owns both socket pairs for the whole process
 //! lifetime, records every announcement in a small cache, and answers
 //! discovery queries from that cache. A query timeout only waits for the
-//! first matching candidate.
+//! first matching candidate. Each bound socket has its own blocking receiver,
+//! so a silent IP family never stalls announcements or replies on the other.
 
 use super::{
     base32_no_padding, canonical_device_id, now_ms, LOCAL_DISCOVERY_MAGIC, LOCAL_DISCOVERY_PORT,
@@ -156,7 +157,13 @@ struct LocalDiscoveryState {
     origin_token: String,
 }
 
-type UdpSocketPair = Vec<(&'static str, UdpSocket)>;
+type UdpSocketPair = Vec<(&'static str, Arc<UdpSocket>)>;
+
+#[derive(Debug, Clone, Copy)]
+enum DiscoveryProtocol {
+    Syncthing,
+    Syncpeer,
+}
 
 pub(crate) struct LocalDiscoveryRuntime {
     state: Mutex<LocalDiscoveryState>,
@@ -189,10 +196,8 @@ impl LocalDiscoveryRuntime {
             state.syncpeer_sockets = syncpeer_sockets.len();
             state.bind_errors = bind_errors;
         }
-        let syncthing_sockets = Arc::new(syncthing_sockets);
-        let syncpeer_sockets = Arc::new(syncpeer_sockets);
-        runtime.start_syncthing_receiver(Arc::clone(&syncthing_sockets));
-        runtime.start_syncpeer_receiver(Arc::clone(&syncpeer_sockets));
+        runtime.start_receivers(&syncthing_sockets, DiscoveryProtocol::Syncthing);
+        runtime.start_receivers(&syncpeer_sockets, DiscoveryProtocol::Syncpeer);
         if probe {
             runtime.start_prober(syncpeer_sockets, ports.syncpeer);
         }
@@ -268,52 +273,40 @@ impl LocalDiscoveryRuntime {
         state
     }
 
-    fn start_syncthing_receiver(self: &Arc<Self>, sockets: Arc<UdpSocketPair>) {
-        let runtime = Arc::clone(self);
-        let _ = thread::Builder::new()
-            .name("syncpeer-discovery-syncthing".to_string())
-            .spawn(move || {
-                let mut buffer = vec![0_u8; 65536];
-                while !runtime.stop.load(Ordering::Acquire) {
-                    for (label, socket) in sockets.iter() {
+    fn start_receivers(self: &Arc<Self>, sockets: &UdpSocketPair, protocol: DiscoveryProtocol) {
+        // Never wait for IPv4 and IPv6 sequentially: either may remain silent.
+        for (label, socket) in sockets {
+            let runtime = Arc::clone(self);
+            let socket = Arc::clone(socket);
+            let label = *label;
+            let _ = thread::Builder::new()
+                .name(format!("syncpeer-discovery-{protocol:?}-{label}"))
+                .spawn(move || {
+                    let mut buffer = vec![0_u8; 65536];
+                    while !runtime.stop.load(Ordering::Acquire) {
                         match socket.recv_from(&mut buffer) {
-                            Ok((size, source)) => {
-                                runtime.handle_announcement(label, &buffer[..size], source);
-                            }
+                            Ok((size, source)) => match protocol {
+                                DiscoveryProtocol::Syncthing => {
+                                    runtime.handle_announcement(label, &buffer[..size], source);
+                                }
+                                DiscoveryProtocol::Syncpeer => {
+                                    runtime.handle_syncpeer_packet(
+                                        &socket,
+                                        label,
+                                        &buffer[..size],
+                                        source,
+                                    );
+                                }
+                            },
                             Err(error) if poll_error(&error) => {}
                             Err(_) => {}
                         }
                     }
-                }
-            });
+                });
+        }
     }
 
-    fn start_syncpeer_receiver(self: &Arc<Self>, sockets: Arc<UdpSocketPair>) {
-        let runtime = Arc::clone(self);
-        let _ = thread::Builder::new()
-            .name("syncpeer-discovery-syncpeer".to_string())
-            .spawn(move || {
-                let mut buffer = vec![0_u8; 65536];
-                while !runtime.stop.load(Ordering::Acquire) {
-                    for (label, socket) in sockets.iter() {
-                        match socket.recv_from(&mut buffer) {
-                            Ok((size, source)) => {
-                                runtime.handle_syncpeer_packet(
-                                    socket,
-                                    label,
-                                    &buffer[..size],
-                                    source,
-                                );
-                            }
-                            Err(error) if poll_error(&error) => {}
-                            Err(_) => {}
-                        }
-                    }
-                }
-            });
-    }
-
-    fn start_prober(self: &Arc<Self>, sockets: Arc<UdpSocketPair>, port: u16) {
+    fn start_prober(self: &Arc<Self>, sockets: UdpSocketPair, port: u16) {
         let runtime = Arc::clone(self);
         let _ = thread::Builder::new()
             .name("syncpeer-discovery-probe".to_string())
@@ -593,14 +586,14 @@ fn bind_socket_pair(port: u16, broadcast: bool, prefix: &str) -> (UdpSocketPair,
             if broadcast {
                 let _ = socket.set_broadcast(true);
             }
-            sockets.push(("udp4", socket));
+            sockets.push(("udp4", Arc::new(socket)));
         }
         Err(error) => errors.push(format!("{prefix}udp4 bind failed: {error}")),
     }
     match bind_udp6(port) {
         Ok(socket) => {
             let _ = socket.join_multicast_v6(&Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8384, 0), 0);
-            sockets.push(("udp6", socket));
+            sockets.push(("udp6", Arc::new(socket)));
         }
         Err(error) => errors.push(format!("{prefix}udp6 bind failed: {error}")),
     }
@@ -717,7 +710,7 @@ pub(crate) fn parse_syncpeer_packet(packet: &[u8]) -> Option<(u8, &[u8])> {
 }
 
 fn send_syncpeer_probe(
-    sockets: &[(&'static str, UdpSocket)],
+    sockets: &UdpSocketPair,
     request_id: &str,
     origin_token: &str,
     device_id: Option<&str>,
@@ -875,6 +868,84 @@ mod tests {
         assert_eq!(response.diagnostics.discovered_device_ids, vec![device_id]);
     }
 
+    fn assert_single_family_discovers_multiple_peers(ip: IpAddr, syncpeer: bool) {
+        let ports = test_ports();
+        let runtime = LocalDiscoveryRuntime::start_with_prober(ports, false);
+        runtime.lock_state().probe_request_id = Some("multiple-peers".to_string());
+        let sender = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+        let target = SocketAddr::new(
+            ip,
+            if syncpeer {
+                ports.syncpeer
+            } else {
+                ports.syncthing
+            },
+        );
+        let expected = (71..=73).map(synthetic_device_id).collect::<Vec<_>>();
+        for (seed, device_id) in (71..=73).zip(&expected) {
+            let port = 22_000 + u16::from(seed);
+            let packet = if syncpeer {
+                make_syncpeer_packet(
+                    SYNCPEER_DISCOVERY_KIND_REPLY,
+                    &serde_json::to_vec(&SyncpeerReplyPacket {
+                        version: 1,
+                        request_id: "multiple-peers".to_string(),
+                        device_id: Some(device_id.clone()),
+                        port,
+                    })
+                    .unwrap(),
+                )
+            } else {
+                syncthing_announce_packet(vec![seed; 32], port)
+            };
+            sender.send_to(&packet, target).unwrap();
+            let response = runtime.query(&DiscoveryLocalRequest {
+                expected_device_id: Some(device_id.clone()),
+                timeout_ms: Some(1_000),
+            });
+            assert_eq!(
+                response.diagnostics.discovered_device_ids,
+                vec![device_id.clone()],
+                "every {ip} peer must be received while the other IP family is silent"
+            );
+        }
+        let response = runtime.query(&DiscoveryLocalRequest {
+            expected_device_id: None,
+            timeout_ms: Some(0),
+        });
+        assert_eq!(response.diagnostics.discovered_device_ids, expected);
+        assert_eq!(response.diagnostics.announcements_accepted, 3);
+        let other_family_packets = if ip.is_ipv4() {
+            response.diagnostics.packets_by_socket_udp6
+        } else {
+            response.diagnostics.packets_by_socket_udp4
+        };
+        assert_eq!(
+            other_family_packets, 0,
+            "fixture must not wake the other IP family"
+        );
+    }
+
+    #[test]
+    fn local_discovery_receives_multiple_ipv4_announcements_without_ipv6() {
+        assert_single_family_discovers_multiple_peers(IpAddr::V4(Ipv4Addr::LOCALHOST), false);
+    }
+
+    #[test]
+    fn local_discovery_receives_multiple_ipv6_announcements_without_ipv4() {
+        assert_single_family_discovers_multiple_peers(IpAddr::V6(Ipv6Addr::LOCALHOST), false);
+    }
+
+    #[test]
+    fn local_discovery_receives_multiple_ipv4_replies_without_ipv6() {
+        assert_single_family_discovers_multiple_peers(IpAddr::V4(Ipv4Addr::LOCALHOST), true);
+    }
+
+    #[test]
+    fn local_discovery_receives_multiple_ipv6_replies_without_ipv4() {
+        assert_single_family_discovers_multiple_peers(IpAddr::V6(Ipv6Addr::LOCALHOST), true);
+    }
+
     #[test]
     fn local_discovery_does_not_cache_its_own_probe_reply() {
         let ports = test_ports();
@@ -1025,36 +1096,45 @@ mod tests {
 
     #[test]
     fn local_discovery_answers_syncpeer_probes_with_identity() {
-        let ports = test_ports();
-        let runtime = LocalDiscoveryRuntime::start_with_prober(ports, false);
-        let local_device_id = synthetic_device_id(31);
-        runtime.set_local_device_id(&local_device_id);
-        runtime.set_sync_port(23_456);
-        let prober = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
-        prober
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let probe = SyncpeerProbePacket {
-            version: 1,
-            request_id: "test-request".to_string(),
-            origin: None,
-            device_id: None,
-        };
-        let packet = make_syncpeer_packet(
-            SYNCPEER_DISCOVERY_KIND_PROBE,
-            &serde_json::to_vec(&probe).unwrap(),
-        );
-        prober
-            .send_to(&packet, ("127.0.0.1", ports.syncpeer))
-            .unwrap();
-        let mut buffer = [0_u8; 4096];
-        let (size, _) = prober.recv_from(&mut buffer).unwrap();
-        let (kind, body) = parse_syncpeer_packet(&buffer[..size]).unwrap();
-        assert_eq!(kind, SYNCPEER_DISCOVERY_KIND_REPLY);
-        let reply: SyncpeerReplyPacket = serde_json::from_slice(body).unwrap();
-        assert_eq!(reply.request_id, "test-request");
-        assert_eq!(reply.device_id.as_deref(), Some(local_device_id.as_str()));
-        assert_eq!(reply.port, 23_456);
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let ports = test_ports();
+            let runtime = LocalDiscoveryRuntime::start_with_prober(ports, false);
+            let local_device_id = synthetic_device_id(31);
+            runtime.set_local_device_id(&local_device_id);
+            runtime.set_sync_port(23_456);
+            let prober = UdpSocket::bind(SocketAddr::new(ip, 0)).unwrap();
+            prober
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            for request_id in ["first-probe", "second-probe", "third-probe"] {
+                let probe = SyncpeerProbePacket {
+                    version: 1,
+                    request_id: request_id.to_string(),
+                    origin: None,
+                    device_id: None,
+                };
+                let packet = make_syncpeer_packet(
+                    SYNCPEER_DISCOVERY_KIND_PROBE,
+                    &serde_json::to_vec(&probe).unwrap(),
+                );
+                prober
+                    .send_to(&packet, SocketAddr::new(ip, ports.syncpeer))
+                    .unwrap();
+                let mut buffer = [0_u8; 4096];
+                let (size, _) = prober
+                    .recv_from(&mut buffer)
+                    .expect("probes must be answered while the other IP family is silent");
+                let (kind, body) = parse_syncpeer_packet(&buffer[..size]).unwrap();
+                assert_eq!(kind, SYNCPEER_DISCOVERY_KIND_REPLY);
+                let reply: SyncpeerReplyPacket = serde_json::from_slice(body).unwrap();
+                assert_eq!(reply.request_id, request_id);
+                assert_eq!(reply.device_id.as_deref(), Some(local_device_id.as_str()));
+                assert_eq!(reply.port, 23_456);
+            }
+        }
     }
 
     #[test]

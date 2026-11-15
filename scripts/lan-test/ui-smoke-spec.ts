@@ -347,6 +347,9 @@ describe("Syncpeer Tauri UI smoke", () => {
     await disclosure.click();
     await $("[data-testid='connection-details']").waitForExist({ timeout: 5_000 });
     assert.equal(await disclosure.getAttribute("aria-expanded"), "true");
+    const pause = $("[data-testid='expert-connection-control']");
+    assert.equal(await pause.isDisplayed(), true,
+      "Pause/resume must be available without enabling Expert View.");
   });
 
   it("resets folder scroll when returning to a password-backed folder view", async () => {

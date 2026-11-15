@@ -22,6 +22,8 @@ import {
 } from "./core/protocol/bep.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import { createAbortableConcurrencyLimit } from "./sync/connectionDialLimiter.js";
+import { settleDiscoveryWithin } from "./sync/discoveryBudgets.js";
 import type { createCiphertextReplica } from "./sync/ciphertextReplica.js";
 import { createCiphertextIndex, selectCiphertextPublication } from "./sync/ciphertextIndex.js";
 import { memoryUploadSource, type FileUploadSource } from "./transfer/stream.js";
@@ -3098,6 +3100,7 @@ class ConnectionAttempt {
   private readonly discoveryMode: NonNullable<SyncpeerConnectOptions["discoveryMode"]>;
   private readonly localDiscoveryTimeoutMs: number;
   private readonly raceController = new AbortController();
+  private readonly directDialLimit = createAbortableConcurrencyLimit(3);
   private readonly errors: string[] = [];
   private connectDeadline = 0;
   private perCandidateTimeout = 0;
@@ -3132,13 +3135,14 @@ class ConnectionAttempt {
   }
 
   async run(): Promise<SyncpeerSessionHandle> {
+    if (this.opts.quicOnly && !this.adapter.connectQuic)
+      throw new Error("QUIC is unavailable in this runtime.");
+    if (this.discoveryMode === "automatic" && !this.opts.relayOnly)
+      return this.runAutomatic();
     const ordered = await this.discoverCandidates();
     this.selectCandidates(ordered);
     if (this.opts.relayOnly && this.relayCandidates.length === 0) {
       throw new Error("Relay-only mode requires a relay address from global discovery.");
-    }
-    if (this.opts.quicOnly && !this.adapter.connectQuic) {
-      throw new Error("QUIC is unavailable in this runtime.");
     }
     if (this.relayCandidates.length > 0 && !this.relayEnabled) {
       this.errors.push("Relay fallback is disabled by settings");
@@ -3148,6 +3152,67 @@ class ConnectionAttempt {
       (attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null,
     );
     return this.awaitRace(attempts);
+  }
+
+  /** Try a LAN dial immediately while the independent global lookup continues.
+   * A stale LAN advertisement must not suppress valid WAN/relay candidates.
+   */
+  private async runAutomatic(): Promise<SyncpeerSessionHandle> {
+    const globalAbort = new AbortController();
+    const forwardAbort = () => globalAbort.abort();
+    if (this.signal?.aborted) forwardAbort();
+    else this.signal?.addEventListener("abort", forwardAbort, { once: true });
+    const global = resolveGlobalDiscoveryInternal(this.adapter, {
+      expectedDeviceId: this.opts.expectedDeviceId ?? "",
+      discoveryServer: this.opts.discoveryServer,
+    }, globalAbort.signal);
+    const globalTask = settleDiscoveryWithin(global,
+      Math.max(1, Math.min(6500, this.totalTimeout)), "Global discovery");
+    try {
+      const local = this.adapter.discoverLocalCandidates
+        ? this.adapter.discoverLocalCandidates({
+            expectedDeviceId: this.opts.expectedDeviceId ?? "",
+            timeoutMs: this.localDiscoveryTimeoutMs,
+            signal: this.signal,
+          })
+        : Promise.resolve([]);
+      const localResult = await settleDiscoveryWithin(local,
+        Math.max(1, Math.min(this.totalTimeout, this.localDiscoveryTimeoutMs + 250)),
+        "LAN discovery");
+      const localCandidates = localResult.status === "fulfilled"
+        ? localResult.value.map(candidate => ({
+            ...candidate, source: "local" as const,
+            scope: candidate.scope ?? "lan" as const,
+          }))
+        : [];
+      const fast = normalizeDiscoveredCandidates(dedupeCandidates([
+        ...this.manualCandidates(), ...localCandidates,
+      ]));
+      this.selectCandidates(fast);
+      this.prepareRace();
+      const immediate = [this.directAttempt(), this.relayAttempt()]
+        .filter((attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null);
+      const fallback = (async () => {
+        const globalResult = await globalTask;
+        if (this.raceSignal.aborted || this.winningSession)
+          throw new Error("Global discovery was superseded by an authenticated session.");
+        this.logDiscovery({ global: globalResult, local: localResult }, localCandidates);
+        if (globalResult.status !== "fulfilled") throw globalResult.reason;
+        const existing = new Set(fast.map(candidateKey));
+        const additional = normalizeDiscoveredCandidates(globalResult.value.candidates)
+          .filter(candidate => !existing.has(candidateKey(candidate)));
+        if (!additional.length) throw new Error("No additional global discovery candidates.");
+        this.selectCandidates(additional);
+        const attempts = [this.directAttempt(), this.relayAttempt()]
+          .filter((attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null);
+        if (!attempts.length) throw new Error("No usable global discovery fallback candidates.");
+        return Promise.any(attempts);
+      })();
+      return await this.awaitRace([...immediate, fallback]);
+    } finally {
+      this.signal?.removeEventListener("abort", forwardAbort);
+      globalAbort.abort();
+    }
   }
 
   private async discoverCandidates() {
@@ -3173,13 +3238,17 @@ class ConnectionAttempt {
   }
 
   private async runDiscovery(): Promise<DiscoveryOutcome> {
+    const globalAbort = new AbortController();
+    const forwardAbort = () => globalAbort.abort();
+    if (this.signal?.aborted) forwardAbort();
+    else this.signal?.addEventListener("abort", forwardAbort, { once: true });
     const global = this.discoveryMode === "lan"
       ? Promise.resolve({ payload: null, candidates: [] } as SyncpeerGlobalDiscoveryResult)
       : resolveGlobalDiscoveryInternal(this.adapter, {
           expectedDeviceId: this.opts.expectedDeviceId ?? "",
           discoveryServer: this.opts.discoveryServer,
-        }, this.signal);
-    const local = this.discoveryMode === "global"
+        }, globalAbort.signal);
+    const local = this.discoveryMode === "global" || this.opts.relayOnly
       ? Promise.resolve([])
       : this.adapter.discoverLocalCandidates
         ? this.adapter.discoverLocalCandidates({
@@ -3188,23 +3257,15 @@ class ConnectionAttempt {
             signal: this.signal,
           })
         : Promise.resolve([]);
-    // An Android LAN lookup can be delayed by native network work. A healthy
-    // global-discovery answer must not be held hostage by that optional path.
-    // LAN-only mode still respects its full requested discovery window.
-    let localTimeout: ReturnType<typeof setTimeout> | undefined;
-    const boundedLocal = this.discoveryMode === "automatic"
-      ? Promise.race([local, new Promise<never>((_resolve, reject) => {
-          localTimeout = setTimeout(
-            () => reject(new Error("LAN discovery exceeded its bounded lookup window.")),
-            Math.min(this.totalTimeout, this.localDiscoveryTimeoutMs + 250),
-          );
-        })])
-      : local;
     try {
-      const [globalResult, localResult] = await Promise.allSettled([global, boundedLocal]);
+      const [globalResult, localResult] = await Promise.all([
+        settleDiscoveryWithin(global, Math.max(1, this.totalTimeout), "Global discovery"),
+        settleDiscoveryWithin(local, Math.max(1, this.totalTimeout), "LAN discovery"),
+      ]);
       return { global: globalResult, local: localResult };
     } finally {
-      if (localTimeout !== undefined) clearTimeout(localTimeout);
+      this.signal?.removeEventListener("abort", forwardAbort);
+      globalAbort.abort();
     }
   }
 
@@ -3295,7 +3356,7 @@ class ConnectionAttempt {
       directCandidates: direct,
       relayCandidates: relay,
     });
-    this.connectDeadline = this.runtime.now() + this.totalTimeout;
+    if (this.connectDeadline === 0) this.connectDeadline = this.runtime.now() + this.totalTimeout;
     this.relayEnabled = this.opts.enableRelayFallback !== false;
     this.relayStartDelayMs = this.relayEnabled && relay.length > 0 && !this.opts.relayOnly
       ? Math.min(2500, Math.max(0, Math.floor(this.totalTimeout * 0.25)))
@@ -3345,7 +3406,22 @@ class ConnectionAttempt {
 
   private directAttempt() {
     if (this.directCandidates.length === 0) return null;
-    return Promise.any(this.directCandidates.map((candidate) => this.openDirectCandidate(candidate)));
+    // Android's native socket worker has four threads. Launching every
+    // advertised IPv4/IPv6 TCP/QUIC endpoint simultaneously can enqueue
+    // dozens of TLS handshakes and starve document and relay requests.
+    // Bound direct dials to three, leaving one slot for relay fallback.
+    const candidates = [...this.directCandidates];
+    let next = 0;
+    const worker = async (): Promise<SyncpeerSessionHandle> => {
+      let lastError: unknown = new Error("No available direct candidates.");
+      while (next < candidates.length && !this.raceSignal.aborted) {
+        const candidate = candidates[next++];
+        try { return await this.openDirectCandidate(candidate); }
+        catch (error) { lastError = error; }
+      }
+      throw lastError;
+    };
+    return Promise.any(Array.from({ length: Math.min(3, candidates.length) }, worker));
   }
 
   private async openDirectCandidate(candidate: DiscoveredCandidate) {
@@ -3356,7 +3432,8 @@ class ConnectionAttempt {
     if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
     const candidateTimeoutMs = Math.min(this.perCandidateTimeout, remainingMs);
     try {
-      return await this.tryDirectCandidate(candidate, candidateTimeoutMs);
+      return await this.directDialLimit.run(
+        () => this.tryDirectCandidate(candidate, candidateTimeoutMs), this.raceSignal);
     } catch (error) {
       this.handleDirectFailure(candidate, error);
       throw error;

@@ -113,6 +113,7 @@ test("Android UI browses through the one service session across visibility chang
       if (request.operation === "listFolders") return [{ id: "folder", label: "Folder", readOnly: true }];
       if (request.operation === "disconnect") return { phase: "idle" };
       if (request.operation === "uiVisible") return { visible: true };
+      if (request.operation === "uiHidden") return { visible: false };
       throw Error("Unexpected service command " + String(request.operation));
     },
   } });
@@ -127,9 +128,15 @@ test("Android UI browses through the one service session across visibility chang
       "An in-flight download must keep the service proxy usable when Android briefly hides the Activity.");
     await client.setForeground(true);
     await client.stopTransfer();
+    await client.setForeground(false);
+    assert.deepEqual((await remote.listFolders()).map(folder => folder.id), ["folder"],
+      "The native service session must survive Android sharing without an active transfer.");
+    await client.setForeground(true);
     assert.equal(socketCount, 0, "UI must never create a competing peer connection.");
-    assert.equal(opens, 1, "Visibility changes during a transfer must not reconnect.");
+    assert.equal(opens, 1, "Visibility changes without transfers must not reconnect.");
     assert.equal(stops, 0, "Returning to the foreground must not stop the service connection.");
+    assert.ok(commands.includes("uiHidden") && commands.includes("uiVisible"),
+      "Activity visibility must reach native service without disconnecting its socket.");
   } finally {
     await client.disconnect();
     await rm(root, { recursive: true, force: true });

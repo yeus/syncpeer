@@ -1,10 +1,11 @@
 import path from "node:path";
 import type { Options } from "@wdio/types";
+import { lanAppBinary } from "./tauri-runner.ts";
 
 // The runner wraps WebDriver in a private XDG/D-Bus session; the existing
 // external Tauri driver launches the test-built native binary directly.
-const binary = path.resolve(process.env.SYNCPEER_UI_DESKTOP_BINARY ??
-  "packages/tauri-shell/src-tauri/target/debug/tauri-shell");
+const binary = process.env.SYNCPEER_UI_DESKTOP_BINARY
+  ? path.resolve(process.env.SYNCPEER_UI_DESKTOP_BINARY) : lanAppBinary();
 
 export const config = {
   runner: "local",

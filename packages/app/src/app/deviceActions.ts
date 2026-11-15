@@ -177,6 +177,16 @@ class DeviceActionsRuntime {
       this.state.devices.peerDiscovery = observePeer(this.state.devices.peerDiscovery, normalized,
         { kind: "manual", lastSeenAtMs: Date.now() });
     }
+    // The same peer may be selected repeatedly while a native connect is
+    // pending. Do not repeatedly restore folders or enqueue another connect:
+    // doing so hid the original progress and thrashed offline snapshots.
+    const alreadyActive = sameDeviceId(
+      this.state.session.activeConnectDeviceId || this.state.session.remoteDevice?.id ||
+        this.state.connection.remoteId, normalized);
+    if (alreadyActive && (this.state.session.isConnecting || this.state.session.isConnected)) {
+      this.state.devices.selectedSavedDeviceId = normalized;
+      return;
+    }
     this.state.devices.selectedSavedDeviceId = normalized;
     Object.assign(this.state.connection, preferredConnectionForDevice(this.state.connection, normalized));
     if (!this.state.session.isConnected) {

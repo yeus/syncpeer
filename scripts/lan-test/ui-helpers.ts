@@ -109,7 +109,10 @@ export const readCurrentDeviceId = async (browser: TauriBrowser): Promise<string
 export const setValue = async (testId: string, value: string): Promise<void> => {
   const element = $("[data-testid='" + testId + "']");
   await element.click();
-  await element.setValue(value);
+  // WebKitWebDriver rejects setValue("") because it omits the required
+  // text parameter. Use the W3C clear-element command for empty values.
+  if (value === "") await element.clearValue();
+  else await element.setValue(value);
 };
 
 export const clickItemTitle = async (

@@ -3,10 +3,14 @@ import { execFileSync, spawn } from "node:child_process";
 
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
-const releaseMode = (): boolean => process.env.SYNCPEER_LAN_RELEASE === "1";
+const releaseMode = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env.SYNCPEER_LAN_RELEASE === "1";
 
-export const lanAppBinary = (): string =>
-  path.resolve("packages", "tauri-shell", "src-tauri", "target", releaseMode() ? "release" : "debug", "tauri-shell");
+export const lanAppBinary = (env: NodeJS.ProcessEnv = process.env): string => {
+  const cargoWorkspace = path.resolve("packages", "tauri-shell", "src-tauri");
+  const targetDir = path.resolve(cargoWorkspace, env.CARGO_TARGET_DIR || "target");
+  return path.join(targetDir, releaseMode(env) ? "release" : "debug", "tauri-shell");
+};
 
 export const buildLanApp = (): void => {
   execFileSync(npmCommand, ["run", releaseMode() ? "build:lan:release" : "build:lan", "-w", "@syncpeer/tauri-shell"], {
@@ -24,7 +28,8 @@ export const runLanWdio = async (env: NodeJS.ProcessEnv): Promise<number> => {
   const wdioBin = path.resolve("node_modules", "@wdio", "cli", "bin", "wdio.js");
   const configPath = path.resolve("scripts", "lan-test", "wdio.conf.ts");
   const wdioArgs = ["--import", "tsx", wdioBin, "run", configPath];
-  const runEnv = { ...process.env, ...env, SYNCPEER_LAN_APP_BINARY: lanAppBinary() };
+  const runEnv = { ...process.env, ...env };
+  runEnv.SYNCPEER_LAN_APP_BINARY = lanAppBinary(runEnv);
   const useVirtualDesktop = process.platform === "linux" &&
     (runEnv.SYNCPEER_LAN_XVFB === "1" || !runEnv.DISPLAY);
   if (useVirtualDesktop) {

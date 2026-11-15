@@ -604,9 +604,11 @@ test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { 
     }
     const fromA = new TextEncoder().encode("created by peer A");
     const fromB = new TextEncoder().encode("created by peer B");
-    const publication = { waitForRemote: true, signal: AbortSignal.timeout(3000) };
-    await incoming.remoteFs.writeFileFully("fixture-folder", "from-a.txt", fromA, publication);
-    await outgoing.remoteFs.writeFileFully("fixture-folder", "from-b.txt", fromB, publication);
+    // Each publication has its own deadline; reusing an already-expiring
+    // signal makes subsequent writes fail based on preceding work.
+    const publication = () => ({ waitForRemote: true, signal: AbortSignal.timeout(3000) });
+    await incoming.remoteFs.writeFileFully("fixture-folder", "from-a.txt", fromA, publication());
+    await outgoing.remoteFs.writeFileFully("fixture-folder", "from-b.txt", fromB, publication());
     {
       assert.deepEqual(new Uint8Array(await readFile(path.join(root, "share-b", "from-a.txt"))), fromA);
       assert.deepEqual(new Uint8Array(await readFile(path.join(root, "share-a", "from-b.txt"))), fromB);
@@ -628,7 +630,7 @@ test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { 
       await incoming.remoteFs.writeFileStream("fixture-folder", "streamed.bin", {
         size: streamed.length,
         read: async (offset, size) => { streamReads.push(size); return streamed.slice(offset, offset + size); },
-      }, publication);
+      }, publication());
       const streamDeadline = Date.now() + 3000;
       while (true) {
         const actual = await readFile(path.join(root, "share-b", "streamed.bin")).catch(() => null);

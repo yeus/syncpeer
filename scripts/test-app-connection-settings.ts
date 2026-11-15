@@ -162,6 +162,33 @@ test("a connected peer session survives an unreadable downloaded-file index", as
     "The unusable cache index should be reported as a warning instead of failing the connection.");
 });
 
+test("a successfully authenticated peer with no advertised folders stays eligible for automatic reconnection", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const { createInitialSessionState } = await import("../packages/core/dist/ui/sessionPolicies.js");
+  const peerId = "A".repeat(52);
+  const state = createInitialState({ deviceName: "Synthetic client" });
+  state.connection.remoteId = peerId;
+  state.devices.selectedSavedDeviceId = peerId;
+  const connected = createInitialSessionState();
+  connected.phase = "connected";
+  connected.remoteFs = {} as never;
+  connected.remoteDevice = { id: peerId, deviceName: "Synthetic peer" } as never;
+  connected.folders = [];
+  const actions = createAppActions({
+    state,
+    client: { getCachedStatuses: async () => [] } as never,
+    sessionStore: { actions: { setFolderPasswords: async () => {}, connect: async () => {} },
+      getState: () => connected } as never,
+    transfers: { transferInProgress: () => false } as never,
+  });
+  await actions.connect();
+  assert.equal(state.session.isConnected, true);
+  assert.equal(state.ui.autoConnectPaused, false, "A connected peer with no shared folders still needs automatic reconnect.");
+});
+
 test("using the peer that is already dialing does not cancel the attempt", async t => {
   const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
   t.after(() => server.close());
@@ -221,4 +248,111 @@ test("using the peer that is already dialing does not cancel the attempt", async
 
   rejectConnect?.(new Error("fixture cleanup"));
   await Promise.allSettled([automatic, explicit]);
+});
+
+test("pausing an Android-style in-flight connect ignores its late native abort", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.connection.deviceName = "fixture-client";
+  state.connection.remoteId = "A".repeat(52);
+  state.connection.cert = "fixture-cert";
+  state.connection.key = "fixture-key";
+  let signalStarted = () => {};
+  const started = new Promise<void>(resolve => { signalStarted = resolve; });
+  let cancel: (error: Error) => void = () => {};
+  const nativeConnect = new Promise<void>((_resolve, reject) => { cancel = reject; });
+  const actions = createAppActions({
+    state, client: {} as never,
+    sessionStore: { actions: {
+      setFolderPasswords: async () => {},
+      connect: async () => { signalStarted(); await nativeConnect; },
+      disconnect: async () => { cancel(new Error("signal is aborted without reason")); },
+    } } as never,
+    transfers: { transferInProgress: () => false } as never,
+  });
+  const opening = actions.connect();
+  await started;
+  await actions.disconnect();
+  await opening;
+  assert.equal(state.ui.autoConnectPaused, true);
+  assert.equal(state.ui.recentError, null);
+  assert.equal(state.logs.items.some(entry => entry.event === "peer.connect.attempt_failed"), false);
+  assert.equal(state.devices.connectionErrors[state.connection.remoteId], undefined);
+});
+
+test("Pause exposes cached folders immediately before the Android service finishes stopping", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  const peerId = "A".repeat(52);
+  state.connection.deviceName = "fixture-client";
+  state.connection.remoteId = peerId;
+  state.session.isConnected = true;
+  state.session.remoteFs = {} as never;
+  state.session.remoteDevice = { id: peerId, deviceName: "Fixture peer" } as never;
+  state.session.folders = [{ id: "photos", label: "Photos", needsPassword: false } as never];
+  state.session.directory = { ...state.session.directory, folderId: "photos", path: "album",
+    status: "ready", entries: [{ name: "existing.txt", path: "album/existing.txt", type: "file", size: 1, modifiedMs: 1 }] };
+  state.session.currentFolderId = "photos";
+  state.session.currentPath = "album";
+  state.session.entries = [...state.session.directory.entries];
+  let stopStarted = () => {};
+  const started = new Promise<void>(resolve => { stopStarted = resolve; });
+  let finishStop = () => {};
+  const pendingStop = new Promise<void>(resolve => { finishStop = resolve; });
+  const actions = createAppActions({
+    state, client: {} as never,
+    sessionStore: { actions: { disconnect: async () => { stopStarted(); await pendingStop; } } } as never,
+    transfers: { transferInProgress: () => false } as never,
+  });
+  const stopping = actions.disconnect();
+  await started;
+  try {
+    assert.equal(state.ui.autoConnectPaused, true);
+    assert.equal(state.session.isConnected, false, "Pause must be reflected before native RPC completes.");
+    assert.equal(state.session.remoteFs, null);
+    assert.deepEqual(state.session.entries.map(entry => entry.name), ["existing.txt"]);
+    assert.equal(state.session.isOfflineSnapshot, true);
+  } finally {
+    finishStop();
+    await stopping;
+  }
+});
+test("Android Share sheet visibility suspension does not report a peer connection failure", async t => {
+  const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null },
+    appType: "custom" });
+  t.after(() => server.close());
+  const { createAppActions } = await server.ssrLoadModule("/packages/app/src/app/actions.ts") as typeof AppActions;
+  const { createInitialState } = await server.ssrLoadModule("/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  const peer = "A".repeat(52);
+  state.connection.deviceName = "fixture-client";
+  state.connection.remoteId = peer;
+  state.connection.discoveryMode = "direct";
+  state.connection.cert = "synthetic-certificate";
+  state.connection.key = "synthetic-private-key";
+  state.ui.deviceNameConfirmed = true;
+  const actions = createAppActions({
+    state, client: {} as never,
+    sessionStore: {
+      actions: {
+        setFolderPasswords: async () => undefined,
+        connect: async () => {
+          state.ui.isAppVisible = false;
+          throw new Error("Connection is suspended or offline.");
+        },
+      },
+    } as never,
+    transfers: { transferInProgress: () => false } as never,
+  });
+  await actions.connect();
+  assert.equal(state.ui.recentError, null);
+  assert.equal(state.devices.connectionErrors[peer], undefined);
+  assert.ok(state.logs.items.some(log => log.event === "peer.connect.suspended"));
+  assert.ok(!state.logs.items.some(log => log.event === "peer.connect.attempt_failed"));
 });

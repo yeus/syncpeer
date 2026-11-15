@@ -55,6 +55,55 @@ const session = (sessionRemoteFs = remoteFs) => {
   };
 };
 
+test("Android service-owned connection is not aborted when a sharesheet hides the Activity", async () => {
+  const pending = deferred<ReturnType<typeof session>>();
+  const connected = session();
+  let signal: AbortSignal | undefined;
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    serviceOwnsSession: true,
+    keyFor: peer => peer,
+    open: async (_peer, controllerSignal) => {
+      opens++;
+      signal = controllerSignal;
+      return pending.promise;
+    },
+  });
+  const opening = lifecycle.connect("synthetic-peer");
+  await Promise.resolve();
+  await lifecycle.setForeground(false);
+  assert.equal(signal?.aborted, false, "Activity pause must not abort native-owned peer startup.");
+  pending.resolve(connected);
+  assert.equal(await opening, connected);
+  assert.equal(lifecycle.getState().phase, "connected");
+  await lifecycle.setForeground(true);
+  assert.equal(opens, 1, "Foreground return must not initiate a redundant dial.");
+  await lifecycle.disconnect();
+});
+
+test("Android service-owned sessions do not let a hidden WebView issue competing retries", async () => {
+  const first = session();
+  const resumed = session();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    serviceOwnsSession: true,
+    keyFor: peer => peer,
+    open: async () => ++opens === 1 ? first : resumed,
+    sleep: async () => undefined,
+  });
+  await lifecycle.connect("synthetic-peer");
+  await lifecycle.setForeground(false);
+  first.finish({ kind: "transport", message: "Peer connection lost" });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(opens, 1, "Android native service alone retries while Activity is hidden.");
+  await lifecycle.setOnline(false);
+  await lifecycle.setOnline(true);
+  assert.equal(opens, 1, "Network return in the background must not start a WebView dial.");
+  await lifecycle.setForeground(true);
+  assert.equal(opens, 2, "Foreground UI may reattach to the service-owned session.");
+  await lifecycle.disconnect();
+});
+
 test("transport configuration changes invalidate browser and Android service session keys", () => {
   const options = { host: "", port: 22000, remoteId: "synthetic-peer",
     deviceName: "Android test device", discoveryMode: "automatic" as const,

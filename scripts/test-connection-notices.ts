@@ -6,6 +6,8 @@ import {
   localDiscoveryUnavailableNotice,
   localDiscoveryHealthFromDiagnostics,
   shouldRenderFolderRootList,
+  directoryPlaceholder,
+  savedPeerUiState,
 } from "../packages/app/src/app/connectionNotices.ts";
 import { createTauriAdapters, reportUiError, shouldLogInvokeLifecycle } from "../packages/app/src/lib/tauriAdapters.ts";
 import { reportClientError } from "@syncpeer/core/browser";
@@ -23,6 +25,26 @@ test("renders attached local folder roots after the peer disconnects", () => {
   assert.equal(shouldRenderFolderRootList(false, 1), true);
   assert.equal(shouldRenderFolderRootList(false, 0), false);
   assert.equal(shouldRenderFolderRootList(true, 0), true);
+});
+
+test("directory refresh never replaces an existing listing with a placeholder", () => {
+  assert.equal(directoryPlaceholder({ hasEntries: true, loading: true, status: "loading" }), null);
+  assert.equal(directoryPlaceholder({ hasEntries: true, loading: false, status: "stale" }), null);
+  assert.equal(directoryPlaceholder({ hasEntries: true, loading: false, status: "error", error: "offline" }), null);
+  assert.equal(directoryPlaceholder({ hasEntries: false, loading: true, status: "loading" }), "Loading folder contents...");
+  assert.equal(directoryPlaceholder({ hasEntries: false, loading: false, status: "error", error: "offline" }), "offline");
+  assert.match(directoryPlaceholder({ hasEntries: true, loading: false, status: "locked" }) ?? "", /locked/i);
+});
+
+test("an unconfirmed active peer attempt shows likely approval and hides redundant Connect", () => {
+  assert.deepEqual(savedPeerUiState({ connected: false, connecting: true, confirmed: false }),
+    { label: "Waiting for approval", canConnect: false });
+  assert.deepEqual(savedPeerUiState({ connected: false, connecting: false, confirmed: false }),
+    { label: "Waiting for approval", canConnect: true });
+  assert.deepEqual(savedPeerUiState({ connected: false, connecting: true, confirmed: true }),
+    { label: "connecting…", canConnect: false });
+  assert.deepEqual(savedPeerUiState({ connected: true, connecting: false, confirmed: true }),
+    { label: "connected", canConnect: true });
 });
 
 test("connected folder status does not claim synchronization before indexes and unlock", () => {

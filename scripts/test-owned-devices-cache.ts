@@ -184,6 +184,28 @@ test("Use explicitly selects a discovered device even while a connect is pending
   assert.ok(state.devices.savedDevices.some(device => device.id === LAN_PEER));
 });
 
+test("repeated Use of the same connecting peer neither redials nor resets its offline snapshot", () => {
+  const state = createInitialState(null);
+  state.devices.savedDevices = [{ id: LAN_PEER, name: "Peer", isIntroducer: false,
+    createdAtMs: Date.now() }];
+  state.devices.selectedSavedDeviceId = LAN_PEER;
+  state.connection.remoteId = LAN_PEER;
+  state.session.activeConnectDeviceId = LAN_PEER;
+  state.session.isConnecting = true;
+  const connections: string[] = [];
+  const actions = createDeviceActions({
+    state, client: {} as never, sessionStore: {} as never,
+    refreshOverview: async () => undefined,
+    refreshActiveView: async () => undefined,
+    refreshCurrentDeviceId: async () => undefined,
+    connectToDevice: async peerId => { connections.push(peerId); },
+  });
+  actions.useSavedDevice(LAN_PEER);
+  actions.useSavedDevice(LAN_PEER);
+  assert.deepEqual(connections, []);
+  assert.equal(state.session.activeConnectDeviceId, LAN_PEER);
+});
+
 
 test("removing an active peer drops confirmed trust and stops its connection", async () => {
   const state = createInitialState(null);

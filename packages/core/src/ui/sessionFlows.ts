@@ -93,7 +93,8 @@ export const makeWaitForFolderIndexToArriveFlow =
     const pollIntervalMs = Math.max(50, args.pollIntervalMs ?? 150);
     const connected = args.isConnected ?? (() => true);
     const now = deps.now ?? (() => Date.now());
-    const deadline = now() + timeoutMs;
+    const startedAtMs = now();
+    const deadline = startedAtMs + timeoutMs;
     let folderSyncStates = [...(args.initialFolderSyncStates ?? [])];
     const attempts: FolderIndexPollAttempt[] = [];
     const getState = (): FolderSyncState | undefined =>
@@ -101,54 +102,62 @@ export const makeWaitForFolderIndexToArriveFlow =
     let attempt = 0;
     while (now() < deadline && connected()) {
       const existing = getState();
-      if (existing?.indexReceived) {
-        return { received: true, folderSyncStates, attempts };
-      }
+      if (existing?.indexReceived) return { received: true, folderSyncStates, attempts };
       attempt += 1;
-      const versions = await Promise.race<FolderSyncState[] | null>([
-        args.fetchFolderVersions(args.connectOptions),
-        deps.sleep(requestTimeoutMs).then(() => null),
+      const startedPollAtMs = now();
+      // Never issue a second native metadata query while the prior one is pending.
+      // The old race timed out its *caller* but leaked the in-flight request,
+      // stacking multiple service RPCs behind one blocked Android session.
+      const pending = args.fetchFolderVersions(args.connectOptions).then(
+        versions => ({ versions, error: null as unknown }),
+        error => ({ versions: null, error }),
+      );
+      const firstWaitMs = Math.min(requestTimeoutMs, Math.max(1, deadline - now()));
+      let response = await Promise.race([
+        pending, deps.sleep(firstWaitMs).then(() => null),
       ]);
-      if (!versions) {
-        attempts.push({
-          attempt,
-          timedOut: true,
+      if (response === null) {
+        deps.log?.({
+          level: "warning", event: "session.flow.folder_index.request_slow",
+          message: "Remote folder metadata request is slow; waiting without starting another request.",
+          details: { attempt, elapsedMs: now() - startedPollAtMs, requestTimeoutMs },
+        });
+        response = await Promise.race([
+          pending, deps.sleep(Math.max(1, deadline - now())).then(() => null),
+        ]);
+      }
+      if (response === null) {
+        attempts.push({ attempt, timedOut: true,
           folderSyncStateCount: folderSyncStates.length,
           indexReceived: Boolean(existing?.indexReceived),
           remoteIndexId: existing?.remoteIndexId ?? null,
-          remoteMaxSequence: existing?.remoteMaxSequence ?? null,
-        });
-        deps.log?.({
-          level: "warning",
-          event: "session.flow.folder_index.timeout",
-          message: `Timed out fetching folder sync states for ${args.folderId}.`,
-          details: { folderId: args.folderId, attempt, requestTimeoutMs },
-        });
-        await deps.sleep(pollIntervalMs);
-        continue;
+          remoteMaxSequence: existing?.remoteMaxSequence ?? null });
+        break;
       }
+      if (response.error != null) throw response.error;
+      const versions = response.versions!;
       folderSyncStates = versions;
       args.onFolderSyncStates?.(versions);
       const next = getState();
-      attempts.push({
-        attempt,
-        timedOut: false,
+      attempts.push({ attempt, timedOut: false,
         folderSyncStateCount: versions.length,
         indexReceived: Boolean(next?.indexReceived),
         remoteIndexId: next?.remoteIndexId ?? null,
-        remoteMaxSequence: next?.remoteMaxSequence ?? null,
-      });
+        remoteMaxSequence: next?.remoteMaxSequence ?? null });
       if (next?.indexReceived) {
+        deps.log?.({ level: "info", event: "session.flow.folder_index.ready",
+          message: "Remote folder index became available.",
+          details: { attempt, elapsedMs: now() - startedAtMs, stateCount: versions.length } });
         return { received: true, folderSyncStates, attempts };
       }
       await deps.sleep(pollIntervalMs);
     }
+    deps.log?.({ level: "warning", event: "session.flow.folder_index.unavailable",
+      message: "Remote folder index remains unavailable; no concurrent metadata polls were issued.",
+      details: { attempt, elapsedMs: now() - startedAtMs, connected: connected(),
+        timedOut: attempts.some(value => value.timedOut), stateCount: folderSyncStates.length } });
     const finalState = getState();
-    return {
-      received: Boolean(finalState?.indexReceived),
-      folderSyncStates,
-      attempts,
-    };
+    return { received: Boolean(finalState?.indexReceived), folderSyncStates, attempts };
   };
 
 export const makeReadDirWithRetryFlow =

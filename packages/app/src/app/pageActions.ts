@@ -15,6 +15,14 @@ export const createPageActions = (args: {
     connect,
   } = args;
 
+// Visibility and focus events can fire in a burst after Android standby.
+// The native service must finish its foreground handoff before a UI dial.
+let visibilityTransition: Promise<void> = Promise.resolve();
+let lastVisibilityRequested: boolean | null = null;
+let visibilityRunning = false;
+let lastVisibilityApplied: boolean | null = null;
+let foregroundPass: Promise<void> | null = null;
+
 const switchTab = (tab: AppState["activeTab"], event?: MouseEvent) => {
   event?.preventDefault();
   event?.stopPropagation();
@@ -33,7 +41,30 @@ const setAutoConnectPaused = (paused: boolean) => {
 
 const setAppVisibility = (isVisible: boolean) => {
   state.ui.isAppVisible = isVisible;
-  void sessionStore.actions.setForeground(isVisible);
+  // Android fires focus, pageshow and visibilitychange in a single wake-up.
+  // Serialize native handoffs and collapse duplicate/obsolete requests so a
+  // stale background transition cannot finish after the foreground transition.
+  if (lastVisibilityRequested === isVisible) return;
+  lastVisibilityRequested = isVisible;
+  const apply = async () => {
+    if (lastVisibilityRequested !== isVisible || lastVisibilityApplied === isVisible) return;
+    await sessionStore.actions.setForeground(isVisible);
+    lastVisibilityApplied = isVisible;
+  };
+  // Preserve the initial synchronous handoff. Subsequent changes queue behind
+  // the running operation; superseded transitions are dropped before dispatch.
+  const work = visibilityRunning
+    ? visibilityTransition.catch(() => undefined).then(apply) : apply();
+  visibilityRunning = true;
+  const settled = work.catch(() => {
+    pushSessionLog(state, "warning", "app.visibility.handoff_failed",
+      "Android foreground/background session handoff did not complete.");
+    throw new Error("Foreground session handoff failed.");
+  });
+  visibilityTransition = settled;
+  void settled.finally(() => {
+    if (visibilityTransition === settled) visibilityRunning = false;
+  }).catch(() => undefined);
 };
 
 const currentAutoTarget = () =>
@@ -41,14 +72,17 @@ const currentAutoTarget = () =>
     ? state.connection.remoteId || state.devices.selectedSavedDeviceId
     : "";
 
-const discoverThenConnect = async () => {
-  if (state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed) return;
-  const targetAtStart = currentAutoTarget();
+const discoverThenConnect = async (targetAtStart = currentAutoTarget()) => {
+  // The service already owns the authenticated socket. Focus/online events
+  // must not perform another native discovery while that socket is usable or
+  // while the UI is already waiting for its one service-owned connection.
+  if (!state.ui.isAppVisible || state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed ||
+    state.session.isConnected || state.session.isConnecting) return;
   await discoverLocalDevices({ timeoutMs: 1200 });
   // Discovery is asynchronous. Adding or selecting a peer while it runs must
   // not let an earlier startup/online callback dial a stale configuration.
   if (!targetAtStart || currentAutoTarget() !== targetAtStart ||
-    state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed ||
+    !state.ui.isAppVisible || state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed ||
     state.session.isConnected || state.session.isConnecting) return;
   await connect();
 };
@@ -58,7 +92,20 @@ const onNetworkOnline = async () => {
   await discoverThenConnect();
 };
 
-const onAppForeground = discoverThenConnect;
+const onAppForeground = (): Promise<void> => {
+  if (foregroundPass) return foregroundPass;
+  const targetAtStart = currentAutoTarget();
+  const work = (async () => {
+    await visibilityTransition;
+    if (!state.ui.isAppVisible) return;
+    await discoverThenConnect(targetAtStart);
+  })();
+  foregroundPass = work;
+  void work.finally(() => {
+    if (foregroundPass === work) foregroundPass = null;
+  }).catch(() => undefined);
+  return work;
+};
 
 const openDiagnosticsPage = () => {
   state.currentPage = "diagnostics";

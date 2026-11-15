@@ -368,3 +368,69 @@ test("does not let a stale restoration replace a newer navigation", async () => 
   assert.equal(state.activeTab, "devices");
   await oldOpen;
 });
+
+test("coalesces rapid Android visibility notifications into one current handoff", async () => {
+  const state = createInitialState(null);
+  state.ui.deviceNameConfirmed = false;
+  const transitions: boolean[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async (visible: boolean) => {
+      transitions.push(visible);
+    } } } as unknown as SyncpeerSessionStore,
+    discoverLocalDevices: async () => {}, connect: async () => {},
+  });
+  actions.setAppVisibility(false);
+  actions.setAppVisibility(false);
+  actions.setAppVisibility(true);
+  actions.setAppVisibility(true);
+  await actions.onAppForeground();
+  assert.deepEqual(transitions, [false, true],
+    "Only the initial hide and final show may run; duplicate visibility events must collapse.");
+});
+
+test("a foreground handoff waits for an already-running background transition", async () => {
+  const state = createInitialState(null);
+  state.ui.deviceNameConfirmed = false;
+  const transitions: string[] = [];
+  let resumeBackground = () => {};
+  const background = new Promise<void>(resolve => { resumeBackground = resolve; });
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async (visible: boolean) => {
+      transitions.push(visible ? "foreground" : "background");
+      if (!visible) await background;
+    } } } as unknown as SyncpeerSessionStore,
+    discoverLocalDevices: async () => {}, connect: async () => {},
+  });
+  actions.setAppVisibility(false);
+  await Promise.resolve();
+  actions.setAppVisibility(true);
+  const foreground = actions.onAppForeground();
+  await Promise.resolve();
+  assert.deepEqual(transitions, ["background"]);
+  resumeBackground();
+  await foreground;
+  assert.deepEqual(transitions, ["background", "foreground"]);
+});
+
+test("a service-connected peer needs no redundant foreground LAN discovery or reconnect", async () => {
+  const state = createInitialState(null);
+  state.ui.isAppVisible = true;
+  state.ui.deviceNameConfirmed = true;
+  state.session.isConnected = true;
+  const calls: string[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: {
+      setForeground: async (foreground: boolean) => { calls.push(`foreground:${foreground}`); },
+      setOnline: async (online: boolean) => { calls.push(`online:${online}`); },
+    } } as unknown as SyncpeerSessionStore,
+    discoverLocalDevices: async () => { calls.push("discover"); },
+    connect: async () => { calls.push("connect"); },
+  });
+  actions.setAppVisibility(true);
+  await actions.onAppForeground();
+  await actions.onNetworkOnline();
+  assert.deepEqual(calls, ["foreground:true", "online:true"]);
+});

@@ -34,7 +34,8 @@ export const createAppActions = (args: {
 }) => {
   const { state, client, sessionStore, transfers } = args;
   const appInfo = getAppBuildInfo();
-  const starred = createStarredActions({ state, client, transfers });
+  const starred = createStarredActions({ state, client, transfers,
+    androidServiceOwned: appInfo.runtimeSurface === "android-ui" });
   const connection = createConnectionActions({
     state,
     client,

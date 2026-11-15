@@ -3,7 +3,8 @@ import test from "node:test";
 import { createInitialSessionState } from "../packages/core/src/ui/sessionPolicies.ts";
 import { createDirectoryActions } from "../packages/app/src/app/directoryActions.ts";
 import { loadDirectorySideEffects } from "../packages/app/src/app/actionSupport.ts";
-import { createInitialState, localDocumentFolders } from "../packages/app/src/app/state.ts";
+import { applySessionState, createInitialState, localDocumentFolders } from "../packages/app/src/app/state.ts";
+import { saveOfflineDirectorySnapshot, saveOfflineSnapshot } from "../packages/app/src/app/syncPolicies.ts";
 
 const createFixture = (options: { localFolder: boolean; snapshotFails: boolean; browseOnly?: boolean }) => {
   const state = createInitialState(null);
@@ -83,4 +84,72 @@ test("session folder projection preserves browse-only storage policy across over
   assert.equal(state.localFolders[0]?.browseOnly, true);
   await loadDirectorySideEffects(state, client);
   assert.deepEqual(snapshotWrites, [], "A session update must not turn browsing into a snapshot write.");
+});
+
+test("offline browsing prefers the saved remote listing to an empty local downloads folder", async () => {
+  const state = createInitialState(null);
+  const peerId = "A".repeat(52);
+  state.connection.remoteId = peerId;
+  const cached = [{ name: "remote.txt", path: "album/remote.txt", type: "file" as const, size: 4, modifiedMs: 1 }];
+  saveOfflineSnapshot(state, peerId, { folders: [{ id: "f1", label: "Photos" } as never],
+    remoteDevice: null, folderSyncStates: [], connectedVia: "", transportKind: "" });
+  state.session.directory = { ...state.session.directory, folderId: "f1", path: "album",
+    entries: cached, status: "ready", loadedAtMs: 10 };
+  saveOfflineDirectorySnapshot(state, peerId);
+  state.session.currentFolderId = "";
+  state.session.currentPath = "";
+  state.session.entries = [];
+  const actions = createDirectoryActions({ state,
+    client: { listLocalDirectory: async () => [], loadDirectorySnapshot: async () => null } as never,
+    sessionStore: {} as never, refreshActiveView: async () => {}, syncStarredFiles: async () => {} });
+  await actions.openLocation("f1", "album", "fixture.open", {});
+  assert.deepEqual(state.session.entries.map(entry => entry.name), ["remote.txt"]);
+  assert.equal(state.session.isOfflineSnapshot, true);
+});
+
+test("an Android-style canceled directory refresh retains cached entries and no abort banner", async () => {
+  const state = createInitialState(null);
+  const peerId = "A".repeat(52);
+  state.connection.remoteId = peerId;
+  const cached = [{ name: "known.txt", path: "album/known.txt", type: "file" as const, size: 5, modifiedMs: 1 }];
+  const session = createInitialSessionState();
+  session.phase = "connected";
+  session.remoteFs = { setFocusedFolder: () => {} } as never;
+  session.folders = [{ id: "f1", label: "Photos", needsPassword: false } as never];
+  state.session.isConnected = true;
+  state.session.remoteFs = session.remoteFs;
+  state.session.folders = session.folders;
+  saveOfflineSnapshot(state, peerId, { folders: session.folders, remoteDevice: null,
+    folderSyncStates: [], connectedVia: "", transportKind: "" });
+  state.session.directory = { ...state.session.directory, folderId: "f1", path: "album",
+    entries: cached, status: "ready", loadedAtMs: 10 };
+  saveOfflineDirectorySnapshot(state, peerId);
+  state.session.currentFolderId = "";
+  state.session.currentPath = "";
+  state.session.entries = [];
+  let started = () => {};
+  const attempting = new Promise<void>(resolve => { started = resolve; });
+  let fail: (error: Error) => void = () => {};
+  const remote = new Promise<void>((_resolve, reject) => { fail = reject; });
+  const actions = createDirectoryActions({ state,
+    client: { loadDirectorySnapshot: async () => null, getCachedStatuses: async () => [] } as never,
+    sessionStore: { getState: () => session, actions: { goToPath: async () => {
+      session.directory = { ...session.directory, folderId: "f1", path: "album", entries: [], status: "loading" };
+      session.pending.loadingDirectory = true;
+      applySessionState(state, session);
+      started();
+      await remote;
+    } } } as never,
+    refreshActiveView: async () => {}, syncStarredFiles: async () => {} });
+  const opening = actions.openLocation("f1", "album", "fixture.open", {});
+  assert.equal(await Promise.race([attempting.then(() => true), opening.then(() => false)]), true,
+    `Expected live refresh; got ${state.ui.recentError ?? "no error"}`);
+  assert.deepEqual(state.session.entries.map(entry => entry.name), ["known.txt"],
+    "The core loading event must not erase cached rows while Android reads the index.");
+  state.ui.autoConnectPaused = true;
+  state.session.isConnected = false;
+  fail(new Error("signal is aborted without reason"));
+  await opening;
+  assert.deepEqual(state.session.entries.map(entry => entry.name), ["known.txt"]);
+  assert.equal(state.ui.recentError, null, "A deliberate pause must not show an aborted-request error.");
 });

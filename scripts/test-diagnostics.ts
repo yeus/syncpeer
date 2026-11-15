@@ -83,7 +83,11 @@ const main = async (): Promise<void> => {
       command: process.execPath,
       // Local Syncthing relay instances have overlapping process/socket lifetimes.
       // Keep test files isolated; the explicit concurrent-invitation test still stresses parallel peers.
-      args: ["--experimental-strip-types", "--test", "--test-concurrency=1", "scripts/test-relay-service.ts", "scripts/test-automatic-relay.ts", "scripts/test-native-discovery.ts", "scripts/test-relay-retry.ts", "scripts/test-relay-sync.ts"],
+      args: ["--experimental-strip-types", "--test", "--test-concurrency=1", "scripts/test-relay-service.ts", "scripts/test-automatic-relay.ts", "scripts/test-native-discovery.ts", "scripts/test-document-runtime-port.ts", "scripts/test-relay-retry.ts", "scripts/test-relay-sync.ts"],
+    },
+    {
+      ...tsxScript("scripts/test-discovery-budgets.ts"),
+      name: "Connection discovery deadlines and dial limits",
     },
     {
       name: "Durable folder replica indexes",
@@ -163,6 +167,12 @@ const main = async (): Promise<void> => {
       ],
     },
     {
+      name: "Android service-owned transfer jobs and staging",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test",
+        "scripts/test-service-transfer-jobs.ts", "scripts/test-service-upload-staging.ts"],
+    },
+    {
       name: "Application connection status diagnostics",
       command: process.execPath,
       args: [
@@ -179,6 +189,12 @@ const main = async (): Promise<void> => {
     {
       ...tsxScript("scripts/test-transfer-runtime.ts"),
       name: "Application transfer runtime diagnostics",
+    },
+    {
+      name: "Android native transfer UI and process recovery",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test",
+        "scripts/test-service-transfer-ui.ts", "scripts/test-service-transfer-recovery.ts"],
     },
     {
       name: "Favorite selection policy",
@@ -229,6 +245,12 @@ const main = async (): Promise<void> => {
       ],
     },
     {
+      name: "Android diagnostic log persistence and refresh coalescing",
+      command: process.execPath,
+      args: ["--import", "tsx/esm", "--test",
+        "scripts/test-session-log-persistence.ts", "scripts/test-connection-refresh-coalescing.ts"],
+    },
+    {
       name: "Application navigation history diagnostics",
       command: process.execPath,
       args: ["--import", "tsx/esm", "--test", "scripts/test-app-navigation.ts"],
@@ -236,7 +258,8 @@ const main = async (): Promise<void> => {
     {
       name: "Session directory navigation diagnostics",
       command: process.execPath,
-      args: ["--import", "tsx/esm", "--test", "scripts/test-session-store-navigation.ts"],
+      args: ["--import", "tsx/esm", "--test", "scripts/test-session-store-navigation.ts",
+        "scripts/test-session-index-flow.ts"],
     },
     {
       name: "Favorite synchronization policy diagnostics",
@@ -251,7 +274,8 @@ const main = async (): Promise<void> => {
     {
       name: "Service-owned favorite synchronization diagnostics",
       command: process.execPath,
-      args: ["--import", "tsx/esm", "--test", "scripts/test-service-favorite-sync.ts"],
+      args: ["--import", "tsx/esm", "--test", "scripts/test-service-favorite-sync.ts",
+        "scripts/test-android-sync-telemetry.ts"],
     },
     {
       ...tsxScript("scripts/test-harness-diagnostics.ts"),

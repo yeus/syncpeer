@@ -185,23 +185,20 @@ export const loadDirectorySideEffects = async (
   client: SyncpeerBrowserClient,
 ) => {
   if (!state.session.currentFolderId) return;
-  await refreshCachedStatuses(
-    state,
-    client,
-    state.session.currentFolderId,
-    state.session.entries.map((entry) => entry.path),
-  );
-  state.session.currentFolderVersionKey = folderVersionKeyFromState(
-    state,
-    state.session.currentFolderId,
-  );
+  const folderId = state.session.currentFolderId;
+  const path = state.session.currentPath;
+  const sourceDeviceId = activeSourceDeviceId(state);
+  const entries = [...state.session.entries];
+  const versionKey = folderVersionKeyFromState(state, folderId);
+  state.session.currentFolderVersionKey = versionKey;
   state.session.lastUpdatedAt = nowTime();
-  saveOfflineDirectorySnapshot(state, activeSourceDeviceId(state));
+  // Preserve the last valid remote listing before any optional cache-status I/O.
+  saveOfflineDirectorySnapshot(state, sourceDeviceId);
+  await refreshCachedStatuses(state, client, folderId, entries.map(entry => entry.path));
   // A registered browse-only folder has no writable local replica. Only
   // download-attached/local document folders can persist offline snapshots.
-  const local = state.localFolders.find(folder => folder.id === state.session.currentFolderId);
+  const local = state.localFolders.find(folder => folder.id === folderId);
   if (!local || local.browseOnly) return;
-  await client.saveDirectorySnapshot(state.session.currentFolderId, activeSourceDeviceId(state),
-    state.session.currentPath, { entries: state.session.entries,
-      versionKey: state.session.currentFolderVersionKey, loadedAtMs: Date.now() });
+  await client.saveDirectorySnapshot(folderId, sourceDeviceId, path,
+    { entries, versionKey, loadedAtMs: Date.now() });
 };

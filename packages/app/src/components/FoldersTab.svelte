@@ -8,7 +8,7 @@
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
   import { activeDownloadForFile, folderUnlockError, type AppState } from "../app/state.ts";
-  import { connectedFolderStatus, folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
+  import { connectedFolderStatus, directoryPlaceholder, folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -246,6 +246,15 @@
     return app.session.isRefreshing || app.session.isLoadingDirectory || status === "loading" || status === "stale";
   });
 
+  let directoryPlaceholderText = $derived(directoryPlaceholder({
+    hasEntries: entryRows.length > 0,
+    loading: app.session.isLoadingDirectory,
+    status: app.session.directory.status,
+    error: app.session.directory.error,
+    filtered: Boolean(directoryNameFilter.trim()),
+    locked: Boolean(app.session.currentFolderId && isFolderLocked(app.session.currentFolderId) && !app.session.isLocalDirectory),
+  }));
+
   let folderViewStatus = $derived.by(() => {
     if (app.session.isConnected && !app.session.isOfflineSnapshot) {
       return { tone: "online" as const, label: connectedFolderStatus(
@@ -291,9 +300,6 @@
       onSelect={onGoToBreadcrumb}
     />
 
-    {#if directoryStatusText}
-      <div class="directory-status-banner">{directoryStatusText}</div>
-    {/if}
 
     {#if app.session.currentFolderId}
       <div class="directory-tools">
@@ -394,27 +400,19 @@
         {/if}
       </ul>
     {:else}
-      {#if showDirectoryUpdating}
-        <div class="directory-live-indicator">
-          <span class="spinner" aria-hidden="true"></span>
-          <span>Updating directory…</span>
-        </div>
-      {/if}
+      <div class="directory-progress-slot" aria-live="polite">
+        {#if showDirectoryUpdating}
+          <div class="directory-live-indicator">
+            <span class="spinner" aria-hidden="true"></span>
+            <span>Updating directory…</span>
+          </div>
+        {:else if directoryStatusText}
+          <span class="directory-status-inline">{directoryStatusText}</span>
+        {/if}
+      </div>
       <ul class={`list ${directoryViewMode === "grid" ? "list-grid" : ""}`}>
-        {#if isFolderLocked(app.session.currentFolderId) && !app.session.isLocalDirectory}
-          <li class="empty">
-            This receive-encrypted folder is locked. Open its folder settings to enter the folder password, then browse or download files.
-          </li>
-        {:else if app.session.directory?.status === "loading" || app.session.isLoadingDirectory}
-          <li class="empty">Loading folder contents...</li>
-        {:else if app.session.directory?.status === "stale"}
-          <li class="empty">Updating folder contents...</li>
-        {:else if app.session.directory?.status === "error"}
-          <li class="empty">{app.session.directory.error || "Could not load folder contents."}</li>
-        {:else if entryRows.length === 0}
-          <li class="empty">
-            {directoryNameFilter.trim() ? "No files match this filter." : "Folder is empty."}
-          </li>
+        {#if directoryPlaceholderText}
+          <li class="empty">{directoryPlaceholderText}</li>
         {:else}
           {#each entryRows as item (item.path)}
             <FileSystemListItem
@@ -607,13 +605,15 @@
     width: 100%;
   }
 
-  .directory-status-banner {
-    margin-top: 0.45rem;
+  .directory-progress-slot {
+    display: flex;
+    align-items: center;
+    min-height: 2.25rem;
+    height: 2.25rem;
     margin-bottom: 0.2rem;
-    padding: 0.4rem 0.55rem;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface-soft);
+  }
+
+  .directory-status-inline {
     color: var(--text-secondary);
     font-size: 0.83rem;
   }
@@ -622,10 +622,8 @@
     display: flex;
     align-items: center;
     gap: 0.45rem;
-    margin: 0.35rem 0 0.65rem;
-    padding: 0.42rem 0.6rem;
+    padding: 0.35rem 0.6rem;
     border-radius: 0.6rem;
-    border: 0;
     background: color-mix(in srgb, var(--bg-surface) 86%, var(--color-secondary) 14%);
     color: var(--text-primary);
     font-size: 0.82rem;

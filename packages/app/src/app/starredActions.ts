@@ -25,6 +25,8 @@ type StarredActionArgs = {
   readonly state: AppState;
   readonly client: SyncpeerBrowserClient;
   readonly transfers: TransferRuntime;
+  /** Android's service owns favorite sync, including transfers when the UI is suspended. */
+  readonly androidServiceOwned?: boolean;
 };
 
 export const createStarredActions = (args: StarredActionArgs) => ({
@@ -498,7 +500,12 @@ class StarredSyncRun {
   }
 }
 
-const syncStarredFiles = async (args: StarredActionArgs) => new StarredSyncRun(args).run();
+/** Sole sync entry point. Android mutations notify the persistent native scheduler;
+ * a WebView must never start its own automatic favorite reconciliation. */
+const syncStarredFiles = async (args: StarredActionArgs): Promise<void> => {
+  if (args.androidServiceOwned) return;
+  await new StarredSyncRun(args).run();
+};
 
 const loadFavoriteSyncStates = async ({ state, client }: StarredActionArgs) => {
   if (!client.listFavoriteSyncStates) return;

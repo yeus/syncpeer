@@ -54,3 +54,18 @@ test("failed metadata registration is reported without rejecting the peer", asyn
   }, [{ id: "remote", label: "Remote" }], reported.resolve);
   assert.match(String(await reported.promise), /Synthetic storage queue failure/);
 });
+test("native discovery ignores already registered roots and deduplicates the rest", async () => {
+  const completed = deferred<void>();
+  const writes: string[] = [];
+  deferDiscoveredFolderRegistration({
+    status: async () => ({ vault: { phase: "unlocked" }, folders: [{ id: "known" }] }),
+    rememberFolder: async folder => { writes.push(folder.id); completed.resolve(); },
+  }, [
+    { id: "known", label: "Already registered" },
+    { id: "new", label: "New" },
+    { id: "new", label: "Duplicate offer" },
+  ], error => assert.fail(String(error)));
+  await completed.promise;
+  await Promise.resolve();
+  assert.deepEqual(writes, ["new"]);
+});

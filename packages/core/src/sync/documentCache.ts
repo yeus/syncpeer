@@ -792,9 +792,15 @@ class DocumentCache {
       // Folder registration mutates the encrypted registry. Wait for unlock; the
       // post-unlock credential load calls syncFolders again.
       if (vaultPhase(status) !== "unlocked") return status.folders;
-      // Discovery must finish even if preparing one folder's contents later fails.
+      // The native service registers consented peer metadata after the
+      // authenticated handshake. Do not enqueue duplicate encrypted registry
+      // writes from the WebView for roots that already exist. Still register
+      // missing roots when the service was previously locked or not running.
+      const registeredIds = new Set(status.folders.map(folder => folder.id));
       for (const folder of folders) {
+        if (registeredIds.has(folder.id)) continue;
         await this.request({ operation: "rememberFolder", id: folder.id, label: folder.label || folder.id });
+        registeredIds.add(folder.id);
       }
       for (const folder of folders) {
         const signature = JSON.stringify([folder.label, folder.encrypted, folder.needsPassword, passwords[folder.id]]);

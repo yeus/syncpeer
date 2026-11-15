@@ -30,7 +30,7 @@ import {
   sortByName,
 } from "./actionSupport.ts";
 import { refreshCachedStatuses, refreshFolderRootCachedStatuses } from "./cacheStatusActions.ts";
-import { applyOfflineDirectory, restoreOfflineDirectory } from "./syncPolicies.ts";
+import { applyOfflineDirectory, restoreOfflineDirectory, saveOfflineDirectorySnapshot } from "./syncPolicies.ts";
 import { updateCachedKey } from "./downloadPolicies.ts";
 
 type DirectoryActionArgs = {
@@ -42,6 +42,8 @@ type DirectoryActionArgs = {
 };
 
 class DirectoryActionsRuntime {
+  private navigationRequest = 0;
+
   constructor(
     private readonly state: AppState,
     private readonly client: SyncpeerBrowserClient,
@@ -57,6 +59,7 @@ class DirectoryActionsRuntime {
     details: unknown,
     missingOfflineMessage = "This folder has not been browsed on this device yet.",
   ): Promise<boolean> => {
+    const request = ++this.navigationRequest;
     const normalizedPath = normalizePath(path);
     this.state.ui.uploadMessage = "";
     if (currentSourceIsIntroducer(this.state) &&
@@ -66,69 +69,130 @@ class DirectoryActionsRuntime {
       return false;
     }
     try {
-      if (await this.tryLocalLocation(folderId, normalizedPath)) return true;
-      if (folderIsLocked(this.state, folderId)) return false;
-      if (!this.state.session.isConnected || !this.state.session.remoteFs) {
-        return this.openOfflineLocation(folderId, normalizedPath, missingOfflineMessage);
+      const online = this.state.session.isConnected && Boolean(this.state.session.remoteFs);
+      const locked = folderIsLocked(this.state, folderId);
+      if (!online && !locked && await this.restoreCachedLocation(folderId, normalizedPath, request)) return true;
+      if (request !== this.navigationRequest) return false;
+      if (await this.tryLocalLocation(folderId, normalizedPath, request)) return true;
+      if (request !== this.navigationRequest || locked) return false;
+      if (!online) {
+        this.state.ui.recentError = missingOfflineMessage;
+        return false;
       }
-      await this.openRemoteLocation(folderId, normalizedPath);
-      return true;
+      return await this.openRemoteLocation(folderId, normalizedPath, request, errorEvent, details);
     } catch (error) {
+      if (request !== this.navigationRequest) return false;
       reportActionError(this.state, errorEvent, error, details);
       restoreAfterTransportFailure(this.state, error);
       return false;
     }
   };
 
-  private tryLocalLocation = async (folderId: string, normalizedPath: string): Promise<boolean> => {
-      const canUseLocal = !this.state.session.isConnected || folderIsLocked(this.state, folderId) ||
-        !this.state.session.folders.some(folder => folder.id === folderId);
-      if (!canUseLocal) return false;
-      const local = await this.client.listLocalDirectory?.(folderId, normalizedPath);
-      if (!local) return false;
-      this.state.session.isLocalDirectory = true;
-      this.state.session.directory = { ...this.state.session.directory, folderId, path: normalizedPath,
-        entries: local, status: "ready", error: null, loadedAtMs: Date.now() };
-      this.state.session.currentFolderId = folderId;
-      this.state.session.currentPath = normalizedPath;
-      this.state.session.entries = local;
-      this.state.session.directoryPage = 1;
+  private tryLocalLocation = async (
+    folderId: string, path: string, request: number,
+  ): Promise<boolean> => {
+    const canUseLocal = !this.state.session.isConnected || folderIsLocked(this.state, folderId) ||
+      !this.state.session.folders.some(folder => folder.id === folderId);
+    if (!canUseLocal) return false;
+    const local = await this.client.listLocalDirectory?.(folderId, path);
+    if (!local || request !== this.navigationRequest) return false;
+    this.state.session.isLocalDirectory = true;
+    this.state.session.isOfflineSnapshot = false;
+    this.state.session.directory = { ...this.state.session.directory, folderId, path,
+      entries: local, status: "ready", error: null, loadedAtMs: Date.now() };
+    this.state.session.currentFolderId = folderId;
+    this.state.session.currentPath = path;
+    this.state.session.entries = local;
+    this.state.session.directoryPage = 1;
+    try {
       await refreshCachedStatuses(this.state, this.client, folderId, local.map(entry => entry.path));
-      return true;
-    };
+    } catch (error) {
+      pushSessionLog(this.state, "warning", "folder.local_status.failed",
+        "Local directory is available, but its downloaded-file indicators could not be refreshed.",
+        { message: error instanceof Error ? error.message : String(error) });
+    }
+    return true;
+  };
 
-    private openOfflineLocation = async (
-      folderId: string,
-      normalizedPath: string,
-      missingOfflineMessage: string,
-    ): Promise<boolean> => {
-      const encrypted = await this.client.loadDirectorySnapshot(
-        folderId,
-        activeSourceDeviceId(this.state),
-        normalizedPath,
-      );
-      if (encrypted) applyOfflineDirectory(this.state, folderId, normalizedPath, encrypted);
-      else if (!restoreOfflineDirectory(this.state, folderId, normalizedPath)) {
-        this.state.ui.recentError = missingOfflineMessage;
-        return false;
-      }
+  private restoreCachedLocation = async (
+    folderId: string, path: string, request: number,
+  ): Promise<boolean> => {
+    if (restoreOfflineDirectory(this.state, folderId, path)) {
+      saveOfflineDirectorySnapshot(this.state, activeSourceDeviceId(this.state));
       return true;
-    };
+    }
+    let encrypted;
+    try {
+      encrypted = await this.client.loadDirectorySnapshot(folderId, activeSourceDeviceId(this.state), path);
+    } catch (error) {
+      pushSessionLog(this.state, "warning", "folder.cache.read_failed",
+        "Saved directory listing could not be read; checking other available sources.",
+        { message: error instanceof Error ? error.message : String(error) });
+      return false;
+    }
+    if (request !== this.navigationRequest || !encrypted) return false;
+    applyOfflineDirectory(this.state, folderId, path, encrypted);
+    saveOfflineDirectorySnapshot(this.state, activeSourceDeviceId(this.state));
+    return true;
+  };
 
-    private openRemoteLocation = async (folderId: string, normalizedPath: string): Promise<void> => {
-      this.state.session.isLocalDirectory = false;
-      await this.sessionStore.actions.goToPath(folderId, normalizedPath, connectionDetails(this.state));
+  private beginRemoteDirectoryView = (folderId: string, path: string, cached: boolean) => {
+    this.state.session.isLocalDirectory = false;
+    this.state.session.isLoadingDirectory = true;
+    this.state.session.directory = { ...this.state.session.directory, folderId, path,
+      entries: cached ? this.state.session.directory.entries : [],
+      status: cached ? "stale" : "loading", error: null };
+    this.state.session.currentFolderId = folderId;
+    this.state.session.currentPath = path;
+    this.state.session.entries = this.state.session.directory.entries;
+    this.state.session.directoryPage = 1;
+  };
+
+  private handleRemoteDirectoryFailure = (
+    folderId: string, path: string, cached: boolean,
+    error: unknown, errorEvent: string, details: unknown,
+  ): boolean => {
+    this.state.session.isLoadingDirectory = false;
+    if (this.state.ui.autoConnectPaused) {
+      if (cached) restoreOfflineDirectory(this.state, folderId, path);
+      return cached;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (cached) {
+      this.state.session.directory = { ...this.state.session.directory, status: "error",
+        error: "Showing saved contents; the live directory could not be refreshed." };
+      pushSessionLog(this.state, "warning", "folder.refresh.failed",
+        "Retained saved directory listing after a failed remote refresh.", { message });
+      return true;
+    }
+    this.state.session.directory = { ...this.state.session.directory, status: "error", error: message };
+    reportActionError(this.state, errorEvent, error, details);
+    return false;
+  };
+
+  private openRemoteLocation = async (
+    folderId: string, path: string, request: number, errorEvent: string, details: unknown,
+  ): Promise<boolean> => {
+    const cached = await this.restoreCachedLocation(folderId, path, request);
+    if (request !== this.navigationRequest) return false;
+    this.beginRemoteDirectoryView(folderId, path, cached);
+    try {
+      await this.sessionStore.actions.goToPath(folderId, path, connectionDetails(this.state));
+      if (request !== this.navigationRequest) return false;
       applySessionState(this.state, this.sessionStore.getState());
       try {
         await loadDirectorySideEffects(this.state, this.client);
       } catch (error) {
-        // The directory opened; caching its listing is best-effort and must not turn
-        // a successful navigation into a failure banner.
         pushSessionLog(this.state, "warning", "folder.side_effects.failed",
           "Directory opened, but its offline listing could not be saved.",
           { message: error instanceof Error ? error.message : String(error) });
       }
-    };
+      return true;
+    } catch (error) {
+      if (request !== this.navigationRequest) return false;
+      return this.handleRemoteDirectoryFailure(folderId, path, cached, error, errorEvent, details);
+    }
+  };
 
     private openFolderRoot = async (folderId: string) => {
       this.state.activeTab = "folders";
@@ -159,6 +223,7 @@ class DirectoryActionsRuntime {
     };
 
     private goToRootView = async () => {
+      this.navigationRequest += 1;
       this.state.ui.uploadMessage = "";
       this.state.session.isLocalDirectory = false;
       if (!this.state.session.isConnected || !this.state.session.remoteFs) {

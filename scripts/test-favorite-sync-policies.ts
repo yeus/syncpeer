@@ -206,3 +206,47 @@ test("reads changed SAF-backed favorites through the native cache boundary befor
   await starred.syncStarredFiles();
   assert.deepEqual(events, ["read", "upload", "acknowledge"]);
 });
+
+test("Android service-owned favorites never start a competing WebView transfer", async () => {
+  const state = createInitialState(null);
+  state.ui.isAppVisible = true;
+  state.session.isConnected = true;
+  state.favorites.items = [{ key: "file:keepass.kdbx", folderId: "folder", path: "keepass.kdbx",
+    name: "keepass.kdbx", kind: "file" }];
+  const events: string[] = [];
+  state.session.remoteFs = { readDir: async () => { events.push("readDir"); return []; } } as never;
+  const starred = createStarredActions({
+    state,
+    androidServiceOwned: true,
+    client: { listCachedFiles: async () => { events.push("listCachedFiles"); return []; } } as never,
+    transfers: { begin: async () => { events.push("transferBegin"); },
+      update: () => {}, finish: async () => {} } as never,
+  });
+  await starred.syncStarredFiles();
+  assert.deepEqual(events, [], "Only the native service may synchronize Android favorites.");
+  assert.equal(state.sync.isSyncingStarredFiles, false);
+});
+
+test("Android retry and conflict-resolution actions delegate without a second WebView sync", async () => {
+  const state = createInitialState(null);
+  state.ui.isAppVisible = true;
+  state.session.isConnected = true;
+  state.favorites.items = [{ key: "file:keepass.kdbx", folderId: "folder", path: "keepass.kdbx",
+    name: "keepass.kdbx", kind: "file" }];
+  const calls: string[] = [];
+  state.session.remoteFs = { readDir: async () => { calls.push("unexpected-ui-read"); return []; } } as never;
+  const actions = createStarredActions({ state, androidServiceOwned: true,
+    client: {
+      retryFavoriteSync: async () => { calls.push("native-retry"); },
+      resolveFavoriteConflict: async () => { calls.push("native-resolution"); },
+      listFavoriteSyncStates: async () => { calls.push("native-status"); return []; },
+      listCachedFiles: async () => { calls.push("unexpected-ui-cache"); return []; },
+    } as never,
+    transfers: { begin: async () => { calls.push("unexpected-ui-transfer"); },
+      update: () => {}, finish: async () => {} } as never,
+  });
+  await actions.retryFavorite({ folderId: "folder", path: "keepass.kdbx" });
+  await actions.resolveFavoriteConflict({ folderId: "folder", path: "keepass.kdbx" }, "keep-remote");
+  assert.deepEqual(calls, ["native-retry", "native-status", "native-resolution", "native-status"]);
+  assert.equal(state.sync.isSyncingStarredFiles, false);
+});

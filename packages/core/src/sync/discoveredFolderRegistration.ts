@@ -9,7 +9,7 @@ export const consentedDiscoveredFolders = <T extends { id: string }>(
  */
 export const deferDiscoveredFolderRegistration = (
   documents: {
-    status: () => Promise<{ vault: { phase: string } }>;
+    status: () => Promise<{ vault: { phase: string }; folders?: readonly { id: string }[] }>;
     rememberFolder: (folder: { id: string; label: string }) => Promise<unknown>;
   },
   folders: readonly { id: string; label: string }[],
@@ -17,9 +17,13 @@ export const deferDiscoveredFolderRegistration = (
 ): void => {
   if (!folders.length) return;
   void (async () => {
-    if ((await documents.status()).vault.phase !== "unlocked") return;
+    const state = await documents.status();
+    if (state.vault.phase !== "unlocked") return;
+    const registered = new Set((state.folders ?? []).map(folder => folder.id));
     for (const folder of folders) {
+      if (registered.has(folder.id)) continue;
       await documents.rememberFolder({ id: folder.id, label: folder.label || folder.id });
+      registered.add(folder.id);
     }
   })().catch(onError);
 };

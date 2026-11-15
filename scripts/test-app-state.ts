@@ -16,13 +16,25 @@ import {
   connectionDetails,
   persistState,
   sensitiveAppState,
+  pushSessionLog,
+  shouldHintRemoteApprovalPending,
 } from "../packages/app/src/app/state.ts";
 import { isConfiguredDeviceName } from "../packages/app/src/app/suggestedNames.ts";
 import { generateMasterPassword } from "../packages/app/src/app/passwords.ts";
 import { observePeer } from "../packages/core/src/peerRegistry.ts";
 import { readInitialVaultStatus } from "../packages/app/src/app/initialVault.ts";
+import { restoreOfflineSnapshot, saveOfflineDirectorySnapshot } from "../packages/app/src/app/syncPolicies.ts";
+import { clearDirectoryView } from "../packages/app/src/app/actionSupport.ts";
 const PEER_ID = "RXB676UZHQX3SONXROHZ7M3DY2VEMB6LCGQCAG5QJ2VIEDX4RIUQ";
 import { createPageActions } from "../packages/app/src/app/pageActions.ts";
+
+test("session log cache retains the latest 4,000 events", () => {
+  const state = createInitialState(null);
+  for (let i = 0; i < 4010; i++) pushSessionLog(state, "info", "fixture", `event-${i}`);
+  assert.equal(state.logs.items.length, 4000);
+  assert.equal(state.logs.items[0]?.message, "event-4009");
+  assert.equal(state.logs.items.at(-1)?.message, "event-10");
+});
 
 test("stability warning appears on first run and stays dismissed", () => {
   assert.equal(createInitialState(null).ui.showStabilityNotice, true);
@@ -194,6 +206,48 @@ test("sensitive UI state round-trips through the encrypted payload", () => {
   assert.equal(applySensitiveAppState(restored, "invalid"), false);
 });
 
+
+test("offline listings survive an encrypted state restart without losing the active directory", () => {
+  const source = createInitialState(null);
+  const key = JSON.stringify(["docs", "nested"]);
+  source.offline.snapshots[PEER_ID] = {
+    deviceId: PEER_ID, remoteDevice: null, folders: [], folderSyncStates: [],
+    connectedVia: "fixture", transportKind: "", lastSeenAtMs: 20,
+    activeDirectoryKey: key,
+    directories: { [key]: { folderId: "docs", path: "nested", versionKey: "v1",
+      loadedAtMs: 19, entries: [{ name: "example.txt", path: "nested/example.txt",
+        type: "file", size: 12, modifiedMs: 5 }] } },
+  } as never;
+  const encrypted = JSON.parse(JSON.stringify(sensitiveAppState(source)));
+  const restored = createInitialState(null);
+  assert.equal(applySensitiveAppState(restored, encrypted), true);
+  assert.deepEqual(restored.offline.snapshots[PEER_ID].directories?.[key]?.entries.map(entry => entry.name), ["example.txt"]);
+  assert.equal(restored.offline.snapshots[PEER_ID].activeDirectoryKey, key);
+});
+test("an offline re-open does not fake a new last-seen connection time", () => {
+  const state = createInitialState(null);
+  state.connection.remoteId = PEER_ID;
+  state.offline.snapshots[PEER_ID] = { deviceId: PEER_ID, remoteDevice: null,
+    folders: [], folderSyncStates: [], connectedVia: "", transportKind: "", lastSeenAtMs: 1234 };
+  state.session.isOfflineSnapshot = true;
+  state.session.directory = { ...state.session.directory, folderId: "photos", path: "album",
+    entries: [{ name: "cached.txt", path: "album/cached.txt", type: "file", size: 1, modifiedMs: 2 }],
+    status: "ready", loadedAtMs: 1234 };
+  saveOfflineDirectorySnapshot(state, PEER_ID);
+  assert.equal(state.offline.snapshots[PEER_ID].lastSeenAtMs, 1234);
+});
+
+test("switching to a new peer never displays a different peer's offline folders", () => {
+  const state = createInitialState(null);
+  state.offline.snapshots[PEER_ID] = { deviceId: PEER_ID, remoteDevice: null,
+    folders: [{ id: "private-folder", label: "Other peer's folder" } as never],
+    folderSyncStates: [], connectedVia: "", transportKind: "", lastSeenAtMs: 1234 };
+  state.session.folders = state.offline.snapshots[PEER_ID].folders;
+  assert.equal(restoreOfflineSnapshot(state, clearDirectoryView, "B".repeat(52)), false);
+  assert.deepEqual(state.session.folders, []);
+  assert.equal(state.session.remoteDevice, null);
+});
+
 test("peer provenance and authenticated peer confirmation persist only in encrypted state", () => {
   const state = createInitialState(null);
   state.devices.savedDevices = [{ id: PEER_ID, name: "Desktop", isIntroducer: false,
@@ -301,6 +355,26 @@ test("an authorization peer error opens the remote approval prompt", () => {
   assert.equal(state.approvals.pendingApprovalPromptDeviceId, "");
 });
 
+test("known authenticated peers do not get a new approval banner after standby", () => {
+  const app = createInitialState(null);
+  app.connection.remoteId = PEER_ID;
+  app.devices.confirmedPeerIds.add(PEER_ID);
+  applySessionState(app, { ...createInitialSessionState(), phase: "waiting",
+    peerStatus: { phase: "waiting", revision: 1, foreground: false,
+      error: "Remote peer not approved" } });
+  assert.equal(app.approvals.pendingApprovalPromptDeviceId, "");
+  app.approvals.pendingApprovalPromptDeviceId = PEER_ID;
+  applySessionState(app, { ...createInitialSessionState(), phase: "connected",
+    remoteFs: {} as never });
+  assert.equal(app.approvals.pendingApprovalPromptDeviceId, "", "Successful recovery clears stale approval prompts");
+});
+
+test("multiple closed network candidates do not imply remote approval is required", () => {
+  assert.equal(shouldHintRemoteApprovalPending(
+    "Could not connect using discovered candidates: connection closed, connection closed, connection closed"), false);
+  assert.equal(shouldHintRemoteApprovalPending("waiting for approval of this client"), true);
+});
+
 test("keeps restored folders visible while reconnecting before live state arrives", () => {
   const app = createInitialState(null);
   app.session.isOfflineSnapshot = true;
@@ -353,6 +427,26 @@ test("keeps restored folders visible while reconnecting before live state arrive
   assert.equal(app.session.isOfflineSnapshot, true);
   assert.deepEqual(app.session.folders.map((folder) => folder.id), ["documents"]);
   assert.deepEqual(app.session.entries.map((entry) => entry.name), ["cached.txt"]);
+});
+
+test("offline cached rows survive stopping, idle and error events during Android pause", () => {
+  const state = createInitialState(null);
+  state.ui.autoConnectPaused = true;
+  state.session.isOfflineSnapshot = true;
+  state.session.folders = [{ id: "photos", label: "Photos" } as never];
+  state.session.directory = { ...state.session.directory, folderId: "photos", path: "album",
+    status: "ready", entries: [{ name: "known.jpg", path: "album/known.jpg", type: "file", size: 1, modifiedMs: 1 }] };
+  state.session.currentFolderId = "photos";
+  state.session.currentPath = "album";
+  state.session.entries = [...state.session.directory.entries];
+  for (const phase of ["stopping", "idle", "error"] as const) {
+    applySessionState(state, { ...createInitialSessionState(), phase,
+      lastError: phase === "error" ? "signal is aborted without reason" : null });
+    assert.deepEqual(state.session.folders.map(folder => folder.id), ["photos"], phase);
+    assert.deepEqual(state.session.entries.map(entry => entry.name), ["known.jpg"], phase);
+    assert.equal(state.ui.recentError, null, phase);
+    assert.equal(state.session.isOfflineSnapshot, true, phase);
+  }
 });
 
 test("replaces restored folders once live connected state arrives", () => {
@@ -583,6 +677,75 @@ test("foreground discovery cannot start a connection for a peer added while disc
   }];
   state.devices.selectedSavedDeviceId = PEER_ID;
   state.connection.remoteId = PEER_ID;
+  release();
+  await pending;
+  assert.deepEqual(calls, ["discover"]);
+});
+
+test("foreground recovery waits for Android visibility handoff and coalesces repeat wakeups", async () => {
+  const state = createInitialState({ deviceName: "Named test client" });
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Synthetic peer", isIntroducer: false, createdAtMs: 1 }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  const events: string[] = [];
+  let release!: () => void;
+  const nativeReady = new Promise<void>(resolve => { release = resolve; });
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => { events.push("foreground"); await nativeReady; } } } as never,
+    discoverLocalDevices: async () => { events.push("discover"); },
+    connect: async () => { events.push("connect"); },
+  });
+  actions.setAppVisibility(true);
+  const first = actions.onAppForeground();
+  const second = actions.onAppForeground();
+  await Promise.resolve();
+  assert.deepEqual(events, ["foreground"], "A service still suspended must not be dialed.");
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["foreground", "discover", "connect"]);
+});
+
+test("network-online callbacks do not dial peers from a hidden Android WebView", async () => {
+  const state = createInitialState({ deviceName: "Named device" });
+  state.ui.isAppVisible = false;
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Peer", isIntroducer: false, createdAtMs: 1 }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  const calls: string[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: {
+      setOnline: async () => { calls.push("native-online"); },
+      setForeground: async () => { calls.push("native-foreground"); },
+    } } as never,
+    discoverLocalDevices: async () => { calls.push("webview-discovery"); },
+    connect: async () => { calls.push("webview-connect"); },
+  });
+  await actions.onNetworkOnline();
+  assert.deepEqual(calls, ["native-online"]);
+  actions.setAppVisibility(true);
+  await actions.onAppForeground();
+  assert.deepEqual(calls, ["native-online", "native-foreground", "webview-discovery", "webview-connect"]);
+});
+
+test("a discovery started in the foreground cannot initiate a dial after backgrounding", async () => {
+  const state = createInitialState({ deviceName: "Named device" });
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Peer", isIntroducer: false, createdAtMs: 1 }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  const calls: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setOnline: async () => {}, setForeground: async () => {} } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); await gate; },
+    connect: async () => { calls.push("connect"); },
+  });
+  const pending = actions.onNetworkOnline();
+  await Promise.resolve();
+  state.ui.isAppVisible = false;
   release();
   await pending;
   assert.deepEqual(calls, ["discover"]);

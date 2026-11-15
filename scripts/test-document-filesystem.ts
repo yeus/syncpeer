@@ -511,6 +511,33 @@ test("directory catalogs stay encrypted and cache eviction preserves favorites a
   await documents.close();
 });
 
+test("opening a downloaded encrypted file without edits never removes it from DocumentsProvider", async () => {
+  const { openStorage } = memoryDocumentStorage();
+  const documents = createDocumentFilesystem({ profileId: "downloaded-open-fixture", deviceCounterId: "42",
+    openStorage, profile: await openStorage("profile"), randomBytes });
+  try {
+    await documents.initialize();
+    await documents.createVault("synthetic-master", false);
+    await documents.register({ id: "folder", label: "Fixture", password: "synthetic-folder-password" });
+    await documents.attachDownloads("folder");
+    const content = Uint8Array.of(1, 2, 3, 4);
+    const download = await documents.beginDownload("folder", "database.kdbx", content.length, 1000);
+    await documents.write(download, 0, content);
+    await documents.finishDownload(download);
+    const [folder] = await documents.list("syncpeer-root");
+    const file = (await documents.list(folder.id)).find(value => value.name === "database.kdbx")!;
+    assert.ok(file, "Downloaded file should be visible before opening.");
+    const opened = await documents.open(file.id, "rw");
+    assert.deepEqual(await documents.read(opened, 0, 4), content);
+    await documents.release(opened);
+    assert.ok((await documents.list(folder.id)).some(value => value.id === file.id));
+    assert.ok((await documents.cachedFiles()).some(value => value.path === "database.kdbx"));
+    const reader = await documents.open(file.id, "r");
+    assert.deepEqual(await documents.read(reader, 0, 4), content);
+    await documents.release(reader);
+  } finally { await documents.close(); }
+});
+
 test("DocumentsProvider can recreate deleted files and directories over replica tombstones", async () => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "recreate-tombstones", deviceCounterId: "42",

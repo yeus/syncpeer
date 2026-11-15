@@ -67,7 +67,7 @@ export const saveOfflineSnapshot = (
       connectionScope: snapshot.connectionScope ?? "",
       directories: previous?.directories ?? {},
       activeDirectoryKey: previous?.activeDirectoryKey,
-      lastSeenAtMs: Date.now(),
+      lastSeenAtMs: state.session.isOfflineSnapshot ? previous?.lastSeenAtMs ?? 0 : Date.now(),
     },
   };
 };
@@ -97,7 +97,7 @@ export const saveOfflineDirectorySnapshot = (
         },
       }),
       activeDirectoryKey: key,
-      lastSeenAtMs: Date.now(),
+      lastSeenAtMs: state.session.isOfflineSnapshot ? current.lastSeenAtMs : Date.now(),
     },
   };
 };
@@ -118,6 +118,7 @@ export const restoreOfflineDirectory = (
     status: "ready",
     error: null,
   };
+  state.session.isLocalDirectory = false;
   state.session.currentFolderId = directory.folderId;
   state.session.currentPath = directory.path;
   state.session.entries = [...directory.entries];
@@ -141,6 +142,7 @@ export const applyOfflineDirectory = (
   state.session.entries = [...directory.entries];
   state.session.currentFolderVersionKey = directory.versionKey;
   state.session.directoryPage = 1;
+  state.session.isLocalDirectory = false;
   state.session.isOfflineSnapshot = true;
 };
 
@@ -171,9 +173,21 @@ export const restoreOfflineSnapshot = (
 ) => {
   const preferred = normalizeDeviceId(preferredDeviceId ?? activeSourceDeviceId(state));
   const snapshots = sortByLastSeenDesc(Object.values(state.offline.snapshots));
-  const snapshot =
-    (preferred ? state.offline.snapshots[preferred] : null) ?? snapshots[0];
-  if (!snapshot) return false;
+  const snapshot = preferred ? state.offline.snapshots[preferred] : snapshots[0];
+  if (!snapshot) {
+    if (preferred) {
+      clearDirectoryView(state);
+      state.session.folders = [];
+      state.session.folderSyncStates = [];
+      state.session.remoteDevice = null;
+      state.session.connectionPath = "";
+      state.session.connectionTransport = "";
+      state.session.connectionScope = "";
+      state.session.isOfflineSnapshot = false;
+      state.session.offlineLastSeenAtMs = 0;
+    }
+    return false;
+  }
   state.session.folders = snapshot.folders;
   state.session.folderSyncStates = snapshot.folderSyncStates;
   state.session.remoteDevice = snapshot.remoteDevice;
@@ -187,10 +201,8 @@ export const restoreOfflineSnapshot = (
     : undefined;
   if (activeDirectory) {
     restoreOfflineDirectory(state, activeDirectory.folderId, activeDirectory.path);
-  } else if (
-    state.session.currentFolderId &&
-    !snapshot.folders.some((folder) => folder.id === state.session.currentFolderId)
-  ) {
+  } else if (state.session.currentFolderId) {
+    // Never display entries from a different source when folder IDs happen to overlap.
     clearDirectoryView(state);
   }
   pushSessionLog(

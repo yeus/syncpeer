@@ -256,10 +256,30 @@ test("automatic folder discovery does not reattach a browse-only local copy", as
     openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
   });
   await cache.syncFolders([{ id: "folder", label: "Folder", readOnly: true }], {});
-  assert.ok(requests.includes("rememberFolder"));
+  assert.ok(!requests.includes("rememberFolder"),
+    "The Android service's existing browse-only registration needs no duplicate write.");
   assert.ok(!requests.includes("register") && !requests.includes("attachDownloads"));
 });
 
+
+test("UI registers only missing folder roots, never duplicates an existing native root", async () => {
+  const requests: Array<{ operation: string; id?: string }> = [];
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      requests.push({ operation: String(input.operation), id: input.id as string | undefined });
+      if (input.operation === "cacheRegistrations") return { vault: { phase: "unlocked" },
+        folders: [{ id: "native", label: "Native", storageId: "root", browseOnly: true }] } as T;
+      return undefined as T;
+    },
+    legacy: {}, openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  await cache.syncFolders([
+    { id: "native", label: "Native", readOnly: true, needsPassword: true },
+    { id: "missing", label: "Missing", readOnly: true, needsPassword: true },
+    { id: "missing", label: "Missing", readOnly: true, needsPassword: true },
+  ], {});
+  assert.deepEqual(requests.filter(req => req.operation === "rememberFolder").map(req => req.id), ["missing"]);
+});
 test("folder discovery waits for an unlocked vault before registration", async () => {
   const requests: string[] = [];
   const cache = createDocumentCache({ enabled: () => true,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { peerRegistryViews, type AdvertisedDeviceItem, type AdvertisedFolderItem } from "@syncpeer/core/browser";
+  import { peerRegistryViews, sameDeviceId, type AdvertisedDeviceItem, type AdvertisedFolderItem } from "@syncpeer/core/browser";
   import PasswordInput from "./PasswordInput.svelte";
   import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
@@ -93,51 +93,63 @@
       confirmedDeviceIds: app.devices.confirmedPeerIds,
       awaitingRemoteApproval: app.approvals.remoteApprovalPendingIds,
     });
+    const connectingTargetId = app.session.activeConnectDeviceId || (
+      app.session.isConnecting || app.session.lifecyclePhase === "connecting" ||
+        app.session.lifecyclePhase === "reconnecting"
+        ? app.connection.remoteId || app.devices.selectedSavedDeviceId : ""
+    );
     const rows = views.map(view => {
       const saved = app.devices.savedDevices.find(device => device.id === view.deviceId);
-      const metaLines = view.sources.map(source => {
+      const sources = view.sources.map(source => {
         const lastSeen = new Date(source.lastSeenAtMs).toLocaleString();
-        if (source.kind === "manual") return "Manually added";
-        if (source.kind === "incoming") return `Incoming connection request (last seen ${lastSeen})`;
-        if (source.kind === "lan") {
-          return `LAN (last seen ${lastSeen})${source.addresses?.length ? ": " + source.addresses.join(", ") : ""}`;
-        }
+        if (source.kind === "manual") return { summary: "Manually added", details: [] as string[] };
+        if (source.kind === "incoming") return {
+          summary: `Incoming request · seen ${lastSeen}`, details: [] as string[],
+        };
+        if (source.kind === "lan") return {
+          summary: `LAN · seen ${lastSeen}`,
+          details: (source.addresses ?? []).map(address => `LAN address: ${address}`),
+        };
         const origin = app.devices.savedDevices.find(device => device.id === source.sourceDeviceId);
-        const via = origin?.name ?? formatSyncthingDeviceId(source.sourceDeviceId ?? "");
-        return `Advertised by ${via} (last seen ${lastSeen})${source.folderIds?.length ? " via " + source.folderIds.join(", ") : ""}`;
+        const via = origin?.name ?? (source.sourceDeviceId?.slice(0, 7) ?? "another peer");
+        return {
+          summary: `Advertised by ${via} · seen ${lastSeen}`,
+          details: (source.folderIds ?? []).map(folderId => `Introduced via folder: ${folderId}`),
+        };
       });
+      const metaLines = sources.map(source => source.summary);
+      const detailLines = sources.flatMap(source => source.details);
       if (view.connected && app.session.connectionPath) {
-        metaLines.unshift(`Connected via ${downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}: ${app.session.connectionPath}`);
+        metaLines.unshift(`Connected via ${downloadTransportText(app.session.connectionTransport, app.session.connectionScope)}`);
+        detailLines.unshift(`Connection path: ${app.session.connectionPath}`);
       }
       if (saved) return {
         kind: "saved" as const, id: view.deviceId, name: view.name,
         confirmed: view.confirmed,
         deviceId: view.deviceId, isConnected: view.connected,
-        isConnecting: app.session.activeConnectDeviceId === view.deviceId && !view.connected,
+        isConnecting: !view.connected && Boolean(connectingTargetId) && sameDeviceId(connectingTargetId, view.deviceId),
         connectError: app.devices.connectionErrors[view.deviceId] ?? "",
         isLanDetected: isLanDiscoveredDevice(view.deviceId),
         isIntroducer: saved.isIntroducer,
-        awaitingApproval: isSavedDeviceAwaitingRemoteApproval(view.deviceId), metaLines,
+        awaitingApproval: isSavedDeviceAwaitingRemoteApproval(view.deviceId), metaLines, detailLines,
       };
       const advertised = advertisedById.get(view.deviceId);
       if (advertised) return {
         kind: "advertised" as const, id: view.deviceId, name: view.name,
-        deviceId: view.deviceId, sourceFolderIds: advertised.sourceFolderIds, metaLines,
+        deviceId: view.deviceId, sourceFolderIds: advertised.sourceFolderIds, metaLines, detailLines,
       };
       return { kind: "candidate" as const, id: view.deviceId, name: view.name,
         deviceId: view.deviceId,
         incomingRequest: view.sources.some(source => source.kind === "incoming"),
-        metaLines };
+        metaLines, detailLines };
     });
     const localCandidates = app.devices.lanAnonymousCandidates.map(candidate => ({
       kind: "local-candidate" as const,
       id: `anonymous:${candidate.id}`,
       name: "Unidentified LAN candidate",
       deviceId: candidate.id,
-      metaLines: [
-        `Addresses: ${candidate.addresses.join(", ")}`,
-        "A verified Syncthing device ID is required before adding a peer.",
-      ],
+      metaLines: ["A verified Syncthing device ID is required before adding this peer."],
+      detailLines: candidate.addresses.map(address => `LAN address: ${address}`),
     }));
     return [...rows, ...localCandidates];
   });
@@ -616,13 +628,46 @@
       >
     {/if}
   </div>
+  <p class="hint">Android encrypted journal: {app.logs.journalStarted ? "writing enabled" : "not confirmed"}. Previous runs: {app.logs.historyAvailable ? `${app.logs.previousRunItems.length} entries recovered` : "not loaded"}. Save/Share retrieves history; installed updates preserve data, uninstalling does not.</p>
+  {#if app.logs.historyError}
+    <p class="hint" role="status">{app.logs.historyError}</p>
+  {/if}
+  {#if app.logs.historyAvailable && app.logs.previousRunItems.length > 0}
+    <details data-testid="previous-session-logs">
+      <summary>Previous runs ({app.logs.previousRunItems.length} entries)
+        {#if app.logs.previousRunStartedAtMs}
+          · {new Date(app.logs.previousRunStartedAtMs).toLocaleString()}
+        {/if}
+      </summary>
+      {#if app.logs.previousRunItems.length > 250}
+        <p class="item-meta">Showing 250 recent entries; Save or Share Logs includes all recovered entries.</p>
+      {/if}
+      <ul class="list">
+        {#each app.logs.previousRunItems.slice(0, 250) as item (item.id)}
+          <ListRow>
+            <div class="item-meta">
+              {new Date(item.timestampMs).toLocaleString()} | {item.level.toUpperCase()} | {item.event}
+            </div>
+            <div class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}>{item.message}</div>
+            {#if item.details !== undefined}
+              <pre class="log-details">{JSON.stringify(item.details, null, 2)}</pre>
+            {/if}
+          </ListRow>
+        {/each}
+      </ul>
+    </details>
+  {/if}
   <details bind:open={app.ui.isLogPanelExpanded}>
     <summary>View logs ({app.logs.items.length})</summary>
-    <ul class="list">
+    {#if app.ui.isLogPanelExpanded}
+      {#if app.logs.items.length > 250}
+        <p class="item-meta">Showing the latest 250 entries. Save or Share Logs includes all {app.logs.items.length} cached entries.</p>
+      {/if}
+      <ul class="list">
       {#if app.logs.items.length === 0}
         <li class="empty">No session logs yet.</li>
       {:else}
-        {#each app.logs.items as item (item.id)}
+        {#each app.logs.items.slice(0, 250) as item (item.id)}
           <ListRow>
             <div class="item-meta">
               {new Date(item.timestampMs).toLocaleTimeString()} | {item.level.toUpperCase()}
@@ -644,6 +689,7 @@
         {/each}
       {/if}
     </ul>
+    {/if}
   </details>
 </Panel>
 

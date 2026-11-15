@@ -87,6 +87,13 @@ export const createTransferRuntime = (args: TransferRuntimeArgs) => {
       value: { name: string; text: string; progressPercent: number },
     ) => setActiveDownload(args, key, value),
     clearActiveDownload: (key: string) => clearActiveDownload(args, key),
+    // Service-owned jobs survive WebView suspension. Register cancellation in
+    // the UI without starting a competing foreground transfer service or pinning
+    // the browser's connection lifecycle.
+    registerServiceTransfer: (id: string, direction: ActiveTransfer["direction"], cancel: () => void) => {
+      control.cancellations.set(id, { direction, cancel });
+    },
+    unregisterServiceTransfer: (id: string) => { control.cancellations.delete(id); },
     cancelDownload: (folderId?: string, path?: string) =>
       cancelDownload(args, control, folderId, path),
     cancelAll: () => cancelAll(control),

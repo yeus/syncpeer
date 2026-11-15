@@ -1,5 +1,4 @@
 const COMMANDS: &[&str] = &["registerListener", "removeListener"];
-
 fn main() {
   tauri_plugin::Builder::new(COMMANDS)
     .android_path("android")

@@ -94,6 +94,17 @@ class DocumentRuntimeServiceTest {
       val downloadedId = (0 until files.length()).map { files.getJSONObject(it) }.first { it.getString("name") == "downloaded.bin" }.getString("id")
       val downloadUri = DocumentsContract.buildDocumentUri(authority, downloadedId)
       resolver.openInputStream(downloadUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
+      // Regression: opening a downloaded document from a third-party editor must
+      // not remove it from DocumentsProvider or invalidate its encrypted copy.
+      resolver.openFileDescriptor(downloadUri, "rw")!!.use { descriptor ->
+        java.io.FileInputStream(descriptor.fileDescriptor).use { input ->
+          assertArrayEquals(byteArrayOf(1, 2, 3, 4), input.readBytes())
+        }
+      }
+      val afterOpen = command("list", JSONObject().put("id", folder)) as JSONArray
+      assertTrue("Opening the downloaded document must not hide or delete it",
+        (0 until afterOpen.length()).any { afterOpen.getJSONObject(it).getString("id") == downloadedId })
+      resolver.openInputStream(downloadUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
       val renamedUri = DocumentsContract.renameDocument(resolver, downloadUri, "renamed.bin")!!
       resolver.openInputStream(renamedUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
       DocumentsContract.deleteDocument(resolver, renamedUri)
@@ -250,6 +261,25 @@ class DocumentRuntimeServiceTest {
     }
   }
 
+  @Test fun pendingFavoriteSyncDoesNotStarveDocumentStatus() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      runtime.command(JSONObject().put("operation", "status")).get(30, TimeUnit.SECONDS)
+      val entered = CountDownLatch(1)
+      val pending = runtime.pendingFavoriteSyncEvaluationForTesting(entered)
+      assertTrue("Favorite directory walk must start", entered.await(10, TimeUnit.SECONDS))
+      val reply = runtime.command(JSONObject().put("operation", "status")).get(3, TimeUnit.SECONDS)
+      assertTrue(reply.getJSONObject("result").has("vault"))
+      assertFalse("Favorite scan still pending", pending.isDone)
+      assertEquals("completed", pending.get(8, TimeUnit.SECONDS))
+    } finally {
+      context.unbindService(client.first)
+    }
+  }
+
   @Test fun sessionStatusBusReplaysLatestSnapshotWithMonotonicRevisions() {
     val events = java.util.concurrent.CopyOnWriteArrayList<SessionStatusSnapshot>()
     val unsubscribe = SessionStatusBus.subscribe { events.add(it) }
@@ -264,9 +294,16 @@ class DocumentRuntimeServiceTest {
         peerPhase = "reconnecting",
         peerError = "Peer is reconnecting.",
         updatedAtMs = System.currentTimeMillis(),
+        sync = FavoriteSyncSnapshot(runId = 3, stage = "download", folderOrdinal = 1,
+          folderCount = 2, itemOrdinal = 3, itemCount = 5, elapsedMs = 12200),
       ))
       assertEquals(revision, events.last().revision)
       assertEquals("reconnecting", events.last().peerPhase)
+      val telemetry = events.last().toEvent()["sync"] as Map<*, *>
+      assertEquals("download", telemetry["stage"])
+      assertEquals(3L, telemetry["runId"])
+      assertFalse("Paths and peer identifiers must not be exported", telemetry.containsKey("path"))
+      assertFalse(telemetry.containsKey("folderId"))
       assertEquals("Peer is reconnecting.", SessionStatusBus.current()?.peerError)
     } finally {
       unsubscribe()
@@ -285,6 +322,34 @@ class DocumentRuntimeServiceTest {
       val after = runtime.backgroundSessionStatus()
       assertTrue("service status revisions must advance", after.getLong("revision") > before)
       assertTrue(after.getBoolean("foreground") == false)
+    } finally {
+      context.unbindService(client.first)
+    }
+  }
+
+  @Test fun transferProgressWithUuidIdDoesNotCrashDocumentRuntime() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      val result = runtime.evaluate("""
+        const port = await android.getNamedPort("network");
+        const reply = await new Promise((resolve, reject) => {
+          port.onmessage = message => resolve(JSON.parse(message.data ?? message.string));
+          port.postMessage(JSON.stringify({
+            __portId: 73,
+            operation: "transferJobProgress",
+            id: "6a6867aa-005e-4749-aad1-a188e176bad5",
+            phase: "queued",
+            transferredBytes: 0,
+            totalBytes: 1
+          }));
+        });
+        if (reply.id !== 73 || !("result" in reply)) throw Error("Transfer request was not acknowledged");
+        return "acknowledged";
+      """.trimIndent(), ByteArray(0)).get(30, TimeUnit.SECONDS)
+      assertEquals("acknowledged", result)
     } finally {
       context.unbindService(client.first)
     }
@@ -485,6 +550,13 @@ class DocumentRuntimeServiceTest {
   }
 
   private fun connect(context: Context): Pair<ServiceConnection, CompletableFuture<DocumentRuntimeService.RuntimeBinder>> {
+    // Standalone plugin instrumentation does not build Rust. Fail immediately rather
+    // than masking a missing JNI fixture as a 30-second document-runtime timeout.
+    try { System.loadLibrary("tauri_shell_lib") }
+    catch (error: UnsatisfiedLinkError) {
+      throw AssertionError("Native libtauri_shell_lib.so is missing from the instrumentation APK. " +
+        "Build the Android Rust library and stage it in gen/android/app/src/main/jniLibs for this ABI.", error)
+    }
     val result = CompletableFuture<DocumentRuntimeService.RuntimeBinder>()
     val connection = object : ServiceConnection {
       override fun onServiceConnected(name: ComponentName, service: IBinder) {

@@ -99,3 +99,19 @@ test("sharing writes a text file through the Android share command", async () =>
   assert.equal(request.mimeType, "text/plain");
   assert.equal(request.chooserTitle, "Share Syncpeer logs");
 });
+
+test("on-phone diagnostics can be saved and shared as a JSON file", async () => {
+  const { calls } = installFakeTauri(({ command }) =>
+    command === "syncpeer_android_pick_saf_directory" ? "content://tree/diagnostics" : null);
+  const files = androidLogFile();
+  const contents = JSON.stringify({ summary: { passed: 2, failed: 0 } });
+  assert.equal(await files.save("syncpeer-diagnostics-1.json", contents), "syncpeer-diagnostics-1.json");
+  await files.share("syncpeer-diagnostics-1.json", contents);
+  const saved = calls.find(call => call.command === "syncpeer_android_save_text_file");
+  const shared = calls.find(call => call.command === "syncpeer_android_share_text_file");
+  assert.ok(saved && shared);
+  assert.equal((saved.args?.request as Record<string, unknown>).mimeType, "application/json");
+  assert.equal((shared.args?.request as Record<string, unknown>).mimeType, "application/json");
+  assert.equal((shared.args?.request as Record<string, unknown>).chooserTitle, "Share Syncpeer diagnostics");
+  assert.equal((saved.args?.request as Record<string, unknown>).text, contents);
+});

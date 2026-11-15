@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import type { PairingInvitation, SyncpeerProfileSettings } from "@syncpeer/core/browser";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { formatProfileCreationError } from "./app/storageErrors.ts";
@@ -7,6 +8,43 @@
   import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
   import { createWorkerPasswordKdf } from "./lib/passwordKdf.ts";
   import PasswordInput from "./components/PasswordInput.svelte";
+  type AndroidSettingsTarget = "app" | "notifications" | "battery" | "power-saver" | "data-saver";
+  type AndroidReadiness = {
+    notifications: boolean;
+    batteryOptimizationExempt: boolean;
+    powerSaverEnabled: boolean;
+    backgroundRestricted: boolean;
+    dataSaverEnabled: boolean;
+  };
+  const isAndroid = typeof navigator !== "undefined" && typeof window !== "undefined" &&
+    "__TAURI_INTERNALS__" in window && /Android/i.test(navigator.userAgent);
+  let androidReadiness = $state<AndroidReadiness | null>(null);
+  let androidReadinessError = $state("");
+  let androidReadinessRows = $derived(androidReadiness ? [
+    { label: "Notifications", target: "notifications" as const,
+      status: androidReadiness.notifications ? "Allowed" : "Blocked" },
+    { label: "Background execution", target: "app" as const,
+      status: androidReadiness.backgroundRestricted ? "Restricted by Android" : "Not restricted" },
+    { label: "Battery optimization", target: "battery" as const,
+      status: androidReadiness.batteryOptimizationExempt ? "Exempt" : "System-managed (optional exemption)" },
+    { label: "Battery saver", target: "power-saver" as const,
+      status: androidReadiness.powerSaverEnabled ? "On (can delay synchronization)" : "Off" },
+    { label: "Data saver", target: "data-saver" as const,
+      status: androidReadiness.dataSaverEnabled ? "On (may restrict background data)" : "Off" },
+  ] : []);
+
+  async function refreshAndroidReadiness() {
+    try {
+      androidReadiness = await invoke<AndroidReadiness>("syncpeer_android_readiness");
+      androidReadinessError = "";
+    } catch { androidReadinessError = "Could not check Android permissions and restrictions."; }
+  }
+
+  async function openAndroidSettings(target: AndroidSettingsTarget) {
+    try { await invoke("syncpeer_android_open_system_settings", { target }); }
+    catch { androidReadinessError = "Could not open Android system settings."; }
+  }
+
   let { onBack, onOpenFolderSettings, onUnlock, onUnlockBiometric, onRotateMasterPassword, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId, onStartPairing, onJoinPairing,
     onPairedDevice, biometric, command }: {
@@ -227,11 +265,41 @@
   onMount(() => {
     void refresh().catch(() => { error = "Personal-space settings are unavailable."; });
     void biometric?.status().then(value => { biometricState = value; }).catch(() => {});
+    if (!isAndroid) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refreshAndroidReadiness();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    void refreshAndroidReadiness();
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
   });
 </script>
 <main class="panel settings-page" data-testid="general-settings-page">
   <button onclick={onBack}>Back</button>
   <h1>Settings</h1>
+  {#if isAndroid}
+    <section data-testid="android-permissions" aria-label="Android permissions and restrictions">
+      <h2>Android permissions &amp; restrictions</h2>
+      <p class="hint">These are system settings, not proof of a live peer connection. Battery optimization is optional. Android Doze and vendor restrictions may still delay background synchronization.</p>
+      <button type="button" class="ghost" onclick={() => void refreshAndroidReadiness()}>Refresh status</button>
+      {#if androidReadinessError}<p role="alert">{androidReadinessError}</p>{/if}
+      {#if androidReadiness}
+        {#each androidReadinessRows as row (row.label)}
+          <div class="android-readiness-row">
+            <div><strong>{row.label}</strong><p class="hint">{row.status}</p></div>
+            <button type="button" class="ghost" aria-label={`Change ${row.label}`}
+              onclick={() => void openAndroidSettings(row.target)}>Change</button>
+          </div>
+        {/each}
+      {:else if !androidReadinessError}
+        <p role="status">Checking Android settings…</p>
+      {/if}
+    </section>
+  {/if}
   {#if status?.vault.phase === "locked"}
     <p class="hint">Your private storage is locked. Unlock it to manage local credentials or Personal Space.</p>
   {/if}
@@ -415,3 +483,15 @@
   {/if}
   {#if status?.vault.issue}<p role="status">{status.vault.issue}</p>{/if}
 </main>
+
+<style>
+  .android-readiness-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.35rem 0;
+    border-bottom: 1px solid var(--border-color, #ccc);
+  }
+  .android-readiness-row .hint { margin: 0.2rem 0; }
+</style>

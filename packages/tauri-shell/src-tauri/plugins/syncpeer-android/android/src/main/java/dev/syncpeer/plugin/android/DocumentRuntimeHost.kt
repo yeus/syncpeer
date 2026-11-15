@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
+import android.util.Log
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ConsoleMessage
 import android.webkit.WebMessage
@@ -37,7 +38,15 @@ private fun dispatchNativeRequest(
   request: (String) -> String,
   respond: (String) -> Unit,
 ) {
-  val task = Runnable { respond(request(raw)) }
+  val task = Runnable {
+    val reply = try { request(raw) } catch (error: Exception) {
+      // A malformed message or a failing native operation must never crash the app process.
+      Log.e("SyncpeerRuntime", "$name port request failed (${error.javaClass.simpleName})")
+      val id = runCatching { JSONObject(raw).optLong("__portId", -1) }.getOrDefault(-1)
+      JSONObject().put("id", id).put("error", "Native $name request failed.").toString()
+    }
+    runCatching { respond(reply) }
+  }
   val control = name == "network" && runCatching {
     when (JSONObject(raw).optString("operation")) {
       "discoveryPrepare", "discoveryCancel" -> true
@@ -160,7 +169,7 @@ internal class SandboxDocumentRuntimeHost private constructor(
       lateinit var port: MessagePort
       port = isolate.createMessageChannel("timer", executor) { message ->
         val request = JSONObject(message.string)
-        val reply = JSONObject().put("id", request.getLong("id")).put("result", JSONObject.NULL)
+        val reply = JSONObject().put("id", request.getLong("__portId")).put("result", JSONObject.NULL)
         val delayMs = request.optLong("delayMs", 0L).coerceAtLeast(0L)
         executor.schedule({ runCatching { port.postMessage(Message.createStringMessage(reply.toString())) } },
           delayMs, TimeUnit.MILLISECONDS)

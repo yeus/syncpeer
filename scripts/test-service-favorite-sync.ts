@@ -36,15 +36,16 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
       indexReceived: options.indexReceived ?? true }),
     waitForFolderIndex: async () => options.indexReceived ?? true,
     readDir: async (_folderId: string, parent: string): Promise<FileEntry[]> => children(parent),
-    readFileToSink: async (_folderId: string, path: string, sink: {
+    readFileToSink: async (folderId: string, path: string, sink: {
       begin: (metadata: { folderId: string; path: string; sizeBytes: number; encrypted: boolean; contentId?: string }) => Promise<void>;
       write: (offset: number, bytes: Uint8Array) => Promise<void>;
       commit: () => Promise<void>;
-    }) => {
+    }, onProgress?: (progress: { downloadedBytes: number; totalBytes: number }) => void) => {
       const file = files.get(path);
       if (!file) throw new Error(`Remote file is missing: ${path}`);
-      await sink.begin({ folderId: "folder", path, sizeBytes: file.bytes.length, encrypted: false, contentId: "test" });
+      await sink.begin({ folderId, path, sizeBytes: file.bytes.length, encrypted: false, contentId: "test" });
       await sink.write(0, file.bytes);
+      onProgress?.({ downloadedBytes: file.bytes.length, totalBytes: file.bytes.length });
       await sink.commit();
       return { bytesWritten: file.bytes.length, totalBytes: file.bytes.length };
     },
@@ -54,13 +55,16 @@ function fakeRemote(files: Map<string, { bytes: Uint8Array; modifiedMs: number }
       files.set(path, { bytes: bytes.slice(), modifiedMs: uploadOptions?.modifiedMs ?? Date.now() });
     },
     writeFileStream: async (_folderId: string, path: string, source: { size: number; read: (offset: number, size: number) => Promise<Uint8Array> },
-      uploadOptions?: { modifiedMs?: number }) => {
+      uploadOptions?: { modifiedMs?: number; onProgress?: (progress: {
+        processedBytes: number; totalBytes: number; elapsedMs: number; phase: "preparing" | "publishing" }) => void }) => {
       if (options.failUploads) throw new Error("Synthetic upload failure.");
       const bytes = new Uint8Array(source.size);
       for (let offset = 0; offset < source.size; offset += 131072) {
         const chunk = await source.read(offset, Math.min(131072, source.size - offset));
         requests.uploadReads.push(chunk.length);
         bytes.set(chunk, offset);
+        uploadOptions?.onProgress?.({ processedBytes: Math.min(offset + chunk.length, source.size),
+          totalBytes: source.size, elapsedMs: 0, phase: "preparing" });
       }
       requests.uploads.push({ path, bytes });
       files.set(path, { bytes: bytes.slice(), modifiedMs: uploadOptions?.modifiedMs ?? Date.now() });
@@ -526,5 +530,76 @@ test("applies a recorded keep-remote resolution by replacing the local copy", as
   assert.deepEqual(await documents.read(reader, 0, 11), encoder.encode("peer choice"));
   await documents.release(reader);
   assert.equal((await documents.favoriteSyncState("folder")).entries["notes.txt"]?.resolution, undefined);
+  await documents.close();
+});
+
+test("redacted favorite-sync progress includes stages but never filenames or folder identities", async () => {
+  const { documents } = await createFixture();
+  const { remote } = fakeRemote(new Map([["notes.txt", {
+    bytes: encoder.encode("fixture"), modifiedMs: 10,
+  }]]));
+  const progress: unknown[] = [];
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs,
+    { nowMs: 1000, onProgress: item => progress.push(item) });
+  assert.equal(results[0]?.result, "downloaded");
+  assert.ok(progress.some(item => (item as { stage: string }).stage === "download"));
+  assert.ok(progress.some(item => (item as { stage: string }).stage === "complete"));
+  assert.ok(!JSON.stringify(progress).includes("notes.txt"));
+  assert.ok(progress.every(item => !Object.keys(item as object).some(key => key === "folderId" || key === "path")));
+  assert.ok(progress.some(item => (item as { transferredBytes?: number }).transferredBytes === 7));
+  assert.ok(progress.some(item => (item as { totalBytes?: number }).totalBytes === 7));
+  await documents.close();
+});
+
+test("an unexpected favorite folder failure becomes a result, not a rejected sync run", async () => {
+  const { documents } = await createFixture();
+  const { remote } = fakeRemote(new Map([["notes.txt", {
+    bytes: encoder.encode("fixture"), modifiedMs: 10,
+  }]]));
+  remote.getFolderSyncState = async () => { throw new Error("Synthetic metadata transport failure"); };
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs,
+    { nowMs: 1000, onProgress: () => { throw new Error("Telemetry callback failed"); } });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].result, "unavailable");
+  await documents.close();
+});
+test("a timed-out favorite folder does not prevent another folder downloading", async () => {
+  const { documents } = await createFixture();
+  await documents.register({ id: "other", label: "Other", password: "synthetic-folder-password" });
+  await documents.attachDownloads("other");
+  const settings = await documents.profileSettings();
+  settings.folders.other = { exclusions: [], ignorePatterns: [], paused: false,
+    favorites: [{ key: "file:other:notes.txt", folderId: "other", kind: "file",
+      path: "notes.txt", name: "notes.txt" }] };
+  await documents.saveProfileSettings(settings);
+  const { remote } = fakeRemote(new Map([["notes.txt", {
+    bytes: encoder.encode("unaffected"), modifiedMs: 10,
+  }]]));
+  const listFolders = remote.listFolders;
+  remote.listFolders = async () => [...await listFolders(), {
+    id: "other", label: "Other", readOnly: false, stats: undefined,
+  }];
+  remote.getFolderSyncState = async folderId => {
+    if (folderId === "folder") throw new Error("Synthetic metadata transport timeout");
+    return { folderId, remoteIndexId: "1", remoteMaxSequence: "1", indexReceived: true };
+  };
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  assert.deepEqual(results.map(({ folderId, result }) => [folderId, result]),
+    [["folder", "unavailable"], ["other", "downloaded"]]);
+  await documents.close();
+});
+
+
+test("a failed offline directory snapshot does not abort downloaded favorites", async () => {
+  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { remote } = fakeRemote(new Map([
+    ["docs/keep.txt", { bytes: encoder.encode("still available"), modifiedMs: 10 }],
+  ]));
+  documents.saveDirectorySnapshot = async () => { throw new Error("Synthetic snapshot storage failure"); };
+  const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
+  assert.deepEqual(results.map(({ result }) => result), ["downloaded"]);
+  const reader = await documents.open(JSON.stringify([storageId, "docs/keep.txt"]), "r");
+  assert.deepEqual(await documents.read(reader, 0, 15), encoder.encode("still available"));
+  await documents.release(reader);
   await documents.close();
 });

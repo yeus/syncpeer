@@ -64,16 +64,34 @@ class DocumentRuntimeService : Service() {
   @Volatile private var sessionError: String? = null
   @Volatile private var peerPhase: String? = null
   @Volatile private var peerError: String? = null
+  @Volatile private var verifiedTransferPeerId: String? = null
   @Volatile private var statusRevision = 0L
+  private var lastDiagnosticSessionPhase: String? = null
+  private var lastDiagnosticPeerPhase: String? = null
+  private val slowLoggedAtMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
   @Volatile private var foregroundStarted = false
+  @Volatile private var uiIsVisible = false
+  @Volatile private var backgroundSyncArmed = false
   private val backgroundSessions by lazy { BackgroundSessionStore(applicationContext) }
+  private val transferJobs by lazy { TransferJobStore(applicationContext) }
+  private val transferStages by lazy { EncryptedUploadStaging(applicationContext) }
+  private val transferRetryRunnable = Runnable { replayTransferJobs() }
+  private var transferStagesPruned = false
+  private val transferJobDispatches = java.util.Collections.synchronizedSet(mutableSetOf<String>())
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
   private var powerReceiver: BroadcastReceiver? = null
   private val initialized = CompletableFuture<DocumentRuntimeStatus>()
   private val favoriteSyncPending = AtomicBoolean(false)
+  @Volatile private var favoriteSyncTelemetry: FavoriteSyncSnapshot? = null
+  @Volatile private var favoriteSyncRunId = 0L
+  @Volatile private var favoriteSyncStartedAtMs = 0L
+  @Volatile private var favoriteSyncLastProgressAtMs = 0L
+  private var favoriteSyncProgressSequence = 0
+  private var favoriteSyncLastPublishedAtMs = 0L
+  private var favoriteSyncWatchdog: Runnable? = null
   private val favoriteSyncRunnable = object : Runnable {
     override fun run() {
-      if (sessionPhase != "connected") return
+      if (!FavoriteSyncOwnership.maySchedule(sessionPhase == "connected", uiIsVisible, backgroundSyncArmed)) return
       requestFavoriteSync()
       mainHandler.postDelayed(this, FAVORITE_SYNC_INTERVAL_MS)
     }
@@ -151,12 +169,21 @@ class DocumentRuntimeService : Service() {
     /** Deterministic regression: an in-flight peer handshake may not starve document commands. */
     internal fun pendingSessionEvaluationForTesting(entered: CountDownLatch): CompletableFuture<String> {
       check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
-      return evaluateRuntime("""
+      return evaluateSessionWork("""
         await new Promise(resolve => setTimeout(resolve, 4500));
         return "completed";
-      """.trimIndent(), ByteArray(0), releaseWorkerWhilePending = true,
+      """.trimIndent(), ByteArray(0), onDispatched = { entered.countDown() })
+    }
+    /** A slow favorite walk must not hold the native worker needed for document status. */
+    internal fun pendingFavoriteSyncEvaluationForTesting(entered: CountDownLatch): CompletableFuture<String> {
+      check(applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+      return evaluateFavoriteWork("""
+        await new Promise(resolve => setTimeout(resolve, 4500));
+        return "completed";
+      """.trimIndent(), "{}".toByteArray(Charsets.UTF_8),
         onDispatched = { entered.countDown() })
     }
+
 
 
     fun command(input: JSONObject): CompletableFuture<JSONObject> {
@@ -175,13 +202,17 @@ class DocumentRuntimeService : Service() {
         val reply = JSONObject(value)
         val timing = reply.optJSONObject("__documentTimings")
         reply.remove("__documentTimings") // Never expose diagnostic metadata through the document-command API.
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 && timing != null) {
+        if (timing != null) {
           val startupMs = timing.optLong("initializationMs")
           val commandMs = timing.optLong("commandMs")
-          if (startupMs >= 1_000 || commandMs >= 1_000) {
-            val operation = input.optString("operation").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other"
+          val operation = input.optString("operation").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other"
+          if ((startupMs >= 1_000 || commandMs >= 1_000) &&
+              applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
             Log.w("SyncpeerRuntime", "document.runtime.stage_slow operation=$operation initializationMs=$startupMs commandMs=$commandMs")
-          }
+          if (startupMs >= 1_500 || commandMs >= 1_500)
+            DiagnosticLogJournal.recordNative(applicationContext, "native.document.operation_slow",
+              "warning", JSONObject().put("operation", operation)
+                .put("initializationMs", startupMs).put("commandMs", commandMs))
         }
         val phase = reply.optJSONObject("result")?.optJSONObject("vault")
           ?.optString("phase")?.takeIf { it.isNotBlank() }
@@ -199,9 +230,27 @@ class DocumentRuntimeService : Service() {
     }
 
     fun sessionCommand(input: JSONObject): CompletableFuture<JSONObject> {
+      if (input.optString("operation") == "uiHidden") {
+        val result = CompletableFuture<JSONObject>()
+        mainHandler.post {
+          uiIsVisible = false
+          if (!backgroundSyncArmed) stopFavoriteSyncSchedule()
+          // Explicitly requested transfers remain service-owned even when
+          // automatic background favorite synchronization is disabled.
+          if (runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)) {
+            ensureForeground()
+            replayTransferJobs()
+          }
+          result.complete(JSONObject().put("result", JSONObject().put("visible", false)))
+        }
+        return result
+      }
       if (input.optString("operation") == "uiVisible") {
         val result = CompletableFuture<JSONObject>()
         mainHandler.post {
+          uiIsVisible = true
+          replayTransferJobs()
+          if (sessionPhase == "connected") startFavoriteSyncSchedule()
           if (foregroundStarted) {
             foregroundStarted = false
             ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -213,6 +262,67 @@ class DocumentRuntimeService : Service() {
         return result
       }
       val operation = input.optString("operation")
+      if (operation == "transferStageBegin") {
+        val stageId = transferStages.begin(input.getLong("sizeBytes"), input.getLong("modifiedMs"))
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject().put("stageId", stageId)))
+      }
+      if (operation == "transferStageWrite") {
+        val offset = transferStages.append(input.getString("stageId"),
+          input.getLong("offset"), input.getString("bytes"))
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject().put("offset", offset)))
+      }
+      if (operation == "transferStageCancel") {
+        val id = input.getString("stageId")
+        check(!transferJobs.referencedStages().contains(id)) { "An active transfer owns this stage." }
+        transferStages.discard(id)
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject().put("cancelled", true)))
+      }
+      if (operation == "transferStageFinish") {
+        val id = input.getString("stageId")
+        val stage = transferStages.finish(id)
+        val job = try {
+          transferJobs.enqueue("upload", input.getString("folderId"), input.getString("path"),
+            input.getString("peerId"), stage)
+        } catch (error: Exception) {
+          transferStages.discard(id)
+          throw error
+        }
+        if (job.optString("stageId") != id) transferStages.discard(id)
+        ensureForeground()
+        replayTransferJobs()
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject()
+          .put("id", job.getString("id")).put("phase", job.optString("phase"))))
+      }
+      if (operation == "transferJobStart") {
+        val job = transferJobs.enqueue(input.optString("direction"),
+          input.optString("folderId"), input.optString("path"), input.optString("peerId"))
+        ensureForeground()
+        replayTransferJobs()
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject()
+          .put("id", job.getString("id")).put("phase", job.optString("phase"))))
+      }
+      if (operation == "transferJobStatus") {
+        val job = transferJobs.list().firstOrNull { it.optString("id") == input.optString("id") }
+          ?: throw IllegalArgumentException("Transfer job not found.")
+        return CompletableFuture.completedFuture(JSONObject().put("result", job))
+      }
+      if (operation == "transferJobList") {
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject()
+          .put("jobs", org.json.JSONArray(transferJobs.list()))))
+      }
+      if (operation == "transferJobCancel") {
+        val id = input.optString("id")
+        val existing = transferJobs.list().find { it.optString("id") == id }
+        transferJobs.cancel(id)
+        existing?.optString("stageId")?.takeIf { it.isNotBlank() }?.let { transferStages.discard(it) }
+        val command = JSONObject().put("protocolVersion", SESSION_PROTOCOL_VERSION)
+          .put("operation", "transferJobCancel").put("id", id)
+        evaluateSessionWork("""
+          if (globalThis.syncpeerSession) await globalThis.syncpeerSession.command(input);
+          return JSON.stringify({result: {cancelled: true}});
+        """.trimIndent(), command.toString().toByteArray(Charsets.UTF_8), operationName = "TransferCancel")
+        return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject().put("cancelled", true)))
+      }
       if (operation == "disarmBackground") {
         // Clearing opt-in must never tear down the visible WebView's shared
         // connection. Invalidate queued background starts and forget persistence.
@@ -223,13 +333,20 @@ class DocumentRuntimeService : Service() {
               nextSessionGeneration()
               sessionRequest = null
               backgroundSessions.clear()
-              stopFavoriteSyncSchedule()
+              backgroundSyncArmed = false
+              if (uiIsVisible && sessionPhase == "connected") startFavoriteSyncSchedule()
+              else stopFavoriteSyncSchedule()
               runOnMain {
-                if (foregroundStarted) {
+                // Background favorite opt-out does not revoke an explicitly
+                // started manual transfer. Keep its foreground service until
+                // the persistent job journal reports no remaining work.
+                val manualTransferActive = runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)
+                if (foregroundStarted && !manualTransferActive) {
                   foregroundStarted = false
                   ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                   SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
                 }
+                if (manualTransferActive && !uiIsVisible) ensureForeground()
                 publishSessionStatus()
                 result.complete(JSONObject().put("result", JSONObject().put("disarmed", true)))
               }
@@ -242,6 +359,7 @@ class DocumentRuntimeService : Service() {
         }
         return result
       }
+      if (operation == "connect") uiIsVisible = true
       if (operation == "disconnect") {
         val prior = synchronized(uiConnectLock) {
           val pending = uiConnectPending
@@ -275,8 +393,10 @@ class DocumentRuntimeService : Service() {
       """.trimIndent()
       val rawInput = input.toString()
       if (operation != "connect") {
-        return evaluateRuntime(code, rawInput.toByteArray(Charsets.UTF_8),
-          diagnosticOperation = "sessionCommand").thenApply(::JSONObject)
+        // A BEP metadata/read/write request may wait on the peer for many seconds.
+        // Never hold the document worker while the JS isolate awaits its result.
+        return evaluateSessionWork(code, rawInput.toByteArray(Charsets.UTF_8),
+          operationName = operation).thenApply(::JSONObject)
       }
       // Concurrent WebView retries must share one in-flight native command.
       // Superseded completions may not overwrite a newer peer's phase.
@@ -284,6 +404,22 @@ class DocumentRuntimeService : Service() {
         val prior = uiConnectPending
         if (uiConnectRequest == rawInput && prior != null && !prior.isDone) {
           return@synchronized prior
+        }
+        if (uiConnectRequest == rawInput && prior == null) {
+          val expected = uiConnectExpectedPeer
+          if (sessionPhase == "connected" && sessionStarted && peerPhase == "connected" &&
+            expected != null && expected == verifiedTransferPeerId) {
+            // Rebinding the WebView to an already TLS-authenticated service
+            // socket must not tear it down and start another global discovery.
+            return@synchronized CompletableFuture.completedFuture(JSONObject()
+              .put("result", JSONObject().put("phase", "connected")))
+          }
+          if (sessionPhase != "error" && peerPhase in setOf("starting", "waiting", "reconnecting")) {
+            // The original native lifecycle continues its own retries. A
+            // second UI subscriber must observe it, never replace its dial.
+            return@synchronized CompletableFuture.completedFuture(JSONObject()
+              .put("result", JSONObject().put("phase", "reconnecting")))
+          }
         }
         uiConnectGeneration += 1
         val generation = uiConnectGeneration
@@ -310,6 +446,10 @@ class DocumentRuntimeService : Service() {
                     sessionPhase = phase
                   }
                   sessionError = null
+                  if (sessionPhase == "connected") {
+                    startFavoriteSyncSchedule()
+                    replayTransferJobs()
+                  }
                   publishSessionStatus()
                 }
               }
@@ -375,9 +515,18 @@ class DocumentRuntimeService : Service() {
     // Only operation names are logged, never paths, names, keys or payloads.
     val safeOperation = diagnosticOperation?.takeIf { it.matches(Regex("[A-Za-z]{1,48}")) }
     fun reportLatency(phase: String, durationMs: Long) {
-      if (safeOperation == null || durationMs < 2000 ||
-        applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
-      Log.w("SyncpeerRuntime", "document.runtime.$phase operation=$safeOperation durationMs=$durationMs")
+      if (safeOperation == null || durationMs < 2000) return
+      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+        Log.w("SyncpeerRuntime", "document.runtime.$phase operation=$safeOperation durationMs=$durationMs")
+      if (durationMs < 4000) return
+      val key = "$phase.$safeOperation"
+      val now = SystemClock.elapsedRealtime()
+      val previous = slowLoggedAtMs.put(key, now) ?: 0L
+      if (now - previous >= 30_000L || previous == 0L) {
+        // Never persist raw request contents, endpoints, paths or credentials.
+        DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.slow.$key",
+          "warning", JSONObject().put("durationMs", durationMs))
+      }
     }
     val task = Runnable {
       var handedOff = false
@@ -463,6 +612,18 @@ class DocumentRuntimeService : Service() {
 
   @Synchronized
   private fun publishSessionStatus() {
+    if (lastDiagnosticSessionPhase != sessionPhase) {
+      lastDiagnosticSessionPhase = sessionPhase
+      DiagnosticLogJournal.recordNative(applicationContext,
+        "native.session.phase." + sessionPhase.replace(Regex("[^A-Za-z0-9_-]"), "_"))
+    }
+    if (lastDiagnosticPeerPhase != peerPhase) {
+      lastDiagnosticPeerPhase = peerPhase
+      peerPhase?.let { phase ->
+        DiagnosticLogJournal.recordNative(applicationContext,
+          "native.peer.phase." + phase.replace(Regex("[^A-Za-z0-9_-]"), "_"))
+      }
+    }
     statusRevision += 1
     SessionStatusBus.publish(SessionStatusSnapshot(
       revision = statusRevision,
@@ -473,6 +634,7 @@ class DocumentRuntimeService : Service() {
       peerPhase = peerPhase,
       peerError = peerError,
       updatedAtMs = System.currentTimeMillis(),
+      sync = favoriteSyncTelemetry,
     ))
   }
 
@@ -607,11 +769,15 @@ class DocumentRuntimeService : Service() {
         ?: throw IllegalArgumentException("Background session requires a valid connect request.")
       // A previously active service may have been demoted while the UI was visible.
       // Promote the same service on the next background transition without re-dialing.
+      backgroundSyncArmed = true
+      uiIsVisible = false
       ensureForeground()
       if (sessionRequest == request && sessionPhase in listOf("starting", "connected")) {
         // Re-promoting a still-connected service must replace the "preparing"
         // notification instead of leaving it stale for the whole session.
         if (sessionPhase == "connected") {
+          startFavoriteSyncSchedule()
+          replayTransferJobs()
           SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization",
             "Peer session connected; selected sync is ready.")
         }
@@ -727,33 +893,189 @@ class DocumentRuntimeService : Service() {
         publishSessionStatus()
         SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", "Peer session connected; selected sync is ready.")
         result.complete(reply)
-        startFavoriteSyncSchedule()
-        requestFavoriteSync()
+        replayTransferJobs()
+        if (FavoriteSyncOwnership.maySchedule(sessionPhase == "connected", uiIsVisible, backgroundSyncArmed)) {
+          startFavoriteSyncSchedule()
+          requestFavoriteSync()
+        }
       }
     }
   }
 
+  /** Keep slow session RPCs off the shared document worker. The instrumentation
+   * probe and production commands use the identical dispatch path. */
+  private fun evaluateSessionWork(
+    code: String,
+    input: ByteArray,
+    onDispatched: () -> Unit = {},
+    operationName: String = "Command",
+  ): CompletableFuture<String> {
+    val safeName = operationName.takeIf { it.matches(Regex("[A-Za-z]{1,40}")) } ?: "Command"
+    return evaluateRuntime(code, input,
+      releaseWorkerWhilePending = true, onDispatched = onDispatched,
+      diagnosticOperation = "session${safeName}")
+  }
+
+  /** Replays pending intents after reconnect, process recovery or backoff.
+   * A live upload may finish while hidden, but new transfers respect opt-out. */
+  private fun replayTransferJobs() {
+    mainHandler.removeCallbacks(transferRetryRunnable)
+    if (sessionPhase != "connected" || destroying ||
+      (!uiIsVisible && !backgroundSyncArmed && !foregroundStarted)) return
+    if (!transferStagesPruned) {
+      runCatching {
+        transferStages.pruneOrphans(transferJobs.referencedStages())
+        transferStagesPruned = true
+      }
+    }
+    val pending = runCatching { transferJobs.pending() }.getOrElse { return }
+    val now = System.currentTimeMillis()
+    val next = pending.mapNotNull { job ->
+      job.optLong("nextAttemptMs").takeIf { it > now }
+    }.minOrNull()
+    if (next != null) mainHandler.postDelayed(transferRetryRunnable,
+      (next - now).coerceIn(1L, 24 * 60 * 60 * 1000L))
+    for (job in pending) {
+      if (job.optLong("nextAttemptMs") > now) continue
+      val id = job.optString("id")
+      if (job.optString("peerId").isBlank()) {
+        transferJobs.progress(id, "failed", 0, 0, "other", job.optInt("attempts"))
+        continue
+      }
+      // A different authenticated peer can advertise the same folder ID.
+      // Leave this job pending until its original peer reconnects.
+      if (verifiedTransferPeerId != null && verifiedTransferPeerId != job.optString("peerId")) continue
+      if (!transferJobDispatches.add(id)) continue
+      val request = JSONObject(job.toString()).put("protocolVersion", SESSION_PROTOCOL_VERSION)
+        .put("operation", "transferJobStart")
+      val code = """
+        if (!globalThis.syncpeerDocuments)
+          globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
+        if (!globalThis.syncpeerSession)
+          globalThis.syncpeerSession = await globalThis.syncpeerDocumentsCore.startSession(android, globalThis.syncpeerDocuments);
+        const result = await globalThis.syncpeerSession.command(input);
+        return JSON.stringify({result});
+      """.trimIndent()
+      evaluateSessionWork(code, request.toString().toByteArray(Charsets.UTF_8),
+        operationName = "TransferJob").whenComplete { _, error ->
+        transferJobDispatches.remove(id)
+        if (error != null && applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+          Log.w("SyncpeerRuntime", "transfer.job.dispatch.failed")
+        }
+      }
+    }
+  }
+
+
+  /** Favorite synchronization can wait on a remote peer for minutes. It must never
+   * monopolize the same single worker used by DocumentsProvider and status RPCs.
+   * The existing favoriteSyncPending guard still serializes full sync runs. */
+  private fun evaluateFavoriteWork(
+    code: String,
+    input: ByteArray,
+    onDispatched: () -> Unit = {},
+  ): CompletableFuture<String> = evaluateRuntime(code, input,
+    releaseWorkerWhilePending = true, onDispatched = onDispatched,
+    diagnosticOperation = "favoriteSync")
+
+  /** Only counts and fixed stage labels enter the UI diagnostic stream. */
+  @Synchronized private fun updateFavoriteSyncProgress(request: JSONObject) {
+    val current = favoriteSyncTelemetry ?: return
+    if (!favoriteSyncPending.get() || sessionPhase != "connected" ||
+      request.optLong("runId", -1) != current.runId) return
+    val sequence = request.optInt("sequence", 0)
+    if (sequence <= favoriteSyncProgressSequence) return
+    val stage = request.optString("stage")
+    if (stage !in setOf("index", "storage", "listing", "planning", "processing",
+        "download", "upload", "delete", "folder_done", "complete")) return
+    fun bounded(name: String) = request.optInt(name, 0).coerceIn(0, 1_000_000)
+    favoriteSyncProgressSequence = sequence
+    val now = SystemClock.elapsedRealtime()
+    favoriteSyncLastProgressAtMs = now
+    favoriteSyncTelemetry = current.copy(stage = stage,
+      folderOrdinal = bounded("folderOrdinal"), folderCount = bounded("folderCount"),
+      itemOrdinal = bounded("itemOrdinal"), itemCount = bounded("itemCount"),
+      elapsedMs = now - favoriteSyncStartedAtMs, stalled = false, idleMs = 0,
+      transferredBytes = request.optLong("transferredBytes", 0).coerceIn(0L, 9_007_199_254_740_991L),
+      totalBytes = request.optLong("totalBytes", 0).coerceIn(0L, 9_007_199_254_740_991L))
+    // Keep exported logs useful even for thousands of tiny files.
+    if (now - favoriteSyncLastPublishedAtMs >= 2_000L ||
+        (stage == "index" && current.stage == "starting")) {
+      favoriteSyncLastPublishedAtMs = now
+      publishSessionStatus()
+    }
+  }
+
+  private fun startFavoriteSyncWatchdog(runId: Long) {
+    favoriteSyncWatchdog?.let { mainHandler.removeCallbacks(it) }
+    val watchdog = object : Runnable {
+      override fun run() {
+        val current = favoriteSyncTelemetry ?: return
+        if (current.runId != runId || !favoriteSyncPending.get() || sessionPhase != "connected") return
+        val now = SystemClock.elapsedRealtime()
+        val idleMs = now - favoriteSyncLastProgressAtMs
+        if (idleMs >= 20_000L) {
+          favoriteSyncTelemetry = current.copy(stalled = true,
+            elapsedMs = now - favoriteSyncStartedAtMs, idleMs = idleMs)
+          publishSessionStatus()
+          if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+            Log.w("SyncpeerRuntime", "favorite.sync.slow stage=${current.stage} idleMs=$idleMs")
+        }
+        mainHandler.postDelayed(this, 20_000L)
+      }
+    }
+    favoriteSyncWatchdog = watchdog
+    mainHandler.postDelayed(watchdog, 20_000L)
+  }
+
   private fun requestFavoriteSync() {
-    if (sessionPhase != "connected" || !favoriteSyncPending.compareAndSet(false, true)) return
-    evaluateRuntime("""
+    if (!FavoriteSyncOwnership.maySchedule(sessionPhase == "connected", uiIsVisible, backgroundSyncArmed) ||
+      !favoriteSyncPending.compareAndSet(false, true)) return
+    val runId = ++favoriteSyncRunId
+    favoriteSyncStartedAtMs = SystemClock.elapsedRealtime()
+    favoriteSyncLastProgressAtMs = favoriteSyncStartedAtMs
+    favoriteSyncProgressSequence = 0
+    favoriteSyncLastPublishedAtMs = favoriteSyncStartedAtMs
+    favoriteSyncTelemetry = FavoriteSyncSnapshot(runId, "starting")
+    publishSessionStatus()
+    startFavoriteSyncWatchdog(runId)
+    evaluateFavoriteWork("""
       const value = await globalThis.syncpeerSession.command({
-        protocolVersion: ${SESSION_PROTOCOL_VERSION}, operation: "syncFavorites",
+        protocolVersion: ${SESSION_PROTOCOL_VERSION}, operation: "syncFavorites", runId: $runId,
       });
       return JSON.stringify({result: value});
     """.trimIndent(), "{}".toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
+      if (runId != favoriteSyncRunId) return@whenComplete
+      replayTransferJobs()
       favoriteSyncPending.set(false)
-      val failures = if (error == null) runCatching {
-        JSONObject(value).getJSONObject("result").getJSONArray("results")
-          .let { results -> (0 until results.length()).count { index ->
-            results.getJSONObject(index).getString("result") in listOf("conflict", "error", "unavailable")
-          } }
-      }.getOrDefault(1) else 1
-      if (failures > 0) SyncpeerSessionNotifications.update(this,
+      favoriteSyncWatchdog?.let { mainHandler.removeCallbacks(it) }
+      favoriteSyncWatchdog = null
+      val results = if (error == null) runCatching {
+        JSONObject(value).optJSONObject("result")?.optJSONArray("results")
+      }.getOrNull() else null
+      val problems = if (results == null) 1 else (0 until results.length()).count { index ->
+        results.optJSONObject(index)?.optString("result") in listOf("conflict", "error", "unavailable")
+      }
+      val waiting = if (results == null) 0 else (0 until results.length()).count { index ->
+        results.optJSONObject(index)?.optString("result") == "waiting"
+      }
+      favoriteSyncTelemetry = (favoriteSyncTelemetry ?: FavoriteSyncSnapshot(runId, "starting")).copy(
+        stage = if (results == null) "failed" else "completed",
+        resultCount = results?.length() ?: 0, problemCount = problems, waitingCount = waiting,
+        elapsedMs = SystemClock.elapsedRealtime() - favoriteSyncStartedAtMs,
+        stalled = false, idleMs = 0)
+      publishSessionStatus()
+      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        val data = favoriteSyncTelemetry!!
+        Log.w("SyncpeerRuntime", "favorite.sync.result stage=${data.stage} total=${data.resultCount} problems=$problems waiting=$waiting durationMs=${data.elapsedMs}")
+      }
+      if (problems > 0) SyncpeerSessionNotifications.update(this,
         "Syncpeer background synchronization", "Selected files need attention in Syncpeer.")
     }
   }
 
   private fun startFavoriteSyncSchedule() {
+    if (!FavoriteSyncOwnership.maySchedule(sessionPhase == "connected", uiIsVisible, backgroundSyncArmed)) return
     mainHandler.removeCallbacks(favoriteSyncRunnable)
     mainHandler.post(favoriteSyncRunnable)
   }
@@ -764,6 +1086,8 @@ class DocumentRuntimeService : Service() {
 
   private fun stopSession(persist: Boolean): CompletableFuture<JSONObject> {
     val generation = nextSessionGeneration()
+    verifiedTransferPeerId = null
+    backgroundSyncArmed = false
     stopFavoriteSyncSchedule()
     sessionRequest = null
     // Keep the last confirmed activity state until transport teardown completes.
@@ -882,6 +1206,7 @@ class DocumentRuntimeService : Service() {
 
   override fun onCreate() {
     super.onCreate()
+    DiagnosticLogJournal.installCrashHandler(applicationContext)
     registerBackgroundSignals()
     worker.execute {
       try {
@@ -889,6 +1214,7 @@ class DocumentRuntimeService : Service() {
         terminalStatus = if (status.phase == "locked") null else status
         initialized.complete(status)
       } catch (error: Exception) {
+        DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.initialize_failed", "error")
         closeRuntimeHost()
         initialized.complete(recordRecoveryFailure(error))
       }
@@ -896,14 +1222,39 @@ class DocumentRuntimeService : Service() {
   }
 
   private fun initialize(): DocumentRuntimeStatus {
+    val startedAtMs = SystemClock.elapsedRealtime()
+    var lastStageAtMs = startedAtMs
+    fun stage(name: String) {
+      val now = SystemClock.elapsedRealtime()
+      val durationMs = now - lastStageAtMs
+      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+        Log.w("SyncpeerRuntime", "document.runtime.initialize.$name elapsedMs=${now - startedAtMs}")
+      // Every stage entry is a breadcrumb: if the engine never returns,
+      // the final recorded stage still identifies where startup got stuck.
+      DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.initialize.stage",
+        if (durationMs >= 500) "warning" else "info",
+        JSONObject().put("stage", name).put("durationMs", durationMs)
+          .put("elapsedMs", now - startedAtMs))
+      lastStageAtMs = now
+    }
+    stage("storage_start")
     storage = DocumentRuntimeStorage(applicationContext)
+    stage("storage_ready")
     network = SessionNetworkTransport()
     val generation = synchronized(this) { runtimeGeneration += 1; runtimeGeneration }
     val terminated = {
-      if (!destroying && synchronized(this) { generation == runtimeGeneration }) startRecovery()
+      if (!destroying && synchronized(this) { generation == runtimeGeneration }) {
+        // A JavaScriptSandbox isolate/renderer may terminate without any
+        // uncaught Java exception or app-process exit notification.
+        DiagnosticLogJournal.recordNative(applicationContext,
+          "native.runtime.host_terminated", "error",
+          JSONObject().put("generation", generation))
+        startRecovery()
+      }
       Unit
     }
     val code = assets.open("syncpeer-documents.js").bufferedReader().use { it.readText() }
+    stage("assets_ready")
     val requiredFeatures = listOf(
       JavaScriptSandbox.JS_FEATURE_PROMISE_RETURN,
       JavaScriptSandbox.JS_FEATURE_MESSAGE_PORTS,
@@ -911,9 +1262,12 @@ class DocumentRuntimeService : Service() {
       JavaScriptSandbox.JS_FEATURE_ISOLATE_TERMINATION,
       JavaScriptSandbox.JS_FEATURE_ISOLATE_MAX_HEAP_SIZE,
     )
+    stage("engine_select")
     runtimeHost = if (forceWebViewForTesting || !JavaScriptSandbox.isSupported()) {
+      stage("webview_start")
       createWebViewHost(terminated)
     } else {
+      stage("sandbox_start")
       val opening = JavaScriptSandbox.createConnectedInstanceAsync(applicationContext)
       val sandbox = try {
         opening.get(15, TimeUnit.SECONDS)
@@ -935,6 +1289,7 @@ class DocumentRuntimeService : Service() {
         }
       }
     }
+    stage("engine_ready")
     documentsStarted = true
     return DocumentRuntimeStatus("locked", "Document access is not configured.")
   }
@@ -954,7 +1309,7 @@ class DocumentRuntimeService : Service() {
 
   private fun executeStorageRequest(raw: String): String {
     val request = JSONObject(raw)
-    val reply = JSONObject().put("id", request.getLong("id"))
+    val reply = JSONObject().put("id", request.getLong("__portId"))
     try { reply.put("result", checkNotNull(storage).execute(request) ?: JSONObject.NULL) }
     catch (error: Exception) {
       if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
@@ -969,7 +1324,7 @@ class DocumentRuntimeService : Service() {
 
   private fun executeNetworkRequest(raw: String): String {
     val request = JSONObject(raw)
-    val reply = JSONObject().put("id", request.getLong("id"))
+    val reply = JSONObject().put("id", request.getLong("__portId"))
     if (request.optString("operation") == "sessionPeerStatus") {
       val phase = request.optString("phase")
       val allowed = setOf("idle", "connecting", "starting", "connected", "waiting",
@@ -979,11 +1334,24 @@ class DocumentRuntimeService : Service() {
       }
       peerPhase = if (phase == "connecting") "starting" else phase
       peerError = request.optString("error").ifBlank { null }
+      if (phase in setOf("waiting", "reconnecting", "suspended", "stopping", "error") &&
+        sessionStarted) {
+        // A transport closure invalidates the socket even if an earlier UI
+        // connect RPC completed successfully. Otherwise active=true would
+        // allow the WebView to adopt a session that no longer exists.
+        sessionStarted = false
+        sessionPhase = phase
+      }
+      if (phase != "connected") verifiedTransferPeerId = null
       if (phase == "connected") {
         // This event comes from the lifecycle-owned, TLS-authenticated socket.
         // Require its peer identity to match the requested UI peer before
         // promoting an earlier pending connect to native connected status.
         val verifiedPeer = request.optString("remoteDeviceId").replace("-", "").uppercase()
+        if (verifiedPeer.matches(Regex("[A-Z2-7]{52}|[A-Z2-7]{56}"))) {
+          verifiedTransferPeerId = verifiedPeer
+          replayTransferJobs()
+        }
         synchronized(uiConnectLock) {
           if (uiConnectRequest != null && verifiedPeer.isNotBlank() &&
             (uiConnectExpectedPeer == null || verifiedPeer == uiConnectExpectedPeer) &&
@@ -1004,14 +1372,94 @@ class DocumentRuntimeService : Service() {
       IncomingPeerBus.publish(id)
       return reply.put("result", JSONObject.NULL).toString()
     }
+    if (request.optString("operation") == "transferJobProgress") {
+      val id = request.optString("id")
+      if (!id.matches(Regex("[a-f0-9-]{8,64}", RegexOption.IGNORE_CASE))) {
+        return reply.put("error", "Invalid transfer job identity.").toString()
+      }
+      val updated = transferJobs.progress(id, request.optString("phase"),
+        request.optLong("transferredBytes", -1), request.optLong("totalBytes", -1),
+        request.optString("reason").ifBlank { null }, request.optInt("attempt", 0))
+      if (updated != null) {
+        if (updated.optString("phase") in setOf("completed", "failed", "cancelled")) {
+          updated.optString("stageId").takeIf { it.isNotBlank() }?.let { transferStages.discard(it) }
+        }
+        if (updated.optString("phase") in setOf("completed", "failed", "cancelled") &&
+          !uiIsVisible && !backgroundSyncArmed &&
+          runCatching { transferJobs.pending().isEmpty() }.getOrDefault(false)) {
+          mainHandler.post {
+            if (foregroundStarted && !uiIsVisible && !backgroundSyncArmed &&
+              runCatching { transferJobs.pending().isEmpty() }.getOrDefault(false)) {
+              foregroundStarted = false
+              ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+              SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
+              publishSessionStatus()
+            }
+          }
+        }
+        if (updated.optString("phase") == "queued") replayTransferJobs()
+      }
+      return reply.put("result", updated ?: JSONObject.NULL).toString()
+    }
+    if (request.optString("operation") == "favoriteSyncProgress") {
+      updateFavoriteSyncProgress(request)
+      return reply.put("result", JSONObject.NULL).toString()
+    }
     if (request.optString("operation") == "diagnostic") {
-      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-        Log.w("SyncpeerRuntime", "${request.optString("event")}: ${request.optString("message")}")
+      val event = request.optString("event")
+      // Only core-owned event names can reach crash-persistent diagnostics.
+      // Never store untrusted endpoint strings, remote identifiers or error text.
+      val allowed = event.matches(Regex("core\\.session\\.connect\\.[a-z_]{2,40}")) ||
+        event in setOf("core.discovery.global_failed", "core.discovery.retry",
+          "core.discovery.full_response", "core.discovery.candidate.failed",
+          "core.discovery.connect_strategy", "core.upload.request.failed",
+          "core.replica.receive.failed")
+      if (allowed) {
+        val details = JSONObject()
+          .put("category", request.optString("category").takeIf {
+            it in setOf("authorization", "timeout", "unreachable", "relay", "disconnected", "other", "none")
+          } ?: "other")
+          .put("directCount", request.optInt("directCount").coerceIn(0, 1000))
+          .put("relayCount", request.optInt("relayCount").coerceIn(0, 1000))
+        DiagnosticLogJournal.recordNative(applicationContext, event,
+          if (event.endsWith("failed")) "warning" else "info", details)
       }
       return reply.put("result", JSONObject.NULL).toString()
     }
+    if (request.optString("operation") == "transferStageRead") {
+      try {
+        val bytes = transferStages.read(request.getString("stageId"), request.getLong("sizeBytes"),
+          request.getLong("offset"), request.getInt("length"))
+        return reply.put("result", JSONObject().put("bytes", bytes)).toString()
+      } catch (_: Exception) {
+        return reply.put("error", "Encrypted upload staging is unavailable.").toString()
+      }
+    }
+    val networkOperation = request.optString("operation")
+    val networkStartedAtMs = SystemClock.elapsedRealtime()
+    val monitored = networkOperation in setOf("tlsOpen", "quicOpen",
+      "relayOpen", "discoveryFetch", "discoverLocal", "tlsListen", "relayListen")
+    val pendingWarning = Runnable {
+      DiagnosticLogJournal.recordNative(applicationContext, "native.network.operation_pending",
+        "warning", JSONObject().put("operation", networkOperation)
+          .put("elapsedMs", SystemClock.elapsedRealtime() - networkStartedAtMs))
+    }
+    if (monitored) mainHandler.postDelayed(pendingWarning, 5000)
+    var failed = false
     try { reply.put("result", checkNotNull(network).execute(request) ?: JSONObject.NULL) }
-    catch (error: Exception) { reply.put("error", error.message ?: "Network operation failed.") }
+    catch (error: Exception) {
+      failed = true
+      reply.put("error", error.message ?: "Network operation failed.")
+    } finally {
+      if (monitored) mainHandler.removeCallbacks(pendingWarning)
+      val durationMs = SystemClock.elapsedRealtime() - networkStartedAtMs
+      if (durationMs >= 2000 && networkOperation in setOf("tlsOpen", "quicOpen",
+          "relayOpen", "discoveryFetch", "discoverLocal", "tlsListen", "relayListen")) {
+        DiagnosticLogJournal.recordNative(applicationContext, "native.network.operation_slow",
+          "warning", JSONObject().put("operation", networkOperation)
+            .put("durationMs", durationMs).put("failed", failed))
+      }
+    }
     return reply.toString()
   }
 
@@ -1041,6 +1489,10 @@ class DocumentRuntimeService : Service() {
   @Synchronized private fun recordRecoveryFailure(error: Exception): DocumentRuntimeStatus {
     recoveryFailureCount += 1
     val decision = documentRuntimeRecoveryDecision(recoveryFailureCount, error)
+    DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.recovery_failed",
+      "error", JSONObject().put("attempt", recoveryFailureCount)
+        .put("failureType", decision.failureType.toString())
+        .put("retryScheduled", decision.retryDelayMs != null && !destroying))
     val privateStorageFailure = privateStorageFailureMessage(error)
     val status = if (privateStorageFailure != null) {
       DocumentRuntimeStatus(
@@ -1091,6 +1543,8 @@ class DocumentRuntimeService : Service() {
       return CompletableFuture.completedFuture(checkNotNull(terminalStatus))
     }
     val task = CompletableFuture<DocumentRuntimeStatus>()
+    DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.recovery_started",
+      "warning", JSONObject().put("attempt", recoveryFailureCount + 1))
     recovery = task
     recoveryWillRetry = true
     terminalStatus = DocumentRuntimeStatus("error", "Document runtime is restarting.")

@@ -5,6 +5,7 @@
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
   import { formatSyncthingDeviceId } from "../app/devicePolicies.ts";
+  import { savedPeerUiState } from "../app/connectionNotices.ts";
 
 export interface SavedDeviceRow {
     kind: "saved";
@@ -19,6 +20,7 @@ export interface SavedDeviceRow {
     isIntroducer: boolean;
     awaitingApproval: boolean;
     metaLines: string[];
+    detailLines: string[];
   }
 
   export interface AdvertisedDeviceRow {
@@ -28,6 +30,7 @@ export interface SavedDeviceRow {
     deviceId: string;
     sourceFolderIds: string[];
     metaLines: string[];
+    detailLines: string[];
   }
 
   export interface LocalCandidateRow {
@@ -36,6 +39,7 @@ export interface SavedDeviceRow {
     name: string;
     deviceId: string;
     metaLines: string[];
+    detailLines: string[];
   }
 
   export interface LanDiscoveredRow {
@@ -45,6 +49,7 @@ export interface SavedDeviceRow {
     deviceId: string;
     incomingRequest: boolean;
     metaLines: string[];
+    detailLines: string[];
   }
 
   export type DeviceListRow = SavedDeviceRow | AdvertisedDeviceRow | LocalCandidateRow | LanDiscoveredRow;
@@ -66,9 +71,10 @@ export interface SavedDeviceRow {
     onRemoveSavedDevice,
     onAddAdvertisedDevice,
   }: Props = $props();
+  let peerUi = $derived(row.kind === "saved" ? savedPeerUiState(row) : null);
 </script>
 
-<ListRow>
+<ListRow peerLayout>
   <div class="item-title-row">
     <div class="item-name-wrap">
       <div class="item-title">{row.name}</div>
@@ -87,23 +93,17 @@ export interface SavedDeviceRow {
     {#if row.kind === "saved" && row.isIntroducer}
       <StatusChip small>introducer</StatusChip>
     {/if}
-    {#if row.kind === "saved" && row.isConnected}
-      <StatusChip tone="online" small>connected</StatusChip>
-    {:else if row.kind === "saved" && !row.confirmed}
-      <StatusChip small title="Added on this device only. The remote device must also authorize this device.">not yet connected</StatusChip>
-    {:else if row.kind === "saved" && row.isConnecting}
-      <StatusChip small>connecting…</StatusChip>
-    {:else if row.kind === "saved"}
-      <StatusChip small>offline</StatusChip>
+    {#if row.kind === "saved" && peerUi}
+      <StatusChip tone={row.isConnected ? "online" : "offline"} small
+        title={!row.confirmed ? "No successful connection yet. Remote approval may still be required; check the other device." : undefined}>
+        {peerUi.label}
+      </StatusChip>
     {/if}
     {#if row.kind === "saved" && row.isLanDetected}
       <StatusChip small>lan</StatusChip>
     {/if}
     {#if row.kind === "saved" && row.connectError && !row.isConnected}
       <StatusChip tone="offline" small>connection error</StatusChip>
-    {/if}
-    {#if row.kind === "saved" && row.awaitingApproval}
-      <StatusChip tone="offline" small>remote approval may be pending</StatusChip>
     {/if}
     {#if row.kind === "advertised"}
       <StatusChip tone="offline" small>not approved</StatusChip>
@@ -124,16 +124,27 @@ export interface SavedDeviceRow {
   {#if row.kind === "saved" && row.connectError && !row.isConnected}
     <div class="item-meta" role="alert">{row.connectError}</div>
   {/if}
-  <div class="item-meta">{formatSyncthingDeviceId(row.deviceId)}</div>
+  <div class="item-meta peer-id-summary" title={formatSyncthingDeviceId(row.deviceId)}>
+    ID: {row.deviceId.length === 52 ? `${row.deviceId.slice(0, 7)}…${row.deviceId.slice(-7)}` : row.deviceId}
+  </div>
 
   {#each row.metaLines as line, index (index)}
     {#if line}
       <div class="item-meta">{line}</div>
     {/if}
   {/each}
+  <details class="peer-details">
+    <summary>Device ID and connection details</summary>
+    <div class="peer-detail-content">
+      <div class="item-meta peer-id-full">{formatSyncthingDeviceId(row.deviceId)}</div>
+      {#each row.detailLines as line, index (index)}
+        <div class="item-meta">{line}</div>
+      {/each}
+    </div>
+  </details>
 
   <svelte:fragment slot="actions">
-    {#if row.kind === "saved" || row.kind === "candidate"}
+    {#if row.kind === "candidate" || (row.kind === "saved" && peerUi?.canConnect)}
       <button
         class="primary"
         onclick={() => onUseSavedDevice(row.deviceId)}
@@ -183,6 +194,41 @@ export interface SavedDeviceRow {
     align-items: center;
     gap: 0.15rem;
     min-width: 0;
+  }
+
+  .peer-id-summary {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    margin: 0.25rem 0;
+  }
+
+  .peer-details {
+    margin-top: 0.35rem;
+    min-width: 0;
+  }
+
+  .peer-details summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 0.79rem;
+    padding: 0.3rem 0;
+    min-height: 32px;
+  }
+
+  .peer-detail-content {
+    margin-top: 0.3rem;
+    display: grid;
+    gap: 0.3rem;
+    min-width: 0;
+  }
+
+  .peer-detail-content .item-meta {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .peer-id-full {
+    font-family: var(--font-mono);
   }
 
   .name-edit-button {

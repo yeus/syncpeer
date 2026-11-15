@@ -12,6 +12,34 @@ export const shouldRenderFolderRootList = (
   rootFolderCount: number,
 ) => isConnected || rootFolderCount > 0;
 
+/** Keep the last usable rows mounted while background metadata refreshes. */
+export const directoryPlaceholder = ({
+  hasEntries, loading, status, error, filtered, locked,
+}: {
+  hasEntries: boolean;
+  loading: boolean;
+  status: string;
+  error?: string | null;
+  filtered?: boolean;
+  locked?: boolean;
+}): string | null => {
+  if (locked || status === "locked") return "This receive-encrypted folder is locked. Open its folder settings to enter the folder password, then browse or download files.";
+  if (hasEntries) return null;
+  if (loading || status === "loading") return "Loading folder contents...";
+  if (status === "stale") return "Updating folder contents...";
+  if (status === "error") return error || "Could not load folder contents.";
+  return filtered ? "No files match this filter." : "Folder is empty.";
+};
+
+/** An unconfirmed peer may need remote approval, but the local UI cannot verify that. */
+export const savedPeerUiState = ({ connected, connecting, confirmed }: {
+  connected: boolean; connecting: boolean; confirmed: boolean;
+}) => ({
+  label: connected ? "connected" : !confirmed ? "Waiting for approval"
+    : connecting ? "connecting…" : "offline",
+  canConnect: !connecting,
+});
+
 /** Network connectivity does not prove metadata or bytes are synchronized. */
 export const connectedFolderStatus = (
   folders: readonly { locked: boolean; indexReceived: boolean }[],

@@ -30,11 +30,13 @@ test("exposes the complete in-app diagnostics catalog", async () => {
 
   assert.deepEqual(
     catalog.categories.map((category) => category.id),
-    ["core", "pim", "syncthing", "android"],
+    ["device", "core", "pim", "syncthing", "android"],
   );
   assert.deepEqual(
     catalog.tests.map((item) => item.id),
     [
+      "device.health_snapshot",
+      "device.journal_readability",
       "core.folder_diagnostics",
       "pim.canonical_paths",
       "pim.vcf_roundtrip",
@@ -65,4 +67,44 @@ test("rejects an unknown diagnostics identifier", async () => {
     createFixture().runDiagnosticsTestById("missing"),
     /Unknown diagnostics test: missing/,
   );
+});
+
+test("phone health diagnostics are read-only and report journal availability", async () => {
+  let healthCalls = 0;
+  let journalCalls = 0;
+  const actions = createDiagnosticsActions({
+    state: createInitialState(null),
+    client: {} as SyncpeerBrowserClient,
+    appInfo: createAppBuildInfo({
+      appVersion: "test", coreVersion: "test", buildCommit: "test",
+      buildTimeUtc: "2026-01-01T00:00:00.000Z", buildMode: "development",
+      runtimeEnvironment: "tauri", runtimeSurface: "android-ui",
+      platform: "android", architecture: "arm64", osVersion: "synthetic",
+    }),
+    readDeviceHealth: async () => { healthCalls++; return { batteryPercent: 65, deviceIdle: false }; },
+    readDiagnosticJournal: async () => { journalCalls++; return {
+      writeInitialized: true, runCount: 2, queued: 0,
+    }; },
+  });
+  const result = await actions.runDiagnosticsCategory("device");
+  assert.equal(result.summary.failed, 0);
+  assert.equal(healthCalls, 1);
+  assert.equal(journalCalls, 1);
+});
+
+test("uninitialized phone journal is reported as a diagnostic failure", async () => {
+  const state = createInitialState(null);
+  const actions = createDiagnosticsActions({
+    state, client: {} as SyncpeerBrowserClient,
+    appInfo: createAppBuildInfo({
+      appVersion: "test", coreVersion: "test", buildCommit: "test",
+      buildTimeUtc: "2026-01-01T00:00:00.000Z", buildMode: "development",
+      runtimeEnvironment: "tauri", runtimeSurface: "android-ui",
+      platform: "android", architecture: "arm64", osVersion: "synthetic",
+    }),
+    readDiagnosticJournal: async () => ({ writeInitialized: false, runCount: 0, queued: 5 }),
+  });
+  const result = await actions.runDiagnosticsTestById("device.journal_readability");
+  assert.equal(result.summary.failed, 1);
+  assert.equal(result.summary.allPassed, false);
 });

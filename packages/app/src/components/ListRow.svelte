@@ -1,4 +1,8 @@
-<li class="list-item">
+<script lang="ts">
+  export let peerLayout = false;
+</script>
+
+<li class:peer-layout={peerLayout} class="list-item">
   <div class="item-main">
     <slot />
   </div>
@@ -26,5 +30,20 @@
     justify-content: flex-end;
     flex-wrap: nowrap;
     white-space: nowrap;
+  }
+
+  /* Peer cards have potentially long addresses and IDs. Give the details the
+     full row, with a separate wrapping action row at every viewport width. */
+  .list-item.peer-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.65rem;
+  }
+
+  .peer-layout .item-actions {
+    min-width: 0;
+    justify-content: flex-start;
+    align-self: auto;
+    flex-wrap: wrap;
+    white-space: normal;
   }
 </style>

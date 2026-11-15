@@ -5,6 +5,8 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
 import { createServiceOwnedSession } from "../sync/serviceRemoteFs.js";
 import { parseServiceSessionStatusEvent,
   type ServiceSessionStatusEvent } from "../sync/serviceSessionStatus.js";
+import { parseServiceResponse, withServiceProtocol } from "../sync/serviceProtocol.js";
+import { stageServiceUpload as stageNativeUpload } from "../sync/serviceUploadStaging.js";
 import { startIncomingPeerService } from "../sync/incomingPeerService.js";
 import { preferredPeerDirection } from "../sync/peerSessionManager.js";
 import { createConnectionLifecycle, type ConnectionLifecycle,
@@ -292,6 +294,9 @@ export interface SyncpeerPlatformAdapter {
     ongoing: boolean;
     cancellable: boolean;
   }) => Promise<void>;
+  stageServiceUpload?: (folderId: string, path: string, peerId: string, file: Blob, modifiedMs: number,
+    options?: { signal?: AbortSignal; onProgress?: (bytes: number, total: number) => void }) =>
+    Promise<{ id: string; phase: string }>;
   getCachedStatuses?: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   digestCachedFiles?: (files: readonly { folderId: string; path: string }[]) => Promise<CachedFileDigest[]>;
   listCachedFiles?: () => Promise<CachedFileRecord[]>;
@@ -344,6 +349,20 @@ export interface CreateSyncpeerBrowserClientOptions {
   onIncomingSession?: (event: IncomingSessionEvent) => void;
 }
 
+export type ServiceTransferJobStatus = {
+  id: string;
+  direction: "download" | "upload";
+  folderId: string;
+  path: string;
+  phase: "queued" | "running" | "completed" | "failed" | "cancelled";
+  transferredBytes: number;
+  totalBytes: number;
+  reason?: string;
+  attempts?: number;
+  nextAttemptMs?: number;
+  updatedAtMs: number;
+};
+
 export interface SyncpeerBrowserClient {
   releaseLocalCopy: (folderId: string, mode: "safe" | "dangerous", confirmedText?: string) => Promise<void>;
   acknowledgeCachedSync?: SyncpeerPlatformAdapter["acknowledgeCachedSync"];
@@ -394,6 +413,12 @@ export interface SyncpeerBrowserClient {
   startTransfer?: (label: string) => Promise<void>;
   stopTransfer?: () => Promise<void>;
   updateTransferNotification?: SyncpeerPlatformAdapter["updateTransferNotification"];
+  startServiceTransferJob?: (direction: "download" | "upload", folderId: string, path: string, peerId: string) =>
+    Promise<{ id: string; phase: string }>;
+  stageServiceUpload?: SyncpeerPlatformAdapter["stageServiceUpload"];
+  serviceTransferJobStatus?: (id: string) => Promise<ServiceTransferJobStatus>;
+  listServiceTransferJobs?: () => Promise<ServiceTransferJobStatus[]>;
+  cancelServiceTransferJob?: (id: string) => Promise<void>;
   getCachedStatuses: (folderId: string, paths: string[]) => Promise<CachedFileStatus[]>;
   digestCachedFiles?: (files: readonly { folderId: string; path: string }[]) => Promise<CachedFileDigest[]>;
   listCachedFiles: () => Promise<CachedFileRecord[]>;
@@ -1631,6 +1656,7 @@ function createSessionLifecycle(
   open: (connectOptions: ConnectOptions, signal: AbortSignal) => Promise<SyncpeerSessionHandle>,
 ) {
   const lifecycle = createConnectionLifecycle<ConnectOptions>({
+    serviceOwnsSession: !!ctx.platformAdapter.serviceSessionCommand,
     open,
     keyFor: (connectOptions) => serializeConnectionKey(
       normalizeConnectOptions(connectOptions),
@@ -1729,6 +1755,9 @@ async function setSessionForegroundImpl(
       await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
       return;
     }
+    // Tell the native scheduler independently of the WebView's reconnect state.
+    // Background sync is authorized only if the native handoff is prepared.
+    await ctx.platformAdapter.serviceSessionCommand({ operation: "uiHidden" });
     const options = backgroundSessionOptions(ctx.state.activeResolvedConnectOptions);
     if (options) await ctx.platformAdapter.startBackgroundSession?.(options);
     // Preserve an active transfer across transient Activity visibility changes.
@@ -1878,29 +1907,35 @@ function subscribePeerStatusImpl(
   let active = true;
   let unsubscribe: () => void = () => undefined;
   let previousStatus = "";
+  let previousSyncStatus = "";
   void subscribe(value => {
     if (!active) return;
     const event = parseServiceSessionStatusEvent(value);
     if (!event) return;
     const errorCategory = classifySessionIssue(event.error);
     const peerErrorCategory = classifySessionIssue(event.peerError);
-    const logText = (value?: string) => value ? value.slice(0, 512) : null;
-    const errorText = logText(event.error);
-    const peerErrorText = logText(event.peerError);
+    // Native service errors may contain peer addresses or secret-bearing context.
+    // Only the classified categories are safe to record in diagnostic events.
     const status = [event.phase, event.active, event.foreground,
-      event.peerPhase, errorCategory, peerErrorCategory,
-      errorText ?? "", peerErrorText ?? ""].join(":");
+      event.peerPhase, errorCategory, peerErrorCategory].join(":");
     if (status !== previousStatus) {
       ctx.coreAdapter.log?.("core.android.service.status", {
         phase: event.phase, active: event.active, foreground: event.foreground,
         peerPhase: event.peerPhase ?? null,
         errorCategory, peerErrorCategory, revision: event.revision,
-        // Free-text keys are sanitized on export; they distinguish a recovery
-        // from an authorization failure without exposing identifiers or paths.
-        ...(errorText ? { errorMessage: errorText } : {}),
-        ...(peerErrorText ? { peerMessage: peerErrorText } : {}),
       });
       previousStatus = status;
+    }
+    if (event.sync) {
+      const syncState = [event.sync.runId, event.sync.stage, event.sync.folderOrdinal,
+        event.sync.itemOrdinal, event.sync.stalled, event.sync.resultCount,
+        event.sync.problemCount, event.sync.waitingCount,
+        event.sync.stalled ? Math.floor(event.sync.idleMs / 60000) : 0,
+        Math.floor(event.sync.transferredBytes / (256 * 1024))].join(":");
+      if (syncState !== previousSyncStatus) {
+        ctx.coreAdapter.log?.("core.android.service.sync", event.sync);
+        previousSyncStatus = syncState;
+      }
     }
     listener(event);
   }).then(cleanup => {
@@ -2339,6 +2374,30 @@ function createTransferApi(
     createFileDownloadSink: platformAdapter.createFileDownloadSink
       ? (args: Parameters<NonNullable<SyncpeerPlatformAdapter["createFileDownloadSink"]>>[0]) =>
           platformAdapter.createFileDownloadSink!(args)
+      : undefined,
+    stageServiceUpload: platformAdapter.serviceSessionCommand
+      ? (folderId: string, path: string, peerId: string, file: Blob, modifiedMs: number,
+          options?: { signal?: AbortSignal; onProgress?: (bytes: number, total: number) => void }) =>
+          stageNativeUpload({ command: value => platformAdapter.serviceSessionCommand!(value),
+            folderId, path, peerId, file, modifiedMs, ...options })
+      : undefined,
+    startServiceTransferJob: platformAdapter.serviceSessionCommand
+      ? async (direction: "download" | "upload", folderId: string, path: string, peerId: string) =>
+          parseServiceResponse("transferJobStart", await platformAdapter.serviceSessionCommand!(
+            withServiceProtocol({ operation: "transferJobStart", direction, folderId, path, peerId }))) as { id: string; phase: string }
+      : undefined,
+    serviceTransferJobStatus: platformAdapter.serviceSessionCommand
+      ? async (id: string) => parseServiceResponse("transferJobStatus",
+          await platformAdapter.serviceSessionCommand!(withServiceProtocol({ operation: "transferJobStatus", id }))) as ServiceTransferJobStatus
+      : undefined,
+    listServiceTransferJobs: platformAdapter.serviceSessionCommand
+      ? async () => (parseServiceResponse("transferJobList",
+          await platformAdapter.serviceSessionCommand!(withServiceProtocol({ operation: "transferJobList" }))) as
+            { jobs: ServiceTransferJobStatus[] }).jobs
+      : undefined,
+    cancelServiceTransferJob: platformAdapter.serviceSessionCommand
+      ? async (id: string) => { await platformAdapter.serviceSessionCommand!(
+          withServiceProtocol({ operation: "transferJobCancel", id })); }
       : undefined,
     startTransfer: async (label: string) => {
       await lifecycle.setTransferActive(true);

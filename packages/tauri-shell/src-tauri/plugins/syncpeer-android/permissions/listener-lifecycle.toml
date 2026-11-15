@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-listener-lifecycle"
+description = "Enables Tauri mobile plugin listener cleanup and registration commands."
+commands.allow = ["register_listener", "remove_listener"]

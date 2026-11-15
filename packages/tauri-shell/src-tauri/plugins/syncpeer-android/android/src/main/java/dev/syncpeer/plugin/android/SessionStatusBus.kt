@@ -2,6 +2,34 @@ package dev.syncpeer.plugin.android
 
 import java.util.concurrent.CopyOnWriteArrayList
 
+/** Bounded, identity-free sync progress included with native service snapshots. */
+internal data class FavoriteSyncSnapshot(
+  val runId: Long,
+  val stage: String,
+  val folderOrdinal: Int = 0,
+  val folderCount: Int = 0,
+  val itemOrdinal: Int = 0,
+  val itemCount: Int = 0,
+  val resultCount: Int = 0,
+  val problemCount: Int = 0,
+  val waitingCount: Int = 0,
+  val elapsedMs: Long = 0,
+  val stalled: Boolean = false,
+  val idleMs: Long = 0,
+  val transferredBytes: Long = 0,
+  val totalBytes: Long = 0,
+) {
+  fun toEvent(): Map<String, Any> = mapOf(
+    "runId" to runId, "stage" to stage,
+    "folderOrdinal" to folderOrdinal, "folderCount" to folderCount,
+    "itemOrdinal" to itemOrdinal, "itemCount" to itemCount,
+    "resultCount" to resultCount, "problemCount" to problemCount,
+    "waitingCount" to waitingCount, "elapsedMs" to elapsedMs,
+    "stalled" to stalled, "idleMs" to idleMs,
+    "transferredBytes" to transferredBytes, "totalBytes" to totalBytes,
+  )
+}
+
 /** Immutable peer-session status shared by the service and the visible UI. */
 internal data class SessionStatusSnapshot(
   val revision: Long,
@@ -12,6 +40,7 @@ internal data class SessionStatusSnapshot(
   val peerPhase: String?,
   val peerError: String?,
   val updatedAtMs: Long,
+  val sync: FavoriteSyncSnapshot? = null,
 ) {
   fun toEvent(): Map<String, Any?> = buildMap {
     put("type", "sessionStatus")
@@ -22,6 +51,7 @@ internal data class SessionStatusSnapshot(
     put("updatedAtMs", updatedAtMs)
     error?.let { put("error", it) }
     peerPhase?.let { put("peerPhase", it) }
+    sync?.let { put("sync", it.toEvent()) }
     peerError?.let { put("peerError", it) }
   }
 }

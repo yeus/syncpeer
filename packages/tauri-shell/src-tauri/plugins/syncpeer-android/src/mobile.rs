@@ -30,11 +30,21 @@ impl<R: Runtime> SyncpeerAndroid<R> {
   pub fn session_command(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("sessionCommand", json!({ "request": request.to_string() })).map_err(Into::into)
   }
+  pub fn diagnostic_logs(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
+    self.0.run_mobile_plugin("diagnosticLogs", json!({ "request": request.to_string() })).map_err(Into::into)
+  }
   pub fn release_local_copy(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("releaseLocalCopy", json!({ "request": request.to_string() })).map_err(Into::into)
   }
   pub fn vault_secret(&self, request: serde_json::Value) -> crate::Result<serde_json::Value> {
     self.0.run_mobile_plugin("vaultSecret", request).map_err(Into::into)
+  }
+  pub fn android_readiness(&self) -> crate::Result<serde_json::Value> {
+    self.0.run_mobile_plugin("androidReadiness", json!({})).map_err(Into::into)
+  }
+  pub fn open_android_system_settings(&self, target: &str) -> crate::Result<()> {
+    self.0.run_mobile_plugin::<serde_json::Value>("openAndroidSystemSettings", json!({ "target": target }))
+      .map(|_| ()).map_err(Into::into)
   }
   pub fn reset_local_data(&self) -> crate::Result<()> {
     self.0.run_mobile_plugin::<serde_json::Value>("resetLocalData", json!({}))

@@ -13,6 +13,6 @@ export const createPortRequest = (port: RuntimePort) => {
   return (input: object): Promise<unknown> => new Promise((resolve, reject) => {
     const id = ++next;
     pending.set(id, { resolve, reject });
-    port.postMessage(JSON.stringify({ id, ...input }));
+    port.postMessage(JSON.stringify({ ...input, __portId: id }));
   });
 };

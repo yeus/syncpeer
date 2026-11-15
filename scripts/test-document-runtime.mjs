@@ -41,7 +41,7 @@ test("packaged document core installs timers through the Android runtime", async
     onmessage: null,
     postMessage(raw) {
       const request = JSON.parse(raw);
-      globalThis.setTimeout(() => this.onmessage({ data: JSON.stringify({ id: request.id, result: null }) }), request.delayMs);
+      globalThis.setTimeout(() => this.onmessage({ data: JSON.stringify({ id: request.__portId, result: null }) }), request.delayMs);
     },
   };
   await context.syncpeerDocumentsCore.installAndroidTimers({

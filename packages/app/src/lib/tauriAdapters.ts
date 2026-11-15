@@ -862,7 +862,8 @@ class TauriAdapters {
     }
     try {
       await this.invokeWithLogging("syncpeer_android_save_text_file", {
-        request: { fileName, text, mimeType: "text/plain", treeUri },
+        request: { fileName, text,
+          mimeType: fileName.endsWith(".json") ? "application/json" : "text/plain", treeUri },
       });
       return fileName;
     } catch (error) {
@@ -881,7 +882,10 @@ class TauriAdapters {
 
   private async shareAndroidTextFile(fileName: string, text: string): Promise<void> {
     await this.invokeWithLogging("syncpeer_android_share_text_file", {
-      request: { fileName, text, mimeType: "text/plain", chooserTitle: "Share Syncpeer logs" },
+      request: { fileName, text,
+        mimeType: fileName.endsWith(".json") ? "application/json" : "text/plain",
+        chooserTitle: fileName.endsWith(".json")
+          ? "Share Syncpeer diagnostics" : "Share Syncpeer logs" },
     });
   }
 

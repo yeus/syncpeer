@@ -332,6 +332,63 @@ const beginDownloadTransfer = async (context: FileActionContext, run: DownloadRu
   );
 };
 
+/** The native service owns the entire transfer, including encrypted writes.
+ * WebView polling is presentation only; Android can suspend it mid-transfer. */
+const downloadWithServiceJob = async (context: FileActionContext,
+  folderId: string, path: string, name: string, openAfterDownload = false): Promise<void> => {
+  const { state, client, transfers } = context;
+  const key = cachedFileKey(folderId, path);
+  let id: string | null = null;
+  let lastProgress = "";
+  try {
+    const peerId = state.session.remoteDevice?.id;
+    if (!peerId) throw new Error("Authenticated peer identity is unavailable.");
+    const job = await client.startServiceTransferJob!("download", folderId, path, peerId);
+    id = job.id;
+    const jobId = id;
+    transfers.registerServiceTransfer(`download:${key}`, "download", () => {
+      void client.cancelServiceTransferJob?.(jobId);
+    });
+    transfers.setActiveDownload(key, { name, text: "Queued in Android service", progressPercent: 0 });
+    for (;;) {
+      const status = await client.serviceTransferJobStatus!(jobId);
+      const total = status.totalBytes;
+      const done = status.transferredBytes;
+      const percent = total ? Math.floor(100 * done / total) : 0;
+      transfers.setActiveDownload(key, {
+        name, text: status.phase === "queued" ? "Queued in Android service" :
+          `${percent}% · ${status.phase} · Android service`, progressPercent: percent,
+      });
+      const progress = `${status.phase}:${Math.floor(done / (256 * 1024))}:${total}`;
+      if (progress !== lastProgress) {
+        lastProgress = progress;
+        pushSessionLog(state, "info", "download.service.job_status",
+          "Android service transfer state changed.", { phase: status.phase, transferredBytes: done,
+            totalBytes: total });
+      }
+      if (status.phase === "completed") {
+        updateCachedKey(state, folderId, path, true);
+        await refreshFolderRootCachedStatuses(state, client, [folderId]);
+        transfers.setDownloadNotice(`Downloaded ${name}`, 4000);
+        if (openAfterDownload) await context.openCachedFile(folderId, path);
+        return;
+      }
+      if (status.phase === "failed" || status.phase === "cancelled") {
+        if (status.phase === "failed") throw new Error(`Android service transfer failed (${status.reason ?? "other"}).`);
+        transfers.setDownloadNotice(`Download cancelled: ${name}`, 4000);
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1200));
+    }
+  } catch (error) {
+    reportActionError(state, "download.service.failed", error, { folderId, path });
+    transfers.setDownloadNotice(`Download failed: ${name}`, 6000);
+  } finally {
+    if (id) transfers.unregisterServiceTransfer(`download:${key}`);
+    transfers.clearActiveDownload(key);
+  }
+};
+
 const downloadFile = async (
   context: FileActionContext,
   folderId: string,
@@ -343,6 +400,10 @@ const downloadFile = async (
   if (context.state.favorites.activeDownloads[downloadKey]) return;
   const connected = await context.ensureConnectedForTransfer("download");
   if (!connected || !context.state.session.remoteFs) return;
+  if (context.client.startServiceTransferJob && context.client.serviceTransferJobStatus) {
+    await downloadWithServiceJob(context, folderId, path, name, options?.openAfterDownload);
+    return;
+  }
   context.state.favorites.isDownloading = true;
   const run = createDownloadRun(context, folderId, path, name, downloadKey);
   announceDownloadStart(run);
@@ -628,10 +689,92 @@ const readUploadBytes = async (
   }
 };
 
+/** Selected-file uploads use independently encrypted native staging. Only the
+ * preparation phase requires the WebView; the published job survives suspension. */
+const uploadSelectedFilesWithService = async (
+  context: FileActionContext,
+  files: File[],
+): Promise<void> => {
+  const controller = new AbortController();
+  for (const [index, file] of files.entries()) {
+    if (controller.signal.aborted) break;
+    const target = await resolveUploadTarget(context, file.name);
+    if (!target) return;
+    const folderId = context.state.session.currentFolderId;
+    const transferId = `upload-service:${Date.now()}:${index}`;
+    const startedAtMs = Date.now();
+    let jobId: string | null = null;
+    prepareUploadUi(context, file.name);
+    context.transfers.registerServiceTransfer(transferId, "upload", () => {
+      controller.abort();
+      if (jobId) void context.client.cancelServiceTransferJob?.(jobId);
+    });
+    try {
+      const job = await context.client.stageServiceUpload!(
+        folderId, target.relativePath, context.state.session.remoteDevice?.id ?? "",
+        file, file.lastModified || Date.now(), {
+          signal: controller.signal,
+          onProgress: (done, total) => {
+            context.state.ui.uploadMessage = `Encrypting ${file.name} for background upload…`;
+            context.state.ui.uploadProgressPercent = total ? Math.floor(100 * done / total) : 100;
+          },
+        });
+      jobId = job.id;
+      context.state.ui.uploadProgressPercent = 0;
+      context.state.ui.uploadMessage = `Uploading ${file.name} in Android service…`;
+      if (controller.signal.aborted) await context.client.cancelServiceTransferJob?.(job.id);
+      for (;;) {
+        const status = await context.client.serviceTransferJobStatus!(job.id);
+        const percent = status.totalBytes
+          ? Math.floor(100 * status.transferredBytes / status.totalBytes) : 0;
+        context.state.ui.uploadProgressPercent = percent;
+        context.state.ui.uploadMessage = status.phase === "queued"
+          ? (status.nextAttemptMs && status.nextAttemptMs > Date.now()
+            ? `Retrying ${file.name} after connection recovery…`
+            : `Queued in Android service: ${file.name}`)
+          : `Uploading ${file.name}: ${percent}%`;
+        if (status.phase === "completed") {
+          try {
+            await finishUploadSuccess(context, file.name, target.relativePath, file.size, startedAtMs);
+          } catch (error) {
+            // Publication succeeded in the service; UI refresh is optional.
+            context.state.ui.uploadMessage = `Uploaded ${file.name}; folder refresh pending.`;
+            pushSessionLog(context.state, "warning", "upload.service.refresh_failed",
+              "Upload completed; the folder view could not refresh.", {
+                reason: error instanceof Error ? error.message : String(error),
+              });
+          }
+          break;
+        }
+        if (status.phase === "cancelled") {
+          context.state.ui.uploadMessage = `Upload cancelled: ${file.name}`;
+          break;
+        }
+        if (status.phase === "failed") {
+          throw new Error(`Android service upload failed (${status.reason ?? "other"}).`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1200));
+      }
+    } catch (error) {
+      handleUploadError(context, error, file.name, target.relativePath, file.size);
+    } finally {
+      context.transfers.unregisterServiceTransfer(transferId);
+      context.state.ui.uploadProgressActive = false;
+      context.state.ui.uploadProgressPercent = 0;
+      context.state.ui.uploadProgressEta = "";
+      context.state.ui.uploadProgressRate = "";
+    }
+  }
+};
+
 const uploadSelectedFiles = async (
   context: FileActionContext,
   files: File[],
 ): Promise<void> => {
+  if (context.client.stageServiceUpload && context.client.serviceTransferJobStatus) {
+    await uploadSelectedFilesWithService(context, files);
+    return;
+  }
   const batchId = Date.now();
   const prepared = files.map((file, index) => ({ file, id: `upload:${batchId}:${index}` }));
   const controller = new AbortController();

@@ -5,6 +5,7 @@ import { createConnectionActions } from "../packages/app/src/app/connectionActio
 import { createInitialState, pushSessionLog } from "../packages/app/src/app/state.ts";
 import {
   CLIPBOARD_SESSION_LOG_LIMIT_BYTES,
+  diagnosticsResultsFileName,
   formatSessionLogs,
   sessionLogFileName,
   sessionLogTextSize,
@@ -66,6 +67,23 @@ test("formatted logs keep messages and sanitized metadata", () => {
   assert.doesNotMatch(text, /192\.0\.2\.10/);
   assert.match(text, /"port": 22000/);
 });
+
+test("Android export reports journal health even when there is no previous-run section", () => {
+  const state = createInitialState(null);
+  state.logs.journalStarted = true;
+  state.logs.historyAvailable = false;
+  const text = formatSessionLogs(appInfo, state.logs.items,
+    { startedAtMs: 0, items: [] }, {
+      journalStarted: state.logs.journalStarted, historyLoaded: state.logs.historyAvailable,
+      historyError: "Encrypted history unavailable.",
+    });
+  assert.match(text, /# Diagnostic Journal/);
+  assert.match(text, /write_initialized: true/);
+  assert.match(text, /history_read_succeeded: false/);
+  assert.match(text, /history_error: Encrypted history unavailable/);
+  assert.doesNotMatch(text, /# Previous Run Logs/);
+});
+
 
 test("exported logs redact folder secrets, device identifiers and candidate addresses", () => {
   const state = createInitialState(null);
@@ -149,5 +167,11 @@ test("cancelling the save folder picker is not an error", async () => {
 test("log file names are filesystem-safe and sortable", () => {
   const name = sessionLogFileName(new Date("2026-10-22T04:08:29.065Z"));
   assert.equal(name, "syncpeer-logs-2026-10-22T04-08-29-065Z.txt");
+  assert.match(name, /^[A-Za-z0-9._-]+$/);
+});
+
+test("diagnostic results use a sortable JSON file name", () => {
+  const name = diagnosticsResultsFileName(new Date("2026-11-15T03:28:15.539Z"));
+  assert.equal(name, "syncpeer-diagnostics-2026-11-15T03-28-15-539Z.json");
   assert.match(name, /^[A-Za-z0-9._-]+$/);
 });

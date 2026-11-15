@@ -13,6 +13,7 @@
     type UiLogEntry,
     type SyncpeerProfileSettings,
   } from "@syncpeer/core/browser";
+  import { sanitizeDiagnosticText } from "../../shared/modules/diagnosticSanitizer.ts";
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
   import AppHeader from "./components/AppHeader.svelte";
   import DeviceTab from "./components/DeviceTab.svelte";
@@ -37,6 +38,7 @@
     syncAndroidPimNow,
   } from "./app/pimActions.ts";
   import { createTransferRuntime } from "./app/transferRuntime.ts";
+  import { createServiceTransferReconciler } from "./app/serviceTransferRecovery.ts";
   import {
     activeFolderPasswords,
     connectionDetails,
@@ -61,6 +63,7 @@
     persistState,
     pushClientLog,
     pushSessionLog,
+    observeSessionLogs,
     localDocumentFolders,
     visibleBreadcrumbs,
     createInitialState,
@@ -70,6 +73,7 @@
     sensitiveAppState,
   } from "./app/state.ts";
   import { createEncryptedUiStateStore } from "./app/encryptedUiState.ts";
+  import { createPersistentSessionLogs } from "./app/sessionLogPersistence.ts";
   import { createLatestDistinctTask } from "./app/latestDistinctTask.ts";
   import { readInitialVaultStatus } from "./app/initialVault.ts";
   import AboutPage from "./AboutPage.svelte";
@@ -190,11 +194,64 @@
     },
   });
   const appInfo = getAppBuildInfo();
+  const logHistory = appInfo.runtimeSurface === "android-ui"
+    ? createPersistentSessionLogs({
+        port: request => invoke("syncpeer_android_diagnostic_logs", { request }),
+        deferHistory: true,
+        runId: crypto.randomUUID(),
+        onStarted: ({ nativePid }) => {
+          pushSessionLog(app, "info", "diagnostics.native.process",
+            "Native diagnostic journal opened.", { nativePid });
+        },
+        onRestored: ({ startedAtMs, items }) => {
+          app.logs.previousRunStartedAtMs = startedAtMs;
+          app.logs.previousRunItems = items;
+          app.logs.historyAvailable = true;
+          app.logs.historyError = "";
+        },
+        onNativeExit: item => {
+          // Native already durably recorded this event. Show it immediately
+          // without re-enqueuing an identical diagnostic entry.
+          app.logs.items = [item, ...app.logs.items].slice(0, 4000);
+        },
+      })
+    : null;
+  const stopLogObserver = logHistory ? observeSessionLogs(app, logHistory.record) : () => {};
+  const exportLogsWithHistory = (
+    kind: "copy" | "save" | "share", action: () => void | Promise<void>,
+  ): void => {
+    void (async () => {
+      pushSessionLog(app, "info", "diagnostics.export.requested",
+        "Diagnostic export started.", { kind });
+      await logHistory?.flush();
+      try { await logHistory?.restore(); }
+      catch (error) {
+        app.logs.historyError = "Historical diagnostics could not be recovered from Android's encrypted journal.";
+        pushSessionLog(app, "error", "diagnostics.history.restore_failed",
+          "Encrypted previous-run logs could not be read.",
+          { reason: error instanceof Error ? error.message : String(error) });
+      }
+      if (logHistory && logHistory.pending() > 0) {
+        app.logs.historyError = "Current diagnostic entries have not been confirmed in encrypted storage.";
+        pushSessionLog(app, "warning", "diagnostics.persistence.unconfirmed",
+          "Some current logs are still pending native storage.");
+      }
+      await action();
+    })().catch(error => {
+      pushSessionLog(app, "error", "diagnostics.export.failed",
+        error instanceof Error ? error.message : "Could not export diagnostics.");
+    });
+  };
   const transferRuntime = createTransferRuntime({
     state: app,
     client,
     runtimeSurface: appInfo.runtimeSurface,
   });
+  const serviceTransfers = createServiceTransferReconciler({ state: app, client, transfers: transferRuntime });
+  const refreshServiceTransfers = () => {
+    if (appInfo.runtimeSurface !== "android-ui") return;
+    void serviceTransfers.refresh().catch(() => undefined);
+  };
   const baseActions = createAppActions({
     state: app,
     client,
@@ -217,6 +274,16 @@
     state: app,
     client,
     appInfo,
+    readDeviceHealth: appInfo.runtimeSurface === "android-ui"
+      ? () => invoke("syncpeer_android_readiness") : undefined,
+    readDiagnosticJournal: appInfo.runtimeSurface === "android-ui"
+      ? async () => {
+          const response = await invoke<{ runs: unknown[] }>("syncpeer_android_diagnostic_logs",
+            { request: { operation: "list" } });
+          return { writeInitialized: app.logs.journalStarted,
+            runCount: Array.isArray(response.runs) ? response.runs.length : 0,
+            queued: logHistory?.pending() ?? 0 };
+        } : undefined,
   });
   const pimDependencies = { state: app, client, sessionStore };
 
@@ -397,7 +464,12 @@
 
   const unsubscribe = sessionStore.subscribe((next) => {
     applySessionState(app, next);
-    scheduleFolderSync(next.folders);
+    // The initial disconnected snapshot has no folders. Sending an empty
+    // cacheRegistrations request here competes with the vault's first status
+    // read and occupied the Android runtime for another 8 seconds in logs.
+    // Once either live or local folders exist, keep normal reconciliation.
+    if (next.folders.length > 0 || app.localFolders.length > 0)
+      scheduleFolderSync(next.folders);
     actions.syncNavigationRoute();
     if (
       next.phase === "connected" &&
@@ -438,14 +510,29 @@
       clearInterval(localDiscoveryTimer);
       localDiscoveryTimer = null;
     }
+    stopLogObserver();
+    logHistory?.dispose();
     encryptedUiState.cancelPendingSave();
     unsubscribe();
     actions.dispose();
+    serviceTransfers.dispose();
     transferRuntime.dispose();
-    void client.disconnect();
+    // Android service owns the peer socket and in-flight durable jobs. A
+    // destroyed/recreated WebView must not issue a native disconnect.
+    if (appInfo.runtimeSurface !== "android-ui") void client.disconnect();
   };
 
   import.meta.hot?.dispose(cleanupAppRuntime);
+
+  $effect(() => {
+    // Historical decryption and IPC are not part of startup. Load on demand
+    // when the user expands the log panel, or explicitly exports diagnostics.
+    if (app.ui.isLogPanelExpanded && app.activeTab === "devices") {
+      void logHistory?.restore().catch(() => {
+        app.logs.historyError = "Could not load previous runs; try opening logs again.";
+      });
+    }
+  });
 
   $effect(() => {
     persistState(app);
@@ -506,6 +593,53 @@
   });
 
   onMount(() => {
+    let logHistoryStarted = false;
+    let logHistoryStarting = false;
+    const startLogHistory = () => {
+      if (logHistoryStarted || logHistoryStarting || !logHistory) return;
+      logHistoryStarting = true;
+      void logHistory.start().then(() => {
+        logHistoryStarted = true;
+        app.logs.journalStarted = true;
+        app.logs.historyError = "";
+        pushSessionLog(app, "info", "diagnostics.persistence.ready",
+          "Android confirmed encrypted diagnostic log storage is initialized.");
+      }).catch(error => {
+        app.logs.historyError = "Encrypted diagnostic storage is unavailable; retrying.";
+        if (!app.logs.items.some(item => item.event === "diagnostics.persistence.failed"))
+          pushSessionLog(app, "error", "diagnostics.persistence.failed",
+            "Android did not confirm persistent diagnostic log storage.",
+            { reason: error instanceof Error ? error.message : String(error) });
+      }).finally(() => { logHistoryStarting = false; });
+    };
+    startLogHistory();
+    const retryLogHistory = logHistory ? setInterval(startLogHistory, 5000) : null;
+    const onUnhandledError = (event: ErrorEvent) => {
+      const error = event.error;
+      pushSessionLog(app, "error", "ui.unhandled_error",
+        sanitizeDiagnosticText(event.message || "Uncaught JavaScript error.").slice(0, 600), {
+          name: error instanceof Error ? error.name : "Unknown",
+          stack: error instanceof Error ? sanitizeDiagnosticText(error.stack ?? "").slice(0, 1200) : "",
+        });
+    };
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason;
+      const message = reason instanceof Error ? reason.message :
+        typeof reason === "string" ? reason :
+        (typeof reason === "object" && reason !== null && "message" in reason &&
+          typeof reason.message === "string") ? reason.message : String(reason);
+      pushSessionLog(app, "error", "ui.unhandled_rejection",
+        sanitizeDiagnosticText(message).slice(0, 600), {
+          name: reason instanceof Error ? reason.name : typeof reason,
+          stack: reason instanceof Error ? sanitizeDiagnosticText(reason.stack ?? "").slice(0, 1200) : "",
+        });
+    };
+    const onPageHideForLogs = () => { void logHistory?.flush(); };
+    window.addEventListener("error", onUnhandledError);
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+    window.addEventListener("pagehide", onPageHideForLogs);
+    const nativeTransferPoll = appInfo.runtimeSurface === "android-ui"
+      ? setInterval(refreshServiceTransfers, 5000) : null;
     const stopNavigation = actions.startNavigation();
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const updateSystemTheme = () => {
@@ -567,6 +701,7 @@
       firstPeerInviteReady = true;
       await actions.restoreNavigationRoute(false);
       await foregroundConnection;
+      refreshServiceTransfers();
       await actions.restoreNavigationRoute(true);
       persistSensitiveState();
     })().catch(error => {
@@ -579,6 +714,16 @@
       }
     }).finally(() => { peerStateInitializing = false; firstPeerInviteReady = true; });
 
+    const recordDeviceHealth = (trigger: string) => {
+      if (appInfo.runtimeSurface !== "android-ui") return;
+      void invoke<Record<string, unknown>>("syncpeer_android_readiness")
+        .then(result => pushSessionLog(app, "info", "android.device.health",
+          "Read-only Android power and restriction snapshot.", { trigger, ...result }))
+        .catch(error => pushSessionLog(app, "warning", "android.device.health.failed",
+          "Android power and restriction snapshot unavailable.",
+          { trigger, category: error instanceof Error ? error.name : typeof error }));
+    };
+    recordDeviceHealth("startup");
     const handleOnline = () => {
       void actions.onNetworkOnline();
       void actions.refreshActiveView();
@@ -588,20 +733,25 @@
     };
     const handleVisibilityChange = () => {
       const isVisible = document.visibilityState === "visible";
+      if (!isVisible) void logHistory?.flush();
       actions.setAppVisibility(isVisible);
+      recordDeviceHealth(isVisible ? "foreground" : "background");
       if (isVisible) {
         void actions.onAppForeground();
+        refreshServiceTransfers();
         void actions.refreshActiveView();
       }
     };
     const handleFocus = () => {
       actions.setAppVisibility(true);
       void actions.onAppForeground();
+      refreshServiceTransfers();
       void actions.refreshActiveView();
     };
     const handlePageShow = () => {
       actions.setAppVisibility(document.visibilityState === "visible");
       void actions.onAppForeground();
+      refreshServiceTransfers();
       void actions.refreshActiveView();
     };
     window.addEventListener("online", handleOnline);
@@ -735,12 +885,17 @@
         delete testWindow.__syncpeerFolderProbe;
         delete testWindow.__syncpeerReadCachedDocument;
       }
+      window.removeEventListener("error", onUnhandledError);
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+      window.removeEventListener("pagehide", onPageHideForLogs);
+      if (retryLogHistory !== null) clearInterval(retryLogHistory);
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("pageshow", handlePageShow);
       colorScheme.removeEventListener("change", updateSystemTheme);
+      if (nativeTransferPoll !== null) clearInterval(nativeTransferPoll);
       stopNavigation();
     };
   });
@@ -750,6 +905,7 @@
     const intervalMs = app.activeTab === "folders" ? 15000 : 60000;
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(() => {
+      if (!app.ui.isAppVisible) return;
       void actions.refreshActiveView();
     }, intervalMs);
     return () => {
@@ -762,6 +918,7 @@
     if (app.currentPage !== "main") return;
     if (localDiscoveryTimer) clearInterval(localDiscoveryTimer);
     localDiscoveryTimer = setInterval(() => {
+      if (!app.ui.isAppVisible) return;
       void actions.discoverLocalDevices();
     }, 15000);
     return () => {
@@ -819,6 +976,18 @@
             <span data-testid="peer-session-status">Peer: {app.session.peerStatus.phase}</span>
           {/if}
         </div>
+        <button
+          type="button"
+          class="ghost connection-pause-control"
+          data-testid="expert-connection-control"
+          onclick={() => app.ui.autoConnectPaused
+            ? actions.connect()
+            : actions.disconnect()}
+        >
+          {app.ui.autoConnectPaused
+            ? "Resume automatic connection"
+            : "Pause automatic connection"}
+        </button>
         {#if app.ui.expertView}
           <div class="connection-details-expert" data-testid="connection-expert-details">
             <span>Phase: {app.session.lifecyclePhase}</span>
@@ -835,18 +1004,6 @@
             {#if app.session.closureReason}
               <span>Last closure: {app.session.closureReason}</span>
             {/if}
-            <button
-              type="button"
-              class="ghost expert-connection-control"
-              data-testid="expert-connection-control"
-              onclick={() => app.ui.autoConnectPaused
-                ? actions.connect()
-                : actions.disconnect()}
-            >
-              {app.ui.autoConnectPaused
-                ? "Resume automatic connection"
-                : "Pause automatic connection"}
-            </button>
           </div>
         {/if}
       </section>
@@ -949,9 +1106,9 @@
           onOpenAboutPage={actions.openAboutPage}
           onOpenGeneralSettings={folderCredentials ? actions.openGeneralSettings : undefined}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
-          onCopySessionLogs={actions.copySessionLogs}
-          onSaveSessionLogs={logFile ? actions.saveSessionLogs : undefined}
-          onShareSessionLogs={logFile ? actions.shareSessionLogs : undefined}
+          onCopySessionLogs={() => exportLogsWithHistory("copy", actions.copySessionLogs)}
+          onSaveSessionLogs={logFile ? () => exportLogsWithHistory("save", actions.saveSessionLogs) : undefined}
+          onShareSessionLogs={logFile ? () => exportLogsWithHistory("share", actions.shareSessionLogs) : undefined}
           onEditLocalDeviceName={actions.editLocalDeviceName}
           onRegenerateDeviceId={actions.regenerateDeviceId}
           onCopyIdentityBackupSecret={actions.copyIdentityBackupSecret}
@@ -1113,6 +1270,8 @@
     onRunTest={diagnosticsActions.runDiagnosticsTestById}
     onRunCategory={diagnosticsActions.runDiagnosticsCategory}
     onRunAll={diagnosticsActions.runAllDiagnostics}
+    onSaveResults={logFile?.save}
+    onShareResults={logFile?.share}
   />
 {:else if app.currentPage === "general-settings"}
   <GeneralSettingsPage onBack={actions.closeGeneralSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
@@ -1222,7 +1381,7 @@
     align-items: center;
   }
 
-  .expert-connection-control {
+  .connection-pause-control {
     min-height: 30px;
     padding: 0.2rem 0.5rem;
     font-size: 0.76rem;

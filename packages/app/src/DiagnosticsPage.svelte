@@ -2,6 +2,7 @@
 <script lang="ts">
   import { sanitizeDiagnosticArtifact } from "../../shared/modules/diagnosticSanitizer.ts";
   import { normalizeDeviceId } from "@syncpeer/core/browser";
+  import { diagnosticsResultsFileName } from "./app/sessionLogs.ts";
 
   interface RunDiagnosticsArgs {
     expectedAdvertisedDeviceIds?: string[];
@@ -32,11 +33,15 @@
     onRunTest: (testId: string, args?: RunDiagnosticsArgs) => Promise<unknown>;
     onRunCategory: (categoryId: string, args?: RunDiagnosticsArgs) => Promise<unknown>;
     onRunAll: (args?: RunDiagnosticsArgs) => Promise<unknown>;
+    onSaveResults?: (fileName: string, contents: string) => Promise<string | null>;
+    onShareResults?: (fileName: string, contents: string) => Promise<void>;
   }
 
-  let { onBack, onLoadCatalog, onRunTest, onRunCategory, onRunAll }: Props = $props();
+  let { onBack, onLoadCatalog, onRunTest, onRunCategory, onRunAll,
+    onSaveResults, onShareResults }: Props = $props();
 
   let isRunning = $state(false);
+  let isExporting = $state(false);
   let isCatalogLoading = $state(false);
   let catalog = $state<DiagnosticsCatalog>({ categories: [], tests: [] });
   let selectedCategoryId = $state("");
@@ -94,14 +99,14 @@
     }
   };
 
-  const runSelectedCategory = async (): Promise<void> => {
-    if (isRunning || !selectedCategoryId) return;
+  const runCategory = async (categoryId: string): Promise<void> => {
+    if (isRunning || !categoryId) return;
     isRunning = true;
     runError = null;
     copiedNotice = "";
     try {
       const expectedAdvertisedDeviceIds = parseExpectedDeviceIds(expectedIdsInput);
-      const result = await onRunCategory(selectedCategoryId, {
+      const result = await onRunCategory(categoryId, {
         expectedAdvertisedDeviceIds,
         failOnExpectedMissing: expectedAdvertisedDeviceIds.length > 0,
       });
@@ -113,6 +118,7 @@
       isRunning = false;
     }
   };
+  const runSelectedCategory = () => runCategory(selectedCategoryId);
 
   const runAllDiagnostics = async (): Promise<void> => {
     if (isRunning) return;
@@ -145,6 +151,26 @@
     copiedNotice = "Copied diagnostics to clipboard.";
   };
 
+  const exportResults = async (mode: "save" | "share"): Promise<void> => {
+    if (!resultJson.trim() || isExporting) return;
+    isExporting = true;
+    runError = null;
+    copiedNotice = "";
+    const fileName = diagnosticsResultsFileName(new Date());
+    try {
+      if (mode === "save" && onSaveResults) {
+        const saved = await onSaveResults(fileName, resultJson);
+        if (saved) copiedNotice = `Diagnostics saved as ${saved}.`;
+      } else if (mode === "share" && onShareResults) {
+        await onShareResults(fileName, resultJson);
+        copiedNotice = "Diagnostics file handed to Android sharing.";
+      }
+    } catch (error) {
+      runError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isExporting = false;
+    }
+  };
   void loadCatalog();
 </script>
 
@@ -156,7 +182,8 @@
 
   <section class="panel diagnostics-panel">
     <p class="hint">
-      Run diagnostics by category or single test. Add expected device IDs to enforce discovery checks.
+      For crash investigation, run Device Health first (read-only). Run All also writes remote probe files and exercises transfer services.
+      Add expected device IDs to enforce discovery checks.
     </p>
     <label class="field-label" for="diagnostics-category">Category</label>
     <select
@@ -184,6 +211,10 @@
       placeholder="Paste one or more device IDs (comma/space/newline separated)."
     ></textarea>
     <div class="actions">
+      <button class="primary" data-testid="diagnostics-run-device-health"
+        onclick={() => runCategory("device")} disabled={isRunning || isCatalogLoading}>
+        {isRunning ? "Running..." : "Run Device Health (Read-only)"}
+      </button>
       <button class="primary" onclick={runSelectedCategory} disabled={isRunning || !selectedCategoryId}>
         {isRunning ? "Running..." : "Run Selected Category"}
       </button>
@@ -198,6 +229,18 @@
       <button class="ghost" onclick={loadCatalog} disabled={isCatalogLoading || isRunning}>
         {isCatalogLoading ? "Refreshing..." : "Refresh Catalog"}
       </button>
+      {#if onSaveResults}
+        <button class="ghost" data-testid="diagnostics-save-results"
+          onclick={() => exportResults("save")} disabled={!resultJson || isExporting || isRunning}>
+          {isExporting ? "Exporting..." : "Save Results as File"}
+        </button>
+      {/if}
+      {#if onShareResults}
+        <button class="ghost" data-testid="diagnostics-share-results"
+          onclick={() => exportResults("share")} disabled={!resultJson || isExporting || isRunning}>
+          Share Results File
+        </button>
+      {/if}
       <button class="ghost" onclick={copyResults} disabled={!resultJson}>
         Copy Results
       </button>

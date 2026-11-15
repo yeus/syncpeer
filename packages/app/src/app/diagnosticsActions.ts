@@ -50,6 +50,11 @@ interface DiagnosticsRunOptions {
 
 const diagnosticsCategories = (): DiagnosticsCategory[] => [
   {
+    id: "device",
+    name: "Device Health (Read-only)",
+    description: "Android battery, system restrictions, service phase and encrypted journal status. No connection or file modifications.",
+  },
+  {
     id: "core",
     name: "Core Connectivity",
     description: "Folder/index diagnostics and upload probe checks.",
@@ -387,6 +392,50 @@ const androidDefinitions = (args: {
   androidTransferDefinition(args),
 ];
 
+type DeviceDiagnosticDeps = {
+  state: AppState;
+  appInfo: AppBuildInfo;
+  readDeviceHealth?: () => Promise<unknown>;
+  readDiagnosticJournal?: () => Promise<{ writeInitialized: boolean; runCount: number; queued: number }>;
+};
+
+const deviceDefinitions = (args: DeviceDiagnosticDeps): DiagnosticsDefinition[] => [
+  {
+    test: {
+      id: "device.health_snapshot",
+      name: "Phone Health and Session State",
+      description: "Read-only snapshot of battery, restrictions and UI session lifecycle.",
+      categoryId: "device",
+    },
+    fn: async () => {
+      if (args.appInfo.runtimeSurface !== "android-ui" || !args.readDeviceHealth)
+        return { skipped: true, reason: "Requires an Android device." };
+      return {
+        android: await args.readDeviceHealth(),
+        sessionPhase: args.state.session.lifecyclePhase,
+        connected: args.state.session.isConnected,
+        uiVisible: args.state.ui.isAppVisible,
+      };
+    },
+  },
+  {
+    test: {
+      id: "device.journal_readability",
+      name: "Crash Journal Read and Write Status",
+      description: "Checks that the native journal initialized and can list encrypted runs.",
+      categoryId: "device",
+    },
+    fn: async () => {
+      if (args.appInfo.runtimeSurface !== "android-ui" || !args.readDiagnosticJournal)
+        return { skipped: true, reason: "Requires Android diagnostic journal." };
+      const status = await args.readDiagnosticJournal();
+      if (!status.writeInitialized)
+        throw new Error("Encrypted crash journal has not acknowledged write initialization.");
+      return status;
+    },
+  },
+];
+
 const executeDefinitions = async (definitions: DiagnosticsDefinition[]) => {
   const tests: Record<string, TaskyonTestFn> = {};
   for (const definition of definitions) {
@@ -401,6 +450,8 @@ export const createDiagnosticsActions = (args: {
   state: AppState;
   client: SyncpeerBrowserClient;
   appInfo: AppBuildInfo;
+  readDeviceHealth?: () => Promise<unknown>;
+  readDiagnosticJournal?: () => Promise<{ writeInitialized: boolean; runCount: number; queued: number }>;
 }) => {
   const runFolderDiagnosticsTest = async (options?: DiagnosticsRunOptions) => {
     const registry = buildDiagnosticsRegistry({
@@ -439,6 +490,7 @@ export const createDiagnosticsActions = (args: {
   };
 
   const definitions = (options?: DiagnosticsRunOptions): DiagnosticsDefinition[] => [
+    ...deviceDefinitions(args),
     {
       test: {
         id: "core.folder_diagnostics",

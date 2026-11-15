@@ -38,7 +38,18 @@ import { normalizeThemePreferences, type ThemePreferences } from "./theme.ts";
 import { isConfiguredDeviceName } from "./suggestedNames.ts";
 
 const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
-const SESSION_LOG_LIMIT = 2000;
+const SESSION_LOG_LIMIT = 4000;
+const sessionLogObservers = new WeakMap<object, (entry: {
+  id: string; timestampMs: number; level: "info" | "warning" | "error";
+  event: string; message: string; details?: unknown;
+}) => void>();
+export const observeSessionLogs = (
+  state: AppState,
+  observer: NonNullable<ReturnType<typeof sessionLogObservers.get>>,
+): (() => void) => {
+  sessionLogObservers.set(state, observer);
+  return () => { sessionLogObservers.delete(state); };
+};
 const MAX_VISIBLE_CRUMBS = 4;
 const DEFAULT_DIRECTORY_PAGE_SIZE = 200;
 const MIN_DIRECTORY_PAGE_SIZE = 10;
@@ -164,6 +175,29 @@ const normalizePersistedPim = (value: Partial<PersistedPimState> | undefined): P
   androidCalendarIntegration: value?.androidCalendarIntegration ?? true,
 });
 
+// Directory entries contain private names: persist only within the encrypted vault,
+// with a global budget so frequent UI-state saves cannot grow without bound.
+const encryptedOfflineSnapshots = (snapshots: AppState["offline"]["snapshots"]) => {
+  // The native encrypted UI-state record has a 512 KiB total limit;
+  // reserve room for peer registry, profile and other private settings.
+  let remainingChars = 256 * 1024;
+  return Object.fromEntries(Object.entries(snapshots)
+    .sort(([, left], [, right]) => right.lastSeenAtMs - left.lastSeenAtMs)
+    .map(([deviceId, snapshot]) => {
+      const directories = Object.fromEntries(Object.entries(snapshot.directories ?? {})
+        .sort(([, left], [, right]) => right.loadedAtMs - left.loadedAtMs)
+        .filter(([, directory]) => {
+          const cost = JSON.stringify(directory).length;
+          if (cost > remainingChars) return false;
+          remainingChars -= cost;
+          return true;
+        }));
+      return [deviceId, { ...snapshot, directories,
+        activeDirectoryKey: snapshot.activeDirectoryKey && directories[snapshot.activeDirectoryKey]
+          ? snapshot.activeDirectoryKey : undefined }];
+    }));
+};
+
 /** Encrypted subset of the app state; loaded and saved after vault unlock. */
 export const sensitiveAppState = (state: AppState): SensitiveAppState => ({
   connection: { ...toConnectionSettings(state.connection), key: "" },
@@ -172,8 +206,7 @@ export const sensitiveAppState = (state: AppState): SensitiveAppState => ({
   peerDiscovery: state.devices.peerDiscovery,
   confirmedPeerIds: [...state.devices.confirmedPeerIds].sort(),
   approvals: [...state.approvals.syncApprovedFolderKeys].sort(),
-  offlineFolderSnapshots: Object.fromEntries(Object.entries(state.offline.snapshots).map(([deviceId, snapshot]) =>
-    [deviceId, { ...snapshot, directories: undefined, activeDirectoryKey: undefined }])),
+  offlineFolderSnapshots: encryptedOfflineSnapshots(state.offline.snapshots),
   pim: state.pim,
 });
 
@@ -466,6 +499,15 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         message: string;
         details?: unknown;
       }>,
+      previousRunStartedAtMs: 0,
+      previousRunItems: [] as Array<{
+        id: string; timestampMs: number;
+        level: "info" | "warning" | "error";
+        event: string; message: string; details?: unknown;
+      }>,
+      journalStarted: false,
+      historyAvailable: false,
+      historyError: "",
     },
   };
 };
@@ -500,18 +542,15 @@ export const pushSessionLog = (
   message: string,
   details?: unknown,
 ) => {
-  state.logs.items = [
-    {
-      id: `${Date.now()}-${state.logs.nextId}`,
-      timestampMs: Date.now(),
-      level,
-      event,
-      message,
-      details,
-    },
-    ...state.logs.items,
-  ].slice(0, SESSION_LOG_LIMIT);
+  const item = {
+    id: `${Date.now()}-${state.logs.nextId}`,
+    timestampMs: Date.now(),
+    level, event, message, details,
+  };
+  state.logs.items = [item, ...state.logs.items].slice(0, SESSION_LOG_LIMIT);
   state.logs.nextId += 1;
+  try { sessionLogObservers.get(state)?.(item); }
+  catch { /* Diagnostics must not change application behavior. */ }
 };
 
 const classifyUiLogLevel = (
@@ -573,9 +612,8 @@ const shouldKeepOfflineSnapshotView = (
   state.session.isOfflineSnapshot &&
   next.remoteFs === null &&
   next.folders.length === 0 &&
-  (next.phase === "connecting" ||
-    next.phase === "reconnecting" ||
-    next.phase === "waiting");
+  next.phase !== "connected" &&
+  next.phase !== "refreshing";
 
 export const applySessionState = (state: AppState, next: SessionState) => {
   const previousFolderId = state.session.currentFolderId;
@@ -583,7 +621,16 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   const keepOfflineSnapshotView = shouldKeepOfflineSnapshotView(state, next);
   const keepLocalDirectory = state.session.isLocalDirectory &&
     (!next.remoteFs || !next.folders.some(folder => folder.id === previousFolderId && !folder.needsPassword));
-  const currentDirectory = keepOfflineSnapshotView || keepLocalDirectory ? state.session.directory : null;
+  const sameDirectory = Boolean(previousFolderId) && previousFolderId === next.directory.folderId &&
+    previousPath === next.directory.path;
+  const keepCachedEntries = sameDirectory && state.session.directory.entries.length > 0 &&
+    next.directory.entries.length === 0 &&
+    (next.directory.status === "loading" || next.directory.status === "stale" ||
+      next.directory.status === "error");
+  const currentDirectory = keepOfflineSnapshotView || keepLocalDirectory ? state.session.directory
+    : keepCachedEntries ? { ...next.directory, entries: state.session.directory.entries,
+      versionKey: state.session.directory.versionKey,
+      loadedAtMs: state.session.directory.loadedAtMs } : next.directory;
   if (!keepLocalDirectory) state.session.isLocalDirectory = false;
   state.session.remoteFs = next.remoteFs;
   state.session.isConnected =
@@ -601,10 +648,19 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.closureReason = next.closureReason;
   state.session.upgradeStatus = next.upgradeStatus;
   state.session.peerStatus = next.peerStatus;
-  if (next.peerStatus?.error && shouldHintRemoteApprovalPending(next.peerStatus.error)) {
+  if (state.session.isConnected) {
+    const known = normalizeDeviceId(next.remoteDevice?.id || next.sourceDeviceId ||
+      state.connection.remoteId || state.devices.selectedSavedDeviceId);
+    if (known && state.approvals.pendingApprovalPromptDeviceId === known) {
+      state.approvals.pendingApprovalPromptDeviceId = "";
+    }
+  } else if (next.peerStatus?.error && shouldHintRemoteApprovalPending(next.peerStatus.error)) {
     const target = normalizeDeviceId(next.remoteDevice?.id || next.sourceDeviceId ||
       state.connection.remoteId || state.devices.selectedSavedDeviceId);
-    if (target) state.approvals.pendingApprovalPromptDeviceId = target;
+    if (target && !hasSuccessfulConnectionHistory(state, target) &&
+      !state.devices.confirmedPeerIds.has(target)) {
+      state.approvals.pendingApprovalPromptDeviceId = target;
+    }
   }
   state.session.folders = keepOfflineSnapshotView ? state.session.folders : next.folders;
   state.session.folderSyncStates = keepOfflineSnapshotView
@@ -640,7 +696,8 @@ export const applySessionState = (state: AppState, next: SessionState) => {
   state.session.connectionScope = keepOfflineSnapshotView
     ? state.session.connectionScope
     : next.connectionScope;
-  if (next.lastError) {
+  if (next.lastError && !(state.ui.autoConnectPaused &&
+    /abort|cancel|suspended or offline|session unavailable/i.test(next.lastError))) {
     state.ui.recentError = next.lastError;
   }
 };
@@ -862,19 +919,15 @@ export const formatModified = (ms: number) =>
 
 export const shouldHintRemoteApprovalPending = (message: string) => {
   const normalized = message.toLowerCase();
-  const connectionClosedCount = (normalized.match(/connection closed/g) ?? [])
-    .length;
-  return (
-    normalized.includes("may be waiting for you to accept this device") ||
+  // Repeated socket closures/timeouts are transport evidence, never evidence
+  // that an already approved identity needs approval on the other device.
+  return normalized.includes("may be waiting for you to accept this device") ||
     normalized.includes("remote peer rejected this device") ||
     normalized.includes("waiting for approval of this client") ||
     normalized.includes("not approved") ||
     normalized.includes("unknown device") ||
     normalized.includes("not configured") ||
-    normalized.includes("not in config") ||
-    (normalized.includes("could not connect using discovered candidates") &&
-      connectionClosedCount >= 2)
-  );
+    normalized.includes("not in config");
 };
 
 export const hasSuccessfulConnectionHistory = (

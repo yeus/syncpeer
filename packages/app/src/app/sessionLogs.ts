@@ -26,31 +26,40 @@ export type SessionLogFilePort = {
 export const sessionLogTextSize = (text: string): number =>
   new TextEncoder().encode(text).length;
 
-/** One readable session log for copy, save and share, with sanitized metadata. */
+const formatEntries = (items: readonly SessionLogItem[]): string =>
+  items.slice().reverse().map(item => {
+    const lines = [
+      `${new Date(item.timestampMs).toISOString()} [${item.level.toUpperCase()}] ${item.event}`,
+    ];
+    if (item.message && item.message !== item.event) {
+      lines.push(sanitizeDiagnosticText(item.message));
+    }
+    if (item.details !== undefined) {
+      lines.push(JSON.stringify(sanitizeDiagnosticArtifact(item.details), null, 2));
+    }
+    return lines.join("\n");
+  }).join("\n\n");
+
+/** Include last run's encrypted, recovered history in every explicit export. */
 export const formatSessionLogs = (
   appInfo: AppBuildInfo,
   items: readonly SessionLogItem[],
+  previousRun?: { startedAtMs: number; items: readonly SessionLogItem[] },
+  diagnostics?: { journalStarted: boolean; historyLoaded: boolean; historyError: string },
 ): string => {
-  const logBody = items
-    .slice()
-    .reverse()
-    .map((item) => {
-      const lines = [
-        `${new Date(item.timestampMs).toISOString()} [${item.level.toUpperCase()}] ${item.event}`,
-      ];
-      // Client-log entries fall back to the event name as their message; only real
-      // messages carry information the event name does not already contain.
-      if (item.message && item.message !== item.event) {
-        lines.push(sanitizeDiagnosticText(item.message));
-      }
-      if (item.details !== undefined) {
-        lines.push(JSON.stringify(sanitizeDiagnosticArtifact(item.details), null, 2));
-      }
-      return lines.join("\n");
-    })
-    .join("\n\n");
-  const metadata = [formatAppBuildInfo(appInfo), "", "# Session Logs"].join("\n");
-  return `${metadata}\n${logBody || "No session logs yet."}`;
+  const journal = diagnostics
+    ? `# Diagnostic Journal
+write_initialized: ${diagnostics.journalStarted}
+history_read_succeeded: ${diagnostics.historyLoaded}
+history_entry_count: ${previousRun?.items.length ?? 0}
+history_error: ${diagnostics.historyError ? sanitizeDiagnosticText(diagnostics.historyError) : "none"}`
+    : "";
+  const metadata = [formatAppBuildInfo(appInfo), journal, "# Session Logs"].filter(Boolean).join("\n\n");
+  const current = formatEntries(items) || "No session logs yet.";
+  if (!previousRun || previousRun.items.length === 0) return `${metadata}\n${current}`;
+  const date = previousRun.startedAtMs
+    ? new Date(previousRun.startedAtMs).toISOString() : "unknown";
+  return `${metadata}\n${current}\n\n# Previous Run Logs (rolling history; newest archived run started ${date})\n${formatEntries(previousRun.items)}`;
 };
 
 export const describeSessionLogSize = (bytes: number): string =>
@@ -62,6 +71,9 @@ export const describeSessionLogSize = (bytes: number): string =>
 export const clipboardSessionLogsTooLarge = (text: string): boolean =>
   sessionLogTextSize(text) > CLIPBOARD_SESSION_LOG_LIMIT_BYTES;
 
-/** Stable, sortable file name for an exported log. */
+/** Stable sortable names for diagnostic exports. */
+const exportStamp = (now: Date): string => now.toISOString().replace(/[:.]/g, "-");
 export const sessionLogFileName = (now: Date): string =>
-  `syncpeer-logs-${now.toISOString().replace(/[:.]/g, "-")}.txt`;
+  `syncpeer-logs-${exportStamp(now)}.txt`;
+export const diagnosticsResultsFileName = (now: Date): string =>
+  `syncpeer-diagnostics-${exportStamp(now)}.json`;

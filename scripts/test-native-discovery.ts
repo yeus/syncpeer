@@ -66,7 +66,7 @@ test("Android network port forwards discovery cancellation through the shared na
   const bridge = installBridge();
   const stop = new AbortController();
   const port: RuntimePort = { onmessage: null, postMessage: raw => {
-    const { id, operation, ...request } = JSON.parse(String(raw));
+    const { __portId: id, operation, ...request } = JSON.parse(String(raw));
     const command = { discoveryPrepare: "syncpeer_discovery_prepare", discoveryFetch: "syncpeer_discovery_fetch",
       discoveryCancel: "syncpeer_discovery_cancel" }[operation as "discoveryPrepare" | "discoveryFetch" | "discoveryCancel"];
     void bridge.invoke(command, { request }).then(result =>

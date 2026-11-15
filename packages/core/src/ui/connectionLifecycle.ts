@@ -79,6 +79,8 @@ export type ConnectionLifecycleDeps<TOptions> = {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /** The platform, not the UI, owns the socket across Activity visibility changes. */
+  serviceOwnsSession?: boolean;
 };
 
 class ConnectionLifecycleRuntime<TOptions> {
@@ -114,7 +116,8 @@ class ConnectionLifecycleRuntime<TOptions> {
     for (const listener of this.listeners) listener(snapshot);
   };
 
-  private eligible = (): boolean => this.online && (this.foreground || this.transferActive) && this.desired !== null;
+  private eligible = (): boolean => this.online &&
+    (this.foreground || this.transferActive || this.deps.serviceOwnsSession === true) && this.desired !== null;
   private cancelOpening = (): void => {
     this.openingController?.abort();
     this.openingController = null;
@@ -177,6 +180,12 @@ class ConnectionLifecycleRuntime<TOptions> {
 
   private scheduleRetry = (reason: string): void => {
     if (!this.eligible()) return;
+    // The Android native service retries its own connection while the WebView
+    // is hidden. Retain the proxy lifecycle without scheduling a second dial.
+    if (this.deps.serviceOwnsSession && !this.foreground) {
+      this.update({ phase: "waiting", nextRetryAtMs: null, closureReason: reason });
+      return;
+    }
     const retryGeneration = this.generation;
     const delayMs = retryDelayMs(this.failureStreak, this.random);
     this.failureStreak += 1;
@@ -187,7 +196,8 @@ class ConnectionLifecycleRuntime<TOptions> {
       closureReason: reason,
     });
     void this.sleep(delayMs).then(async () => {
-      if (retryGeneration !== this.generation || !this.eligible()) return;
+      if (retryGeneration !== this.generation || !this.eligible() ||
+        (this.deps.serviceOwnsSession && !this.foreground)) return;
       this.update({ phase: "reconnecting", nextRetryAtMs: null });
       try {
         await this.openDesired(retryGeneration);
@@ -292,7 +302,8 @@ class ConnectionLifecycleRuntime<TOptions> {
   };
 
   private attemptNow = async (): Promise<void> => {
-    if (!this.eligible() || (this.active && !this.active.isClosed())) return;
+    if (!this.eligible() || (this.deps.serviceOwnsSession && !this.foreground) ||
+      (this.active && !this.active.isClosed())) return;
     if (this.opening) {
       await this.opening.catch(() => undefined);
       return;
@@ -416,7 +427,7 @@ class ConnectionLifecycleRuntime<TOptions> {
   };
   private setForeground = async (nextForeground: boolean) => {
       this.foreground = nextForeground;
-      if (!this.foreground && !this.transferActive) await this.suspend();
+      if (!this.foreground && !this.transferActive && !this.deps.serviceOwnsSession) await this.suspend();
       else if (this.foreground) {
         if (!this.desired && this.state.phase === "suspended") {
           this.update({ phase: "idle", nextRetryAtMs: null, closureReason: null });
@@ -427,7 +438,7 @@ class ConnectionLifecycleRuntime<TOptions> {
   };
   private setTransferActive = async (activeTransfer: boolean) => {
       this.transferActive = activeTransfer;
-      if (!this.transferActive && !this.foreground) await this.suspend();
+      if (!this.transferActive && !this.foreground && !this.deps.serviceOwnsSession) await this.suspend();
       else if (this.transferActive) await this.attemptNow();
       else this.scheduleUpgrade(this.generation);
   };

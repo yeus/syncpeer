@@ -75,6 +75,7 @@ type ConnectionActionArgs = {
 
 type ConnectionActionControl = {
   connectInFlight: Promise<void> | null;
+  disconnectInFlight: Promise<void> | null;
   connectRequestGeneration: number;
   connectionSettingsTimer: ReturnType<typeof setTimeout> | null;
   connectionSettingsGeneration: number;
@@ -84,17 +85,44 @@ type ConnectionActionControl = {
 export const createConnectionActions = (args: ConnectionActionArgs) => {
   const control: ConnectionActionControl = {
     connectInFlight: null,
+    disconnectInFlight: null,
     connectionSettingsTimer: null,
     connectRequestGeneration: 0,
     connectionSettingsGeneration: 0,
     lastAttemptedConnectionSettings: null,
   };
+  // Focus, pageshow and periodic refresh may fire together. Keep one native
+  // overview/metadata pass active per app controller, without blocking a
+  // subsequent refresh once it settles.
+  let overviewInFlight: Promise<void> | null = null;
+  let activeViewInFlight: Promise<void> | null = null;
+  const refreshOverviewOnce = (): Promise<void> => {
+    if (overviewInFlight) return overviewInFlight;
+    const next = refreshOverview(args).finally(() => {
+      if (overviewInFlight === next) overviewInFlight = null;
+    });
+    overviewInFlight = next;
+    return next;
+  };
+  const refreshActiveViewOnce = (): Promise<void> => {
+    if (activeViewInFlight) return activeViewInFlight;
+    const next = (async () => {
+      if (args.transfers.transferInProgress()) return;
+      await refreshOverviewOnce();
+      await args.syncStarredFiles();
+      await args.loadFavoriteSyncStates();
+    })().finally(() => {
+      if (activeViewInFlight === next) activeViewInFlight = null;
+    });
+    activeViewInFlight = next;
+    return next;
+  };
   return {
     connect: (targetDeviceId?: string) => connect(args, control, targetDeviceId),
     ensureConnectedForTransfer: (kind: "download" | "upload") =>
       ensureConnectedForTransfer(args, control, kind),
-    refreshOverview: () => refreshOverview(args),
-    refreshActiveView: () => refreshActiveView(args),
+    refreshOverview: refreshOverviewOnce,
+    refreshActiveView: refreshActiveViewOnce,
     hydrate: () => hydrate(args),
     disconnect: () => disconnect(args, control),
     scheduleConnectionSettingsApply: () => scheduleConnectionSettingsApply(args, control),
@@ -115,6 +143,8 @@ const connect = async (
   targetDeviceId?: string,
 ) => {
   const { state, client, sessionStore } = args;
+  // A native Android stop can take seconds. Never dial until teardown finishes.
+  if (control.disconnectInFlight) await control.disconnectInFlight.catch(() => undefined);
   control.connectionSettingsGeneration += 1;
   if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
   control.connectionSettingsTimer = null;
@@ -205,11 +235,23 @@ const connect = async (
     }
     saveCurrentOfflineState(state, sourceDeviceId);
     recordAdvertisedPeerSuggestions(state, currentSourceDeviceId(state));
-    if (session.folders.length === 0) state.ui.autoConnectPaused = true;
+    // No advertised folders is a valid authenticated connection, not an instruction
+    // to disable reconnect after the next Android standby transition.
     state.session.lastUpdatedAt = nowTime();
   } catch (error) {
     if (generation !== control.connectRequestGeneration) return;
     const message = error instanceof Error ? error.message : String(error);
+    if (!state.ui.isAppVisible && /connection is suspended or offline|connection attempt was cancelled/i.test(message)) {
+      // Android's system Sharesheet backgrounds the WebView. The UI lifecycle
+      // then deliberately suspends its local connect; the native service may
+      // still connect and its next foreground push will reattach the UI.
+      // This is neither a reachability error nor a reason to warn about trust.
+      pushSessionLog(state, "info", "peer.connect.suspended",
+        "Foreground connection paused while Syncpeer is in the background.");
+      resetRuntimeState(state);
+      restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_suspended");
+      return;
+    }
     pushSessionLog(state, "warning", "peer.connect.attempt_failed",
       "Peer connection did not complete; remote approval or reachability may be required.",
       { peerId: attemptedDeviceId, reason: message });
@@ -324,13 +366,6 @@ const refreshOverview = async (args: ConnectionActionArgs) => {
   }
 };
 
-const refreshActiveView = async (args: ConnectionActionArgs) => {
-  if (args.transfers.transferInProgress()) return;
-  await refreshOverview(args);
-  await args.syncStarredFiles();
-  await args.loadFavoriteSyncStates();
-};
-
 const hydrate = async (args: ConnectionActionArgs) => {
   const { state, client, loadFavoriteSyncStates, appInfo } = args;
   pushSessionLog(state, "info", "app.build.info", "Build metadata", {
@@ -363,24 +398,32 @@ const hydrate = async (args: ConnectionActionArgs) => {
 
 const disconnect = async (args: ConnectionActionArgs, control: ConnectionActionControl) => {
   const { state, sessionStore } = args;
+  if (control.disconnectInFlight) return control.disconnectInFlight;
   saveCurrentOfflineState(state, activeSourceDeviceId(state));
   control.connectionSettingsGeneration += 1;
   if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
   control.connectionSettingsTimer = null;
   state.ui.autoConnectPaused = true;
-  // A cancelled native connect can remain unresolved after the service stops.
-  // Invalidate its UI generation; it must never block a user disconnect.
+  // Invalidate an unfinished dial before asking Android to stop its session.
   control.connectRequestGeneration += 1;
   control.connectInFlight = null;
+  const presentOffline = (reason: string) => {
+    resetRuntimeState(state);
+    clearDirectoryView(state);
+    restoreOfflineSnapshot(state, clearDirectoryView, undefined, reason);
+    state.ui.recentError = null;
+  };
+  // Cached browsing must work immediately, even during a slow native stop RPC.
+  presentOffline("pause");
+  const stopping = sessionStore.actions.disconnect();
+  control.disconnectInFlight = stopping;
   try {
-    await sessionStore.actions.disconnect();
+    await stopping;
   } catch (error) {
     reportActionError(state, "disconnect.failed", error);
   } finally {
-    resetRuntimeState(state);
-    clearDirectoryView(state);
-    restoreOfflineSnapshot(state, clearDirectoryView, undefined, "disconnect");
-    state.ui.recentError = null;
+    if (control.disconnectInFlight === stopping) control.disconnectInFlight = null;
+    if (state.ui.autoConnectPaused) presentOffline("disconnect");
   }
 };
 
@@ -533,7 +576,14 @@ const copyCurrentDeviceId = async (args: ConnectionActionArgs) => {
 };
 
 const exportedSessionLogs = (args: ConnectionActionArgs) =>
-  formatSessionLogs(args.appInfo, args.state.logs.items);
+  formatSessionLogs(args.appInfo, args.state.logs.items, {
+    startedAtMs: args.state.logs.previousRunStartedAtMs,
+    items: args.state.logs.previousRunItems,
+  }, {
+    journalStarted: args.state.logs.journalStarted,
+    historyLoaded: args.state.logs.historyAvailable,
+    historyError: args.state.logs.historyError,
+  });
 
 const copySessionLogs = async (args: ConnectionActionArgs) => {
   const { state } = args;

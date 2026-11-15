@@ -9,10 +9,15 @@ import android.app.job.JobInfo
 import android.app.job.JobScheduler
 import android.content.ComponentName
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.provider.Settings
 import android.os.Bundle
 import android.os.PersistableBundle
 import android.webkit.MimeTypeMap
@@ -28,6 +33,7 @@ import android.provider.ContactsContract
 import android.provider.DocumentsContract
 import org.json.JSONObject
 import androidx.activity.result.ActivityResult
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -161,15 +167,127 @@ class AndroidCalendarDeleteArgs {
   var eventId: String = ""
 }
 
+@InvokeArg
+class AndroidSystemSettingsArgs {
+  var target: String = ""
+}
+
 @TauriPlugin
 class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private val vaultSecrets by lazy { VaultSecretStore(activity.applicationContext) }
+  private val diagnosticJournal by lazy { DiagnosticLogJournal(activity.applicationContext) }
+  private val diagnosticExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { job ->
+    Thread(job, "syncpeer-diagnostics").apply { isDaemon = true }
+  }
+
+  /** Direct plugin IPC, independent of the service's single runtime worker.
+   * Log reads work even when vault unlock or peer synchronization has failed. */
+  @Command
+  fun diagnosticLogs(invoke: Invoke) {
+    val raw = try { invoke.parseArgs(DocumentCommandArgs::class.java).request }
+      catch (_: Exception) { invoke.reject("Invalid diagnostic log request."); return }
+    if (raw.length > 160 * 1024) { invoke.reject("Diagnostic batch is too large."); return }
+    diagnosticExecutor.execute {
+      try {
+        val input = JSONObject(raw)
+        val store = diagnosticJournal
+        val result = when (input.optString("operation")) {
+          "start" -> store.startRun(input.getString("runId")).also { result ->
+            result.put("nativePid", android.os.Process.myPid())
+            val previousExit = DiagnosticLogJournal.recordPreviousProcessExit(
+              activity.applicationContext, store, input.getString("runId"))
+            if (previousExit != null) result.put("previousExit", previousExit)
+          }
+          "append" -> {
+            val entries = input.getJSONArray("items")
+            store.append((0 until entries.length()).map { entries.getJSONObject(it) })
+            JSONObject().put("saved", entries.length())
+          }
+          "list" -> JSONObject().put("runs", store.listRuns())
+          "read" -> store.readRun(input.getString("runId"), input.optInt("offset", 0),
+            input.optInt("limit", 100))
+          else -> throw IllegalArgumentException("Unknown diagnostic operation.")
+        }
+        invoke.resolve(app.tauri.plugin.JSObject(result.toString()))
+      } catch (error: Exception) {
+        // Log only class names, never exception messages or potentially private paths.
+        android.util.Log.e("SyncpeerDiagnostics",
+          "Journal operation failed: " + error.javaClass.simpleName +
+            " (cause: " + (error.cause?.javaClass?.simpleName ?: "none") + ")")
+        invoke.reject("Encrypted diagnostic log storage failed: " + error.javaClass.simpleName)
+      }
+    }
+  }
 
   @Command
   fun resetLocalData(invoke: Invoke) {
     val manager = activity.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
     if (!manager.clearApplicationUserData()) invoke.reject("Android could not clear Syncpeer local data.")
     // A successful request clears the app's own private data and terminates its process.
+  }
+
+  /** Read-only device policy diagnostics; these settings do not prove the service is alive. */
+  @Command
+  fun androidReadiness(invoke: Invoke) {
+    try {
+      val power = activity.getSystemService(PowerManager::class.java)
+      val processes = activity.getSystemService(ActivityManager::class.java)
+      val connectivity = activity.getSystemService(ConnectivityManager::class.java)
+      val battery = activity.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+      val batteryLevel = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+      val batteryScale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+      val batteryPercent = if (batteryLevel >= 0 && batteryScale > 0)
+        batteryLevel * 100 / batteryScale else null
+      val batteryStatus = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+      val charging = batteryStatus == BatteryManager.BATTERY_STATUS_CHARGING ||
+        batteryStatus == BatteryManager.BATTERY_STATUS_FULL
+      val interruption = runCatching {
+        activity.getSystemService(android.app.NotificationManager::class.java)?.currentInterruptionFilter
+      }.getOrNull()
+      val notificationsAllowed = NotificationManagerCompat.from(activity).areNotificationsEnabled() &&
+        (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+          ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+      invoke.resolve(app.tauri.plugin.JSObject()
+        .put("notifications", notificationsAllowed)
+        .put("batteryOptimizationExempt", power?.isIgnoringBatteryOptimizations(activity.packageName) ?: false)
+        .put("powerSaverEnabled", power?.isPowerSaveMode ?: false)
+        .put("backgroundRestricted", Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && processes?.isBackgroundRestricted == true)
+        .put("dataSaverEnabled", Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+          connectivity?.restrictBackgroundStatus == ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED)
+        .put("batteryPercent", batteryPercent ?: JSONObject.NULL)
+        .put("batteryCharging", charging)
+        .put("deviceIdle", power?.isDeviceIdleMode ?: false)
+        .put("screenInteractive", power?.isInteractive ?: true)
+        .put("doNotDisturbEnabled", interruption?.let {
+          it != android.app.NotificationManager.INTERRUPTION_FILTER_ALL &&
+            it != android.app.NotificationManager.INTERRUPTION_FILTER_UNKNOWN
+        } ?: JSONObject.NULL))
+    } catch (_: Exception) { invoke.reject("Android restrictions could not be checked.") }
+  }
+
+  @Command
+  fun openAndroidSystemSettings(invoke: Invoke) {
+    val target = try { invoke.parseArgs(AndroidSystemSettingsArgs::class.java).target }
+      catch (_: Exception) { invoke.reject("Invalid Android settings destination."); return }
+    val appDetails = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+      Uri.parse("package:${activity.packageName}"))
+    val destination = when (target) {
+      "app" -> appDetails
+      "notifications" -> Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+        .putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName)
+      "battery" -> Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+      "power-saver" -> Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)
+      "data-saver" -> Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS,
+        Uri.parse("package:${activity.packageName}"))
+      else -> { invoke.reject("Invalid Android settings destination."); return }
+    }
+    activity.runOnUiThread {
+      try {
+        runCatching { activity.startActivity(destination) }
+          .getOrElse { activity.startActivity(appDetails) }
+        invoke.resolve(app.tauri.plugin.JSObject())
+      } catch (_: Exception) { invoke.reject("Android settings could not be opened.") }
+    }
   }
 
   @Command
@@ -397,6 +515,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
   override fun load(webView: WebView) {
     super.load(webView)
+    DiagnosticLogJournal.installCrashHandler(activity.applicationContext)
     if (!backgroundLifecycleRegistered) {
       activity.application.registerActivityLifecycleCallbacks(backgroundLifecycleCallbacks)
       backgroundLifecycleRegistered = true
@@ -424,6 +543,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     incomingPeerSubscription?.invoke()
     incomingPeerSubscription = null
     sessionStatusSubscription = null
+    diagnosticExecutor.shutdown()
     super.onDestroy(activity)
   }
 

@@ -17,15 +17,16 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
   type SyncpeerSessionHandle } from "../../core/src/client.js";
 import type { ConnectOptions } from "../../core/src/ui/browserClient.js";
 import { serializeConnectionKey } from "../../core/src/ui/connectionKey.js";
-import { createConnectionLifecycle, waitForLifecyclePhase,
+import { createConnectionLifecycle,
   type ConnectionLifecycle, type ConnectionLifecycleState } from "../../core/src/ui/connectionLifecycle.js";
 import { startIncomingPeerService } from "../../core/src/sync/incomingPeerService.js";
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
 import { sameDeviceId } from "../../core/src/ui/helpers.js";
-import { syncServiceFileFavorites } from "../../core/src/sync/serviceFavoriteSync.js";
+import { syncServiceFileFavorites, type FavoriteSyncProgress } from "../../core/src/sync/serviceFavoriteSync.js";
 import { executeServiceRemoteCommand } from "../../core/src/sync/serviceRemoteCommands.js";
 import { createServiceDownloadBridge } from "../../core/src/sync/serviceDownloadBridge.js";
+import { createServiceTransferJobs } from "../../core/src/sync/serviceTransferJobs.js";
 import { createServiceUploadBridge } from "../../core/src/sync/serviceUploadBridge.js";
 import { decodeBase64 } from "../../core/src/transfer/base64.js";
 import { parseServiceCommand } from "../../core/src/sync/serviceProtocol.js";
@@ -87,14 +88,22 @@ const createAndroidSessionAdapter = async (
         !["core.discovery.global_failed", "core.discovery.retry", "core.discovery.full_response",
           "core.discovery.candidate.failed", "core.discovery.connect_strategy", "core.upload.request.failed",
           "core.replica.receive.failed"].includes(event)) return;
-      const addresses = (details?.payload as { addresses?: unknown } | undefined)?.addresses;
-      const message = event === "core.discovery.connect_strategy"
-        ? `direct=${details?.directCandidateCount ?? 0}, relay=${details?.relayCandidateCount ?? 0}`
-        : event === "core.discovery.full_response"
-          ? `candidates=${Array.isArray(details?.candidates) ? details.candidates.length : "?"}, addresses=${
-            Array.isArray(addresses) ? addresses.length : "?"}`
-        : typeof details?.message === "string" ? details.message : "No further details";
-      void request({ operation: "diagnostic", event, message });
+      const message = typeof details?.message === "string" ? details.message : "";
+      const category = /not authorized|revoked|retired|not paired/i.test(message) ? "authorization"
+        : /timed? ?out|deadline/i.test(message) ? "timeout"
+        : /refused|unreachable/i.test(message) ? "unreachable"
+        : /relay/i.test(message) ? "relay"
+        : /closed|disconnected|cancelled|aborted/i.test(message) ? "disconnected"
+        : message ? "other" : "none";
+      // Never transmit raw peer addresses, identity, paths or error text to
+      // native release diagnostics. Only static event names and bounded counts.
+      void request({
+        operation: "diagnostic", event, category,
+        directCount: typeof details?.directCandidateCount === "number"
+          ? details.directCandidateCount : 0,
+        relayCount: typeof details?.relayCandidateCount === "number"
+          ? details.relayCandidateCount : 0,
+      }).catch(() => undefined);
     },
     connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal, alpnProtocols }) => {
       const value = await request({ operation: "tlsOpen", host, port, certPem, keyPem, caPem: caPem ?? null,
@@ -179,8 +188,18 @@ async function startDocuments(android: AndroidRuntime) {
     ownedDevices: documents.ownedDevices,
     sessionSharedFolders: documents.sessionSharedFolders,
     rememberFolder: documents.rememberFolder,
-    syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1], excludeFolderIds: readonly string[]) =>
-      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds }),
+    cachedFiles: documents.cachedFiles,
+    digestCachedFiles: documents.digestCachedFiles,
+    beginDownload: documents.beginDownload,
+    write: documents.write,
+    finishDownload: documents.finishDownload,
+    release: documents.release,
+    open: documents.open,
+    size: documents.size,
+    read: documents.read,
+    syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1], excludeFolderIds: readonly string[],
+      onProgress?: (progress: FavoriteSyncProgress) => void) =>
+      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds, onProgress }),
   };
 }
 
@@ -216,6 +235,14 @@ class AndroidSessionRuntime {
     await session.remoteFs.writeFileStream(folderId, path, source, options);
   });
 
+  private transferWork: Promise<void> = Promise.resolve();
+  private readonly transferJobs: ReturnType<typeof createServiceTransferJobs>;
+
+  private withTransferLock = <T>(work: () => Promise<T>): Promise<T> => {
+    const next = this.transferWork.catch(() => undefined).then(work);
+    this.transferWork = next.then(() => undefined, () => undefined);
+    return next;
+  };
   private peerStatusUnsubscribe: (() => void) | null = null;
 
   private constructor(
@@ -225,6 +252,18 @@ class AndroidSessionRuntime {
     private readonly nativeRequest: AndroidRuntimeRequest,
   ) {
     this.lifecycle = this.createLifecycle();
+    this.transferJobs = createServiceTransferJobs({
+      documents: this.documents,
+      remoteFs: () => this.lifecycle.getSession()?.remoteFs ?? null,
+      peerId: () => this.lifecycle.getSession()?.remoteDeviceId ?? null,
+      readStaged: async (stageId, sizeBytes, offset, length) => {
+        const response = await this.nativeRequest({ operation: "transferStageRead", stageId, sizeBytes, offset, length }) as
+          { bytes: string };
+        return decodeBase64(response.bytes, 64 * 1024);
+      },
+      runExclusive: work => this.withTransferLock(work),
+      progress: async value => { await this.nativeRequest({ operation: "transferJobProgress", ...value }); },
+    });
   }
 
   static async create(android: AndroidRuntime, documents: Documents): Promise<AndroidSessionRuntime> {
@@ -470,33 +509,24 @@ class AndroidSessionRuntime {
     return session;
   };
 
-  private connectSession = async (options: ConnectOptions): Promise<SyncpeerSessionHandle> => {
+  private connectSession = async (options: ConnectOptions): Promise<SyncpeerSessionHandle | null> => {
     try {
       return await this.lifecycle.connect(options);
     } catch (error) {
-      // The lifecycle keeps retrying after a failed opening, for example when
-      // the foreground app's session briefly overlaps the background handoff.
-      // The service needs the runtime-bound session rather than the first
-      // rejection, so wait for the lifecycle's own retry to connect.
       const phase = this.lifecycle.getState().phase;
-      if (phase !== "waiting" && phase !== "reconnecting" && phase !== "connecting") {
-        this.adapter.log?.("core.session.connect.failed", {
+      if (phase === "waiting" || phase === "reconnecting" || phase === "connecting") {
+        // The native runtime owns the reconnect loop. Do not keep the original
+        // WebView connect RPC unresolved for 60 seconds while its retry sleeps:
+        // the UI subscribes to authenticated native sessionStatus events.
+        this.adapter.log?.("core.session.connect.retrying", {
           message: `${phase}: ${error instanceof Error ? error.message : String(error)}`,
         });
-        throw error;
+        return null;
       }
-      this.adapter.log?.("core.session.connect.retrying", {
+      this.adapter.log?.("core.session.connect.failed", {
         message: `${phase}: ${error instanceof Error ? error.message : String(error)}`,
       });
-      const connected = await waitForLifecyclePhase(this.lifecycle, "connected", 60_000);
-      if (!connected) {
-        this.adapter.log?.("core.session.connect.failed", {
-          message: `${this.lifecycle.getState().phase}: ${error instanceof Error ? error.message : String(error)}`,
-        });
-        throw error;
-      }
-      this.adapter.log?.("core.session.connect.recovered", {});
-      return await this.lifecycle.ensureSession(options);
+      throw error;
     }
   };
 
@@ -507,6 +537,7 @@ class AndroidSessionRuntime {
     const options = request.options as ConnectOptions;
     this.activeOptions = options;
     const session = await this.connectSession(options);
+    if (!session) return { phase: "reconnecting" };
     this.adapter.log?.("core.session.connect.session_ready", { message: session.transportKind });
     const folders = await session.remoteFs.listFolders();
     this.adapter.log?.("core.session.connect.folders_ready", { message: String(folders.length) });
@@ -534,6 +565,7 @@ class AndroidSessionRuntime {
   };
 
   private disconnectCommand = async () => {
+    this.transferJobs.cancelAll();
     this.downloads.cancelAll();
     this.uploads.cancelAll();
     this.activeOptions = null;
@@ -543,12 +575,38 @@ class AndroidSessionRuntime {
     return { phase: "idle" };
   };
 
-  private syncFavoritesCommand = async () => {
+  private syncFavoritesCommand = (request: Record<string, unknown>) => this.withTransferLock(async () => {
     const session = this.lifecycle.getSession();
     if (!session) return { phase: "waiting" };
-    return this.documents.syncFavorites(session.remoteFs, this.sharedFolderIds);
-  };
-
+    const runId = typeof request.runId === "number" ? request.runId : 0;
+    let sequence = 0, lastSentAtMs = 0;
+    let pending: FavoriteSyncProgress | null = null;
+    let scheduled: ReturnType<typeof setTimeout> | null = null;
+    const dispatch = () => {
+      scheduled = null;
+      if (!pending) return;
+      const progress = pending;
+      pending = null;
+      lastSentAtMs = Date.now();
+      // Only safe stage and numeric counts leave the JS isolate. At most one
+      // progress notification per second; a trailing update identifies stalls.
+      void this.nativeRequest({ operation: "favoriteSyncProgress", runId, sequence: ++sequence,
+        ...progress }).catch(() => undefined);
+    };
+    try {
+      return await this.documents.syncFavorites(session.remoteFs, this.sharedFolderIds, progress => {
+        pending = progress;
+        const delay = Math.max(0, 1000 - (Date.now() - lastSentAtMs));
+        if (delay === 0) {
+          if (scheduled !== null) clearTimeout(scheduled);
+          dispatch();
+        } else if (scheduled === null) scheduled = setTimeout(dispatch, delay);
+      });
+    } finally {
+      if (scheduled !== null) clearTimeout(scheduled);
+      dispatch();
+    }
+  });
   private releaseLocalCopyCommand = async (request: Record<string, unknown>) => {
     if (typeof request.folderId !== "string" || !request.folderId || request.folderId.length > 4096) {
       throw new Error("Invalid release folder identity.");
@@ -568,6 +626,7 @@ class AndroidSessionRuntime {
     }
     this.downloads.cancelAll();
     this.uploads.cancelAll();
+    this.transferJobs.cancelAll();
     await this.lifecycle.disconnect();
     await this.stopIncomingService();
     this.sharedFolderIds = [];
@@ -668,7 +727,18 @@ class AndroidSessionRuntime {
         if (this.activeOptions) this.activeOptions = { ...this.activeOptions, folderPasswords: { ...folderPasswords } };
         return { updated: true };
       }
-      case "syncFavorites": return this.syncFavoritesCommand();
+      case "transferJobStart": return this.transferJobs.start({
+        id: String(request.id), direction: request.direction as "download" | "upload",
+        peerId: String(request.peerId),
+        folderId: String(request.folderId), path: String(request.path),
+        ...(typeof request.attempts === "number" ? { attempts: request.attempts } : {}),
+        ...(typeof request.stageId === "string" ? { stageId: request.stageId } : {}),
+        ...(typeof request.sizeBytes === "number" ? { sizeBytes: request.sizeBytes } : {}),
+        ...(typeof request.modifiedMs === "number" ? { modifiedMs: request.modifiedMs } : {}),
+        ...(typeof request.sha256 === "string" ? { sha256: request.sha256 } : {}),
+      });
+      case "transferJobCancel": return this.transferJobs.cancel(String(request.id));
+      case "syncFavorites": return this.syncFavoritesCommand(request);
       case "releaseLocalCopy": return this.releaseLocalCopyCommand(request);
       case "status": return { ...this.lifecycle.getState(), active: !!this.lifecycle.getSession(), hasOptions: !!this.activeOptions };
       default: {
@@ -686,6 +756,7 @@ class AndroidSessionRuntime {
     this.peerStatusUnsubscribe = null;
     this.downloads.cancelAll();
     this.uploads.cancelAll();
+    this.transferJobs.cancelAll();
     this.activeOptions = null;
     this.sharedFolderIds = [];
     await this.lifecycle.disconnect();

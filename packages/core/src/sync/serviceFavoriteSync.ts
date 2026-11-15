@@ -23,6 +23,17 @@ export interface FavoriteSyncResult {
     | "waiting" | "conflict" | "error" | "unavailable";
   message?: string;
 }
+/** Redacted progress for Android diagnostics; never includes folder IDs or paths. */
+export type FavoriteSyncProgress = {
+  stage: "index" | "storage" | "listing" | "planning" | "download" | "upload" | "delete" | "processing" | "folder_done" | "complete";
+  folderOrdinal: number;
+  folderCount: number;
+  itemOrdinal?: number;
+  itemCount?: number;
+  transferredBytes?: number;
+  totalBytes?: number;
+};
+
 
 interface FavoriteContext {
   documents: DocumentFilesystem;
@@ -34,6 +45,7 @@ interface FavoriteContext {
   renames: FavoriteRename[];
   nowMs: number;
   persist: () => Promise<void>;
+  reportTransfer?: (stage: "download" | "upload" | "delete", transferredBytes?: number, totalBytes?: number) => void;
 }
 
 /** Hashes one document without materializing it. */
@@ -124,7 +136,10 @@ const downloadFavorite = async (context: FavoriteContext, path: string,
   await setEntry(context, path, { phase: "downloading", attempts: context.entries[path]?.attempts ?? 0,
     updatedAtMs: context.nowMs, nextAttemptMs: 0 });
   const sink = documentDownloadSink(context.documents, context.folderId, path, remote.modifiedMs, expectedLocalHash);
-  try { await context.remoteFs.readFileToSink(context.folderId, path, sink); }
+  try {
+    await context.remoteFs.readFileToSink(context.folderId, path, sink, progress =>
+      context.reportTransfer?.("download", progress.downloadedBytes, progress.totalBytes));
+  }
   catch (error) { await sink.abort(error); throw error; }
 };
 
@@ -135,7 +150,9 @@ const uploadFavorite = async (context: FavoriteContext, path: string,
   const modifiedMs = context.nowMs;
   try {
     await context.remoteFs.writeFileStream(context.folderId, path, source,
-      { modifiedMs, waitForRemote: true, expectedHash: local.hash });
+      { modifiedMs, waitForRemote: true, expectedHash: local.hash,
+        onProgress: progress => context.reportTransfer?.("upload", progress.processedBytes, progress.totalBytes) });
+    context.reportTransfer?.("upload", source.size, source.size);
     const baseline = { hash: local.hash, sizeBytes: source.size, modifiedMs };
     await context.documents.setSyncBaseline(id, baseline);
     return baseline;
@@ -297,10 +314,10 @@ const planAndRunCandidate = async (context: FavoriteContext, candidate: Favorite
     case "unchanged":
       if (context.entries[path]?.phase !== "synced") await markSynced(context, path);
       return { folderId: context.folderId, path, result: "unchanged" };
-    case "download": return runDownload(context, path, candidate.remote!, action.expectedLocalHash);
-    case "upload": return runUpload(context, path, local!);
-    case "delete-remote": return runDeleteRemote(context, path);
-    case "delete-local": return runDeleteLocal(context, path);
+    case "download": context.reportTransfer?.("download"); return runDownload(context, path, candidate.remote!, action.expectedLocalHash);
+    case "upload": context.reportTransfer?.("upload"); return runUpload(context, path, local!);
+    case "delete-remote": context.reportTransfer?.("delete"); return runDeleteRemote(context, path);
+    case "delete-local": context.reportTransfer?.("delete"); return runDeleteLocal(context, path);
     default: {
       const entry = await recordIssue(context, path, "conflict", action.message);
       return { folderId: context.folderId, path, result: "conflict", message: entry.message };
@@ -355,8 +372,11 @@ const syncFolderFavorites = async (args: {
   exclusions: FavoriteExclusion[];
   patterns: string[];
   nowMs: number;
+  report?: (stage: FavoriteSyncProgress["stage"], itemOrdinal?: number, itemCount?: number,
+    transferredBytes?: number, totalBytes?: number) => void;
 }): Promise<FavoriteSyncResult[]> => {
-  const { documents, remoteFs, folder, favorites, exclusions, patterns, nowMs } = args;
+  const { documents, remoteFs, folder, favorites, exclusions, patterns, nowMs, report } = args;
+  report?.("index");
   let indexState = await remoteFs.getFolderSyncState(folder.id);
   if (indexState?.indexReceived !== true) {
     await remoteFs.waitForFolderIndex(folder.id, 6000, 120);
@@ -365,6 +385,7 @@ const syncFolderFavorites = async (args: {
   if (indexState?.indexReceived !== true) {
     return favoriteFolderResults(folder.id, favorites, "waiting", "Folder index is still being received.");
   }
+  report?.("storage");
   let cached: CachedFileRecord[], state;
   try {
     cached = await documents.cachedFiles(folder.id);
@@ -373,9 +394,12 @@ const syncFolderFavorites = async (args: {
     return favoriteFolderResults(folder.id, favorites, "unavailable",
       error instanceof Error ? error.message : "Document folder is unavailable.");
   }
+  let itemOrdinal = 0, itemCount = 0;
   const context: FavoriteContext = { documents, remoteFs, folderId: folder.id, storageId: folder.storageId,
     cached: new Map(cached.map(file => [file.path, file])), entries: state.entries, renames: state.renames,
-    nowMs, persist: async () => { await documents.saveFavoriteSyncEntries(folder.id, context.entries); } };
+    nowMs, persist: async () => { await documents.saveFavoriteSyncEntries(folder.id, context.entries); },
+    reportTransfer: (stage, transferredBytes, totalBytes) =>
+      report?.(stage, itemOrdinal, itemCount, transferredBytes, totalBytes) };
   const results: FavoriteSyncResult[] = [];
   const hadRenames = context.renames.length > 0;
   if (!await runRenames(context, results)) return results;
@@ -387,10 +411,12 @@ const syncFolderFavorites = async (args: {
   const activeFavorites = current?.favorites ?? favorites;
   const activeExclusions = current?.exclusions ?? exclusions;
   const activePatterns = current?.ignorePatterns ?? patterns;
+  report?.("listing");
   const sourceDeviceId = remoteFs.getRemoteDeviceInfo()?.id;
   const onDirectory = sourceDeviceId ? async (path: string, entries: FileEntry[]) => {
+    // Offline-listing persistence is best effort. It must not abort transfers.
     await documents.saveDirectorySnapshot(folder.id, sourceDeviceId, path,
-      { entries, versionKey: "", loadedAtMs: nowMs });
+      { entries, versionKey: "", loadedAtMs: nowMs }).catch(() => undefined);
   } : undefined;
   let remote: FileEntry[];
   try {
@@ -400,13 +426,19 @@ const syncFolderFavorites = async (args: {
     const message = error instanceof Error ? error.message : "Folder contents are unavailable.";
     return results.concat(favoriteFolderResults(folder.id, activeFavorites, "unavailable", message));
   }
+  report?.("planning");
   const baselines = new Map<string, NonNullable<CachedFileRecord["syncBaseline"]>>();
   for (const file of cached) if (file.syncBaseline) baselines.set(file.path, file.syncBaseline);
   const candidates = planFavoriteCandidates({ folderId: folder.id, favorites: activeFavorites,
     exclusions: activeExclusions, patterns: activePatterns,
     remote, local: cached.map(file => ({ path: file.path, sizeBytes: file.sizeBytes, modifiedMs: file.modifiedMs ?? file.cachedAtMs })),
     baselines });
-  for (const candidate of candidates) results.push(await runCandidate(context, candidate));
+  itemCount = candidates.length;
+  for (const [index, candidate] of candidates.entries()) {
+    itemOrdinal = index + 1;
+    report?.("processing", itemOrdinal, itemCount);
+    results.push(await runCandidate(context, candidate));
+  }
   const retained = pruneEntries(context.entries, candidates, activeFavorites, context.renames);
   if (Object.keys(retained).length !== Object.keys(context.entries).length) {
     context.entries = retained;
@@ -418,7 +450,8 @@ const syncFolderFavorites = async (args: {
 export async function syncServiceFileFavorites(
   documents: DocumentFilesystem,
   remoteFs: RemoteFs,
-  options: { nowMs?: number; excludeFolderIds?: readonly string[] } = {},
+  options: { nowMs?: number; excludeFolderIds?: readonly string[];
+    onProgress?: (progress: FavoriteSyncProgress) => void } = {},
 ): Promise<{ skipped?: "locked"; results: FavoriteSyncResult[] }> {
   const nowMs = options.nowMs ?? Date.now();
   const status = await documents.status();
@@ -430,18 +463,40 @@ export async function syncServiceFileFavorites(
     .map(folder => [folder.id, folder]));
   const folderInfos = new Map((await remoteFs.listFolders()).map(folder => [folder.id, folder]));
   const results: FavoriteSyncResult[] = [];
-  for (const [folderId, folderSettings] of Object.entries(settings.folders)) {
-    const folder = registered.get(folderId);
+  const targets = Object.entries(settings.folders).filter(([folderId, value]) =>
+    registered.has(folderId) && !value.paused && value.favorites.length > 0);
+  const report = (progress: FavoriteSyncProgress) => {
+    // Diagnostics must never be allowed to break synchronization.
+    try { options.onProgress?.(progress); } catch { /* nonessential */ }
+  };
+  for (const [index, [folderId, folderSettings]] of targets.entries()) {
+    const folder = registered.get(folderId)!;
     const favorites = folderSettings.favorites;
-    if (!folder || folderSettings.paused || favorites.length === 0) continue;
-    const info = folderInfos.get(folderId);
-    if (!info || info.needsPassword || info.passwordError || info.stopReason) {
+    const folderOrdinal = index + 1, folderCount = targets.length;
+    const emit = (stage: FavoriteSyncProgress["stage"], itemOrdinal?: number, itemCount?: number,
+      transferredBytes?: number, totalBytes?: number) =>
+      report({ stage, folderOrdinal, folderCount,
+        ...(itemOrdinal !== undefined ? { itemOrdinal } : {}),
+        ...(itemCount !== undefined ? { itemCount } : {}),
+        ...(transferredBytes !== undefined ? { transferredBytes } : {}),
+        ...(totalBytes !== undefined ? { totalBytes } : {}) });
+    try {
+      const info = folderInfos.get(folderId);
+      if (!info || info.needsPassword || info.passwordError || info.stopReason) {
+        results.push(...favoriteFolderResults(folderId, favorites, "unavailable",
+          "Folder metadata is unavailable for synchronization."));
+        continue;
+      }
+      results.push(...await syncFolderFavorites({ documents, remoteFs, folder, favorites,
+        exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs, report: emit }));
+    } catch (error) {
+      // A transient failure on one folder must not prevent all other favorites syncing.
       results.push(...favoriteFolderResults(folderId, favorites, "unavailable",
-        "Folder metadata is unavailable for synchronization."));
-      continue;
+        error instanceof Error ? error.message : "Folder sync failed."));
+    } finally {
+      emit("folder_done");
     }
-    results.push(...await syncFolderFavorites({ documents, remoteFs, folder, favorites,
-      exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs }));
   }
+  report({ stage: "complete", folderOrdinal: targets.length, folderCount: targets.length });
   return { results };
 }

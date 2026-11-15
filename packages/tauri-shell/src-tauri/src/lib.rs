@@ -4100,6 +4100,36 @@ async fn syncpeer_android_session_command(
 }
 
 #[tauri::command]
+async fn syncpeer_android_diagnostic_logs(
+    app: tauri::AppHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app.syncpeer_android().diagnostic_logs(request)
+            .map_err(|error| {
+                // Android rejects with the exception class only. Do not expose raw
+                // plugin errors, which could contain private filesystem paths.
+                let failure = error.to_string();
+                let category = [
+                    "InvalidAlgorithmParameterException", "KeyStoreException",
+                    "UnrecoverableKeyException", "InvalidKeyException",
+                    "ProviderException", "IOException", "SecurityException",
+                ]
+                .into_iter()
+                .find(|name| failure.contains(name))
+                .unwrap_or("UnknownNativeFailure");
+                format!("Encrypted Android diagnostic log storage is unavailable ({category}).")
+            });
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, request);
+        Err("Android diagnostic logs are unavailable on this platform.".to_string())
+    }
+}
+
+#[tauri::command]
 async fn syncpeer_android_release_local_copy(
     app: tauri::AppHandle,
     request: serde_json::Value,
@@ -4191,6 +4221,37 @@ async fn syncpeer_android_stop_transfer_service(app: tauri::AppHandle) -> Result
     {
         let _ = app;
         Ok(())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_readiness(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        return app.syncpeer_android().android_readiness()
+            .map_err(|_| "Android permissions and restrictions could not be read.".to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("Android readiness is unavailable on this platform.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn syncpeer_android_open_system_settings(app: tauri::AppHandle, target: String) -> Result<(), String> {
+    if !["app", "notifications", "battery", "power-saver", "data-saver"].contains(&target.as_str()) {
+        return Err("Invalid Android settings destination.".to_string());
+    }
+    #[cfg(target_os = "android")]
+    {
+        return app.syncpeer_android().open_android_system_settings(&target)
+            .map_err(|_| "Android settings could not be opened.".to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err("Android settings are unavailable on this platform.".to_string())
     }
 }
 
@@ -5175,10 +5236,13 @@ pub fn run() {
             syncpeer_android_prepare_background_session,
             syncpeer_android_start_background_session,
             syncpeer_android_session_command,
+            syncpeer_android_diagnostic_logs,
             syncpeer_android_release_local_copy,
             syncpeer_android_biometric_status,
             syncpeer_android_biometric_set_enabled,
             syncpeer_android_biometric_authenticate,
+            syncpeer_android_readiness,
+            syncpeer_android_open_system_settings,
             syncpeer_android_stop_transfer_service,
             syncpeer_android_stop_background_session,
             syncpeer_android_disarm_background_session,

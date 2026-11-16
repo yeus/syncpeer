@@ -39,16 +39,22 @@ import { isConfiguredDeviceName } from "./suggestedNames.ts";
 
 const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
 const SESSION_LOG_LIMIT = 4000;
-const sessionLogObservers = new WeakMap<object, (entry: {
+type SessionLogObserver = (entry: {
   id: string; timestampMs: number; level: "info" | "warning" | "error";
   event: string; message: string; details?: unknown;
-}) => void>();
+}) => void;
+const sessionLogObservers = new WeakMap<object, Set<SessionLogObserver>>();
 export const observeSessionLogs = (
   state: AppState,
-  observer: NonNullable<ReturnType<typeof sessionLogObservers.get>>,
+  observer: SessionLogObserver,
 ): (() => void) => {
-  sessionLogObservers.set(state, observer);
-  return () => { sessionLogObservers.delete(state); };
+  const observers = sessionLogObservers.get(state) ?? new Set<SessionLogObserver>();
+  observers.add(observer);
+  sessionLogObservers.set(state, observers);
+  return () => {
+    observers.delete(observer);
+    if (observers.size === 0) sessionLogObservers.delete(state);
+  };
 };
 const MAX_VISIBLE_CRUMBS = 4;
 const DEFAULT_DIRECTORY_PAGE_SIZE = 200;
@@ -549,8 +555,10 @@ export const pushSessionLog = (
   };
   state.logs.items = [item, ...state.logs.items].slice(0, SESSION_LOG_LIMIT);
   state.logs.nextId += 1;
-  try { sessionLogObservers.get(state)?.(item); }
-  catch { /* Diagnostics must not change application behavior. */ }
+  for (const observer of sessionLogObservers.get(state) ?? []) {
+    try { observer(item); }
+    catch { /* Diagnostics must not change application behavior. */ }
+  }
 };
 
 const classifyUiLogLevel = (

@@ -33,7 +33,12 @@ const tauriConfig = JSON.parse(await readFile(
   path.join(tauriRoot, "src-tauri/tauri.conf.json"),
   "utf8",
 ));
-const debDir = path.join(tauriRoot, "src-tauri/target/release/bundle/deb");
+// Tauri honors CARGO_TARGET_DIR; use the artifact from this build rather
+// than accidentally testing a stale .deb in src-tauri/target.
+const cargoTarget = process.env.CARGO_TARGET_DIR
+  ? path.resolve(process.env.CARGO_TARGET_DIR)
+  : path.join(tauriRoot, "src-tauri/target");
+const debDir = path.join(cargoTarget, "release/bundle/deb");
 const candidates = (await readdir(debDir))
   .filter(name => name.startsWith(`Syncpeer_${tauriConfig.version}_`) && name.endsWith(".deb"));
 assert.equal(candidates.length, 1,

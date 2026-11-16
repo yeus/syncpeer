@@ -42,6 +42,19 @@ const fixture = () => {
   return { entries, port, failNextAppend: () => { failAppend = true; } };
 };
 
+test("E2E log stream and native journal can observe the same events independently", () => {
+  const state = createInitialState(null);
+  const journal: string[] = [], e2e: string[] = [];
+  const stopJournal = observeSessionLogs(state, entry => { journal.push(entry.event); });
+  const stopE2e = observeSessionLogs(state, entry => { e2e.push(entry.event); });
+  pushSessionLog(state, "info", "client.shared_folders.selected", "Synthetic folder selection.");
+  stopE2e();
+  pushSessionLog(state, "warning", "core.replica.index.decision", "Synthetic replica index.");
+  assert.deepEqual(journal, ["client.shared_folders.selected", "core.replica.index.decision"]);
+  assert.deepEqual(e2e, ["client.shared_folders.selected"]);
+  stopJournal();
+});
+
 test("two app runs restore previous crash logs and sanitize secrets before durable storage", async () => {
   const native = fixture();
   const app = createInitialState(null);

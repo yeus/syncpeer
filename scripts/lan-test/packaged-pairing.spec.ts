@@ -333,6 +333,10 @@ async function acceptPendingApproval(peer: WebdriverIO.Browser) {
 async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
   await peer.execute(() => {
     const observed = window as typeof window & {
+      __syncpeerObserveLogEntries?: (
+        listener: (entry: { event: string; details?: unknown }) => void,
+      ) => () => void;
+      __syntheticLogCleanup?: () => void;
       __syntheticFolderCounts?: number[];
       __syntheticFolderTotalCounts?: number[];
       __syntheticEvents?: string[];
@@ -345,6 +349,9 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
       __syntheticQueueStages?: string[];
       __syntheticSettingsRefresh?: string[];
     };
+    if (!observed.__syncpeerObserveLogEntries)
+      throw new Error("Packaged E2E log stream is unavailable.");
+    observed.__syntheticLogCleanup?.();
     observed.__syntheticFolderCounts = [];
     observed.__syntheticFolderTotalCounts = [];
     observed.__syntheticEvents = [];
@@ -356,204 +363,67 @@ async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
     observed.__syntheticHandshakeStages = [];
     observed.__syntheticQueueStages = [];
     observed.__syntheticSettingsRefresh = [];
-    const summary = [...document.querySelectorAll("summary")].find((value) =>
-      value.textContent?.includes("View logs"),
-    );
-    const list = summary?.parentElement?.querySelector("ul.list");
-    if (!list) throw new Error("The session log list is unavailable.");
-    type Observed = typeof observed;
-    // WebdriverIO serializes this callback with Function#toString. Keep helpers
-    // as object methods: tsx names function bindings with a module-scoped
-    // __name helper that does not exist in the page.
-    const handlers = {
-      processEntry(entry: Element, node: Element, observed: Observed) {
-            const event = entry.textContent?.split(" | ").at(-1)?.trim();
-            if (event === "document.session_folders.queued") {
-              const details =
-                node.querySelector("pre.log-details")?.textContent;
-              const stage = details
-                ? (JSON.parse(details) as {
-                    operation?: string;
-                    activeOperation?: string;
-                    queuedMs?: number;
-                    elapsedMs?: number;
-                  })
-                : {};
-              observed.__syntheticQueueStages?.push(
-                `${event}:${stage.operation ?? stage.activeOperation ?? "?"}:` +
-                  `${stage.queuedMs ?? stage.elapsedMs ?? 0}`,
-              );
-              observed.__syntheticQueueStages?.splice(
-                0,
-                Math.max(0, observed.__syntheticQueueStages.length - 20),
-              );
-            }
-            if (event?.startsWith("tauri.invoke.")) {
-              const details =
-                node.querySelector("pre.log-details")?.textContent;
-              const command = details
-                ? (JSON.parse(details) as { command?: string }).command
-                : undefined;
-              if (
-                [
-                  "syncpeer_tls_accept",
-                  "syncpeer_tls_listen",
-                  "syncpeer_replica_storage",
-                  "syncpeer_profile_storage_root",
-                  "syncpeer_vault_secret",
-                ].includes(command ?? "")
-              ) {
-                const key = `${event}:${command}`;
-                observed.__syntheticNativeCalls![key] =
-                  (observed.__syntheticNativeCalls![key] ?? 0) + 1;
-              }
-            }
-            if (event?.startsWith("document.settings_refresh.")) {
-              const details = node.querySelector("pre.log-details")?.textContent;
-              const summary = `${event}:${details ?? "{}"}`;
-              observed.__syntheticSettingsRefresh?.push(summary);
-              observed.__syntheticSettingsRefresh?.splice(0,
-                Math.max(0, observed.__syntheticSettingsRefresh.length - 20));
-            }
-            if (
-              event &&
-              /^(client\.|core\.|document\.)/.test(event) &&
-              !observed.__syntheticEvents?.includes(event)
-            )
-              observed.__syntheticEvents?.push(event);
-            if (
-              event?.startsWith("core.bep.handshake.") ||
-              event?.startsWith("core.incoming.trace.") ||
-              event === "core.bep.cluster_config.wait"
-            ) {
-              const details =
-                node.querySelector("pre.log-details")?.textContent;
-              if (details) {
-                const stage = JSON.parse(details) as {
-                  direction?: string;
-                  connectedHost?: string;
-                  connectedPort?: number;
-                };
-                const summary =
-                  `${Date.now()}:${event}:${stage.direction ?? "unknown"}:` +
-                  `${stage.connectedHost ?? "?"}:${stage.connectedPort ?? "?"}`;
-                if (!observed.__syntheticHandshakeStages?.includes(summary)) {
-                  observed.__syntheticHandshakeStages?.push(summary);
-                }
-              }
-            }
-            if (
-              event === "core.upload.request.failed" ||
-              event === "core.replica.receive.failed" ||
-              event === "core.replica.scan.failed" ||
-              event === "core.socket.closed" ||
-              event === "core.incoming.failed" ||
-              event === "core.session.refresh.failed"
-            ) {
-              const details = entry
-                .closest("li")
-                ?.querySelector("pre.log-details")?.textContent;
-              if (details) {
-                const message = (JSON.parse(details) as { message?: string })
-                  .message;
-                if (message && !observed.__syntheticFailures?.includes(message))
-                  observed.__syntheticFailures?.push(message);
-              }
-            }
-            if (
-              event === "core.replica.index.decision" ||
-              event === "core.replica.index.receive.done"
-            ) {
-              const details = entry
-                .closest("li")
-                ?.querySelector("pre.log-details")?.textContent;
-              if (details) {
-                const state = JSON.parse(details) as {
-                  internal?: boolean;
-                  hasReceiver?: boolean;
-                  paused?: boolean;
-                  needsPassword?: boolean;
-                  fileCount?: number;
-                  changed?: boolean;
-                };
-                const summary = JSON.stringify({
-                  event,
-                  internal: state.internal,
-                  hasReceiver: state.hasReceiver,
-                  paused: state.paused,
-                  needsPassword: state.needsPassword,
-                  fileCount: state.fileCount,
-                  changed: state.changed,
-                });
-                if (!observed.__syntheticReplicaStates?.includes(summary))
-                  observed.__syntheticReplicaStates?.push(summary);
-              }
-            }
-            if (
-              event === "core.index.received" ||
-              event === "core.index.applied"
-            ) {
-              const details = entry
-                .closest("li")
-                ?.querySelector("pre.log-details")?.textContent;
-              if (details) {
-                const info = JSON.parse(details) as {
-                  fileCount?: number;
-                  storedFiles?: number;
-                  processedFiles?: number;
-                  decryptedStored?: number;
-                  decryptFailed?: number;
-                  needsPassword?: boolean;
-                  passwordError?: string | null;
-                };
-                const summary = JSON.stringify({
-                  event,
-                  fileCount: info.fileCount,
-                  storedFiles: info.storedFiles,
-                  processedFiles: info.processedFiles,
-                  decryptedStored: info.decryptedStored,
-                  decryptFailed: info.decryptFailed,
-                  needsPassword: info.needsPassword,
-                  passwordError: info.passwordError,
-                });
-                if (!observed.__syntheticIndexes?.includes(summary))
-                  observed.__syntheticIndexes?.push(summary);
-              }
-            }
-            if (event !== "client.shared_folders.selected") return;
-            observed.__syntheticSelectionEvents =
-              (observed.__syntheticSelectionEvents ?? 0) + 1;
-            const details = node.querySelector("pre.log-details")?.textContent;
-            if (!details) return;
-            const counts = JSON.parse(details) as {
-              count?: number;
-              internalCount?: number;
-            };
-            if (
-              typeof counts.internalCount === "number" &&
-              !observed.__syntheticFolderCounts?.includes(counts.internalCount)
-            ) {
-              observed.__syntheticFolderCounts?.push(counts.internalCount);
-            }
-            if (
-              typeof counts.count === "number" &&
-              !observed.__syntheticFolderTotalCounts?.includes(counts.count)
-            ) {
-              observed.__syntheticFolderTotalCounts?.push(counts.count);
-            }
-      },
-      processNode(node: Node, observed: Observed) {
-        if (!(node instanceof Element) || !node.matches("li")) return;
-        for (const entry of node.querySelectorAll(".item-meta")) {
-          handlers.processEntry(entry, node, observed);
-        }
-      },
-    };
-    const observer = new MutationObserver((records) => {
-      for (const record of records)
-        for (const node of record.addedNodes) handlers.processNode(node, observed);
+
+    // Read the source event stream, independent of which tab or log panel is
+    // mounted. The production log journal retains its own independent observer.
+    observed.__syntheticLogCleanup = observed.__syncpeerObserveLogEntries(({ event, details }) => {
+      const data = details && typeof details === "object"
+        ? details as Record<string, unknown> : {};
+      if (/^(client\.|core\.|document\.)/.test(event) &&
+        !observed.__syntheticEvents?.includes(event)) observed.__syntheticEvents?.push(event);
+
+      if (event === "client.shared_folders.selected") {
+        observed.__syntheticSelectionEvents = (observed.__syntheticSelectionEvents ?? 0) + 1;
+        if (typeof data.internalCount === "number" &&
+          !observed.__syntheticFolderCounts?.includes(data.internalCount))
+          observed.__syntheticFolderCounts?.push(data.internalCount);
+        if (typeof data.count === "number" &&
+          !observed.__syntheticFolderTotalCounts?.includes(data.count))
+          observed.__syntheticFolderTotalCounts?.push(data.count);
+      }
+      if (event === "document.session_folders.queued") {
+        observed.__syntheticQueueStages?.push(
+          `${event}:${data.operation ?? data.activeOperation ?? "?"}:${data.queuedMs ?? data.elapsedMs ?? 0}`);
+        observed.__syntheticQueueStages?.splice(0,
+          Math.max(0, observed.__syntheticQueueStages.length - 20));
+      }
+      if (event.startsWith("tauri.invoke.") &&
+        ["syncpeer_tls_accept", "syncpeer_tls_listen", "syncpeer_replica_storage",
+          "syncpeer_profile_storage_root", "syncpeer_vault_secret"].includes(String(data.command ?? ""))) {
+        const key = `${event}:${data.command}`;
+        observed.__syntheticNativeCalls![key] = (observed.__syntheticNativeCalls![key] ?? 0) + 1;
+      }
+      if (event.startsWith("document.settings_refresh.")) {
+        observed.__syntheticSettingsRefresh?.push(`${event}:${JSON.stringify(data)}`);
+        observed.__syntheticSettingsRefresh?.splice(0,
+          Math.max(0, observed.__syntheticSettingsRefresh.length - 20));
+      }
+      if (event.startsWith("core.bep.handshake.") ||
+        event.startsWith("core.incoming.trace.") || event === "core.bep.cluster_config.wait") {
+        observed.__syntheticHandshakeStages?.push(
+          `${Date.now()}:${event}:${data.direction ?? "unknown"}:${data.connectedHost ?? "?"}:${data.connectedPort ?? "?"}`);
+      }
+      if (["core.upload.request.failed", "core.replica.receive.failed",
+        "core.replica.scan.failed", "core.socket.closed", "core.incoming.failed",
+        "core.session.refresh.failed"].includes(event) &&
+        typeof data.message === "string" && !observed.__syntheticFailures?.includes(data.message))
+        observed.__syntheticFailures?.push(data.message);
+
+      if (event === "core.replica.index.decision" || event === "core.replica.index.receive.done") {
+        const summary = JSON.stringify({ event,
+          internal: data.internal, hasReceiver: data.hasReceiver, paused: data.paused,
+          needsPassword: data.needsPassword, fileCount: data.fileCount, changed: data.changed });
+        if (!observed.__syntheticReplicaStates?.includes(summary))
+          observed.__syntheticReplicaStates?.push(summary);
+      }
+      if (event === "core.index.received" || event === "core.index.applied") {
+        const summary = JSON.stringify({ event, fileCount: data.fileCount,
+          storedFiles: data.storedFiles, processedFiles: data.processedFiles,
+          decryptedStored: data.decryptedStored, decryptFailed: data.decryptFailed,
+          needsPassword: data.needsPassword, passwordError: data.passwordError });
+        if (!observed.__syntheticIndexes?.includes(summary)) observed.__syntheticIndexes?.push(summary);
+      }
     });
-    observer.observe(list, { childList: true });
   });
 }
 

@@ -120,6 +120,9 @@
       logs: Array<{ event: string; message: string }>;
       syncTrace: Array<{ event: string; timestampMs: number; fileCount?: number; changed?: boolean }>;
     };
+    __syncpeerObserveLogEntries?: (
+      observer: (entry: { event: string; details?: unknown }) => void,
+    ) => () => void;
     __syncpeerStoreStateProbe?: () => {
       currentFolderId: string;
       currentPath: string;
@@ -755,6 +758,10 @@
 
     if (import.meta.env.SYNCPEER_LAN_E2E === true) {
       const testWindow = window as SyncpeerTestWindow;
+      // E2E instrumentation must observe the source stream, never a mounted
+      // or expanded diagnostic UI panel.
+      testWindow.__syncpeerObserveLogEntries = listener =>
+        observeSessionLogs(app, entry => listener({ event: entry.event, details: entry.details }));
       testWindow.__syncpeerSetRelayPoolUrl = (url: string) => {
         app.connection.relayPoolUrl = url;
       };
@@ -869,6 +876,7 @@
         delete testWindow.__syncpeerClearDownloadProgress;
         delete testWindow.__syncpeerDigestCachedFile;
         delete testWindow.__syncpeerReadCachedDocument;
+        delete testWindow.__syncpeerObserveLogEntries;
         delete testWindow.__syncpeerStateProbe;
         delete testWindow.__syncpeerDocumentProbe;
         delete testWindow.__syncpeerStoreStateProbe;

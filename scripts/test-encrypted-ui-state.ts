@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createEncryptedUiStateStore } from "../packages/app/src/app/encryptedUiState.ts";
+import { loadVerifiedFolderPasswords } from "../packages/app/src/app/credentialLoading.ts";
 import {
   applySensitiveAppState,
   createInitialState,
@@ -33,6 +34,44 @@ test("saved peers survive an encrypted UI-state round trip", () => {
   assert.deepEqual(restarted.devices.savedDevices.map((device) => device.id), [PEER_ID]);
   assert.equal(restarted.devices.selectedSavedDeviceId, PEER_ID);
 });
+test("startup reuses verified encrypted passwords without extra merge and reread", async () => {
+  const calls: string[] = [];
+  const saved = { "folder-1": "test-secret" };
+  const resolved = await loadVerifiedFolderPasswords({
+    load: async () => { calls.push("load"); return saved; },
+    merge: async () => { calls.push("merge"); },
+  }, { "folder-1": "test-secret" });
+  assert.deepEqual(resolved, saved);
+  assert.deepEqual(calls, ["load"]);
+});
+
+test("startup migration merges missing credentials and verifies persisted values", async () => {
+  const calls: string[] = [];
+  let saved = { "folder-1": "existing" };
+  const credentials = {
+    load: async () => { calls.push("load"); return { ...saved }; },
+    merge: async (pending: Record<string, string>) => {
+      calls.push("merge"); saved = { ...saved, ...pending };
+    },
+  };
+  const resolved = await loadVerifiedFolderPasswords(credentials, {
+    "folder-1": "existing", "folder-2": "migrated",
+  });
+  assert.deepEqual(calls, ["load", "merge", "load"]);
+  assert.deepEqual(resolved, { "folder-1": "existing", "folder-2": "migrated" });
+});
+
+test("startup rejects credential conflicts and unverified migrations", async () => {
+  await assert.rejects(loadVerifiedFolderPasswords({
+    load: async () => ({ "folder-1": "correct" }),
+    merge: async () => { throw new Error("must not merge conflicting secrets"); },
+  }, { "folder-1": "wrong" }), /Conflicting saved folder passwords/);
+  await assert.rejects(loadVerifiedFolderPasswords({
+    load: async () => ({}),
+    merge: async () => undefined,
+  }, { "folder-1": "migrated" }), /could not be verified/);
+});
+
 
 test("a failed save does not stop later encrypted UI-state saves", async () => {
   const operations: string[] = [];

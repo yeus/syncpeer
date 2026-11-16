@@ -630,8 +630,25 @@ test("a restored saved peer is dialed after the app returns to the foreground", 
     connect: async () => { calls.push("connect"); },
   });
   await actions.onAppForeground();
-  assert.deepEqual(calls, ["discover", "connect"],
+  assert.deepEqual(calls, ["connect"],
     "Unlocking restores saved peers first, then the foreground pass must dial the selected one.");
+});
+
+test("a saved peer connects immediately without a redundant LAN scan", async () => {
+  const state = createInitialState({ deviceName: "Known peer device" });
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Known peer", createdAtMs: 1, isIntroducer: false }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  const calls: string[] = [];
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => undefined } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); },
+    connect: async () => { calls.push("connect"); },
+  });
+  await actions.onAppForeground();
+  assert.deepEqual(calls, ["connect"],
+    "Known-peer session discovery should not wait for UI multicast discovery.");
 });
 
 test("first-run foreground pass does not discover or connect before naming", async () => {
@@ -703,7 +720,7 @@ test("foreground recovery waits for Android visibility handoff and coalesces rep
   assert.deepEqual(events, ["foreground"], "A service still suspended must not be dialed.");
   release();
   await Promise.all([first, second]);
-  assert.deepEqual(events, ["foreground", "discover", "connect"]);
+  assert.deepEqual(events, ["foreground", "connect"]);
 });
 
 test("network-online callbacks do not dial peers from a hidden Android WebView", async () => {
@@ -726,10 +743,10 @@ test("network-online callbacks do not dial peers from a hidden Android WebView",
   assert.deepEqual(calls, ["native-online"]);
   actions.setAppVisibility(true);
   await actions.onAppForeground();
-  assert.deepEqual(calls, ["native-online", "native-foreground", "webview-discovery", "webview-connect"]);
+  assert.deepEqual(calls, ["native-online", "native-foreground", "webview-connect"]);
 });
 
-test("a discovery started in the foreground cannot initiate a dial after backgrounding", async () => {
+test("an online callback finishing after the app hides cannot start a peer dial", async () => {
   const state = createInitialState({ deviceName: "Named device" });
   state.devices.savedDevices = [{ id: PEER_ID, name: "Peer", isIntroducer: false, createdAtMs: 1 }];
   state.devices.selectedSavedDeviceId = PEER_ID;
@@ -739,14 +756,16 @@ test("a discovery started in the foreground cannot initiate a dial after backgro
   const gate = new Promise<void>(resolve => { release = resolve; });
   const actions = createPageActions({
     state,
-    sessionStore: { actions: { setOnline: async () => {}, setForeground: async () => {} } } as never,
-    discoverLocalDevices: async () => { calls.push("discover"); await gate; },
+    sessionStore: { actions: {
+      setOnline: async () => { calls.push("online"); await gate; },
+      setForeground: async () => {},
+    } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); },
     connect: async () => { calls.push("connect"); },
   });
   const pending = actions.onNetworkOnline();
-  await Promise.resolve();
   state.ui.isAppVisible = false;
   release();
   await pending;
-  assert.deepEqual(calls, ["discover"]);
+  assert.deepEqual(calls, ["online"], "A hidden UI must not start discovery or dialing.");
 });

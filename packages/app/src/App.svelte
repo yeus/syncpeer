@@ -73,6 +73,7 @@
     sensitiveAppState,
   } from "./app/state.ts";
   import { createEncryptedUiStateStore } from "./app/encryptedUiState.ts";
+  import { loadVerifiedFolderPasswords } from "./app/credentialLoading.ts";
   import { createPersistentSessionLogs } from "./app/sessionLogPersistence.ts";
   import { createLatestDistinctTask } from "./app/latestDistinctTask.ts";
   import { readInitialVaultStatus } from "./app/initialVault.ts";
@@ -308,8 +309,7 @@
 
   async function loadEncryptedUiState() {
     if (uiStateLoaded || !folderCredentials) return;
-    const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
-    if (status.vault.phase !== "unlocked") return;
+    // Only called after the vault's unlocked state has been checked by loadFolderCredentials.
     uiStateLoaded = await encryptedUiState.load();
   }
 
@@ -337,24 +337,17 @@
     if (manual) document.querySelector<HTMLInputElement>('[data-testid="new-peer-device-id"]')?.focus();
   };
 
-  async function loadFolderCredentials() {
+  async function loadFolderCredentials(knownUnlocked = false) {
     if (!folderCredentials) return;
-    const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
-    if (status.vault.phase !== "unlocked") return;
+    if (!knownUnlocked) {
+      const status = await documentCommand<{ vault: { phase: string } }>({ operation: "status" });
+      if (status.vault.phase !== "unlocked") return;
+    }
     await loadEncryptedUiState();
-    const saved = await folderCredentials.load();
     const pending = { ...readLegacyFolderPasswords(), ...app.passwords.saved };
-    for (const [id, password] of Object.entries(pending)) {
-      if (saved[id] !== undefined && saved[id] !== password) throw new Error("Conflicting saved folder passwords require review.");
-    }
-    const merged = { ...pending, ...saved };
-    await folderCredentials.merge(merged);
-    const verifiedPasswords = await folderCredentials.load();
-    if (Object.entries(merged).some(([id, value]) => verifiedPasswords[id] !== value)) {
-      throw new Error("Encrypted credentials could not be verified; legacy data was retained.");
-    }
-    app.passwords.saved = merged;
-    app.passwords.drafts = { ...merged };
+    const verifiedPasswords = await loadVerifiedFolderPasswords(folderCredentials, pending);
+    app.passwords.saved = verifiedPasswords;
+    app.passwords.drafts = { ...verifiedPasswords };
     app.passwords.secureStorage = true;
     persistState(app, true);
     const restoreRegistrations = async () => {
@@ -683,7 +676,7 @@
           localStorageInitializing = false;
         }
       } else if (initialVault?.vault.phase === "unlocked") {
-        await loadFolderCredentials();
+        await loadFolderCredentials(true);
       } else if (initialVault?.vault.phase === "locked" && biometric &&
         await biometric.status().then(status => status.enabled).catch(() => false)) {
         await unlockWithBiometric().catch(() => undefined);

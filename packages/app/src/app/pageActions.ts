@@ -73,17 +73,16 @@ const currentAutoTarget = () =>
     : "";
 
 const discoverThenConnect = async (targetAtStart = currentAutoTarget()) => {
-  // The service already owns the authenticated socket. Focus/online events
-  // must not perform another native discovery while that socket is usable or
-  // while the UI is already waiting for its one service-owned connection.
+  // Peer-session discovery is already owned by the transport. Do not start an
+  // additional LAN scan (and native multicast work) before a saved-peer dial.
   if (!state.ui.isAppVisible || state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed ||
     state.session.isConnected || state.session.isConnecting) return;
-  await discoverLocalDevices({ timeoutMs: 1200 });
-  // Discovery is asynchronous. Adding or selecting a peer while it runs must
-  // not let an earlier startup/online callback dial a stale configuration.
-  if (!targetAtStart || currentAutoTarget() !== targetAtStart ||
-    !state.ui.isAppVisible || state.ui.autoConnectPaused || !state.ui.deviceNameConfirmed ||
-    state.session.isConnected || state.session.isConnecting) return;
+  if (!targetAtStart) {
+    await discoverLocalDevices({ timeoutMs: 1200 });
+    return;
+  }
+  if (currentAutoTarget() !== targetAtStart || !state.ui.isAppVisible ||
+    state.ui.autoConnectPaused || state.session.isConnected || state.session.isConnecting) return;
   await connect();
 };
 

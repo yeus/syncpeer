@@ -5,6 +5,7 @@ dist/
 .envrc
 .tools/
 .flatpak-builder/
+.fresh/
 .tmp/
 .winx/
 .code-analysis/reports/

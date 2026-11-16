@@ -3472,6 +3472,11 @@ class ConnectionAttempt {
       address: candidate.address,
       host: candidate.host,
       port: candidate.port,
+      protocol: candidate.protocol,
+      source: candidate.source ?? "unknown",
+      scope: candidate.scope ?? "unknown",
+      addressFamily: candidate.host?.includes(":") ? "ipv6"
+        : /^\d{1,3}(?:\.\d{1,3}){3}$/.test(candidate.host ?? "") ? "ipv4" : "dns",
       message,
     });
     this.errors.push(`${candidate.address}: ${message}`);
@@ -3510,6 +3515,11 @@ class ConnectionAttempt {
       address: candidate.address,
       attempt,
       attemptsTotal: relayMaxAttempts,
+      protocol: candidate.protocol,
+      source: candidate.source ?? "unknown",
+      scope: candidate.scope ?? "unknown",
+      addressFamily: candidate.host?.includes(":") ? "ipv6"
+        : /^\d{1,3}(?:\.\d{1,3}){3}$/.test(candidate.host ?? "") ? "ipv4" : "dns",
       message,
     });
     this.errors.push(`${candidate.address} (attempt ${attempt}/${relayMaxAttempts}): ${message}`);

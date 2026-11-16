@@ -1444,15 +1444,28 @@ class DocumentRuntimeService : Service() {
       val allowed = event.matches(Regex("core\\.session\\.connect\\.[a-z_]{2,40}")) ||
         event in setOf("core.discovery.global_failed", "core.discovery.retry",
           "core.discovery.full_response", "core.discovery.candidate.failed",
-          "core.discovery.connect_strategy", "core.upload.request.failed",
-          "core.replica.receive.failed")
+          "core.discovery.relay.failed", "core.discovery.connect_strategy",
+          "core.upload.request.failed", "core.replica.receive.failed")
       if (allowed) {
         val details = JSONObject()
           .put("category", request.optString("category").takeIf {
-            it in setOf("authorization", "timeout", "unreachable", "relay", "disconnected", "other", "none")
+            it in setOf("authorization", "timeout", "unreachable", "relay", "disconnected",
+              "tls", "dns", "other", "none")
           } ?: "other")
           .put("directCount", request.optInt("directCount").coerceIn(0, 1000))
           .put("relayCount", request.optInt("relayCount").coerceIn(0, 1000))
+          .put("protocol", request.optString("protocol").takeIf {
+            it in setOf("tcp", "quic", "relay", "unknown")
+          } ?: "unknown")
+          .put("source", request.optString("source").takeIf {
+            it in setOf("local", "global", "manual", "unknown")
+          } ?: "unknown")
+          .put("scope", request.optString("scope").takeIf {
+            it in setOf("lan", "wan", "unknown")
+          } ?: "unknown")
+          .put("addressFamily", request.optString("addressFamily").takeIf {
+            it in setOf("ipv4", "ipv6", "dns", "unknown")
+          } ?: "unknown")
         DiagnosticLogJournal.recordNative(applicationContext, event,
           if (event.endsWith("failed")) "warning" else "info", details)
       }

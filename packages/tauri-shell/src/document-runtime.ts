@@ -30,6 +30,7 @@ import { createServiceTransferJobs } from "../../core/src/sync/serviceTransferJo
 import { createServiceUploadBridge } from "../../core/src/sync/serviceUploadBridge.js";
 import { decodeBase64 } from "../../core/src/transfer/base64.js";
 import { parseServiceCommand } from "../../core/src/sync/serviceProtocol.js";
+import { safeNativeDiscoveryDiagnostic } from "./nativeDiagnosticFields.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
 type AndroidRuntimeRequest = (input: object) => Promise<unknown>;
@@ -86,23 +87,14 @@ const createAndroidSessionAdapter = async (
       }
       if (!event.startsWith("core.session.connect.") &&
         !["core.discovery.global_failed", "core.discovery.retry", "core.discovery.full_response",
-          "core.discovery.candidate.failed", "core.discovery.connect_strategy", "core.upload.request.failed",
+          "core.discovery.candidate.failed", "core.discovery.relay.failed",
+          "core.discovery.connect_strategy", "core.upload.request.failed",
           "core.replica.receive.failed"].includes(event)) return;
-      const message = typeof details?.message === "string" ? details.message : "";
-      const category = /not authorized|revoked|retired|not paired/i.test(message) ? "authorization"
-        : /timed? ?out|deadline/i.test(message) ? "timeout"
-        : /refused|unreachable/i.test(message) ? "unreachable"
-        : /relay/i.test(message) ? "relay"
-        : /closed|disconnected|cancelled|aborted/i.test(message) ? "disconnected"
-        : message ? "other" : "none";
-      // Never transmit raw peer addresses, identity, paths or error text to
-      // native release diagnostics. Only static event names and bounded counts.
+      // The native journal contains only enums and bounded counts; never
+      // addresses, peer IDs, paths, certificates, credentials or error text.
       void request({
-        operation: "diagnostic", event, category,
-        directCount: typeof details?.directCandidateCount === "number"
-          ? details.directCandidateCount : 0,
-        relayCount: typeof details?.relayCandidateCount === "number"
-          ? details.relayCandidateCount : 0,
+        operation: "diagnostic", event,
+        ...safeNativeDiscoveryDiagnostic(details),
       }).catch(() => undefined);
     },
     connectTls: async ({ host, port, certPem, keyPem, caPem, timeoutMs, signal, alpnProtocols }) => {

@@ -820,7 +820,10 @@ const enableBackgroundSyncOptIn = async (cdp) => {
   const settings = await documentCommand(cdp, { operation: "profileSettings" });
   await documentCommand(cdp, { operation: "saveProfileSettings", settings: {
     ...settings,
-    profile: { ...settings.profile, keepSyncingInBackground: true },
+    // This test isolates airplane/power/idle transitions. The emulator may
+    // report its Wi-Fi as metered after airplane-mode restoration; opt in to
+    // metered sync explicitly rather than mistaking that policy for a failure.
+    profile: { ...settings.profile, keepSyncingInBackground: true, allowMetered: true },
   } });
 };
 
@@ -971,6 +974,48 @@ const runPeerConnectSmoke = async () => {
       console.log("Android encrypted peer folder unlocked, attached, and remote file indexed.");
     }
     console.log(`Android ${discoveryMode} real-peer connection and remote folder index passed.`);
+  } finally { cdp.close(); }
+};
+/** Cold-relaunch acceptance: verify startup connects without any UI "Connect" action. */
+const runPeerStartupAutoConnect = async () => {
+  if (!serverDeviceId) throw new Error("Startup reconnect requires a synthetic server peer.");
+  const startedAt = Date.now();
+  const cdp = await launchAndroidApp(true);
+  try {
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=tab-devices]") !== null',
+      "restored device UI", 60_000);
+    await clickUiTestId(cdp, "tab-devices");
+    // Saved Devices belongs to the collapsible advanced settings panel.
+    // Expanding it is observational and must not trigger a peer reconnect.
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
+      "restored settings toggle", 20_000);
+    if (!await cdp.evaluate(
+      'document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"')) {
+      await clickUiTestId(cdp, "connection-settings-toggle");
+    }
+    await waitForUiCondition(cdp,
+      `Array.from(document.querySelectorAll('[data-testid="connection-saved-device"] option'))` +
+        `.some(option => option.value.replace(/[^A-Z2-7]/gi, "").toUpperCase() === ${JSON.stringify(normalizeDeviceId(serverDeviceId))})`,
+      "restored encrypted peer roster", 60_000);
+    const rosterReadyAt = Date.now();
+    const deadline = rosterReadyAt + 20_000;
+    let lastStatus = "";
+    while (Date.now() < deadline) {
+      lastStatus = await cdp.evaluate(
+        'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() ?? "missing"',
+      );
+      if (lastStatus === "Connected") {
+        console.log(`Android cold-start peer auto-connected: ${Date.now() - rosterReadyAt} ms after saved roster ready, ` +
+          `${Date.now() - startedAt} ms from Activity launch.`);
+        return;
+      }
+      await wait(250);
+    }
+    const events = await readAndroidSessionEvents(cdp);
+    throw new Error(`Android did not automatically connect within 20 seconds of restoring the saved roster: ` +
+      `${JSON.stringify({ lastStatus, events })}`);
   } finally { cdp.close(); }
 };
 const runPeerSwitchApproval = async () => {
@@ -1140,11 +1185,12 @@ const preparePeerTransferPowerCut = async () => {
   console.log("Android headless replica received the large-file index and is ready for abrupt emulator termination.");
 };
 
-const verifyPeerTransferPowerCut = async () => {
-  const cdp = await launchAndroidAppAfterPowerLoss();
+const verifyPeerTransferPowerCut = async (afterPowerCut = true) => {
+  const cdp = afterPowerCut ? await launchAndroidAppAfterPowerLoss()
+    : await launchAndroidApp(true);
   try {
     await waitForEditorGrant();
-    if (!await openAndroidConnection(cdp)) throw new Error("Power-cut recovery did not reconnect.");
+    if (!await openAndroidConnection(cdp)) throw new Error("Transfer verification did not connect.");
     runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
     await waitForSessionService(true, 30_000);
     await waitForSessionNotificationText(
@@ -1172,12 +1218,14 @@ const verifyPeerTransferPowerCut = async () => {
       }
       await wait(500);
     }
-    if (!seenCommitted) console.error("Android recovery: large file never became visible to DocumentsProvider.");
+    if (!seenCommitted) console.error("Android transfer: large file never became visible to DocumentsProvider.");
     if (summary !== expectedDigest) {
-      throw new Error(`abrupt emulator termination recovery produced an invalid document: ${summary || "missing"}` +
+      throw new Error(`Android transfer integrity mismatch: ${summary || "missing"}` +
         `${lastError ? ` (${lastError})` : ""}`);
     }
-    console.log("Headless replica recovered after abrupt emulator termination without a corrupt committed file.");
+    console.log(afterPowerCut
+      ? "Headless replica recovered after abrupt emulator termination without a corrupt committed file."
+      : "Android large-file transfer SHA-256 verified through DocumentsProvider.");
   } finally {
     try { cdp.close(); } catch { /* The backgrounded WebView may already be detached. */ }
   }
@@ -3474,6 +3522,10 @@ const main = async () => {
     await runPeerConnectSmoke();
     return;
   }
+  if (hasArgument("--peer-startup-auto-connect")) {
+    await runPeerStartupAutoConnect();
+    return;
+  }
   if (hasArgument("--peer-switch-approval")) {
     await runPeerSwitchApproval();
     return;
@@ -3496,6 +3548,10 @@ const main = async () => {
   }
   if (hasArgument("--verify-transfer-power-cut")) {
     await verifyPeerTransferPowerCut();
+    return;
+  }
+  if (hasArgument("--verify-transfer-no-power-cut")) {
+    await verifyPeerTransferPowerCut(false);
     return;
   }
   if (hasArgument("--prepare-edit-power-cut")) {

@@ -23,7 +23,7 @@ const editorPackage = "dev.syncpeer.synthetic.editor";
 const appApk = "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk";
 const editorApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk";
 const peerApiLevel = Number(process.env.SYNCPEER_ANDROID_PEER_API || 29);
-type RunningEmulator = { child: ChildProcess; serial: string };
+type RunningEmulator = { child: ChildProcess | null; serial: string };
 
 const peerProfile = peerApiLevel === 26 ? "minimum" : peerApiLevel === 36 ? "modern" : "compat";
 const requestedDiscoveryMode = process.env.SYNCPEER_ANDROID_PEER_DISCOVERY_MODE;
@@ -89,6 +89,20 @@ const startSyntheticDiscovery = async (
 };
 
 const startEmulator = async (): Promise<RunningEmulator> => {
+  // An existing, isolated emulator may use a different ADB server or transport.
+  // Validate it before touching only its disposable test packages.
+  const serial = process.env.SYNCPEER_ANDROID_EXISTING_SERIAL?.trim();
+  if (serial) {
+    if (!listDeviceSerials().includes(serial)) throw new Error("Configured Android emulator is not online.");
+    const isEmulator = adb(["-s", serial, "shell", "getprop", "ro.kernel.qemu"]).trim() === "1";
+    if (!isEmulator) throw new Error("Destructive Android E2E requires a disposable emulator, never a physical device.");
+    const sdk = Number(adb(["-s", serial, "shell", "getprop", "ro.build.version.sdk"]).trim());
+    const booted = adb(["-s", serial, "shell", "getprop", "sys.boot_completed"]).trim();
+    if (sdk !== peerApiLevel || booted !== "1")
+      throw new Error("Configured Android emulator has the wrong API level or is not booted.");
+    process.env.ANDROID_SERIAL = serial;
+    return { child: null, serial };
+  }
   const selected = profile(peerProfile);
   create(selected);
   const knownSerials = listDeviceTransports();
@@ -118,12 +132,14 @@ const startEmulator = async (): Promise<RunningEmulator> => {
 };
 
 const killEmulatorAbruptly = async (emulator: RunningEmulator): Promise<void> => {
-  emulator.child.kill("SIGKILL");
+  if (!emulator.child) throw new Error("Cannot force-stop an externally managed Android emulator.");
+  const child = emulator.child;
+  child.kill("SIGKILL");
   const deadline = Date.now() + 30_000;
-  while (emulator.child.exitCode === null && emulator.child.signalCode === null && Date.now() < deadline) {
+  while (child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  if (emulator.child.exitCode === null && emulator.child.signalCode === null) {
+  if (child.exitCode === null && child.signalCode === null) {
     throw new Error("Android emulator did not terminate after SIGKILL.");
   }
   const deviceDeadline = Date.now() + 30_000;
@@ -426,8 +442,15 @@ const main = async (): Promise<void> => {
     }
 
     if (process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1" ||
-      process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1") {
+      process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1" ||
+      process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1") {
       await runPhase("--peer-connect-smoke", env);
+      // Keep startup reconnection in the ordinary automatic-peer CI gate,
+      // not only in a manually selected profiling scenario.
+      if (process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1" ||
+        process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1") {
+        await runPhase("--peer-startup-auto-connect", env);
+      }
       if (discovery && discovery.lookupCount() === 0) {
         throw new Error("Automatic Android connection never queried pinned synthetic discovery.");
       }
@@ -448,7 +471,11 @@ const main = async (): Promise<void> => {
       await runPhase("--peer-power-cut-setup", env);
     } else {
       await runPhase("--peer-cross-app", env);
-      await runPhase("--session-policy-transition", env);
+      // Transfer-only acceptance must not depend on airplane/Doze policy
+      // simulation. That scenario has its own dedicated deterministic gate.
+      if (process.env.SYNCPEER_ANDROID_PEER_TRANSFER_ONLY !== "1") {
+        await runPhase("--session-policy-transition", env);
+      }
     }
     const startingPeerOutBytes = await peerOutBytes(fixture.syncGuiUrl, fixture.apiKey);
     const largeFile = Buffer.allocUnsafe(largeFileSize);
@@ -471,6 +498,11 @@ const main = async (): Promise<void> => {
       fixture.apiKey,
       startingPeerOutBytes,
     );
+    if (process.env.SYNCPEER_ANDROID_PEER_TRANSFER_ONLY === "1") {
+      await runPhase("--verify-transfer-no-power-cut", env);
+      console.log("Android 4 MiB transfer integrity E2E passed without a power cut.");
+      return;
+    }
     await killEmulatorAbruptly(emulator);
     emulator = await startEmulator();
     if (forwardedPort !== null) run("adb", ["forward", `tcp:${forwardedPort}`, "tcp:22000"]);
@@ -567,7 +599,7 @@ const main = async (): Promise<void> => {
       try { adb(["forward", "--remove", `tcp:${forwardedPort}`]); }
       catch { /* The emulator may already have been abruptly terminated. */ }
     }
-    if (emulator && process.env.SYNCPEER_KEEP_ANDROID_EMULATOR !== "1") {
+    if (emulator?.child && process.env.SYNCPEER_KEEP_ANDROID_EMULATOR !== "1") {
       await stopEmulator(emulator.child, emulator.serial);
     }
     if (previousSerial === undefined) delete process.env.ANDROID_SERIAL;

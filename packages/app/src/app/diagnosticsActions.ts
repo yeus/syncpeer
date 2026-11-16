@@ -393,6 +393,7 @@ const androidDefinitions = (args: {
 ];
 
 type DeviceDiagnosticDeps = {
+  client: SyncpeerBrowserClient;
   state: AppState;
   appInfo: AppBuildInfo;
   readDeviceHealth?: () => Promise<unknown>;
@@ -432,6 +433,38 @@ const deviceDefinitions = (args: DeviceDiagnosticDeps): DiagnosticsDefinition[] 
       if (!status.writeInitialized)
         throw new Error("Encrypted crash journal has not acknowledged write initialization.");
       return status;
+    },
+  },
+  {
+    test: {
+      id: "device.transfer_job_status",
+      name: "Native Transfer Queue Status",
+      description: "Read-only job status, retry state and failure categories; never exports file paths or identities.",
+      categoryId: "device",
+    },
+    fn: async () => {
+      if (args.appInfo.runtimeSurface !== "android-ui" || !args.client.listServiceTransferJobs)
+        return { skipped: true, reason: "Requires Android native transfer service." };
+      const jobs = await args.client.listServiceTransferJobs();
+      const counts = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 };
+      for (const job of jobs) counts[job.phase] += 1;
+      const safeReason = (reason: string | undefined) =>
+        reason && ["network", "storage", "cancelled", "unavailable", "other"].includes(reason)
+          ? reason : "other";
+      return {
+        total: jobs.length,
+        phases: counts,
+        latest: jobs.slice(-32).map(job => ({
+          direction: job.direction,
+          phase: job.phase,
+          reason: job.phase === "failed" ? safeReason(job.reason) : null,
+          attempts: job.attempts ?? 0,
+          transferredBytes: job.transferredBytes,
+          totalBytes: job.totalBytes,
+          updatedAtMs: job.updatedAtMs,
+          nextAttemptMs: job.nextAttemptMs ?? null,
+        })),
+      };
     },
   },
 ];

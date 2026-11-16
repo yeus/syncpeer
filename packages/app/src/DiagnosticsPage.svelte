@@ -151,6 +151,22 @@
     copiedNotice = "Copied diagnostics to clipboard.";
   };
 
+  const downloadBrowserResults = (fileName: string, contents: string): void => {
+    const blob = new Blob([contents], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    try {
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+    } finally {
+      link.remove();
+      // Revoke after the browser has dispatched the download request.
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+  };
+
   const exportResults = async (mode: "save" | "share"): Promise<void> => {
     if (!resultJson.trim() || isExporting) return;
     isExporting = true;
@@ -158,9 +174,14 @@
     copiedNotice = "";
     const fileName = diagnosticsResultsFileName(new Date());
     try {
-      if (mode === "save" && onSaveResults) {
-        const saved = await onSaveResults(fileName, resultJson);
-        if (saved) copiedNotice = `Diagnostics saved as ${saved}.`;
+      if (mode === "save") {
+        if (onSaveResults) {
+          const saved = await onSaveResults(fileName, resultJson);
+          if (saved) copiedNotice = `Diagnostics saved as ${saved}.`;
+        } else {
+          downloadBrowserResults(fileName, resultJson);
+          copiedNotice = `Diagnostics file download requested: ${fileName}.`;
+        }
       } else if (mode === "share" && onShareResults) {
         await onShareResults(fileName, resultJson);
         copiedNotice = "Diagnostics file handed to Android sharing.";
@@ -229,12 +250,10 @@
       <button class="ghost" onclick={loadCatalog} disabled={isCatalogLoading || isRunning}>
         {isCatalogLoading ? "Refreshing..." : "Refresh Catalog"}
       </button>
-      {#if onSaveResults}
-        <button class="ghost" data-testid="diagnostics-save-results"
-          onclick={() => exportResults("save")} disabled={!resultJson || isExporting || isRunning}>
-          {isExporting ? "Exporting..." : "Save Results as File"}
-        </button>
-      {/if}
+      <button class="ghost" data-testid="diagnostics-save-results"
+        onclick={() => exportResults("save")} disabled={!resultJson || isExporting || isRunning}>
+        {isExporting ? "Exporting..." : "Save Results as File"}
+      </button>
       {#if onShareResults}
         <button class="ghost" data-testid="diagnostics-share-results"
           onclick={() => exportResults("share")} disabled={!resultJson || isExporting || isRunning}>

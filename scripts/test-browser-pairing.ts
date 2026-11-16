@@ -160,7 +160,8 @@ test("Android service diagnostics classify terminal failures without exposing na
       },
     },
   });
-  const unsubscribe = client.subscribePeerStatus(() => undefined);
+  const delivered: string[] = [];
+  const unsubscribe = client.subscribePeerStatus(event => { delivered.push(event.phase); });
   try {
     await Promise.resolve();
     assert.ok(emitStatus);
@@ -169,8 +170,12 @@ test("Android service diagnostics classify terminal failures without exposing na
     emitStatus({ type: "sessionStatus", revision: 2, phase: "error",
       active: false, foreground: false,
       error: "Connection to 192.0.2.1 timed out, secret=synthetic-password" });
+    emitStatus({ type: "sessionStatus", revision: 1, phase: "waiting",
+      active: false, foreground: false, peerError: "not authorized" });
     const statusLogs = logs.filter(entry => entry.event === "core.android.service.status");
     assert.equal(statusLogs.length, 2);
+    assert.deepEqual(delivered, ["connected", "error"],
+      "A delayed native revision must not regress a newer peer status.");
     assert.deepEqual(statusLogs.map(entry => (entry.details as { phase: string }).phase),
       ["connected", "error"]);
     assert.equal((statusLogs[1]?.details as { errorCategory: string }).errorCategory, "timeout");

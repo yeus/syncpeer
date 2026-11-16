@@ -21,7 +21,13 @@ let visibilityTransition: Promise<void> = Promise.resolve();
 let lastVisibilityRequested: boolean | null = null;
 let visibilityRunning = false;
 let lastVisibilityApplied: boolean | null = null;
-let foregroundPass: Promise<void> | null = null;
+type ForegroundPass = {
+  work: Promise<void>;
+  targetAtDial: string;
+  followUpTarget: string;
+  followUp: Promise<void> | null;
+};
+let foregroundPass: ForegroundPass | null = null;
 
 const switchTab = (tab: AppState["activeTab"], event?: MouseEvent) => {
   event?.preventDefault();
@@ -92,16 +98,37 @@ const onNetworkOnline = async () => {
 };
 
 const onAppForeground = (): Promise<void> => {
-  if (foregroundPass) return foregroundPass;
-  const targetAtStart = currentAutoTarget();
+  const target = currentAutoTarget();
+  if (foregroundPass) {
+    const pass = foregroundPass;
+    // The first pass can be busy with LAN discovery when the encrypted roster
+    // finishes loading. Coalesce its post-unlock retry, rather than losing the
+    // only saved-peer dial to the earlier empty-roster foreground pass.
+    if (target && target !== pass.targetAtDial) {
+      if (pass.followUp && pass.followUpTarget === target) return pass.followUp;
+      pass.followUpTarget = target;
+      pass.followUp = pass.work.then(() =>
+        pass.targetAtDial === target ? undefined : discoverThenConnect(target));
+      return pass.followUp;
+    }
+    return pass.work;
+  }
+  const pass: ForegroundPass = {
+    work: Promise.resolve(), targetAtDial: target, followUpTarget: "", followUp: null,
+  };
+  // A peer restored during a still-running native handoff is already
+  // authorized. A new peer added during a subsequent UI-only scan is not.
+  const waitForHandoff = visibilityRunning;
   const work = (async () => {
     await visibilityTransition;
     if (!state.ui.isAppVisible) return;
-    await discoverThenConnect(targetAtStart);
+    pass.targetAtDial = waitForHandoff ? currentAutoTarget() : target;
+    await discoverThenConnect(pass.targetAtDial);
   })();
-  foregroundPass = work;
+  pass.work = work;
+  foregroundPass = pass;
   void work.finally(() => {
-    if (foregroundPass === work) foregroundPass = null;
+    if (foregroundPass === pass) foregroundPass = null;
   }).catch(() => undefined);
   return work;
 };

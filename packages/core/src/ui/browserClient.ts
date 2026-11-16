@@ -1907,11 +1907,24 @@ function subscribePeerStatusImpl(
   let active = true;
   let unsubscribe: () => void = () => undefined;
   let previousStatus = "";
+  let previousRevision = -1;
+  let previousUpdatedAtMs: number | undefined;
   let previousSyncStatus = "";
   void subscribe(value => {
     if (!active) return;
     const event = parseServiceSessionStatusEvent(value);
     if (!event) return;
+    // Native notifications cross a queued bridge and can arrive out of
+    // order (observed revision 6 before 5 on Android). A stale waiting/error
+    // snapshot must not regress the current connected state. A later process
+    // restart may reset the revision counter, so use native timestamps first.
+    const stale = event.updatedAtMs !== undefined && previousUpdatedAtMs !== undefined
+      ? event.updatedAtMs < previousUpdatedAtMs ||
+        (event.updatedAtMs === previousUpdatedAtMs && event.revision <= previousRevision)
+      : event.revision <= previousRevision;
+    if (stale) return;
+    previousRevision = event.revision;
+    previousUpdatedAtMs = event.updatedAtMs;
     const errorCategory = classifySessionIssue(event.error);
     const peerErrorCategory = classifySessionIssue(event.peerError);
     // Native service errors may contain peer addresses or secret-bearing context.

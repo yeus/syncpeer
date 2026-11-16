@@ -722,6 +722,53 @@ test("foreground recovery waits for Android visibility handoff and coalesces rep
   await Promise.all([first, second]);
   assert.deepEqual(events, ["foreground", "connect"]);
 });
+test("foreground handoff sees a trusted peer restored while the native service initializes", async () => {
+  const state = createInitialState({ deviceName: "Named device" });
+  const calls: string[] = [];
+  let release!: () => void;
+  const nativeReady = new Promise<void>(resolve => { release = resolve; });
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => { calls.push("foreground"); await nativeReady; } } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); },
+    connect: async () => { calls.push("connect"); },
+  });
+  actions.setAppVisibility(true);
+  const foreground = actions.onAppForeground();
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Restored", isIntroducer: false, createdAtMs: 1 }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  release();
+  await foreground;
+  assert.deepEqual(calls, ["foreground", "connect"],
+    "Verified saved peers restored during native startup should connect without a new foreground event.");
+});
+test("post-unlock foreground request connects while an earlier empty-roster scan is still pending", async () => {
+  const state = createInitialState({ deviceName: "Named device" });
+  const calls: string[] = [];
+  let scanning!: () => void;
+  const scan = new Promise<void>(resolve => { scanning = resolve; });
+  const actions = createPageActions({
+    state,
+    sessionStore: { actions: { setForeground: async () => undefined } } as never,
+    discoverLocalDevices: async () => { calls.push("discover"); await scan; },
+    connect: async () => { calls.push("connect"); },
+  });
+  const first = actions.onAppForeground();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(calls, ["discover"]);
+  state.devices.savedDevices = [{ id: PEER_ID, name: "Restored", isIntroducer: false, createdAtMs: 1 }];
+  state.devices.selectedSavedDeviceId = PEER_ID;
+  state.connection.remoteId = PEER_ID;
+  const restored = actions.onAppForeground();
+  scanning();
+  await Promise.all([first, restored]);
+  assert.deepEqual(calls, ["discover", "connect"],
+    "Protected state restoration must not lose its connection request to an earlier UI scan.");
+});
+
+
 
 test("network-online callbacks do not dial peers from a hidden Android WebView", async () => {
   const state = createInitialState({ deviceName: "Named device" });

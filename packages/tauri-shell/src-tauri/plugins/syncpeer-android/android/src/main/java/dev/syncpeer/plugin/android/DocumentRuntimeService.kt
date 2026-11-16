@@ -403,7 +403,10 @@ class DocumentRuntimeService : Service() {
       return synchronized(uiConnectLock) {
         val prior = uiConnectPending
         if (uiConnectRequest == rawInput && prior != null && !prior.isDone) {
-          return@synchronized prior
+          // Return promptly even when the existing native dial is queued or
+          // waiting on TLS/BEP. Its completion is reported via sessionStatus.
+          return@synchronized CompletableFuture.completedFuture(JSONObject()
+            .put("result", JSONObject().put("phase", "starting")))
         }
         if (uiConnectRequest == rawInput && prior == null) {
           val expected = uiConnectExpectedPeer
@@ -414,7 +417,8 @@ class DocumentRuntimeService : Service() {
             return@synchronized CompletableFuture.completedFuture(JSONObject()
               .put("result", JSONObject().put("phase", "connected")))
           }
-          if (sessionPhase != "error" && peerPhase in setOf("starting", "waiting", "reconnecting")) {
+          if (sessionPhase in setOf("starting", "waiting", "reconnecting") &&
+            sessionError == null) {
             // The original native lifecycle continues its own retries. A
             // second UI subscriber must observe it, never replace its dial.
             return@synchronized CompletableFuture.completedFuture(JSONObject()
@@ -467,7 +471,11 @@ class DocumentRuntimeService : Service() {
             }
           }
         uiConnectPending = pending
-        pending
+        // The WebView subscribes to authoritative sessionStatus after this
+        // nonterminal acknowledgment. Never hold its RPC until discovery,
+        // authorization or BEP finishes; those can take tens of seconds.
+        CompletableFuture.completedFuture(JSONObject()
+          .put("result", JSONObject().put("phase", "starting")))
       }
     }
 
@@ -691,13 +699,31 @@ class DocumentRuntimeService : Service() {
     }
   }
 
+  private fun refreshConnectedBackgroundNotice() {
+    runOnMain {
+      val request = sessionRequest?.let(::parseSessionRequest) ?: return@runOnMain
+      // A delayed peer event must not override a deliberate metered/power policy pause.
+      if (sessionStarted && sessionPhase == "connected" && backgroundSyncArmed &&
+        !uiIsVisible && backgroundPauseReason(request) == null) {
+        SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization",
+          "Peer session connected; selected sync is ready.")
+      }
+    }
+  }
+
   private fun resumePersistedSessionIfAllowed() {
     runCatching {
       worker.execute {
         val request = sessionRequest ?: runCatching { backgroundSessions.load() }.getOrNull() ?: return@execute
         val input = parseSessionRequest(request) ?: return@execute
         if (backgroundPauseReason(input) != null) return@execute
-        if (sessionPhase == "connected" || sessionPhase == "starting") return@execute
+        if (sessionPhase == "connected") {
+          // A late policy callback may have left the notification at "waiting"
+          // even though the authenticated session recovered independently.
+          refreshConnectedBackgroundNotice()
+          return@execute
+        }
+        if (sessionPhase == "starting") return@execute
         scheduleBackgroundSession(request, persist = false)
       }
     }
@@ -1352,15 +1378,21 @@ class DocumentRuntimeService : Service() {
           verifiedTransferPeerId = verifiedPeer
           replayTransferJobs()
         }
+        val policyRecovered = backgroundSyncArmed && sessionRequest?.let(::parseSessionRequest)
+          ?.let { backgroundPauseReason(it) == null } == true
         synchronized(uiConnectLock) {
           if (uiConnectRequest != null && verifiedPeer.isNotBlank() &&
             (uiConnectExpectedPeer == null || verifiedPeer == uiConnectExpectedPeer) &&
             sessionPhase != "stopping" &&
-            (sessionError == null || sessionError == "Peer connection could not be established.")) {
+            (sessionError == null || sessionError == "Peer connection could not be established." ||
+              policyRecovered)) {
             sessionStarted = true
             sessionPhase = "connected"
             sessionError = null
           }
+        }
+        if (verifiedPeer.matches(Regex("[A-Z2-7]{52}|[A-Z2-7]{56}"))) {
+          refreshConnectedBackgroundNotice()
         }
       }
       publishSessionStatus()

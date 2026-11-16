@@ -241,6 +241,26 @@ class DocumentRuntimeServiceTest {
     }
   }
 
+  @Test fun uiConnectAcknowledgesImmediatelyWhileNativeWorkerIsBusy() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    val release = CountDownLatch(1)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      assertTrue(runtime.blockSessionWorkerForTesting(release).await(3, TimeUnit.SECONDS))
+      val request = JSONObject().put("operation", "connect")
+        .put("options", JSONObject().put("host", "synthetic.invalid").put("port", 22000))
+      val reply = runtime.sessionCommand(request).get(2, TimeUnit.SECONDS)
+      assertEquals("starting", reply.getJSONObject("result").getString("phase"))
+    } finally {
+      release.countDown()
+      client.second.get(15, TimeUnit.SECONDS).sessionCommand(
+        JSONObject().put("operation", "disconnect")).get(30, TimeUnit.SECONDS)
+      context.unbindService(client.first)
+    }
+  }
+
   @Test fun pendingPeerConnectionDoesNotStarveDocumentStatus() {
     val context = InstrumentationRegistry.getInstrumentation().targetContext
     val client = connect(context)

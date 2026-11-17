@@ -3190,21 +3190,32 @@ class ConnectionAttempt {
       ]));
       this.selectCandidates(fast);
       this.prepareRace();
-      const immediate = [this.directAttempt(), this.relayAttempt()]
+      // Reserve a direct-dial slot for global candidates while the lookup
+      // runs, but hand it back to the LAN queue if global discovery fails.
+      // The workers must share one cursor to avoid dialing the same IP twice.
+      const localQueue = { candidates: [...this.directCandidates], next: 0 };
+      const promoteLocal = (reason: unknown) =>
+        this.directAttempt(1, localQueue) ?? Promise.reject(reason);
+      const immediate = [this.directAttempt(2, localQueue), this.relayAttempt()]
         .filter((attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null);
       const fallback = (async () => {
         const globalResult = await globalTask;
         if (this.raceSignal.aborted || this.winningSession)
           throw new Error("Global discovery was superseded by an authenticated session.");
         this.logDiscovery({ global: globalResult, local: localResult }, localCandidates);
-        if (globalResult.status !== "fulfilled") throw globalResult.reason;
+        if (globalResult.status !== "fulfilled") return promoteLocal(globalResult.reason);
         const existing = new Set(fast.map(candidateKey));
         const additional = normalizeDiscoveredCandidates(globalResult.value.candidates)
           .filter(candidate => !existing.has(candidateKey(candidate)));
-        if (!additional.length) throw new Error("No additional global discovery candidates.");
+        if (!additional.length) return promoteLocal(new Error("No additional global discovery candidates."));
         this.selectCandidates(additional);
         const attempts = [this.directAttempt(), this.relayAttempt()]
           .filter((attempt): attempt is Promise<SyncpeerSessionHandle> => attempt !== null);
+        // Relay-only global results leave the reserved direct slot free.
+        if (this.directCandidates.length === 0) {
+          const local = this.directAttempt(1, localQueue);
+          if (local) attempts.push(local);
+        }
         if (!attempts.length) throw new Error("No usable global discovery fallback candidates.");
         return Promise.any(attempts);
       })();
@@ -3361,10 +3372,16 @@ class ConnectionAttempt {
     this.relayStartDelayMs = this.relayEnabled && relay.length > 0 && !this.opts.relayOnly
       ? Math.min(2500, Math.max(0, Math.floor(this.totalTimeout * 0.25)))
       : 0;
-    this.perCandidateTimeout = Math.max(
-      8000,
-      Math.min(30000, Math.floor(this.totalTimeout / Math.max(direct.length || 1, 1))),
-    );
+    // With many advertised endpoints, an 8-second minimum per bad address
+    // exhausts the whole connection deadline before the working path is
+    // attempted. Budget time per parallel wave instead; preserve the
+    // existing longer handshake allowance when there are only 1–3 choices.
+    const crowded = direct.length > 3;
+    this.perCandidateTimeout = crowded
+      ? Math.max(2000, Math.min(8000,
+          Math.floor(this.totalTimeout / Math.ceil(direct.length / 3))))
+      : Math.max(8000,
+          Math.min(30000, Math.floor(this.totalTimeout / Math.max(direct.length || 1, 1))));
     this.adapter.log?.("core.discovery.connect_strategy", {
       totalTimeout: this.totalTimeout,
       perCandidateTimeout: this.perCandidateTimeout,
@@ -3404,24 +3421,29 @@ class ConnectionAttempt {
     return session;
   }
 
-  private directAttempt() {
-    if (this.directCandidates.length === 0) return null;
+  private directAttempt(
+    maxConcurrentWorkers = 3,
+    sharedQueue?: { candidates: DiscoveredCandidate[]; next: number },
+  ) {
+    const queue = sharedQueue ?? { candidates: [...this.directCandidates], next: 0 };
+    if (queue.next >= queue.candidates.length) return null;
     // Android's native socket worker has four threads. Launching every
     // advertised IPv4/IPv6 TCP/QUIC endpoint simultaneously can enqueue
     // dozens of TLS handshakes and starve document and relay requests.
-    // Bound direct dials to three, leaving one slot for relay fallback.
-    const candidates = [...this.directCandidates];
-    let next = 0;
+    // Three slots total leave one native socket worker for relay. Automatic
+    // discovery uses only two for LAN while the global lookup is pending.
     const worker = async (): Promise<SyncpeerSessionHandle> => {
       let lastError: unknown = new Error("No available direct candidates.");
-      while (next < candidates.length && !this.raceSignal.aborted) {
-        const candidate = candidates[next++];
+      while (queue.next < queue.candidates.length && !this.raceSignal.aborted) {
+        const candidate = queue.candidates[queue.next++];
         try { return await this.openDirectCandidate(candidate); }
         catch (error) { lastError = error; }
       }
       throw lastError;
     };
-    return Promise.any(Array.from({ length: Math.min(3, candidates.length) }, worker));
+    return Promise.any(Array.from({
+      length: Math.min(maxConcurrentWorkers, queue.candidates.length - queue.next),
+    }, worker));
   }
 
   private async openDirectCandidate(candidate: DiscoveredCandidate) {

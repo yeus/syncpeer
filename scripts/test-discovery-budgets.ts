@@ -116,13 +116,21 @@ test("a large advertisement list never launches more than three simultaneous dir
   assert.ok(peak >= 2, "The dialer should still race a few candidates.");
 });
 
-test("blackholed LAN TLS endpoints cannot starve delayed healthy global peer", { timeout: 14000 }, async () => {
+test("multipath network resilience regressions (real TLS/BEP)", { timeout: 14000 }, async t => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-multipath-"));
   const stalledSockets = new Set<net.Socket>();
   const stalledServers: net.Server[] = [];
   const incoming: SyncpeerSessionHandle[] = [];
   let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
   let outgoing: SyncpeerSessionHandle | undefined;
+  const runCase = async (name: string, fn: () => Promise<void>) =>
+    t.test(name, async () => {
+      try { await fn(); }
+      finally {
+        await outgoing?.close().catch(() => undefined);
+        outgoing = undefined;
+      }
+    });
   const identity = async (name: string) => {
     const cert = path.join(root, name + ".pem");
     const key = path.join(root, name + ".key");
@@ -161,6 +169,7 @@ test("blackholed LAN TLS endpoints cannot starve delayed healthy global peer", {
         protocol: "tcp" as const, scope: "lan" as const })),
     ];
     const base = createNodeHostAdapter();
+    await runCase("blackholed LAN does not starve a delayed global peer", async () => {
     const attempted: string[] = [];
     const client = createSyncpeerCoreClient({
       ...base,
@@ -186,8 +195,8 @@ test("blackholed LAN TLS endpoints cannot starve delayed healthy global peer", {
     assert.ok(attempted.includes(`127.0.0.1:${listener.port}`),
       "Healthy global endpoint must start even while blackholed LAN dials are pending.");
     assert.ok(elapsed < 2600, `Healthy path delayed by ${Math.round(elapsed)} ms`);
-    await outgoing.close();
-    outgoing = undefined;
+    });
+    await runCase("global discovery outage releases reserved dial slot for LAN", async () => {
     // Reverse the setup: global discovery is offline, but the third LAN
     // candidate is healthy. The reserved slot must become available to LAN
     // once global discovery finishes, not remain idle behind two blackholes.
@@ -210,8 +219,8 @@ test("blackholed LAN TLS endpoints cannot starve delayed healthy global peer", {
     assert.equal(outgoing.remoteDeviceId, peer.deviceId);
     assert.ok(performance.now() - lanStart < 2600,
       "Healthy third LAN candidate was starved when global discovery was unavailable.");
-    await outgoing.close();
-    outgoing = undefined;
+    });
+    await runCase("blocked QUIC does not starve healthy TCP", async () => {
     // UDP/QUIC can be filtered even when TCP works. A blocked QUIC LAN
     // candidate must not prevent the globally discovered TCP path.
     let quicAttempts = 0;
@@ -241,8 +250,8 @@ test("blackholed LAN TLS endpoints cannot starve delayed healthy global peer", {
     assert.equal(quicAttempts, 1, "The blocked QUIC path must actually be attempted.");
     assert.ok(performance.now() - quicStart < 2600,
       "A stalled QUIC path starved the healthy discovered TCP path.");
-    await outgoing.close();
-    outgoing = undefined;
+    });
+    await runCase("crowded global discovery reaches healthy endpoint after stale addresses", async () => {
     // The remote may advertise 14 obsolete WAN addresses before its working
     // address. Each native timeout must fit a fair slice of the overall
     // connection budget or the healthy address is never reached.
@@ -264,6 +273,7 @@ test("blackholed LAN TLS endpoints cannot starve delayed healthy global peer", {
     assert.equal(outgoing.remoteDeviceId, peer.deviceId);
     assert.ok(performance.now() - crowdedStart < 3500,
       "Global connection budget expired behind stale candidates before healthy TCP was attempted.");
+    });
   } finally {
     await outgoing?.close().catch(() => undefined);
     await Promise.allSettled(incoming.map(session => session.close()));

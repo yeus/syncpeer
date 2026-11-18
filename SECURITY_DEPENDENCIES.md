@@ -4,11 +4,44 @@ The October 2026 Dependabot review contained 39 open alerts. Compatible npm and
 Cargo updates address 37; the two upstream Rust blockers below remain open.
 Fixed and auto-dismissed historical alerts are not counted as new fixes.
 
+## November 17, 2026 downloaded alert snapshot
+
+The local `.tmp/dependabot-alerts.json` export contains **109 historical alerts**:
+92 fixed, two automatically dismissed, and **15 open**. Of the 15 open:
+
+- **9 npm `undici` alerts** (versions 6.29.0 and 7.30.0): lockfile
+  resolves 6.29.1 and 7.30.2, satisfying the 6.29.1/7.30.1 advisory floors.
+  These are **development-only transitive dependencies** from WebdriverIO
+  and Cheerio; no major-version override is needed.
+- **4 `rustls` alerts**: `Cargo.lock` resolves patched 0.23.46, and the
+  direct `Cargo.toml` floor is now 0.23.46.
+- **2 upstream Rust exceptions**: `glib` 0.18.5 and `rand` 0.7.3 are still
+  present; see the documented constraints below. **They are not fixed.**
+
+The repository dependency-floor test guards both `undici` major versions and
+`rustls`; never assume the ignored export itself is a repository regression
+fixture. A current `npm audit --omit=dev` reports **zero runtime npm
+vulnerabilities**. The full npm audit, however, currently reports **34
+additional advisories affecting development tooling** (not included among
+these 15 open GitHub alerts); this should be triaged separately before any
+claim that *all* development dependencies are clean. This section describes
+review of the downloaded snapshot, not a live GitHub-alert state transition.
+
+**Local verification for these updates:** clean `npm ci --ignore-scripts`,
+`npm run security:test-dependencies` (4/4), `npm run typecheck:app`, `npm run lint`,
+`npm run build:app`, `cargo check --locked --tests`, and
+`cargo test --locked --lib native_` (10/10, including mutual TLS and relay)
+passed. Cargo audit reports the two documented vulnerable Rust crates; the
+remaining advisory inventory also includes unmaintained/yanked warnings.
+Packaged desktop, cross-platform, and physical Android acceptance were not
+rerun for these dependency changes.
+
 Run the focused dependency and tooling compatibility regressions with:
 
 ```bash
 npm run security:test-dependencies
-npm audit
+npm audit --omit=dev
+npm audit # separately triage currently open development-tooling reports
 ```
 
 The regression reads committed lockfiles and uses synthetic fixtures. The ZIP

@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import test from "node:test";
 
-// Patched stable release floors from the October 2026 Dependabot review.
+// Patched stable release floors from the October and November 2026 Dependabot reviews.
 // Check every locked copy, including nested development dependencies.
 const atLeast = (version, minimum) => {
   assert.match(version, /^\d+\.\d+\.\d+$/);
@@ -25,7 +25,7 @@ test("npm lockfile excludes the reviewed vulnerable dependency versions", () => 
     "postcss-selector-parser": "7.1.6",
     devalue: "5.9.3",
     "brace-expansion": { 1: "1.1.21", 2: "2.1.7", 5: "5.0.12" },
-    undici: { 6: "6.28.1", 7: "7.29.1" },
+    undici: { 6: "6.29.1", 7: "7.30.1" },
     "ip-address": "10.7.1",
     "js-yaml": "4.3.2",
     nanoid: "3.3.12",
@@ -49,7 +49,7 @@ test("npm lockfile excludes the reviewed vulnerable dependency versions", () => 
 });
 
 test("Cargo lockfile uses patched versions except the documented upstream blockers", () => {
-  const floors = { rustls: "0.23.45", tauri: "2.11.1", serde_with: "3.21.0",
+  const floors = { rustls: "0.23.46", tauri: "2.11.1", serde_with: "3.21.0",
     rand: "0.8.6", glib: "0.20.0" };
   const lock = fs.readFileSync("packages/tauri-shell/src-tauri/Cargo.lock", "utf8");
   const failures = [...lock.matchAll(/\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"/g)]

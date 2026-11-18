@@ -261,6 +261,29 @@ class DocumentRuntimeServiceTest {
     }
   }
 
+  @Test fun nativeSessionStatusBypassesBlockedDocumentWorker() {
+    val context = InstrumentationRegistry.getInstrumentation().targetContext
+    val client = connect(context)
+    val release = CountDownLatch(1)
+    try {
+      val runtime = client.second.get(15, TimeUnit.SECONDS)
+      runtime.status().get(30, TimeUnit.SECONDS)
+      assertTrue(runtime.blockSessionWorkerForTesting(release).await(3, TimeUnit.SECONDS))
+      val request = JSONObject().put("operation", "status").put("protocolVersion", 1)
+      val started = SystemClock.elapsedRealtime()
+      val reply = runtime.sessionCommand(request).get(1, TimeUnit.SECONDS).getJSONObject("result")
+      assertTrue("Native session status should bypass the blocked JS runtime",
+        SystemClock.elapsedRealtime() - started < 1000)
+      assertEquals(runtime.backgroundSessionStatus().getString("phase"), reply.getString("phase"))
+      assertEquals(runtime.backgroundSessionStatus().getBoolean("active"), reply.getBoolean("active"))
+      assertTrue("Status includes current authenticated peer state", reply.has("peerPhase"))
+      assertTrue("Status must be revisioned", reply.has("revision"))
+    } finally {
+      release.countDown()
+      context.unbindService(client.first)
+    }
+  }
+
   @Test fun pendingPeerConnectionDoesNotStarveDocumentStatus() {
     val context = InstrumentationRegistry.getInstrumentation().targetContext
     val client = connect(context)

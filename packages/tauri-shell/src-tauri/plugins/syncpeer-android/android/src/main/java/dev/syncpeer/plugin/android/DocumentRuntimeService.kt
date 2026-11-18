@@ -262,6 +262,15 @@ class DocumentRuntimeService : Service() {
         return result
       }
       val operation = input.optString("operation")
+      if (operation == "status") {
+        // Observation must never wait behind a document decrypt, favorite scan
+        // or pending TLS/BEP evaluation. The native status bus already owns
+        // the authoritative authenticated session/peer phase snapshot.
+        require(input.optInt("protocolVersion", -1) == SESSION_PROTOCOL_VERSION) {
+          "Invalid Android session status protocol version."
+        }
+        return CompletableFuture.completedFuture(JSONObject().put("result", sessionStatus()))
+      }
       if (operation == "transferStageBegin") {
         val stageId = transferStages.begin(input.getLong("sizeBytes"), input.getLong("modifiedMs"))
         return CompletableFuture.completedFuture(JSONObject().put("result", JSONObject().put("stageId", stageId)))
@@ -442,15 +451,21 @@ class DocumentRuntimeService : Service() {
               synchronized(uiConnectLock) {
                 if (generation == uiConnectGeneration) {
                   val phase = reply.optJSONObject("result")?.optString("phase", "connected") ?: "connected"
-                  // The authenticated lifecycle can recover through peer
-                  // arbitration while this original RPC returns a pending
-                  // snapshot. Never demote a newer confirmed push event.
-                  if (phase == "connected" || sessionPhase != "connected") {
-                    sessionStarted = phase == "connected"
-                    sessionPhase = phase
+                  // A pending connect reply can arrive after the peer started
+                  // another handshake. Only the authenticated lifecycle may
+                  // promote the service to an active connected session.
+                  val authenticated = peerPhase == "connected" &&
+                    uiConnectExpectedPeer != null &&
+                    uiConnectExpectedPeer == verifiedTransferPeerId
+                  if (phase == "connected" && authenticated) {
+                    sessionStarted = true
+                    sessionPhase = "connected"
+                  } else if (sessionPhase != "connected") {
+                    sessionStarted = false
+                    sessionPhase = if (phase == "connected") "starting" else phase
                   }
                   sessionError = null
-                  if (sessionPhase == "connected") {
+                  if (sessionPhase == "connected" && sessionStarted) {
                     startFavoriteSyncSchedule()
                     replayTransferJobs()
                   }
@@ -1360,13 +1375,11 @@ class DocumentRuntimeService : Service() {
       }
       peerPhase = if (phase == "connecting") "starting" else phase
       peerError = request.optString("error").ifBlank { null }
-      if (phase in setOf("waiting", "reconnecting", "suspended", "stopping", "error") &&
-        sessionStarted) {
-        // A transport closure invalidates the socket even if an earlier UI
-        // connect RPC completed successfully. Otherwise active=true would
-        // allow the WebView to adopt a session that no longer exists.
+      if (phase != "connected" && sessionStarted) {
+        // Starting/idle also invalidate the previous socket. A newer handshake
+        // must not leave native active=true while its overview is unavailable.
         sessionStarted = false
-        sessionPhase = phase
+        sessionPhase = if (phase == "idle" || phase == "connecting") "starting" else phase
       }
       if (phase != "connected") verifiedTransferPeerId = null
       if (phase == "connected") {

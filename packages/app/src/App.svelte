@@ -221,13 +221,18 @@
       })
     : null;
   const stopLogObserver = logHistory ? observeSessionLogs(app, logHistory.record) : () => {};
+  let logExportStatus = $state<"preparing" | "copying" | "saving" | "sharing" | null>(null);
   const exportLogsWithHistory = (
     kind: "copy" | "save" | "share", action: () => void | Promise<void>,
   ): void => {
+    // Prevent repeat taps from launching overlapping journal scans/share sheets.
+    if (logExportStatus !== null) return;
+    logExportStatus = "preparing";
+    const startedAtMs = Date.now();
     void (async () => {
       pushSessionLog(app, "info", "diagnostics.export.requested",
         "Diagnostic export started.", { kind });
-      await logHistory?.flush();
+      await logHistory?.flushAll();
       try { await logHistory?.restore(); }
       catch (error) {
         app.logs.historyError = "Historical diagnostics could not be recovered from Android's encrypted journal.";
@@ -235,15 +240,22 @@
           "Encrypted previous-run logs could not be read.",
           { reason: error instanceof Error ? error.message : String(error) });
       }
+      pushSessionLog(app, "info", "diagnostics.export.history_ready",
+        "Diagnostic history prepared for export.",
+        { kind, durationMs: Date.now() - startedAtMs,
+          historyEntryCount: app.logs.previousRunItems.length });
       if (logHistory && logHistory.pending() > 0) {
         app.logs.historyError = "Current diagnostic entries have not been confirmed in encrypted storage.";
         pushSessionLog(app, "warning", "diagnostics.persistence.unconfirmed",
           "Some current logs are still pending native storage.");
       }
+      logExportStatus = kind === "share" ? "sharing" : kind === "save" ? "saving" : "copying";
       await action();
     })().catch(error => {
       pushSessionLog(app, "error", "diagnostics.export.failed",
         error instanceof Error ? error.message : "Could not export diagnostics.");
+    }).finally(() => {
+      logExportStatus = null;
     });
   };
   const transferRuntime = createTransferRuntime({
@@ -1107,6 +1119,7 @@
           onOpenAboutPage={actions.openAboutPage}
           onOpenGeneralSettings={folderCredentials ? actions.openGeneralSettings : undefined}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
+          {logExportStatus}
           onCopySessionLogs={() => exportLogsWithHistory("copy", actions.copySessionLogs)}
           onSaveSessionLogs={logFile ? () => exportLogsWithHistory("save", actions.saveSessionLogs) : undefined}
           onShareSessionLogs={logFile ? () => exportLogsWithHistory("share", actions.shareSessionLogs) : undefined}

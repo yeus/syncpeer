@@ -24,8 +24,10 @@ internal class DiagnosticLogJournal(context: Context) {
   private val root = File(context.noBackupFilesDir, "diagnostic-journal").apply {
     check(isDirectory || mkdirs()) { "Diagnostic log storage is unavailable." }
   }
-  // One historical run is typically paged in dozens of 100-entry IPC calls.
-  // Cache that immutable run instead of decrypting the entire ring each time.
+  // A history export reads many 100-entry Binder pages from multiple runs.
+  // Keep one immutable, consistent snapshot for the entire export. Previously
+  // switching runs decrypted all eight journal segments again for every run.
+  private var cachedHistory: List<JSONObject>? = null
   private var cachedRun: Pair<String, List<JSONObject>>? = null
   private val key: SecretKey by lazy {
     val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -176,7 +178,12 @@ internal class DiagnosticLogJournal(context: Context) {
   }
 
   fun listRuns(): JSONArray = synchronized(IO_LOCK) {
-    val grouped = readAll().groupBy { it.getString("runId") }
+    // Explicit listing starts a new export snapshot. Appends continue using
+    // the same encrypted write-ahead journal without invalidating these pages.
+    val snapshot = readAll()
+    cachedHistory = snapshot
+    cachedRun = null
+    val grouped = snapshot.groupBy { it.getString("runId") }
     return JSONArray(grouped.map { (id, values) ->
       JSONObject().put("runId", id).put("startedAtMs", values.first().optLong("timestampMs"))
         .put("lastEventAtMs", values.last().optLong("timestampMs")).put("count", values.size)
@@ -186,10 +193,17 @@ internal class DiagnosticLogJournal(context: Context) {
   fun readRun(runId: String, offset: Int, limit: Int): JSONObject = synchronized(IO_LOCK) {
     require(runId.matches(RUN_ID) && offset >= 0 && limit in 1..100)
     val values = cachedRun?.takeIf { it.first == runId }?.second
-      ?: readAll().filter { it.optString("runId") == runId }.also { cachedRun = runId to it }
+      ?: (cachedHistory ?: readAll()).filter { it.optString("runId") == runId }
+        .also { cachedRun = runId to it }
     return JSONObject().put("total", values.size)
       .put("items", JSONArray(values.drop(offset).take(limit)))
   }
+  /** Drop decrypted snapshot after the WebView finishes paginated export. */
+  fun releaseHistory(): Unit = synchronized(IO_LOCK) {
+    cachedHistory = null
+    cachedRun = null
+  }
+
 
   companion object {
     private const val KEY_ALIAS = "syncpeer.diagnostic.journal.v1"

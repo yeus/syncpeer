@@ -107,6 +107,15 @@ test("document status reads the encrypted vault once without caching plaintext s
     assert.deepEqual(state.folders.map(folder => folder.id), ["folder"]);
     assert.deepEqual(state.pendingLocalReleases, []);
     assert.equal(vaultReads, 1, "Status must not decrypt identical vault contents twice");
+    for (let iteration = 0; iteration < 8; iteration++) {
+      const cached = await dispatchDocumentCommandWithSessionConfiguration(
+        documents, { operation: "cacheRegistrations" }, () => {
+          throw new Error("A read-only registration lookup must not invalidate a session.");
+        });
+      assert.deepEqual((cached as Pick<typeof state, "folders">).folders, state.folders);
+      assert.deepEqual((cached as Pick<typeof state, "vault">).vault, state.vault);
+    }
+    assert.equal(vaultReads, 1, "Repeated registration snapshots must not decrypt the encrypted vault");
   } finally { await documents.close(); }
 });
 
@@ -726,6 +735,11 @@ test("legacy folder registrations migrate only after encrypted read-back and sta
   assert.equal(roots.get("profile")!.files.has(".syncpeer-document-folders"), false);
   await reopened.lock();
   assert.deepEqual((await reopened.status()).folders, []);
+  const locked = await dispatchDocumentCommandWithSessionConfiguration(
+    reopened, { operation: "cacheRegistrations" }, () => {});
+  assert.equal((locked as { vault: { phase: string } }).vault.phase, "locked");
+  assert.deepEqual((locked as { folders: unknown[] }).folders, [],
+    "Locked registration snapshots must not expose folder metadata");
   await reopened.close();
 });
 

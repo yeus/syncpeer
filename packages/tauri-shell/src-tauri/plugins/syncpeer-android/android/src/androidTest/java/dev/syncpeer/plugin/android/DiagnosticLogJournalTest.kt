@@ -62,6 +62,40 @@ class DiagnosticLogJournalTest {
     } finally { context.cleanup() }
   }
 
+  @Test fun historicalExportPagesReuseAnImmutableEncryptedSnapshot() {
+    val context = IsolatedLogs(InstrumentationRegistry.getInstrumentation().targetContext)
+    try {
+      val first = "44444444-4444-4444-4444-444444444444"
+      val second = "55555555-5555-5555-5555-555555555555"
+      val store = DiagnosticLogJournal(context)
+      store.startRun(first)
+      fun event(runId: String, name: String) = JSONObject()
+        .put("runId", runId).put("timestampMs", System.currentTimeMillis())
+        .put("level", "info").put("event", name).put("message", name)
+      store.append(listOf(event(first, "first.event")))
+      store.startRun(second)
+      store.append(listOf(event(second, "second.event")))
+      val snapshot = store.listRuns()
+      val firstCount = (0 until snapshot.length()).map { snapshot.getJSONObject(it) }
+        .first { it.getString("runId") == first }.getInt("count")
+      store.append(listOf(event(first, "late.event")))
+      val oldPage = store.readRun(first, 0, 100).getJSONArray("items")
+      assertEquals(firstCount, oldPage.length())
+      assertFalse((0 until oldPage.length()).any {
+        oldPage.getJSONObject(it).optString("event") == "late.event"
+      })
+      // A subsequent explicit history listing starts a new coherent snapshot.
+      store.listRuns()
+      val newPage = store.readRun(first, 0, 100).getJSONArray("items")
+      assertEquals(firstCount + 1, newPage.length())
+      assertEquals("late.event", newPage.getJSONObject(newPage.length() - 1).getString("event"))
+      store.releaseHistory()
+      store.append(listOf(event(first, "after.release")))
+      val uncachedPage = store.readRun(first, 0, 100).getJSONArray("items")
+      assertEquals(firstCount + 2, uncachedPage.length())
+    } finally { context.cleanup() }
+  }
+
   @Test fun interruptedTailIsRepairedBeforeAppendingMoreDiagnostics() {
     val context = IsolatedLogs(InstrumentationRegistry.getInstrumentation().targetContext)
     try {

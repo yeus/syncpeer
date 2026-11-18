@@ -384,11 +384,56 @@ test("inactive startup and stale idle events do not reject a pending native conn
   listener({ type: "sessionStatus", revision: 4, phase: "idle",
     active: false, foreground: false });
   phase = "connected";
+  let resolved = false;
+  void connecting.then(() => { resolved = true; });
   listener({ type: "sessionStatus", revision: 5, phase: "connected", peerPhase: "reconnecting",
+    active: true, foreground: false });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(resolved, false, "A stale native connected flag must not expose a restarting peer.");
+  listener({ type: "sessionStatus", revision: 6, phase: "connected", peerPhase: "connected",
     active: true, foreground: false });
   const session = await connecting;
   assert.equal(session.isClosed(), false);
   await session.close();
+});
+
+test("fast native connected reply waits for current authenticated peer before overview", { timeout: 4000 }, async () => {
+  let listener: ((event: unknown) => void) | undefined;
+  let peerPhase = "starting";
+  let overviewCalls = 0;
+  const controller = new AbortController();
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "connected" };
+    if (request.operation === "status") return { phase: "connected", active: true,
+      peerPhase, foreground: true, revision: 4 };
+    if (request.operation === "overview") {
+      overviewCalls++;
+      if (peerPhase !== "connected") throw new Error("The Android peer session is unavailable.");
+      return { folders: [], folderSyncStates: [], connectedVia: "test", transportKind: "direct-tcp" };
+    }
+    throw new Error("Unexpected service command.");
+  };
+  const connecting = createServiceOwnedSession(rpc, { remoteId: "peer" } as never,
+    controller.signal, 60_000, async handler => {
+      listener = handler;
+      return () => undefined;
+    });
+  let settled = false;
+  void connecting.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    for (let i = 0; i < 10 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(overviewCalls, 0, "Stale connected reply must not request an unavailable overview.");
+    assert.equal(settled, false);
+    assert.ok(listener);
+    peerPhase = "connected";
+    listener({ type: "sessionStatus", revision: 5, phase: "connected", peerPhase,
+      active: true, foreground: true });
+    const session = await connecting;
+    assert.equal(session.isClosed(), false);
+    await session.close();
+    assert.equal(overviewCalls, 1);
+  } finally { controller.abort(); }
 });
 
 test("stale idle connection reply reconciles with a live native reconnect", async () => {

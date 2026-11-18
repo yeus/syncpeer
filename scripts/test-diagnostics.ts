@@ -86,6 +86,11 @@ const main = async (): Promise<void> => {
       args: ["--experimental-strip-types", "--test", "--test-concurrency=1", "scripts/test-relay-service.ts", "scripts/test-automatic-relay.ts", "scripts/test-native-discovery.ts", "scripts/test-document-runtime-port.ts", "scripts/test-relay-retry.ts", "scripts/test-relay-sync.ts"],
     },
     {
+      name: "Connection performance state and latency budget regressions",
+      command: process.execPath,
+      args: ["--test", "scripts/test-connection-performance.mjs"],
+    },
+    {
       // Permanent release regression gate: stale LAN paths, dead global discovery,
       // blocked QUIC, and crowded global advertisements use real TLS/BEP peers.
       ...tsxScript("scripts/test-discovery-budgets.ts"),

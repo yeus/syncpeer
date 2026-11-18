@@ -1153,6 +1153,19 @@ const createLifecycleActions = (runtime: DocumentRuntime) => ({
     await refreshSharedFolderCredentialsIfChanged(runtime);
     return documentStatus(runtime);
   }, "status"),
+  // Cache ownership reads are frequent during startup and transfer reconciliation.
+  // Use the already-validated, in-memory registry instead of decrypting the
+  // vault and probing the filesystem for every read-only lookup.
+  cacheRegistrations: () => runQueued(runtime, async () => {
+    const vault = runtime.vault.status();
+    const folders = vault.phase !== "unlocked" ? [] : runtime.registry?.getState().map(
+      ({ id, label, storageId, downloads, browseOnly }) => ({
+        id, label, storageId,
+        ...(downloads ? { downloads: true } : {}),
+        ...(browseOnly ? { browseOnly: true } : {}),
+      })) ?? [];
+    return { vault, folders };
+  }, "cacheRegistrations"),
   close: () => closeFilesystem(runtime),
 });
 

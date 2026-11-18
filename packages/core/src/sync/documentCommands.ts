@@ -270,7 +270,7 @@ const unknownCommand = (): never => { throw new Error("Unknown document command.
 
 const commandHandlers: Record<string, CommandHandler> = {
   status: ({ documents }) => documents.status(),
-  cacheRegistrations: ({ documents }) => documents.status(),
+  cacheRegistrations: ({ documents }) => documents.cacheRegistrations(),
   connectionPasswords: ({ documents }) => documents.connectionPasswords(),
   sessionSharedFolders,
   profileSettings: ({ documents }) => documents.profileSettings(),

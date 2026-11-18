@@ -116,7 +116,7 @@ test("a large advertisement list never launches more than three simultaneous dir
   assert.ok(peak >= 2, "The dialer should still race a few candidates.");
 });
 
-test("multipath network resilience regressions (real TLS/BEP)", { timeout: 14000 }, async t => {
+test("multipath network resilience regressions (real TLS/BEP)", { timeout: 22000 }, async t => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-multipath-"));
   const stalledSockets = new Set<net.Socket>();
   const stalledServers: net.Server[] = [];
@@ -169,32 +169,37 @@ test("multipath network resilience regressions (real TLS/BEP)", { timeout: 14000
         protocol: "tcp" as const, scope: "lan" as const })),
     ];
     const base = createNodeHostAdapter();
-    await runCase("blackholed LAN does not starve a delayed global peer", async () => {
-    const attempted: string[] = [];
-    const client = createSyncpeerCoreClient({
-      ...base,
-      connectTls: async options => {
-        attempted.push(`${options.host}:${options.port}`);
-        return base.connectTls(options);
-      },
-      discoverLocalCandidates: async () => localCandidates,
-      discoveryFetch: async () => ({
-        ok: true, status: 200, text: async () => "",
-        json: async () => {
-          await new Promise(resolve => setTimeout(resolve, 180));
-          return { addresses: [`tcp://127.0.0.1:${listener!.port}`] };
-        },
-      }),
-    });
-    const start = performance.now();
-    outgoing = await client.openSession({ ...local, host: "", port: 22000,
-      expectedDeviceId: peer.deviceId, deviceName: "synthetic-multipath-client",
-      discoveryMode: "automatic", timeoutMs: 3500, enableRelayFallback: false });
-    const elapsed = performance.now() - start;
-    assert.equal(outgoing.remoteDeviceId, peer.deviceId);
-    assert.ok(attempted.includes(`127.0.0.1:${listener.port}`),
-      "Healthy global endpoint must start even while blackholed LAN dials are pending.");
-    assert.ok(elapsed < 2600, `Healthy path delayed by ${Math.round(elapsed)} ms`);
+    await runCase("repeated blackholed LAN and jittered discovery reach authenticated folder metadata", async () => {
+      for (let round = 0; round < 3; round++) {
+        const attempted: string[] = [];
+        const client = createSyncpeerCoreClient({
+          ...base,
+          connectTls: async options => {
+            attempted.push(`${options.host}:${options.port}`);
+            return base.connectTls(options);
+          },
+          discoverLocalCandidates: async () => localCandidates,
+          discoveryFetch: async () => ({
+            ok: true, status: 200, text: async () => "",
+            json: async () => {
+              await new Promise(resolve => setTimeout(resolve, 180 + round * 90));
+              return { addresses: [`tcp://127.0.0.1:${listener!.port}`] };
+            },
+          }),
+        });
+        const start = performance.now();
+        outgoing = await client.openSession({ ...local, host: "", port: 22000,
+          expectedDeviceId: peer.deviceId, deviceName: "synthetic-multipath-client",
+          discoveryMode: "automatic", timeoutMs: 3500, enableRelayFallback: false });
+        assert.equal(outgoing.remoteDeviceId, peer.deviceId);
+        assert.ok(attempted.includes(`127.0.0.1:${listener.port}`),
+          "Healthy global endpoint must start even while blackholed LAN dials are pending.");
+        assert.ok(Array.isArray(await outgoing.remoteFs.listFolders()), "Authenticated peer must accept a live BEP folder request.");
+        const elapsed = performance.now() - start;
+        assert.ok(elapsed < 2600, `Round ${round + 1}: live folder readiness delayed by ${Math.round(elapsed)} ms`);
+        await outgoing.close();
+        outgoing = undefined;
+      }
     });
     await runCase("global discovery outage releases reserved dial slot for LAN", async () => {
     // Reverse the setup: global discovery is offline, but the third LAN

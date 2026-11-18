@@ -573,6 +573,7 @@ describe("Packaged desktop to Android pairing", () => {
           await connectionControl.click();
         }
         await relayFinished;
+        const relayConnectionStartedAt = performance.now();
         try {
           await browser.waitUntil(async () =>
             (await $("[data-testid='connection-status']").getText()).includes("Connected"),
@@ -597,6 +598,9 @@ describe("Packaged desktop to Android pairing", () => {
         await browser.waitUntil(async () => (await browser.getPageSource()).includes("Path: relay"),
           { timeout: 30_000, interval: 500,
             timeoutMsg: "Packaged connection did not report relay transport." });
+        const relayConnectionMs = performance.now() - relayConnectionStartedAt;
+        assert.ok(relayConnectionMs < 45_000,
+          `Authenticated local relay path required ${Math.round(relayConnectionMs)}ms after Android was ready.`);
 
         await attachSharedFolder();
         console.log("Relay session delivered and attached the Android-created encrypted folder.");

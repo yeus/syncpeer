@@ -443,13 +443,18 @@ const main = async (): Promise<void> => {
 
     if (process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1" ||
       process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1" ||
-      process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1") {
+      process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1" ||
+      process.env.SYNCPEER_ANDROID_PEER_LATENCY_ONLY === "1") {
       await runPhase("--peer-connect-smoke", env);
       // Keep startup reconnection in the ordinary automatic-peer CI gate,
       // not only in a manually selected profiling scenario.
       if (process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1" ||
-        process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1") {
+        process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1" ||
+        process.env.SYNCPEER_ANDROID_PEER_LATENCY_ONLY === "1") {
         await runPhase("--peer-startup-auto-connect", env);
+      }
+      if (process.env.SYNCPEER_ANDROID_PEER_LATENCY_ONLY === "1") {
+        await runPhase("--peer-connection-latency", env);
       }
       if (discovery && discovery.lookupCount() === 0) {
         throw new Error("Automatic Android connection never queried pinned synthetic discovery.");

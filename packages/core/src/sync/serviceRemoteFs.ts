@@ -181,8 +181,12 @@ const awaitServiceConnection = (
     finish(new Error("Android service did not confirm its peer connection.")), 60_000);
   if (signal?.aborted) { onAbort(); return; }
   signal?.addEventListener("abort", onAbort, { once: true });
-  const accept = (phase: unknown, active: unknown, error?: string) => {
-    if (phase === "connected" && active === true) finish();
+  const accept = (phase: unknown, active: unknown, peerPhase?: unknown, error?: string) => {
+    // The service can still report its prior socket as active while the peer
+    // runtime has already begun a replacement. Do not open an overview against
+    // that retired session until the authoritative peer lifecycle confirms it.
+    if (phase === "connected" && active === true &&
+      (peerPhase === undefined || peerPhase === "connected")) finish();
     // Initial native startup reports active=false, and a superseded idle status
     // can replay while a newer connection is in flight. Neither is terminal.
     else if (phase === "error" || phase === "stopping") {
@@ -191,7 +195,7 @@ const awaitServiceConnection = (
   };
   void subscribe(raw => {
     const event = parseServiceSessionStatusEvent(raw);
-    if (event) accept(event.phase, event.active, serviceSessionStatusMessage(event));
+    if (event) accept(event.phase, event.active, event.peerPhase, serviceSessionStatusMessage(event));
   }).then(async stop => {
     if (settled) { stop(); return; }
     unsubscribe = stop;
@@ -199,7 +203,7 @@ const awaitServiceConnection = (
     // the listener. No polling or competing session connection is needed.
     const status = requireResult(parseServiceResponse("status",
       await rpc(withServiceProtocol({ operation: "status" }), signal)));
-    accept(status.phase, status.active,
+    accept(status.phase, status.active, status.peerPhase,
       typeof status.error === "string" ? status.error : undefined);
   }, error => finish(error instanceof Error ? error : new Error(String(error))))
     .catch(error => finish(error instanceof Error ? error : new Error(String(error))));
@@ -230,11 +234,13 @@ export async function createServiceOwnedSession(
       throw error;
     }
   }
-  if (phase !== "connected") {
-    // A stale native reply or a superseded connect RPC does not invalidate the
-    // service's active socket. Subscribe and reconcile the authoritative state.
-    if (!subscribeStatus) throw new Error("Android service could not establish a peer session.");
+  if (subscribeStatus) {
+    // Even an optimistic "connected" reply can race a newer peer handshake.
+    // Confirm the current peer phase before reading its overview, without
+    // creating a competing dial.
     await awaitServiceConnection(rpc, subscribeStatus, signal);
+  } else if (phase !== "connected") {
+    throw new Error("Android service could not establish a peer session.");
   }
   const overview = requireResult(parseServiceResponse("overview",
     await rpc(withServiceProtocol({ operation: "overview" }), signal))) as Overview;

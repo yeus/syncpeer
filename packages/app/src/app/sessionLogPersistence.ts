@@ -94,6 +94,17 @@ export const createPersistentSessionLogs = (args: {
     await task;
   };
 
+  /** Explicit export drains the initial backlog, not just the first 24-entry batch.
+   * Stop on a failed write rather than retrying indefinitely on the UI path. */
+  const flushAll = async (): Promise<void> => {
+    const batches = Math.ceil(queue.length / BATCH_LIMIT) + (flushing ? 1 : 0);
+    for (let i = 0; i < batches && (queue.length > 0 || flushing); i++) {
+      const before = queue.length;
+      await flush();
+      if (queue.length >= before && !flushing) break;
+    }
+  };
+
   const schedule = (delay = 100): void => {
     if (disposed || timer) return;
     timer = setTimeout(() => { timer = null; void flush(); }, delay);
@@ -179,7 +190,12 @@ export const createPersistentSessionLogs = (args: {
       });
       restored = true;
     })();
-    restoreInFlight = work.finally(() => { restoreInFlight = null; });
+    restoreInFlight = work.finally(() => {
+      restoreInFlight = null;
+      // Native should not retain the entire decrypted journal after sharing.
+      // No need to delay opening the share sheet for this cleanup.
+      void request({ operation: "release" }).catch(() => undefined);
+    });
     return restoreInFlight;
   };
 
@@ -194,5 +210,5 @@ export const createPersistentSessionLogs = (args: {
     disposed = true;
   };
 
-  return { record, start, restore, flush, dispose, pending: () => queue.length };
+  return { record, start, restore, flush, flushAll, dispose, pending: () => queue.length };
 };

@@ -7,6 +7,7 @@ import { build, transformWithEsbuild } from "vite";
 import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
 import { normalizeDeviceId } from "@syncpeer/core/browser";
 import { createBrowserBepSchemaPlugin } from "./vite-plugins/browserBepSchema.mjs";
+import { measureConnectionReadiness, probeServiceReadiness } from "./connection-performance.mjs";
 
 const cliArguments = process.argv.slice(2);
 const hasArgument = (name) => cliArguments.includes(name);
@@ -1017,6 +1018,93 @@ const runPeerStartupAutoConnect = async () => {
     throw new Error(`Android did not automatically connect within 20 seconds of restoring the saved roster: ` +
       `${JSON.stringify({ lastStatus, events })}`);
   } finally { cdp.close(); }
+};
+/** One native service RPC. It never opens a new foreground peer socket. */
+const livePeerCommand = async (cdp, operation) =>
+  (await tauriInvoke(cdp, "syncpeer_android_session_command", {
+    request: { protocolVersion: 1, operation },
+  }, 6_000)).result;
+
+/** A successful BEP overview and current remote-folder query are mandatory. */
+const probeAndroidConnectionReadiness = cdp => probeServiceReadiness({
+  call: async operation => {
+    const started = performance.now();
+    try { return await livePeerCommand(cdp, operation); }
+    finally {
+      const durationMs = Math.round(performance.now() - started);
+      if (durationMs > 1_000) {
+        console.log(`Android connection probe slow RPC: ${JSON.stringify({ operation, durationMs })}`);
+      }
+    }
+  },
+  expectedDeviceId: serverDeviceId,
+  expectedFolderId: targetFolderId,
+  normalizeDeviceId,
+});
+
+const readConnectionLatencyBudgets = () => ({
+  authenticationBudgetMs: Number(process.env.SYNCPEER_ANDROID_AUTH_BUDGET_MS ?? 20_000),
+  folderBudgetMs: Number(process.env.SYNCPEER_ANDROID_FOLDER_BUDGET_MS ?? 25_000),
+  stableWindowMs: Number(process.env.SYNCPEER_ANDROID_STABLE_WINDOW_MS ?? 2_000),
+});
+
+/** Disposable-emulator only. A caller must provision an approved synthetic
+ * Syncthing peer and prime saved settings via --peer-connect-smoke first.
+ */
+const runPeerConnectionPerformance = async () => {
+  if (!serverDeviceId) throw new Error("Connection latency gate requires a synthetic approved peer.");
+  if (runAdb(["shell", "getprop", "ro.kernel.qemu"]).trim() !== "1") {
+    throw new Error("Connection performance E2E requires a disposable Android emulator, not a real device.");
+  }
+  const rounds = Number(process.env.SYNCPEER_ANDROID_LATENCY_ROUNDS ?? 3);
+  if (!Number.isSafeInteger(rounds) || rounds < 2 || rounds > 10) {
+    throw new Error("Android latency samples must be between 2 and 10 cold launches.");
+  }
+  const budgets = readConnectionLatencyBudgets();
+  const samples = [];
+  for (let round = 0; round < rounds; round++) {
+    const startedAtMs = performance.now();
+    const cdp = await launchAndroidApp(true);
+    // Last cold restart deliberately competes with the vault's read-only
+    // status/profile operations observed in the physical-device logs.
+    const stressed = round === rounds - 1;
+    const storage = stressed ? Promise.allSettled(Array.from({ length: 24 }, (_, index) =>
+      documentCommand(cdp, { operation: ["status", "cacheRegistrations", "ownedDevices", "connectionPasswords"][index % 4] }))) : null;
+    try {
+      const result = await measureConnectionReadiness({
+        ...budgets, startedAtMs, probe: () => probeAndroidConnectionReadiness(cdp),
+      });
+      if (storage) {
+        const settled = await storage;
+        if (settled.some(value => value.status === "rejected")) {
+          throw new Error("Android storage contention caused a read-only document command to fail.");
+        }
+      }
+      samples.push({ round: round + 1, kind: stressed ? "cold-with-storage-contention" : "cold", ...result });
+      console.log(`Android connection timing: ${JSON.stringify(samples.at(-1))}`);
+      if (round === 0) {
+        await setAndroidAutomaticConnectionPaused(cdp, true);
+        const deadline = Date.now() + 15_000;
+        let disconnected = false;
+        while (Date.now() < deadline) {
+          const state = await probeAndroidConnectionReadiness(cdp);
+          if (!state.authenticated) { disconnected = true; break; }
+          await wait(250);
+        }
+        if (!disconnected) throw new Error("Android pause did not end the authenticated session.");
+        const warmStartedAtMs = performance.now();
+        await setAndroidAutomaticConnectionPaused(cdp, false);
+        samples.push({ round: 1, kind: "warm-reconnect", ...await measureConnectionReadiness({
+          ...budgets, startedAtMs: warmStartedAtMs, probe: () => probeAndroidConnectionReadiness(cdp),
+        }) });
+        console.log(`Android connection timing: ${JSON.stringify(samples.at(-1))}`);
+      }
+    } finally {
+      if (storage) await storage;
+      cdp.close();
+    }
+  }
+  console.log(`Android native authenticated connection performance (API ${androidSdkVersion()}): ${JSON.stringify(samples)}`);
 };
 const runPeerSwitchApproval = async () => {
   const secondDeviceId = process.env.SYNCPEER_PEER_SECOND_DEVICE_ID?.trim();
@@ -3524,6 +3612,10 @@ const main = async () => {
   }
   if (hasArgument("--peer-startup-auto-connect")) {
     await runPeerStartupAutoConnect();
+    return;
+  }
+  if (hasArgument("--peer-connection-latency")) {
+    await runPeerConnectionPerformance();
     return;
   }
   if (hasArgument("--peer-switch-approval")) {

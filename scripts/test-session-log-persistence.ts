@@ -244,6 +244,34 @@ test("unacknowledged native appends are retained for retry instead of being sile
   history.dispose();
 });
 
+test("export flush drains all queued diagnostics instead of just one native page", async () => {
+  const native = fixture();
+  const history = createPersistentSessionLogs({ port: native.port, runId: first, deferHistory: true });
+  await history.start();
+  for (let i = 0; i < 61; i++) history.record({
+    timestampMs: Date.now() + i, level: "info", event: "export.current", message: `item-${i}`,
+  });
+  await history.flushAll();
+  assert.equal(history.pending(), 0);
+  assert.equal(native.entries.filter(item => item.event === "export.current").length, 61);
+  history.dispose();
+});
+
+test("export flush stops after an unacknowledged native append and can retry later", async () => {
+  const native = fixture();
+  const history = createPersistentSessionLogs({ port: native.port, runId: first, deferHistory: true });
+  await history.start();
+  for (let i = 0; i < 30; i++) history.record({
+    timestampMs: Date.now() + i, level: "error", event: "export.retry", message: "retry",
+  });
+  native.failNextAppend();
+  await history.flushAll();
+  assert.equal(history.pending(), 30, "A failed native write must not spin or discard diagnostics.");
+  await history.flushAll();
+  assert.equal(history.pending(), 0);
+  history.dispose();
+});
+
 test("invalid startup and history IPC responses are errors, not empty recovered logs", async () => {
   const invalidStart = createPersistentSessionLogs({
     runId: first, port: async () => ({ result: { started: true } }),

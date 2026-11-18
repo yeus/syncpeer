@@ -26,6 +26,7 @@
     onCopySessionLogs: () => void;
     onSaveSessionLogs?: () => void;
     onShareSessionLogs?: () => void;
+    logExportStatus?: "preparing" | "copying" | "saving" | "sharing" | null;
     onEditLocalDeviceName: () => void;
     onRegenerateDeviceId: () => void;
     onCopyIdentityBackupSecret: () => void;
@@ -57,6 +58,7 @@
     onCopySessionLogs,
     onSaveSessionLogs,
     onShareSessionLogs,
+    logExportStatus = null,
     onEditLocalDeviceName,
     onRegenerateDeviceId,
     onCopyIdentityBackupSecret,
@@ -71,6 +73,7 @@
     onConnectionSettingsChanged,
   }: Props = $props();
 
+  let previousRunPanelExpanded = $state(false);
   const appInfo = getAppBuildInfo();
 
   const buildTimeLocalLabel = formatBuildTimeLocal(appInfo.buildTimeUtc);
@@ -614,31 +617,40 @@
 
 <Panel title="Session Logs">
   <div class="actions">
-    <button type="button" class="ghost" onclick={onCopySessionLogs}
+    <button type="button" class="ghost" disabled={logExportStatus !== null} onclick={onCopySessionLogs}
       >Copy Logs</button
     >
     {#if onSaveSessionLogs}
-      <button type="button" class="ghost" data-testid="save-session-logs" onclick={onSaveSessionLogs}
+      <button type="button" class="ghost" data-testid="save-session-logs" disabled={logExportStatus !== null} onclick={onSaveSessionLogs}
         >Save Logs</button
       >
     {/if}
     {#if onShareSessionLogs}
-      <button type="button" class="ghost" data-testid="share-session-logs" onclick={onShareSessionLogs}
+      <button type="button" class="ghost" data-testid="share-session-logs" disabled={logExportStatus !== null} onclick={onShareSessionLogs}
         >Share Logs</button
       >
     {/if}
+  {#if logExportStatus !== null}
+    <p role="status" data-testid="session-log-export-status" class="hint">
+      {logExportStatus === "preparing"
+        ? "Preparing encrypted previous-run history for export…"
+        : logExportStatus === "sharing" ? "Opening Android share sheet…"
+        : logExportStatus === "saving" ? "Saving logs…" : "Copying logs…"}
+    </p>
+  {/if}
   </div>
   <p class="hint">Android encrypted journal: {app.logs.journalStarted ? "writing enabled" : "not confirmed"}. Previous runs: {app.logs.historyAvailable ? `${app.logs.previousRunItems.length} entries recovered` : "not loaded"}. Save/Share retrieves history; installed updates preserve data, uninstalling does not.</p>
   {#if app.logs.historyError}
     <p class="hint" role="status">{app.logs.historyError}</p>
   {/if}
   {#if app.logs.historyAvailable && app.logs.previousRunItems.length > 0}
-    <details data-testid="previous-session-logs">
+    <details data-testid="previous-session-logs" bind:open={previousRunPanelExpanded}>
       <summary>Previous runs ({app.logs.previousRunItems.length} entries)
         {#if app.logs.previousRunStartedAtMs}
           · {new Date(app.logs.previousRunStartedAtMs).toLocaleString()}
         {/if}
       </summary>
+      {#if previousRunPanelExpanded}
       {#if app.logs.previousRunItems.length > 250}
         <p class="item-meta">Showing 250 recent entries; Save or Share Logs includes all recovered entries.</p>
       {/if}
@@ -655,6 +667,7 @@
           </ListRow>
         {/each}
       </ul>
+      {/if}
     </details>
   {/if}
   <details bind:open={app.ui.isLogPanelExpanded}>

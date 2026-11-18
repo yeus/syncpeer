@@ -566,7 +566,14 @@ test("Android UI connect and disconnect update the service-owned session invento
   const handler = kotlin.slice(kotlin.indexOf("fun sessionCommand(input:"), kotlin.indexOf("internal fun startBackgroundSession("));
   assert.match(handler, /operation == "disconnect"/);
   assert.match(handler, /stopSession\(persist = true\)/);
-  assert.match(handler, /sessionStarted = phase == "connected"/);
+  assert.match(handler, /val authenticated = peerPhase == "connected"/);
+  assert.match(handler, /uiConnectExpectedPeer == verifiedTransferPeerId/);
+  assert.match(handler, /if \(phase == "connected" && authenticated\)/);
+  assert.doesNotMatch(handler, /sessionStarted = phase == "connected"/);
+  const peerStatus = kotlin.slice(kotlin.indexOf('if (request.optString("operation") == "sessionPeerStatus")'),
+    kotlin.indexOf('if (request.optString("operation") == "pendingPeer")'));
+  assert.match(peerStatus, /if \(phase != "connected" && sessionStarted\)/);
+  assert.match(peerStatus, /sessionStarted = false/);
   assert.match(handler, /uiConnectPending/);
   assert.match(handler, /generation == uiConnectGeneration/);
   assert.match(handler, /sessionPhase =/);

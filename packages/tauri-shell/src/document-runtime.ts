@@ -279,12 +279,18 @@ class AndroidSessionRuntime {
     // distinguish waiting/reconnecting from a confirmed connected socket.
     this.peerStatusUnsubscribe = this.lifecycle.subscribe(this.reportPeerStatus);
     this.documents.onSessionConfigurationChange(() => {
+      this.adapter.log?.("core.session.configuration.invalidated", {
+        message: `revision=${this.documents.sessionConfigurationRevision()} phase=${this.lifecycle.getState().phase}`,
+      });
       setTimeout(() => {
         if (!this.activeOptions) return;
-        // The new opening refreshes incoming handlers via ensureIncomingService.
-        // Closing the listener first also closes live sessions, allowing a
-        // second connect to race with its own BEP teardown.
-        void this.lifecycle.ensureSession(this.activeOptions).catch(() => undefined);
+        // Refresh prepared incoming folders through the current lifecycle,
+        // without tearing down the listener ahead of the replacement.
+        void this.lifecycle.ensureSession(this.activeOptions).catch(error => {
+          this.adapter.log?.("core.session.configuration.refresh_failed", {
+            message: error instanceof Error ? error.name : "Unknown",
+          });
+        });
       }, 0);
     });
     return { command: this.command, close: this.close };

@@ -206,6 +206,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
           "list" -> JSONObject().put("runs", store.listRuns())
           "read" -> store.readRun(input.getString("runId"), input.optInt("offset", 0),
             input.optInt("limit", 100))
+          "release" -> { store.releaseHistory(); JSONObject().put("released", true) }
           else -> throw IllegalArgumentException("Unknown diagnostic operation.")
         }
         invoke.resolve(app.tauri.plugin.JSObject(result.toString()))

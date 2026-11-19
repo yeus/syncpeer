@@ -46,6 +46,7 @@ export const formatSessionLogs = (
   items: readonly SessionLogItem[],
   previousRun?: { startedAtMs: number; items: readonly SessionLogItem[] },
   diagnostics?: { journalStarted: boolean; historyLoaded: boolean; historyError: string },
+  currentNative?: readonly SessionLogItem[],
 ): string => {
   const journal = diagnostics
     ? `# Diagnostic Journal
@@ -56,10 +57,12 @@ history_error: ${diagnostics.historyError ? sanitizeDiagnosticText(diagnostics.h
     : "";
   const metadata = [formatAppBuildInfo(appInfo), journal, "# Session Logs"].filter(Boolean).join("\n\n");
   const current = formatEntries(items) || "No session logs yet.";
-  if (!previousRun || previousRun.items.length === 0) return `${metadata}\n${current}`;
+  const currentNativeText = currentNative?.length
+    ? `\n\n# Current Native Service Diagnostics (encrypted journal)\n${formatEntries(currentNative)}` : "";
+  if (!previousRun || previousRun.items.length === 0) return `${metadata}\n${current}${currentNativeText}`;
   const date = previousRun.startedAtMs
     ? new Date(previousRun.startedAtMs).toISOString() : "unknown";
-  return `${metadata}\n${current}\n\n# Previous Run Logs (rolling history; newest archived run started ${date})\n${formatEntries(previousRun.items)}`;
+  return `${metadata}\n${current}${currentNativeText}\n\n# Previous Run Logs (rolling history; newest archived run started ${date})\n${formatEntries(previousRun.items)}`;
 };
 
 export const describeSessionLogSize = (bytes: number): string =>

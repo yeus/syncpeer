@@ -68,6 +68,22 @@ test("formatted logs keep messages and sanitized metadata", () => {
   assert.match(text, /"port": 22000/);
 });
 
+test("current native TLS and discovery diagnostics appear in a separate sanitized section", () => {
+  const trace = [{
+    timestampMs: Date.parse("2026-11-18T06:55:55Z"),
+    level: "warning" as const,
+    event: "native.network.operation_slow",
+    message: "native.network.operation_slow",
+    details: { operation: "tlsOpen", failed: true, host: "192.0.2.20" },
+  }];
+  const text = formatSessionLogs(appInfo, [], { startedAtMs: 0, items: [] },
+    undefined, trace);
+  assert.match(text, /# Current Native Service Diagnostics \(encrypted journal\)/);
+  assert.match(text, /native\.network\.operation_slow/);
+  assert.match(text, /"operation": "tlsOpen"/);
+  assert.doesNotMatch(text, /192\.0\.2\.20/);
+});
+
 test("Android export reports journal health even when there is no previous-run section", () => {
   const state = createInitialState(null);
   state.logs.journalStarted = true;

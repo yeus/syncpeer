@@ -1,7 +1,7 @@
 import { normalizeDeviceId } from "./ui/helpers.js";
 
 /** Discovery is evidence of reachability, never an authorization grant. */
-export type PeerDiscoveryKind = "lan" | "introduced" | "manual" | "incoming";
+export type PeerDiscoveryKind = "lan" | "verified" | "introduced" | "manual" | "incoming";
 export interface PeerDiscoveryEvidence {
   kind: PeerDiscoveryKind;
   sourceDeviceId?: string;
@@ -79,7 +79,7 @@ export const normalizePeerDiscovery = (value: unknown, nowMs = Date.now()): Peer
   for (const [deviceId, record] of Object.entries(value).slice(0, MAX_DISCOVERED_PEERS)) {
     if (!record || typeof record !== "object" || !Array.isArray((record as PeerDiscoveryRecord).sources)) continue;
     for (const source of (record as PeerDiscoveryRecord).sources.slice(0, MAX_SOURCES_PER_PEER)) {
-      if (!source || !["lan", "introduced", "manual", "incoming"].includes(source.kind) ||
+      if (!source || !["lan", "verified", "introduced", "manual", "incoming"].includes(source.kind) ||
         typeof source.lastSeenAtMs !== "number" || source.lastSeenAtMs > nowMs ||
         (source.sourceDeviceId && typeof source.sourceDeviceId !== "string") ||
         (source.addresses && (!Array.isArray(source.addresses) ||

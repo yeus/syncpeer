@@ -14,6 +14,7 @@ export interface SavedDeviceRow {
     deviceId: string;
     isConnected: boolean;
     isConnecting: boolean;
+    directTcpPreparing: boolean;
     connectError: string;
     confirmed: boolean;
     isLanDetected: boolean;
@@ -57,6 +58,7 @@ export interface SavedDeviceRow {
   interface Props {
     row: DeviceListRow;
     onUseSavedDevice: (deviceId: string) => void;
+    onConnectDirectTcp: (deviceId: string) => Promise<void>;
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
@@ -66,6 +68,7 @@ export interface SavedDeviceRow {
   let {
     row,
     onUseSavedDevice,
+    onConnectDirectTcp,
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
@@ -151,7 +154,16 @@ export interface SavedDeviceRow {
       >
         {row.kind === "candidate" ? row.incomingRequest ? "Approve peer" : "Add peer" : row.isConnected ? "Reconnect" : "Connect"}
       </button>
-      {#if row.kind === "saved"}
+    {/if}
+    {#if row.kind === "saved"}
+        <button
+          class="ghost"
+          data-testid="peer-direct-tcp"
+          aria-label={`Connect ${row.name} over direct LAN TCP`}
+          disabled={row.directTcpPreparing}
+          title="Use the saved peer identity and its known LAN IPv4 address; bypass discovery during the actual TCP connection"
+          onclick={() => { void onConnectDirectTcp(row.deviceId); }}
+        >{row.directTcpPreparing ? "Finding LAN address…" : "Direct TCP"}</button>
         <button
           class="ghost"
           onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}
@@ -165,7 +177,6 @@ export interface SavedDeviceRow {
         >
           <Trash2 size={16} />
         </button>
-      {/if}
     {:else if row.kind === "advertised"}
       <button
         class="primary icon icon-only"

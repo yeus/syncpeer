@@ -7,6 +7,7 @@
   interface RunDiagnosticsArgs {
     expectedAdvertisedDeviceIds?: string[];
     failOnExpectedMissing?: boolean;
+    onProgress?: (peerNumber: number, stage: string) => void;
   }
 
   interface DiagnosticsCategory {
@@ -35,10 +36,11 @@
     onRunAll: (args?: RunDiagnosticsArgs) => Promise<unknown>;
     onSaveResults?: (fileName: string, contents: string) => Promise<string | null>;
     onShareResults?: (fileName: string, contents: string) => Promise<void>;
+    onSharePeerSupportBundle?: (diagnosticsJson: string) => Promise<void>;
   }
 
   let { onBack, onLoadCatalog, onRunTest, onRunCategory, onRunAll,
-    onSaveResults, onShareResults }: Props = $props();
+    onSaveResults, onShareResults, onSharePeerSupportBundle }: Props = $props();
 
   let isRunning = $state(false);
   let isExporting = $state(false);
@@ -50,6 +52,7 @@
   let runError = $state<string | null>(null);
   let copiedNotice = $state("");
   let expectedIdsInput = $state("");
+  let peerProbeProgress = $state("");
 
   const parseExpectedDeviceIds = (value: string): string[] => [...new Set(
     value
@@ -140,6 +143,42 @@
     }
   };
 
+  /** One action: test all saved peers and open Android sharing with diagnostics
+   * and the current native network journal in one sanitized text bundle. */
+  const runAndSharePeerConnectivity = async (): Promise<void> => {
+    if (isRunning || isExporting) return;
+    isRunning = true;
+    peerProbeProgress = "Looking up saved peers and testing connection paths…";
+    runError = null;
+    copiedNotice = "";
+    try {
+      const result = await onRunTest("network.saved_peer_paths", {
+        onProgress: (peerNumber, stage) => {
+          peerProbeProgress = `Peer ${peerNumber}: ${stage.replace(/-/g, " ")}…`;
+        },
+      });
+      resultJson = JSON.stringify(sanitizeDiagnosticArtifact(result), null, 2);
+      lastRunAt = new Date().toLocaleString();
+      if (onSharePeerSupportBundle) {
+        peerProbeProgress = "Preparing native logs and sharing…";
+        isExporting = true;
+        try {
+          await onSharePeerSupportBundle(resultJson);
+          copiedNotice = "Peer diagnostics and native logs handed to Android sharing.";
+        } finally {
+          isExporting = false;
+        }
+      } else {
+        copiedNotice = "Peer diagnostics complete. Save or copy results below.";
+      }
+    } catch (error) {
+      runError = error instanceof Error ? error.message : String(error);
+    } finally {
+      isRunning = false;
+      peerProbeProgress = "";
+    }
+  };
+
   const copyResults = async (): Promise<void> => {
     copiedNotice = "";
     if (!resultJson.trim()) return;
@@ -203,8 +242,8 @@
 
   <section class="panel diagnostics-panel">
     <p class="hint">
-      For crash investigation, run Device Health first (read-only). Run All also writes remote probe files and exercises transfer services.
-      Add expected device IDs to enforce discovery checks.
+      For connection problems, use Diagnose Saved Peers to check existing targets without changing their settings or writing files.
+      The focused share includes the current native trace. Run All also performs write-bearing tests.
     </p>
     <label class="field-label" for="diagnostics-category">Category</label>
     <select
@@ -232,6 +271,11 @@
       placeholder="Paste one or more device IDs (comma/space/newline separated)."
     ></textarea>
     <div class="actions">
+      <button class="primary" data-testid="diagnostics-run-peer-connectivity"
+        onclick={runAndSharePeerConnectivity} disabled={isRunning || isExporting || isCatalogLoading}>
+        {isRunning ? "Diagnosing saved peers…" : onSharePeerSupportBundle
+          ? "Diagnose Saved Peers & Share Logs" : "Diagnose Saved Peers"}
+      </button>
       <button class="primary" data-testid="diagnostics-run-device-health"
         onclick={() => runCategory("device")} disabled={isRunning || isCatalogLoading}>
         {isRunning ? "Running..." : "Run Device Health (Read-only)"}
@@ -281,6 +325,9 @@
         {/each}
       {/if}
     </ul>
+    {#if peerProbeProgress}
+      <p class="meta" role="status" data-testid="peer-probe-progress">{peerProbeProgress}</p>
+    {/if}
     {#if lastRunAt}
       <div class="meta">Last run: {lastRunAt}</div>
     {/if}

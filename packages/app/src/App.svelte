@@ -75,6 +75,7 @@
   import { createEncryptedUiStateStore } from "./app/encryptedUiState.ts";
   import { loadVerifiedFolderPasswords } from "./app/credentialLoading.ts";
   import { createPersistentSessionLogs } from "./app/sessionLogPersistence.ts";
+  import { formatPeerSupportBundle, peerSupportBundleFileName } from "./app/peerSupportBundle.ts";
   import { createLatestDistinctTask } from "./app/latestDistinctTask.ts";
   import { readInitialVaultStatus } from "./app/initialVault.ts";
   import AboutPage from "./AboutPage.svelte";
@@ -244,6 +245,23 @@
         "Diagnostic history prepared for export.",
         { kind, durationMs: Date.now() - startedAtMs,
           historyEntryCount: app.logs.previousRunItems.length });
+      // The history_ready marker is itself journaled. Flush it before testing
+      // for unconfirmed writes, otherwise every export falsely warns about its
+      // own newly queued diagnostic event.
+      await logHistory?.flushAll();
+      // Read the service's current-run TLS/QUIC/relay trace separately: the
+      // WebView logger sees only its own events, while restore() excludes the
+      // current run by design.
+      if (logHistory) {
+        try {
+          app.logs.currentNativeItems = await logHistory.readCurrentNativeTrace();
+        } catch (error) {
+          app.logs.currentNativeItems = [];
+          pushSessionLog(app, "warning", "diagnostics.native_current.unavailable",
+            "Current native network diagnostics could not be exported.",
+            { category: error instanceof Error ? error.name : "unknown" });
+        }
+      }
       if (logHistory && logHistory.pending() > 0) {
         app.logs.historyError = "Current diagnostic entries have not been confirmed in encrypted storage.";
         pushSessionLog(app, "warning", "diagnostics.persistence.unconfirmed",
@@ -258,6 +276,33 @@
       logExportStatus = null;
     });
   };
+  const sharePeerSupportBundle = async (diagnosticsJson: string): Promise<void> => {
+    if (!logFile?.share) throw new Error("Native file sharing is unavailable.");
+    pushSessionLog(app, "info", "diagnostics.peer_probe.export",
+      "Preparing focused peer diagnostics and current native trace.");
+    try {
+      await logHistory?.flushAll();
+    } catch {
+      pushSessionLog(app, "warning", "diagnostics.peer_probe.journal_flush_incomplete",
+        "Some diagnostic events could not be confirmed in encrypted storage; sharing available evidence.");
+    }
+    let native = app.logs.currentNativeItems;
+    if (logHistory) {
+      try {
+        native = await logHistory.readCurrentNativeTrace(400);
+        app.logs.currentNativeItems = native;
+      } catch {
+        native = [];
+        pushSessionLog(app, "warning", "diagnostics.peer_probe.native_trace_unavailable",
+          "Current Android transport trace could not be included.",
+          { reasonCategory: "journal_read_failed" });
+      }
+    }
+    const contents = formatPeerSupportBundle(
+      appInfo, diagnosticsJson, app.logs.items, native, app.logs.journalStarted);
+    await logFile.share(peerSupportBundleFileName(new Date()), contents);
+  };
+
   const transferRuntime = createTransferRuntime({
     state: app,
     client,
@@ -962,7 +1007,11 @@
 
 {#if showDeviceNameOnboarding}
   <DeviceNameOnboarding suggestedName={onboardingSuggestedName} onSave={saveDeviceName} />
-{:else if app.currentPage === "main"}
+{:else}
+  <!-- The Android status bar overlays the WebView in edge-to-edge mode.
+       Every page (not only the main app header) must share this inset. -->
+  <div class="app-viewport" class:android-viewport={appInfo.runtimeSurface === "android-ui"}>
+  {#if app.currentPage === "main"}
   <div class="app-shell">
     <AppHeader
       phase={app.session.lifecyclePhase}
@@ -1112,6 +1161,7 @@
             isSavedDeviceAwaitingRemoteApproval(app, deviceId)}
           isLanDiscoveredDevice={(deviceId) => isLanDiscoveredDevice(app, deviceId)}
           onUseSavedDevice={actions.useSavedDevice}
+          onConnectDirectTcp={actions.connectSavedDeviceDirectTcp}
           onResetDiscoveryServer={actions.resetDiscoveryServer}
           onClearAllCache={actions.clearAllCache}
           onClearOfflineFolderState={actions.clearOfflineFolderState}
@@ -1286,6 +1336,7 @@
     onRunAll={diagnosticsActions.runAllDiagnostics}
     onSaveResults={logFile?.save}
     onShareResults={logFile?.share}
+    onSharePeerSupportBundle={logFile?.share ? sharePeerSupportBundle : undefined}
   />
 {:else if app.currentPage === "general-settings"}
   <GeneralSettingsPage onBack={actions.closeGeneralSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
@@ -1338,16 +1389,28 @@
 {:else}
   <AboutPage onBack={actions.closeAboutPage} />
 {/if}
-
-
+  </div>
+{/if}
 
 <style>
-  .app-shell {
+  .app-viewport {
     height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+    overflow-y: auto;
+    background: var(--bg-shell);
+  }
+
+  /* Some Android WebViews report a zero CSS safe-area inset despite
+     edge-to-edge window flags. Keep a minimum status-bar touch clearance. */
+  .android-viewport {
+    padding-top: max(32px, env(safe-area-inset-top));
+  }
+
+  .app-shell {
+    height: 100%;
     display: flex;
     flex-direction: column;
     background: var(--bg-shell);
-    padding-top: env(safe-area-inset-top);
     overflow: hidden;
   }
 

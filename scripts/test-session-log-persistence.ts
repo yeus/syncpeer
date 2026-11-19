@@ -244,6 +244,76 @@ test("unacknowledged native appends are retained for retry instead of being sile
   history.dispose();
 });
 
+test("explicit export includes current-run native network trace, not just archived runs", async () => {
+  const native = fixture();
+  const current = createPersistentSessionLogs({
+    runId: first,
+    port: request => {
+      if (request.operation === "list") {
+        return { runs: [
+          { runId: first, count: native.entries.filter(e => e.runId === first).length },
+          { runId: second, count: native.entries.filter(e => e.runId === second).length },
+        ] };
+      }
+      if (request.operation === "release") return { released: true };
+      return native.port(request);
+    },
+    deferHistory: true,
+  });
+  await current.start();
+  const entries = [
+    { runId: first, timestampMs: 1000, level: "warning", event: "native.network.operation_slow",
+      message: "native.network.operation_slow", details: JSON.stringify({
+        operation: "tlsOpen", durationMs: 8000, failed: true }) },
+    { runId: first, timestampMs: 1001, level: "warning", event: "core.discovery.candidate.failed",
+      message: "core.discovery.candidate.failed", details: JSON.stringify({
+        protocol: "tcp", source: "local", category: "timeout", addressFamily: "ipv4" }) },
+    { runId: first, timestampMs: 1002, level: "info", event: "peer.connect.attempt_started",
+      message: "Already visible through the WebView observer." },
+    { runId: second, timestampMs: 1003, level: "warning", event: "native.network.operation_slow",
+      message: "native.network.operation_slow" },
+  ];
+  await native.port({ operation: "append", items: entries });
+  const trace = await current.readCurrentNativeTrace();
+  assert.deepEqual(trace.map(x => x.event),
+    ["native.network.operation_slow", "core.discovery.candidate.failed"]);
+  assert.deepEqual((trace[0].details as Record<string, unknown>).operation, "tlsOpen");
+  assert.deepEqual((trace[1].details as Record<string, unknown>).source, "local");
+  current.dispose();
+});
+
+test("focused peer support bundle pages only the recent native tail", async () => {
+  const events = Array.from({ length: 1200 }, (_, i) => ({
+    runId: first, timestampMs: i, level: "info",
+    event: "native.network.operation_slow", message: "synthetic event",
+  }));
+  const reads: Array<[number, number]> = [];
+  const history = createPersistentSessionLogs({
+    runId: first, deferHistory: true,
+    port: async request => {
+      if (request.operation === "start") return { started: true };
+      if (request.operation === "list") return { runs: [{ runId: first, count: events.length }] };
+      if (request.operation === "release") return { released: true };
+      if (request.operation === "read") {
+        const offset = Number(request.offset), limit = Number(request.limit);
+        reads.push([offset, limit]);
+        return { items: events.slice(offset, offset + limit) };
+      }
+      return { saved: 0 };
+    },
+  });
+  await history.start();
+  const focused = await history.readCurrentNativeTrace(225);
+  assert.equal(focused.length, 225);
+  assert.equal(focused[0]?.timestampMs, 975);
+  assert.deepEqual(reads, [[975, 100], [1075, 100], [1175, 25]]);
+  reads.length = 0;
+  const full = await history.readCurrentNativeTrace();
+  assert.equal(full.length, 1200);
+  assert.equal(reads.length, 12);
+  history.dispose();
+});
+
 test("export flush drains all queued diagnostics instead of just one native page", async () => {
   const native = fixture();
   const history = createPersistentSessionLogs({ port: native.port, runId: first, deferHistory: true });
@@ -255,6 +325,24 @@ test("export flush drains all queued diagnostics instead of just one native page
   assert.equal(history.pending(), 0);
   assert.equal(native.entries.filter(item => item.event === "export.current").length, 61);
   history.dispose();
+});
+
+test("export readiness marker is durably flushed before asserting journal persistence", async () => {
+  const native = fixture();
+  const state = createInitialState(null);
+  const history = createPersistentSessionLogs({ port: native.port, runId: first, deferHistory: true });
+  const stop = observeSessionLogs(state, history.record);
+  try {
+    await history.start();
+    pushSessionLog(state, "info", "diagnostics.export.requested", "Preparing export.");
+    await history.flushAll();
+    assert.equal(history.pending(), 0);
+    pushSessionLog(state, "info", "diagnostics.export.history_ready", "History loaded.");
+    assert.equal(history.pending(), 1, "The export-ready marker itself creates a pending write.");
+    await history.flushAll();
+    assert.equal(history.pending(), 0, "Only post-marker flush confirms the exported journal is current.");
+    assert.ok(native.entries.some(entry => entry.event === "diagnostics.export.history_ready"));
+  } finally { stop(); history.dispose(); }
 });
 
 test("export flush stops after an unacknowledged native append and can retry later", async () => {

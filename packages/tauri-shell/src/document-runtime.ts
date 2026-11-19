@@ -87,6 +87,7 @@ const createAndroidSessionAdapter = async (
       }
       if (!event.startsWith("core.session.connect.") &&
         !["core.discovery.global_failed", "core.discovery.retry", "core.discovery.full_response",
+          "core.discovery.candidate.try", "core.discovery.candidate.connected",
           "core.discovery.candidate.failed", "core.discovery.relay.failed",
           "core.discovery.connect_strategy", "core.upload.request.failed",
           "core.replica.receive.failed"].includes(event)) return;

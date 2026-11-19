@@ -3,6 +3,8 @@ import { certificateDerFromPem, createSyncpeerCoreClient, deviceIdFromCertificat
   type SyncpeerTlsSocket,
   withMetadataSession } from "../client.js";
 import { createServiceOwnedSession } from "../sync/serviceRemoteFs.js";
+import { runPeerConnectivityProbes,
+  type PeerConnectivityReport, type PeerConnectivityTarget } from "./peerConnectivityDiagnostics.js";
 import { parseServiceSessionStatusEvent,
   type ServiceSessionStatusEvent } from "../sync/serviceSessionStatus.js";
 import { parseServiceResponse, withServiceProtocol } from "../sync/serviceProtocol.js";
@@ -370,6 +372,9 @@ export interface SyncpeerBrowserClient {
   connectAndGetOverview: (options: ConnectOptions) => Promise<ConnectionOverview>;
   connectAndGetFolderVersions: (options: ConnectOptions) => Promise<FolderSyncState[]>;
   discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<LocalDiscoveredDevice[]>;
+  /** Independent TLS/QUIC identity checks; never changes the live BEP session. */
+  probeSavedPeerConnectivity: (targets: readonly PeerConnectivityTarget[],
+    discoveryServer?: string, onProgress?: (peerNumber: number, stage: string) => void) => Promise<PeerConnectivityReport>;
   /**
    * Keep the incoming TLS listener open independently of any connect attempt,
    * so approved peers can dial this device while it is idle.
@@ -2538,5 +2543,12 @@ export const createSyncpeerBrowserClient = (
     ...createAndroidSafApi(base.platformAdapter),
     ...createAndroidPimApi(base.platformAdapter),
     ...createDiscoveryApi(base.coreAdapter),
+    probeSavedPeerConnectivity: async (targets, discoveryServer, onProgress) =>
+      runPeerConnectivityProbes({
+        adapter: base.coreAdapter,
+        identity: await identity.resolveDefaultIdentity(),
+        targets, discoveryServer, onProgress,
+        identifyRemote: certificateDer => deviceIdFromCertificate(base.coreAdapter, certificateDer),
+      }),
   };
 };

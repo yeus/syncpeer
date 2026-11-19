@@ -70,6 +70,7 @@ export const createAppActions = (args: {
     refreshActiveView: connection.refreshActiveView,
     refreshCurrentDeviceId: connection.refreshCurrentDeviceId,
     connectToDevice: connection.connect,
+    discoverLocalDevices: connection.discoverLocalDevices,
     disconnectPeer: connection.disconnect,
     onConfiguredPeersChanged: connection.scheduleConnectionSettingsApply,
   });

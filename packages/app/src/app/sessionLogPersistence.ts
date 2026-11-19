@@ -4,6 +4,7 @@ import type { SessionLogItem } from "./sessionLogs.ts";
 export type ArchivedSessionLog = SessionLogItem & { id: string };
 type DiagnosticPort = (request: Record<string, unknown>) => Promise<unknown>;
 const HISTORY_LIMIT = 4000;
+const CURRENT_NATIVE_TRACE_LIMIT = 1500;
 const BATCH_LIMIT = 24;
 const QUEUE_LIMIT = 1000;
 const MAX_LOG_MESSAGE = 600;
@@ -199,6 +200,49 @@ export const createPersistentSessionLogs = (args: {
     return restoreInFlight;
   };
 
+  /** Explicit exports must contain native TLS/QUIC/relay diagnostics from THIS
+   * run. The UI's live log observer never sees native service journal events;
+   * restore() intentionally reads only PREVIOUS runs.
+   */
+  const readCurrentNativeTrace = async (
+    maxEntries = CURRENT_NATIVE_TRACE_LIMIT,
+  ): Promise<ArchivedSessionLog[]> => {
+    await begin();
+    const listing = await request({ operation: "list" });
+    if (!Array.isArray(listing.runs))
+      throw new Error("Android diagnostic journal returned no current-run listing.");
+    const run = listing.runs.map(objectValue).find(value => value.runId === args.runId);
+    const total = run?.count;
+    if (!Number.isSafeInteger(total) || (total as number) < 0)
+      throw new Error("Android diagnostic journal has no valid current run.");
+    const items: ArchivedSessionLog[] = [];
+    // Focused shares can request a smaller tail to avoid many sequential
+    // Android Binder reads, while a full manual export keeps its larger cap.
+    const boundedEntries = Number.isFinite(maxEntries)
+      ? Math.max(1, Math.min(CURRENT_NATIVE_TRACE_LIMIT, Math.floor(maxEntries)))
+      : CURRENT_NATIVE_TRACE_LIMIT;
+    let offset = Math.max(0, (total as number) - boundedEntries);
+    try {
+      while (offset < (total as number)) {
+        const limit = Math.min(100, (total as number) - offset);
+        const page = await request({ operation: "read", runId: args.runId, offset, limit });
+        if (!Array.isArray(page.items) || page.items.length === 0)
+          throw new Error("Android diagnostic journal returned an incomplete current-run page.");
+        const parsed = page.items.map((value, i) => parseEntry(args.runId, value, offset + i));
+        if (parsed.some(item => item === null))
+          throw new Error("Android diagnostic journal returned invalid native diagnostics.");
+        items.push(...parsed as ArchivedSessionLog[]);
+        offset += parsed.length;
+      }
+    } finally {
+      await request({ operation: "release" }).catch(() => undefined);
+    }
+    // The rest of the current-run UI logs are already in app.logs.items.
+    // Include only events that the native service records independently.
+    return items.filter(item => item.event.startsWith("native.") ||
+      item.event.startsWith("core.discovery.") || item.event.startsWith("core.session.connect."));
+  };
+
   const start = async (): Promise<void> => {
     await begin();
     if (!args.deferHistory) await restore();
@@ -210,5 +254,5 @@ export const createPersistentSessionLogs = (args: {
     disposed = true;
   };
 
-  return { record, start, restore, flush, flushAll, dispose, pending: () => queue.length };
+  return { record, start, restore, readCurrentNativeTrace, flush, flushAll, dispose, pending: () => queue.length };
 };

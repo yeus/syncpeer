@@ -164,47 +164,60 @@ const awaitServiceConnection = (
   rpc: CallService,
   subscribe: ServiceSessionStatusSubscription,
   signal?: AbortSignal,
+  idleTimeoutMs = 60_000,
 ): Promise<void> => new Promise<void>((resolve, reject) => {
   let settled = false;
+  let lastRevision = -1;
   let unsubscribe = () => {};
+  let timeout: ReturnType<typeof setTimeout> | null = null;
   const finish = (error?: Error) => {
     if (settled) return;
     settled = true;
-    clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
     unsubscribe();
     if (error) reject(error);
     else resolve();
   };
   const onAbort = () => finish(new Error("Connection attempt was cancelled."));
-  const timeout = setTimeout(() =>
-    finish(new Error("Android service did not confirm its peer connection.")), 60_000);
+  const armWatchdog = () => {
+    if (settled) return;
+    if (timeout !== null) clearTimeout(timeout);
+    timeout = setTimeout(() =>
+      finish(new Error("Android service stopped reporting connection progress.")), idleTimeoutMs);
+  };
+  armWatchdog();
   if (signal?.aborted) { onAbort(); return; }
   signal?.addEventListener("abort", onAbort, { once: true });
-  const accept = (phase: unknown, active: unknown, peerPhase?: unknown, error?: string) => {
-    // The service can still report its prior socket as active while the peer
-    // runtime has already begun a replacement. Do not open an overview against
-    // that retired session until the authoritative peer lifecycle confirms it.
+  const accept = (phase: unknown, active: unknown, peerPhase?: unknown,
+    error?: string, revision?: unknown) => {
+    // A replayed stale status cannot reset the inactivity deadline or
+    // incorrectly confirm a socket that a newer handshake already replaced.
+    if (typeof revision === "number" && revision <= lastRevision) return;
+    if (typeof revision === "number") lastRevision = revision;
     if (phase === "connected" && active === true &&
       (peerPhase === undefined || peerPhase === "connected")) finish();
-    // Initial native startup reports active=false, and a superseded idle status
-    // can replay while a newer connection is in flight. Neither is terminal.
     else if (phase === "error" || phase === "stopping") {
       finish(new Error(error || "Android service stopped its peer connection."));
+    } else if (typeof revision === "number") {
+      // The native session owner is actively advancing its retry lifecycle.
+      // Its status revisions are authoritative: a fixed 60s wall-clock timer
+      // was previously reporting failure seconds before an authenticated
+      // peer connected, despite receiving new progress events.
+      armWatchdog();
     }
   };
   void subscribe(raw => {
     const event = parseServiceSessionStatusEvent(raw);
-    if (event) accept(event.phase, event.active, event.peerPhase, serviceSessionStatusMessage(event));
+    if (event) accept(event.phase, event.active, event.peerPhase,
+      serviceSessionStatusMessage(event), event.revision);
   }).then(async stop => {
     if (settled) { stop(); return; }
     unsubscribe = stop;
-    // Catch a transition between the initial connect reply and installing
-    // the listener. No polling or competing session connection is needed.
     const status = requireResult(parseServiceResponse("status",
       await rpc(withServiceProtocol({ operation: "status" }), signal)));
     accept(status.phase, status.active, status.peerPhase,
-      typeof status.error === "string" ? status.error : undefined);
+      typeof status.error === "string" ? status.error : undefined, status.revision);
   }, error => finish(error instanceof Error ? error : new Error(String(error))))
     .catch(error => finish(error instanceof Error ? error : new Error(String(error))));
 });
@@ -218,6 +231,7 @@ export async function createServiceOwnedSession(
   signal?: AbortSignal,
   heartbeatIntervalMs = 15_000,
   subscribeStatus?: ServiceSessionStatusSubscription,
+  confirmationIdleTimeoutMs = 60_000,
 ): Promise<SyncpeerSessionHandle> {
   let phase: unknown;
   try {
@@ -238,7 +252,7 @@ export async function createServiceOwnedSession(
     // Even an optimistic "connected" reply can race a newer peer handshake.
     // Confirm the current peer phase before reading its overview, without
     // creating a competing dial.
-    await awaitServiceConnection(rpc, subscribeStatus, signal);
+    await awaitServiceConnection(rpc, subscribeStatus, signal, confirmationIdleTimeoutMs);
   } else if (phase !== "connected") {
     throw new Error("Android service could not establish a peer session.");
   }

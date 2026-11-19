@@ -28,7 +28,7 @@ import {
 } from "./actionSupport.ts";
 import { restoreOfflineSnapshot, setRemoteApprovalPending } from "./syncPolicies.ts";
 import { suggestedClientName } from "./suggestedNames.ts";
-import { preferredConnectionForDevice, suggestedSavedDeviceName, upsertSavedDevice } from "./devicePolicies.ts";
+import { directTcpEndpointForPeer, preferredConnectionForDevice, suggestedSavedDeviceName, upsertSavedDevice } from "./devicePolicies.ts";
 
 type DeviceActionArgs = {
   readonly state: AppState;
@@ -38,6 +38,7 @@ type DeviceActionArgs = {
   readonly refreshActiveView: () => Promise<void>;
   readonly refreshCurrentDeviceId: () => Promise<void>;
   readonly connectToDevice: (deviceId: string) => Promise<void>;
+  readonly discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<void>;
   readonly disconnectPeer?: () => Promise<void>;
   readonly savePasswords?: (values: Record<string, string>) => Promise<void>;
   readonly onConfiguredPeersChanged?: () => void;
@@ -52,6 +53,7 @@ class DeviceActionsRuntime {
     private readonly refreshActiveView: () => Promise<void>,
     private readonly refreshCurrentDeviceId: () => Promise<void>,
     private readonly connectToDevice: (deviceId: string) => Promise<void>,
+    private readonly discoverLocalDevices: (options?: { timeoutMs?: number }) => Promise<void>,
     private readonly disconnectPeer?: () => Promise<void>,
     private readonly savePasswords?: (values: Record<string, string>) => Promise<void>,
     private readonly onConfiguredPeersChanged?: () => void,
@@ -196,6 +198,49 @@ class DeviceActionsRuntime {
     void this.connectToDevice(normalized).catch(error => {
       reportActionError(this.state, "device.use.failed", error);
     });
+  };
+
+  /** One-click direct TCP for an existing peer. Discovery is used only to
+   * look up an address if none was remembered; the actual dial is direct TCP.
+   */
+  private connectSavedDeviceDirectTcp = async (deviceId: string) => {
+    const id = normalizeDeviceId(deviceId);
+    if (!id || !this.state.devices.savedDevices.some(peer => sameDeviceId(peer.id, id)) ||
+        this.state.devices.directTcpPreparingDeviceId) return;
+    this.state.devices.directTcpPreparingDeviceId = id;
+    this.state.devices.directTcpNotice = "";
+    try {
+      let endpoint = directTcpEndpointForPeer(this.state, id);
+      if (!endpoint) {
+        // Scan for this peer's own authenticated device ID, never use an
+        // anonymous LAN endpoint or another peer's saved host.
+        await this.discoverLocalDevices({ timeoutMs: 2000 });
+        endpoint = directTcpEndpointForPeer(this.state, id);
+      }
+      this.state.devices.selectedSavedDeviceId = id;
+      Object.assign(this.state.connection, {
+        remoteId: id,
+        discoveryMode: "direct" as const,
+        quicOnly: false,
+        host: endpoint?.host ?? "",
+        port: endpoint?.port ?? 22000,
+      });
+      if (!endpoint) {
+        this.state.ui.isSettingsExpanded = true;
+        this.state.devices.directTcpNotice =
+          "No recent LAN IPv4 address for this peer. Enter its host below; its device ID is already selected.";
+        return;
+      }
+      this.state.ui.recentError = null;
+      if (!this.state.session.isConnected) {
+        restoreOfflineSnapshot(this.state, clearDirectoryView, id, "direct_tcp");
+      }
+      await this.connectToDevice(id);
+    } catch (error) {
+      reportActionError(this.state, "device.direct_tcp.failed", error);
+    } finally {
+      this.state.devices.directTcpPreparingDeviceId = "";
+    }
   };
 
   private setSavedDeviceIntroducer = (deviceId: string, isIntroducer: boolean) => {
@@ -392,6 +437,7 @@ class DeviceActionsRuntime {
       addSavedDevice: this.addSavedDevice,
       editSavedDeviceName: this.editSavedDeviceName,
       useSavedDevice: this.useSavedDevice,
+      connectSavedDeviceDirectTcp: this.connectSavedDeviceDirectTcp,
       setSavedDeviceIntroducer: this.setSavedDeviceIntroducer,
       removeSavedDevice: this.removeSavedDevice,
       approveAdvertisedDevice: this.approveAdvertisedDevice,
@@ -416,6 +462,7 @@ export const createDeviceActions = (args: DeviceActionArgs) =>
     args.refreshActiveView,
     args.refreshCurrentDeviceId,
     args.connectToDevice,
+    args.discoverLocalDevices,
     args.disconnectPeer,
     args.savePasswords,
     args.onConfiguredPeersChanged,

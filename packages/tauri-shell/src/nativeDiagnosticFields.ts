@@ -9,6 +9,10 @@ const boundedCount = (value: unknown): number =>
   typeof value === "number" && Number.isSafeInteger(value)
     ? Math.min(1000, Math.max(0, value)) : 0;
 
+const boundedMilliseconds = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value)
+    ? Math.min(120_000, Math.max(0, value)) : 0;
+
 export const safeNativeDiscoveryDiagnostic = (details?: Record<string, unknown>) => {
   const message = typeof details?.message === "string" ? details.message : "";
   const category =
@@ -28,5 +32,8 @@ export const safeNativeDiscoveryDiagnostic = (details?: Record<string, unknown>)
     source: enumerated(details?.source, ["local", "global", "manual", "unknown"] as const, "unknown"),
     scope: enumerated(details?.scope, ["lan", "wan", "unknown"] as const, "unknown"),
     addressFamily: enumerated(details?.addressFamily, ["ipv4", "ipv6", "dns", "unknown"] as const, "unknown"),
+    candidateOrdinal: boundedCount(details?.candidateOrdinal),
+    durationMs: boundedMilliseconds(details?.durationMs),
+    timeoutMs: boundedMilliseconds(details?.timeoutMs),
   };
 };

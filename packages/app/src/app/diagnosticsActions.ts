@@ -23,7 +23,8 @@ import {
   type TaskyonTestFn,
 } from "../../../shared/modules/diagnosticsRunner.ts";
 import { runFolderContentDiagnostics } from "../lib/folderDiagnostics.ts";
-import { connectionDetails, type AppState } from "./state.ts";
+import { connectionDetails, pushSessionLog, type AppState } from "./state.ts";
+import { directTcpEndpointForPeer } from "./devicePolicies.ts";
 
 interface DiagnosticsCategory {
   id: string;
@@ -46,6 +47,7 @@ interface DiagnosticsDefinition {
 interface DiagnosticsRunOptions {
   expectedAdvertisedDeviceIds?: string[];
   failOnExpectedMissing?: boolean;
+  onProgress?: (peerNumber: number, stage: string) => void;
 }
 
 const diagnosticsCategories = (): DiagnosticsCategory[] => [
@@ -53,6 +55,11 @@ const diagnosticsCategories = (): DiagnosticsCategory[] => [
     id: "device",
     name: "Device Health (Read-only)",
     description: "Android battery, system restrictions, service phase and encrypted journal status. No connection or file modifications.",
+  },
+  {
+    id: "network",
+    name: "Peer Connectivity (No file writes)",
+    description: "Check up to four saved peers with independent TLS and QUIC identity probes. Does not replace the live BEP session or modify files.",
   },
   {
     id: "core",
@@ -96,6 +103,9 @@ const createFolderContentTest = (args: {
   options?: DiagnosticsRunOptions;
 }): TaskyonTestFn => {
   const test: TaskyonTestFn = async () => {
+    if (!args.state.session.isConnected) {
+      throw new Error("No active authenticated peer session. Export Session Logs for connection failures; folder diagnostics must not start a competing connection.");
+    }
     const report = await runFolderContentDiagnostics({
       client: args.client,
       options: connectionDetails(args.state),
@@ -135,8 +145,10 @@ const runUploadProbe = async (args: {
   state: AppState;
   client: SyncpeerBrowserClient;
 }) => {
+  if (!args.state.session.isConnected) {
+    return { skipped: true, reason: "No active authenticated peer session; upload probe did not initiate a connection." };
+  }
   const session = createSyncpeerSessionStore({ transport: args.client });
-  await session.actions.disconnect();
   await session.actions.connect(connectionDetails(args.state));
   const folder = writableProbeFolder(session.getState().folders);
   if (!folder) {
@@ -162,7 +174,6 @@ const runUploadProbe = async (args: {
   );
   await session.actions.reloadCurrentDirectory(connectionDetails(args.state));
   const listed = session.getState().entries.some((entry) => entry.path === targetPath);
-  await session.actions.disconnect();
   return {
     skipped: false,
     folderId: folder.id,
@@ -469,12 +480,20 @@ const deviceDefinitions = (args: DeviceDiagnosticDeps): DiagnosticsDefinition[] 
   },
 ];
 
+const containsFailedNestedDiagnostics = (value: unknown): boolean =>
+  value !== null && typeof value === "object" &&
+  "summary" in value &&
+  value.summary !== null && typeof value.summary === "object" &&
+  "allPassed" in value.summary && value.summary.allPassed === false;
+
 const executeDefinitions = async (definitions: DiagnosticsDefinition[]) => {
   const tests: Record<string, TaskyonTestFn> = {};
   for (const definition of definitions) {
     tests[definition.test.name] = definition.fn;
   }
-  const results = await runDiagnosticsTests(tests, { details: true });
+  const results = (await runDiagnosticsTests(tests, { details: true })).map(result =>
+    result.ok && containsFailedNestedDiagnostics(result.details)
+      ? { ...result, ok: false } : result);
   const passed = results.filter((item) => item.ok).length;
   return { results, passed, failed: results.length - passed };
 };
@@ -524,6 +543,56 @@ export const createDiagnosticsActions = (args: {
 
   const definitions = (options?: DiagnosticsRunOptions): DiagnosticsDefinition[] => [
     ...deviceDefinitions(args),
+    {
+      test: {
+        id: "network.saved_peer_paths",
+        name: "Diagnose Saved Peer Connections",
+        description: "Checks saved peers using isolated local/global discovery, TCP/TLS and QUIC identity handshakes. No BEP or file writes.",
+        categoryId: "network",
+      },
+      fn: Object.assign(async () => {
+        const selected = normalizeDeviceId(args.state.devices.selectedSavedDeviceId);
+        const activePeerId = normalizeDeviceId(
+          args.state.session.remoteDevice?.id || args.state.session.activeConnectDeviceId);
+        const targets = args.state.devices.savedDevices
+          .filter(peer => normalizeDeviceId(peer.id) !== normalizeDeviceId(args.state.devices.currentDeviceId))
+          .slice().sort((a, b) =>
+            Number(normalizeDeviceId(b.id) === selected) - Number(normalizeDeviceId(a.id) === selected))
+          .map(peer => ({
+            deviceId: normalizeDeviceId(peer.id),
+            knownTcp: directTcpEndpointForPeer(args.state, peer.id) ?? undefined,
+            activeSession: args.state.session.isConnected &&
+              normalizeDeviceId(peer.id) === activePeerId,
+          }));
+        if (!targets.length) return { skipped: true, reason: "No saved peers configured." };
+        pushSessionLog(args.state, "info", "diagnostics.peer_probe.started",
+          "Testing saved peer connection paths without modifying the active session.",
+          { savedPeerCount: targets.length });
+        const report = await args.client.probeSavedPeerConnectivity(
+          targets, args.state.connection.discoveryServer,
+          (peerNumber, stage) => {
+            options?.onProgress?.(peerNumber, stage);
+            pushSessionLog(args.state, "info", "diagnostics.peer_probe.stage",
+              "Connectivity probe running.", { peerNumber, stage });
+          },
+        );
+        const passed = report.peers.filter(peer =>
+          peer.activeSessionPreserved ||
+          peer.attempts.some(attempt => attempt.outcome === "verified")).length;
+        const intermittent = report.peers.filter(peer => peer.intermittentDirectTcp).length;
+        pushSessionLog(args.state, "info", "diagnostics.peer_probe.completed",
+          "Saved peer connection-path checks finished.",
+          { testedPeers: report.testedPeerCount, verifiedPeers: passed, intermittentPeers: intermittent });
+        return { ...report, liveSession: {
+          connected: args.state.session.isConnected,
+          phase: args.state.session.lifecyclePhase,
+          transport: args.state.session.connectionTransport || "none",
+          scope: args.state.session.connectionScope || "unknown",
+        }, summary: { passed, failed: report.testedPeerCount - passed,
+          intermittentPeers: intermittent,
+          allPassed: passed === report.testedPeerCount && intermittent === 0 && !report.truncated } };
+      }, { timeoutMs: 180_000, description: "Isolated peer transport/TLS checks (no BEP or file writes)" }),
+    },
     {
       test: {
         id: "core.folder_diagnostics",

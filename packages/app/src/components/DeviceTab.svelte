@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { peerRegistryViews, sameDeviceId, type AdvertisedDeviceItem, type AdvertisedFolderItem } from "@syncpeer/core/browser";
   import PasswordInput from "./PasswordInput.svelte";
   import DeviceListItem from "./DeviceListItem.svelte";
@@ -16,6 +17,7 @@
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
     isLanDiscoveredDevice: (deviceId: string) => boolean;
     onUseSavedDevice: (deviceId: string) => void;
+    onConnectDirectTcp: (deviceId: string) => Promise<void>;
     onResetDiscoveryServer: () => void;
     onClearAllCache: () => void;
     onClearOfflineFolderState: () => void;
@@ -48,6 +50,7 @@
     isSavedDeviceAwaitingRemoteApproval,
     isLanDiscoveredDevice,
     onUseSavedDevice,
+    onConnectDirectTcp,
     onResetDiscoveryServer,
     onClearAllCache,
     onClearOfflineFolderState,
@@ -109,8 +112,8 @@
         if (source.kind === "incoming") return {
           summary: `Incoming request · seen ${lastSeen}`, details: [] as string[],
         };
-        if (source.kind === "lan") return {
-          summary: `LAN · seen ${lastSeen}`,
+        if (source.kind === "lan" || source.kind === "verified") return {
+          summary: `${source.kind === "verified" ? "Authenticated TCP" : "LAN"} · seen ${lastSeen}`,
           details: (source.addresses ?? []).map(address => `LAN address: ${address}`),
         };
         const origin = app.devices.savedDevices.find(device => device.id === source.sourceDeviceId);
@@ -131,6 +134,7 @@
         confirmed: view.confirmed,
         deviceId: view.deviceId, isConnected: view.connected,
         isConnecting: !view.connected && Boolean(connectingTargetId) && sameDeviceId(connectingTargetId, view.deviceId),
+        directTcpPreparing: sameDeviceId(app.devices.directTcpPreparingDeviceId, view.deviceId),
         connectError: app.devices.connectionErrors[view.deviceId] ?? "",
         isLanDetected: isLanDiscoveredDevice(view.deviceId),
         isIntroducer: saved.isIntroducer,
@@ -156,6 +160,15 @@
     }));
     return [...rows, ...localCandidates];
   });
+
+  const connectDirectTcp = async (deviceId: string) => {
+    await onConnectDirectTcp(deviceId);
+    if (!app.devices.directTcpNotice) return;
+    await tick();
+    const hostInput = document.querySelector<HTMLInputElement>('[data-testid="connection-host"]');
+    hostInput?.scrollIntoView({ block: "center" });
+    hostInput?.focus();
+  };
 
   const addAdvertisedDevice = (deviceId: string) => {
     const match = advertisedById.get(deviceId);
@@ -341,7 +354,10 @@
       </div>
       <form
         class="settings"
-        onchange={onConnectionSettingsChanged}
+        onchange={() => {
+          app.devices.directTcpNotice = "";
+          onConnectionSettingsChanged();
+        }}
         onsubmit={(event) => {
           event.preventDefault();
         }}
@@ -377,9 +393,12 @@
               data-testid="connection-host"
               type="text"
               bind:value={app.connection.host}
-              placeholder="127.0.0.1"
+              placeholder="e.g. 192.168.1.10"
             />
           </label>
+          {#if app.connection.discoveryMode === "direct" && app.devices.directTcpNotice}
+            <p class="hint" role="status" data-testid="direct-tcp-address-notice">{app.devices.directTcpNotice}</p>
+          {/if}
 
           <label>
             Port
@@ -586,6 +605,7 @@
         <DeviceListItem
           {row}
           onUseSavedDevice={onUseSavedDevice}
+          onConnectDirectTcp={connectDirectTcp}
           onEditSavedDeviceName={onEditSavedDeviceName}
           onSetSavedDeviceIntroducer={onSetSavedDeviceIntroducer}
           onRemoveSavedDevice={onRemoveSavedDevice}

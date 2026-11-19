@@ -113,7 +113,8 @@ async function openDiagnosticsSession(
     port: options.port,
     remoteId: options.remoteId,
   });
-  await session.actions.disconnect();
+  // This store shares the application's native session owner. Disconnecting
+  // here tears down the user's live connection while diagnosing it.
   await session.actions.connect(options);
   const connectedState = session.getState();
   log("info", "diag.connect.ready", "sessionStore.connect returned with state.", {

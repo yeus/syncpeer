@@ -1456,7 +1456,8 @@ class DocumentRuntimeService : Service() {
       // Never store untrusted endpoint strings, remote identifiers or error text.
       val allowed = event.matches(Regex("core\\.session\\.connect\\.[a-z_]{2,40}")) ||
         event in setOf("core.discovery.global_failed", "core.discovery.retry",
-          "core.discovery.full_response", "core.discovery.candidate.failed",
+          "core.discovery.full_response", "core.discovery.candidate.try",
+          "core.discovery.candidate.connected", "core.discovery.candidate.failed",
           "core.discovery.relay.failed", "core.discovery.connect_strategy",
           "core.upload.request.failed", "core.replica.receive.failed")
       if (allowed) {
@@ -1479,6 +1480,9 @@ class DocumentRuntimeService : Service() {
           .put("addressFamily", request.optString("addressFamily").takeIf {
             it in setOf("ipv4", "ipv6", "dns", "unknown")
           } ?: "unknown")
+          .put("candidateOrdinal", request.optInt("candidateOrdinal").coerceIn(0, 1000))
+          .put("durationMs", request.optInt("durationMs").coerceIn(0, 120_000))
+          .put("timeoutMs", request.optInt("timeoutMs").coerceIn(0, 120_000))
         DiagnosticLogJournal.recordNative(applicationContext, event,
           if (event.endsWith("failed")) "warning" else "info", details)
       }

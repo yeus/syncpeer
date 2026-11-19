@@ -427,6 +427,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       localDiscoveryHealth: "idle" as "idle" | "scanning" | "available" | "partial" | "unavailable",
       isDiscoveringLanDevices: false,
       localDiscoveryNotice: "",
+      directTcpPreparingDeviceId: "",
+      directTcpNotice: "",
     },
     approvals: {
       syncApprovedFolderKeys: normalizeSyncApprovedIntroducedFolderKeys(undefined),
@@ -504,6 +506,11 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         event: string;
         message: string;
         details?: unknown;
+      }>,
+      currentNativeItems: [] as Array<{
+        id: string; timestampMs: number;
+        level: "info" | "warning" | "error";
+        event: string; message: string; details?: unknown;
       }>,
       previousRunStartedAtMs: 0,
       previousRunItems: [] as Array<{

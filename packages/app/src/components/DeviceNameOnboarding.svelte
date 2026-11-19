@@ -48,7 +48,7 @@
     place-items: center;
     min-height: 100vh;
     min-height: 100dvh;
-    padding: max(1.5rem, env(safe-area-inset-top))
+    padding: max(2rem, env(safe-area-inset-top))
       max(1.5rem, env(safe-area-inset-right))
       max(1.5rem, env(safe-area-inset-bottom))
       max(1.5rem, env(safe-area-inset-left));

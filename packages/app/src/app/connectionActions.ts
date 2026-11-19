@@ -42,6 +42,7 @@ import {
   normalizeCandidateDeviceId,
   syncConnectedDeviceSavedName,
   preferredConnectionForDevice,
+  rememberAuthenticatedTcpEndpoint,
 } from "./devicePolicies.ts";
 import {
   hasAutoConnectTarget,
@@ -149,7 +150,8 @@ const connect = async (
   if (control.connectionSettingsTimer) clearTimeout(control.connectionSettingsTimer);
   control.connectionSettingsTimer = null;
   if (control.connectInFlight && (!targetDeviceId ||
-    sameDeviceId(targetDeviceId, state.session.activeConnectDeviceId))) {
+    sameDeviceId(targetDeviceId, state.session.activeConnectDeviceId)) &&
+    control.lastAttemptedConnectionSettings === JSON.stringify(connectionDetails(state))) {
     await control.connectInFlight;
     return;
   }
@@ -225,6 +227,7 @@ const connect = async (
       { peerId: sourceDeviceId });
     if (state.session.isConnected && sourceDeviceId) {
       state.devices.confirmedPeerIds = new Set([...state.devices.confirmedPeerIds, sourceDeviceId]);
+      rememberAuthenticatedTcpEndpoint(state, sourceDeviceId);
     }
     if (
       state.approvals.pendingApprovalPromptDeviceId &&
@@ -583,7 +586,7 @@ const exportedSessionLogs = (args: ConnectionActionArgs) =>
     journalStarted: args.state.logs.journalStarted,
     historyLoaded: args.state.logs.historyAvailable,
     historyError: args.state.logs.historyError,
-  });
+  }, args.state.logs.currentNativeItems);
 
 const copySessionLogs = async (args: ConnectionActionArgs) => {
   const { state } = args;

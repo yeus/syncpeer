@@ -33,6 +33,28 @@ test("Android 0.7.0 supports API 26, 29 and 36 only", () => {
   ]) assert.match(fs.readFileSync(file, "utf8"), /minSdk = 26/);
 });
 
+test("every app page has Android edge-to-edge status bar clearance", () => {
+  const app = fs.readFileSync("packages/app/src/App.svelte", "utf8");
+  const root = app.indexOf('<div class="app-viewport" class:android-viewport={appInfo.runtimeSurface === "android-ui"}>');
+  const end = app.indexOf("\n  </div>\n{/if}\n", root);
+  assert.ok(root > 0 && end > root, "Main and standalone screens must share a single viewport.");
+  for (const page of [
+    '<div class="app-shell">', "<DiagnosticsPage", "<GeneralSettingsPage",
+    "<FolderSettingsPage", "<NewFolderPage", "<VersionsPage", "<AboutPage",
+  ]) {
+    const offset = app.indexOf(page, root);
+    assert.ok(offset > root && offset < end, `${page} must stay inside the shared safe-area viewport.`);
+  }
+  assert.match(app, /padding-top: max\(32px, env\(safe-area-inset-top\)\)/);
+  assert.match(fs.readFileSync("packages/app/src/components/DeviceNameOnboarding.svelte", "utf8"),
+    /padding: max\(2rem, env\(safe-area-inset-top\)\)/,
+    "First-run onboarding must also clear the Android status bar.");
+  assert.match(app, /\.app-shell\s*\{\s*height:\s*100%;/);
+  assert.doesNotMatch(app.slice(app.indexOf(".app-shell {"), app.indexOf(".content {")),
+    /padding-top:\s*env\(safe-area-inset-top\)/,
+    "The main screen must not double-apply the status bar inset.");
+});
+
 test("Android minimum WebView build target stays Chrome 69 compatible", () => {
   assert.match(fs.readFileSync("packages/app/vite.config.ts", "utf8"), /target: "chrome69"/);
   const documentRuntime = fs.readFileSync("scripts/build-document-runtime.mjs", "utf8");
@@ -554,7 +576,7 @@ test("Android pending connect becomes native-connected only after matching authe
   assert.match(runtime, /remoteDeviceId: active && !active\.isClosed\(\) \? active\.remoteDeviceId : null/);
   assert.match(runtime, /core\.session\.connect\.confirmation_pending/);
   assert.match(runtime, /return \{ phase: "reconnecting" \}/);
-  assert.match(bridge, /Android service did not confirm its peer connection/);
+  assert.match(bridge, /Android service stopped reporting connection progress/);
   assert.match(kotlin, /uiConnectExpectedPeer/);
   assert.match(kotlin, /verifiedPeer == uiConnectExpectedPeer/);
   assert.match(kotlin, /sessionPhase != "stopping"/);

@@ -326,6 +326,71 @@ test("service proxy uses pushed status revisions and ignores stale replay", asyn
   }
 });
 
+test("native retry progress prevents a false fixed-duration connection failure", { timeout: 3000 }, async () => {
+  let listener: ((event: unknown) => void) | undefined;
+  let connects = 0;
+  let unsubscribeCount = 0;
+  let revision = 2;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") { connects++; return { phase: "starting" }; }
+    if (request.operation === "status") {
+      return { phase: "reconnecting", peerPhase: "starting",
+        active: false, foreground: false, revision };
+    }
+    if (request.operation === "overview") {
+      return { folders: [], folderSyncStates: [], connectedVia: "synthetic",
+        transportKind: "direct-tcp" };
+    }
+    throw new Error(`Unexpected service operation: ${String(request.operation)}`);
+  };
+  const connecting = createServiceOwnedSession(rpc, { remoteId: "peer" } as never,
+    undefined, 60_000, async handler => {
+      listener = handler;
+      return () => { unsubscribeCount++; };
+    }, 180);
+  for (let i = 0; i < 20 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener);
+  await new Promise(resolve => setTimeout(resolve, 120));
+  revision = 3;
+  listener({ type: "sessionStatus", revision, phase: "reconnecting",
+    peerPhase: "starting", active: false, foreground: false });
+  await new Promise(resolve => setTimeout(resolve, 110));
+  revision = 4;
+  listener({ type: "sessionStatus", revision, phase: "connected",
+    peerPhase: "connected", active: true, foreground: false });
+  const session = await connecting;
+  try {
+    assert.equal(connects, 1, "Native reconnect progress must not trigger another UI dial.");
+    assert.equal(session.transportKind, "direct-tcp");
+    assert.ok(unsubscribeCount > 0);
+  } finally { await session.close(); }
+});
+
+test("replayed stale native status cannot indefinitely postpone a stalled connection", { timeout: 3000 }, async () => {
+  let listener: ((event: unknown) => void) | undefined;
+  const rpc = async (request: Record<string, unknown>) => {
+    if (request.operation === "connect") return { phase: "reconnecting" };
+    if (request.operation === "status") return {
+      phase: "reconnecting", peerPhase: "starting", active: false, revision: 2,
+    };
+    throw new Error(`Unexpected service operation: ${String(request.operation)}`);
+  };
+  const connecting = createServiceOwnedSession(rpc, { remoteId: "peer" } as never,
+    undefined, 60_000, async handler => {
+      listener = handler;
+      return () => undefined;
+    }, 70);
+  for (let i = 0; i < 20 && !listener; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(listener);
+  const replay = setInterval(() => listener?.({
+    type: "sessionStatus", revision: 2, phase: "reconnecting",
+    peerPhase: "starting", active: false, foreground: false,
+  }), 12);
+  try {
+    await assert.rejects(connecting, /stopped reporting connection progress/);
+  } finally { clearInterval(replay); }
+});
+
 test("a transient service reconnect is acknowledged by pushed status without redialing", async () => {
   let listener: ((value: unknown) => void) | undefined;
   let phase = "reconnecting", connects = 0, stopped = 0;

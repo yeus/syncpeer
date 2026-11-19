@@ -737,6 +737,15 @@ function describeCandidate(candidate: DiscoveredCandidate): string {
   return `${candidate.address} (${candidate.protocol}${candidate.host ? ` ${candidate.host}` : ""}${candidate.port ? `:${candidate.port}` : ""})`;
 }
 
+// Coarse transport provenance, excluding network addresses and device IDs.
+const candidateTraceFields = (candidate: DiscoveredCandidate) => ({
+  protocol: candidate.protocol,
+  source: candidate.source ?? "unknown",
+  scope: candidate.scope ?? "unknown",
+  addressFamily: candidate.host?.includes(":") ? "ipv6"
+    : /^\d{1,3}(?:\.\d{1,3}){3}$/.test(candidate.host ?? "") ? "ipv4" : "dns",
+});
+
 function dedupeCandidates(candidates: DiscoveredCandidate[]): DiscoveredCandidate[] {
   const seen = new Set<string>();
   const out: DiscoveredCandidate[] = [];
@@ -885,8 +894,9 @@ async function resolveGlobalDiscoveryInternal(
 export async function resolveGlobalDiscovery(
   adapter: SyncpeerHostAdapter,
   options: SyncpeerGlobalDiscoveryOptions,
+  signal?: AbortSignal,
 ): Promise<SyncpeerGlobalDiscoveryResult> {
-  return resolveGlobalDiscoveryInternal(adapter, options);
+  return resolveGlobalDiscoveryInternal(adapter, options, signal);
 }
 
 type UploadPlan = {
@@ -3102,6 +3112,7 @@ class ConnectionAttempt {
   private readonly raceController = new AbortController();
   private readonly directDialLimit = createAbortableConcurrencyLimit(3);
   private readonly errors: string[] = [];
+  private nextCandidateOrdinal = 0;
   private connectDeadline = 0;
   private perCandidateTimeout = 0;
   private relayStartDelayMs = 0;
@@ -3453,21 +3464,28 @@ class ConnectionAttempt {
     const remainingMs = Math.max(0, this.connectDeadline - this.runtime.now());
     if (remainingMs <= 0) throw new Error("Direct connection timeout budget exhausted");
     const candidateTimeoutMs = Math.min(this.perCandidateTimeout, remainingMs);
+    const candidateOrdinal = ++this.nextCandidateOrdinal;
+    const startedAtMs = this.runtime.now();
     try {
       return await this.directDialLimit.run(
-        () => this.tryDirectCandidate(candidate, candidateTimeoutMs), this.raceSignal);
+        () => this.tryDirectCandidate(candidate, candidateTimeoutMs, candidateOrdinal), this.raceSignal);
     } catch (error) {
-      this.handleDirectFailure(candidate, error);
+      this.handleDirectFailure(candidate, error, candidateOrdinal, this.runtime.now() - startedAtMs);
       throw error;
     }
   }
 
-  private async tryDirectCandidate(candidate: DiscoveredCandidate, candidateTimeoutMs: number) {
+  private async tryDirectCandidate(
+    candidate: DiscoveredCandidate, candidateTimeoutMs: number, candidateOrdinal: number,
+  ) {
+    const startedAtMs = this.runtime.now();
     this.adapter.log?.("core.discovery.candidate.try", {
       address: candidate.address,
       host: candidate.host,
       port: candidate.port,
-      perCandidateTimeout: candidateTimeoutMs,
+      ...candidateTraceFields(candidate),
+      candidateOrdinal,
+      timeoutMs: candidateTimeoutMs,
       strategy: "parallel-with-relay-fallback",
     });
     const open = candidate.protocol === "quic" ? openQuicSession : openDirectSession;
@@ -3484,22 +3502,26 @@ class ConnectionAttempt {
       candidateTimeoutMs,
     );
     trackCandidateSession(this.candidateHealth, candidate, session, this.runtime.now);
-    return this.claimSession(session);
+    const winner = await this.claimSession(session);
+    this.adapter.log?.("core.discovery.candidate.connected", {
+      ...candidateTraceFields(candidate),
+      candidateOrdinal,
+      durationMs: this.runtime.now() - startedAtMs,
+    });
+    return winner;
   }
 
-  private handleDirectFailure(candidate: DiscoveredCandidate, error: unknown) {
+  private handleDirectFailure(
+    candidate: DiscoveredCandidate, error: unknown, candidateOrdinal: number, durationMs: number,
+  ) {
     if (this.raceSignal.aborted) return;
     const message = error instanceof Error ? error.message : String(error);
     this.adapter.log?.("core.discovery.candidate.failed", {
       address: candidate.address,
       host: candidate.host,
       port: candidate.port,
-      protocol: candidate.protocol,
-      source: candidate.source ?? "unknown",
-      scope: candidate.scope ?? "unknown",
-      addressFamily: candidate.host?.includes(":") ? "ipv6"
-        : /^\d{1,3}(?:\.\d{1,3}){3}$/.test(candidate.host ?? "") ? "ipv4" : "dns",
-      message,
+      ...candidateTraceFields(candidate),
+      candidateOrdinal, durationMs, message,
     });
     this.errors.push(`${candidate.address}: ${message}`);
     recordCandidateFailure(this.candidateHealth, candidate, this.runtime.now);
@@ -3632,12 +3654,30 @@ async function openDirectMode(
   const forwardAbort = () => attempt.abort();
   signal?.addEventListener("abort", forwardAbort, { once: true });
   const timer = setTimeout(forwardAbort, timeoutMs);
+  const trace = {
+    ...candidateTraceFields({
+      address: "", host: opts.host, port: opts.port,
+      protocol: opts.quicOnly ? "quic" : "tcp",
+      source: "manual", scope: connectionScopeForHost(opts.host),
+    }),
+    candidateOrdinal: 1,
+  };
+  const startedAtMs = Date.now();
+  adapter.log?.("core.discovery.candidate.try", { ...trace, timeoutMs });
   try {
     const opening = opts.quicOnly
       ? openQuicSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal)
       : openDirectSession(adapter, opts, opts.host, opts.port, timeoutMs, undefined, attempt.signal);
-    return await withSessionTimeout(opening, timeoutMs);
+    const session = await withSessionTimeout(opening, timeoutMs);
+    adapter.log?.("core.discovery.candidate.connected", {
+      ...trace, durationMs: Date.now() - startedAtMs,
+    });
+    return session;
   } catch (error) {
+    adapter.log?.("core.discovery.candidate.failed", {
+      ...trace, durationMs: Date.now() - startedAtMs,
+      message: error instanceof Error ? error.message : String(error),
+    });
     attempt.abort();
     throw error;
   } finally {

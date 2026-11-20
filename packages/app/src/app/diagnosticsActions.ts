@@ -561,6 +561,14 @@ export const createDiagnosticsActions = (args: {
           .map(peer => ({
             deviceId: normalizeDeviceId(peer.id),
             knownTcp: directTcpEndpointForPeer(args.state, peer.id) ?? undefined,
+            configuredQuic: args.state.connection.discoveryMode === "direct" &&
+              args.state.connection.quicOnly === true &&
+              normalizeDeviceId(args.state.connection.remoteId) === normalizeDeviceId(peer.id) &&
+              args.state.connection.host.trim() &&
+              Number.isInteger(Number(args.state.connection.port)) &&
+              Number(args.state.connection.port) > 0 && Number(args.state.connection.port) <= 65535
+                ? { host: args.state.connection.host.trim(), port: Number(args.state.connection.port) }
+                : undefined,
             activeSession: args.state.session.isConnected &&
               normalizeDeviceId(peer.id) === activePeerId,
           }));
@@ -583,12 +591,24 @@ export const createDiagnosticsActions = (args: {
         pushSessionLog(args.state, "info", "diagnostics.peer_probe.completed",
           "Saved peer connection-path checks finished.",
           { testedPeers: report.testedPeerCount, verifiedPeers: passed, intermittentPeers: intermittent });
-        return { ...report, liveSession: {
-          connected: args.state.session.isConnected,
-          phase: args.state.session.lifecyclePhase,
-          transport: args.state.session.connectionTransport || "none",
-          scope: args.state.session.connectionScope || "unknown",
-        }, summary: { passed, failed: report.testedPeerCount - passed,
+        return { ...report,
+          requestedConnection: {
+            mode: args.state.connection.discoveryMode,
+            transport: args.state.connection.discoveryMode === "direct"
+              ? (args.state.connection.quicOnly ? "direct-quic" : "direct-tcp")
+              : "automatic-selection",
+          },
+          liveSession: {
+            connected: args.state.session.isConnected,
+            phase: args.state.session.lifecyclePhase,
+            // The offline snapshot retains the *last* transport even while
+            // the Android service is dialing a different transport.
+            transport: args.state.session.isConnected
+              ? args.state.session.connectionTransport || "unknown" : "none",
+            scope: args.state.session.isConnected
+              ? args.state.session.connectionScope || "unknown" : "unknown",
+            offlineSnapshot: args.state.session.isOfflineSnapshot,
+          }, summary: { passed, failed: report.testedPeerCount - passed,
           intermittentPeers: intermittent,
           allPassed: passed === report.testedPeerCount && intermittent === 0 && !report.truncated } };
       }, { timeoutMs: 180_000, description: "Isolated peer transport/TLS checks (no BEP or file writes)" }),

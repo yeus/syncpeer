@@ -85,7 +85,7 @@ test("saved peer diagnostic checks known LAN TCP, discovered LAN, global v4/v6 T
   const report = await run(adapter);
   assert.equal(report.savedPeerCount, 1);
   assert.equal(report.peers[0]?.localDiscovery.tcp, 1, "other peers must not be counted");
-  assert.deepEqual(report.peers[0]?.attempts.map(item => item.path), [
+  assert.deepEqual(report.peers[0]?.attempts.map(item => item.route), [
     "saved-lan-tcp", "saved-lan-tcp", "saved-lan-tcp",
     "discovered-lan-tcp", "global-ipv4-tcp",
     "global-ipv6-tcp", "global-ipv4-quic", "global-relay",
@@ -131,6 +131,33 @@ test("three direct-TCP attempts surface intermittent failures rather than report
   assert.equal(report.peers[0]?.attempts[0]?.category, "timeout");
 });
 
+
+test("configured direct and discovered LAN QUIC failures remain visible beside working global QUIC", async () => {
+  const { adapter, opens, closes } = fakeAdapter({
+    localAddresses: [{
+      deviceId: A, address: "quic://192.168.5.8:22000",
+      protocol: "quic", host: "192.168.5.8", port: 22000,
+    }],
+    globalAddresses: ["quic://203.0.113.10:22000"],
+    tlsErrorFor: ["192.168.5.7", "192.168.5.8"],
+  });
+  const report = await run(adapter, [{ deviceId: A,
+    configuredQuic: { host: "192.168.5.7", port: 22000 },
+  }]);
+  assert.deepEqual(report.peers[0]?.attempts.map(item => [item.route, item.outcome]), [
+    ["configured-direct-quic", "failed"],
+    ["discovered-lan-quic", "failed"],
+    ["global-ipv4-quic", "verified"],
+  ]);
+  assert.deepEqual(opens, ["quic:192.168.5.7:22000", "quic:192.168.5.8:22000",
+    "quic:203.0.113.10:22000"]);
+  assert.equal(closes.length, 1);
+  const serialized = JSON.stringify(report);
+  for (const secret of ["192.168.5.7", "192.168.5.8", "203.0.113.10", A]) {
+    assert.ok(!serialized.includes(secret), "report exposed a peer or network identifier");
+  }
+});
+
 test("already authenticated peer gets discovery diagnostics without duplicate TLS, QUIC or relay connections", async () => {
   const { adapter, opens } = fakeAdapter({
     globalAddresses: ["tcp://203.0.113.44:22000", "quic://203.0.113.44:22000"],
@@ -171,13 +198,20 @@ test("focused support bundle combines sanitized results with current native tran
   });
   const output = formatPeerSupportBundle(
     info,
-    JSON.stringify({ savedPeerCount: 1, leaked: "192.168.5.7", peerId: A }),
+    JSON.stringify({ savedPeerCount: 1, leaked: "192.168.5.7", peerId: A,
+      peers: [{ peerNumber: 1, attempts: [
+        { route: "configured-direct-quic", outcome: "failed", category: "timeout" },
+        { route: "saved-lan-tcp", outcome: "verified" },
+      ] }] }),
     [{ timestampMs: 1000, level: "info", event: "diagnostics.peer_probe.completed", message: "test done" }],
     [{ timestampMs: 900, level: "error", event: "native.tls.failed", message: "TLS handshake failed 10.3.2.1" }],
     true,
   );
   assert.match(output, /Focused Test Results/);
   assert.match(output, /Current Native Service Diagnostics/);
+  assert.match(output, /"route": "configured-direct-quic"/,
+    "sanitized report must retain the exact route category that failed");
+  assert.match(output, /"route": "saved-lan-tcp"/);
   assert.match(output, /native\.tls\.failed/);
   assert.ok(!output.includes(A));
   assert.ok(!output.includes("192.168.5.7"));

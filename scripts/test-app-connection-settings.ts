@@ -93,13 +93,33 @@ test("a saved peer retains its explicitly configured direct endpoint but a diffe
   connection.discoveryMode = "direct";
   connection.host = "127.0.0.1";
   connection.port = 22000;
+  connection.quicOnly = true;
 
   assert.deepEqual(preferredConnectionForDevice(connection, selectedId), {
-    remoteId: selectedId, discoveryMode: "direct", host: "127.0.0.1",
+    remoteId: selectedId, discoveryMode: "direct", host: "127.0.0.1", quicOnly: true,
   });
   assert.deepEqual(preferredConnectionForDevice(connection, "B".repeat(52)), {
-    remoteId: "B".repeat(52), discoveryMode: "automatic", host: "",
+    remoteId: "B".repeat(52), discoveryMode: "automatic", host: "", quicOnly: false,
   });
+});
+
+test("Automatic mode never sends stale hidden QUIC-only flag from a previous Direct selection", async t => {
+  const server = await createServer({ configFile: false,
+    server: { middlewareMode: true, watch: null }, appType: "custom" });
+  t.after(() => server.close());
+  const { createInitialState, connectionDetails } = await server.ssrLoadModule(
+    "/packages/app/src/app/state.ts") as typeof AppState;
+  const state = createInitialState(null);
+  state.connection.remoteId = "A".repeat(52);
+  state.connection.quicOnly = true;
+  state.connection.discoveryMode = "automatic";
+  assert.equal(connectionDetails(state).quicOnly, false);
+  state.connection.discoveryMode = "lan";
+  assert.equal(connectionDetails(state).quicOnly, false);
+  state.connection.discoveryMode = "global";
+  assert.equal(connectionDetails(state).quicOnly, false);
+  state.connection.discoveryMode = "direct";
+  assert.equal(connectionDetails(state).quicOnly, true);
 });
 
 test("a connected peer session survives an unreadable downloaded-file index", async t => {

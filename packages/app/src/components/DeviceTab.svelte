@@ -364,7 +364,10 @@
       >
         <label>
           Discovery Method
-          <select data-testid="connection-discovery-mode" bind:value={app.connection.discoveryMode}>
+          <select data-testid="connection-discovery-mode" bind:value={app.connection.discoveryMode}
+            onchange={() => {
+              if (app.connection.discoveryMode !== "direct") app.connection.quicOnly = false;
+            }}>
             <option value="automatic">Automatic (default)</option>
             <option value="global">Global Discovery</option>
             <option value="lan">LAN Discovery</option>

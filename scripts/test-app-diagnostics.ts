@@ -94,11 +94,11 @@ test("focused peer diagnostic uses saved peers (selected first) without altering
       onProgress(1, "global-discovery");
       return {
         savedPeerCount: 2, testedPeerCount: 2, truncated: false,
-        scope: "isolated-transport-and-tls-identity" as const, note: "synthetic",
+        scope: "tls-identity-only" as const, note: "synthetic",
         peers: [1, 2].map(peerNumber => ({
           peerNumber, localDiscovery: { tcp: 0, quic: 0, relay: 0, status: "ok" as const },
           globalDiscovery: { tcp: 1, quic: 0, relay: 0, status: "ok" as const },
-          attempts: [{ path: "global-ipv4-tcp" as const,
+          attempts: [{ route: "global-ipv4-tcp" as const,
             outcome: peerNumber === 1 ? "verified" as const : "failed" as const,
             durationMs: 50, category: peerNumber === 2 ? "timeout" : undefined }],
         })),
@@ -143,7 +143,7 @@ test("saved peer diagnosis marks active native session to avoid competing socket
       })), [{ deviceId: id, activeSession: true }]);
       return {
         savedPeerCount: 1, testedPeerCount: 1, truncated: false,
-        scope: "isolated-transport-and-tls-identity" as const, note: "synthetic",
+        scope: "tls-identity-only" as const, note: "synthetic",
         peers: [{ peerNumber: 1, attempts: [], activeSessionPreserved: true,
           intermittentDirectTcp: false, localDiscovery: { tcp: 1, quic: 0, relay: 0, status: "ok" },
           globalDiscovery: { tcp: 1, quic: 0, relay: 0, status: "ok" } }],
@@ -164,6 +164,64 @@ test("saved peer diagnosis marks active native session to avoid competing socket
   assert.equal(report.summary.failed, 0);
   assert.equal(state.session.isConnected, true);
 });
+
+test("configured QUIC is reported separately from a stale offline TCP snapshot", async () => {
+  const id = "A".repeat(52);
+  const state = createInitialState(null);
+  state.devices.savedDevices = [{ id, name: "Peer", createdAtMs: 1, isIntroducer: false }];
+  Object.assign(state.connection, {
+    remoteId: id, discoveryMode: "direct", quicOnly: true,
+    host: "192.168.25.30", port: 22000,
+  });
+  state.session.isConnected = false;
+  state.session.isOfflineSnapshot = true;
+  state.session.connectionTransport = "direct-tcp";
+  state.session.connectionScope = "lan";
+  state.session.lifecyclePhase = "connecting";
+  const client = {
+    probeSavedPeerConnectivity: async (targets: Array<{
+      deviceId: string; configuredQuic?: { host: string; port: number };
+    }>) => {
+      assert.deepEqual(targets[0]?.configuredQuic,
+        { host: "192.168.25.30", port: 22000 });
+      return {
+        savedPeerCount: 1, testedPeerCount: 1, truncated: false,
+        scope: "tls-identity-only" as const, note: "synthetic",
+        peers: [{ peerNumber: 1, attempts: [{ route: "configured-direct-quic",
+          trial: 1, outcome: "failed", durationMs: 3500, category: "timeout" }],
+          intermittentDirectTcp: false, activeSessionPreserved: false,
+          localDiscovery: { tcp: 1, quic: 1, relay: 0, status: "ok" },
+          globalDiscovery: { tcp: 1, quic: 1, relay: 1, status: "ok" },
+        }],
+      };
+    },
+  } as unknown as SyncpeerBrowserClient;
+  const actions = createDiagnosticsActions({
+    state, client,
+    appInfo: createAppBuildInfo({
+      appVersion: "test", coreVersion: "test", buildCommit: "test",
+      buildTimeUtc: "2026-01-01T00:00:00.000Z", buildMode: "development",
+      runtimeEnvironment: "tauri", runtimeSurface: "android-ui",
+      platform: "android", architecture: "arm64", osVersion: "synthetic",
+    }),
+  });
+  const report = await actions.runDiagnosticsTestById("network.saved_peer_paths");
+  const details = report.results[0]?.details as {
+    requestedConnection?: { mode: string; transport: string };
+    liveSession?: { connected: boolean; transport: string; offlineSnapshot: boolean };
+    peers?: Array<{ attempts: Array<{ route: string }> }>;
+  };
+  assert.deepEqual(details.requestedConnection,
+    { mode: "direct", transport: "direct-quic" });
+  assert.deepEqual(details.liveSession, {
+    connected: false, phase: "connecting", transport: "none", scope: "unknown",
+    offlineSnapshot: true,
+  });
+  assert.equal(details.peers?.[0]?.attempts[0]?.route, "configured-direct-quic");
+  assert.ok(!JSON.stringify(report).includes("192.168.25.30"));
+  assert.ok(!JSON.stringify(report).includes(id));
+});
+
 
 test("peer diagnosis with no saved devices skips safely without touching sockets", async () => {
   const report = await createFixture().runDiagnosticsTestById("network.saved_peer_paths");

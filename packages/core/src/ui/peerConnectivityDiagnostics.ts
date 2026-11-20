@@ -5,17 +5,20 @@ export interface PeerConnectivityTarget {
   deviceId: string;
   /** Optional existing endpoint of this peer, never another peer's host. */
   knownTcp?: { host: string; port: number };
+  /** Only when the current connection settings explicitly select this peer and QUIC. */
+  configuredQuic?: { host: string; port: number };
   /** Transport is already healthy; do not open another socket using the same identity. */
   activeSession?: boolean;
 }
 
 export type ConnectivityProbeOutcome = "verified" | "failed" | "skipped";
 export type ConnectivityProbePath =
-  "saved-lan-tcp" | "discovered-lan-tcp" | "global-ipv4-tcp" |
+  "saved-lan-tcp" | "discovered-lan-tcp" | "configured-direct-quic" |
+  "discovered-lan-quic" | "global-ipv4-tcp" |
   "global-ipv6-tcp" | "global-ipv4-quic" | "global-relay";
 
 export interface ConnectivityProbeAttempt {
-  path: ConnectivityProbePath;
+  route: ConnectivityProbePath;
   trial: number;
   outcome: ConnectivityProbeOutcome;
   durationMs: number;
@@ -36,13 +39,13 @@ export interface PeerConnectivityReport {
   savedPeerCount: number;
   testedPeerCount: number;
   truncated: boolean;
-  scope: "isolated-transport-and-tls-identity";
+  scope: "tls-identity-only";
   note: string;
   peers: PeerConnectivityResult[];
 }
 
 const MAX_PEERS = 4;
-const MAX_CANDIDATES_PER_PEER = 6;
+const MAX_CANDIDATES_PER_PEER = 8;
 const TLS_TIMEOUT_MS = 3500;
 const LOOKUP_TIMEOUT_MS = 5500;
 
@@ -91,23 +94,31 @@ const probeCases = (
   global: readonly DiscoveredCandidate[],
 ) => {
   const localTcp = local.find(c => c.protocol === "tcp" && endpointValid(c) && ipv4(c.host));
+  const localQuic = local.find(c => c.protocol === "quic" && endpointValid(c) && (ipv4(c.host) || ipv6(c.host)));
   const globalTcp4 = global.find(c => c.protocol === "tcp" && endpointValid(c) && ipv4(c.host));
   const globalTcp6 = global.find(c => c.protocol === "tcp" && endpointValid(c) && ipv6(c.host));
   const globalQuic4 = global.find(c => c.protocol === "quic" && endpointValid(c) && ipv4(c.host));
   const globalRelay = global.find(c => c.protocol === "relay" && c.address.startsWith("relay://"));
-  const cases: Array<{ path: ConnectivityProbePath; host?: string; port?: number;
+  const cases: Array<{ route: ConnectivityProbePath; host?: string; port?: number;
     address?: string; transport: "tcp" | "quic" | "relay" }> = [];
+  if (target.configuredQuic) {
+    cases.push({ route: "configured-direct-quic", ...target.configuredQuic, transport: "quic" });
+  }
   if (target.knownTcp) {
-    cases.push({ path: "saved-lan-tcp", ...target.knownTcp, transport: "tcp" });
+    cases.push({ route: "saved-lan-tcp", ...target.knownTcp, transport: "tcp" });
   }
   if (localTcp && (!target.knownTcp || localTcp.host !== target.knownTcp.host ||
     localTcp.port !== target.knownTcp.port)) {
-    cases.push({ path: "discovered-lan-tcp", ...localTcp, transport: "tcp" });
+    cases.push({ route: "discovered-lan-tcp", ...localTcp, transport: "tcp" });
   }
-  if (globalTcp4) cases.push({ path: "global-ipv4-tcp", ...globalTcp4, transport: "tcp" });
-  if (globalTcp6) cases.push({ path: "global-ipv6-tcp", ...globalTcp6, transport: "tcp" });
-  if (globalQuic4) cases.push({ path: "global-ipv4-quic", ...globalQuic4, transport: "quic" });
-  if (globalRelay) cases.push({ path: "global-relay", address: globalRelay.address, transport: "relay" });
+  if (localQuic && (!target.configuredQuic || localQuic.host !== target.configuredQuic.host ||
+    localQuic.port !== target.configuredQuic.port)) {
+    cases.push({ route: "discovered-lan-quic", ...localQuic, transport: "quic" });
+  }
+  if (globalTcp4) cases.push({ route: "global-ipv4-tcp", ...globalTcp4, transport: "tcp" });
+  if (globalTcp6) cases.push({ route: "global-ipv6-tcp", ...globalTcp6, transport: "tcp" });
+  if (globalQuic4) cases.push({ route: "global-ipv4-quic", ...globalQuic4, transport: "quic" });
+  if (globalRelay) cases.push({ route: "global-relay", address: globalRelay.address, transport: "relay" });
   return cases.slice(0, MAX_CANDIDATES_PER_PEER);
 };
 
@@ -181,7 +192,7 @@ export const runPeerConnectivityProbes = async (args: {
     // discovery results instead of attempting a second socket.
     const cases = target.activeSession ? [] : probeCases(target, localForPeer, global);
     const repeatedDirectIndex = peerNumber === 1
-      ? cases.findIndex(probe => probe.path === "saved-lan-tcp" || probe.path === "discovered-lan-tcp")
+      ? cases.findIndex(probe => probe.route === "saved-lan-tcp" || probe.route === "discovered-lan-tcp")
       : -1;
     // Three automatic direct-TCP trials on the priority saved peer expose
     // intermittent first-dial failures without any manual toggling on the phone.
@@ -189,10 +200,10 @@ export const runPeerConnectivityProbes = async (args: {
       (i === repeatedDirectIndex ? [1, 2, 3] : [1]).map(trial => ({ ...probe, trial })));
     for (const probe of scheduled) {
       if (probe.transport !== "relay" && (!probe.host || !probe.port)) continue;
-      args.onProgress?.(peerNumber, `${probe.path} trial ${probe.trial}`);
+      args.onProgress?.(peerNumber, `${probe.route} trial ${probe.trial}`);
       if ((probe.transport === "quic" && !args.adapter.connectQuic) ||
           (probe.transport === "relay" && !args.adapter.connectRelay)) {
-        result.attempts.push({ path: probe.path, trial: probe.trial, outcome: "skipped",
+        result.attempts.push({ route: probe.route, trial: probe.trial, outcome: "skipped",
           durationMs: 0, category: "unsupported" });
         continue;
       }
@@ -232,12 +243,12 @@ export const runPeerConnectivityProbes = async (args: {
         category = classify(error);
       }
       result.attempts.push({
-        path: probe.path, trial: probe.trial, outcome, durationMs: Date.now() - started,
+        route: probe.route, trial: probe.trial, outcome, durationMs: Date.now() - started,
         ...(category ? { category } : {}),
       });
     }
     const directTrials = result.attempts.filter(attempt =>
-      repeatedDirectIndex >= 0 && attempt.path === cases[repeatedDirectIndex]?.path);
+      repeatedDirectIndex >= 0 && attempt.route === cases[repeatedDirectIndex]?.route);
     result.intermittentDirectTcp = directTrials.some(item => item.outcome === "verified") &&
       directTrials.some(item => item.outcome === "failed");
     peers.push(result);
@@ -246,8 +257,8 @@ export const runPeerConnectivityProbes = async (args: {
     savedPeerCount: args.targets.length,
     testedPeerCount: peers.length,
     truncated: args.targets.length > peers.length,
-    scope: "isolated-transport-and-tls-identity",
-    note: "The priority peer gets three automatic Direct TCP trials when an address is available. Already connected peers are discovery-only to avoid duplicate socket arbitration. Otherwise only short-lived transport/TLS certificate checks are attempted; no BEP, folder writes, or live-session replacement. Failed handshakes do not prove remote authorization was rejected.",
+    scope: "tls-identity-only",
+    note: "The priority peer gets three automatic Direct TCP trials when an address is available. Configured QUIC and LAN QUIC are checked separately from global QUIC. Already connected peers are discovery-only to avoid duplicate socket arbitration. Otherwise only short-lived transport/TLS certificate checks are attempted; no BEP, folder writes, or live-session replacement.",
     peers,
   };
 };

@@ -866,6 +866,9 @@ const introducerFolderConsent = (state: AppState) => {
 
 export const connectionDetails = (state: AppState) => ({
   ...buildConnectionDetails(state.connection, activeFolderPasswords(state)),
+  // Historic persisted profiles may still have this hidden Direct-only flag
+  // enabled after switching to Automatic. Never turn Automatic into QUIC-only.
+  quicOnly: state.connection.discoveryMode === "direct" && state.connection.quicOnly === true,
   configuredPeerIds: state.devices.savedDevices.map(device => device.id),
   ...introducerFolderConsent(state),
   ...(import.meta.env?.SYNCPEER_LAN_E2E === true && state.connection.relayPoolUrl

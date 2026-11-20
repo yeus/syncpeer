@@ -139,7 +139,7 @@ export const rememberAuthenticatedTcpEndpoint = (
 export const preferredConnectionForDevice = (
   connection: AppState["connection"],
   deviceId: string,
-): Pick<AppState["connection"], "remoteId" | "discoveryMode" | "host"> => {
+): Pick<AppState["connection"], "remoteId" | "discoveryMode" | "host" | "quicOnly"> => {
   const preserveDirect = connection.discoveryMode === "direct" &&
     sameDeviceId(connection.remoteId, deviceId) &&
     connection.host.trim().length > 0 &&
@@ -149,6 +149,9 @@ export const preferredConnectionForDevice = (
     remoteId: normalizeDeviceId(deviceId),
     discoveryMode: preserveDirect ? "direct" : "automatic",
     host: preserveDirect ? connection.host : "",
+    // QUIC-only is a Direct-mode choice. It must not leak to another peer's
+    // automatic connection, where it would suppress TCP and relay fallback.
+    quicOnly: preserveDirect ? connection.quicOnly : false,
   };
 };
 

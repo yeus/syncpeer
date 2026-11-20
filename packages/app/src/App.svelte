@@ -234,7 +234,7 @@
       pushSessionLog(app, "info", "diagnostics.export.requested",
         "Diagnostic export started.", { kind });
       await logHistory?.flushAll();
-      try { await logHistory?.restore(); }
+      try { await logHistory?.readRecentHistory(); }
       catch (error) {
         app.logs.historyError = "Historical diagnostics could not be recovered from Android's encrypted journal.";
         pushSessionLog(app, "error", "diagnostics.history.restore_failed",
@@ -280,12 +280,10 @@
     if (!logFile?.share) throw new Error("Native file sharing is unavailable.");
     pushSessionLog(app, "info", "diagnostics.peer_probe.export",
       "Preparing focused peer diagnostics and current native trace.");
-    try {
-      await logHistory?.flushAll();
-    } catch {
-      pushSessionLog(app, "warning", "diagnostics.peer_probe.journal_flush_incomplete",
-        "Some diagnostic events could not be confirmed in encrypted storage; sharing available evidence.");
-    }
+    // A focused report already contains live WebView logs and the native
+    // in-memory ring. It must not block the share sheet on slow Keystore
+    // encryption/fsync of the independent durable crash journal.
+    const traceStartedAt = Date.now();
     let native = app.logs.currentNativeItems;
     if (logHistory) {
       try {
@@ -298,6 +296,9 @@
           { reasonCategory: "journal_read_failed" });
       }
     }
+    pushSessionLog(app, "info", "diagnostics.peer_probe.trace_ready",
+      "Focused diagnostic trace prepared.",
+      { durationMs: Date.now() - traceStartedAt, nativeEventCount: native.length });
     const contents = formatPeerSupportBundle(
       appInfo, diagnosticsJson, app.logs.items, native, app.logs.journalStarted);
     await logFile.share(peerSupportBundleFileName(new Date()), contents);

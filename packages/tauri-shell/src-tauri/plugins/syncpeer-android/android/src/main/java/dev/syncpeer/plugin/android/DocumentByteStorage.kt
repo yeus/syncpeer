@@ -3,6 +3,9 @@ package dev.syncpeer.plugin.android
 import androidx.annotation.Keep
 import org.json.JSONObject
 
+internal class DocumentStorageFailure(val category: String) :
+  IllegalStateException("Document storage operation failed.")
+
 /** Owns native handles; all actual byte-storage behavior lives in replica_storage.rs. */
 @Keep
 class DocumentByteStorage(metadataPath: String, metadataKey: String) : AutoCloseable {
@@ -14,7 +17,15 @@ class DocumentByteStorage(metadataPath: String, metadataKey: String) : AutoClose
   @Synchronized fun execute(request: JSONObject): Any? {
     check(nativeHandle != 0L) { "Document storage is closed" }
     val reply = JSONObject(request(request.toString()))
-    check(!reply.has("error")) { reply.optString("error") }
+    if (reply.has("error")) {
+      val category = reply.optString("failureCategory").takeIf { it in setOf(
+        "metadata-key-mismatch", "metadata-key-check-missing", "replica-marker-mismatch",
+        "root-identity-mismatch", "root-identity-missing", "metadata-schema-unsupported",
+        "metadata-database-missing", "metadata-integrity", "replica-lock",
+        "legacy-migration", "metadata-database", "permission", "missing-file", "other")
+      } ?: "other"
+      throw DocumentStorageFailure(category)
+    }
     return reply.opt("result").takeUnless { it == JSONObject.NULL }
   }
   @Synchronized override fun close() { if (nativeHandle != 0L) dispose() }

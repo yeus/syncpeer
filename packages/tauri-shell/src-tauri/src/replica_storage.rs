@@ -95,6 +95,42 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+/// JNI reports only fixed error categories; never Rust's raw filesystem,
+/// database, path or encryption error text. Also testable on the host.
+pub(crate) fn storage_failure_category(message: &str) -> &'static str {
+    if message.contains("metadata key does not match this installation") {
+        "metadata-key-mismatch"
+    } else if message.contains("metadata key check is missing") {
+        "metadata-key-check-missing"
+    } else if message.contains("Replica folder marker unavailable or replaced") {
+        "replica-marker-mismatch"
+    } else if message.contains("selected folder identity changed")
+        || message.contains("Selected folder was replaced")
+    {
+        "root-identity-mismatch"
+    } else if message.contains("root identity missing") {
+        "root-identity-missing"
+    } else if message.contains("missing or unsupported schema") {
+        "metadata-schema-unsupported"
+    } else if message.contains("missing; restore a backup") {
+        "metadata-database-missing"
+    } else if message.contains("integrity validation failed") {
+        "metadata-integrity"
+    } else if message.contains("Replica root is busy") || message.contains("already locked") {
+        "replica-lock"
+    } else if message.contains("Invalid legacy") || message.contains("Legacy metadata") {
+        "legacy-migration"
+    } else if message.contains("Metadata database:") {
+        "metadata-database"
+    } else if message.contains("Permission denied") || message.contains("permission denied") {
+        "permission"
+    } else if message.contains("No such file or directory") {
+        "missing-file"
+    } else {
+        "other"
+    }
+}
+
 fn check_relative(root: &Dir, relative: &str) -> io::Result<()> {
     if relative.contains('\\')
         || relative.contains('\0')
@@ -1534,6 +1570,21 @@ pub async fn syncpeer_replica_storage_write_files_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_failure_categories_never_echo_private_error_text() {
+        assert_eq!(storage_failure_category(
+            "Metadata database: metadata key does not match this installation"
+        ), "metadata-key-mismatch");
+        assert_eq!(storage_failure_category(
+            "Metadata database: selected folder identity changed"
+        ), "root-identity-mismatch");
+        assert_eq!(storage_failure_category(
+            "Metadata database: disk image malformed /data/user/0/private"
+        ), "metadata-database");
+        assert_eq!(storage_failure_category("Replica root is busy"), "replica-lock");
+        assert_eq!(storage_failure_category("secret /data/user/0/foo key=abc"), "other");
+    }
 
     #[test]
     fn copies_use_the_same_storage_for_private_records_and_files() {

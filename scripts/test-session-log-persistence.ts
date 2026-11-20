@@ -314,6 +314,69 @@ test("focused peer support bundle pages only the recent native tail", async () =
   history.dispose();
 });
 
+test("Android in-memory native tail exports without decrypting or listing the journal", async () => {
+  const native = fixture();
+  let listOrRead = 0;
+  const history = createPersistentSessionLogs({
+    runId: first, deferHistory: true,
+    port: async request => {
+      if (request.operation === "recentNative") {
+        assert.equal(request.runId, first);
+        assert.equal(request.limit, 400);
+        return { items: [{ runId: first, timestampMs: 1000, level: "error",
+          event: "native.document.storage_failed",
+          message: "native.document.storage_failed",
+          details: JSON.stringify({ failureCategory: "metadata-database", operation: "register" }) }] };
+      }
+      if (request.operation === "list" || request.operation === "read") {
+        listOrRead++;
+        throw new Error("Must not decrypt the old journal for a current native trace.");
+      }
+      return native.port(request);
+    },
+  });
+  await history.start();
+  const recent = await history.readCurrentNativeTrace(400);
+  assert.equal(recent.length, 1);
+  assert.equal(recent[0]?.event, "native.document.storage_failed");
+  assert.equal((recent[0]?.details as Record<string, unknown>)?.failureCategory, "metadata-database");
+  assert.equal(listOrRead, 0);
+  history.dispose();
+});
+
+test("regular export takes bounded prior-run tail without a historical journal scan", async () => {
+  const native = fixture();
+  let calls = 0;
+  let restored: Array<{ event: string }> = [];
+  const history = createPersistentSessionLogs({
+    runId: first, deferHistory: true,
+    onRestored: value => { restored = value.items; },
+    port: async request => {
+      if (request.operation === "recentHistory") {
+        assert.equal(request.limit, 160);
+        return { items: [
+          { runId: second, timestampMs: 1200, level: "warning",
+            event: "native.previous_process_exit", message: "Crash" },
+          { runId: second, timestampMs: 1100, level: "info",
+            event: "native.runtime.initialize.stage", message: "Startup" },
+        ], startedAtMs: 1100, truncated: true };
+      }
+      if (request.operation === "list" || request.operation === "read") {
+        calls++;
+        throw new Error("Unexpected full historical decrypt.");
+      }
+      return native.port(request);
+    },
+  });
+  await history.start();
+  await history.readRecentHistory();
+  assert.equal(calls, 0);
+  assert.deepEqual(restored.map(item => item.event), [
+    "native.previous_process_exit", "native.runtime.initialize.stage",
+  ]);
+  history.dispose();
+});
+
 test("export flush drains all queued diagnostics instead of just one native page", async () => {
   const native = fixture();
   const history = createPersistentSessionLogs({ port: native.port, runId: first, deferHistory: true });

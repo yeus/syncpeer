@@ -1,5 +1,5 @@
 //! JNI transport for the same byte-storage implementation used by Tauri commands.
-use crate::replica_storage::{dispatch, ReplicaRoots, ReplicaStorageRequest};
+use crate::replica_storage::{dispatch, storage_failure_category, ReplicaRoots, ReplicaStorageRequest};
 use jni::{
     objects::{JObject, JString},
     sys::jstring,
@@ -67,7 +67,10 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_DocumentByteStorage_requ
     })();
     let response = match result {
         Ok(value) => serde_json::json!({"result": value}),
-        Err(_) => serde_json::json!({"error": "Document storage operation failed"}),
+        Err(error) => serde_json::json!({
+            "error": "Document storage operation failed",
+            "failureCategory": storage_failure_category(&error),
+        }),
     };
     match env.new_string(response.to_string()) {
         Ok(value) => value.into_raw(),

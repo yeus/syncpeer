@@ -225,9 +225,13 @@ test("configured QUIC is reported separately from a stale offline TCP snapshot",
 
 test("peer diagnosis with no saved devices skips safely without touching sockets", async () => {
   const report = await createFixture().runDiagnosticsTestById("network.saved_peer_paths");
-  assert.equal(report.summary.failed, 0);
+  assert.equal(report.summary.failed, 1);
+  assert.equal(report.summary.allPassed, false,
+    "No targets must not produce a successful connectivity diagnosis.");
   assert.deepEqual(report.results[0]?.details, {
-    skipped: true, reason: "No saved peers configured.",
+    skipped: true,
+    reason: "Saved peer roster unavailable: encrypted local storage has not been unlocked.",
+    summary: { allPassed: false, passed: 0, failed: 0, skipped: 1 },
   });
 });
 

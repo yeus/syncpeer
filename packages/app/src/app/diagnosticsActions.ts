@@ -572,7 +572,13 @@ export const createDiagnosticsActions = (args: {
             activeSession: args.state.session.isConnected &&
               normalizeDeviceId(peer.id) === activePeerId,
           }));
-        if (!targets.length) return { skipped: true, reason: "No saved peers configured." };
+        if (!targets.length) return {
+          skipped: true,
+          reason: args.state.passwords.secureStorage
+            ? "No saved peers configured."
+            : "Saved peer roster unavailable: encrypted local storage has not been unlocked.",
+          summary: { allPassed: false, passed: 0, failed: 0, skipped: 1 },
+        };
         pushSessionLog(args.state, "info", "diagnostics.peer_probe.started",
           "Testing saved peer connection paths without modifying the active session.",
           { savedPeerCount: targets.length });

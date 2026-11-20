@@ -40,7 +40,8 @@ const formatEntries = (items: readonly SessionLogItem[]): string =>
     return lines.join("\n");
   }).join("\n\n");
 
-/** Include last run's encrypted, recovered history in every explicit export. */
+/** Include the recovered recent previous-run tail in quick exports; the full
+ * historical journal remains available from the in-app log history view. */
 export const formatSessionLogs = (
   appInfo: AppBuildInfo,
   items: readonly SessionLogItem[],

@@ -1409,7 +1409,8 @@ class DocumentRuntimeService : Service() {
       DiagnosticLogJournal.recordNative(applicationContext, "native.document.storage_failed",
         "error", JSONObject().put("method", method).put("operation", safeOperation)
           .put("exceptionTypes", category)
-          .put("failureCategory", documentStorageFailureCategory(error)))
+          .put("failureCategory", (error as? DocumentStorageFailure)?.category
+            ?: documentStorageFailureCategory(error)))
       if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
         Log.w("SyncpeerRuntime", "storage $method failed: $category")
       }

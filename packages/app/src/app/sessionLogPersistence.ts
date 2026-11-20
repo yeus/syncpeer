@@ -5,6 +5,7 @@ export type ArchivedSessionLog = SessionLogItem & { id: string };
 type DiagnosticPort = (request: Record<string, unknown>) => Promise<unknown>;
 const HISTORY_LIMIT = 4000;
 const CURRENT_NATIVE_TRACE_LIMIT = 1500;
+const IN_MEMORY_NATIVE_TRACE_LIMIT = 512;
 const BATCH_LIMIT = 24;
 const QUEUE_LIMIT = 1000;
 const MAX_LOG_MESSAGE = 600;
@@ -200,6 +201,32 @@ export const createPersistentSessionLogs = (args: {
     return restoreInFlight;
   };
 
+  /** Fast bounded previous-run tail for regular shares. The full restore()
+   * remains available from the History view. Older APKs use that fallback. */
+  const readRecentHistory = async (): Promise<void> => {
+    if (restored) return;
+    await begin();
+    let tail: Record<string, unknown>;
+    try {
+      tail = await request({ operation: "recentHistory", runId: args.runId, limit: 160 });
+    } catch {
+      await restore();
+      return;
+    }
+    if (!Array.isArray(tail.items)) {
+      throw new Error("Android journal returned invalid recent history.");
+    }
+    const items = tail.items.map((value, index) => parseEntry(args.runId, value, index));
+    if (items.some(value => value === null))
+      throw new Error("Android journal returned malformed recent history.");
+    args.onRestored?.({
+      startedAtMs: typeof tail.startedAtMs === "number" ? tail.startedAtMs : 0,
+      items: items as ArchivedSessionLog[],
+    });
+    // The bounded tail is not a full restore; expanding history can still
+    // request all available older records.
+  };
+
   /** Explicit exports must contain native TLS/QUIC/relay diagnostics from THIS
    * run. The UI's live log observer never sees native service journal events;
    * restore() intentionally reads only PREVIOUS runs.
@@ -208,6 +235,27 @@ export const createPersistentSessionLogs = (args: {
     maxEntries = CURRENT_NATIVE_TRACE_LIMIT,
   ): Promise<ArchivedSessionLog[]> => {
     await begin();
+    const boundedEntries = Number.isFinite(maxEntries)
+      ? Math.max(1, Math.min(CURRENT_NATIVE_TRACE_LIMIT, Math.floor(maxEntries)))
+      : CURRENT_NATIVE_TRACE_LIMIT;
+    // Android native events are kept in a bounded current-process ring as
+    // well as encrypted on disk. Prefer this zero-decryption path. Other/
+    // older plugin backends may fall back to the journal scan below.
+    try {
+      const tail = await request({
+        operation: "recentNative", runId: args.runId,
+        limit: Math.min(boundedEntries, IN_MEMORY_NATIVE_TRACE_LIMIT),
+      });
+      if (Array.isArray(tail.items)) {
+        const parsed = tail.items.map((value, index) =>
+          parseEntry(args.runId, value, index));
+        if (parsed.some(value => value === null))
+          throw new Error("Invalid native diagnostic tail.");
+        return parsed as ArchivedSessionLog[];
+      }
+    } catch {
+      // Older Android plugin without recentNative; retain historical fallback.
+    }
     const listing = await request({ operation: "list" });
     if (!Array.isArray(listing.runs))
       throw new Error("Android diagnostic journal returned no current-run listing.");
@@ -218,9 +266,6 @@ export const createPersistentSessionLogs = (args: {
     const items: ArchivedSessionLog[] = [];
     // Focused shares can request a smaller tail to avoid many sequential
     // Android Binder reads, while a full manual export keeps its larger cap.
-    const boundedEntries = Number.isFinite(maxEntries)
-      ? Math.max(1, Math.min(CURRENT_NATIVE_TRACE_LIMIT, Math.floor(maxEntries)))
-      : CURRENT_NATIVE_TRACE_LIMIT;
     let offset = Math.max(0, (total as number) - boundedEntries);
     try {
       while (offset < (total as number)) {
@@ -254,5 +299,6 @@ export const createPersistentSessionLogs = (args: {
     disposed = true;
   };
 
-  return { record, start, restore, readCurrentNativeTrace, flush, flushAll, dispose, pending: () => queue.length };
+  return { record, start, restore, readRecentHistory, readCurrentNativeTrace,
+    flush, flushAll, dispose, pending: () => queue.length };
 };

@@ -165,6 +165,59 @@ internal class DiagnosticLogJournal(context: Context) {
     return events
   }
 
+  /** Fast recent previous-run diagnostics: seek encrypted frame headers without
+   * decrypting every old journal segment, then authenticate only the newest
+   * bounded tail. The full historical reader remains available on demand. */
+  fun recentHistory(excludeRunId: String, limit: Int): JSONObject = synchronized(IO_LOCK) {
+    require(excludeRunId.matches(RUN_ID) && limit in 1..RECENT_HISTORY_LIMIT)
+    val offsets = mutableListOf<Pair<File, Long>>()
+    for (file in segments()) {
+      RandomAccessFile(file, "r").use { input ->
+        while (input.filePointer + 4 <= input.length()) {
+          val pos = input.filePointer
+          val size = input.readInt()
+          if (size !in 29..(MAX_RECORD_BYTES + 28) ||
+              input.filePointer + size > input.length()) break
+          offsets.add(file to pos)
+          input.seek(input.filePointer + size)
+        }
+      }
+    }
+    val items = mutableListOf<JSONObject>()
+    var currentFile: File? = null
+    var opened: RandomAccessFile? = null
+    var attempted = 0
+    try {
+      for ((file, pos) in offsets.asReversed()) {
+        if (items.size >= limit || attempted >= RECENT_HISTORY_SCAN_LIMIT) break
+        if (currentFile != file) {
+          opened?.close()
+          opened = RandomAccessFile(file, "r")
+          currentFile = file
+        }
+        val input = checkNotNull(opened)
+        input.seek(pos)
+        val size = input.readInt()
+        val payload = ByteArray(size)
+        input.readFully(payload)
+        attempted++
+        try {
+          val plaintext = decrypt(payload)
+          try {
+            val entry = JSONObject(String(plaintext, Charsets.UTF_8))
+            if (entry.optString("runId").matches(RUN_ID) &&
+                entry.optString("runId") != excludeRunId) items.add(entry)
+          } finally { plaintext.fill(0) }
+        } catch (_: Exception) {
+          // Authentication failure never produces a record.
+        } finally { payload.fill(0) }
+      }
+    } finally { opened?.close() }
+    JSONObject().put("items", JSONArray(items))
+      .put("startedAtMs", items.lastOrNull()?.optLong("timestampMs") ?: 0L)
+      .put("truncated", offsets.size > attempted)
+  }
+
   /** Startup must not decrypt the entire historical journal on the critical
    * path. Historical runs are requested separately only after UI is ready. */
   fun startRun(runId: String): JSONObject = synchronized(IO_LOCK) {
@@ -215,9 +268,14 @@ internal class DiagnosticLogJournal(context: Context) {
     private const val MAX_MESSAGE_CHARS = 600
     private const val MAX_DETAILS_CHARS = 2400
     private const val MAX_BATCH = 32
+    private const val RECENT_HISTORY_LIMIT = 160
+    private const val RECENT_HISTORY_SCAN_LIMIT = 400
     private const val SEGMENT_BYTES = 512 * 1024L
     private const val MAX_SEGMENTS = 8
     private val IO_LOCK = Any()
+    private val NATIVE_RECENT_LOCK = Any()
+    private const val NATIVE_RECENT_LIMIT = 512
+    private val recentNative = ArrayDeque<JSONObject>()
     @Volatile private var activeRunId = ""
     // A service may initialize and even crash before the WebView registers
     // its run ID. Keep those native events in a process-scoped encrypted run.
@@ -281,16 +339,31 @@ internal class DiagnosticLogJournal(context: Context) {
       }
     }
 
+    /** Current-process native events are already sanitized at emission. Read
+     * this bounded ring without decrypting years of unrelated journal records.
+     * The encrypted append-only journal still handles crash/previous-run recovery. */
+    fun recentNativeTrace(runId: String, limit: Int): JSONObject {
+      require(runId.matches(RUN_ID) && limit in 1..NATIVE_RECENT_LIMIT)
+      val items = synchronized(NATIVE_RECENT_LOCK) {
+        recentNative.filter { it.optString("runId") == runId }.takeLast(limit)
+      }
+      return JSONObject().put("items", JSONArray(items))
+    }
+
     fun recordNative(context: Context, event: String, level: String = "info",
       details: JSONObject? = null) {
       val id = activeRunId.takeIf { it.matches(RUN_ID) } ?: processRunId
       if (!event.matches(EVENT_ID) || level !in LEVELS) return
+      val record = JSONObject().put("runId", id)
+        .put("timestampMs", System.currentTimeMillis())
+        .put("level", level).put("event", event).put("message", event)
+      if (details != null) record.put("details", details.toString().take(MAX_DETAILS_CHARS))
+      synchronized(NATIVE_RECENT_LOCK) {
+        recentNative.addLast(record)
+        while (recentNative.size > NATIVE_RECENT_LIMIT) recentNative.removeFirst()
+      }
       nativeWriter.execute {
         runCatching {
-          val record = JSONObject().put("runId", id)
-            .put("timestampMs", System.currentTimeMillis())
-            .put("level", level).put("event", event).put("message", event)
-          if (details != null) record.put("details", details.toString().take(MAX_DETAILS_CHARS))
           DiagnosticLogJournal(context.applicationContext).append(listOf(record))
         }
       }

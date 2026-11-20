@@ -59,6 +59,8 @@ interface DocumentFilesystemOptions {
   /** Defaults to the in-process scrypt derivation; platforms may inject a worker. */
   kdf?: PasswordKdf;
   onDiagnostic?: (event: string, details?: Record<string, unknown>) => void;
+  /** Diagnostic stage names only; never include private document metadata. */
+  onInitializeStage?: (stage: "profile-replica" | "vault-load" | "folders-open" | "initial-status") => void;
   onSessionConfigurationChange?: () => void;
 }
 
@@ -387,9 +389,13 @@ const documentStatus = async (runtime: DocumentRuntime) => {
 };
 
 const initializeFilesystem = async (runtime: DocumentRuntime) => {
+  runtime.options.onInitializeStage?.("profile-replica");
   await runtime.options.profile.initializeReplica();
+  runtime.options.onInitializeStage?.("vault-load");
   await runtime.vault.initialize();
+  runtime.options.onInitializeStage?.("folders-open");
   await openRegisteredFolders(runtime);
+  runtime.options.onInitializeStage?.("initial-status");
   return documentStatus(runtime);
 };
 

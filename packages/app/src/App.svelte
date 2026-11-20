@@ -701,6 +701,7 @@
     updateSystemTheme();
     colorScheme.addEventListener("change", updateSystemTheme);
     actions.setAppVisibility(document.visibilityState === "visible");
+    let vaultBootstrapFailed = false;
     void (async () => {
       // Repair leftover downloaded-file metadata before the first cache read. A
       // reinstall can restore app data while removing the key that protects it.
@@ -758,14 +759,27 @@
       await actions.restoreNavigationRoute(true);
       persistSensitiveState();
     })().catch(error => {
+      vaultBootstrapFailed = true;
       if (isPrivateStorageRecoveryIssue(error)) {
         const issue = documentStoragePreparationIssue(0, error);
         app.ui.recentError = issue.message;
         privateStorageRecoveryMessage = issue.canResetPrivateStorage ? issue.message : null;
       } else {
-        app.ui.recentError = error instanceof Error ? error.message : "Private local storage could not be initialized.";
+        const message = error instanceof Error ? error.message : String(error);
+        if (/Document operation failed\. Check the vault and Android System WebView\./.test(message)) {
+          pushSessionLog(app, "error", "app.vault.bootstrap_unavailable",
+            "Android document storage could not open. Existing peer settings are not being reset.");
+          app.ui.recentError = "Syncpeer could not open its encrypted local vault. Saved peers cannot load until storage recovers. Do not clear app data or reset the vault; export logs for diagnosis.";
+        } else {
+          app.ui.recentError = message || "Private local storage could not be initialized.";
+        }
       }
-    }).finally(() => { peerStateInitializing = false; firstPeerInviteReady = true; });
+    }).finally(() => {
+      peerStateInitializing = false;
+      // An unreadable protected roster is not a first-run empty roster.
+      // Never invite the user to replace peer setup while its vault cannot load.
+      firstPeerInviteReady = !vaultBootstrapFailed;
+    });
 
     const recordDeviceHealth = (trigger: string) => {
       if (appInfo.runtimeSurface !== "android-ui") return;

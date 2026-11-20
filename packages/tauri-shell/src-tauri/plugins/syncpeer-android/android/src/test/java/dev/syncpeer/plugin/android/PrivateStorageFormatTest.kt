@@ -138,6 +138,18 @@ class DocumentFailureMessagesTest {
       documentRuntimeFailureMessage("Starting document access…"))
   }
 
+  @Test fun storageFailuresAreClassifiedWithoutPersistingSensitiveExceptionText() {
+    assertEquals("protected-metadata-key-missing",
+      documentStorageFailureCategory(IllegalStateException(
+        "Existing metadata requires its protected key or a confirmed local reset")))
+    assertEquals("keystore-alias-missing",
+      documentStorageFailureCategory(IllegalStateException("Remembered credential key is missing")))
+    assertEquals("protected-secret-decryption",
+      documentStorageFailureCategory(javax.crypto.AEADBadTagException("secret /data/private/profile")))
+    assertEquals("other",
+      documentStorageFailureCategory(IllegalStateException("Private /data/user/0/secret document")))
+  }
+
   @Test fun preservesOnlySafeDocumentCommandFailures() {
     assertEquals(DOCUMENT_RUNTIME_RESTARTING_MESSAGE,
       documentCommandFailureMessage(java.io.FileNotFoundException(DOCUMENT_RUNTIME_RESTARTING_MESSAGE)))

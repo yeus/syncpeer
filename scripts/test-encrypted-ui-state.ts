@@ -103,6 +103,25 @@ test("a failed save does not stop later encrypted UI-state saves", async () => {
     "The next change must be saved again after a failed save.");
 });
 
+test("vault startup failure must never overwrite an existing peer roster with empty UI state", async () => {
+  const operations: string[] = [];
+  const store = createEncryptedUiStateStore({
+    command: async <T>(request: Record<string, unknown>): Promise<T> => {
+      operations.push(String(request.operation));
+      if (request.operation === "uiState")
+        throw new Error("Document operation failed. Check the vault and Android System WebView.");
+      throw new Error("A save would overwrite existing data.");
+    },
+    readLegacy: () => null, apply: () => false, onFailure: () => undefined,
+    saveDelayMs: 0,
+  });
+  await assert.rejects(store.load(), /Document operation failed/);
+  assert.equal(store.isLoaded(), false);
+  store.scheduleSave(sensitiveAppState(createInitialState(null)));
+  await settle();
+  assert.deepEqual(operations, ["uiState"]);
+});
+
 test("encrypted UI-state load rejects an invalid stored document", async () => {
   const store = createEncryptedUiStateStore({
     command: async <T>(): Promise<T> => ({ approvals: "not-an-array" }) as T,

@@ -188,18 +188,63 @@ class DocumentRuntimeService : Service() {
 
     fun command(input: JSONObject): CompletableFuture<JSONObject> {
       return evaluateRuntime("""
-        const initializeStarted = Date.now();
-        const wasInitialized = !!globalThis.syncpeerDocuments;
-        if (!wasInitialized) globalThis.syncpeerDocuments = await globalThis.syncpeerDocumentsCore.startDocuments(android);
-        const initializationMs = Date.now() - initializeStarted;
-        const commandStarted = Date.now();
-        const result = await globalThis.syncpeerDocuments.command(input);
-        return JSON.stringify({result: result === undefined ? null : result,
-          __documentTimings: {initializationMs: wasInitialized ? 0 : initializationMs,
-            commandMs: Date.now() - commandStarted}});
+        let stage = "bootstrap";
+        try {
+          const initializeStarted = Date.now();
+          const wasInitialized = !!globalThis.syncpeerDocuments;
+          if (!wasInitialized) globalThis.syncpeerDocuments =
+            await globalThis.syncpeerDocumentsCore.startDocuments(android, step => { stage = step; });
+          const initializationMs = Date.now() - initializeStarted;
+          stage = "command";
+          const commandStarted = Date.now();
+          const result = await globalThis.syncpeerDocuments.command(input);
+          return JSON.stringify({result: result === undefined ? null : result,
+            __documentTimings: {initializationMs: wasInitialized ? 0 : initializationMs,
+              commandMs: Date.now() - commandStarted}});
+        } catch (error) {
+          // No exception messages, document contents, paths or secret material
+          // cross the diagnostic boundary. Only fixed bootstrap stages/types.
+          const allowedStages = ["bootstrap", "timers", "storage-port", "profile-root",
+            "filesystem-create", "filesystem-initialize", "profile-replica",
+            "vault-load", "folders-open", "initial-status", "ready", "command"];
+          const allowedTypes = ["Error", "TypeError", "RangeError", "SyntaxError",
+            "ReferenceError", "URIError", "DOMException", "NotAllowedError", "OperationError"];
+          const type = error && typeof error.name === "string" ? error.name : "Other";
+          const message = typeof error?.message === "string" ? error.message : "";
+          const category = message.includes("Document storage operation failed")
+            ? "storage-request"
+            : message.includes("Existing metadata requires") ? "protected-metadata-key"
+            : message.includes("Remembered credential key is missing") ? "keystore-key-missing"
+            : message.includes("Document vault is locked") ? "vault-locked"
+            : "other";
+          return JSON.stringify({__documentFailure: {
+            stage: allowedStages.includes(stage) ? stage : "unknown",
+            type: allowedTypes.includes(type) ? type : "Other",
+            category,
+          }});
+        }
       """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8),
         diagnosticOperation = input.optString("operation")).thenApply { value ->
         val reply = JSONObject(value)
+        val failure = reply.optJSONObject("__documentFailure")
+        if (failure != null) {
+          // The JS isolate has already discarded the original exception string.
+          // This event is safe to retain in production diagnostics.
+          val stage = failure.optString("stage").takeIf { it in setOf(
+            "bootstrap", "timers", "storage-port", "profile-root", "filesystem-create",
+            "filesystem-initialize", "ready", "command") } ?: "unknown"
+          val type = failure.optString("type").takeIf { it in setOf(
+            "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError",
+            "URIError", "DOMException", "NotAllowedError", "OperationError") } ?: "Other"
+          val category = failure.optString("category").takeIf { it in setOf(
+            "storage-request", "protected-metadata-key", "keystore-key-missing",
+            "vault-locked", "other") } ?: "other"
+          DiagnosticLogJournal.recordNative(applicationContext, "native.document.command_failed",
+            "error", JSONObject().put("operation",
+              input.optString("operation").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other")
+              .put("stage", stage).put("errorType", type).put("category", category))
+          throw IllegalStateException("Document runtime evaluation failed.")
+        }
         val timing = reply.optJSONObject("__documentTimings")
         reply.remove("__documentTimings") // Never expose diagnostic metadata through the document-command API.
         if (timing != null) {
@@ -1353,12 +1398,22 @@ class DocumentRuntimeService : Service() {
     val reply = JSONObject().put("id", request.getLong("__portId"))
     try { reply.put("result", checkNotNull(storage).execute(request) ?: JSONObject.NULL) }
     catch (error: Exception) {
+      val method = request.optString("method").takeIf {
+        it in setOf("storage", "secret", "random", "root", "counter", "availableBytes")
+      } ?: "unknown"
+      val operation = if (method == "storage")
+        request.optJSONObject("input")?.optString("operation") else request.optString("operation")
+      val safeOperation = operation?.takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other"
+      val category = generateSequence(error as Throwable?) { it.cause }
+        .take(3).map { it.javaClass.simpleName }.joinToString(",")
+      DiagnosticLogJournal.recordNative(applicationContext, "native.document.storage_failed",
+        "error", JSONObject().put("method", method).put("operation", safeOperation)
+          .put("exceptionTypes", category)
+          .put("failureCategory", documentStorageFailureCategory(error)))
       if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-        Log.w("SyncpeerRuntime", "storage ${request.optString("method")} failed: " +
-          generateSequence(error as Throwable?) { it.cause }.take(4)
-            .joinToString(">") { it.javaClass.simpleName })
+        Log.w("SyncpeerRuntime", "storage $method failed: $category")
       }
-      reply.put("error", "Document storage operation failed.")
+      reply.put("error", privateStorageFailureMessage(error) ?: "Document storage operation failed.")
     }
     return reply.toString()
   }

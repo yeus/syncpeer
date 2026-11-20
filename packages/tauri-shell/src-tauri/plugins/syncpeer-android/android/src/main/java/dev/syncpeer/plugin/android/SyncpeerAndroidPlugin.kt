@@ -330,11 +330,17 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         }
         invoke.resolve(app.tauri.plugin.JSObject(checkNotNull(result?.getString("result"))))
       } catch (error: Exception) {
-        if (activity.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-          android.util.Log.w("SyncpeerRuntime", "document command failed: " +
-            generateSequence(error as Throwable?) { it.cause }.take(4)
-              .joinToString(">") { it.javaClass.simpleName })
-        }
+        val types = generateSequence(error as Throwable?) { it.cause }.take(4)
+          .joinToString(",") { it.javaClass.simpleName }
+        val operation = runCatching { JSONObject(args.request).optString("operation") }
+          .getOrNull()?.takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other"
+        // The provider intentionally masks Java/JS error messages; retain
+        // only safe cause classes and operation for production incident reports.
+        DiagnosticLogJournal.recordNative(activity.applicationContext,
+          "native.document.bridge_failed", "error",
+          JSONObject().put("operation", operation).put("exceptionTypes", types))
+        if (activity.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
+          android.util.Log.w("SyncpeerRuntime", "document command failed: $types")
         invoke.reject(documentCommandFailureMessage(error))
       }
     }.start()

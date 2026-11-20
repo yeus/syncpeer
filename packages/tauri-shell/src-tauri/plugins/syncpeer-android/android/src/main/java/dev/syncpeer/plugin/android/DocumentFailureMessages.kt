@@ -38,6 +38,23 @@ internal fun documentRuntimeFailureMessage(summary: String): String {
   }
 }
 
+/** Fixed categories only; never persist exception messages containing user paths or secrets. */
+internal fun documentStorageFailureCategory(error: Throwable): String {
+  val chain = generateSequence(error as Throwable?) { it.cause }.take(5).toList()
+  val messages = chain.map { it.message.orEmpty() }
+  return when {
+    messages.any { it.contains(PRIVATE_STORAGE_UNRECOGNIZED) } -> "unrecognized-private-storage"
+    messages.any { it.contains("Existing metadata requires") } -> "protected-metadata-key-missing"
+    messages.any { it.contains("Protected metadata key is invalid") } -> "protected-metadata-key-invalid"
+    messages.any { it.contains("Remembered credential key is missing") } -> "keystore-alias-missing"
+    messages.any { it.contains("Invalid remembered credential") } -> "remembered-secret-invalid"
+    chain.any { it.javaClass.simpleName == "AEADBadTagException" } -> "protected-secret-decryption"
+    messages.any { it.contains("Replica root is busy", ignoreCase = true) } -> "replica-lock"
+    messages.any { it.contains("permission denied", ignoreCase = true) } -> "permission"
+    else -> "other"
+  }
+}
+
 /** Preserve a safe app-authored cause; never forward arbitrary exception text. */
 internal fun documentCommandFailureMessage(error: Throwable): String {
   privateStorageFailureMessage(error)?.let { return it }

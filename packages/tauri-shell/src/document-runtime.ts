@@ -148,8 +148,10 @@ const createAndroidSessionAdapter = async (
   return { adapter, request };
 };
 
-async function startDocuments(android: AndroidRuntime) {
+async function startDocuments(android: AndroidRuntime, onBootstrapStage: (stage: string) => void = () => {}) {
+  onBootstrapStage("timers");
   await installAndroidTimers(android);
+  onBootstrapStage("storage-port");
   const port = await android.getNamedPort("storage");
   const request = createPortRequest(port);
   const native = (input: object) => request({ method: "storage", input });
@@ -161,14 +163,20 @@ async function startDocuments(android: AndroidRuntime) {
     sessionConfigurationRevision++;
     for (const listener of sessionConfigurationListeners) listener();
   };
-  const documents = createDocumentFilesystem({ profileId: "documents", profile: await openStorage("profile"), openStorage,
+  onBootstrapStage("profile-root");
+  const profile = await openStorage("profile");
+  onBootstrapStage("filesystem-create");
+  const documents = createDocumentFilesystem({ profileId: "documents", profile, openStorage,
     deviceCounterId: String(await request({ method: "counter" })),
     randomBytes: async size => new Uint8Array(await request({ method: "random", size }) as number[]),
     availableBytes: async () => Number(await request({ method: "availableBytes" })),
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
       remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true },
-    onSessionConfigurationChange: invalidateSessionConfiguration });
+    onSessionConfigurationChange: invalidateSessionConfiguration,
+    onInitializeStage: onBootstrapStage });
+  onBootstrapStage("filesystem-initialize");
   await documents.initialize();
+  onBootstrapStage("ready");
   return {
     command: (input: unknown) => dispatchDocumentCommandWithSessionConfiguration(
       documents, input, invalidateSessionConfiguration),

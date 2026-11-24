@@ -1860,18 +1860,36 @@ const setAirplaneMode = (enabled) => {
 const verifyOfflineEditorAfterColdStart = () => {
   const existing = "synthetic-offline-existing.txt";
   const created = "synthetic-offline-created.txt";
+  const video = "synthetic-provider-video.MP4";
+  const renamedVideo = "synthetic-provider-video.webm";
+  const unknown = "synthetic-provider-unknown.syncpeerfixture";
+  const fixtures = [existing, created, video, renamedVideo, unknown];
+  const assertMime = (name, expected) => {
+    const actual = editorCommand("mimeTypes", name);
+    if (actual !== Array(3).fill(expected).join("|")) {
+      throw new Error(`Android document MIME mismatch for ${name}: ${actual}; expected ${expected} in listing, stat, and getType.`);
+    }
+  };
   let airplaneMode = false;
   try {
-    for (const name of [existing, created]) {
+    for (const name of fixtures) {
       if (editorCommand("stat", name) === "true") editorCommand("delete", name);
     }
     editorCommand("create", existing);
     editorCommand("write", existing, { content: "available-before-disconnect" });
+    editorCommand("create", video, { mimeType: "video/mp4" });
+    editorCommand("create", unknown);
+    assertMime(existing, "text/plain");
+    assertMime(video, "video/mp4");
+    assertMime(unknown, "application/octet-stream");
+    editorCommand("rename", video, { target: renamedVideo });
+    assertMime(renamedVideo, "video/webm");
     setAirplaneMode(true);
     airplaneMode = true;
     runAdb(["shell", "am", "force-stop", packageName]);
     runAdb(["shell", "am", "force-stop", editorPackage]);
     if (!editorCommand("status")) throw new Error("Offline editor lost its SAF grant.");
+    assertMime(renamedVideo, "video/webm");
     if (editorCommand("read", existing) !== "available-before-disconnect") {
       throw new Error("Cold-started DocumentsProvider could not read an existing file offline.");
     }
@@ -1888,13 +1906,63 @@ const verifyOfflineEditorAfterColdStart = () => {
     if (editorCommand("stat", created) !== "false") throw new Error("Offline editor could not delete its test file.");
   } finally {
     if (airplaneMode) setAirplaneMode(false);
-    for (const name of [existing, created]) {
+    for (const name of fixtures) {
       try { if (editorCommand("stat", name) === "true") editorCommand("delete", name); }
       catch { /* The test error above remains the primary failure. */ }
     }
   }
-  console.log("Cold-started DocumentsProvider passed separate-APK offline create, read, edit and delete.");
+  console.log("Cold-started DocumentsProvider passed separate-APK offline CRUD and MIME type queries.");
 };
+
+// Local-only acceptance: no remote peer or real documents are needed.
+const runProviderHeaderSmoke = async () => {
+  if (runAdb(["shell", "getprop", "ro.kernel.qemu"]).trim() !== "1") {
+    throw new Error("Provider/header acceptance requires a disposable emulator.");
+  }
+  const cdp = await launchAndroidApp(true);
+  try {
+    await waitForUiCondition(cdp,
+      'Boolean(document.querySelector("[data-testid=device-name-onboarding], [data-testid=tab-folders]"))',
+      "device name or main UI");
+    await completeAndroidDeviceNaming(cdp, "Provider MIME test device");
+    await ensurePeerDocumentVault(cdp);
+    await documentCommand(cdp, { operation: "register", id: targetFolderId,
+      label: targetFolderTitle, password: "synthetic-provider-password" });
+    await documentCommand(cdp, { operation: "attachDownloads", id: targetFolderId });
+    await clickUiTestId(cdp, "tab-folders");
+    try {
+      await cdp.evaluate(`(() => {
+        if (!window.__syncpeerSetDownloadProgress) throw new Error("Missing transfer test hook.");
+        window.__syncpeerSetDownloadProgress(${JSON.stringify(targetFolderId)}, "video.MP4", "64%", 64);
+        return true;
+      })()`);
+      await waitForUiCondition(cdp,
+        'document.querySelector("[data-testid=header-transfer] [role=progressbar]")?.getAttribute("aria-valuenow") === "64"',
+        "header transfer progress");
+      const geometry = await cdp.evaluate(`(() => {
+        const transfer = document.querySelector("[data-testid=header-transfer]");
+        const header = transfer?.closest("header");
+        const content = document.querySelector("[data-testid=app-content]");
+        const nav = document.querySelector(".bottom-tabs");
+        if (!header || !content || !nav) throw new Error("Missing layout elements.");
+        const top = header.getBoundingClientRect().top;
+        const noOverlap = header.getBoundingClientRect().bottom <= content.getBoundingClientRect().top + 1 &&
+          content.getBoundingClientRect().bottom <= nav.getBoundingClientRect().top + 1;
+        content.scrollTop = content.scrollHeight;
+        return { noOverlap, headerFixed: top === header.getBoundingClientRect().top,
+          bottomReachable: content.scrollHeight - content.clientHeight - content.scrollTop <= 1 };
+      })()`);
+      if (!Object.values(geometry).every(Boolean)) throw new Error("Header layout: " + JSON.stringify(geometry));
+      console.log("Android persistent transfer header passed layout checks.");
+    } finally {
+      await cdp.evaluate("window.__syncpeerClearDownloadProgress?.()");
+    }
+  } finally { cdp.close(); }
+  await grantEditorFolder();
+  await waitForEditorGrant();
+  verifyOfflineEditorAfterColdStart();
+};
+
 
 const setDeviceIdle = (enabled) => {
   runAdb(["shell", "cmd", "deviceidle", enabled ? "force-idle" : "unforce", ...(enabled ? ["deep"] : [])]);
@@ -3578,6 +3646,10 @@ const main = async () => {
   }
   if (hasArgument("--onboarding-smoke")) {
     await runAndroidOnboardingSmoke();
+    return;
+  }
+  if (hasArgument("--provider-header-smoke")) {
+    await runProviderHeaderSmoke();
     return;
   }
   if (hasArgument("--storage-format-reset")) {

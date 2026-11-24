@@ -20,7 +20,6 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.os.Bundle
 import android.os.PersistableBundle
-import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.app.Activity
 import android.app.ActivityManager
@@ -1383,15 +1382,6 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
     activity.contentResolver.takePersistableUriPermission(uri, grantedFlags)
     invoke.resolveObject(mapOf("treeUri" to uri.toString()))
-  }
-
-  private fun guessMimeType(fileName: String): String {
-    val extension = fileName.substringAfterLast('.', "").lowercase()
-    if (extension.isBlank()) {
-      return "application/octet-stream"
-    }
-    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
-      ?: "application/octet-stream"
   }
 
   private fun skipFully(input: java.io.InputStream, count: Long) {

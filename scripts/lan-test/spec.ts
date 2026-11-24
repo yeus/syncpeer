@@ -325,7 +325,7 @@ describe("Syncpeer LAN integration", () => {
         logStage("completion wait failed; reading app state");
         const state = await lanBrowser.execute(() => ({
           issue: document.querySelector("p.error")?.textContent ?? "",
-          transfer: document.querySelector("[data-testid='transfer-float']")?.textContent?.trim() ?? "",
+          transfer: document.querySelector("[data-testid='header-transfer']")?.textContent?.trim() ?? "",
         }));
         throw new Error(`Large transfer did not show completion (reason: ${safeNativeFailureText(state.issue) ?? "none"}; transfer: ${safeNativeFailureText(state.transfer) ?? "none"}; events: ${(await readSessionEventNames(lanBrowser)).slice(0, 20).join(", ")}).`,
           { cause: error });

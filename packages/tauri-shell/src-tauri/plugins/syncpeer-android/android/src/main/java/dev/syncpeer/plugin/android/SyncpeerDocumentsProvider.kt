@@ -255,15 +255,19 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
         try {
           signal?.throwIfCanceled()
           val input = JSONObject().put("operation", operation).put("handle", handle).put("offset", offset).put("size", size)
+          if (operation == "read") input.put("encoding", "base64")
           if (data != null) input.put("bytes", JSONArray(data.take(size).map { it.toInt() and 255 }))
           return command(input)
         } catch (_: Exception) { throw ErrnoException(operation, OsConstants.EIO) }
       }
       override fun onGetSize(): Long = (request("size") as Number).toLong()
       override fun onRead(offset: Long, size: Int, data: ByteArray): Int {
-        val bytes = request("read", offset, minOf(size, 131072)) as JSONArray
-        for (index in 0 until bytes.length()) data[index] = bytes.getInt(index).toByte()
-        return bytes.length()
+        val bytes = android.util.Base64.decode(request("read", offset, minOf(size, 131072)) as String, android.util.Base64.NO_WRAP)
+        try {
+          if (bytes.size > minOf(size, data.size)) throw ErrnoException("read", OsConstants.EIO)
+          bytes.copyInto(data)
+          return bytes.size
+        } finally { bytes.fill(0) }
       }
       override fun onWrite(offset: Long, size: Int, data: ByteArray): Int {
         // Core durably journals encrypted changed blocks before acknowledging this write.
@@ -319,10 +323,11 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
 
   private fun addDocument(cursor: MatrixCursor, value: JSONObject) {
     val directory = value.getBoolean("directory")
+    val name = value.getString("name")
     cursor.newRow().apply {
       add(Document.COLUMN_DOCUMENT_ID, value.getString("id"))
-      add(Document.COLUMN_DISPLAY_NAME, value.getString("name"))
-      add(Document.COLUMN_MIME_TYPE, if (directory) Document.MIME_TYPE_DIR else "application/octet-stream")
+      add(Document.COLUMN_DISPLAY_NAME, name)
+      add(Document.COLUMN_MIME_TYPE, if (directory) Document.MIME_TYPE_DIR else guessMimeType(name))
       add(Document.COLUMN_FLAGS, if (directory) {
         Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_DELETE
       } else {

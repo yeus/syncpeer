@@ -247,6 +247,14 @@ const main = async () => {
       await runProfile("compat", ["--expect-sdk", "29", "--startup-smoke"], undefined, false, true);
       return;
     }
+    if (process.argv.includes("--provider-header-only")) {
+      if (!fs.existsSync(appApk)) throw new Error("Build the Android E2E APK before provider acceptance.");
+      run(path.join(androidProject, "gradlew"), [
+        "-p", editorProject, "assembleDebug", "--no-daemon", "--console=plain",
+      ]);
+      await runProfile("compat", ["--expect-sdk", "29", "--provider-header-smoke"], undefined, true);
+      return;
+    }
     run("npm", ["run", "build:android:e2e"]);
     run(path.join(androidProject, "gradlew"), [
       "-p", editorProject, "assembleDebug", "--no-daemon", "--console=plain",

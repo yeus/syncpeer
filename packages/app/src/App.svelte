@@ -1066,6 +1066,9 @@
       peerError={app.session.peerStatus?.error ?? null}
       paused={app.ui.autoConnectPaused}
       expanded={app.ui.isConnectionDetailsExpanded}
+      transferSummary={activeDownloadSummary}
+      transferNotice={app.ui.downloadNotice}
+      transferPercent={activeDownloadProgressPercent}
       onToggleDetails={() => {
         app.ui.isConnectionDetailsExpanded = !app.ui.isConnectionDetailsExpanded;
       }}
@@ -1305,21 +1308,6 @@
       {/if}
     </main>
 
-    {#if app.ui.downloadNotice || activeDownloadSummary}
-      <aside class="transfer-float" data-testid="transfer-float" aria-live="polite">
-        <div class="transfer-float-text">
-          {activeDownloadSummary || app.ui.downloadNotice}
-        </div>
-        {#if activeDownloadSummary}
-          <div class="transfer-float-track" aria-hidden="true">
-            <span
-              style={`width: ${activeDownloadProgressPercent}%`}
-            ></span>
-          </div>
-        {/if}
-      </aside>
-    {/if}
-
     <nav class="bottom-tabs" aria-label="Main navigation">
       <button
         type="button"
@@ -1517,49 +1505,6 @@
     gap: 0.35rem;
     z-index: 1000;
     pointer-events: auto;
-  }
-
-  .transfer-float {
-    position: fixed;
-    right: max(0.75rem, env(safe-area-inset-right));
-    bottom: calc(4.45rem + env(safe-area-inset-bottom));
-    left: max(0.75rem, env(safe-area-inset-left));
-    z-index: 1100;
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    max-width: 32rem;
-    margin: 0 auto;
-    padding: 0.5rem 0.6rem;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
-    box-shadow: var(--shadow-soft);
-    color: var(--text-secondary);
-    pointer-events: none;
-  }
-
-  .transfer-float-text {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 0.78rem;
-  }
-
-  .transfer-float-track {
-    height: 2px;
-    overflow: hidden;
-    border-radius: 999px;
-    background: var(--bg-surface-muted);
-  }
-
-  .transfer-float-track span {
-    display: block;
-    height: 100%;
-    border-radius: inherit;
-    background: var(--color-secondary);
-    transition: width 120ms ease;
   }
 
   .tab-button {

@@ -392,7 +392,7 @@ describe("Syncpeer Tauri UI smoke", () => {
     }
   });
 
-  it("shows concurrent download progress without shifting the scrolled folder view", async () => {
+  it("keeps concurrent download progress in the persistent header without covering folder controls", async () => {
     await seedOfflineFolderState();
     try {
       await $(`[data-testid='folder-entry-fixture-45.txt']`).waitForExist({ timeout: 10_000 });
@@ -427,7 +427,7 @@ describe("Syncpeer Tauri UI smoke", () => {
           64,
         );
       }, syntheticFolderId);
-      await $("[data-testid='transfer-float']").waitForExist({ timeout: 5_000 });
+      await $("[data-testid='header-transfer']").waitForExist({ timeout: 5_000 });
       const after = await tauriBrowser.execute(() => {
         const content = document.querySelector("[data-testid='app-content']") as HTMLElement | null;
         const row = document.querySelector(
@@ -439,15 +439,27 @@ describe("Syncpeer Tauri UI smoke", () => {
         ) as HTMLElement | null;
         const secondFill = secondRow?.querySelector(".item-progress-fill") as HTMLElement | null;
         const rowText = row?.textContent ?? "";
-        const floatText = document.querySelector("[data-testid='transfer-float']")?.textContent ?? "";
-        if (!content || !row || !fill || !secondFill) throw new Error("Download progress UI did not render.");
+        const transfer = document.querySelector("[data-testid='header-transfer']") as HTMLElement | null;
+        const header = transfer?.closest("header");
+        const nav = document.querySelector(".bottom-tabs");
+        if (!content || !row || !fill || !secondFill || !transfer || !header || !nav) {
+          throw new Error("Download progress UI did not render.");
+        }
+        const contentRect = content.getBoundingClientRect();
+        const headerRect = header.getBoundingClientRect();
+        const transferRect = transfer.getBoundingClientRect();
+        const navRect = nav.getBoundingClientRect();
         return {
           scrollTop: content.scrollTop,
           rowHeight: row.getBoundingClientRect().height,
           fillWidth: fill.style.width,
           secondFillWidth: secondFill.style.width,
           rowText,
-          floatText,
+          transferText: transfer.textContent ?? "",
+          progressValue: transfer.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow"),
+          overlapsContent: headerRect.bottom > contentRect.top + 1 || transferRect.bottom > contentRect.top + 1,
+          overlapsNavigation: contentRect.bottom > navRect.top + 1,
+          headerTop: headerRect.top,
         };
       });
       assert.equal(after.scrollTop, before.scrollTop);
@@ -455,8 +467,20 @@ describe("Syncpeer Tauri UI smoke", () => {
       assert.equal(after.fillWidth, "37%");
       assert.equal(after.secondFillWidth, "64%");
       assert.match(after.rowText, /Download: 37%/);
-      assert.match(after.floatText, /2 downloads/);
-      assert.match(after.floatText, /50%/);
+      assert.match(after.transferText, /2 downloads/);
+      assert.match(after.transferText, /50%/);
+      assert.equal(after.progressValue, "50");
+      assert.equal(after.overlapsContent, false, "Transfer header must reserve layout space.");
+      assert.equal(after.overlapsNavigation, false, "Folder content must end above navigation.");
+      const bottom = await tauriBrowser.execute(() => {
+        const content = document.querySelector("[data-testid='app-content']") as HTMLElement;
+        content.scrollTop = content.scrollHeight;
+        const header = document.querySelector(".app-header")!;
+        return { headerTop: header.getBoundingClientRect().top,
+          remaining: content.scrollHeight - content.scrollTop - content.clientHeight };
+      });
+      assert.equal(bottom.headerTop, after.headerTop, "Header must stay visible while scrolling.");
+      assert.ok(bottom.remaining <= 1, "The content must scroll all the way to its bottom.");
     } finally {
       await tauriBrowser.execute(() => {
         const testWindow = window as Window & {

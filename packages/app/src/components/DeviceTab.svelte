@@ -599,7 +599,7 @@
 
 <Panel title="Peers">
   <p class="hint">Discovery does not grant access. Add a peer explicitly, then approve its offered folders. Sources are retained for 24 hours after last seen.</p>
-  <ul class="list">
+  <ul class="list peer-list">
 
     {#if deviceRows.length === 0}
       <li class="empty">No peers yet. Add a saved device or wait for introductions.</li>
@@ -730,6 +730,10 @@
 </Panel>
 
 <style>
+  .peer-list :global(.list-item.peer-layout + .list-item.peer-layout) {
+    border-top: 1px solid var(--border-list-divider);
+  }
+
   .appearance-settings {
     padding-bottom: 0.7rem;
     border-bottom: 0;

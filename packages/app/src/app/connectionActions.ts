@@ -168,6 +168,14 @@ const connect = async (
     if (control.connectInFlight === previous) control.connectInFlight = null;
   }
   control.connectInFlight = (async () => {
+  if (state.ui.storageUnavailable) {
+    state.ui.recentError =
+      "Encrypted local storage is unavailable. Recover the vault before connecting to a peer.";
+    state.ui.autoConnectPaused = true;
+    pushSessionLog(state, "error", "peer.connect.blocked_local_storage",
+      "The connection was not attempted: encrypted peer settings could not be opened.");
+    return;
+  }
   state.ui.recentError = null;
   state.ui.uploadMessage = "";
   state.ui.autoConnectPaused = false;
@@ -255,13 +263,19 @@ const connect = async (
       restoreOfflineSnapshot(state, clearDirectoryView, attemptedDeviceId, "connect_suspended");
       return;
     }
-    pushSessionLog(state, "warning", "peer.connect.attempt_failed",
-      "Peer connection did not complete; remote approval or reachability may be required.",
+    const unavailableRoster = error instanceof Error &&
+      error.name === "ProtectedPeerRosterUnavailableError";
+    pushSessionLog(state, unavailableRoster ? "error" : "warning",
+      unavailableRoster ? "peer.connect.blocked_local_storage" : "peer.connect.attempt_failed",
+      unavailableRoster
+        ? "Connection blocked locally: encrypted peer permissions could not be read. No network connection was attempted."
+        : "Peer connection did not complete; remote approval or reachability may be required.",
       { peerId: attemptedDeviceId, reason: message });
     if (attemptedDeviceId) state.devices.connectionErrors[attemptedDeviceId] = message;
     state.ui.recentError = message;
     // A revoked or explicitly disallowed identity must not enter a retry loop.
-    if (/not authorized|revoked|retired|not paired|removed from (?:the )?trusted device list/i.test(message)) {
+    if (unavailableRoster ||
+      /not authorized|revoked|retired|not paired|removed from (?:the )?trusted device list/i.test(message)) {
       state.ui.autoConnectPaused = true;
     }
     if (

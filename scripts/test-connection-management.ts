@@ -55,6 +55,37 @@ const session = (sessionRemoteFs = remoteFs) => {
   };
 };
 
+test("permanent encrypted-roster errors enter terminal state without retry storms", async () => {
+  let opened = 0, ready = false, scheduled = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    keyFor: peer => peer,
+    open: async () => {
+      opened++;
+      if (ready) return session();
+      const error = new Error("Encrypted peer permissions are unavailable.");
+      error.name = "ProtectedPeerRosterUnavailableError";
+      throw error;
+    },
+    shouldRetry: error => !(error instanceof Error &&
+      error.name === "ProtectedPeerRosterUnavailableError"),
+    sleep: async () => { scheduled++; },
+  });
+  await assert.rejects(lifecycle.connect("synthetic-peer"),
+    /Encrypted peer permissions are unavailable/);
+  assert.equal(lifecycle.getState().phase, "error");
+  assert.equal(lifecycle.getState().nextRetryAtMs, null);
+  assert.equal(opened, 1);
+  assert.equal(scheduled, 0);
+  await lifecycle.setForeground(false);
+  await lifecycle.setForeground(true);
+  assert.equal(opened, 1, "Returning to foreground must not replay a permanently failed dial.");
+  ready = true;
+  await lifecycle.connect("synthetic-peer");
+  assert.equal(lifecycle.getState().phase, "connected",
+    "An explicit retry after storage recovery must still work.");
+  await lifecycle.disconnect();
+});
+
 test("Android service-owned connection is not aborted when a sharesheet hides the Activity", async () => {
   const pending = deferred<ReturnType<typeof session>>();
   const connected = session();

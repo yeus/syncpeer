@@ -123,6 +123,13 @@ class DeviceActionsRuntime {
   };
 
   private addSavedDevice = () => {
+    if (this.state.ui.storageUnavailable) {
+      this.state.ui.recentError =
+        "Encrypted local storage is unavailable. Recover the vault before adding a peer.";
+      pushSessionLog(this.state, "warning", "peer.add.blocked_local_storage",
+        "The discovered peer was not saved because encrypted peer settings cannot be opened.");
+      return;
+    }
     const normalized = normalizeDeviceId(this.state.devices.newSavedDeviceId);
     if (!normalized) {
       this.state.ui.recentError = "Device ID is required.";

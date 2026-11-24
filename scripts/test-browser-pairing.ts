@@ -78,6 +78,43 @@ test("a service-owned Android session does not start a competing UI listener", a
   }
 });
 
+test("unavailable protected peer roster blocks service dialing before any network attempt", async () => {
+  let serviceCommands = 0, tcpDials = 0, rosterReads = 0;
+  const logs: string[] = [];
+  const client = createSyncpeerBrowserClient({
+    hostAdapter: { ...createNodeHostAdapter(),
+      log: event => { logs.push(event); },
+      connectTls: async () => { tcpDials++; throw new Error("network must not be attempted"); },
+    },
+    platformAdapter: {
+      ownedDevices: async () => {
+        rosterReads++;
+        throw new Error("Synthetic encrypted replica root-marker-mismatch");
+      },
+      serviceSessionCommand: async () => {
+        serviceCommands++;
+        throw new Error("native service must not start");
+      },
+    },
+  });
+  try {
+    await assert.rejects(client.connectAndSync({
+      host: "127.0.0.1", port: 22000, remoteId: "A".repeat(52),
+      deviceName: "fixture", discoveryMode: "direct", timeoutMs: 1000,
+    }), (error: unknown) => error instanceof Error &&
+      error.name === "ProtectedPeerRosterUnavailableError" &&
+      /encrypted peer permissions are unavailable/i.test(error.message));
+    assert.equal(rosterReads, 1);
+    assert.equal(serviceCommands, 0);
+    assert.equal(tcpDials, 0);
+    assert.equal(logs.includes("core.session.open.trust_done"), false,
+      "A failed authorization lookup must not be presented as a successful empty roster.");
+    assert.equal(logs.includes("core.session.lifecycle.transition"), true);
+  } finally {
+    await client.disconnect();
+  }
+});
+
 test("Android UI browses through the one service session across visibility changes", { timeout: 30000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-unified-service-"));
   const localIdentity = await identity(root, "local");

@@ -81,6 +81,9 @@ export type ConnectionLifecycleDeps<TOptions> = {
   random?: () => number;
   /** The platform, not the UI, owns the socket across Activity visibility changes. */
   serviceOwnsSession?: boolean;
+  /** Permanent local failures (for example unavailable encrypted trust data)
+   * must stop retries rather than be mistaken for network reachability errors. */
+  shouldRetry?: (error: unknown) => boolean;
 };
 
 class ConnectionLifecycleRuntime<TOptions> {
@@ -279,7 +282,14 @@ class ConnectionLifecycleRuntime<TOptions> {
     } catch (error) {
       if (openGeneration === this.generation && this.eligible()) {
         const message = error instanceof Error ? error.message : String(error);
-        this.scheduleRetry(message);
+        if (this.deps.shouldRetry?.(error) === false) {
+          this.desired = null;
+          this.failureStreak = 0;
+          this.update({ phase: "error", attempt: 0, nextRetryAtMs: null,
+            closureReason: message });
+        } else {
+          this.scheduleRetry(message);
+        }
       }
       throw error;
     } finally {

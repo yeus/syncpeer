@@ -126,6 +126,60 @@ test("authenticated TCP endpoint persists encrypted per peer for later one-click
   assert.equal(directTcpEndpointForPeer(restored, B), null);
 });
 
+test("unavailable encrypted vault does not accept an unsaved discovered peer", () => {
+  const state = createInitialState(null);
+  state.ui.storageUnavailable = true;
+  state.devices.newSavedDeviceId = A;
+  state.devices.newSavedDeviceCustomName = "Synthetic discovered peer";
+  const { actions, connected } = actionsFor(state);
+  actions.addSavedDevice();
+  assert.equal(state.devices.savedDevices.length, 0,
+    "A newly discovered peer must not become a phantom saved entry while storage is unreadable.");
+  assert.equal(state.devices.newSavedDeviceId, A,
+    "The user's proposed device ID should remain available to add after recovery.");
+  assert.deepEqual(connected, []);
+  assert.match(state.ui.recentError ?? "", /Encrypted local storage is unavailable/);
+  assert.equal(state.logs.items.some(value => value.event === "peer.add.blocked_local_storage"), true);
+});
+
+test("unreadable encrypted peer roster pauses auto-connect and does not blame the remote", async () => {
+  const state = stateWithPeers();
+  state.ui.deviceNameConfirmed = true;
+  state.connection.remoteId = A;
+  const unavailable = new Error(
+    "Encrypted peer permissions are unavailable. Restore local storage before connecting.");
+  unavailable.name = "ProtectedPeerRosterUnavailableError";
+  const sessionStore = {
+    actions: {
+      setFolderPasswords: async () => {},
+      connect: async () => { throw unavailable; },
+      disconnect: async () => {},
+    },
+    getState: createInitialSessionState,
+  } as unknown as Parameters<typeof createConnectionActions>[0]["sessionStore"];
+  const connection = createConnectionActions({
+    state,
+    client: {} as Parameters<typeof createConnectionActions>[0]["client"],
+    sessionStore,
+    transfers: { transferInProgress: () => false } as Parameters<typeof createConnectionActions>[0]["transfers"],
+    syncStarredFiles: async () => {},
+    loadFavoriteSyncStates: async () => {},
+    appInfo: createAppBuildInfo({
+      appVersion: "test", coreVersion: "test", buildCommit: "test",
+      buildTimeUtc: "2026-01-01T00:00:00.000Z", buildMode: "development",
+      runtimeEnvironment: "tauri", runtimeSurface: "android-ui",
+      platform: "android", architecture: "arm64", osVersion: "synthetic",
+    }),
+  });
+  await connection.connect(A);
+  assert.equal(state.ui.autoConnectPaused, true);
+  assert.equal(state.ui.recentError, unavailable.message);
+  assert.equal(state.approvals.pendingApprovalPromptDeviceId, "");
+  assert.equal(state.logs.items.some(entry => entry.event === "peer.connect.blocked_local_storage"), true);
+  assert.equal(state.logs.items.some(entry => entry.event === "peer.connect.attempt_failed"), false,
+    "Vault failures are not remote network or approval failures.");
+});
+
 test("selecting Direct TCP for an already-dialing peer replaces the automatic attempt", async () => {
   const state = stateWithPeers();
   state.ui.deviceNameConfirmed = true;

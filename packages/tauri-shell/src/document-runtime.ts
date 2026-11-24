@@ -330,7 +330,7 @@ class AndroidSessionRuntime {
     if (!coreOptions.expectedDeviceId) return null;
     const localDeviceId = await deviceIdFromCertificate(this.adapter,
       certificateDerFromPem(coreOptions.certPem));
-    const trustedDevices = (await this.documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
+    const trustedDevices = (await this.documents.ownedDevices()).devices;
     const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
       localDeviceId, trustedDevices, options.configuredPeerIds ?? []);
     if (!approvedDeviceIds.length) { await this.stopIncomingService(); return null; }
@@ -441,7 +441,7 @@ class AndroidSessionRuntime {
       // unlock it later before requesting a favorite download.
     }
     if (!options.cert || !options.key) throw new Error("Background session is missing the resolved identity.");
-    const trustedDevices = (await this.documents.ownedDevices().catch(() => ({ devices: [] }))).devices;
+    const trustedDevices = (await this.documents.ownedDevices()).devices;
     if (options.remoteId && !resolveApprovedPeerDeviceIds(options.remoteId, trustedDevices)
       .some(id => sameDeviceId(id, options.remoteId!))) {
       throw new Error("Peer identity is revoked, retired, or not authorized for this connection.");

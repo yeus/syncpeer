@@ -1046,7 +1046,7 @@ async function selectIncomingDevices(
     certificateDerFromPem(coreOptions.certPem),
   );
   ctx.coreAdapter.log?.("core.incoming.prepare.trust_start", {});
-  const trustedDevices = (await ctx.platformAdapter.ownedDevices?.().catch(() => [])) ?? [];
+  const trustedDevices = await readTrustedDeviceRoster(ctx.platformAdapter);
   ctx.coreAdapter.log?.("core.incoming.prepare.trust_done", {
     deviceCount: trustedDevices.length,
   });
@@ -1383,6 +1383,21 @@ function createIncomingController(ctx: IncomingContext): IncomingRuntime {
   };
 }
 
+/** Unreadable encrypted permissions must never be treated as an empty roster.
+ * An actually empty roster can still explicitly admit a newly selected peer. */
+async function readTrustedDeviceRoster(adapter: SyncpeerPlatformAdapter): Promise<OwnedSpaceDevice[]> {
+  if (!adapter.ownedDevices) return [];
+  try {
+    return await adapter.ownedDevices();
+  } catch {
+    const error = new Error(
+      "Encrypted peer permissions are unavailable. Restore local storage before connecting.",
+    );
+    error.name = "ProtectedPeerRosterUnavailableError";
+    throw error;
+  }
+}
+
 function assertTrustedPeer(normalized: ConnectOptions, trustedDevices: OwnedSpaceDevice[]) {
   if (
     normalized.remoteId &&
@@ -1553,7 +1568,7 @@ async function admitOutgoingSession(
 async function prepareSession(ctx: SessionContext, connectOptions: ConnectOptions) {
   const normalized = normalizeConnectOptions(connectOptions);
   ctx.coreAdapter.log?.("core.session.open.trust_start", {});
-  const trustedDevices = (await ctx.platformAdapter.ownedDevices?.().catch(() => [])) ?? [];
+  const trustedDevices = await readTrustedDeviceRoster(ctx.platformAdapter);
   ctx.coreAdapter.log?.("core.session.open.trust_done", {
     deviceCount: trustedDevices.length,
   });
@@ -1646,7 +1661,7 @@ async function refreshSessionConfiguration(
 const classifySessionIssue = (message?: string | null): string | null => {
   if (!message) return null;
   const categories = [
-    ["authorization", /not authorized|revoked|not paired|trusted device|approval/i],
+    ["authorization", /not authorized|revoked|not paired|not approved|unknown device|not configured|not in config|access denied|remote peer rejected this device/i],
     ["timeout", /timeout|timed out|deadline/i],
     ["credentials", /password|credential|decrypt/i],
     ["network", /network|offline|unreachable|refused/i],
@@ -1662,6 +1677,8 @@ function createSessionLifecycle(
 ) {
   const lifecycle = createConnectionLifecycle<ConnectOptions>({
     serviceOwnsSession: !!ctx.platformAdapter.serviceSessionCommand,
+    shouldRetry: error => !(error instanceof Error &&
+      error.name === "ProtectedPeerRosterUnavailableError"),
     open,
     keyFor: (connectOptions) => serializeConnectionKey(
       normalizeConnectOptions(connectOptions),

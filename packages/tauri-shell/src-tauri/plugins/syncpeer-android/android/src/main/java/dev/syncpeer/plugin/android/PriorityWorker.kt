@@ -17,6 +17,7 @@ internal class PriorityWorker(name: String) {
   private val high = ArrayDeque<Runnable>()
   private val lock = Object()
   private var stopped = false
+  private var cleanup: Runnable? = null
   private val thread = Thread({ runLoop() }, name).apply {
     isDaemon = true
     start()
@@ -25,6 +26,8 @@ internal class PriorityWorker(name: String) {
   fun execute(task: Runnable) = enqueue(task, priority = false)
 
   fun executeHighPriority(task: Runnable) = enqueue(task, priority = true)
+  fun tryExecute(task: Runnable, highPriority: Boolean): Boolean = enqueue(task, highPriority)
+
 
   fun shutdownNow() {
     synchronized(lock) {
@@ -34,15 +37,25 @@ internal class PriorityWorker(name: String) {
       lock.notifyAll()
     }
   }
+  fun shutdownWithCleanup(task: Runnable) {
+    synchronized(lock) {
+      if (stopped) return
+      stopped = true
+      high.clear()
+      normal.clear()
+      cleanup = task
+      lock.notifyAll()
+    }
+  }
+
 
   internal fun pendingCount(): Int = synchronized(lock) { high.size + normal.size }
 
-  private fun enqueue(task: Runnable, priority: Boolean) {
-    synchronized(lock) {
-      if (stopped) return
-      if (priority) high.addLast(task) else normal.addLast(task)
-      lock.notifyAll()
-    }
+  private fun enqueue(task: Runnable, priority: Boolean): Boolean = synchronized(lock) {
+    if (stopped) return@synchronized false
+    if (priority) high.addLast(task) else normal.addLast(task)
+    lock.notifyAll()
+    true
   }
 
   private fun runLoop() {
@@ -55,8 +68,11 @@ internal class PriorityWorker(name: String) {
             // Nothing interrupts this worker; keep waiting rather than dying.
           }
         }
-        if (stopped) return
-        checkNotNull(high.pollFirst() ?: normal.pollFirst())
+        if (stopped) {
+          val finalTask = cleanup ?: return
+          cleanup = null
+          finalTask
+        } else checkNotNull(high.pollFirst() ?: normal.pollFirst())
       }
       try {
         task.run()

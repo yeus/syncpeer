@@ -1,3 +1,4 @@
+import { encodeBase64 } from "../transfer/base64.js";
 import type { createDocumentFilesystem } from "./documentFilesystem.js";
 
 /** Changes that can invalidate a listener's prepared peer-specific folder view. */
@@ -216,11 +217,12 @@ function createDocument({ documents, command, text }: DocumentCommandContext) {
   return documents.create(text("id"), text("name"), command.directory);
 }
 
-async function readDocument({ documents, integer }: DocumentCommandContext) {
+async function readDocument({ documents, integer, command }: DocumentCommandContext) {
   const size = integer("size");
   if (size > 131072) throw new Error("Document read exceeds bridge limit.");
   const bytes = await documents.read(integer("handle"), integer("offset"), size);
-  try { return Array.from(bytes); } finally { bytes.fill(0); }
+  try { return command.encoding === "base64" ? encodeBase64(bytes) : Array.from(bytes); }
+  finally { bytes.fill(0); }
 }
 
 async function writeDocument({ documents, command, integer }: DocumentCommandContext) {

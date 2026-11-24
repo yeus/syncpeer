@@ -27,8 +27,9 @@ import { syncServiceFileFavorites, type FavoriteSyncProgress } from "../../core/
 import { executeServiceRemoteCommand } from "../../core/src/sync/serviceRemoteCommands.js";
 import { createServiceDownloadBridge } from "../../core/src/sync/serviceDownloadBridge.js";
 import { createServiceTransferJobs } from "../../core/src/sync/serviceTransferJobs.js";
+import { createServiceTransferScheduler } from "../../core/src/sync/serviceTransferScheduler.js";
 import { createServiceUploadBridge } from "../../core/src/sync/serviceUploadBridge.js";
-import { decodeBase64 } from "../../core/src/transfer/base64.js";
+import { decodeBase64, encodeBase64 } from "../../core/src/transfer/base64.js";
 import { parseServiceCommand } from "../../core/src/sync/serviceProtocol.js";
 import { safeNativeBepDiagnostic, safeNativeDiscoveryDiagnostic, safeNativeTransferDiagnostic } from "./nativeDiagnosticFields.js";
 
@@ -39,16 +40,29 @@ const createAndroidSessionAdapter = async (
   android: AndroidRuntime,
 ): Promise<{ adapter: SyncpeerHostAdapter; request: AndroidRuntimeRequest }> => {
   const request = createPortRequest(await android.getNamedPort("network"));
-  const socket = (sessionId: number, peerCertificateDer: Uint8Array, transport: "tls" | "quic" = "tls"): SyncpeerTlsSocket => ({
-    peerCertificateDer: async () => peerCertificateDer,
-    read: async (maxBytes?: number) => {
-      const value = await request({ operation: transport === "quic" ? "quicRead" : "tlsRead", sessionId, maxBytes: maxBytes ?? null }) as { bytes: number[]; eof: boolean };
-      if (value.eof) throw new Error("Connection closed");
-      return new Uint8Array(value.bytes);
-    },
-    write: async (bytes: Uint8Array) => { await request({ operation: transport === "quic" ? "quicWrite" : "tlsWrite", sessionId, bytes: [...bytes] }); },
-    close: async () => { await request({ operation: transport === "quic" ? "quicClose" : "tlsClose", sessionId }); },
-  });
+  const socket = (sessionId: number, peerCertificateDer: Uint8Array, transport: "tls" | "quic" = "tls"): SyncpeerTlsSocket => {
+    let writeTail = Promise.resolve();
+    return {
+      peerCertificateDer: async () => peerCertificateDer,
+      read: async (maxBytes?: number) => {
+        const value = await request({ operation: transport === "quic" ? "quicRead" : "tlsRead", sessionId,
+          maxBytes: Math.min(maxBytes ?? 64 * 1024, 256 * 1024), encoding: "base64" }) as { bytes: string; eof: boolean };
+        if (value.eof) throw new Error("Connection closed");
+        return decodeBase64(value.bytes, 256 * 1024);
+      },
+      write: (bytes: Uint8Array) => {
+        // Keep each complete BEP frame contiguous even if callers write concurrently.
+        const task = writeTail.then(async () => {
+          for (let offset = 0; offset < bytes.length; offset += 256 * 1024)
+            await request({ operation: transport === "quic" ? "quicWrite" : "tlsWrite", sessionId,
+              bytesBase64: encodeBase64(bytes.subarray(offset, offset + 256 * 1024)) });
+        });
+        writeTail = task;
+        return task;
+      },
+      close: async () => { await request({ operation: transport === "quic" ? "quicClose" : "tlsClose", sessionId }); },
+    };
+  };
   const listener = (opened: { listenerId: number; port: number }, relayAddress?: string) => {
     let closed = false;
     return {
@@ -147,7 +161,7 @@ const createAndroidSessionAdapter = async (
       if (signal?.aborted) { await result.close(); throw new Error("Connection attempt was cancelled."); }
       return { connectedVia: value.connectedVia ?? relayAddress, socket: result };
     },
-    sha256: async bytes => new Uint8Array(await request({ operation: "sha256", bytes: [...bytes] }) as number[]),
+    sha256: async bytes => new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(bytes))),
     randomBytes: async size => new Uint8Array(await request({ operation: "random", size }) as number[]),
     discoveryFetch: createNativeDiscoveryFetch(request),
     discoverLocalCandidates: async ({ expectedDeviceId, timeoutMs }) => {
@@ -160,14 +174,23 @@ const createAndroidSessionAdapter = async (
   return { adapter, request };
 };
 
-async function startDocuments(android: AndroidRuntime, onBootstrapStage: (stage: string) => void = () => {}) {
+async function createDocuments(android: AndroidRuntime, onBootstrapStage: (stage: string) => void = () => {}) {
   onBootstrapStage("timers");
   await installAndroidTimers(android);
   onBootstrapStage("storage-port");
   const port = await android.getNamedPort("storage");
   const request = createPortRequest(port);
   const native = (input: object) => request({ method: "storage", input });
-  const openStorage = async (id: string) => createNativeFilesystem(native, String(await request({ method: "root", idValue: id })));
+  const binary = {
+    read: async (input: { rootId: number; path: string; offset: number; size: number }) =>
+      decodeBase64(await native({ operation: "readBase64", ...input }) as string, input.size),
+    write: async ({ writerId, offset, bytes }: { writerId: number; offset: number; bytes: Uint8Array }) => {
+      for (let start = 0; start < bytes.length; start += 131072)
+        await native({ operation: "writeBase64", writerId, offset: offset + start,
+          bytes: encodeBase64(bytes.subarray(start, start + 131072)) });
+    },
+  };
+  const openStorage = async (id: string) => createNativeFilesystem(native, String(await request({ method: "root", idValue: id })), binary);
   const secret = (operation: string, value?: string) => request({ method: "secret", operation, secret: value });
   let sessionConfigurationRevision = 0;
   const sessionConfigurationListeners = new Set<() => void>();
@@ -185,6 +208,7 @@ async function startDocuments(android: AndroidRuntime, onBootstrapStage: (stage:
     rememberedSecret: { load: async () => await secret("load") as string | null, save: async value => { await secret("save", value); },
       remove: async () => { await secret("remove"); }, isDeviceUnlocked: async () => await secret("isDeviceUnlocked") === true },
     onSessionConfigurationChange: invalidateSessionConfiguration,
+    onDocumentChange: async () => { await request({ method: "documentChanged" }); },
     onInitializeStage: onBootstrapStage });
   onBootstrapStage("filesystem-initialize");
   await documents.initialize();
@@ -204,19 +228,29 @@ async function startDocuments(android: AndroidRuntime, onBootstrapStage: (stage:
     cachedFiles: documents.cachedFiles,
     digestCachedFiles: documents.digestCachedFiles,
     beginDownload: documents.beginDownload,
-    write: documents.write,
+    writeBatch: documents.writeBatch,
     finishDownload: documents.finishDownload,
     release: documents.release,
     open: documents.open,
     size: documents.size,
     read: documents.read,
     syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1], excludeFolderIds: readonly string[],
-      onProgress?: (progress: FavoriteSyncProgress) => void) =>
-      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds, onProgress }),
+      onProgress?: (progress: FavoriteSyncProgress) => void, shouldYield?: () => boolean) =>
+      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds, onProgress, shouldYield }),
   };
 }
 
-type Documents = Awaited<ReturnType<typeof startDocuments>>;
+type Documents = Awaited<ReturnType<typeof createDocuments>>;
+// All document and session entry points share one bootstrap, including when
+// native evaluations yield while the asynchronous core queue is busy.
+let documentBootstrap: Promise<Documents> | undefined;
+function startDocuments(android: AndroidRuntime, onBootstrapStage?: (stage: string) => void): Promise<Documents> {
+  documentBootstrap ??= createDocuments(android, onBootstrapStage).catch(error => {
+    documentBootstrap = undefined;
+    throw error;
+  });
+  return documentBootstrap;
+}
 
 type IncomingContext = {
   localDeviceId: string;
@@ -248,14 +282,8 @@ class AndroidSessionRuntime {
     await session.remoteFs.writeFileStream(folderId, path, source, options);
   });
 
-  private transferWork: Promise<void> = Promise.resolve();
+  private readonly transferScheduler = createServiceTransferScheduler();
   private readonly transferJobs: ReturnType<typeof createServiceTransferJobs>;
-
-  private withTransferLock = <T>(work: () => Promise<T>): Promise<T> => {
-    const next = this.transferWork.catch(() => undefined).then(work);
-    this.transferWork = next.then(() => undefined, () => undefined);
-    return next;
-  };
   private peerStatusUnsubscribe: (() => void) | null = null;
 
   private constructor(
@@ -274,7 +302,7 @@ class AndroidSessionRuntime {
           { bytes: string };
         return decodeBase64(response.bytes, 64 * 1024);
       },
-      runExclusive: work => this.withTransferLock(work),
+      runExclusive: this.transferScheduler.runManual,
       diagnostic: value => {
         const safe = safeNativeTransferDiagnostic(value);
         if (safe) void this.nativeRequest({ operation: "diagnostic", event: "core.transfer.stage", ...safe })
@@ -602,7 +630,7 @@ class AndroidSessionRuntime {
     return { phase: "idle" };
   };
 
-  private syncFavoritesCommand = (request: Record<string, unknown>) => this.withTransferLock(async () => {
+  private syncFavoritesCommand = (request: Record<string, unknown>) => this.transferScheduler.runFavorite(async shouldYield => {
     const session = this.lifecycle.getSession();
     if (!session) return { phase: "waiting" };
     const runId = typeof request.runId === "number" ? request.runId : 0;
@@ -628,7 +656,7 @@ class AndroidSessionRuntime {
           if (scheduled !== null) clearTimeout(scheduled);
           dispatch();
         } else if (scheduled === null) scheduled = setTimeout(dispatch, delay);
-      });
+      }, shouldYield);
     } finally {
       if (scheduled !== null) clearTimeout(scheduled);
       dispatch();

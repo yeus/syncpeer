@@ -17,6 +17,7 @@ import {
   waitForBoot,
 } from "./test-android.mjs";
 import { createLanFixture, freePort, generateSyncthingIdentity } from "./lan-test/syncthing.ts";
+import { videoFixtureBytes, videoFixtureName } from "./lan-test/video-fixture.mjs";
 
 const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
@@ -339,7 +340,8 @@ const main = async (): Promise<void> => {
     // The ordinary Android transfer suite covers 128 MiB. This fixture stays
     // smaller so it can prove multi-block journal recovery plus a full
     // DocumentsProvider hash within emulator time limits.
-    const largeFileSize = 4 * 1024 * 1024;
+    const playbackOnly = process.env.SYNCPEER_ANDROID_PEER_PLAYBACK_ONLY === "1";
+    const largeFileSize = (playbackOnly ? 16 : 4) * 1024 * 1024;
     const env = {
       ...process.env,
       SYNCPEER_DEV_SERVER_DEVICE_ID: fixture.fixture.remoteDeviceId,
@@ -477,7 +479,7 @@ const main = async (): Promise<void> => {
       return;
     }
     const powerCutOnly = process.env.SYNCPEER_ANDROID_PEER_POWER_CUT_ONLY === "1";
-    if (powerCutOnly) {
+    if (powerCutOnly || playbackOnly) {
       await runPhase("--peer-power-cut-setup", env);
     } else {
       await runPhase("--peer-cross-app", env);
@@ -487,6 +489,22 @@ const main = async (): Promise<void> => {
         await runPhase("--session-policy-transition", env);
       }
     }
+    if (playbackOnly) {
+      fs.writeFileSync(path.join(fixture.encryptedSharePath, videoFixtureName), videoFixtureBytes);
+      const headers = { "X-API-Key": fixture.apiKey };
+      const scan = await fetch(`${fixture.syncGuiUrl}/rest/db/scan?folder=${encodeURIComponent(fixture.fixture.encryptedFolderId)}`,
+        { method: "POST", headers });
+      if (!scan.ok) throw new Error("Could not index video fixture.");
+      await runPhase("--prepare-concurrent-playback", env);
+      // Bound the peer bandwidth so a fast emulator cannot finish the entire
+      // download before the independent media decoder has exercised its reads.
+      const limit = await fetch(`${fixture.syncGuiUrl}/rest/config/options`, {
+        method: "PATCH", headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ maxSendKbps: 512, limitBandwidthInLan: true }),
+      });
+      if (!limit.ok) throw new Error("Could not configure synthetic peer bandwidth.");
+    }
+    const transferStarted = performance.now();
     const startingPeerOutBytes = await peerOutBytes(fixture.syncGuiUrl, fixture.apiKey);
     const largeFile = Buffer.allocUnsafe(largeFileSize);
     for (let index = 0; index < largeFile.length; index += 1) largeFile[index] = index % 251;
@@ -502,15 +520,16 @@ const main = async (): Promise<void> => {
       fixture.fixture.encryptedFolderId,
       largeFileSize,
     );
-    await runPhase("--prepare-transfer-power-cut", env);
+    if (!playbackOnly) await runPhase("--prepare-transfer-power-cut", env);
     await waitForPeerTransfer(
       fixture.syncGuiUrl,
       fixture.apiKey,
       startingPeerOutBytes,
     );
-    if (process.env.SYNCPEER_ANDROID_PEER_TRANSFER_ONLY === "1") {
+    if (playbackOnly) await runPhase("--verify-concurrent-playback", env);
+    if (playbackOnly || process.env.SYNCPEER_ANDROID_PEER_TRANSFER_ONLY === "1") {
       await runPhase("--verify-transfer-no-power-cut", env);
-      console.log("Android 4 MiB transfer integrity E2E passed without a power cut.");
+      console.log(`Android ${largeFileSize / 1048576} MiB transfer integrity E2E passed without a power cut; total test interval ${Math.round(performance.now() - transferStarted)}ms (includes setup, publication and digest).`);
       return;
     }
     await killEmulatorAbruptly(emulator);

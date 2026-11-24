@@ -65,6 +65,20 @@ Only one owner maintains the connection: foreground and background both use
 the service; the WebView is merely a session client. Background favorites
 sync requires opt-in; explicit transfers can outlive the 90-second grace.
 
+Manual service transfers have priority over background favorite passes. An
+active favorite file transaction (or rename batch) finishes atomically; the
+remaining pass yields without pruning its pending work. A fresh pass replans
+against the current local and peer metadata after the manual work, rather than
+reusing an obsolete baseline. The normal 15-second scheduler resumes favorites.
+
+The emulator-only media regression is `npm run test:android:peer:playback`
+(after building the Android E2E and synthetic editor APKs). It starts a real
+local Syncthing peer, caches a generated H.264 clip, decodes and seeks frames
+through the independent editor's SAF descriptor during a deliberately
+bandwidth-limited 16 MiB transfer, and verifies the final file's SHA-256.
+It reports decoder and provider-digest timing; neither is an ARM64 throughput
+or sustained real-time playback guarantee.
+
 Acknowledged encrypted download ranges are journaled with the remote content
 identity. They can be reused after the service or app restarts, but are discarded
 when the remote identity changes. The document runtime also recreates its

@@ -92,4 +92,23 @@ class PriorityWorkerTest {
       worker.shutdownNow()
     }
   }
+
+  @Test fun shutdownRunsCleanupExactlyOnceWithoutWaitingForQueuedWork() {
+    val worker = PriorityWorker("priority-cleanup-test")
+    val started = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    val cleaned = CountDownLatch(1)
+    val unwanted = AtomicBoolean(false)
+    try {
+      worker.execute { started.countDown(); release.await(5, TimeUnit.SECONDS) }
+      assertTrue(started.await(5, TimeUnit.SECONDS))
+      worker.execute { unwanted.set(true) }
+      worker.shutdownWithCleanup { cleaned.countDown() }
+      worker.shutdownWithCleanup { unwanted.set(true) }
+      worker.execute { unwanted.set(true) }
+      release.countDown()
+      assertTrue(cleaned.await(5, TimeUnit.SECONDS))
+      assertFalse(unwanted.get())
+    } finally { release.countDown(); worker.shutdownNow() }
+  }
 }

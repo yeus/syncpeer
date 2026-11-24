@@ -1034,6 +1034,12 @@ pub enum ReplicaStorageRequest {
         offset: u64,
         size: usize,
     },
+    ReadBase64 {
+        root_id: u64,
+        path: String,
+        offset: u64,
+        size: usize,
+    },
     Begin {
         root_id: u64,
         path: String,
@@ -1043,6 +1049,11 @@ pub enum ReplicaStorageRequest {
         writer_id: u64,
         offset: u64,
         bytes: Vec<u8>,
+    },
+    WriteBase64 {
+        writer_id: u64,
+        offset: u64,
+        bytes: String,
     },
     Commit {
         writer_id: u64,
@@ -1130,6 +1141,14 @@ pub fn dispatch(
         } => serde_json::json!(roots
             .read(root_id, &path, offset, size)
             .map_err(|e| e.to_string())?),
+        ReplicaStorageRequest::ReadBase64 {
+            root_id,
+            path,
+            offset,
+            size,
+        } => serde_json::json!(data_encoding::BASE64.encode(&roots
+            .read(root_id, &path, offset, size)
+            .map_err(|e| e.to_string())?)),
         ReplicaStorageRequest::Begin {
             root_id,
             path,
@@ -1145,6 +1164,22 @@ pub fn dispatch(
             roots
                 .write(writer_id, offset, &bytes)
                 .map_err(|e| e.to_string())?;
+            serde_json::Value::Null
+        }
+        ReplicaStorageRequest::WriteBase64 {
+            writer_id,
+            offset,
+            bytes,
+        } => {
+            if bytes.len() > 4 * 131072usize.div_ceil(3) {
+                return Err("Oversized encoded folder write".into());
+            }
+            let data = data_encoding::BASE64.decode(bytes.as_bytes())
+                .map_err(|_| "Invalid encoded folder write".to_string())?;
+            if data.len() > 131072 {
+                return Err("Oversized decoded folder write".into());
+            }
+            roots.write(writer_id, offset, &data).map_err(|e| e.to_string())?;
             serde_json::Value::Null
         }
         ReplicaStorageRequest::Commit {

@@ -44,7 +44,11 @@ class DocumentRuntimeService : Service() {
   // Single-threaded by contract; teardown work jumps the queue so a busy worker
   // cannot delay a session stop or the resume that follows it.
   private val worker = PriorityWorker("SyncpeerDocumentsWorker")
+  private val pendingEvaluations = java.util.concurrent.ConcurrentHashMap<CompletableFuture<String>, ByteArray>()
   private val storageWorker = Executors.newSingleThreadExecutor()
+  // WebView evaluation callbacks arrive on Android's main thread. Keep response
+  // decoding, diagnostics and dependent completion callbacks off that thread.
+  private val completionWorker = Executors.newSingleThreadExecutor()
   // A BEP session keeps one blocking read active while writes and closes must
   // continue independently through the same native transport.
   private val networkWorker = Executors.newFixedThreadPool(4)
@@ -231,7 +235,7 @@ class DocumentRuntimeService : Service() {
           }});
         }
       """.trimIndent(), input.toString().toByteArray(Charsets.UTF_8),
-        diagnosticOperation = input.optString("operation")).thenApply { value ->
+        releaseWorkerWhilePending = true, diagnosticOperation = input.optString("operation")).thenApply { value ->
         val reply = JSONObject(value)
         val failure = reply.optJSONObject("__documentFailure")
         if (failure != null) {
@@ -590,8 +594,14 @@ class DocumentRuntimeService : Service() {
     require(!releaseWorkerWhilePending || timeoutMs == null) {
       "Nonblocking session evaluation uses its caller's deadline."
     }
-    val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
     val result = CompletableFuture<String>()
+    if (destroying) {
+      result.completeExceptionally(IllegalStateException("Document runtime is closing."))
+      return result
+    }
+    val data = (if (input.isEmpty()) "{}".toByteArray(Charsets.UTF_8) else input).copyOf()
+    pendingEvaluations[result] = data
+    result.whenComplete { _, _ -> pendingEvaluations.remove(result) }
     val queuedAtMs = SystemClock.elapsedRealtime()
     // Only operation names are logged, never paths, names, keys or payloads.
     val safeOperation = diagnosticOperation?.takeIf { it.matches(Regex("[A-Za-z]{1,48}")) }
@@ -614,20 +624,21 @@ class DocumentRuntimeService : Service() {
       val startedAtMs = SystemClock.elapsedRealtime()
       reportLatency("queue_slow", startedAtMs - queuedAtMs)
       try {
-        if (result.isCancelled) return@Runnable
+        if (result.isDone) return@Runnable
+        check(!destroying) { "Document runtime is closing." }
         check(terminalStatus == null && runtimeHost != null) { "Document runtime unavailable." }
         val evaluation = checkNotNull(runtimeHost).evaluate(code, data)
         onDispatched()
         if (releaseWorkerWhilePending) {
-          // A network connect can wait minutes for TLS/BEP. It must not monopolize
-          // the worker and starve vault status, folder settings, or cancellation.
-          evaluation.whenComplete { value, error ->
+          // Dispatch is serialized, not the asynchronous result. The core owns
+          // mutation ordering and may admit reads during a download commit.
+          evaluation.whenCompleteAsync({ value, error ->
             try {
               reportLatency("async_slow", SystemClock.elapsedRealtime() - startedAtMs)
               if (error != null) result.completeExceptionally(error)
               else result.complete(value)
             } finally { data.fill(0) }
-          }
+          }, completionWorker)
           handedOff = true
         } else {
           // Trusted core publication is bounded by file size, not a fixed
@@ -649,7 +660,7 @@ class DocumentRuntimeService : Service() {
       }
     }
     try {
-      if (highPriority) worker.executeHighPriority(task) else worker.execute(task)
+      check(worker.tryExecute(task, highPriority)) { "Document runtime is closing." }
     } catch (error: Exception) {
       data.fill(0)
       result.completeExceptionally(error)
@@ -1483,7 +1494,12 @@ class DocumentRuntimeService : Service() {
   private fun executeStorageRequest(raw: String): String {
     val request = JSONObject(raw)
     val reply = JSONObject().put("id", request.getLong("__portId"))
-    try { reply.put("result", checkNotNull(storage).execute(request) ?: JSONObject.NULL) }
+    try {
+      if (request.optString("method") == "documentChanged") {
+        contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
+        reply.put("result", JSONObject.NULL)
+      } else reply.put("result", checkNotNull(storage).execute(request) ?: JSONObject.NULL)
+    }
     catch (error: Exception) {
       val method = request.optString("method").takeIf {
         it in setOf("storage", "secret", "random", "root", "counter", "availableBytes")
@@ -1881,20 +1897,32 @@ class DocumentRuntimeService : Service() {
     peerPhase = null
     peerError = null
     foregroundStarted = false
-    publishSessionStatus()
-    // Serialize teardown after initialization; shutdown drains the already queued work.
-    worker.execute {
+    mainHandler.removeCallbacks(transferRetryRunnable)
+    favoriteSyncWatchdog?.let { mainHandler.removeCallbacks(it) }
+    // Atomically replace queued work with teardown; never discard cleanup or
+    // block Android's main thread waiting for the runtime to finish.
+    // The status journal and observer notifications are also off the main thread.
+    worker.shutdownWithCleanup {
+      publishSessionStatus()
       runCatching {
         runtimeHost?.evaluate("if (globalThis.syncpeerDocuments) await globalThis.syncpeerDocuments.close(); return 'closed';", ByteArray(0))
           ?.get(15, TimeUnit.SECONDS)
       }
+      // Release callers whose evaluations were discarded during teardown.
+      pendingEvaluations.forEach { (future, bytes) ->
+        future.completeExceptionally(IllegalStateException("Document runtime closed."))
+        bytes.fill(0)
+      }
       closeRuntimeHost()
       storageWorker.execute { storage?.close(); storage = null }
-      networkWorker.execute { network?.close(); network = null }
+      // Don't queue close behind blocking network reads. Native disposal closes
+      // the sockets even while read requests retain a reference to the transport.
+      runCatching { network?.close() }
+      network = null
       networkWorker.shutdown()
+      completionWorker.shutdown()
       storageWorker.shutdown()
     }
-    worker.shutdownNow()
     super.onDestroy()
   }
 

@@ -8,6 +8,7 @@ import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
 import { normalizeDeviceId } from "@syncpeer/core/browser";
 import { createBrowserBepSchemaPlugin } from "./vite-plugins/browserBepSchema.mjs";
 import { measureConnectionReadiness, probeServiceReadiness } from "./connection-performance.mjs";
+import { videoFixtureName } from "./lan-test/video-fixture.mjs";
 
 const cliArguments = process.argv.slice(2);
 const hasArgument = (name) => cliArguments.includes(name);
@@ -739,7 +740,7 @@ const editorCommand = (method, name = "", extras = {}) => {
   }
   // Reading a multi-MiB file through the Android proxy descriptor requires
   // multiple native/TypeScript round trips; do not use the metadata timeout.
-  const output = runAdb(args, method === "digest" ? 150_000 : 30_000).trim();
+  const output = runAdb(args, ["digest", "decodeVideo"].includes(method) ? 150_000 : 30_000).trim();
   const result = output.match(/result=([^}]*)/)?.[1];
   if (result === undefined) throw new Error(`Synthetic editor ${method} returned ${output}.`);
   return result;
@@ -1312,6 +1313,31 @@ const preparePeerTransferPowerCut = async () => {
   console.log("Android headless replica received the large-file index and is ready for abrupt emulator termination.");
 };
 
+const prepareConcurrentPlayback = async () => {
+  await waitForEditorGrant();
+  const deadline = Date.now() + downloadTimeoutMs;
+  while (Date.now() < deadline) {
+    if (editorCommand("stat", videoFixtureName) === "true") {
+      const baseline = editorCommand("decodeVideo", videoFixtureName);
+      if (!/^3:\d+$/.test(baseline)) throw new Error("Video decode did not return three frames.");
+      console.log("Offline video decode baseline (frames:ms): " + baseline);
+      return;
+    }
+    await wait(500);
+  }
+  throw new Error("Cached video never became visible to Android media APIs.");
+};
+
+const verifyConcurrentPlayback = async () => {
+  if (editorCommand("stat", targetLargeFileName) !== "false")
+    throw new Error("Concurrent media probe started after the transfer was already committed.");
+  const decoded = editorCommand("decodeVideo", videoFixtureName);
+  if (!/^3:\d+$/.test(decoded)) throw new Error("Concurrent video frame decode failed: " + decoded);
+  if (editorCommand("stat", targetLargeFileName) !== "false")
+    throw new Error("Transfer finished before overlap could be verified; increase the fixture size.");
+  console.log("Video decoded and sought three frames while background download remained unpublished (frames:ms): " + decoded);
+};
+
 const verifyPeerTransferPowerCut = async (afterPowerCut = true) => {
   const cdp = afterPowerCut ? await launchAndroidAppAfterPowerLoss()
     : await launchAndroidApp(true);
@@ -1325,6 +1351,8 @@ const verifyPeerTransferPowerCut = async (afterPowerCut = true) => {
       120_000,
     );
     cdp.close();
+    const verificationStarted = performance.now();
+    let committedAt = 0, digestMs = 0;
     const deadline = Date.now() + downloadTimeoutMs;
     const expectedDigest = `${targetLargeFileSize}:${fixtureBlobHash()}`;
     let summary = "";
@@ -1336,7 +1364,9 @@ const verifyPeerTransferPowerCut = async (afterPowerCut = true) => {
         // can stall the proxy descriptor after an abrupt process restart.
         if (editorCommand("stat", targetLargeFileName) === "true") {
           seenCommitted = true;
+          committedAt = performance.now();
           summary = editorCommand("digest", targetLargeFileName);
+          digestMs = performance.now() - committedAt;
           if (summary === expectedDigest) break;
         }
       } catch (error) {
@@ -1350,6 +1380,10 @@ const verifyPeerTransferPowerCut = async (afterPowerCut = true) => {
       throw new Error(`Android transfer integrity mismatch: ${summary || "missing"}` +
         `${lastError ? ` (${lastError})` : ""}`);
     }
+    console.log("Android transfer measurement: " + JSON.stringify({
+      bytes: targetLargeFileSize, waitForPublicationMs: Math.round(committedAt - verificationStarted),
+      providerDigestMs: Math.round(digestMs), providerMiBPerSecond: Number((targetLargeFileSize / 1048576 / (digestMs / 1000)).toFixed(3)),
+    }));
     console.log(afterPowerCut
       ? "Headless replica recovered after abrupt emulator termination without a corrupt committed file."
       : "Android large-file transfer SHA-256 verified through DocumentsProvider.");
@@ -3743,6 +3777,14 @@ const main = async () => {
   }
   if (hasArgument("--peer-power-cut-setup")) {
     await preparePeerPowerCutSession();
+    return;
+  }
+  if (hasArgument("--prepare-concurrent-playback")) {
+    await prepareConcurrentPlayback();
+    return;
+  }
+  if (hasArgument("--verify-concurrent-playback")) {
+    await verifyConcurrentPlayback();
     return;
   }
   if (hasArgument("--prepare-transfer-power-cut")) {

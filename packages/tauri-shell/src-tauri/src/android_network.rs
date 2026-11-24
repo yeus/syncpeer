@@ -18,8 +18,8 @@ struct AndroidNetwork {
     quic_store: SharedQuicStore,
 }
 
-impl Drop for AndroidNetwork {
-    fn drop(&mut self) {
+impl AndroidNetwork {
+    fn close_sessions(&self) {
         let sessions = self
             .tls_store
             .lock()
@@ -47,6 +47,12 @@ impl Drop for AndroidNetwork {
         }
     }
 }
+impl Drop for AndroidNetwork {
+    fn drop(&mut self) {
+        self.close_sessions();
+    }
+}
+
 
 fn read_random_bytes(size: usize) -> Result<Vec<u8>, String> {
     if !(1..=131_072).contains(&size) {
@@ -59,6 +65,33 @@ fn read_random_bytes(size: usize) -> Result<Vec<u8>, String> {
         .read_exact(&mut output)
         .map_err(|error| format!("Could not read platform random bytes: {error}"))?;
     Ok(output)
+}
+
+// Compact, bounded payloads avoid materializing JSON integer arrays in the
+// Android JS isolate, Kotlin and JNI. Existing diagnostic callers still work.
+fn socket_read_json(request: &serde_json::Value, response: TlsReadResponse) -> Result<serde_json::Value, String> {
+    if request.get("encoding").and_then(serde_json::Value::as_str) == Some("base64") {
+        Ok(serde_json::json!({"bytes": data_encoding::BASE64.encode(&response.bytes), "eof": response.eof}))
+    } else {
+        serde_json::to_value(response).map_err(|error| format!("Could not encode socket response: {error}"))
+    }
+}
+
+fn socket_write_request(request: &serde_json::Value) -> Result<TlsWriteRequest, String> {
+    if let Some(encoded) = request.get("bytesBase64").and_then(serde_json::Value::as_str) {
+        if encoded.len() > 4 * (256 * 1024usize).div_ceil(3) {
+            return Err("Oversized encoded socket write".into());
+        }
+        let bytes = data_encoding::BASE64.decode(encoded.as_bytes())
+            .map_err(|_| "Invalid encoded socket write".to_string())?;
+        if bytes.len() > 256 * 1024 {
+            return Err("Oversized socket write".into());
+        }
+        let session_id = request.get("sessionId").and_then(serde_json::Value::as_u64)
+            .ok_or("Invalid socket session")?;
+        return Ok(TlsWriteRequest { session_id, bytes });
+    }
+    serde_json::from_value(request.clone()).map_err(|error| format!("Invalid socket write request: {error}"))
 }
 
 fn execute(
@@ -123,12 +156,10 @@ fn execute(
             let input: TlsReadRequest = serde_json::from_value(request.clone())
                 .map_err(|error| format!("Invalid TLS read request: {error}"))?;
             let response = read_tls_session(&network.tls_store, input)?;
-            Ok(serde_json::to_value(response)
-                .map_err(|error| format!("Could not encode TLS response: {error}"))?)
+            socket_read_json(request, response)
         }
         "tlsWrite" => {
-            let input: TlsWriteRequest = serde_json::from_value(request.clone())
-                .map_err(|error| format!("Invalid TLS write request: {error}"))?;
+            let input = socket_write_request(request)?;
             write_tls_session(&network.tls_store, input)?;
             Ok(serde_json::Value::Null)
         }
@@ -153,12 +184,10 @@ fn execute(
                 .map_err(|error| format!("Invalid QUIC read request: {error}"))?;
             let response =
                 tauri::async_runtime::block_on(read_quic_session(&network.quic_store, input))?;
-            Ok(serde_json::to_value(response)
-                .map_err(|error| format!("Could not encode QUIC response: {error}"))?)
+            socket_read_json(request, response)
         }
         "quicWrite" => {
-            let input: TlsWriteRequest = serde_json::from_value(request.clone())
-                .map_err(|error| format!("Invalid QUIC write request: {error}"))?;
+            let input = socket_write_request(request)?;
             tauri::async_runtime::block_on(write_quic_session(&network.quic_store, input))?;
             Ok(serde_json::Value::Null)
         }
@@ -287,5 +316,6 @@ pub extern "system" fn Java_dev_syncpeer_plugin_android_SessionNetworkTransport_
         unsafe { env.take_rust_field::<_, _, Arc<AndroidNetwork>>(&object, "nativeHandle") }
     {
         discovery::cancel_all(&network.discovery_store);
+        network.close_sessions();
     }
 }

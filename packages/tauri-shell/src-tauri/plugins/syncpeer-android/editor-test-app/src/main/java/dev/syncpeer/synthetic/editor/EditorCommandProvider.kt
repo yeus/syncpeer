@@ -22,7 +22,8 @@ class EditorCommandProvider : ContentProvider() {
       "create" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
         check(findChild(tree, name) == null) { "Synthetic document already exists" }
-        checkNotNull(DocumentsContract.createDocument(resolver, rootDocument(tree), "text/plain", name)).toString()
+        val mimeType = extras?.getString("mimeType") ?: "text/plain"
+        checkNotNull(DocumentsContract.createDocument(resolver, rootDocument(tree), mimeType, name)).toString()
       }
       "write" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
@@ -72,6 +73,41 @@ class EditorCommandProvider : ContentProvider() {
         ).toString()
       }
       "stat" -> (tree != null && validName(name) && findChild(tree, name) != null).toString()
+      "mimeTypes" -> {
+        require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
+        val document = checkNotNull(findChild(tree, name)) { "Synthetic document is missing" }
+        val typeColumn = DocumentsContract.Document.COLUMN_MIME_TYPE
+        val nameColumn = DocumentsContract.Document.COLUMN_DISPLAY_NAME
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+        val listedType = checkNotNull(resolver.query(children, arrayOf(nameColumn, typeColumn), null, null, null)).use { cursor ->
+          generateSequence { if (cursor.moveToNext()) cursor.getString(0) to cursor.getString(1) else null }
+            .first { it.first == name }.second
+        }
+        val queriedType = checkNotNull(resolver.query(document, arrayOf(typeColumn), null, null, null)).use { cursor ->
+          check(cursor.moveToFirst())
+          cursor.getString(0)
+        }
+        listOf(listedType, queriedType, resolver.getType(document)).joinToString("|")
+      }
+      "decodeVideo" -> {
+        require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
+        val document = checkNotNull(findChild(tree, name)) { "Synthetic video is missing" }
+        val started = android.os.SystemClock.elapsedRealtime()
+        val retriever = android.media.MediaMetadataRetriever()
+        try {
+          resolver.openFileDescriptor(document, "r")!!.use { descriptor ->
+            retriever.setDataSource(descriptor.fileDescriptor)
+            val duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)!!.toLong()
+            check(duration >= 1500) { "Synthetic video duration is invalid" }
+            for (time in listOf(0L, 1_000_000L, 500_000L)) {
+              val frame = checkNotNull(retriever.getFrameAtTime(time, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC))
+              try { check(frame.width == 64 && frame.height == 64) { "Invalid decoded frame" } }
+              finally { frame.recycle() }
+            }
+          }
+          "3:${android.os.SystemClock.elapsedRealtime() - started}"
+        } finally { retriever.release() }
+      }
       "digest" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
         val document = checkNotNull(findChild(tree, name)) { "Synthetic document is missing" }

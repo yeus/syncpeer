@@ -470,6 +470,7 @@
             onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
               keepSyncingInBackground: event.currentTarget.checked } })} />
             Keep syncing in background on this Android device</label>
+          <p class="muted">Connections are retained for up to 90 seconds after switching apps or locking the screen by default. Enable continuous background sync for longer sessions (subject to Android power restrictions).</p>
         {/if}
         <label>Cache override (MiB, blank for adaptive 5%)
           <input type="number" min="0" value={settings.profile.cache.overrideBytes === undefined ? "" : settings.profile.cache.overrideBytes / 1048576}

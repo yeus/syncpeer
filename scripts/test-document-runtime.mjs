@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import vm from "node:vm";
+import { parse } from "acorn";
 import test from "node:test";
 
 test("packaged document core boots without browser globals and retains strict UTF-8", async () => {
@@ -57,4 +58,18 @@ test("packaged document core installs timers through the Android runtime", async
       if (calls === 2) { clearInterval(interval); resolve(calls); }
     }, 1);
   })`, context), 2);
+});
+
+// Kotlin's inline JavaScript does not pass through the Chrome 69 transpilation
+// applied to syncpeer-documents.js. Reject unsupported syntax before Android CI.
+test("Kotlin-hosted document runtime code parses on legacy Android WebView", async () => {
+  const source = await fs.readFile(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
+  const command = source.match(/fun command\(input: JSONObject\): CompletableFuture<JSONObject> \{[\s\S]*?return evaluateRuntime\("""([\s\S]*?)"""\.trimIndent\(\), input\.toString\(\)/)?.[1];
+  const shutdown = source.match(/runtimeHost\?\.evaluate\("([^"]+)", ByteArray\(0\)\)/)?.[1];
+  assert.ok(command, "Android document command JavaScript must be found");
+  assert.ok(shutdown, "Android runtime shutdown JavaScript must be found");
+  for (const script of [command, shutdown]) {
+    assert.doesNotThrow(() => parse(`async function evaluate(android, input) {\n${script}\n}`, { ecmaVersion: 2018 }));
+  }
 });

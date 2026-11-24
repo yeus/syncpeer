@@ -462,6 +462,11 @@ const main = async (): Promise<void> => {
       console.log(`Android ${discoveryMode} real-peer connection E2E passed.`);
       return;
     }
+    if (process.env.SYNCPEER_ANDROID_PEER_GRACE_ONLY === "1") {
+      await runPhase("--session-grace", env);
+      console.log("Android default background grace E2E passed.");
+      return;
+    }
     if (process.env.SYNCPEER_ANDROID_PEER_POLICY_ONLY === "1") {
       await runPhase("--session-policy-transition", env);
       return;

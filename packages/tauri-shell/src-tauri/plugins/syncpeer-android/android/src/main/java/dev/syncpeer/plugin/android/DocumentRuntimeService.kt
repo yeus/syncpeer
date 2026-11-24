@@ -55,6 +55,8 @@ class DocumentRuntimeService : Service() {
   @Volatile private var sessionRequest: String? = null
   @Volatile private var sessionGeneration = 0L
   private var pendingSessionStart: CompletableFuture<JSONObject>? = null
+  // Concurrent stop requests share the same teardown and generation.
+  private var pendingSessionStop: CompletableFuture<JSONObject>? = null
   private val uiConnectLock = Any()
   private var uiConnectGeneration = 0L
   private var uiConnectRequest: String? = null
@@ -64,6 +66,7 @@ class DocumentRuntimeService : Service() {
   @Volatile private var sessionError: String? = null
   @Volatile private var peerPhase: String? = null
   @Volatile private var peerError: String? = null
+  @Volatile private var peerAuthenticatedAtElapsedMs = 0L
   @Volatile private var verifiedTransferPeerId: String? = null
   @Volatile private var statusRevision = 0L
   private var lastDiagnosticSessionPhase: String? = null
@@ -72,6 +75,10 @@ class DocumentRuntimeService : Service() {
   @Volatile private var foregroundStarted = false
   @Volatile private var uiIsVisible = false
   @Volatile private var backgroundSyncArmed = false
+  // Short-lived keepalive is independent of the opt-in for continuous favorite sync.
+  // The service owns the socket even when the Activity/WebView is hidden.
+  @Volatile private var backgroundGraceUntilElapsedMs = 0L
+  private val backgroundGraceRunnable = Runnable { expireBackgroundGrace() }
   private val backgroundSessions by lazy { BackgroundSessionStore(applicationContext) }
   private val transferJobs by lazy { TransferJobStore(applicationContext) }
   private val transferStages by lazy { EncryptedUploadStaging(applicationContext) }
@@ -210,7 +217,7 @@ class DocumentRuntimeService : Service() {
           const allowedTypes = ["Error", "TypeError", "RangeError", "SyntaxError",
             "ReferenceError", "URIError", "DOMException", "NotAllowedError", "OperationError"];
           const type = error && typeof error.name === "string" ? error.name : "Other";
-          const message = typeof error?.message === "string" ? error.message : "";
+          const message = error && typeof error.message === "string" ? error.message : "";
           const category = message.includes("Document storage operation failed")
             ? "storage-request"
             : message.includes("Existing metadata requires") ? "protected-metadata-key"
@@ -281,9 +288,11 @@ class DocumentRuntimeService : Service() {
         val result = CompletableFuture<JSONObject>()
         mainHandler.post {
           uiIsVisible = false
-          if (!backgroundSyncArmed) stopFavoriteSyncSchedule()
-          // Explicitly requested transfers remain service-owned even when
-          // automatic background favorite synchronization is disabled.
+          if (!backgroundSyncArmed) {
+            stopFavoriteSyncSchedule()
+            beginBackgroundGrace()
+          }
+          // A user-requested transfer continues independently of background favorites.
           if (runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)) {
             ensureForeground()
             replayTransferJobs()
@@ -295,6 +304,7 @@ class DocumentRuntimeService : Service() {
       if (input.optString("operation") == "uiVisible") {
         val result = CompletableFuture<JSONObject>()
         mainHandler.post {
+          cancelBackgroundGrace("visible")
           uiIsVisible = true
           replayTransferJobs()
           if (sessionPhase == "connected") startFavoriteSyncSchedule()
@@ -390,6 +400,7 @@ class DocumentRuntimeService : Service() {
               sessionRequest = null
               backgroundSessions.clear()
               backgroundSyncArmed = false
+              // Disarming continuous sync must not cancel the short grace period.
               if (uiIsVisible && sessionPhase == "connected") startFavoriteSyncSchedule()
               else stopFavoriteSyncSchedule()
               runOnMain {
@@ -397,7 +408,7 @@ class DocumentRuntimeService : Service() {
                 // started manual transfer. Keep its foreground service until
                 // the persistent job journal reports no remaining work.
                 val manualTransferActive = runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)
-                if (foregroundStarted && !manualTransferActive) {
+                if (foregroundStarted && !manualTransferActive && !backgroundGraceActive()) {
                   foregroundStarted = false
                   ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                   SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
@@ -863,6 +874,7 @@ class DocumentRuntimeService : Service() {
     try {
       val input = parseSessionRequest(request)
         ?: throw IllegalArgumentException("Background session requires a valid connect request.")
+      runOnMain { cancelBackgroundGrace("continuous_sync") }
       // A previously active service may have been demoted while the UI was visible.
       // Promote the same service on the next background transition without re-dialing.
       backgroundSyncArmed = true
@@ -1180,7 +1192,12 @@ class DocumentRuntimeService : Service() {
     mainHandler.removeCallbacks(favoriteSyncRunnable)
   }
 
-  private fun stopSession(persist: Boolean): CompletableFuture<JSONObject> {
+  @Synchronized private fun stopSession(persist: Boolean): CompletableFuture<JSONObject> {
+    pendingSessionStop?.takeIf { !it.isDone }?.let { existing ->
+      if (persist) worker.executeHighPriority { runCatching { backgroundSessions.clear() } }
+      return existing
+    }
+    runOnMain { cancelBackgroundGrace("explicit_stop") }
     val generation = nextSessionGeneration()
     verifiedTransferPeerId = null
     backgroundSyncArmed = false
@@ -1193,6 +1210,11 @@ class DocumentRuntimeService : Service() {
     peerError = null
     publishSessionStatus()
     val result = CompletableFuture<JSONObject>()
+    pendingSessionStop = result
+    result.whenComplete { _, _ -> synchronized(this@DocumentRuntimeService) {
+      if (pendingSessionStop === result) pendingSessionStop = null
+    } }
+    val stopStartedAtMs = SystemClock.elapsedRealtime()
     try {
       worker.executeHighPriority {
         if (persist) runCatching { backgroundSessions.clear() }
@@ -1205,7 +1227,13 @@ class DocumentRuntimeService : Service() {
             protocolVersion: ${SESSION_PROTOCOL_VERSION}, operation: "disconnect",
           });
           return JSON.stringify({result: {phase: "idle"}});
-        """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS, highPriority = true).whenComplete { _, error ->
+        """.trimIndent(), ByteArray(0), SESSION_STOP_TIMEOUT_MS, highPriority = true,
+          diagnosticOperation = "sessionStop").whenComplete { _, error ->
+          DiagnosticLogJournal.recordNative(applicationContext,
+            if (error == null) "native.session.stop.completed" else "native.session.stop.failed",
+            if (error == null) "info" else "warning",
+            JSONObject().put("durationMs", (SystemClock.elapsedRealtime() - stopStartedAtMs).coerceIn(0L, 120_000L))
+              .put("reason", if (error == null) "none" else "shutdown_unconfirmed"))
           if (error != null && applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             Log.w("SyncpeerRuntime", "session stop gave up after ${SESSION_STOP_TIMEOUT_MS}ms")
           }
@@ -1250,6 +1278,55 @@ class DocumentRuntimeService : Service() {
       ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
       SyncpeerSessionNotifications.cancel(this)
       result.complete(sessionStatus())
+    }
+  }
+
+  private fun backgroundGraceActive(): Boolean =
+    !uiIsVisible && !backgroundSyncArmed && backgroundGraceUntilElapsedMs > SystemClock.elapsedRealtime()
+
+  private fun cancelBackgroundGrace(reason: String) {
+    mainHandler.removeCallbacks(backgroundGraceRunnable)
+    if (backgroundGraceUntilElapsedMs == 0L) return
+    backgroundGraceUntilElapsedMs = 0L
+    DiagnosticLogJournal.recordNative(applicationContext, "native.session.grace.cancelled", "info",
+      JSONObject().put("reason", reason))
+  }
+
+  private fun beginBackgroundGrace() {
+    if (sessionPhase !in setOf("connected", "connecting", "starting", "reconnecting", "waiting") &&
+      !sessionStarted) return
+    mainHandler.removeCallbacks(backgroundGraceRunnable)
+    backgroundGraceUntilElapsedMs = SystemClock.elapsedRealtime() + BACKGROUND_GRACE_MS
+    DiagnosticLogJournal.recordNative(applicationContext, "native.session.grace.started", "info",
+      JSONObject().put("durationMs", BACKGROUND_GRACE_MS).put("phase", sessionPhase))
+    // Promote while the Activity's visibility transition is being delivered.
+    // Foreground-service startup can still be denied by Android power policy.
+    try { ensureForeground() } catch (error: Exception) {
+      DiagnosticLogJournal.recordNative(applicationContext, "native.session.grace.foreground_failed", "warning",
+        JSONObject().put("category", error.javaClass.simpleName.take(48)))
+    }
+    mainHandler.postDelayed(backgroundGraceRunnable, BACKGROUND_GRACE_MS)
+  }
+
+  private fun expireBackgroundGrace() {
+    if (uiIsVisible || backgroundSyncArmed || backgroundGraceUntilElapsedMs == 0L) return
+    val remaining = backgroundGraceUntilElapsedMs - SystemClock.elapsedRealtime()
+    if (remaining > 0L) {
+      mainHandler.postDelayed(backgroundGraceRunnable, remaining)
+      return
+    }
+    backgroundGraceUntilElapsedMs = 0L
+    val pending = runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)
+    DiagnosticLogJournal.recordNative(applicationContext, "native.session.grace.expired", "info",
+      JSONObject().put("transferActive", pending).put("phase", sessionPhase))
+    if (pending) return // Manual transfer remains foreground-owned until completion.
+    if (sessionStarted || sessionPhase in setOf("connected", "connecting", "starting", "reconnecting", "waiting")) {
+      stopSession(persist = false)
+    } else if (foregroundStarted) {
+      foregroundStarted = false
+      ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+      SyncpeerSessionNotifications.cancel(this)
+      publishSessionStatus()
     }
   }
 
@@ -1438,8 +1515,29 @@ class DocumentRuntimeService : Service() {
       if (phase !in allowed) {
         return reply.put("error", "Invalid peer session phase.").toString()
       }
-      peerPhase = if (phase == "connecting") "starting" else phase
-      peerError = request.optString("error").ifBlank { null }
+      val nextPhase = if (phase == "connecting") "starting" else phase
+      val priorPhase = peerPhase
+      val errorReason = request.optString("error")
+      if (priorPhase == "connected" && nextPhase != "connected") {
+        val category = when {
+          errorReason.contains(Regex("not authorized|revoked|not paired|not approved|unknown device|not configured|not in config|access denied|remote peer rejected this device", RegexOption.IGNORE_CASE)) -> "authorization"
+          errorReason.contains(Regex("timed? ?out|deadline", RegexOption.IGNORE_CASE)) -> "timeout"
+          errorReason.contains(Regex("network|unreachable|refused|socket", RegexOption.IGNORE_CASE)) -> "network"
+          errorReason.contains(Regex("disconnected|closed|cancelled|abort", RegexOption.IGNORE_CASE)) -> "closed"
+          errorReason.isBlank() -> "none"
+          else -> "other"
+        }
+        DiagnosticLogJournal.recordNative(applicationContext, "native.peer.closed", "warning",
+          JSONObject().put("reason", category).put("nextPhase", nextPhase)
+            .put("connectedMs", (SystemClock.elapsedRealtime() - peerAuthenticatedAtElapsedMs).coerceIn(0L, 86_400_000L))
+            .put("uiVisible", uiIsVisible).put("foregroundService", foregroundStarted)
+            .put("backgroundSyncArmed", backgroundSyncArmed).put("graceActive", backgroundGraceActive())
+            .put("attempt", request.optInt("attempt").coerceIn(0, 1000)))
+      }
+      if (nextPhase == "connected" && priorPhase != "connected")
+        peerAuthenticatedAtElapsedMs = SystemClock.elapsedRealtime()
+      peerPhase = nextPhase
+      peerError = errorReason.ifBlank { null }
       if (phase != "connected" && sessionStarted) {
         // Starting/idle also invalidate the previous socket. A newer handshake
         // must not leave native active=true while its overview is unavailable.
@@ -1498,12 +1596,17 @@ class DocumentRuntimeService : Service() {
           !uiIsVisible && !backgroundSyncArmed &&
           runCatching { transferJobs.pending().isEmpty() }.getOrDefault(false)) {
           mainHandler.post {
-            if (foregroundStarted && !uiIsVisible && !backgroundSyncArmed &&
+            if (!uiIsVisible && !backgroundSyncArmed && !backgroundGraceActive() &&
               runCatching { transferJobs.pending().isEmpty() }.getOrDefault(false)) {
-              foregroundStarted = false
-              ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-              SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
-              publishSessionStatus()
+              DiagnosticLogJournal.recordNative(applicationContext, "native.session.transfer.background_complete", "info")
+              if (sessionStarted || sessionPhase in setOf("connected", "starting", "reconnecting", "waiting")) {
+                stopSession(persist = false)
+              } else if (foregroundStarted) {
+                foregroundStarted = false
+                ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
+                publishSessionStatus()
+              }
             }
           }
         }
@@ -1769,6 +1872,7 @@ class DocumentRuntimeService : Service() {
 
   override fun onDestroy() {
     destroying = true
+    mainHandler.removeCallbacks(backgroundGraceRunnable)
     cancelPendingRecoveryRetry()
     stopFavoriteSyncSchedule()
     unregisterBackgroundSignals()
@@ -1781,7 +1885,7 @@ class DocumentRuntimeService : Service() {
     // Serialize teardown after initialization; shutdown drains the already queued work.
     worker.execute {
       runCatching {
-        runtimeHost?.evaluate("await globalThis.syncpeerDocuments?.close(); return 'closed';", ByteArray(0))
+        runtimeHost?.evaluate("if (globalThis.syncpeerDocuments) await globalThis.syncpeerDocuments.close(); return 'closed';", ByteArray(0))
           ?.get(15, TimeUnit.SECONDS)
       }
       closeRuntimeHost()
@@ -1796,6 +1900,7 @@ class DocumentRuntimeService : Service() {
 
   private companion object {
     const val SESSION_PROTOCOL_VERSION = 1
+    const val BACKGROUND_GRACE_MS = 90_000L
     const val FAVORITE_SYNC_INTERVAL_MS = 15_000L
     /** A session teardown may not hold the shared document worker behind a dead network. */
     const val SESSION_STOP_TIMEOUT_MS = 10_000L

@@ -841,6 +841,45 @@ const powerSaveModeActive = () =>
   runAdb(["shell", "dumpsys", "power"]).includes("mSettingBatterySaverEnabled=true") ||
   runAdb(["shell", "dumpsys", "power"]).includes("mPowerSaveMode=true");
 
+/** Exercise the default no-sync 90s grace against a real authenticated peer.
+ * It must retain the service-owned socket on HOME, avoid forced redials on a
+ * quick return, and demote after expiration without enabling favorite sync. */
+const runSessionGrace = async () => {
+  if (!serverDeviceId) throw new Error("Background grace requires a provisioned approved peer.");
+  const cdp = await launchAndroidApp(true);
+  try {
+    await ensurePeerDocumentVault(cdp);
+    const settings = await documentCommand(cdp, { operation: "profileSettings" });
+    await documentCommand(cdp, { operation: "saveProfileSettings", settings: {
+      ...settings, profile: { ...settings.profile, keepSyncingInBackground: false },
+    } });
+    if (!await openAndroidConnection(cdp)) throw new Error("Background grace peer connection failed.");
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+      "connected before background grace", 45_000);
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 20_000);
+    await wait(3_000);
+    if (!sessionForegroundActive()) throw new Error("Default grace dropped foreground protection too soon.");
+    runAdb(["shell", "monkey", "-p", packageName, "1"]);
+    await assertForeground();
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+      "warm connection after background grace", 15_000);
+    await waitForSessionService(false, 15_000);
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 20_000);
+    await wait(92_000);
+    await waitForSessionService(false, 20_000);
+    runAdb(["shell", "monkey", "-p", packageName, "1"]);
+    await assertForeground();
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+      "reconnected after grace expiration", 45_000);
+    console.log("Android default 90s grace: retained, warm-resumed, expired and reconnected.");
+  } finally { cdp.close(); }
+};
+
 const runSessionPolicyTransition = async () => {
   let cdp = await launchAndroidApp(true);
   let airplaneMode = false;
@@ -3696,6 +3735,10 @@ const main = async () => {
   }
   if (hasArgument("--session-policy-transition")) {
     await runSessionPolicyTransition();
+    return;
+  }
+  if (hasArgument("--session-grace")) {
+    await runSessionGrace();
     return;
   }
   if (hasArgument("--peer-power-cut-setup")) {

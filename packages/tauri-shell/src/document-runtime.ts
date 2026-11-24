@@ -589,13 +589,16 @@ class AndroidSessionRuntime {
   };
 
   private disconnectCommand = async () => {
+    this.adapter.log?.("core.session.shutdown.begin", {});
     this.transferJobs.cancelAll();
     this.downloads.cancelAll();
     this.uploads.cancelAll();
     this.activeOptions = null;
     this.sharedFolderIds = [];
     await this.lifecycle.disconnect();
+    this.adapter.log?.("core.session.shutdown.lifecycle_done", {});
     await this.stopIncomingService();
+    this.adapter.log?.("core.session.shutdown.listener_done", {});
     return { phase: "idle" };
   };
 

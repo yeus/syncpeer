@@ -49,17 +49,21 @@ encrypted copy is not attached and the original remains available for retry.
 External-storage imports can require manual handling. Failed preparation never
 silently falls back to writing new Android downloads in plaintext.
 
-When the Activity is backgrounded after a connection, the WebView-owned peer
-session is closed before the service starts its own authenticated core session.
-The service is the only background session owner, runs as a low-noise `dataSync`
-foreground service, persists its bounded connection request through the
-Keystore-backed vault, and reconnects after network/power policy changes or an
-Android process restart. Returning to the Activity stops the service and waits
-for that session to close before the UI session resumes. This handoff keeps the
-ownership explicit: folders attached to the DocumentsProvider use their full
-encrypted replica, while unattached folders still download only explicit
-favorites. Peer-scoped saved passwords are resolved before an attached encrypted
-folder is advertised after restart.
+When the Activity is hidden, the Android service keeps an already-connected
+peer alive for a default 90-second foreground-service grace period. No automatic
+favorites sync is enabled by this short retention; after the grace expires,
+the socket is shut down unless a manual transfer remains active. Returning to
+the Activity cancels that timer and reuses the existing authenticated session.
+This bounded grace does not need the background-sync opt-in and does not
+promise survival under manufacturer power restrictions.
+
+Continuous background synchronization remains opt-in. When enabled, the
+service owns the authenticated core session as a `dataSync` foreground service,
+persists its bounded connect request in the Keystore-backed vault, and
+reconnects after network/power transitions subject to Android restrictions.
+Only one owner maintains the connection: foreground and background both use
+the service; the WebView is merely a session client. Background favorites
+sync requires opt-in; explicit transfers can outlive the 90-second grace.
 
 Acknowledged encrypted download ranges are journaled with the remote content
 identity. They can be reused after the service or app restarts, but are discarded

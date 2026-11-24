@@ -1051,6 +1051,11 @@ export class RemoteFs {
     signal?: AbortSignal,
     requestRange?: (items: readonly T[]) => Promise<Uint8Array>,
   ): Promise<FileDownloadResult> {
+    const startedAt = Date.now();
+    const profileFullTransfer = totalBytes >= 128 * 1024;
+    if (profileFullTransfer) {
+      this.log?.("core.transfer.stage", { stage: "blocks_start", totalBytes, bytes: 0 });
+    }
     throwIfAborted(signal);
     const blocks: RangeDigest[] = plan.flatMap((item) => item.hash?.length === 32
       ? [{ offset: item.offset, size: item.size, hash: item.hash }] : []);
@@ -1070,6 +1075,7 @@ export class RemoteFs {
       .filter((item) => !remainingPlan.includes(item))
       .reduce((sum, item) => sum + item.size, 0);
     onProgress?.({ downloadedBytes: downloaded, totalBytes, reusedBytes, resumedBytes, networkBytes });
+    let storageMs = 0;
     let pending: Array<{ offset: number; bytes: Uint8Array }> = [];
     let pendingBytes = 0;
     const flushPending = async (): Promise<void> => {
@@ -1083,7 +1089,9 @@ export class RemoteFs {
       }
       pending = [];
       pendingBytes = 0;
-      await sink.write(first.offset, combined);
+      const writeStartedAt = Date.now();
+      try { await sink.write(first.offset, combined); }
+      finally { storageMs += Date.now() - writeStartedAt; }
     };
     const maxRangeBytes = 1024 * 1024;
     const groups: Array<{ startIndex: number; items: T[]; size: number }> = [];
@@ -1106,23 +1114,26 @@ export class RemoteFs {
     }
 
     const inFlight = new Map<number, Promise<
-      { groupIndex: number; bytes: Uint8Array; error?: never } |
-      { groupIndex: number; bytes?: never; error: unknown }
+      { groupIndex: number; bytes: Uint8Array; durationMs: number; error?: never } |
+      { groupIndex: number; bytes?: never; durationMs: number; error: unknown }
     >>();
     const completed = new Map<number, Uint8Array>();
     let nextRequestGroup = 0;
     let nextWriteIndex = 0;
     const startRequest = (groupIndex: number) => {
       const group = groups[groupIndex];
+      const requestStartedAt = Date.now();
       const operation = requestRange && group.items.length > 1
         ? requestRange(group.items)
         : request(group.items[0]);
       const pendingRequest = operation.then(
-        (bytes) => ({ groupIndex, bytes }),
-        (error: unknown) => ({ groupIndex, error }),
+        (bytes) => ({ groupIndex, bytes, durationMs: Date.now() - requestStartedAt }),
+        (error: unknown) => ({ groupIndex, error, durationMs: Date.now() - requestStartedAt }),
       );
       inFlight.set(groupIndex, pendingRequest);
     };
+    let aggregateRequestMs = 0, maxRequestMs = 0;
+    let firstResponse = false, lastDiagnosticAt = startedAt;
     while (nextRequestGroup < Math.min(groups.length, Math.max(1, concurrency))) {
       startRequest(nextRequestGroup++);
     }
@@ -1131,6 +1142,8 @@ export class RemoteFs {
       const result = await Promise.race(inFlight.values());
       inFlight.delete(result.groupIndex);
       if ("error" in result) throw result.error;
+      aggregateRequestMs += result.durationMs;
+      maxRequestMs = Math.max(maxRequestMs, result.durationMs);
       const group = groups[result.groupIndex];
       if (result.bytes.length !== group.size) {
         throw new Error(
@@ -1149,6 +1162,19 @@ export class RemoteFs {
         }
         networkBytes += item.networkSize ?? bytes.length;
         completed.set(group.startIndex + itemIndex, bytes);
+      }
+      if (!firstResponse) {
+        firstResponse = true;
+        if (profileFullTransfer || Date.now() - startedAt >= 2000) {
+          this.log?.("core.transfer.stage", { stage: "blocks_first", durationMs: Date.now() - startedAt,
+            bytes: networkBytes, totalBytes, requestMs: result.durationMs });
+        }
+      }
+      if (Date.now() - lastDiagnosticAt >= 5000) {
+        lastDiagnosticAt = Date.now();
+        this.log?.("core.transfer.stage", { stage: "blocks_progress", durationMs: lastDiagnosticAt - startedAt,
+          bytes: downloaded, totalBytes, networkBytes, requestMs: aggregateRequestMs,
+          maxRequestMs, storageMs });
       }
       if (nextRequestGroup < groups.length) startRequest(nextRequestGroup++);
       while (completed.has(nextWriteIndex)) {
@@ -1191,6 +1217,11 @@ export class RemoteFs {
     }
     throwIfAborted(signal);
     await sink.commit();
+    if (profileFullTransfer || Date.now() - startedAt >= 2000) {
+      this.log?.("core.transfer.stage", { stage: "blocks_complete", durationMs: Date.now() - startedAt,
+        bytes: downloaded, totalBytes, networkBytes, requestMs: aggregateRequestMs,
+        maxRequestMs, storageMs });
+    }
     return {
       bytesWritten: downloaded,
       totalBytes,

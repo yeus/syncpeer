@@ -343,7 +343,12 @@ const downloadWithServiceJob = async (context: FileActionContext,
   try {
     const peerId = state.session.remoteDevice?.id;
     if (!peerId) throw new Error("Authenticated peer identity is unavailable.");
+    pushSessionLog(state, "info", "download.service.submit",
+      "Submitting download to Android service.", { openAfterDownload });
+    const submittedAt = Date.now();
     const job = await client.startServiceTransferJob!("download", folderId, path, peerId);
+    pushSessionLog(state, "info", "download.service.submitted",
+      "Android service accepted the transfer job.", { durationMs: Date.now() - submittedAt });
     id = job.id;
     const jobId = id;
     transfers.registerServiceTransfer(`download:${key}`, "download", () => {
@@ -397,8 +402,15 @@ const downloadFile = async (
   options?: { openAfterDownload?: boolean },
 ): Promise<void> => {
   const downloadKey = cachedFileKey(folderId, path);
+  const requestedAt = Date.now();
+  pushSessionLog(context.state, "info", "download.action.requested",
+    "Requested file download.", { serviceAvailable: !!context.client.startServiceTransferJob });
   if (context.state.favorites.activeDownloads[downloadKey]) return;
   const connected = await context.ensureConnectedForTransfer("download");
+  pushSessionLog(context.state, "info", "download.action.connection_checked",
+    "Connection readiness checked before downloading.", {
+      connected, durationMs: Date.now() - requestedAt,
+    });
   if (!connected || !context.state.session.remoteFs) return;
   if (context.client.startServiceTransferJob && context.client.serviceTransferJobStatus) {
     await downloadWithServiceJob(context, folderId, path, name, options?.openAfterDownload);

@@ -14,6 +14,7 @@ import {
   createSyncpeerCoreClient,
   candidateCooldownMs,
   candidatePreferenceScore,
+  orderCandidatesForReconnect,
   normalizeDiscoveredCandidates,
   UploadOutcomeUnknownError,
   withMetadataSession,
@@ -232,6 +233,27 @@ test("candidate preference and cooldown match Syncthing ordering", () => {
   assert.deepEqual([1, 2, 3, 4, 5, 9].map(candidateCooldownMs), [5000, 10000, 20000, 40000, 60000, 60000]);
 });
 
+test("reconnect candidates prioritize authenticated LAN addresses and quarantine failures", () => {
+  const ipv4 = { address: "tcp://192.168.0.10:22000", protocol: "tcp" as const,
+    host: "192.168.0.10", port: 22000, scope: "lan" as const, source: "local" as const };
+  const ipv6 = { address: "tcp://[fe80::10]:22000", protocol: "tcp" as const,
+    host: "fe80::10", port: 22000, scope: "lan" as const, source: "global" as const };
+  const quic = { address: "quic://192.168.0.10:22000", protocol: "quic" as const,
+    host: "192.168.0.10", port: 22000, scope: "lan" as const, source: "local" as const };
+  const history = new Map([["tcp:fe80::10:22000", {
+    failures: 0, successes: 1, shortLived: 0, cooldownUntilMs: 0,
+    lastAuthenticatedAtMs: 10_000, candidate: ipv6,
+  }]]);
+  const rank = (now: number) => orderCandidatesForReconnect([quic, ipv6, ipv4], history, now);
+  assert.equal(rank(10_500)[0], ipv6, "Authenticated IPv6 can beat default IPv4 preference");
+  assert.equal(rank(611_000)[0], ipv4, "Stale endpoint success must expire");
+  history.set("tcp:fe80::10:22000", {
+    ...history.get("tcp:fe80::10:22000")!, cooldownUntilMs: 31_000,
+  });
+  assert.equal(rank(12_000)[0], ipv4, "Failing addresses cannot block healthy candidates");
+  assert.equal(rank(31_001)[0], ipv6, "Cooldown expiry restores a recently authenticated endpoint");
+});
+
 function cooldownFixture(runtime?: Parameters<typeof createSyncpeerCoreClient>[1]) {
   let attempts = 0;
   const client = createSyncpeerCoreClient({
@@ -245,6 +267,23 @@ function cooldownFixture(runtime?: Parameters<typeof createSyncpeerCoreClient>[1
     deviceName: "synthetic", timeoutMs: 15000 };
   return { client, options, attempts: () => attempts };
 }
+
+test("repeated early peer closes do not invent a missing-approval diagnosis", async () => {
+  let attempted = 0;
+  const client = createSyncpeerCoreClient({
+    connectTls: async () => { attempted++; throw new Error("Connection closed"); },
+    sha256: async () => new Uint8Array(32), randomBytes: async size => new Uint8Array(size),
+    discoveryFetch: async () => ({ ok: true, status: 200, text: async () => "",
+      json: async () => ({ addresses: ["tcp://192.0.2.10:22000", "tcp://192.0.2.11:22000"] }) }),
+  });
+  const error = await client.openSession({
+    host: "", port: 22000, discoveryMode: "global", expectedDeviceId: "SYNTHETIC",
+    certPem: "synthetic", keyPem: "synthetic", deviceName: "synthetic", timeoutMs: 3000,
+  }).then(() => new Error("Unexpectedly connected"), failure => failure as Error);
+  assert.equal(attempted, 2);
+  assert.match(error.message, /closed before BEP session readiness/);
+  assert.doesNotMatch(error.message, /remote peer rejected|waiting for approval|accept the new device/i);
+});
 
 test("a reconnect waits for candidate cooldown instead of reporting an undialed failure", async () => {
   let timeMs = 0;

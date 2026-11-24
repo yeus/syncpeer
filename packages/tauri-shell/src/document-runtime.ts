@@ -30,7 +30,7 @@ import { createServiceTransferJobs } from "../../core/src/sync/serviceTransferJo
 import { createServiceUploadBridge } from "../../core/src/sync/serviceUploadBridge.js";
 import { decodeBase64 } from "../../core/src/transfer/base64.js";
 import { parseServiceCommand } from "../../core/src/sync/serviceProtocol.js";
-import { safeNativeDiscoveryDiagnostic } from "./nativeDiagnosticFields.js";
+import { safeNativeBepDiagnostic, safeNativeDiscoveryDiagnostic, safeNativeTransferDiagnostic } from "./nativeDiagnosticFields.js";
 
 type AndroidRuntime = { getNamedPort: (name: string) => Promise<MessagePort> };
 type AndroidRuntimeRequest = (input: object) => Promise<unknown>;
@@ -85,12 +85,24 @@ const createAndroidSessionAdapter = async (
         if (typeof deviceId === "string") void request({ operation: "pendingPeer", deviceId });
         return;
       }
+      if (event === "core.transfer.stage") {
+        const safe = safeNativeTransferDiagnostic(details);
+        if (safe) void request({ operation: "diagnostic", event, ...safe }).catch(() => undefined);
+        return;
+      }
+      if (event.startsWith("core.bep.handshake.")) {
+        const safe = safeNativeBepDiagnostic(event, details);
+        if (safe) void request({ operation: "diagnostic", event, ...safe }).catch(() => undefined);
+        return;
+      }
       if (!event.startsWith("core.session.connect.") &&
         !["core.discovery.global_failed", "core.discovery.retry", "core.discovery.full_response",
           "core.discovery.candidate.try", "core.discovery.candidate.connected",
           "core.discovery.candidate.failed", "core.discovery.relay.failed",
-          "core.discovery.connect_strategy", "core.upload.request.failed",
-          "core.replica.receive.failed"].includes(event)) return;
+          "core.discovery.connect_strategy", "core.discovery.candidate.order",
+          "core.upload.request.failed", "core.replica.receive.failed",
+          "core.session.shutdown.begin", "core.session.shutdown.lifecycle_done",
+          "core.session.shutdown.listener_done"].includes(event)) return;
       // The native journal contains only enums and bounded counts; never
       // addresses, peer IDs, paths, certificates, credentials or error text.
       void request({
@@ -263,6 +275,11 @@ class AndroidSessionRuntime {
         return decodeBase64(response.bytes, 64 * 1024);
       },
       runExclusive: work => this.withTransferLock(work),
+      diagnostic: value => {
+        const safe = safeNativeTransferDiagnostic(value);
+        if (safe) void this.nativeRequest({ operation: "diagnostic", event: "core.transfer.stage", ...safe })
+          .catch(() => undefined);
+      },
       progress: async value => { await this.nativeRequest({ operation: "transferJobProgress", ...value }); },
     });
   }

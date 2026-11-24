@@ -14,6 +14,16 @@ export type ServiceTransferProgress = {
   attempt?: number;
   reason?: "network" | "storage" | "cancelled" | "unavailable" | "other";
 };
+export type ServiceTransferDiagnostic = {
+  stage: "queue_wait" | "local_preflight" | "remote_lookup" | "draft_open" |
+    "first_bytes" | "progress" | "storage_write" | "draft_commit" | "finished" | "failed";
+  durationMs?: number;
+  bytes?: number;
+  totalBytes?: number;
+  networkBytes?: number;
+  storageMs?: number;
+  reason?: ServiceTransferProgress["reason"];
+};
 export type ServiceTransferRequest = {
   id: string;
   direction: ServiceTransferDirection;
@@ -47,6 +57,7 @@ export const createServiceTransferJobs = (deps: {
   peerId?: () => string | null;
   remoteFs: () => RemoteFs | null;
   progress: (value: ServiceTransferProgress) => void | Promise<void>;
+  diagnostic?: (value: ServiceTransferDiagnostic) => void | Promise<void>;
   readStaged?: (stageId: string, size: number, offset: number, length: number) => Promise<Uint8Array>;
   runExclusive?: (work: () => Promise<void>) => Promise<void>;
 }) => {
@@ -67,9 +78,14 @@ export const createServiceTransferJobs = (deps: {
     } catch { /* Diagnostics may not abort the transfer. */ }
     if (phase !== "running" && phase !== "queued") lastPersisted.delete(job.id);
   };
+  const diagnose = (value: ServiceTransferDiagnostic) => {
+    try { void Promise.resolve(deps.diagnostic?.(value)).catch(() => undefined); }
+    catch { /* Diagnostic failure may not interrupt data transfer. */ }
+  };
 
   const download = async (job: ServiceTransferRequest, remote: RemoteFs, controller: AbortController,
     report: (done: number, total: number) => void) => {
+    const startedAt = Date.now();
     const folder = (await deps.documents.status()).folders.find(value => value.id === job.folderId);
     if (!folder || folder.browseOnly || !folder.downloads) throw new Error("Document downloads are unavailable.");
     const local = (await deps.documents.cachedFiles(job.folderId)).find(file => file.path === job.path);
@@ -77,32 +93,48 @@ export const createServiceTransferJobs = (deps: {
       ? (await deps.documents.digestCachedFiles([{ folderId: job.folderId, path: job.path }]))[0]?.hash
       : null;
     if (local && !expectedLocalHash) throw new Error("Existing local document cannot be verified.");
+    diagnose({ stage: "local_preflight", durationMs: Date.now() - startedAt });
+    const lookupAt = Date.now();
     const parent = job.path.split("/").slice(0, -1).join("/");
     const file = (await remote.readDir(job.folderId, parent))
       .find(entry => entry.path === job.path && entry.type === "file");
+    diagnose({ stage: "remote_lookup", durationMs: Date.now() - lookupAt });
     if (!file) throw new Error("Remote file is unavailable.");
+
     let handle: number | undefined;
+    let storageMs = 0, writtenBytes = 0, networkBytes = 0;
     const sink: FileDownloadSink = {
       begin: async metadata => {
         controller.signal.throwIfAborted();
         if (metadata.folderId !== job.folderId || metadata.path !== job.path) {
           throw new Error("Remote download identity changed.");
         }
+        const start = Date.now();
         handle = await deps.documents.beginDownload(job.folderId, job.path,
           metadata.sizeBytes, file.modifiedMs, expectedLocalHash, metadata);
+        diagnose({ stage: "draft_open", durationMs: Date.now() - start, totalBytes: metadata.sizeBytes });
         report(0, metadata.sizeBytes);
       },
       write: async (offset, bytes) => {
         if (handle === undefined) throw new Error("Download was not initialized.");
         controller.signal.throwIfAborted();
-        for (let done = 0; done < bytes.length; done += 131072) {
-          await deps.documents.write(handle, offset + done, bytes.subarray(done, done + 131072));
+        const start = Date.now();
+        try {
+          for (let done = 0; done < bytes.length; done += 131072) {
+            await deps.documents.write(handle, offset + done, bytes.subarray(done, done + 131072));
+          }
+          writtenBytes += bytes.length;
+        } finally {
+          storageMs += Date.now() - start;
         }
       },
       commit: async () => {
         if (handle === undefined) throw new Error("Download was not initialized.");
         controller.signal.throwIfAborted();
+        diagnose({ stage: "storage_write", durationMs: storageMs, bytes: writtenBytes });
+        const start = Date.now();
         await deps.documents.finishDownload(handle);
+        diagnose({ stage: "draft_commit", durationMs: Date.now() - start });
         handle = undefined;
       },
       abort: async () => {
@@ -112,8 +144,24 @@ export const createServiceTransferJobs = (deps: {
       },
     };
     try {
-      await remote.readFileToSink(job.folderId, job.path, sink,
-        value => report(value.downloadedBytes, value.totalBytes), controller.signal);
+      const networkAt = Date.now();
+      let firstBytes = false, lastProgressAt = networkAt;
+      await remote.readFileToSink(job.folderId, job.path, sink, value => {
+        const now = Date.now();
+        networkBytes = value.networkBytes ?? networkBytes;
+        if (!firstBytes && value.downloadedBytes > 0) {
+          firstBytes = true;
+          diagnose({ stage: "first_bytes", durationMs: now - networkAt, bytes: value.downloadedBytes });
+        }
+        report(value.downloadedBytes, value.totalBytes);
+        if (now - lastProgressAt >= 5000) {
+          lastProgressAt = now;
+          diagnose({ stage: "progress", durationMs: now - startedAt, bytes: value.downloadedBytes,
+            totalBytes: value.totalBytes, networkBytes, storageMs });
+        }
+      }, controller.signal);
+      diagnose({ stage: "finished", durationMs: Date.now() - startedAt, bytes: writtenBytes,
+        totalBytes: file.size, networkBytes, storageMs });
     } catch (error) {
       await Promise.resolve(sink.abort(error)).catch(() => undefined);
       throw error;
@@ -190,8 +238,10 @@ export const createServiceTransferJobs = (deps: {
       if (isInternalReplicaPath(job.path)) throw new Error("Private documents cannot be transferred.");
       if (tasks.has(job.id)) return { started: false };
       if (terminal.has(job.id)) return { started: false };
+      const submittedAt = Date.now();
       const controller = new AbortController();
       const promise = (deps.runExclusive ?? (async work => work()))(async () => {
+        diagnose({ stage: "queue_wait", durationMs: Date.now() - submittedAt });
         controller.signal.throwIfAborted();
         const remote = deps.remoteFs();
         // The journal's recipient is not inferred from folder identity:
@@ -214,6 +264,8 @@ export const createServiceTransferJobs = (deps: {
           if (terminal.size > 256) terminal.delete(terminal.values().next().value!);
           publish(job, "completed", transferredBytes, totalBytes);
         } catch (error) {
+          diagnose({ stage: "failed", durationMs: Date.now() - submittedAt,
+            bytes: transferredBytes, totalBytes, reason: category(error) });
           if (controller.signal.aborted) {
             terminal.add(job.id);
             if (terminal.size > 256) terminal.delete(terminal.values().next().value!);
@@ -224,6 +276,7 @@ export const createServiceTransferJobs = (deps: {
         }
         if (controller.signal.aborted) terminal.add(job.id);
       }).catch(error => {
+        diagnose({ stage: "failed", durationMs: Date.now() - submittedAt, reason: category(error) });
         publish(job, controller.signal.aborted ? "cancelled" : "failed", 0, 0,
           controller.signal.aborted ? "cancelled" : category(error));
       }).finally(() => { tasks.delete(job.id); });

@@ -16,7 +16,8 @@ const boundedMilliseconds = (value: unknown): number =>
 export const safeNativeDiscoveryDiagnostic = (details?: Record<string, unknown>) => {
   const message = typeof details?.message === "string" ? details.message : "";
   const category =
-    /not authorized|revoked|retired|not paired|approval/i.test(message) ? "authorization" :
+    // Suggestions about possible approval must never reclassify network errors.
+    /not authorized|revoked|retired|not paired|not approved|unknown device|not configured|not in config|access denied|certificate unknown|remote peer rejected this device/i.test(message) ? "authorization" :
     /timed? ?out|deadline/i.test(message) ? "timeout" :
     /refused|unreachable|no route/i.test(message) ? "unreachable" :
     /certificate|tls|handshake|alpn|peer identity/i.test(message) ? "tls" :
@@ -27,6 +28,8 @@ export const safeNativeDiscoveryDiagnostic = (details?: Record<string, unknown>)
   return {
     category,
     directCount: boundedCount(details?.directCandidateCount),
+    priorSuccessCount: boundedCount(details?.priorSuccessCount),
+    cooldownCount: boundedCount(details?.cooldownCount),
     relayCount: boundedCount(details?.relayCandidateCount),
     protocol: enumerated(details?.protocol, ["tcp", "quic", "relay", "unknown"] as const, "unknown"),
     source: enumerated(details?.source, ["local", "global", "manual", "unknown"] as const, "unknown"),
@@ -35,5 +38,52 @@ export const safeNativeDiscoveryDiagnostic = (details?: Record<string, unknown>)
     candidateOrdinal: boundedCount(details?.candidateOrdinal),
     durationMs: boundedMilliseconds(details?.durationMs),
     timeoutMs: boundedMilliseconds(details?.timeoutMs),
+  };
+};
+
+/** Persist only fixed BEP stage/direction labels, timing and error category. */
+export const safeNativeBepDiagnostic = (event: string, details?: Record<string, unknown>) => {
+  const phases: Record<string, string> = {
+    "core.bep.handshake.peer_cert": "peer_certificate",
+    "core.bep.handshake.hello_sent": "hello_sent",
+    "core.bep.handshake.hello_recv": "hello_received",
+    "core.bep.handshake.ready": "ready",
+  };
+  const stage = event === "core.bep.handshake.failed"
+    ? enumerated(details?.stage, ["peer_certificate", "hello_exchange", "cluster_config"] as const, "peer_certificate")
+    : phases[event];
+  if (!stage) return null;
+  return {
+    stage,
+    direction: enumerated(details?.direction, ["incoming", "outgoing"] as const, "outgoing"),
+    category: event === "core.bep.handshake.failed"
+      ? safeNativeDiscoveryDiagnostic(details).category : "none",
+    durationMs: boundedMilliseconds(details?.durationMs),
+  };
+};
+
+const boundedPositive = (value: unknown, max: number): number =>
+  typeof value === "number" && Number.isSafeInteger(value)
+    ? Math.min(max, Math.max(0, value)) : 0;
+
+/** Safe for persistent native diagnostics: never carries paths, peer IDs or error messages. */
+export const safeNativeTransferDiagnostic = (details?: Record<string, unknown>) => {
+  const stage = enumerated(details?.stage,
+    ["queue_wait", "local_preflight", "remote_lookup", "draft_open", "first_bytes",
+      "progress", "storage_write", "draft_commit", "finished", "failed",
+      "blocks_start", "blocks_first", "blocks_progress", "blocks_complete", "invalid"] as const,
+    "invalid");
+  if (stage === "invalid") return null;
+  return {
+    stage,
+    durationMs: boundedPositive(details?.durationMs, 86_400_000),
+    bytes: boundedPositive(details?.bytes, 1_000_000_000_000),
+    totalBytes: boundedPositive(details?.totalBytes, 1_000_000_000_000),
+    networkBytes: boundedPositive(details?.networkBytes, 1_000_000_000_000),
+    storageMs: boundedPositive(details?.storageMs, 86_400_000),
+    requestMs: boundedPositive(details?.requestMs, 86_400_000),
+    maxRequestMs: boundedPositive(details?.maxRequestMs, 86_400_000),
+    reason: enumerated(details?.reason,
+      ["network", "storage", "cancelled", "unavailable", "other", "none"] as const, "none"),
   };
 };

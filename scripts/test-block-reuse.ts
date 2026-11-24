@@ -110,6 +110,45 @@ test("cancellation prevents copying", async () => {
   }, controller.signal), { name: "AbortError" });
 });
 
+test("all download paths emit bounded block timing without remote paths or identities", async () => {
+  const events: Array<{ stage?: string; durationMs?: number; bytes?: number; networkBytes?: number;
+    requestMs?: number; storageMs?: number }> = [];
+  const size = 128 * 1024;
+  const folder = { id: "fixture", indexReceived: true, encrypted: false,
+    files: new Map([["data.bin", { indexFile: { name: "data.bin", type: 0, size,
+      blocks: [{ offset: 0, size, hash: sha256(new Uint8Array(size)) }] } }]]) };
+  const remote = new RemoteFs(new Map([[folder.id, folder]]) as never,
+    async () => new Uint8Array(size), async () => {}, () => {},
+    (event, details) => { if (event === "core.transfer.stage") events.push(details ?? {}); });
+  await remote.readFileToSink(folder.id, "data.bin", {
+    begin: async () => {}, write: async () => {}, commit: async () => {}, abort: async () => {},
+  });
+  const stages = events.map(value => value.stage);
+  assert.ok(stages.includes("blocks_start"));
+  assert.ok(stages.includes("blocks_first"));
+  assert.ok(stages.includes("blocks_complete"));
+  const summary = events.find(value => value.stage === "blocks_complete");
+  assert.equal(summary?.bytes, size);
+  assert.equal(summary?.networkBytes, size);
+  assert.ok(typeof summary?.requestMs === "number");
+  assert.ok(events.every(value => Object.keys(value).every(key =>
+    !["folderId", "path", "deviceId", "name"].includes(key))));
+});
+
+test("fast small downloads do not flood persistent transfer diagnostics", async () => {
+  let events = 0;
+  const folder = { id: "fixture", indexReceived: true, encrypted: false,
+    files: new Map([["tiny.bin", { indexFile: { name: "tiny.bin", type: 0, size: 4,
+      blocks: [{ offset: 0, size: 4, hash: sha256(new Uint8Array(4)) }] } }]]) };
+  const remote = new RemoteFs(new Map([[folder.id, folder]]) as never,
+    async () => new Uint8Array(4), async () => {}, () => {},
+    event => { if (event === "core.transfer.stage") events += 1; });
+  await remote.readFileToSink(folder.id, "tiny.bin", {
+    begin: async () => {}, write: async () => {}, commit: async () => {}, abort: async () => {},
+  });
+  assert.equal(events, 0);
+});
+
 for (const mode of ['plaintext', 'encrypted', 'unhashed', 'corrupted-copy']) {
 test(`real ${mode} download verifies data through checkpoint and hashing wrappers`, async () => {
   const encrypted = mode === 'encrypted';

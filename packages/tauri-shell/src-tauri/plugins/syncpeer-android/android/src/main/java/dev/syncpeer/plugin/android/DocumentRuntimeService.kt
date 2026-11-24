@@ -243,6 +243,8 @@ class DocumentRuntimeService : Service() {
             "error", JSONObject().put("operation",
               input.optString("operation").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other")
               .put("stage", stage).put("errorType", type).put("category", category))
+          if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+            Log.w("SyncpeerRuntime", "document command failed: stage=$stage category=$category type=$type")
           throw IllegalStateException("Document runtime evaluation failed.")
         }
         val timing = reply.optJSONObject("__documentTimings")
@@ -737,6 +739,14 @@ class DocumentRuntimeService : Service() {
       debugNetworkEvent("policy pause ignored: no session request")
       return
     }
+    DiagnosticLogJournal.recordNative(applicationContext, "native.session.policy.paused", "info",
+      JSONObject().put("reason", when (reason) {
+        "Waiting for a network connection." -> "network"
+        "Waiting for an unmetered network." -> "metered"
+        "Waiting for normal power mode." -> "battery_saver"
+        "Waiting for the device to leave idle mode." -> "device_idle"
+        else -> "other"
+      }))
     val generation = nextSessionGeneration()
     val wasStarted = sessionStarted && documentsStarted && runtimeHost != null
     sessionStarted = false
@@ -1507,14 +1517,57 @@ class DocumentRuntimeService : Service() {
     }
     if (request.optString("operation") == "diagnostic") {
       val event = request.optString("event")
+      if (event == "core.transfer.stage") {
+        val stage = request.optString("stage").takeIf {
+          it in setOf("queue_wait", "local_preflight", "remote_lookup", "draft_open",
+            "first_bytes", "progress", "storage_write", "draft_commit", "finished", "failed",
+            "blocks_start", "blocks_first", "blocks_progress", "blocks_complete")
+        }
+        if (stage != null) {
+          val details = JSONObject().put("stage", stage)
+            .put("durationMs", request.optLong("durationMs", 0).coerceIn(0L, 86_400_000L))
+            .put("bytes", request.optLong("bytes", 0).coerceIn(0L, 1_000_000_000_000L))
+            .put("totalBytes", request.optLong("totalBytes", 0).coerceIn(0L, 1_000_000_000_000L))
+            .put("networkBytes", request.optLong("networkBytes", 0).coerceIn(0L, 1_000_000_000_000L))
+            .put("storageMs", request.optLong("storageMs", 0).coerceIn(0L, 86_400_000L))
+            .put("requestMs", request.optLong("requestMs", 0).coerceIn(0L, 86_400_000L))
+            .put("maxRequestMs", request.optLong("maxRequestMs", 0).coerceIn(0L, 86_400_000L))
+            .put("reason", request.optString("reason").takeIf {
+              it in setOf("network", "storage", "cancelled", "unavailable", "other")
+            } ?: "none")
+          DiagnosticLogJournal.recordNative(applicationContext, event,
+            if (stage == "failed") "warning" else "info", details)
+        }
+        return reply.put("result", JSONObject.NULL).toString()
+      }
+      if (event in setOf("core.bep.handshake.peer_cert", "core.bep.handshake.hello_sent",
+          "core.bep.handshake.hello_recv", "core.bep.handshake.ready", "core.bep.handshake.failed")) {
+        val stage = request.optString("stage").takeIf {
+          it in setOf("peer_certificate", "hello_sent", "hello_received", "ready",
+            "hello_exchange", "cluster_config")
+        } ?: return reply.put("result", JSONObject.NULL).toString()
+        val direction = request.optString("direction").takeIf { it in setOf("incoming", "outgoing") }
+          ?: "outgoing"
+        val category = request.optString("category").takeIf {
+          it in setOf("authorization", "timeout", "unreachable", "relay", "disconnected",
+            "tls", "dns", "other", "none")
+        } ?: "other"
+        DiagnosticLogJournal.recordNative(applicationContext, event,
+          if (event.endsWith(".failed")) "warning" else "info",
+          JSONObject().put("stage", stage).put("direction", direction)
+            .put("category", category).put("durationMs", request.optInt("durationMs").coerceIn(0, 120_000)))
+        return reply.put("result", JSONObject.NULL).toString()
+      }
       // Only core-owned event names can reach crash-persistent diagnostics.
       // Never store untrusted endpoint strings, remote identifiers or error text.
       val allowed = event.matches(Regex("core\\.session\\.connect\\.[a-z_]{2,40}")) ||
         event in setOf("core.discovery.global_failed", "core.discovery.retry",
           "core.discovery.full_response", "core.discovery.candidate.try",
           "core.discovery.candidate.connected", "core.discovery.candidate.failed",
-          "core.discovery.relay.failed", "core.discovery.connect_strategy",
-          "core.upload.request.failed", "core.replica.receive.failed")
+           "core.discovery.relay.failed", "core.discovery.connect_strategy",
+           "core.discovery.candidate.order", "core.upload.request.failed", "core.replica.receive.failed",
+           "core.session.shutdown.begin", "core.session.shutdown.lifecycle_done",
+           "core.session.shutdown.listener_done")
       if (allowed) {
         val details = JSONObject()
           .put("category", request.optString("category").takeIf {
@@ -1522,6 +1575,8 @@ class DocumentRuntimeService : Service() {
               "tls", "dns", "other", "none")
           } ?: "other")
           .put("directCount", request.optInt("directCount").coerceIn(0, 1000))
+           .put("priorSuccessCount", request.optInt("priorSuccessCount").coerceIn(0, 1000))
+           .put("cooldownCount", request.optInt("cooldownCount").coerceIn(0, 1000))
           .put("relayCount", request.optInt("relayCount").coerceIn(0, 1000))
           .put("protocol", request.optString("protocol").takeIf {
             it in setOf("tcp", "quic", "relay", "unknown")

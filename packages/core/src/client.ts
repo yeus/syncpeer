@@ -632,13 +632,13 @@ function maybeConnectionHint(
   }
   const allTimeoutLike = errors.every((entry) => isTimeoutLikeError(entry));
   if (allTimeoutLike) {
-    return "All connection attempts timed out. If the remote peer is online but this is a new pairing, it may be waiting for you to accept this device on the remote Syncthing instance.";
+    return "All connection attempts timed out. Check network reachability and the selected transport; a timeout does not establish missing peer approval.";
   }
   const immediateCloseCount = errors.filter((entry) =>
     isImmediateRemoteCloseLikeError(entry),
   ).length;
   if (immediateCloseCount >= 2) {
-    return "Connection was closed by the remote peer before sync started. If this is a first-time pairing, the remote Syncthing device is likely waiting for approval of this client. Accept the new device there, then retry.";
+    return "Peer connections repeatedly closed before BEP session readiness. Inspect the handshake stage and remote Syncthing logs; a closed socket does not establish missing approval.";
   }
   return "";
 }
@@ -763,11 +763,34 @@ export const normalizeDiscoveredCandidates = (
 ): DiscoveredCandidate[] => dedupeCandidates(candidates)
   .sort((left, right) => candidatePreferenceScore(right) - candidatePreferenceScore(left));
 
-interface CandidateHealth {
+export interface CandidateHealth {
   failures: number;
   successes: number;
   shortLived: number;
   cooldownUntilMs: number;
+  lastAuthenticatedAtMs?: number;
+  candidate?: DiscoveredCandidate;
+}
+
+/** Prefer the last authenticated address, but never pin an expired/stale path.
+ * The 10-minute in-memory hint is scoped to one peer and discarded on restart. */
+export function orderCandidatesForReconnect(
+  candidates: DiscoveredCandidate[],
+  health: ReadonlyMap<string, CandidateHealth>,
+  nowMs: number,
+): DiscoveredCandidate[] {
+  const score = (candidate: DiscoveredCandidate) => {
+    const history = health.get(candidateKey(candidate));
+    const recentlyAuthenticated = history?.lastAuthenticatedAtMs !== undefined &&
+      nowMs - history.lastAuthenticatedAtMs >= 0 && nowMs - history.lastAuthenticatedAtMs < 600_000;
+    const coolingDown = (history?.cooldownUntilMs ?? 0) > nowMs;
+    return candidatePreferenceScore(candidate) +
+      (recentlyAuthenticated ? 75 : 0) - (coolingDown ? 350 : 0) -
+      Math.min(120, (history?.shortLived ?? 0) * 40) +
+      (candidate.source === "local" ? 10 : 0) +
+      (candidateTraceFields(candidate).addressFamily === "ipv4" ? 5 : 0);
+  };
+  return [...candidates].sort((left, right) => score(right) - score(left));
 }
 
 interface CandidateRuntime {
@@ -788,6 +811,7 @@ const recordCandidateFailure = (
   const cooldownMs = candidateCooldownMs(failures);
   const previous = health.get(key);
   health.set(key, {
+    ...previous,
     failures,
     successes: previous?.successes ?? 0,
     shortLived: previous?.shortLived ?? 0,
@@ -803,17 +827,22 @@ const trackCandidateSession = (
 ): void => {
   const key = candidateKey(candidate);
   const previous = health.get(key);
+  const connectedAtMs = now();
   health.set(key, {
-    failures: previous?.failures ?? 0,
+    ...previous,
+    failures: 0,
     successes: (previous?.successes ?? 0) + 1,
     shortLived: previous?.shortLived ?? 0,
-    cooldownUntilMs: previous?.cooldownUntilMs ?? 0,
+    cooldownUntilMs: 0,
+    lastAuthenticatedAtMs: connectedAtMs,
+    candidate,
   });
-  const connectedAtMs = now();
   void session.closed.then((closure) => {
     if (closure.kind === "manual") return;
     if (now() - connectedAtMs >= 30_000) {
-      health.delete(key);
+      // Preserve the successful address; only clear failure penalties.
+      const current = health.get(key);
+      if (current) health.set(key, { ...current, failures: 0, shortLived: 0, cooldownUntilMs: 0 });
     } else {
       const current = health.get(key);
       if (current) health.set(key, { ...current, shortLived: current.shortLived + 1 });
@@ -2820,25 +2849,43 @@ async function openBepSessionOnSocketUncancelled(
   incoming = false,
 ): Promise<SyncpeerSessionHandle> {
   const direction = incoming ? "incoming" : "outgoing";
+  const startedAtMs = Date.now();
+  let stage = "peer_certificate";
   adapter.log?.("core.bep.handshake.start", {
     direction, connectedHost, connectedPort, expectedDeviceId: opts.expectedDeviceId,
   });
-  const identity = await readBepPeerIdentity(
-    adapter, socket, opts, connectedHost, connectedPort, direction,
-  );
-  const { hello, leftover } = await exchangeBepHello(
-    adapter, socket, opts, direction, connectedHost, connectedPort,
-  );
-  const session = await createReadyBepSession(
-    adapter, socket, opts, identity.localDeviceId, identity.remoteDeviceIdBytes, leftover, incoming,
-  );
-  adapter.log?.("core.bep.cluster_config.wait", { direction, connectedHost, connectedPort });
-  await session.waitForReady();
-  session.startReplicaSync(opts.replicaScanIntervalMs);
-  adapter.log?.("core.bep.handshake.ready", {
-    direction, connectedHost, connectedPort, remoteDeviceId: identity.remoteDeviceId,
-  });
-  return bepSessionHandle(session, identity.remoteDeviceId, hello, connectedVia, transportKind, connectionScope);
+  try {
+    const identity = await readBepPeerIdentity(
+      adapter, socket, opts, connectedHost, connectedPort, direction,
+    );
+    stage = "hello_exchange";
+    const { hello, leftover } = await exchangeBepHello(
+      adapter, socket, opts, direction, connectedHost, connectedPort,
+    );
+    stage = "cluster_config";
+    const session = await createReadyBepSession(
+      adapter, socket, opts, identity.localDeviceId, identity.remoteDeviceIdBytes, leftover, incoming,
+    );
+    try {
+      adapter.log?.("core.bep.cluster_config.wait", { direction, connectedHost, connectedPort });
+      await session.waitForReady();
+      session.startReplicaSync(opts.replicaScanIntervalMs);
+    } catch (error) {
+      // A failed cluster handshake must also retire the BEP session's tasks.
+      void session.close().catch(() => undefined);
+      throw error;
+    }
+    adapter.log?.("core.bep.handshake.ready", {
+      direction, connectedHost, connectedPort, remoteDeviceId: identity.remoteDeviceId,
+    });
+    return bepSessionHandle(session, identity.remoteDeviceId, hello, connectedVia, transportKind, connectionScope);
+  } catch (error) {
+    adapter.log?.("core.bep.handshake.failed", {
+      direction, stage, durationMs: Date.now() - startedAtMs,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
 function bepSessionHandle(
@@ -2895,6 +2942,9 @@ async function openBepSessionOnSocket(
       connectionScope,
     );
   } catch (error) {
+    // On failed BEP negotiation, release the TLS/QUIC handle even if the
+    // remote peer already sent EOF. Aborted attempts also require cleanup.
+    await socket.close().catch(() => undefined);
     if (!signal?.aborted) throw error;
     const abortError = new Error("Connection attempt was cancelled.", { cause: error });
     abortError.name = "AbortError";
@@ -3196,8 +3246,15 @@ class ConnectionAttempt {
             scope: candidate.scope ?? "lan" as const,
           }))
         : [];
+      const rememberedLan = [...this.candidateHealth.values()]
+        .filter(entry => entry.candidate?.protocol === "tcp" &&
+          (entry.candidate.scope ?? connectionScopeForHost(entry.candidate.host ?? "")) === "lan" &&
+          entry.lastAuthenticatedAtMs !== undefined &&
+          this.runtime.now() - entry.lastAuthenticatedAtMs >= 0 &&
+          this.runtime.now() - entry.lastAuthenticatedAtMs < 600_000)
+        .map(entry => entry.candidate!);
       const fast = normalizeDiscoveredCandidates(dedupeCandidates([
-        ...this.manualCandidates(), ...localCandidates,
+        ...this.manualCandidates(), ...localCandidates, ...rememberedLan,
       ]));
       this.selectCandidates(fast);
       this.prepareRace();
@@ -3361,16 +3418,15 @@ class ConnectionAttempt {
   }
 
   private selectCandidates(ordered: DiscoveredCandidate[]) {
-    const direct = this.opts.relayOnly ? [] : ordered.filter(
-      (candidate) =>
-        (candidate.protocol === "tcp" || candidate.protocol === "quic") &&
-        (!this.opts.quicOnly || candidate.protocol === "quic") &&
-        candidate.host &&
-        Number.isFinite(candidate.port) &&
-        (candidate.protocol !== "quic" || this.adapter.connectQuic !== undefined),
+    const ranked = orderCandidatesForReconnect(ordered, this.candidateHealth, this.runtime.now());
+    const direct = this.opts.relayOnly ? [] : ranked.filter(candidate =>
+      (candidate.protocol === "tcp" || candidate.protocol === "quic") &&
+      (!this.opts.quicOnly || candidate.protocol === "quic") &&
+      candidate.host && Number.isFinite(candidate.port) &&
+      (candidate.protocol !== "quic" || this.adapter.connectQuic !== undefined),
     );
-    const relay = this.opts.quicOnly ? [] : ordered.filter(
-      (candidate) => candidate.protocol === "relay",
+    const relay = this.opts.quicOnly ? [] : ranked.filter(candidate =>
+      candidate.protocol === "relay",
     ).sort((left, right) =>
       (this.candidateHealth.get(candidateKey(left))?.cooldownUntilMs ?? 0) -
       (this.candidateHealth.get(candidateKey(right))?.cooldownUntilMs ?? 0));
@@ -3378,15 +3434,23 @@ class ConnectionAttempt {
       directCandidates: direct,
       relayCandidates: relay,
     });
+    this.adapter.log?.("core.discovery.candidate.order", {
+      directCandidateCount: direct.length,
+      priorSuccessCount: direct.filter(candidate => {
+        const authenticatedAt = this.candidateHealth.get(candidateKey(candidate))?.lastAuthenticatedAtMs;
+        return authenticatedAt !== undefined && this.runtime.now() - authenticatedAt < 600_000;
+      }).length,
+      cooldownCount: direct.filter(candidate =>
+        (this.candidateHealth.get(candidateKey(candidate))?.cooldownUntilMs ?? 0) > this.runtime.now()).length,
+      ...(direct[0] ? candidateTraceFields(direct[0]) : {}),
+    });
     if (this.connectDeadline === 0) this.connectDeadline = this.runtime.now() + this.totalTimeout;
     this.relayEnabled = this.opts.enableRelayFallback !== false;
     this.relayStartDelayMs = this.relayEnabled && relay.length > 0 && !this.opts.relayOnly
       ? Math.min(2500, Math.max(0, Math.floor(this.totalTimeout * 0.25)))
       : 0;
-    // With many advertised endpoints, an 8-second minimum per bad address
-    // exhausts the whole connection deadline before the working path is
-    // attempted. Budget time per parallel wave instead; preserve the
-    // existing longer handshake allowance when there are only 1–3 choices.
+    // Bound each wave when discovery returns many dead endpoints. The healthy
+    // last-known-good LAN address and non-cooling candidates are tried first.
     const crowded = direct.length > 3;
     this.perCandidateTimeout = crowded
       ? Math.max(2000, Math.min(8000,
@@ -3399,11 +3463,12 @@ class ConnectionAttempt {
       relayStartDelayMs: this.relayStartDelayMs,
       directCandidateCount: direct.length,
       relayCandidateCount: relay.length,
-      orderedCandidates: ordered.map((candidate) => describeCandidate(candidate)),
+      orderedCandidates: ranked.map(describeCandidate),
     });
     this.directCandidates = direct;
     this.relayCandidates = relay;
   }
+
 
   private prepareRace() {
     if (this.signal?.aborted) this.abortRace();
@@ -3501,8 +3566,8 @@ class ConnectionAttempt {
       ),
       candidateTimeoutMs,
     );
-    trackCandidateSession(this.candidateHealth, candidate, session, this.runtime.now);
     const winner = await this.claimSession(session);
+    trackCandidateSession(this.candidateHealth, candidate, winner, this.runtime.now);
     this.adapter.log?.("core.discovery.candidate.connected", {
       ...candidateTraceFields(candidate),
       candidateOrdinal,
@@ -3752,12 +3817,30 @@ export function createSyncpeerCoreClient(
   runtimeInput?: { now?: () => number; sleep?: (ms: number, signal?: AbortSignal) => Promise<void> },
 ): SyncpeerCoreClient {
   const candidateHealth = new Map<string, CandidateHealth>();
+  let lastExpectedDeviceId: string | undefined;
   const runtime: CandidateRuntime = {
     now: runtimeInput?.now ?? Date.now,
     sleep: runtimeInput?.sleep ?? waitMs,
   };
   return {
     openSession: async (options: SyncpeerConnectOptions, signal?: AbortSignal) => {
+      // Endpoint hints are never shared across peers or anonymous connections.
+      if (!options.expectedDeviceId || lastExpectedDeviceId !== options.expectedDeviceId) {
+        candidateHealth.clear();
+        lastExpectedDeviceId = options.expectedDeviceId;
+      }
+      // Avoid retaining obsolete endpoint metadata indefinitely while keeping
+      // recent successful addresses and active cooldowns for the next retry.
+      const nowMs = runtime.now();
+      for (const [key, entry] of candidateHealth) {
+        if ((entry.lastAuthenticatedAtMs ?? 0) < nowMs - 600_000 &&
+          entry.cooldownUntilMs <= nowMs) candidateHealth.delete(key);
+      }
+      while (candidateHealth.size > 128) {
+        const oldest = candidateHealth.keys().next().value;
+        if (oldest === undefined) break;
+        candidateHealth.delete(oldest);
+      }
       try {
         return await openSession(adapter, options, candidateHealth, runtime, signal);
       } catch (error) {

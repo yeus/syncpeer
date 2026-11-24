@@ -420,6 +420,29 @@ const initialFolderState = await fakeSession.remoteFs.getFolderSyncState("docume
 assert.equal(initialFolderState?.indexReceived, true);
 await fakeSession.close();
 
+// Peers can finish TLS then close before BEP Hello (e.g. after device reset).
+// A failed candidate must always retire the native TLS handle.
+let failedBepSocketCloses = 0;
+const failedBepStages: Array<{ event: string; stage?: unknown }> = [];
+const failedBepClient = createSyncpeerCoreClient({
+  connectTls: async () => ({
+    peerCertificateDer: async () => new Uint8Array([4, 5, 6]),
+    write: async () => undefined,
+    read: async () => { throw new Error("Connection closed"); },
+    close: async () => { failedBepSocketCloses += 1; },
+  }),
+  sha256: data => new Uint8Array(createHash("sha256").update(data).digest()),
+  randomBytes: size => new Uint8Array(size),
+  log: (event, fields) => failedBepStages.push({ event, stage: fields?.stage }),
+});
+await assert.rejects(failedBepClient.openSession({
+  host: "127.0.0.1", port: 22000, certPem: fakeCertificate,
+  keyPem: fakeCertificate, deviceName: "reset-identity", discoveryMode: "direct",
+}), /Connection closed/);
+assert.equal(failedBepSocketCloses, 1, "A failed BEP Hello must close its authenticated TLS socket");
+assert.equal(failedBepStages.some(item => item.event === "core.bep.handshake.failed" &&
+  item.stage === "hello_exchange"), true);
+
 // Connection readiness must not wait for an initial replica receive that can
 // block on a remote file request. The receive may continue after BEP handshake.
 let releaseReceive!: () => void;

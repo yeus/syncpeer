@@ -52,6 +52,28 @@ test("native download completes without WebView chunk polling, into an encrypted
   assert.deepEqual(events, ["begin", "write:3", "commit"]);
   assert.equal(status.at(-1)?.transferredBytes, 3);
 });
+test("download diagnostics distinguish queue, lookup, network progress, encrypted writes and commit without leaking identities", async () => {
+  const { documents, remote } = fixture();
+  const diagnostics: Array<{ stage: string; durationMs?: number; bytes?: number; totalBytes?: number;
+    networkBytes?: number; storageMs?: number }> = [];
+  const status: ServiceTransferProgress[] = [];
+  const executor = createServiceTransferJobs({
+    documents, remoteFs: () => remote,
+    progress: value => { status.push(value); },
+    diagnostic: detail => { diagnostics.push(detail); },
+  });
+  executor.start(job("12345678-9876"));
+  await wait(() => status.some(value => value.phase === "completed"));
+  const stages = diagnostics.map(value => value.stage);
+  for (const expected of ["queue_wait", "local_preflight", "remote_lookup", "draft_open",
+    "first_bytes", "storage_write", "draft_commit", "finished"]) {
+    assert.ok(stages.includes(expected), `Missing ${expected} diagnostic: ${stages.join(", ")}`);
+  }
+  assert.equal(diagnostics.find(value => value.stage === "finished")?.bytes, 3);
+  assert.ok(diagnostics.every(value =>
+    Object.keys(value).every(key => !["folderId", "path", "peerId", "jobId"].includes(key))));
+});
+
 
 test("duplicate native job ID does not launch a second download", async () => {
   const { executor, status, events } = fixture();

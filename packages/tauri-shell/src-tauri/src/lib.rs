@@ -1070,7 +1070,9 @@ fn verify_hostname_against_cert(cert_der: &[u8], host: &str) -> Result<(), Strin
 }
 
 const APP_STORAGE_FORMAT_FILE: &str = ".syncpeer-storage-format.json";
-const APP_STORAGE_FORMAT_VERSION: u64 = 1;
+// Bump whenever the persisted app-private storage schema, identity binding,
+// encryption layout or on-disk semantics change. No pre-1.0 migrations.
+const APP_STORAGE_FORMAT_VERSION: u64 = 2;
 const PRIVATE_STORAGE_UNRECOGNIZED: &str = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED";
 
 fn private_storage_unrecognized(detail: &str) -> String {
@@ -1105,11 +1107,17 @@ fn app_storage_marker_is_current(path: &Path) -> Result<bool, String> {
         describe_storage_failure("Private storage marker could not be read", error)
     })?)
     .map_err(|_| private_storage_unrecognized("the storage format marker is invalid"))?;
-    Ok(
-        marker.get("owner").and_then(serde_json::Value::as_str) == Some("syncpeer")
-            && marker.get("version").and_then(serde_json::Value::as_u64)
-                == Some(APP_STORAGE_FORMAT_VERSION),
-    )
+    if marker.get("owner").and_then(serde_json::Value::as_str) != Some("syncpeer") {
+        return Err(private_storage_unrecognized("invalid storage format owner"));
+    }
+    let found = marker.get("version").and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| private_storage_unrecognized("missing or invalid storage format version"))?;
+    if found != APP_STORAGE_FORMAT_VERSION {
+        return Err(private_storage_unrecognized(&format!(
+            "stored storage format v{found} is incompatible with required v{APP_STORAGE_FORMAT_VERSION}"
+        )));
+    }
+    Ok(true)
 }
 
 fn secure_app_data_root(root: &Path) -> Result<(), String> {
@@ -5788,15 +5796,18 @@ mod tests {
     }
 
     #[test]
-    fn private_storage_rejects_an_unknown_format_version() {
+    fn private_storage_rejects_incompatible_version_without_modification() {
         let root = tempfile::tempdir().unwrap();
-        fs::write(
-            root.path().join(APP_STORAGE_FORMAT_FILE),
-            r#"{"owner":"syncpeer","version":999}"#,
-        )
-        .unwrap();
+        let marker = root.path().join(APP_STORAGE_FORMAT_FILE);
+        let old = r#"{"owner":"syncpeer","version":1}"#;
+        fs::write(&marker, old).unwrap();
+        let saved = root.path().join("my-identity");
+        fs::write(&saved, b"unchanged").unwrap();
         let error = prepare_app_data_root(root.path()).unwrap_err();
         assert!(error.starts_with(PRIVATE_STORAGE_UNRECOGNIZED));
+        assert!(error.contains("stored storage format v1 is incompatible with required v2"));
+        assert_eq!(fs::read_to_string(marker).unwrap(), old);
+        assert_eq!(fs::read(saved).unwrap(), b"unchanged");
     }
 
     #[test]

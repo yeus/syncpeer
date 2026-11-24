@@ -12,10 +12,12 @@ const rawErrorText = (error: unknown): string => {
 
 const errorText = (error: unknown): string => rawErrorText(error).toLowerCase();
 const privateStorageUnrecognized = "syncpeer_private_storage_unrecognized";
-const privateStorageResetMessage =
-  "Syncpeer found existing data in its private local storage, but this version cannot recognize or safely use it. " +
+const privateStorageResetConsequences =
   "You can reset Syncpeer's private local data and start fresh. This removes local settings, downloaded copies, " +
   "unsynced edits, and this device's identity. External folders and other devices are not changed.";
+const privateStorageResetMessage =
+  "Syncpeer found existing data in its private local storage, but this version cannot recognize or safely use it. " +
+  privateStorageResetConsequences;
 
 /** Plain-language explanation for a reinstall that left cache data without its key. */
 export const previousInstallationStorageNotice = {
@@ -94,7 +96,10 @@ const storageFailureReason = (error: unknown): string | null => {
 
 export const documentStoragePreparationIssue = (folderCount: number, error?: unknown) => {
   if (errorText(error).includes(privateStorageUnrecognized)) {
-    return { message: privateStorageResetMessage, canResetPrivateStorage: true };
+    const versionMatch = errorText(error).match(/stored storage format v(\d{1,8}) is incompatible with required v(\d{1,8})/);
+    return { message: versionMatch
+      ? `Syncpeer storage format v${versionMatch[1]} is incompatible with this build (requires v${versionMatch[2]}). ${privateStorageResetConsequences}`
+      : privateStorageResetMessage, canResetPrivateStorage: true };
   }
   if (errorText(error).includes("existing metadata requires")) {
     return { message: previousInstallationResetMessage, canResetPrivateStorage: true };

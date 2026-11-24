@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   documentStoragePreparationIssue,
@@ -119,6 +120,25 @@ test("offers a private-data reset for unrecognized app-owned storage", () => {
       "unsynced edits, and this device's identity. External folders and other devices are not changed.",
   );
 });
+test("storage versions stay in sync across Rust and Kotlin", () => {
+  const rust = readFileSync(new URL("../packages/tauri-shell/src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const kotlin = readFileSync(new URL("../packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/PrivateStorageFormat.kt", import.meta.url), "utf8");
+  const rustVersion = Number(rust.match(/const APP_STORAGE_FORMAT_VERSION: u64 = (\d+);/)?.[1]);
+  const androidVersion = Number(kotlin.match(/internal const val privateStorageFormatVersion = (\d+)/)?.[1]);
+  assert.ok(Number.isInteger(rustVersion) && rustVersion >= 2);
+  assert.equal(androidVersion, rustVersion, "Bump Kotlin and Rust together on every incompatible storage change");
+});
+
+test("incompatible storage version gives an explicit v1 to v2 reset path", () => {
+  const issue = documentStoragePreparationIssue(0, new Error(
+    "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED: stored storage format v1 is incompatible with required v2",
+  ));
+  assert.equal(issue.canResetPrivateStorage, true);
+  assert.match(issue.message, /storage format v1 is incompatible with this build \(requires v2\)/);
+  assert.match(issue.message, /reset Syncpeer's private local data/);
+  assert.match(issue.message, /External folders and other devices are not changed/);
+});
+
 
 test("explains leftover data from a previous installation in plain language", () => {
   assert.deepEqual(previousInstallationStorageNotice, {

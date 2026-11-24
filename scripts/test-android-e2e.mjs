@@ -3388,7 +3388,7 @@ const runAndroidLocalResetAcceptance = async () => {
         return "issued";
       })()`);
     } catch (error) {
-      if (!/CDP connection failed|WebSocket.*closed|Target closed/i.test(String(error))) throw error;
+      if (!/CDP connection failed|CDP connection closed|WebSocket.*closed|Target closed/i.test(String(error))) throw error;
     }
     await waitForPackageStopped(45_000);
     cdp.close();
@@ -3407,6 +3407,70 @@ const runAndroidLocalResetAcceptance = async () => {
     runAdb(["shell", "rm", "-f", outside]);
   }
 };
+/** Confirm native storage-format detection and reset without using a real phone. */
+const runAndroidStorageFormatResetAcceptance = async () => {
+  if (process.env.SYNCPEER_ANDROID_RESET_EMULATOR !== "1" ||
+    runAdb(["shell", "getprop", "ro.kernel.qemu"]).trim() !== "1") {
+    throw new Error("Storage-format reset acceptance requires a disposable emulator.");
+  }
+  const marker = "no_backup/syncpeer/.syncpeer-storage-format.json";
+  const outside = "/sdcard/Download/syncpeer-storage-version-acceptance.txt";
+  runAdb(["shell", "touch", outside]);
+  let cdp = await launchAndroidApp(true);
+  try {
+    await ensurePeerDocumentVault(cdp);
+    const previousId = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+    if (typeof previousId !== "string" || !previousId) throw new Error("Missing fixture identity.");
+    cdp.close();
+    runAdb(["shell", "am", "force-stop", packageName]);
+    await waitForPackageStopped();
+    // Change only the test fixture marker, not the protected profile or key.
+    runAdb(["shell", "run-as", packageName, "sed", "-i", "s/:2}/:1}/", marker]);
+    const originalMarker = runAdb(["shell", "run-as", packageName, "cat", marker]);
+    if (!originalMarker.includes('"version":1')) throw new Error("Format v1 fixture was not installed.");
+    cdp = await launchAndroidApp();
+    try {
+      await waitForUiCondition(cdp,
+        'Boolean(document.querySelector("[data-testid=reset-unrecognized-private-storage]"))',
+        "version mismatch recovery action", 20_000);
+    } catch (error) {
+      const state = await cdp.evaluate('({ message: document.querySelector(".error-banner-panel")?.textContent ?? "", body: document.body?.innerText?.slice(0, 700) ?? "" })');
+      let nativeError = "none";
+      try { await tauriInvoke(cdp, "syncpeer_document_command", { request: { operation: "status" } }); }
+      catch (failure) { nativeError = String(failure).slice(0, 300); }
+      throw new Error(`Mismatch recovery UI absent: ${JSON.stringify(state)}; native: ${nativeError}`, { cause: error });
+    }
+    const message = await cdp.evaluate('document.querySelector(".error-banner-panel")?.textContent ?? ""');
+    if (!/format v1/.test(message) || !/requires v2/.test(message)) {
+      throw new Error("Storage mismatch did not include both format versions.");
+    }
+    if (runAdb(["shell", "run-as", packageName, "cat", marker]) !== originalMarker) {
+      throw new Error("Startup silently rewrote incompatible storage.");
+    }
+    // The native reset closes the process; only test a pre-confirmed action.
+    try {
+      await cdp.evaluate('(() => { const invoke = globalThis.__TAURI__?.core?.invoke ?? globalThis.__TAURI_INTERNALS__?.invoke; if (!invoke) throw new Error("Native reset unavailable"); void invoke("syncpeer_reset_local_data", { confirmation: "RESET LOCAL DATA" }).catch(() => {}); return true; })()');
+    } catch (error) {
+      if (!/CDP connection failed|CDP connection closed|WebSocket.*closed|Target closed/i.test(String(error))) throw error;
+    }
+    await waitForPackageStopped(45_000);
+    cdp.close();
+    cdp = await launchAndroidApp();
+    await waitForUiCondition(cdp,
+      'Boolean(document.querySelector("[data-testid=device-name-onboarding]"))',
+      "fresh onboarding after incompatible-storage reset", 90_000);
+    const replacement = await tauriInvoke(cdp, "syncpeer_get_default_device_id");
+    if (!replacement || replacement === previousId) throw new Error("Reset retained old identity.");
+    if (!runAdb(["shell", "ls", outside]).includes("syncpeer-storage-version-acceptance.txt")) {
+      throw new Error("Reset affected external storage.");
+    }
+    console.log("Android v1/v2 incompatibility, recovery UI, confirmed reset and fresh identity E2E passed.");
+  } finally {
+    cdp.close();
+    runAdb(["shell", "rm", "-f", outside]);
+  }
+};
+
 
 const main = async () => {
   runAdb(["wait-for-device"], 60_000);
@@ -3441,6 +3505,10 @@ const main = async () => {
   }
   if (hasArgument("--onboarding-smoke")) {
     await runAndroidOnboardingSmoke();
+    return;
+  }
+  if (hasArgument("--storage-format-reset")) {
+    await runAndroidStorageFormatResetAcceptance();
     return;
   }
   if (hasArgument("--local-reset-acceptance")) {

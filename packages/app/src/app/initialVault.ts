@@ -6,7 +6,9 @@ export async function readInitialVaultStatus<T>(
   for (let attempt = 0; attempt < 4; attempt++) {
     try { return await read(); }
     catch (error) {
-      if (attempt === 3) throw error;
+      // Format incompatibility is permanent until a confirmed reset. Retrying
+      // cannot repair it, and hides the actionable version error on startup.
+      if (String(error).includes("SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED") || attempt === 3) throw error;
       await pause(250 * (attempt + 1));
     }
   }

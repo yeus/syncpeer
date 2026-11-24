@@ -34,6 +34,7 @@ struct ReplicaRootGuard {
     path: PathBuf,
     identity: String,
     marker: Option<String>,
+    app_private_profile: bool,
 }
 
 fn file_identity(metadata: &Metadata) -> io::Result<String> {
@@ -56,6 +57,43 @@ fn marker_identity(root: &Dir) -> io::Result<Option<String>> {
         Ok(_) => Err(invalid("Invalid replica folder marker")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+const PROFILE_MARKER_PATH: &str = ".stfolder/.syncpeer-profile-id";
+
+/// App-private profiles use a random persistent marker rather than filesystem
+/// inode numbers. Inodes change on legitimate directory copies and restores.
+/// Other (user-selected) replica folders retain their strict inode checks.
+fn profile_marker_identity(root: &Dir) -> io::Result<Option<String>> {
+    if marker_identity(root)?.is_none() {
+        return Ok(None);
+    }
+    match root.symlink_metadata(PROFILE_MARKER_PATH) {
+        Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {
+            let token = root.read(PROFILE_MARKER_PATH)?;
+            if token.len() != 32 {
+                return Err(invalid("Invalid app-private profile marker"));
+            }
+            Ok(Some(format!(
+                "profile-v1:{}",
+                token
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )))
+        }
+        Ok(_) => Err(invalid("Invalid app-private profile marker")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn registered_marker_identity(root: &Dir, app_private_profile: bool) -> io::Result<Option<String>> {
+    if app_private_profile {
+        profile_marker_identity(root)
+    } else {
+        marker_identity(root)
     }
 }
 
@@ -102,6 +140,8 @@ pub(crate) fn storage_failure_category(message: &str) -> &'static str {
         "metadata-key-mismatch"
     } else if message.contains("metadata key check is missing") {
         "metadata-key-check-missing"
+    } else if message.contains("Invalid app-private profile marker") {
+        "profile-marker-invalid"
     } else if message.contains("Replica folder marker unavailable or replaced") {
         "replica-marker-mismatch"
     } else if message.contains("selected folder identity changed")
@@ -118,8 +158,6 @@ pub(crate) fn storage_failure_category(message: &str) -> &'static str {
         "metadata-integrity"
     } else if message.contains("Replica root is busy") || message.contains("already locked") {
         "replica-lock"
-    } else if message.contains("Invalid legacy") || message.contains("Legacy metadata") {
-        "legacy-migration"
     } else if message.contains("Metadata database:") {
         "metadata-database"
     } else if message.contains("Permission denied") || message.contains("permission denied") {
@@ -219,82 +257,7 @@ impl ReplicaRoots {
         }
         let id = self.register(path)?;
         self.metadata_prefixes.insert(id, prefixes);
-        let migration = self.migrate_metadata(id);
-        if migration.is_err() {
-            let _ = self.release(id);
-        }
-        migration?;
         Ok(id)
-    }
-
-    fn migrate_metadata(&mut self, id: u64) -> io::Result<()> {
-        self.acquire(id)?;
-        let result = (|| {
-            let root = self.root(id)?;
-            let db = self
-                .metadata
-                .get(&id)
-                .ok_or_else(|| invalid("Metadata unavailable"))?;
-            if root.try_exists(".syncpeer-folder-lock")? {
-                return Err(invalid(
-                    "Legacy Node folder lock exists; stop older writers before migration",
-                ));
-            }
-            let legacy_lock = if root.try_exists(".syncpeer-replica.lock")? {
-                check_relative(root, ".syncpeer-replica.lock")?;
-                let file = root
-                    .open_with(
-                        ".syncpeer-replica.lock",
-                        OpenOptions::new().read(true).write(true),
-                    )?
-                    .into_std();
-                fs2::FileExt::try_lock_exclusive(&file)?;
-                Some(file)
-            } else {
-                None
-            };
-            for entry in root.entries()? {
-                let entry = entry?;
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| invalid("Invalid metadata filename"))?;
-                if !self.is_metadata(id, &name) {
-                    continue;
-                }
-                check_relative(root, &name)?;
-                let info = entry.metadata()?;
-                if !info.is_file() || info.len() > 64 * 1024 * 1024 {
-                    return Err(invalid("Invalid legacy metadata record"));
-                }
-                let original = revision(&info);
-                let bytes = root.read(&name)?;
-                if db.get("private", &name)?.is_none() {
-                    db.put("private", &name, &bytes, 0)?;
-                }
-                // An interrupted migration may leave a legacy file. Reject ambiguity instead of restoring stale state.
-                if db.get("private", &name)?.as_deref() != Some(bytes.as_slice())
-                    || current_revision(root, &name)?.as_deref() != Some(&original)
-                {
-                    return Err(invalid(
-                        "Legacy metadata differs from committed SQLite record",
-                    ));
-                }
-                root.remove_file(&name)?;
-                flush_parents(root, &name)?;
-            }
-            if root.try_exists(".syncpeer-folder-marker")? {
-                root.remove_file(".syncpeer-folder-marker")?;
-                flush_parents(root, ".syncpeer-folder-marker")?;
-            }
-            if legacy_lock.is_some() {
-                root.remove_file(".syncpeer-replica.lock")?;
-                flush_parents(root, ".syncpeer-replica.lock")?;
-            }
-            Ok(())
-        })();
-        self.unlock(id)?;
-        result
     }
 
     pub fn register(&mut self, path: &Path) -> io::Result<u64> {
@@ -307,26 +270,29 @@ impl ReplicaRoots {
         if self.metadata_root.as_os_str().is_empty() {
             return Err(invalid("Metadata root is not configured"));
         }
+        // A private profile is bound to the protected SQLCipher database and
+        // a durable random marker, not the inode of its parent directory.
+        // App data copied to new storage must not strand the peer roster.
+        let app_profile = self
+            .metadata_root
+            .parent()
+            .and_then(|private| private.join("documents/profile").canonicalize().ok());
+        let app_private_profile = app_profile.as_deref() == Some(path);
+        let root_identity = if app_private_profile {
+            "syncpeer-private-profile-v1".to_owned()
+        } else {
+            file_identity(&root.dir_metadata()?)?
+        };
         let db = MetadataDatabase::open(
             &self.metadata_root,
             path,
-            &file_identity(&root.dir_metadata()?)?,
+            &root_identity,
             self.metadata_key
                 .as_ref()
                 .ok_or_else(|| invalid("Protected metadata key is unavailable"))?,
         )?;
         let expected = db.get("marker", "identity")?;
-        let mut marker = marker_identity(&root)?;
-        if marker.is_none() && expected.is_none() {
-            if let Ok(legacy) = root.symlink_metadata(".syncpeer-folder-marker") {
-                if !legacy.is_file() || legacy.is_symlink() {
-                    return Err(invalid("Invalid legacy marker"));
-                }
-                root.create_dir(".stfolder")?;
-                flush_parents(&root, ".stfolder")?;
-                marker = marker_identity(&root)?;
-            }
-        }
+        let marker = registered_marker_identity(&root, app_private_profile)?;
         if let Some(expected) = expected {
             if marker.as_ref().map(|value| value.as_bytes()) != Some(expected.as_slice()) {
                 return Err(invalid("Replica folder marker unavailable or replaced"));
@@ -344,6 +310,7 @@ impl ReplicaRoots {
                 path: path.to_path_buf(),
                 identity: file_identity(&root.dir_metadata()?)?,
                 marker,
+                app_private_profile,
             },
         );
         self.roots.insert(self.next, root);
@@ -385,7 +352,11 @@ impl ReplicaRoots {
 
     fn check_health(&self, id: u64) -> io::Result<()> {
         let root = self.root(id)?;
-        let marker = marker_identity(root)?;
+        let app_private_profile = self
+            .guards
+            .get(&id)
+            .is_some_and(|guard| guard.app_private_profile);
+        let marker = registered_marker_identity(root, app_private_profile)?;
         if marker.is_none() || marker != self.guards.get(&id).and_then(|guard| guard.marker.clone())
         {
             return Err(invalid("Replica folder marker unavailable or replaced"));
@@ -461,20 +432,58 @@ impl ReplicaRoots {
         self.acquire(id)?;
         let result = (|| {
             let root = self.root(id)?;
-            if let Some(marker) = marker_identity(root)? {
+            let app_private_profile = self
+                .guards
+                .get(&id)
+                .is_some_and(|guard| guard.app_private_profile);
+            if let Some(marker) = registered_marker_identity(root, app_private_profile)? {
                 self.guards.get_mut(&id).unwrap().marker = Some(marker);
                 return Ok(());
             }
-            // Initialization is explicit and only safe for an otherwise empty root.
-            for entry in root.entries()? {
-                if entry?.file_name() != ".syncpeer-replica.lock" {
-                    return Err(invalid("Replica initialization requires an empty folder"));
-                }
+            // No silent replacement of a previously initialized profile.
+            if self
+                .metadata
+                .get(&id)
+                .ok_or_else(|| invalid("Metadata unavailable"))?
+                .get("marker", "identity")?
+                .is_some()
+            {
+                return Err(invalid("Protected profile marker is missing"));
             }
-            root.create_dir(".stfolder")?;
+            // Allow an interrupted first-ever profile initialization to finish
+            // after .stfolder was created but before the random token was saved.
+            let mut has_marker_directory = false;
+            for entry in root.entries()? {
+                if app_private_profile && entry?.file_name() == ".stfolder" {
+                    has_marker_directory = true;
+                    continue;
+                }
+                return Err(invalid("Replica initialization requires an empty folder"));
+            }
+            if has_marker_directory {
+                if root.read_dir(".stfolder")?.next().is_some() {
+                    return Err(invalid("Incomplete profile marker has unexpected files"));
+                }
+            } else {
+                root.create_dir(".stfolder")?;
+            }
+            if app_private_profile {
+                let mut token = [0u8; 32];
+                getrandom::getrandom(&mut token)
+                    .map_err(|_| invalid("Could not create protected profile marker"))?;
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                let result = (|| {
+                    let mut file = root.open_with(PROFILE_MARKER_PATH, &options)?;
+                    file.write_all(&token)?;
+                    file.sync_all()
+                })();
+                token.fill(0);
+                result?;
+            }
             root.open(".stfolder")?.sync_all()?;
             flush_parents(root, ".stfolder")?;
-            let marker = marker_identity(root)?;
+            let marker = registered_marker_identity(root, app_private_profile)?;
             self.metadata
                 .get(&id)
                 .ok_or_else(|| invalid("Metadata unavailable"))?
@@ -1573,17 +1582,30 @@ mod tests {
 
     #[test]
     fn storage_failure_categories_never_echo_private_error_text() {
-        assert_eq!(storage_failure_category(
-            "Metadata database: metadata key does not match this installation"
-        ), "metadata-key-mismatch");
-        assert_eq!(storage_failure_category(
-            "Metadata database: selected folder identity changed"
-        ), "root-identity-mismatch");
-        assert_eq!(storage_failure_category(
-            "Metadata database: disk image malformed /data/user/0/private"
-        ), "metadata-database");
-        assert_eq!(storage_failure_category("Replica root is busy"), "replica-lock");
-        assert_eq!(storage_failure_category("secret /data/user/0/foo key=abc"), "other");
+        assert_eq!(
+            storage_failure_category(
+                "Metadata database: metadata key does not match this installation"
+            ),
+            "metadata-key-mismatch"
+        );
+        assert_eq!(
+            storage_failure_category("Metadata database: selected folder identity changed"),
+            "root-identity-mismatch"
+        );
+        assert_eq!(
+            storage_failure_category(
+                "Metadata database: disk image malformed /data/user/0/private"
+            ),
+            "metadata-database"
+        );
+        assert_eq!(
+            storage_failure_category("Replica root is busy"),
+            "replica-lock"
+        );
+        assert_eq!(
+            storage_failure_category("secret /data/user/0/foo key=abc"),
+            "other"
+        );
     }
 
     #[test]
@@ -1605,16 +1627,20 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_private_records_migrate_and_failed_replacements_keep_old_bytes() {
+    fn sqlite_private_records_persist_and_failed_replacements_keep_old_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join(".syncpeer-folder-marker"), b"").unwrap();
-        std::fs::write(temp.path().join(".syncpeer-test-record"), [1, 2, 3]).unwrap();
         let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
         let id = roots
             .register_metadata(temp.path(), vec![".syncpeer-test-".into()])
             .unwrap();
         roots.initialize_replica(id).unwrap();
+        roots
+            .metadata
+            .get(&id)
+            .unwrap()
+            .put("private", ".syncpeer-test-record", &[1, 2, 3], 0)
+            .unwrap();
         assert!(!temp.path().join(".syncpeer-test-record").exists());
         assert!(temp.path().join(".stfolder").exists());
         assert_eq!(
@@ -1645,6 +1671,156 @@ mod tests {
         assert_eq!(
             roots.read(id, ".syncpeer-test-record", 0, 3).unwrap(),
             [4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn old_inode_bound_profile_is_rejected_without_migration_or_data_loss() {
+        let private = tempfile::tempdir().unwrap();
+        let metadata = private.path().join("metadata");
+        let profile = private.path().join("documents/profile");
+        std::fs::create_dir_all(profile.join(".stfolder")).unwrap();
+        let root = Dir::open_ambient_dir(&profile, cap_std::ambient_authority()).unwrap();
+        let old_root = file_identity(&root.dir_metadata().unwrap()).unwrap();
+        let old_marker = marker_identity(&root).unwrap().unwrap();
+        let key = [7u8; 32];
+        {
+            let db = MetadataDatabase::open(&metadata, &profile, &old_root, &key).unwrap();
+            db.put("marker", "identity", old_marker.as_bytes(), 0)
+                .unwrap();
+            db.put("private", ".syncpeer-ui-state", b"keep-record", 0)
+                .unwrap();
+        }
+        assert!(ReplicaRoots::new(metadata.clone(), key)
+            .register_metadata(&profile, vec![".syncpeer-".into()])
+            .is_err());
+        assert!(!profile.join(PROFILE_MARKER_PATH).exists());
+        let db = MetadataDatabase::open(&metadata, &profile, &old_root, &key).unwrap();
+        assert_eq!(
+            db.get("private", ".syncpeer-ui-state").unwrap().unwrap(),
+            b"keep-record"
+        );
+        assert_eq!(
+            db.get("system", "root").unwrap().unwrap(),
+            old_root.as_bytes()
+        );
+    }
+
+    #[test]
+    fn app_private_profile_configuration_survives_new_directory_inodes() {
+        let private = tempfile::tempdir().unwrap();
+        let metadata = private.path().join("metadata");
+        let profile = private.path().join("documents/profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let key = [7u8; 32];
+        let mut roots = ReplicaRoots::new(metadata.clone(), key);
+        let id = roots
+            .register_metadata(&profile, vec![".syncpeer-".into()])
+            .unwrap();
+        roots.initialize_replica(id).unwrap();
+        roots
+            .metadata
+            .get(&id)
+            .unwrap()
+            .put(
+                "private",
+                ".syncpeer-ui-state",
+                b"new-peers-must-persist",
+                0,
+            )
+            .unwrap();
+        let original_token = std::fs::read(profile.join(PROFILE_MARKER_PATH)).unwrap();
+        drop(roots);
+
+        // A filesystem copy changes both root and .stfolder inodes. Only
+        // the durable marker content, not those inode numbers, is significant.
+        let old = private.path().join("old");
+        std::fs::rename(&profile, &old).unwrap();
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::create_dir(profile.join(".stfolder")).unwrap();
+        std::fs::copy(
+            old.join(PROFILE_MARKER_PATH),
+            profile.join(PROFILE_MARKER_PATH),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(profile.join(PROFILE_MARKER_PATH)).unwrap(),
+            original_token
+        );
+        let mut reopened = ReplicaRoots::new(metadata.clone(), key);
+        let id = reopened
+            .register_metadata(&profile, vec![".syncpeer-".into()])
+            .unwrap();
+        reopened.check_health(id).unwrap();
+        assert_eq!(
+            reopened
+                .metadata
+                .get(&id)
+                .unwrap()
+                .get("private", ".syncpeer-ui-state")
+                .unwrap()
+                .unwrap(),
+            b"new-peers-must-persist"
+        );
+        drop(reopened);
+
+        let mut again = ReplicaRoots::new(metadata, key);
+        again
+            .register_metadata(&profile, vec![".syncpeer-".into()])
+            .unwrap();
+    }
+
+    #[test]
+    fn missing_or_modified_profile_marker_never_replaces_existing_configuration() {
+        let private = tempfile::tempdir().unwrap();
+        let metadata = private.path().join("metadata");
+        let profile = private.path().join("documents/profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let mut roots = ReplicaRoots::new(metadata.clone(), [7u8; 32]);
+        let id = roots.register_metadata(&profile, vec![]).unwrap();
+        roots.initialize_replica(id).unwrap();
+        roots
+            .metadata
+            .get(&id)
+            .unwrap()
+            .put("private", "roster", b"preserve", 0)
+            .unwrap();
+        drop(roots);
+        let original = std::fs::read(profile.join(PROFILE_MARKER_PATH)).unwrap();
+        std::fs::write(profile.join(PROFILE_MARKER_PATH), [9u8; 32]).unwrap();
+        let mut reopening = ReplicaRoots::new(metadata.clone(), [7u8; 32]);
+        assert!(reopening.register_metadata(&profile, vec![]).is_err());
+        std::fs::remove_file(profile.join(PROFILE_MARKER_PATH)).unwrap();
+        assert!(reopening.register_metadata(&profile, vec![]).is_err());
+        // No automatic reinitialization or removal of existing encrypted data.
+        std::fs::write(profile.join(PROFILE_MARKER_PATH), original).unwrap();
+        let id = reopening.register_metadata(&profile, vec![]).unwrap();
+        assert_eq!(
+            reopening
+                .metadata
+                .get(&id)
+                .unwrap()
+                .get("private", "roster")
+                .unwrap()
+                .unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn interrupted_first_profile_init_completes_without_migration() {
+        let private = tempfile::tempdir().unwrap();
+        let metadata = private.path().join("metadata");
+        let profile = private.path().join("documents/profile");
+        std::fs::create_dir_all(profile.join(".stfolder")).unwrap();
+        let mut roots = ReplicaRoots::new(metadata, [7u8; 32]);
+        let id = roots.register_metadata(&profile, vec![]).unwrap();
+        roots.initialize_replica(id).unwrap();
+        assert_eq!(
+            std::fs::read(profile.join(PROFILE_MARKER_PATH))
+                .unwrap()
+                .len(),
+            32
         );
     }
 

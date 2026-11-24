@@ -5,9 +5,13 @@ import java.io.File
 internal const val PRIVATE_STORAGE_FORMAT_FILE = ".syncpeer-storage-format.json"
 internal const val PRIVATE_STORAGE_UNRECOGNIZED = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED"
 private const val privateStorageDirectory = "syncpeer"
-private const val privateStorageFormatVersion = 1
-private val currentMarker = Regex(
-  """\s*\{\s*"owner"\s*:\s*"syncpeer"\s*,\s*"version"\s*:\s*$privateStorageFormatVersion\s*\}\s*""",
+// Must match APP_STORAGE_FORMAT_VERSION in native Rust. Update both on any
+// incompatible persisted-storage schema, binding, key or layout change.
+internal const val privateStorageFormatVersion = 2
+// Parse only Syncpeer's canonical local marker; do not trust arbitrary paths or
+// embedded error text. The captured version is safe to show to the user.
+private val knownMarker = Regex(
+  """\s*\{\s*"owner"\s*:\s*"syncpeer"\s*,\s*"version"\s*:\s*([0-9]{1,8})\s*\}\s*""",
 )
 
 private fun unrecognizedPrivateStorage(detail: String): Nothing =
@@ -21,8 +25,11 @@ private fun markerIsCurrent(marker: File): Boolean {
   if (!marker.isFile || isSymbolicLink(marker)) {
     unrecognizedPrivateStorage("the storage format marker is not a regular file")
   }
-  val value = marker.readText()
-  return currentMarker.matches(value)
+  val found = knownMarker.matchEntire(marker.readText())?.groupValues?.get(1)?.toIntOrNull()
+    ?: unrecognizedPrivateStorage("invalid storage format marker")
+  if (found != privateStorageFormatVersion)
+    unrecognizedPrivateStorage("stored storage format v$found is incompatible with required v$privateStorageFormatVersion")
+  return true
 }
 
 // Document runtime and vault secret initialization can race during first launch.

@@ -46,6 +46,25 @@ class PrivateStorageFormatTest {
     } finally { root.deleteRecursively() }
   }
 
+  @Test fun incompatibleStorageVersionIsActionableAndNeverOverwritten() {
+    val root = Files.createTempDirectory("syncpeer-v1-storage").toFile()
+    try {
+      val marker = root.resolve(PRIVATE_STORAGE_FORMAT_FILE)
+      val original = """{"owner":"syncpeer","version":1}"""
+      marker.writeText(original)
+      val saved = root.resolve("keep-my-config")
+      saved.writeText("unchanged")
+      try {
+        preparePrivateStorageRoot(root)
+        fail("Format v1 must not be opened as format v2")
+      } catch (error: IllegalStateException) {
+        assertTrue(error.message.orEmpty().contains("stored storage format v1 is incompatible with required v2"))
+      }
+      assertEquals(original, marker.readText())
+      assertEquals("unchanged", saved.readText())
+    } finally { root.deleteRecursively() }
+  }
+
   @Test fun parallelFirstUsePublishesOneFormatMarker() {
     val androidRoot = Files.createTempDirectory("syncpeer-parallel-no-backup").toFile()
     val executor = java.util.concurrent.Executors.newFixedThreadPool(16)

@@ -1406,14 +1406,13 @@ class DocumentRuntimeService : Service() {
       val safeOperation = operation?.takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other"
       val category = generateSequence(error as Throwable?) { it.cause }
         .take(3).map { it.javaClass.simpleName }.joinToString(",")
+      val failureCategory = (error as? DocumentStorageFailure)?.category
+        ?: documentStorageFailureCategory(error)
       DiagnosticLogJournal.recordNative(applicationContext, "native.document.storage_failed",
         "error", JSONObject().put("method", method).put("operation", safeOperation)
-          .put("exceptionTypes", category)
-          .put("failureCategory", (error as? DocumentStorageFailure)?.category
-            ?: documentStorageFailureCategory(error)))
-      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-        Log.w("SyncpeerRuntime", "storage $method failed: $category")
-      }
+          .put("exceptionTypes", category).put("failureCategory", failureCategory))
+      if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+        Log.w("SyncpeerRuntime", "storage $method/$safeOperation failed: $failureCategory ($category)")
       reply.put("error", privateStorageFailureMessage(error) ?: "Document storage operation failed.")
     }
     return reply.toString()

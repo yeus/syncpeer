@@ -107,6 +107,17 @@ test("initial Android vault status retries transient service startup failures", 
   assert.deepEqual(delays, [250, 500]);
 });
 
+test("incompatible Android storage version fails immediately without retries", async () => {
+  let attempts = 0;
+  let pauses = 0;
+  await assert.rejects(readInitialVaultStatus(async () => {
+    attempts += 1;
+    throw new Error("SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED: stored storage format v1 is incompatible with required v2");
+  }, async () => { pauses += 1; }), /stored storage format v1/);
+  assert.equal(attempts, 1);
+  assert.equal(pauses, 0);
+});
+
 test("unavailable Android vault status fails startup rather than silently skipping provisioning", async () => {
   let attempts = 0;
   await assert.rejects(readInitialVaultStatus(async () => {

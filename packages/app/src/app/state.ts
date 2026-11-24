@@ -451,6 +451,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       isDeviceBackupExpanded: false,
       showRestoreFromBackup: false,
       autoConnectPaused: false,
+      /** Ephemeral startup failure: peer settings must not be modified until recovered. */
+      storageUnavailable: false,
       isAppVisible: true,
       uploadMessage: "",
       uploadProgressActive: false,

@@ -20,9 +20,10 @@ class DocumentByteStorage(metadataPath: String, metadataKey: String) : AutoClose
     if (reply.has("error")) {
       val category = reply.optString("failureCategory").takeIf { it in setOf(
         "metadata-key-mismatch", "metadata-key-check-missing", "replica-marker-mismatch",
-        "root-identity-mismatch", "root-identity-missing", "metadata-schema-unsupported",
-        "metadata-database-missing", "metadata-integrity", "replica-lock",
-        "legacy-migration", "metadata-database", "permission", "missing-file", "other")
+        "root-identity-mismatch", "root-identity-missing", "profile-marker-invalid",
+        "metadata-schema-unsupported", "metadata-database-missing",
+        "metadata-integrity", "replica-lock", "metadata-database",
+        "permission", "missing-file", "other")
       } ?: "other"
       throw DocumentStorageFailure(category)
     }

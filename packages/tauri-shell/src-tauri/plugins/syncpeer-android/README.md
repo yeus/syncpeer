@@ -8,6 +8,25 @@ installation has an empty root; known folders remain visible across peer switche
 and restarts. Inside each folder, only downloaded or locally created content is
 exposed, never placeholder files from the remote index.
 
+### Storage-format compatibility (pre-release)
+
+The app-private root contains `.syncpeer-storage-format.json` with an owner
+and **storage format version 2**. Both Kotlin (`PrivateStorageFormat.kt`)
+and Rust (`APP_STORAGE_FORMAT_VERSION`) must agree. **Bump both whenever an
+incompatible on-disk schema, root-identity method, encryption-key binding,
+folder-marker representation, or storage layout changes**, even when SQLCipher's
+`PRAGMA user_version` (the database *schema* version) remains unchanged.
+The automated parity test rejects divergent implementations.
+
+During pre-release, there is **no automatic migration of incompatible app data**.
+The version gate rejects an old marker *before* opening the encrypted profile,
+displays stored and required versions, and offers a confirmed **Reset local
+Syncpeer data**. Never silently clear the old root. Android's confirmed reset
+uses `ActivityManager.clearApplicationUserData()`; it removes app-owned data,
+including the device identity and unsynced changes, but not external selected
+folders. Real-user migrations can be added later, keyed to explicit versions.
+
+
 New installations initialize encrypted storage automatically. A random unlock
 secret is wrapped by Android Keystore and stored in private, non-backed-up app
 storage before the encrypted credential record is created. After the first normal

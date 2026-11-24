@@ -758,9 +758,11 @@
       await foregroundConnection;
       refreshServiceTransfers();
       await actions.restoreNavigationRoute(true);
+      app.ui.storageUnavailable = false;
       persistSensitiveState();
     })().catch(error => {
       vaultBootstrapFailed = true;
+      app.ui.storageUnavailable = true;
       if (isPrivateStorageRecoveryIssue(error)) {
         const issue = documentStoragePreparationIssue(0, error);
         app.ui.recentError = issue.message;
@@ -770,7 +772,7 @@
         if (/Document operation failed\. Check the vault and Android System WebView\./.test(message)) {
           pushSessionLog(app, "error", "app.vault.bootstrap_unavailable",
             "Android document storage could not open. Existing peer settings are not being reset.");
-          app.ui.recentError = "Syncpeer could not open its encrypted local vault. Saved peers cannot load until storage recovers. Do not clear app data or reset the vault; export logs for diagnosis.";
+          app.ui.recentError = "Encrypted local storage could not be opened. Existing peers, device identity, and local files have not been reset. Do not uninstall or reset the app: export diagnostic logs and investigate the protected storage error before changing any data.";
         } else {
           app.ui.recentError = message || "Private local storage could not be initialized.";
         }
@@ -1020,7 +1022,36 @@
   onDestroy(cleanupAppRuntime);
 </script>
 
-{#if showDeviceNameOnboarding}
+{#if app.ui.storageUnavailable}
+  <!-- A storage failure must be actionable even before naming this device.
+       Do not hide it behind first-run onboarding or ordinary peer controls. -->
+  <div class="app-viewport" class:android-viewport={appInfo.runtimeSurface === "android-ui"}>
+    <main class="content" data-testid="storage-unavailable">
+      <section class="panel error-banner-panel">
+        <h1>Local storage unavailable</h1>
+        <p class="error">{app.ui.recentError || "Syncpeer could not open its private local storage."}</p>
+        {#if privateStorageRecoveryMessage === app.ui.recentError}
+          <div class="actions">
+            <button type="button" data-testid="reset-unrecognized-private-storage"
+              disabled={privateStorageResetPending} onclick={resetPrivateStorage}>
+              {privateStorageResetPending ? "Resetting…" : "Reset Syncpeer local data"}
+            </button>
+          </div>
+          {#if privateStorageResetError}<p class="error">{privateStorageResetError}</p>{/if}
+        {/if}
+        {#if logFile}
+          <div class="actions">
+            <button type="button" class="ghost" data-testid="storage-share-logs"
+              disabled={logExportStatus !== null}
+              onclick={() => exportLogsWithHistory("share", actions.shareSessionLogs)}>
+              {logExportStatus ? "Preparing diagnostics…" : "Share diagnostic logs"}
+            </button>
+          </div>
+        {/if}
+      </section>
+    </main>
+  </div>
+{:else if showDeviceNameOnboarding}
   <DeviceNameOnboarding suggestedName={onboardingSuggestedName} onSave={saveDeviceName} />
 {:else}
   <!-- The Android status bar overlays the WebView in edge-to-edge mode.
@@ -1125,17 +1156,6 @@
       {#if app.ui.recentError}
         <section class="panel error-banner-panel">
           <p class="error">{app.ui.recentError}</p>
-          {#if privateStorageRecoveryMessage === app.ui.recentError}
-            <div class="actions">
-              <button
-                type="button"
-                data-testid="reset-unrecognized-private-storage"
-                disabled={privateStorageResetPending}
-                onclick={resetPrivateStorage}
-              >{privateStorageResetPending ? "Resetting…" : "Reset Syncpeer local data"}</button>
-            </div>
-            {#if privateStorageResetError}<p class="error">{privateStorageResetError}</p>{/if}
-          {/if}
         </section>
       {/if}
 

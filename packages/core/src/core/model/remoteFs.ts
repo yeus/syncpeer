@@ -1071,9 +1071,8 @@ export class RemoteFs {
     let networkBytes = 0;
     const remainingPlan = plan.filter((item) =>
       !sink.hasRange?.(item.offset, item.size) && !copied.has(`${item.offset}:${item.size}`));
-    let downloaded = plan
-      .filter((item) => !remainingPlan.includes(item))
-      .reduce((sum, item) => sum + item.size, 0);
+    let downloaded = plan.reduce((sum, item) => sum + item.size, 0) -
+      remainingPlan.reduce((sum, item) => sum + item.size, 0);
     onProgress?.({ downloadedBytes: downloaded, totalBytes, reusedBytes, resumedBytes, networkBytes });
     let storageMs = 0;
     let pending: Array<{ offset: number; bytes: Uint8Array }> = [];
@@ -1119,6 +1118,8 @@ export class RemoteFs {
     >>();
     const completed = new Map<number, Uint8Array>();
     let nextRequestGroup = 0;
+    let firstUnconsumedGroup = 0;
+    const requestWindow = Math.max(1, concurrency);
     let nextWriteIndex = 0;
     const startRequest = (groupIndex: number) => {
       const group = groups[groupIndex];
@@ -1134,9 +1135,12 @@ export class RemoteFs {
     };
     let aggregateRequestMs = 0, maxRequestMs = 0;
     let firstResponse = false, lastDiagnosticAt = startedAt;
-    while (nextRequestGroup < Math.min(groups.length, Math.max(1, concurrency))) {
-      startRequest(nextRequestGroup++);
-    }
+    const fillRequestWindow = () => {
+      while (nextRequestGroup < Math.min(groups.length, firstUnconsumedGroup + requestWindow)) {
+        startRequest(nextRequestGroup++);
+      }
+    };
+    fillRequestWindow();
     while (inFlight.size > 0) {
       throwIfAborted(signal);
       const result = await Promise.race(inFlight.values());
@@ -1176,7 +1180,6 @@ export class RemoteFs {
           bytes: downloaded, totalBytes, networkBytes, requestMs: aggregateRequestMs,
           maxRequestMs, storageMs });
       }
-      if (nextRequestGroup < groups.length) startRequest(nextRequestGroup++);
       while (completed.has(nextWriteIndex)) {
         throwIfAborted(signal);
         const chunk = completed.get(nextWriteIndex)!;
@@ -1199,6 +1202,13 @@ export class RemoteFs {
         });
         nextWriteIndex += 1;
       }
+      // Bound completed-but-not-yet-written bytes as well as live requests.
+      // A delayed first group must not let the rest of a huge file accumulate.
+      while (firstUnconsumedGroup < groups.length &&
+        groups[firstUnconsumedGroup].startIndex + groups[firstUnconsumedGroup].items.length <= nextWriteIndex) {
+        firstUnconsumedGroup++;
+      }
+      fillRequestWindow();
     }
     throwIfAborted(signal);
     await flushPending();

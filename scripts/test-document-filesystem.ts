@@ -547,6 +547,67 @@ test("opening a downloaded encrypted file without edits never removes it from Do
   } finally { await documents.close(); }
 });
 
+
+test("published documents remain readable during a stalled download commit and publication notifies consumers", async () => {
+  const { openStorage: backing } = memoryDocumentStorage();
+  let hold = false, entered!: () => void, unblock!: () => void;
+  const enteredCommit = new Promise<void>(resolve => { entered = resolve; });
+  const resumeCommit = new Promise<void>(resolve => { unblock = resolve; });
+  let notifications = 0;
+  const openStorage = async (id: string) => {
+    const storage = await backing(id);
+    return { ...storage, createSink: async (path: string, size: number) => {
+      const sink = await storage.createSink(path, size);
+      return { ...sink, commit: async () => {
+        if (hold && path.includes(".syncthing-enc/")) {
+          hold = false; entered(); await resumeCommit;
+        }
+        await sink.commit();
+      } };
+    } };
+  };
+  const documents = createDocumentFilesystem({ profileId: "concurrent-download", deviceCounterId: "42",
+    openStorage, profile: await openStorage("profile"), randomBytes, onDocumentChange: () => { notifications++; } });
+  let publishing: Promise<void> | undefined;
+  try {
+    await documents.initialize();
+    await documents.createVault("synthetic-master", false);
+    await documents.register({ id: "folder", label: "Folder", password: "synthetic-folder-password" });
+    await documents.attachDownloads("folder");
+    const content = Uint8Array.of(1, 2, 3, 4);
+    const old = await documents.beginDownload("folder", "old.mp4", content.length, 1000);
+    await documents.write(old, 0, content); await documents.finishDownload(old);
+    assert.equal(notifications, 1);
+    const [folder] = await documents.list("syncpeer-root");
+    const incoming = await documents.beginDownload("folder", "new.mp4", content.length, 2000);
+    await documents.write(incoming, 0, content);
+    hold = true;
+    publishing = documents.finishDownload(incoming);
+    await Promise.race([enteredCommit, publishing.then(() => assert.fail("Commit did not stall"))]);
+    const result = await Promise.race([
+      (async () => {
+        assert.equal((await documents.cacheRegistrations()).folders.length, 1);
+        assert.deepEqual((await documents.cachedStatuses("folder", ["old.mp4", "new.mp4"])).map(file => file.available), [true, false]);
+        const items = await documents.list(folder.id);
+        assert.deepEqual(items.map(item => item.name), ["old.mp4"]);
+        const reader = await documents.open(items[0].id, "r");
+        assert.deepEqual(await documents.read(reader, 0, content.length), content);
+        return reader;
+      })(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Published reads blocked by download")), 2000)),
+    ]);
+    assert.equal(notifications, 1);
+    unblock(); await publishing;
+    assert.equal(notifications, 2);
+    assert.deepEqual((await documents.cachedStatuses("folder", ["old.mp4", "new.mp4"])).map(file => file.available), [true, true]);
+    assert.deepEqual((await documents.list(folder.id)).map(item => item.name).sort(), ["new.mp4", "old.mp4"]);
+    await documents.release(result);
+  } finally {
+    unblock(); await publishing?.catch(() => {});
+    await documents.close();
+  }
+});
+
 test("DocumentsProvider can recreate deleted files and directories over replica tombstones", async () => {
   const { openStorage } = memoryDocumentStorage();
   const documents = createDocumentFilesystem({ profileId: "recreate-tombstones", deviceCounterId: "42",

@@ -23,8 +23,8 @@ const fixture = () => {
     cachedFiles: async () => [],
     digestCachedFiles: async () => [{ hash: "a".repeat(64) }],
     beginDownload: async () => { events.push("begin"); return 7; },
-    write: async (_handle: number, _offset: number, chunk: Uint8Array) => {
-      events.push("write:" + chunk.length);
+    writeBatch: async (_handle: number, writes: readonly { offset: number; bytes: Uint8Array }[]) => {
+      events.push("write:" + writes.reduce((sum, item) => sum + item.bytes.length, 0));
     },
     finishDownload: async () => { events.push("commit"); },
     release: async (_id: number, abort?: boolean) => { events.push(abort ? "abort" : "release"); },
@@ -52,6 +52,53 @@ test("native download completes without WebView chunk polling, into an encrypted
   assert.deepEqual(events, ["begin", "write:3", "commit"]);
   assert.equal(status.at(-1)?.transferredBytes, 3);
 });
+test("full received progress is visible before the atomic publication completes", async () => {
+  const { documents, executor, status } = fixture();
+  let resume!: () => void;
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  let committing = false;
+  documents.finishDownload = async () => { committing = true; await gate; };
+  try {
+    executor.start(job("12345678-aaaa"));
+    await wait(() => committing);
+    assert.equal(status.at(-1)?.phase, "running");
+    assert.equal(status.at(-1)?.transferredBytes, 3);
+    assert.equal(status.at(-1)?.totalBytes, 3);
+    assert.equal(status.some(p => p.phase === "completed"), false);
+  } finally { resume(); }
+  await wait(() => status.some(p => p.phase === "completed"));
+});
+
+test("service download persists each 1 MiB buffer as one bounded draft batch", async () => {
+  const { documents, remote, executor, events, status } = fixture();
+  const bytes = Uint8Array.from({ length: 2 * 1024 * 1024 + 17 }, (_, i) => i % 233);
+  const batches: number[] = [];
+  const output = new Uint8Array(bytes.length);
+  documents.writeBatch = async (handle, writes) => {
+    assert.equal(handle, 7);
+    assert.ok(writes.length <= 8);
+    for (const write of writes) {
+      assert.ok(write.bytes.length <= 128 * 1024);
+      output.set(write.bytes, write.offset);
+    }
+    batches.push(writes.reduce((sum, item) => sum + item.bytes.length, 0));
+  };
+  remote.readFileToSink = (async (_folder: string, _path: string, sink: {
+    begin: (metadata: unknown) => Promise<void>;
+    write: (offset: number, bytes: Uint8Array) => Promise<void>;
+    commit: () => Promise<void>;
+  }) => {
+    await sink.begin({ folderId: "folder", path: "keepass.kdbx", sizeBytes: bytes.length, encrypted: false });
+    await sink.write(0, bytes);
+    await sink.commit();
+  }) as never;
+  executor.start(job("12345678-bbbb"));
+  await wait(() => status.some(p => p.phase === "completed"));
+  assert.deepEqual(batches, [1024 * 1024, 1024 * 1024, 17]);
+  assert.deepEqual(output, bytes);
+  assert.deepEqual(events, ["begin", "commit"]);
+});
+
 test("download diagnostics distinguish queue, lookup, network progress, encrypted writes and commit without leaking identities", async () => {
   const { documents, remote } = fixture();
   const diagnostics: Array<{ stage: string; durationMs?: number; bytes?: number; totalBytes?: number;

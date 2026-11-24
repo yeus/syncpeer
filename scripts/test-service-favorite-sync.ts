@@ -3,6 +3,7 @@ import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/src/sync/documentFilesystem.ts";
 import { syncServiceFileFavorites } from "../packages/core/src/sync/serviceFavoriteSync.ts";
+import { createServiceTransferScheduler } from "../packages/core/src/sync/serviceTransferScheduler.ts";
 import type { FileEntry, RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 
@@ -140,6 +141,75 @@ test("downloads a newly selected favorite and persists its baseline", async () =
   assert.deepEqual((await documents.syncBaseline(id))?.hash.length, 64);
   assert.equal((await favoriteState(documents))?.phase, "synced");
   await documents.close();
+});
+
+test("unchanged favorites reuse their verified version but changed files are hashed", async () => {
+  const { documents, storageId } = await createFixture();
+  const content = encoder.encode("original");
+  const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
+  const run = () => syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
+  try {
+    await run();
+    let reads = 0;
+    const originalRead = documents.read;
+    documents.read = async (...args) => { reads++; return originalRead(...args); };
+    assert.equal((await run()).results[0].result, "unchanged");
+    assert.equal(reads, 0, "Unchanged verified file should not be streamed again");
+    const id = JSON.stringify([storageId, "notes.txt"]);
+    const writer = await documents.open(id, "rwt");
+    await documents.write(writer, 0, encoder.encode("modified"));
+    await documents.release(writer);
+    assert.equal((await run()).results[0].result, "uploaded");
+    assert.ok(reads > 0, "A new local revision requires real content verification");
+    assert.deepEqual(requests.uploads[0].bytes, encoder.encode("modified"));
+  } finally { await documents.close(); }
+});
+
+
+test("manual transfer runs between favorite transactions and the next pass replans", async () => {
+  const { documents, storageId } = await createFixture([{ path: "", name: "Folder", kind: "folder" }]);
+  const { remote, files } = fakeRemote(new Map([
+    ["a.txt", { bytes: encoder.encode("first"), modifiedMs: 10 }],
+    ["b.txt", { bytes: encoder.encode("old"), modifiedMs: 11 }],
+  ]));
+  const scheduler = createServiceTransferScheduler();
+  const events: string[] = [];
+  const download = remote.readFileToSink;
+  let entered!: () => void, resume!: () => void;
+  const enteredFirst = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { resume = resolve; });
+  remote.readFileToSink = async (...args) => {
+    events.push(args[1]);
+    if (args[1] === "a.txt") { entered(); await gate; }
+    return download(...args);
+  };
+  const run = () => scheduler.runFavorite(shouldYield =>
+    syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { shouldYield }));
+  try {
+    const favorites = run();
+    await enteredFirst;
+    const manual = scheduler.runManual(async () => {
+      events.push("manual");
+      const updated = { bytes: encoder.encode("new manual copy"), modifiedMs: 12 };
+      files.set("b.txt", updated);
+      await cacheRemoteFile(documents, "b.txt", updated.bytes, updated.modifiedMs);
+    });
+    const queuedFavorite = run();
+    resume();
+    const result = await favorites;
+    assert.equal(result.yielded, true);
+    assert.deepEqual(result.results.map(item => item.result), ["downloaded", "waiting"]);
+    await manual;
+    await queuedFavorite;
+    await run();
+    assert.deepEqual(events, ["a.txt", "manual"]);
+    const handle = await documents.open(JSON.stringify([storageId, "b.txt"]), "r");
+    assert.equal(new TextDecoder().decode(await documents.read(handle, 0, await documents.size(handle))), "new manual copy");
+    await documents.release(handle);
+    // Rejection must not poison the scheduler or leave a manual count stuck.
+    await assert.rejects(scheduler.runManual(async () => { throw new Error("cancelled"); }), /cancelled/);
+    assert.equal(await scheduler.runFavorite(async shouldYield => shouldYield()), false);
+  } finally { resume(); await documents.close(); }
 });
 
 test("uploads an offline favorite edit and advances the baseline", async () => {

@@ -3,10 +3,10 @@ import type { LocalFolderReplica } from "./replicaIndex.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 
 /** Optimistic versioned source: reads fail if the captured blocks are no longer available. */
-export async function createReplicaFileSource(replica: LocalFolderReplica, path: string) {
+export async function createReplicaFileSource(replica: LocalFolderReplica, path: string, publishedOnly = false) {
   assertReplicaPath(path);
   if (isInternalReplicaPath(path)) throw new Error("Internal replica file cannot be opened.");
-  const entry = (await replica.scan()).find(file => file.name === path);
+  const entry = (await (publishedOnly && replica.publishedFiles ? replica.publishedFiles() : replica.scan())).find(file => file.name === path);
   if (!entry || entry.deleted || entry.invalid || Number(entry.type ?? 0) !== 0) throw new Error("Replica file is unavailable.");
   const info = structuredClone(entry);
   const size = Number(info.size ?? 0);
@@ -22,10 +22,12 @@ export async function createReplicaFileSource(replica: LocalFolderReplica, path:
       for (const part of plan.blocks) {
         signal?.throwIfAborted();
         const block = blocks[part.index];
-        const bytes = await replica.readBlock(path, block.offset, block.size, block.hash);
-        signal?.throwIfAborted();
-        if (bytes.length !== block.size) throw new Error("Replica file changed during range read.");
-        result.set(bytes.subarray(part.sourceOffset, part.sourceOffset + part.size), part.targetOffset);
+        const bytes = await (replica.readCapturedBlock ?? replica.readBlock)(path, block.offset, block.size, block.hash);
+        try {
+          signal?.throwIfAborted();
+          if (bytes.length !== block.size) throw new Error("Replica file changed during range read.");
+          result.set(bytes.subarray(part.sourceOffset, part.sourceOffset + part.size), part.targetOffset);
+        } finally { bytes.fill(0); }
       }
       return result;
     },

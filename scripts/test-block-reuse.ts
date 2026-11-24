@@ -149,6 +149,46 @@ test("fast small downloads do not flood persistent transfer diagnostics", async 
   assert.equal(events, 0);
 });
 
+test("delayed first block bounds outstanding and buffered requests", async () => {
+  const size = 128 * 1024, count = 40;
+  const data = new Uint8Array(size).fill(19), digest = sha256(data);
+  const folder = { id: "fixture", indexReceived: true, encrypted: false,
+    files: new Map([["large.bin", { indexFile: { name: "large.bin", type: 0, size: count * size,
+      blocks: Array.from({ length: count }, (_, index) => ({ offset: index * size, size, hash: digest })) } }]]) };
+  const requests: number[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let written = 0;
+  const remote = new RemoteFs(new Map([[folder.id, folder]]) as never,
+    async (_folder, _path, offset, length) => {
+      requests.push(offset);
+      if (!offset) await gate;
+      assert.equal(length, size);
+      return data.slice();
+    }, async () => {}, () => {});
+  const result = remote.readFileToSink(folder.id, "large.bin", {
+    begin: async () => {},
+    write: async (offset, bytes) => {
+      assert.equal(offset, written);
+      assert.ok(bytes.every(value => value === 19));
+      written += bytes.length;
+    },
+    commit: async () => assert.equal(written, count * size),
+    abort: async () => {},
+  });
+  try {
+    // Allow the fast responses to drain while the first request is held.
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(requests.length > 1 && requests.length <= 6, `Request window grew to ${requests.length}`);
+    assert.equal(written, 0);
+  } finally {
+    release();
+    await result;
+  }
+  assert.equal(requests.length, count);
+  assert.equal(written, count * size);
+});
+
 for (const mode of ['plaintext', 'encrypted', 'unhashed', 'corrupted-copy']) {
 test(`real ${mode} download verifies data through checkpoint and hashing wrappers`, async () => {
   const encrypted = mode === 'encrypted';

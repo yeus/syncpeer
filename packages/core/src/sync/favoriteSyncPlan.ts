@@ -7,6 +7,7 @@ export interface FavoriteSyncBaseline {
   hash: string;
   sizeBytes: number;
   modifiedMs: number;
+  versionKey?: string;
 }
 
 export interface FavoriteRemoteVersion {

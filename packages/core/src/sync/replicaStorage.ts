@@ -3,7 +3,7 @@ import { hashReplicaEntry, readReplicaBlock, scanReplicaIndex, type LocalReplica
 import { receiveReplicaFiles, type ReplicaDestination } from "./replicaReceive.js";
 import { advanceVersionVector, compareConcurrentVersionCounters } from "../core/protocol/versionVector.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
-import { validateBlockPlan } from "../transfer/blockReuse.js";
+import { equalHash, validateBlockPlan } from "../transfer/blockReuse.js";
 
 export interface ReplicaStorage extends ReplicaDestination {
   loadIndex: () => Promise<ReplicaIndex | null>;
@@ -77,6 +77,21 @@ export function createFolderReplica(
         }, hash, edit.method === "write");
       return (await storage.loadIndex())!.files[edit.path].info;
     }),
+    publishedFiles: async () => Object.values((await storage.loadIndex())?.files ?? {}).map(entry => entry.info),
+    readCapturedBlock: async (path: string, offset: number, size: number, expectedHash?: Uint8Array) => {
+      // A local reader holds an authenticated descriptor from a committed index.
+      // Read the ciphertext directly rather than reloading the complete index
+      // for every block. A changed path can still resolve to a conflict copy.
+      assertReplicaPath(path);
+      if (isInternalReplicaPath(path) || !expectedHash || expectedHash.length !== 32)
+        throw new Error("Invalid captured block.");
+      const data = await storage.readRange(path, offset, size).catch(() => undefined);
+      if (data) {
+        if (data.length === size && equalHash(await hash(data), expectedHash)) return data;
+        data.fill(0);
+      }
+      return readReplicaBlock(await storage.loadIndex(), storage.readRange, { path, offset, size, hash: expectedHash }, hash);
+    },
     scan: () => storage.withLock(async () => Object.values((await scan()).files).map(entry => entry.info)),
     receive: (folderId: string, files: BepFileInfo[], request: ReplicaBlockReader) => storage.withLock(async () =>
       receiveReplicaFiles(folderId, await scan(), files, storage, request, hash)),

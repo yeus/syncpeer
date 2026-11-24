@@ -362,6 +362,7 @@ const downloadWithServiceJob = async (context: FileActionContext,
       const percent = total ? Math.floor(100 * done / total) : 0;
       transfers.setActiveDownload(key, {
         name, text: status.phase === "queued" ? "Queued in Android service" :
+          status.phase === "running" && total > 0 && done >= total ? "Verifying and saving…" :
           `${percent}% · ${status.phase} · Android service`, progressPercent: percent,
       });
       const progress = `${status.phase}:${Math.floor(done / (256 * 1024))}:${total}`;

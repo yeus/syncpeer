@@ -5,6 +5,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { memoryReplicaStorage } from "./lan-test/replica-storage.ts";
 import { createEncryptedReplicaStorage, createFolderReplica, deriveUntrustedFolderCrypto } from "../packages/core/dist/filesystem.js";
 import { openDocumentDownloadDraft, openDocumentDraft, recoverDocumentDrafts } from "../packages/core/dist/sync/documentDraft.js";
+import { writeDocumentDownload } from "../packages/core/dist/sync/documentDownloadWrites.js";
 
 test("large document writes are linear, durable before publication, and recover after interruption", async () => {
   const fixture = memoryReplicaStorage();
@@ -107,6 +108,48 @@ test("native draft record writes split on the encoded byte limit", async () => {
   folderKey.fill(0);
 });
 
+test("service download batching eliminates repeated encryption and persistence of the same draft chunk", async () => {
+  const fixture = memoryReplicaStorage();
+  let recordBytes = 0, recordWrites = 0;
+  const bytes = { ...fixture.storage, writeFiles: async (records: readonly { path: string; bytes: Uint8Array }[]) => {
+    for (const record of records) {
+      if (/\/chunk-\d+$/.test(record.path)) { recordBytes += record.bytes.length; recordWrites++; }
+      const sink = await fixture.storage.createSink(record.path, record.bytes.length);
+      await sink.write(0, record.bytes);
+      await sink.commit();
+    }
+  } };
+  const { folderKey } = await deriveUntrustedFolderCrypto("fixture-folder", "synthetic-password");
+  const content = Uint8Array.from({ length: 2 * 1024 * 1024 + 17 }, (_, index) => index % 233);
+  const path = "throughput.bin";
+  const options = { folderId: "fixture-folder", path, folderKey, randomBytes,
+    replica: { scan: async () => [] } as never,
+    download: { folderId: "fixture-folder", path, sizeBytes: content.length, modifiedMs: 1, encrypted: true } };
+  const measure = async (batched: boolean) => {
+    const draft = await openDocumentDownloadDraft(bytes, options);
+    recordWrites = recordBytes = 0;
+    const started = performance.now();
+    if (batched) {
+      await writeDocumentDownload({ writeBatch: (_handle, writes) => draft.writeBatch(writes) }, 0, 0, content);
+    } else {
+      for (let offset = 0; offset < content.length; offset += 131072)
+        await draft.write(offset, content.subarray(offset, offset + 131072));
+    }
+    const result = { recordWrites, recordBytes, elapsedMs: Math.round(performance.now() - started) };
+    assert.deepEqual(await draft.readRange(0, content.length), content);
+    assert.deepEqual(draft.downloadRanges(), [{ offset: 0, end: content.length }]);
+    await draft.discard();
+    return result;
+  };
+  try {
+    const old = await measure(false), batched = await measure(true);
+    assert.equal(old.recordWrites, 17);
+    assert.equal(batched.recordWrites, 3);
+    assert.ok(batched.recordBytes < old.recordBytes / 5);
+    console.log("Encrypted draft write amplification:", JSON.stringify({ old, batched }));
+  } finally { folderKey.fill(0); }
+});
+
 test("a resumed download replaces a damaged full journal block", async () => {
   const fixture = memoryReplicaStorage();
   const bytes = { ...fixture.storage, copy: async (source: string, target: string) => {
@@ -132,4 +175,49 @@ test("a resumed download replaces a damaged full journal block", async () => {
   assert.deepEqual(await resumed.readRange(0, replacement.length), replacement);
   await resumed.close();
   folderKey.fill(0);
+});
+
+test("download publication decrypts each journal chunk once and still verifies all source blocks", async () => {
+  const fixture = memoryReplicaStorage();
+  let chunkReads = 0;
+  const bytes = { ...fixture.storage, readFile: async (path: string, limit: number) => {
+    const data = fixture.files.get(path)!.bytes;
+    assert.ok(data.length <= limit);
+    if (/\/chunk-\d+$/.test(path)) chunkReads++;
+    return data.slice();
+  }, copy: async (source: string, target: string) => {
+    const data = fixture.files.get(source)!.bytes;
+    const sink = await fixture.storage.createSink(target, data.length);
+    await sink.write(0, data); await sink.commit();
+  } };
+  const { folderKey } = await deriveUntrustedFolderCrypto("fixture-folder", "synthetic-password");
+  const replica = createFolderReplica(createEncryptedReplicaStorage(bytes, { folderKey, randomBytes,
+    withLock: async fn => fn(), checkHealth: async () => {}, archive: async () => {} }), "42", sha256);
+  const content = Uint8Array.from({ length: 2 * 1024 * 1024 + 17 }, (_, index) => index % 233);
+  const blocks = [];
+  for (let offset = 0; offset < content.length; offset += 131072) {
+    const block = content.subarray(offset, offset + 131072);
+    blocks.push({ offset, size: block.length, hash: sha256(block) });
+  }
+  const open = (path: string, plan = blocks) => openDocumentDownloadDraft(bytes, {
+    folderId: "fixture-folder", path, folderKey, randomBytes, replica,
+    download: { folderId: "fixture-folder", path, sizeBytes: content.length, modifiedMs: 1,
+      encrypted: true, blocks: plan } });
+  try {
+    const draft = await open("large.bin");
+    await writeDocumentDownload({ writeBatch: (_handle, writes) => draft.writeBatch(writes) }, 0, 0, content);
+    chunkReads = 0;
+    const started = performance.now();
+    assert.deepEqual(await draft.flush(), sha256(content));
+    assert.equal(chunkReads, 3, "17 publication ranges must decrypt only three journal chunks");
+    console.log("Publication: 17 block reads, 3 journal reads, elapsedMs=" + Math.round(performance.now() - started));
+    await draft.close();
+    const wrong = blocks.map(block => ({ ...block, hash: block.hash.slice() }));
+    wrong[1].hash[0] ^= 1;
+    const corrupt = await open("wrong.bin", wrong);
+    await writeDocumentDownload({ writeBatch: (_handle, writes) => corrupt.writeBatch(writes) }, 0, 0, content);
+    await assert.rejects(corrupt.flush(), /block changed|digest/);
+    assert.equal((await replica.scan()).some(file => file.name === "wrong.bin" && !file.deleted), false);
+    await corrupt.discard();
+  } finally { folderKey.fill(0); }
 });

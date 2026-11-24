@@ -62,6 +62,8 @@ interface DocumentFilesystemOptions {
   /** Diagnostic stage names only; never include private document metadata. */
   onInitializeStage?: (stage: "profile-replica" | "vault-load" | "folders-open" | "initial-status") => void;
   onSessionConfigurationChange?: () => void;
+  /** Notify external document consumers after an atomic background publication. */
+  onDocumentChange?: () => void | Promise<void>;
 }
 
 interface DocumentHandle {
@@ -107,6 +109,7 @@ interface DocumentRuntime {
   closed: boolean;
   queue: Promise<void>;
   activeQueueOperation?: string;
+  readonly concurrentReads: Set<Promise<unknown>>;
   closeTask: Promise<void> | undefined;
 }
 
@@ -167,7 +170,8 @@ const removeReplicaPaths = async (
 };
 
 const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation = "other"): Promise<T> => {
-  const task = runtime.queue.then(() => {
+  const task = runtime.queue.then(async () => {
+    await Promise.allSettled([...runtime.concurrentReads]);
     if (runtime.closed) throw new Error("Documents are closed.");
     runtime.activeQueueOperation = operation;
     return fn().finally(() => { runtime.activeQueueOperation = undefined; });
@@ -175,6 +179,22 @@ const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation 
   runtime.queue = task.then(() => {}, () => {});
   return task;
 };
+// Downloads mutate only private drafts until publication. Admit committed-file
+// reads while those long operations run, but drain them before any next mutation
+// (in particular locking the vault or releasing a folder). Never bypass the
+// queue for a writable handle or a partially downloaded file.
+const runPublishedRead = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation = "publishedRead"): Promise<T> => {
+  if (runtime.closed) return Promise.reject(new Error("Documents are closed."));
+  if (!["downloadWrite", "downloadCommit", "digestCachedFiles", "beginDownload"].includes(runtime.activeQueueOperation ?? "")) {
+    return runQueued(runtime, fn, operation);
+  }
+  if (runtime.concurrentReads.size >= 8) return runQueued(runtime, fn, operation);
+  const task = Promise.resolve().then(fn);
+  runtime.concurrentReads.add(task);
+  void task.then(() => runtime.concurrentReads.delete(task), () => runtime.concurrentReads.delete(task));
+  return task;
+};
+
 
 const revokeAccess = async (runtime: DocumentRuntime): Promise<void> => {
   const pending = [...runtime.handles.values()]; runtime.handles.clear();
@@ -402,6 +422,7 @@ const initializeFilesystem = async (runtime: DocumentRuntime) => {
 const closeFilesystem = (runtime: DocumentRuntime): Promise<void> => {
   runtime.closed = true;
   runtime.closeTask ??= runtime.queue.then(async () => {
+    await Promise.allSettled([...runtime.concurrentReads]);
     await runtime.vault.close();
     await runtime.options.profile.close();
   });
@@ -426,7 +447,7 @@ const resolveDocument = (runtime: DocumentRuntime, id: string) => {
 const documentStat = async (runtime: DocumentRuntime, id: string) => {
   const { folder, path, replica } = resolveDocument(runtime, id);
   if (!path) return toEntry(folder, "", 0, true);
-  const info = (await replica.scan()).find(file => file.name === path && !file.deleted && !file.invalid);
+  const info = (await (replica.publishedFiles?.() ?? replica.scan())).find(file => file.name === path && !file.deleted && !file.invalid);
   if (!info || ![0, 1].includes(Number(info.type ?? 0))) throw new Error("Document is unavailable.");
   return toEntry(folder, path, Number(info.size ?? 0), info.type === 1, Number(info.modified_s ?? 0) * 1000);
 };
@@ -500,7 +521,9 @@ const touchCachedFile = async (
   if (!folder.downloads) return;
   const bytes = runtime.storage.get(folder.storageId)!, key = runtime.folderKeys.get(folder.storageId)!;
   const access = await loadCacheAccess(bytes, key);
-  access[path] = Date.now();
+  const now = Date.now();
+  if (now - (access[path] ?? 0) < 60_000) return;
+  access[path] = now;
   await saveCacheAccess(bytes, key, runtime.options.randomBytes, access);
 };
 
@@ -659,6 +682,7 @@ const cachedFilesAction = async (
       files.push({ key: cachedFileKey(folder.id, info.name), folderId: folder.id, path: info.name,
         name: info.name.split("/").at(-1)!, sizeBytes: Number(info.size ?? 0), modifiedMs, cachedAtMs: modifiedMs,
         localPath: "syncpeer-document:" + JSON.stringify([folder.storageId, info.name]),
+        localVersionKey: versionVectorKey(info.version ?? {}),
         syncBaselineRequired: true,
         syncBaseline: await loadDocumentBaseline(runtime.storage.get(folder.storageId)!, runtime.folderKeys.get(folder.storageId)!, info.name) });
     }
@@ -691,10 +715,12 @@ const cachedStatusesAction = async (
   if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
   const folder = runtime.registry!.getState().find(folder => folder.id === folderId && folder.downloads);
   if (!folder) throw new Error("Downloads are not attached.");
-  const files = await runtime.registry!.getReplica(folderId)!.scan();
+  const replica = runtime.registry!.getReplica(folderId)!;
+  const files = new Map((await (replica.publishedFiles?.() ?? replica.scan()))
+    .filter(file => !file.deleted && !file.invalid).map(file => [file.name, file]));
   return paths.map(path => {
     if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
-    const file = files.find(file => file.name === path && !file.deleted && !file.invalid);
+    const file = files.get(path);
     const available = !path || !!file;
     return { path, available, localPath: available ? "syncpeer-document:" + JSON.stringify([folder.storageId, path]) : undefined,
       cachedAtMs: file ? Number(file.modified_s ?? 0) * 1000 : undefined };
@@ -808,7 +834,7 @@ const listEntriesAction = async (runtime: DocumentRuntime, id: string) => {
   const { folder, path, replica } = resolveDocument(runtime, id);
   if (!(await documentStat(runtime, id)).directory) throw new Error("Document is not a directory.");
   const prefix = path ? path + "/" : "";
-  return (await replica.scan()).filter(file => !file.deleted && !file.invalid && [0, 1].includes(Number(file.type ?? 0)) &&
+  return (await (replica.publishedFiles?.() ?? replica.scan())).filter(file => !file.deleted && !file.invalid && [0, 1].includes(Number(file.type ?? 0)) &&
     file.name.startsWith(prefix) && !file.name.slice(prefix.length).includes("/") && file.name !== path)
     .map(file => toEntry(folder, file.name, Number(file.size ?? 0), file.type === 1, Number(file.modified_s ?? 0) * 1000));
 };
@@ -944,13 +970,16 @@ const finishDownloadAction = async (runtime: DocumentRuntime, id: number): Promi
   const digest = await value.writer.flush(false, download.modifiedMs);
   if (!(digest instanceof Uint8Array) || digest.length !== 32) throw new Error("Download digest is unavailable.");
   const hash = [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
-  const published = (await file.replica.scan()).find(info => info.name === file.path && !info.deleted);
+  const published = (await (file.replica.publishedFiles?.() ?? file.replica.scan())).find(info => info.name === file.path && !info.deleted);
   if (!published) throw new Error("Downloaded document was not published.");
   await saveDocumentBaseline(file.bytes, { path: file.path, folderKey: runtime.folderKeys.get(file.folder.storageId)!,
     randomBytes: runtime.options.randomBytes, baseline: { hash, sizeBytes: download.size, modifiedMs: download.modifiedMs,
       versionKey: versionVectorKey(published.version ?? {}) } });
   await value.writer.close();
   runtime.handles.delete(id);
+  // Service-owned downloads bypass dispatchDocumentCommand; notify SAF here.
+  try { void Promise.resolve(runtime.options.onDocumentChange?.()).catch(() => undefined); }
+  catch { /* Notification failure cannot undo a committed document. */ }
 };
 const setSyncBaselineAction = async (
   runtime: DocumentRuntime,
@@ -1027,12 +1056,23 @@ const openHandleAction = async (runtime: DocumentRuntime, id: string, mode: stri
   const file = resolveDocument(runtime, id);
   if ((await documentStat(runtime, id)).directory) throw new Error("Cannot open a directory.");
   const value: DocumentHandle = { documentId: id, dirty: false, append: mode === "wa" };
-  if (mode === "r") value.reader = await createReplicaFileSource(file.replica, file.path);
+  if (mode === "r") value.reader = await createReplicaFileSource(file.replica, file.path, true);
   else {
     value.dirty = ["w", "wt", "rwt"].includes(mode);
     value.writer = await openWritableDraft(runtime, id, value.dirty);
   }
-  if (mode === "r") await touchCachedFile(runtime, file.folder, file.path);
+  if (mode === "r") {
+    // Access timestamps are advisory. Always serialize the update with mutations,
+    // even if a concurrent read outlasts the original download operation.
+    void runQueued(runtime, async () => {
+      if (runtime.vault.status().phase === "unlocked" && runtime.storage.get(file.folder.storageId) === file.bytes)
+        await touchCachedFile(runtime, file.folder, file.path);
+    }).catch(() => undefined);
+  }
+  if (runtime.handles.size >= 64) {
+    await value.writer?.close();
+    throw new Error("Too many open documents.");
+  }
   const idNumber = ++runtime.nextHandle; runtime.handles.set(idNumber, value); return idNumber;
 };
 
@@ -1162,7 +1202,7 @@ const createLifecycleActions = (runtime: DocumentRuntime) => ({
   // Cache ownership reads are frequent during startup and transfer reconciliation.
   // Use the already-validated, in-memory registry instead of decrypting the
   // vault and probing the filesystem for every read-only lookup.
-  cacheRegistrations: () => runQueued(runtime, async () => {
+  cacheRegistrations: () => runPublishedRead(runtime, async () => {
     const vault = runtime.vault.status();
     const folders = vault.phase !== "unlocked" ? [] : runtime.registry?.getState().map(
       ({ id, label, storageId, downloads, browseOnly }) => ({
@@ -1647,12 +1687,12 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
 const createDirectoryActions = (runtime: DocumentRuntime) => ({
   cachedFiles: (folderId?: string) => runQueued(runtime, () => cachedFilesAction(runtime, folderId)),
   digestCachedFiles: (files: readonly { folderId: string; path: string }[]) =>
-    runQueued(runtime, () => digestCachedFilesAction(runtime, files)),
-  cachedStatuses: (folderId: string, paths: string[]) => runQueued(runtime, () => cachedStatusesAction(runtime, folderId, paths)),
+    runQueued(runtime, () => digestCachedFilesAction(runtime, files), "digestCachedFiles"),
+  cachedStatuses: (folderId: string, paths: string[]) => runPublishedRead(runtime, () => cachedStatusesAction(runtime, folderId, paths)),
   remove: (id: string) => runQueued(runtime, () => removeDocumentAction(runtime, id)),
   rename: (id: string, name: string) => runQueued(runtime, () => renameDocumentAction(runtime, id, name)),
-  stat: (id: string) => runQueued(runtime, () => statById(runtime, id)),
-  list: (id: string) => runQueued(runtime, () => listEntriesAction(runtime, id)),
+  stat: (id: string) => runPublishedRead(runtime, () => statById(runtime, id)),
+  list: (id: string) => runPublishedRead(runtime, () => listEntriesAction(runtime, id)),
   create: (parentId: string, name: string, directory: boolean) =>
     runQueued(runtime, () => createEntryAction(runtime, parentId, name, directory)),
 });
@@ -1660,10 +1700,10 @@ const createDirectoryActions = (runtime: DocumentRuntime) => ({
 const createHandleActions = (runtime: DocumentRuntime) => ({
   beginDownload: (folderId: string, path: string, size: number, modifiedMs: number,
     expectedLocalHash?: string | null, metadata: DownloadMetadata = { encrypted: false }) =>
-    runQueued(runtime, () => beginDownloadAction(runtime, folderId, path, size, modifiedMs, expectedLocalHash, metadata)),
+    runQueued(runtime, () => beginDownloadAction(runtime, folderId, path, size, modifiedMs, expectedLocalHash, metadata), "beginDownload"),
   downloadRanges: (id: number) => runQueued(runtime, () => downloadRangesAction(runtime, id)),
   suspendDownload: (id: number) => runQueued(runtime, () => suspendDownloadAction(runtime, id)),
-  finishDownload: (id: number) => runQueued(runtime, () => finishDownloadAction(runtime, id)),
+  finishDownload: (id: number) => runQueued(runtime, () => finishDownloadAction(runtime, id), "downloadCommit"),
   setSyncBaseline: (id: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) =>
     runQueued(runtime, () => setSyncBaselineAction(runtime, id, baseline)),
   clearSyncBaseline: (id: string) => runQueued(runtime, () => clearSyncBaselineAction(runtime, id)),
@@ -1673,20 +1713,23 @@ const createHandleActions = (runtime: DocumentRuntime) => ({
     runQueued(runtime, () => digestRangesAction(runtime, id, source, ranges)),
   copyRanges: (id: number, ranges: readonly { offset: number; size: number }[]) =>
     runQueued(runtime, () => copyRangesAction(runtime, id, ranges)),
-  open: (id: string, mode: string) => runQueued(runtime, () => openHandleAction(runtime, id, mode)),
-  size: (id: number) => runQueued(runtime, async () => {
+  open: (id: string, mode: string) => (mode === "r" ? runPublishedRead : runQueued)(runtime, () => openHandleAction(runtime, id, mode)),
+  size: (id: number) => (runtime.handles.get(id)?.writer ? runQueued : runPublishedRead)(runtime, async () => {
     const value = requireHandle(runtime, id);
     return value.writer ? value.writer.size() : value.reader!.size;
   }),
-  read: (id: number, offset: number, size: number) => runQueued(runtime, async () => {
-    const value = requireHandle(runtime, id);
-    return (value.writer ?? value.reader!).readRange(offset, size);
-  }),
-  write: (id: number, offset: number, bytes: Uint8Array) => runQueued(runtime, () => writeToHandle(runtime, id, offset, bytes)),
+  read: (id: number, offset: number, size: number) =>
+    (runtime.handles.get(id)?.writer ? runQueued : runPublishedRead)(runtime, async () => {
+      const value = requireHandle(runtime, id);
+      return (value.writer ?? value.reader!).readRange(offset, size);
+    }),
+  write: (id: number, offset: number, bytes: Uint8Array) =>
+    runQueued(runtime, () => writeToHandle(runtime, id, offset, bytes), runtime.handles.get(id)?.download ? "downloadWrite" : "other"),
   writeBatch: (id: number, writes: readonly { offset: number; bytes: Uint8Array }[]) =>
-    runQueued(runtime, () => writeBatchToHandle(runtime, id, writes)),
+    runQueued(runtime, () => writeBatchToHandle(runtime, id, writes), runtime.handles.get(id)?.download ? "downloadWrite" : "other"),
   flush: (id: number) => runQueued(runtime, () => flushHandleAction(runtime, id)),
-  release: (id: number, abort = false) => runQueued(runtime, () => releaseHandleAction(runtime, id, abort)),
+  release: (id: number, abort = false) =>
+    (runtime.handles.get(id)?.writer ? runQueued : runPublishedRead)(runtime, () => releaseHandleAction(runtime, id, abort)),
 });
 
 const createVersionActions = (runtime: DocumentRuntime) => ({
@@ -1715,6 +1758,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     nextHandle: 0,
     closed: false,
     queue: Promise.resolve(),
+    concurrentReads: new Set(),
     closeTask: undefined,
   };
   runtime.vault = createCredentialVault({

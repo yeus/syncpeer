@@ -183,6 +183,8 @@ export interface CachedFileRecord {
   sizeBytes: number;
   cachedAtMs: number;
   modifiedMs?: number;
+  /** Version of the current authenticated local replica entry, when available. */
+  localVersionKey?: string;
   syncBaseline?: { hash: string; sizeBytes: number; modifiedMs: number; versionKey?: string };
   /** Writable providers cannot safely infer a remote baseline from local timestamps. */
   syncBaselineRequired?: boolean;

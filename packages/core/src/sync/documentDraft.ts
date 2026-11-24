@@ -313,8 +313,39 @@ class DocumentDraft {
       if (nextHashOffset === this.head.size) publishedDigest = wholeHash.digest();
     };
 
+    // Publication owns an immutable draft. Keep at most one decrypted chunk
+    // across bounded range requests (including legacy/noncanonical block plans).
+    // Serialize cache access: replica publication may request ranges concurrently.
+    let cachedIndex = -1, cachedChunk: Uint8Array | undefined;
+    let readTail = Promise.resolve();
+    let readsClosed = false;
+    const readPublicationRange = (offset: number, size: number): Promise<Uint8Array> => {
+      if (readsClosed) return Promise.reject(new Error("Document publication is closed."));
+      const task = readTail.then(async () => {
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(size) ||
+            size < 0 || size > 16 * 1024 * 1024) throw new Error("Invalid document range.");
+        const data = new Uint8Array(Math.max(0, Math.min(size, this.head.size - offset)));
+        try {
+          for (let done = 0; done < data.length;) {
+            const position = offset + done, index = Math.floor(position / this.chunkSize);
+            if (cachedIndex !== index || !cachedChunk) {
+              cachedChunk?.fill(0);
+              cachedChunk = undefined;
+              cachedChunk = await this.chunk(index);
+              cachedIndex = index;
+            }
+            const start = position % this.chunkSize, count = Math.min(data.length - done, this.chunkSize - start);
+            data.set(cachedChunk.subarray(start, start + count), done);
+            done += count;
+          }
+          return data;
+        } catch (error) { data.fill(0); throw error; }
+      });
+      readTail = task.then(() => {}, () => {});
+      return task;
+    };
     const publicationReadRange = async (offset: number, size: number) => {
-      const data = await this.readRange(offset, size);
+      const data = await readPublicationRange(offset, size);
       if (expectedByOffset) {
         let cursor = offset, consumed = 0;
         while (consumed < data.length) {
@@ -332,20 +363,20 @@ class DocumentDraft {
       return data;
     };
 
-    if (expectedBlocks && !reusableBlocks) {
-      for (const block of expectedBlocks) {
-        const hash = sha256.create();
-        for (let done = 0; done < block.size; done += 131072) {
-          const data = await this.readRange(block.offset + done, Math.min(131072, block.size - done));
-          try { hash.update(data); } finally { data.fill(0); }
-        }
-        if (!equalHash(hash.digest(), block.hash)) {
-          throw new Error("Downloaded document block changed before publication.");
+    try {
+      if (expectedBlocks && !reusableBlocks) {
+        for (const block of expectedBlocks) {
+          const hash = sha256.create();
+          for (let done = 0; done < block.size; done += 131072) {
+            const data = await readPublicationRange(block.offset + done, Math.min(131072, block.size - done));
+            try { hash.update(data); } finally { data.fill(0); }
+          }
+          if (!equalHash(hash.digest(), block.hash)) {
+            throw new Error("Downloaded document block changed before publication.");
+          }
         }
       }
-    }
 
-    try {
       const result = await this.options.replica.edit!({
         method: "write",
         folderId: this.options.folderId,
@@ -354,7 +385,7 @@ class DocumentDraft {
         modifiedMs: modifiedMs ?? Date.now(),
         source: {
           size: this.head.size,
-          readRange: this.head.download ? publicationReadRange : this.readRange,
+          readRange: this.head.download ? publicationReadRange : readPublicationRange,
         },
         ...(reusableBlocks ? { blocks: reusableBlocks } : {}),
       });
@@ -365,6 +396,9 @@ class DocumentDraft {
       await this.saveHead();
       return publishedDigest;
     } finally {
+      readsClosed = true;
+      await readTail;
+      cachedChunk?.fill(0);
       for (const pending of pendingHashChunks.values()) pending.fill(0);
       pendingHashChunks.clear();
     }

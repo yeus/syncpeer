@@ -3,6 +3,7 @@ import type { DocumentFilesystem } from "./documentFilesystem.js";
 import type { FileDownloadSink, FileUploadSource } from "../transfer/stream.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
 import { sameDeviceId } from "../ui/helpers.js";
+import { writeDocumentDownload } from "./documentDownloadWrites.js";
 
 export type ServiceTransferDirection = "download" | "upload";
 export type ServiceTransferPhase = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -53,7 +54,7 @@ const category = (error: unknown): NonNullable<ServiceTransferProgress["reason"]
  * Android persists/replays job intents separately from these active JS tasks. */
 export const createServiceTransferJobs = (deps: {
   documents: Pick<DocumentFilesystem, "status" | "cachedFiles" | "digestCachedFiles" |
-    "beginDownload" | "write" | "finishDownload" | "release" | "open" | "size" | "read">;
+    "beginDownload" | "writeBatch" | "finishDownload" | "release" | "open" | "size" | "read">;
   peerId?: () => string | null;
   remoteFs: () => RemoteFs | null;
   progress: (value: ServiceTransferProgress) => void | Promise<void>;
@@ -69,7 +70,7 @@ export const createServiceTransferJobs = (deps: {
   const publish = (job: ServiceTransferRequest, phase: ServiceTransferPhase,
     transferredBytes: number, totalBytes: number, reason?: ServiceTransferProgress["reason"]) => {
     const now = Date.now();
-    if (phase === "running" && lastPersisted.has(job.id) &&
+    if (phase === "running" && !(totalBytes > 0 && transferredBytes >= totalBytes) && lastPersisted.has(job.id) &&
       now - lastPersisted.get(job.id)! < 1500) return;
     lastPersisted.set(job.id, now);
     try {
@@ -120,9 +121,7 @@ export const createServiceTransferJobs = (deps: {
         controller.signal.throwIfAborted();
         const start = Date.now();
         try {
-          for (let done = 0; done < bytes.length; done += 131072) {
-            await deps.documents.write(handle, offset + done, bytes.subarray(done, done + 131072));
-          }
+          await writeDocumentDownload(deps.documents, handle, offset, bytes, controller.signal);
           writtenBytes += bytes.length;
         } finally {
           storageMs += Date.now() - start;

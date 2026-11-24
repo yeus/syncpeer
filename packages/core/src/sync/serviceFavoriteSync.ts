@@ -13,6 +13,7 @@ import { applyFavoriteRename, planFavoriteCandidates, planFavoriteRename,
   type FavoriteRemoteVersion } from "./favoriteSyncPlan.js";
 import { collectFavoriteFiles, type FavoriteExclusion } from "../ui/favoriteSelection.js";
 import type { FileEntry } from "../core/model/remoteFs.js";
+import { writeDocumentDownload } from "./documentDownloadWrites.js";
 
 type Baseline = NonNullable<CachedFileRecord["syncBaseline"]>;
 
@@ -86,9 +87,7 @@ function documentDownloadSink(documents: DocumentFilesystem, folderId: string, p
     },
     write: async (offset, bytes) => {
       if (handle === undefined) throw new Error("Favorite download has not started.");
-      for (let done = 0; done < bytes.length; done += 131072) {
-        await documents.write(handle, offset + done, bytes.subarray(done, done + 131072));
-      }
+      await writeDocumentDownload(documents, handle, offset, bytes);
     },
     commit: async () => {
       if (handle === undefined) throw new Error("Favorite download has not started.");
@@ -308,7 +307,14 @@ const planAndRunCandidate = async (context: FavoriteContext, candidate: Favorite
     return runResolution(context, candidate, pending.resolution);
   }
   const baseline = candidate.local?.baseline ?? await context.documents.syncBaseline(id);
-  const local = candidate.local ? { size: candidate.local.sizeBytes, hash: await hashLocal(context, path) } : undefined;
+  // Reuse the authenticated baseline only for a no-op. Uploads, replacements,
+  // deletions and resolutions still verify actual content, not size or mtime.
+  const cached = context.cached.get(path);
+  const unchanged = baseline && cached?.localVersionKey && baseline.versionKey === cached.localVersionKey &&
+    cached.sizeBytes === baseline.sizeBytes && candidate.remote?.size === baseline.sizeBytes &&
+    candidate.remote.modifiedMs === baseline.modifiedMs;
+  const local = candidate.local ? { size: candidate.local.sizeBytes,
+    hash: unchanged ? baseline.hash : await hashLocal(context, path) } : undefined;
   const action = planFavoriteSync({ local, remote: candidate.remote, baseline });
   switch (action.kind) {
     case "unchanged":
@@ -372,10 +378,13 @@ const syncFolderFavorites = async (args: {
   exclusions: FavoriteExclusion[];
   patterns: string[];
   nowMs: number;
+  shouldYield?: () => boolean;
   report?: (stage: FavoriteSyncProgress["stage"], itemOrdinal?: number, itemCount?: number,
     transferredBytes?: number, totalBytes?: number) => void;
 }): Promise<FavoriteSyncResult[]> => {
-  const { documents, remoteFs, folder, favorites, exclusions, patterns, nowMs, report } = args;
+  const { documents, remoteFs, folder, favorites, exclusions, patterns, nowMs, report, shouldYield } = args;
+  const deferred = () => favoriteFolderResults(folder.id, favorites, "waiting", "Manual transfer has priority.");
+  if (shouldYield?.()) return deferred();
   report?.("index");
   let indexState = await remoteFs.getFolderSyncState(folder.id);
   if (indexState?.indexReceived !== true) {
@@ -385,6 +394,7 @@ const syncFolderFavorites = async (args: {
   if (indexState?.indexReceived !== true) {
     return favoriteFolderResults(folder.id, favorites, "waiting", "Folder index is still being received.");
   }
+  if (shouldYield?.()) return deferred();
   report?.("storage");
   let cached: CachedFileRecord[], state;
   try {
@@ -401,6 +411,7 @@ const syncFolderFavorites = async (args: {
     reportTransfer: (stage, transferredBytes, totalBytes) =>
       report?.(stage, itemOrdinal, itemCount, transferredBytes, totalBytes) };
   const results: FavoriteSyncResult[] = [];
+  if (shouldYield?.()) return deferred();
   const hadRenames = context.renames.length > 0;
   if (!await runRenames(context, results)) return results;
   if (hadRenames) {
@@ -426,6 +437,7 @@ const syncFolderFavorites = async (args: {
     const message = error instanceof Error ? error.message : "Folder contents are unavailable.";
     return results.concat(favoriteFolderResults(folder.id, activeFavorites, "unavailable", message));
   }
+  if (shouldYield?.()) return results.concat(deferred());
   report?.("planning");
   const baselines = new Map<string, NonNullable<CachedFileRecord["syncBaseline"]>>();
   for (const file of cached) if (file.syncBaseline) baselines.set(file.path, file.syncBaseline);
@@ -435,6 +447,11 @@ const syncFolderFavorites = async (args: {
     baselines });
   itemCount = candidates.length;
   for (const [index, candidate] of candidates.entries()) {
+    // Never interrupt a publication, deletion, or rename transaction. Discard
+    // the remaining plan so a manual transfer cannot make its baselines stale.
+    if (shouldYield?.()) return results.concat(candidates.slice(index).map(item => ({
+      folderId: folder.id, path: item.path, result: "waiting" as const, message: "Manual transfer has priority.",
+    })));
     itemOrdinal = index + 1;
     report?.("processing", itemOrdinal, itemCount);
     results.push(await runCandidate(context, candidate));
@@ -451,8 +468,9 @@ export async function syncServiceFileFavorites(
   documents: DocumentFilesystem,
   remoteFs: RemoteFs,
   options: { nowMs?: number; excludeFolderIds?: readonly string[];
-    onProgress?: (progress: FavoriteSyncProgress) => void } = {},
-): Promise<{ skipped?: "locked"; results: FavoriteSyncResult[] }> {
+    onProgress?: (progress: FavoriteSyncProgress) => void; shouldYield?: () => boolean } = {},
+): Promise<{ skipped?: "locked"; yielded?: true; results: FavoriteSyncResult[] }> {
+  if (options.shouldYield?.()) return { yielded: true, results: [] };
   const nowMs = options.nowMs ?? Date.now();
   const status = await documents.status();
   if (status.vault.phase !== "unlocked") return { skipped: "locked", results: [] };
@@ -470,6 +488,7 @@ export async function syncServiceFileFavorites(
     try { options.onProgress?.(progress); } catch { /* nonessential */ }
   };
   for (const [index, [folderId, folderSettings]] of targets.entries()) {
+    if (options.shouldYield?.()) return { yielded: true, results };
     const folder = registered.get(folderId)!;
     const favorites = folderSettings.favorites;
     const folderOrdinal = index + 1, folderCount = targets.length;
@@ -488,7 +507,7 @@ export async function syncServiceFileFavorites(
         continue;
       }
       results.push(...await syncFolderFavorites({ documents, remoteFs, folder, favorites,
-        exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs, report: emit }));
+        exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs, report: emit, shouldYield: options.shouldYield }));
     } catch (error) {
       // A transient failure on one folder must not prevent all other favorites syncing.
       results.push(...favoriteFolderResults(folderId, favorites, "unavailable",
@@ -497,6 +516,7 @@ export async function syncServiceFileFavorites(
       emit("folder_done");
     }
   }
+  if (options.shouldYield?.()) return { yielded: true, results };
   report({ stage: "complete", folderOrdinal: targets.length, folderCount: targets.length });
   return { results };
 }

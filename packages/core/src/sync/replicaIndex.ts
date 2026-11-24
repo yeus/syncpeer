@@ -43,6 +43,10 @@ export type LocalReplicaEdit = {
 export interface LocalFolderReplica {
   isPaused?: () => boolean;
   scan: () => Promise<BepFileInfo[]>;
+  /** Authenticated committed index without taking the replica mutation lock. */
+  publishedFiles?: () => Promise<BepFileInfo[]>;
+  /** Only for locally captured, already authenticated block descriptors. */
+  readCapturedBlock?: ReplicaBlockReader;
   readBlock: ReplicaBlockReader;
   receive?: (folderId: string, files: BepFileInfo[], request: ReplicaBlockReader) => Promise<boolean>;
   edit?: (edit: LocalReplicaEdit) => Promise<BepFileInfo>;

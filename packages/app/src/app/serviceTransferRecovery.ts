@@ -32,7 +32,8 @@ export const createServiceTransferReconciler = (args: {
         if (job.direction === "download") {
           args.transfers.setActiveDownload(cachedFileKey(job.folderId, job.path), {
             name: label, text: retry ? "Waiting to retry · Android service" :
-              `${job.phase} · Android service · ${percent}%`,
+              job.phase === "running" && job.totalBytes > 0 && job.transferredBytes >= job.totalBytes
+                ? "Verifying and saving…" : `${job.phase} · Android service · ${percent}%`,
             progressPercent: percent,
           });
         } else if (!args.state.ui.uploadProgressActive) {

@@ -76,6 +76,10 @@ export function createReplicaController(replica: LocalFolderReplica, settings?: 
   return {
     scan: () => run("scanning", replica.scan),
     readBlock: ((...args) => run("syncing", () => replica.readBlock(...args))) as LocalFolderReplica["readBlock"],
+    ...(replica.publishedFiles ? { publishedFiles: () => run("scanning", replica.publishedFiles!) } : {}),
+    ...(replica.readCapturedBlock ? {
+      readCapturedBlock: ((...args) => run("syncing", () => replica.readCapturedBlock!(...args))) as NonNullable<LocalFolderReplica["readCapturedBlock"]>,
+    } : {}),
     ...(replica.receive ? { receive: ((...args) => run("syncing", async () => {
       const changed = await replica.receive!(...args);
       if (changed) committed("received");

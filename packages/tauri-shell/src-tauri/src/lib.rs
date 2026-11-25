@@ -5173,9 +5173,12 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_syncpeer_android::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_opener::init());
+    // Android already uses the native service notification implementation.
+    // The generic plugin injects an unsolicited startup permission RPC.
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    let builder = builder.plugin(tauri_plugin_os::init())
         .manage(Arc::new(
             Mutex::new(discovery::DiscoveryRequests::default()),
         ))

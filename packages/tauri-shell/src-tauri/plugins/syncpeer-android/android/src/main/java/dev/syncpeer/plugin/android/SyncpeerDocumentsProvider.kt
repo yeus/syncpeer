@@ -166,6 +166,31 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       child.getString(1).startsWith(parent.getString(1).let { if (it.isEmpty()) "" else "$it/" }) && parentDocumentId != documentId
   }
 
+  override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
+    // DocumentsUI needs the real provider hierarchy to launch directly into a
+    // directory (and to restore a previously selected SAF document).
+    val child = if (childDocumentId == ROOT_DOCUMENT_ID) childDocumentId else
+      (command(JSONObject().put("operation", "stat").put("id", childDocumentId)) as JSONObject).getString("id")
+    val ids = mutableListOf(ROOT_DOCUMENT_ID)
+    if (child != ROOT_DOCUMENT_ID) {
+      val parts = JSONArray(child)
+      val storageId = parts.getString(0)
+      val path = parts.getString(1)
+      val prefixes = listOf("") + path.split('/').filter { it.isNotEmpty() }
+        .runningReduce { prefix, segment -> "$prefix/$segment" }
+      for (prefix in prefixes) {
+        val id = JSONArray().put(storageId).put(prefix).toString()
+        // Use the core's canonical ID, not Android's JSON escaping convention.
+        val metadata = command(JSONObject().put("operation", "stat").put("id", id)) as JSONObject
+        ids.add(metadata.getString("id"))
+      }
+    }
+    if (parentDocumentId == null) return DocumentsContract.Path(ROOT_ID, ids)
+    val index = ids.indexOf(parentDocumentId)
+    if (index < 0) throw FileNotFoundException("Document is outside the requested tree.")
+    return DocumentsContract.Path(null, ids.subList(index, ids.size))
+  }
+
   override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
     val result = command(JSONObject().put("operation", "create").put("id", parentDocumentId)
       .put("name", displayName).put("directory", mimeType == Document.MIME_TYPE_DIR)) as JSONObject

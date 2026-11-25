@@ -10,9 +10,12 @@ object BackgroundSessionPolicy {
     allowMetered: Boolean,
     allowPowerSave: Boolean,
     allowDeviceIdle: Boolean,
+    requireCharging: Boolean = false,
+    charging: Boolean = false,
   ): String? = when {
     !networkAvailable -> "Waiting for a network connection."
     networkMetered && !allowMetered -> "Waiting for an unmetered network."
+    requireCharging && !charging -> "Waiting for external power."
     powerSave && !allowPowerSave -> "Waiting for normal power mode."
     deviceIdle && !allowDeviceIdle -> "Waiting for the device to leave idle mode."
     else -> null

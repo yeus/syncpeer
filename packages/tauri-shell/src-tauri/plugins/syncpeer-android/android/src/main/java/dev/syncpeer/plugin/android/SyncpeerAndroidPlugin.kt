@@ -322,11 +322,15 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         if (show) {
           val metadata = JSONObject(checkNotNull(result?.getString("result"))).getJSONObject("result")
           val document = DocumentsContract.buildDocumentUri("${activity.packageName}.documents", request.getString("id"))
-          val mime = if (metadata.getBoolean("directory")) DocumentsContract.Document.MIME_TYPE_DIR else guessMimeType(metadata.getString("name"))
+          val directory = metadata.getBoolean("directory")
+          val mime = if (directory) DocumentsContract.Document.MIME_TYPE_DIR else guessMimeType(metadata.getString("name"))
           val intent = Intent(Intent.ACTION_VIEW).setDataAndType(document, mime)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
           activity.runOnUiThread {
-            try { activity.startActivity(Intent.createChooser(intent, "Open with")); invoke.resolve() }
+            try {
+              activity.startActivity(if (directory) intent else Intent.createChooser(intent, "Open with"))
+              invoke.resolve()
+            }
             catch (_: Exception) { invoke.reject("No application can open this document.") }
           }
           return@Thread
@@ -1084,7 +1088,7 @@ class SyncpeerAndroidPlugin(private val activity: Activity) : Plugin(activity) {
 
       val chooser = Intent.createChooser(viewIntent, "Open with")
       chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-      activity.startActivity(chooser)
+      activity.startActivity(if (target.isDirectory) viewIntent else chooser)
       invoke.resolve()
     } catch (error: Exception) {
       invoke.reject(error.message ?: "Could not open SAF path.")

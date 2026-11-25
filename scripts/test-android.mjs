@@ -252,7 +252,8 @@ const main = async () => {
       run(path.join(androidProject, "gradlew"), [
         "-p", editorProject, "assembleDebug", "--no-daemon", "--console=plain",
       ]);
-      await runProfile("compat", ["--expect-sdk", "29", "--provider-header-smoke"], undefined, true);
+      const modern = process.argv.includes("--modern");
+      await runProfile(modern ? "modern" : "compat", ["--expect-sdk", modern ? "36" : "29", "--provider-header-smoke"], undefined, true);
       return;
     }
     run("npm", ["run", "build:android:e2e"]);

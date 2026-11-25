@@ -31,4 +31,20 @@ class BackgroundSessionPolicyTest {
     assertNull(BackgroundSessionPolicy.pauseReason(true, true, true, false, true, true, false))
     assertNull(BackgroundSessionPolicy.pauseReason(true, false, false, true, false, false, true))
   }
+  @Test fun batterySavingPolicyRequiresExternalPower() {
+    assertEquals("Waiting for external power.",
+      BackgroundSessionPolicy.pauseReason(true, false, false, false, false, false, false,
+        requireCharging = true, charging = false))
+    assertNull(BackgroundSessionPolicy.pauseReason(true, false, false, false, false, false, false,
+      requireCharging = true, charging = true))
+    assertEquals("Waiting for an unmetered network.",
+      BackgroundSessionPolicy.pauseReason(true, true, false, false, false, false, false,
+        requireCharging = true, charging = true))
+  }
+  @Test fun alwaysStillRespectsSystemPowerRestrictions() {
+    assertEquals("Waiting for normal power mode.",
+      BackgroundSessionPolicy.pauseReason(true, true, true, false, true, false, false))
+    assertEquals("Waiting for the device to leave idle mode.",
+      BackgroundSessionPolicy.pauseReason(true, true, false, true, true, false, false))
+  }
 }

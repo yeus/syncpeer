@@ -2068,11 +2068,72 @@ const verifyOfflineEditorAfterColdStart = () => {
   console.log("Cold-started DocumentsProvider passed separate-APK offline CRUD and MIME type queries.");
 };
 
+// Exercise real DocumentsUI navigation, not just successful intent dispatch.
+const expectNativeDirectory = async (fileName) => {
+  const deadline = Date.now() + 30_000;
+  let xml = "";
+  while (Date.now() < deadline) {
+    xml = await captureUiHierarchy("/sdcard/syncpeer-open-local.xml");
+    if (recoverEmulatorAnr(xml)) { await wait(500); continue; }
+    if (/package="[^"]*documentsui"/i.test(xml) && hierarchyTextBounds(xml, fileName)) {
+      runAdb(["shell", "am", "start", "-n", `${packageName}/.MainActivity`]);
+      await assertForeground();
+      return;
+    }
+    await wait(500);
+  }
+  throw new Error("Native directory did not contain " + fileName + ": " +
+    JSON.stringify([...xml.matchAll(/text="([^"]+)"/g)].map(match => match[1]).slice(0, 30)));
+};
+const verifyOpenLocal = async (cdp) => {
+  const status = await documentCommand(cdp, { operation: "status" });
+  const folder = status.folders.find(value => value.id === targetFolderId && value.downloads);
+  if (!folder?.storageId) throw new Error("Open Local requires attached storage.");
+  const rootId = JSON.stringify([folder.storageId, ""]);
+  const suffix = Date.now().toString(36);
+  const rootFile = `root-open-local-${suffix}.txt`, nestedFile = `nested-open-local-${suffix}.txt`;
+  const dirName = `open-local-parent-${suffix}`;
+  const directory = await documentCommand(cdp, { operation: "create", id: rootId, name: dirName, directory: true });
+  await documentCommand(cdp, { operation: "create", id: rootId, name: rootFile, directory: false });
+  await documentCommand(cdp, { operation: "create", id: directory.id, name: nestedFile, directory: false });
+  console.log("Open Local fixture created.");
+  // Rehydrate the real folder UI from the encrypted registration and cache.
+  const browser = await launchAndroidApp(true);
+  try {
+    await waitForUiCondition(browser, '!!document.querySelector("[data-testid=tab-folders]")', "restored main UI", 60_000);
+    await clickUiTestId(browser, "tab-folders");
+    await waitForUiCondition(browser, `!!document.querySelector(${JSON.stringify(`[data-testid="folder-root-${targetFolderId}"]`)})`, "local shared folder");
+    if (await browser.evaluate('!!document.querySelector("[data-testid=folder-root-back]")')) {
+      await clickUiTestId(browser, "folder-root-back");
+    }
+    await waitForUiCondition(browser, '!!document.querySelector("[data-testid=new-folder]") && !document.querySelector(".breadcrumbs")', "clean shared-folder overview");
+    await clickUiTestId(browser, `folder-root-${targetFolderId}`);
+    await waitForUiCondition(browser, `!!document.querySelector(${JSON.stringify(`[data-testid="folder-entry-${rootFile}"]`)}) && !document.querySelector("[data-testid=new-folder]")`, "shared-folder contents");
+    if (await browser.evaluate('!!document.querySelector("[data-testid=folder-name-filter]")')) throw new Error("Filters should be collapsed.");
+    await clickUiTestId(browser, "folder-filter-toggle");
+    await waitForUiCondition(browser, '!!document.querySelector("[data-testid=folder-name-filter]") && !!document.querySelector("[data-testid=folder-sort-mode]")', "expanded filters");
+    await clickUiTestId(browser, "folder-filter-toggle");
+    await waitForUiCondition(browser, '!document.querySelector("[data-testid=folder-name-filter]")', "collapsed filters");
+    const openLocal = async name => {
+      const ready = '[...document.querySelectorAll("button")].some(b => b.textContent.trim() === "Open Local" && !b.disabled)';
+      await waitForUiCondition(browser, ready, "enabled Open Local");
+      await browser.evaluate('[...document.querySelectorAll("button")].find(b => b.textContent.trim() === "Open Local").click()');
+      await expectNativeDirectory(name);
+    };
+    await openLocal(rootFile);
+    await clickUiTestId(browser, `folder-entry-${dirName}`);
+    await waitForUiCondition(browser, `!!document.querySelector(${JSON.stringify(`[data-testid="folder-entry-${dirName}/${nestedFile}"]`)})`, "nested local folder contents");
+    await openLocal(nestedFile);
+    console.log("Android Open Local buttons opened exact root and nested directory; folder toolbar and filters passed.");
+  } finally { browser.close(); }
+};
+
 // Local-only acceptance: no remote peer or real documents are needed.
 const runProviderHeaderSmoke = async () => {
   if (runAdb(["shell", "getprop", "ro.kernel.qemu"]).trim() !== "1") {
     throw new Error("Provider/header acceptance requires a disposable emulator.");
   }
+  runAdb(["logcat", "-c"]);
   const cdp = await launchAndroidApp(true);
   try {
     await waitForUiCondition(cdp,
@@ -2084,6 +2145,14 @@ const runProviderHeaderSmoke = async () => {
       label: targetFolderTitle, password: "synthetic-provider-password" });
     await documentCommand(cdp, { operation: "attachDownloads", id: targetFolderId });
     await clickUiTestId(cdp, "tab-folders");
+    if (await cdp.evaluate(`Boolean(document.querySelector("[data-testid=tab-pim]"))`)) {
+      throw new Error("The PIM tab must remain hidden for 0.7.0.");
+    }
+    const startupErrors = runAdb(["logcat", "-d"]);
+    if (/plugin:notification\|is_permission_granted[^\n]*not allowed by ACL/i.test(startupErrors)) {
+      throw new Error("The generic Android notification plugin still triggers an unauthorized startup request.");
+    }
+    console.log("PIM release visibility and startup notification ACL checks passed.");
     try {
       await cdp.evaluate(`(() => {
         if (!window.__syncpeerSetDownloadProgress) throw new Error("Missing transfer test hook.");
@@ -2111,6 +2180,11 @@ const runProviderHeaderSmoke = async () => {
     } finally {
       await cdp.evaluate("window.__syncpeerClearDownloadProgress?.()");
     }
+    await verifyOpenLocal(cdp);
+  } catch (error) {
+    console.error(runAdb(["logcat", "-d", "-t", "1500"]).split("\n")
+      .filter(line => /DocumentsUI|DocumentsProvider|SyncpeerRuntime|FATAL EXCEPTION|DocumentRuntime/i.test(line)).slice(-60).join("\n"));
+    throw error;
   } finally { cdp.close(); }
   await grantEditorFolder();
   await waitForEditorGrant();

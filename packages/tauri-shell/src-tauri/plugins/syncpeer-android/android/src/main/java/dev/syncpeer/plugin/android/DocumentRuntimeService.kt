@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Binder
 import android.os.Handler
@@ -96,6 +97,7 @@ class DocumentRuntimeService : Service() {
   private var powerReceiver: BroadcastReceiver? = null
   private val initialized = CompletableFuture<DocumentRuntimeStatus>()
   private val favoriteSyncPending = AtomicBoolean(false)
+  @Volatile private var favoriteSyncNextAtMs = 0L
   @Volatile private var favoriteSyncTelemetry: FavoriteSyncSnapshot? = null
   @Volatile private var favoriteSyncRunId = 0L
   @Volatile private var favoriteSyncStartedAtMs = 0L
@@ -753,20 +755,23 @@ class DocumentRuntimeService : Service() {
     ))
   }
 
-  private fun backgroundPauseReason(input: JSONObject): String? {
+  private fun backgroundPauseReason(input: JSONObject, networkCapabilities: NetworkCapabilities? = null): String? {
     val options = input.optJSONObject("options") ?: input
     val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     val network = manager?.activeNetwork
-    val capabilities = network?.let(manager::getNetworkCapabilities)
+    val capabilities = networkCapabilities ?: network?.let(manager::getNetworkCapabilities)
     val power = getSystemService(Context.POWER_SERVICE) as? PowerManager
     return BackgroundSessionPolicy.pauseReason(
       networkAvailable = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true,
-      networkMetered = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true,
+      networkMetered = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true ||
+        capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true,
       powerSave = power?.isPowerSaveMode == true,
       deviceIdle = power?.isDeviceIdleMode == true,
       allowMetered = options.optBoolean("allowMetered", false),
       allowPowerSave = options.optBoolean("allowPowerSave", false),
       allowDeviceIdle = options.optBoolean("allowDeviceIdle", false),
+      requireCharging = options.optBoolean("requireCharging", false),
+      charging = (getSystemService(Context.BATTERY_SERVICE) as? BatteryManager)?.isCharging == true,
     )
   }
 
@@ -777,6 +782,8 @@ class DocumentRuntimeService : Service() {
   }
 
   private fun pauseForPolicy(reason: String) {
+    // These presets constrain background work, not interactive foreground access.
+    if (uiIsVisible || !backgroundSyncArmed) return
     debugNetworkEvent("policy pause: $reason")
     if (sessionPhase == "waiting" && sessionError == reason) return
     val request = sessionRequest
@@ -788,15 +795,16 @@ class DocumentRuntimeService : Service() {
       JSONObject().put("reason", when (reason) {
         "Waiting for a network connection." -> "network"
         "Waiting for an unmetered network." -> "metered"
+        "Waiting for external power." -> "charging"
         "Waiting for normal power mode." -> "battery_saver"
         "Waiting for the device to leave idle mode." -> "device_idle"
         else -> "other"
       }))
-    val generation = nextSessionGeneration()
-    val wasStarted = sessionStarted && documentsStarted && runtimeHost != null
+    val wasStarted = (sessionStarted || sessionPhase == "starting" || sessionPhase == "reconnecting") && documentsStarted && runtimeHost != null
     sessionStarted = false
     sessionPhase = "waiting"
     sessionError = reason
+    val generation = nextSessionGeneration()
     publishSessionStatus()
     runOnMain {
       if (generation == sessionGeneration) {
@@ -829,6 +837,7 @@ class DocumentRuntimeService : Service() {
   private fun resumePersistedSessionIfAllowed() {
     runCatching {
       worker.execute {
+        if (uiIsVisible) return@execute
         val request = sessionRequest ?: runCatching { backgroundSessions.load() }.getOrNull() ?: return@execute
         val input = parseSessionRequest(request) ?: return@execute
         if (backgroundPauseReason(input) != null) return@execute
@@ -859,17 +868,7 @@ class DocumentRuntimeService : Service() {
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
           val request = sessionRequest ?: return
           val input = parseSessionRequest(request) ?: return
-          val options = sessionOptions(input)
-          val power = getSystemService(Context.POWER_SERVICE) as? PowerManager
-          val reason = BackgroundSessionPolicy.pauseReason(
-            networkAvailable = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
-            networkMetered = !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
-            powerSave = power?.isPowerSaveMode == true,
-            deviceIdle = power?.isDeviceIdleMode == true,
-            allowMetered = options.optBoolean("allowMetered", false),
-            allowPowerSave = options.optBoolean("allowPowerSave", false),
-            allowDeviceIdle = options.optBoolean("allowDeviceIdle", false),
-          )
+          val reason = backgroundPauseReason(input, capabilities)
           if (reason == null) resumePersistedSessionIfAllowed() else pauseForPolicy(reason)
         }
       }
@@ -885,6 +884,8 @@ class DocumentRuntimeService : Service() {
     }
     val filter = IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED).apply {
       addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+      addAction(Intent.ACTION_POWER_CONNECTED)
+      addAction(Intent.ACTION_POWER_DISCONNECTED)
       addAction(Intent.ACTION_USER_UNLOCKED)
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -915,6 +916,12 @@ class DocumentRuntimeService : Service() {
       uiIsVisible = false
       ensureForeground()
       if (sessionRequest == request && sessionPhase in listOf("starting", "connected")) {
+        val reason = backgroundPauseReason(input)
+        if (reason != null) {
+          pauseForPolicy(reason)
+          result.complete(sessionStatus())
+          return result
+        }
         // Re-promoting a still-connected service must replace the "preparing"
         // notification instead of leaving it stale for the whole session.
         if (sessionPhase == "connected") {
@@ -954,10 +961,7 @@ class DocumentRuntimeService : Service() {
               result.complete(sessionStatus())
               return@execute
             }
-            sessionPhase = "waiting"
-            sessionError = reason
-            publishSessionStatus()
-            SyncpeerSessionNotifications.update(this, "Syncpeer background synchronization", reason)
+            pauseForPolicy(reason)
             result.complete(sessionStatus())
             return@execute
           }
@@ -1171,6 +1175,9 @@ class DocumentRuntimeService : Service() {
   }
 
   private fun requestFavoriteSync() {
+    // Leave a full idle interval after each run, even when the previous
+    // reconciliation took longer than the periodic timer.
+    if (SystemClock.elapsedRealtime() < favoriteSyncNextAtMs) return
     if (!FavoriteSyncOwnership.maySchedule(sessionPhase == "connected", uiIsVisible, backgroundSyncArmed) ||
       !favoriteSyncPending.compareAndSet(false, true)) return
     val runId = ++favoriteSyncRunId
@@ -1189,6 +1196,7 @@ class DocumentRuntimeService : Service() {
     """.trimIndent(), "{}".toByteArray(Charsets.UTF_8)).whenComplete { value, error ->
       if (runId != favoriteSyncRunId) return@whenComplete
       replayTransferJobs()
+      favoriteSyncNextAtMs = SystemClock.elapsedRealtime() + FAVORITE_SYNC_INTERVAL_MS
       favoriteSyncPending.set(false)
       favoriteSyncWatchdog?.let { mainHandler.removeCallbacks(it) }
       favoriteSyncWatchdog = null
@@ -1678,6 +1686,18 @@ class DocumentRuntimeService : Service() {
     }
     if (request.optString("operation") == "diagnostic") {
       val event = request.optString("event")
+      if (event == "core.runtime.memory_sample") {
+        val details = JSONObject()
+          .put("folderCount", request.optLong("folderCount").coerceIn(0L, 1_000_000L))
+          .put("indexEntries", request.optLong("indexEntries").coerceIn(0L, 100_000_000L))
+          .put("lockedFolders", request.optLong("lockedFolders").coerceIn(0L, 1_000_000L))
+          .put("jsHeapAvailable", request.optBoolean("jsHeapAvailable"))
+        for (key in listOf("jsHeapUsedBytes", "jsHeapTotalBytes", "jsHeapLimitBytes")) {
+          details.put(key, request.optLong(key).coerceIn(0L, 1_000_000_000_000L))
+        }
+        DiagnosticLogJournal.recordNative(applicationContext, event, "info", details)
+        return reply.put("result", JSONObject.NULL).toString()
+      }
       if (event == "core.transfer.stage") {
         val stage = request.optString("stage").takeIf {
           it in setOf("queue_wait", "local_preflight", "remote_lookup", "draft_open",
@@ -1932,9 +1952,11 @@ class DocumentRuntimeService : Service() {
     super.onTrimMemory(level)
     // Record only bounded numeric process metrics, never document identifiers.
     val memory = Runtime.getRuntime()
+    val processMemory = android.os.Debug.MemoryInfo().also { android.os.Debug.getMemoryInfo(it) }
     DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.memory_pressure", "warning",
       JSONObject().put("level", level).put("heapUsedBytes", memory.totalMemory() - memory.freeMemory())
         .put("heapMaxBytes", memory.maxMemory()).put("nativeAllocatedBytes", android.os.Debug.getNativeHeapAllocatedSize())
+        .put("processPssKb", processMemory.totalPss).put("privateDirtyKb", processMemory.totalPrivateDirty)
         .put("sessionPhase", sessionPhase).put("uiVisible", uiIsVisible))
   }
 

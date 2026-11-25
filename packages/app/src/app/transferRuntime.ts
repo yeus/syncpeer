@@ -177,7 +177,9 @@ export const createTransferRuntime = (args: TransferRuntimeArgs) => {
     control.pendingNotification = null;
     control.notificationInFlight = (async () => {
       await ensureNotificationSetup(args, control);
-      if (!(await ensurePermission(control))) return;
+      // The Android service manages its own notification permission and channel.
+      // Do not invoke the generic notification plugin for this native path.
+      if (!args.client.updateTransferNotification && !(await ensurePermission(control))) return;
       const android = supportsOngoingTransferNotifications(args.runtimeSurface);
       try {
         if (android && args.client.updateTransferNotification) {
@@ -282,6 +284,7 @@ export const createTransferRuntime = (args: TransferRuntimeArgs) => {
     } catch {
       // Runtime transition failures were already reported.
     }
+    if (args.client.updateTransferNotification) return;
     try {
       await removeActiveNativeNotifications([{ id: NOTIFICATION_ID }]);
     } catch {

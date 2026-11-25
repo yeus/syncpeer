@@ -18,12 +18,16 @@ import {
 } from "./test-android.mjs";
 import { createLanFixture, freePort, generateSyncthingIdentity } from "./lan-test/syncthing.ts";
 import { videoFixtureBytes, videoFixtureName } from "./lan-test/video-fixture.mjs";
+import { checkKeepassCli, createKeepassFixture, getKeepassApk, keepassFilename, keepassPackage } from "./lan-test/keepass-fixture.mjs";
 
 const appPackage = "dev.syncpeer.app";
 const editorPackage = "dev.syncpeer.synthetic.editor";
 const appApk = "packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk";
 const editorApk = "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build/outputs/apk/debug/syncpeer-document-editor-debug.apk";
-const peerApiLevel = Number(process.env.SYNCPEER_ANDROID_PEER_API || 29);
+// Playback needs an image with working H.264 codecs; retain API29 for other gates.
+const peerApiLevel = Number(process.env.SYNCPEER_ANDROID_PEER_API ||
+  (process.env.SYNCPEER_ANDROID_PEER_PLAYBACK_ONLY === "1" || process.env.SYNCPEER_ANDROID_PEER_KEEPASS_ONLY === "1" ||
+    process.env.SYNCPEER_ANDROID_PEER_KEEPASS_INTERRUPT_ONLY === "1" ? 36 : 29));
 type RunningEmulator = { child: ChildProcess | null; serial: string };
 
 const peerProfile = peerApiLevel === 26 ? "minimum" : peerApiLevel === 36 ? "modern" : "compat";
@@ -278,17 +282,37 @@ const main = async (): Promise<void> => {
   let discovery: Awaited<ReturnType<typeof startSyntheticDiscovery>> | null = null;
   const approvalOnly = process.env.SYNCPEER_ANDROID_PEER_APPROVAL_ONLY === "1";
   const switchApproval = process.env.SYNCPEER_ANDROID_PEER_SWITCH_APPROVAL === "1";
+  const playbackOnly = process.env.SYNCPEER_ANDROID_PEER_PLAYBACK_ONLY === "1";
+  const keepassOnly = process.env.SYNCPEER_ANDROID_PEER_KEEPASS_ONLY === "1";
+  const keepassInterruptOnly = process.env.SYNCPEER_ANDROID_PEER_KEEPASS_INTERRUPT_ONLY === "1";
   // Host-initiated connections could make acceptance pass without Android
   // dispatching the outbound pairing request.
   const outboundOnly = approvalOnly || switchApproval || discoveryMode !== "direct" ||
     process.env.SYNCPEER_ANDROID_PEER_OUTBOUND_ONLY === "1";
   try {
+    const keepassApk = keepassOnly ? await getKeepassApk(root) : null;
+    if (keepassOnly || keepassInterruptOnly) console.log("Independent KDBX validator:", checkKeepassCli());
     emulator = await startEmulator();
     uninstallIfPresent(editorPackage);
     uninstallIfPresent("dev.syncpeer.plugin.android.test");
     uninstallIfPresent(appPackage);
     run("adb", ["install", "-r", appApk]);
     run("adb", ["install", "-r", editorApk]);
+    if (keepassApk) {
+      if (!adb(["shell", "getprop", "ro.product.cpu.abilist"]).includes("x86_64")) {
+        throw new Error("Pinned KeePass2Android APK requires an x86_64 disposable emulator.");
+      }
+      uninstallIfPresent(keepassPackage);
+      run("adb", ["install", "-r", keepassApk]);
+    }
+    if (playbackOnly) {
+      const reference = adb(["shell", "content", "call", "--uri", `content://${editorPackage}.commands`,
+        "--method", "probeVideoDecoder", "--extra", `fixture:s:${videoFixtureBytes.toString("base64")}`]);
+      if (!/result=3:\d+/.test(reference)) {
+        throw new Error(`Android API ${peerApiLevel} cannot decode the local H.264 reference; check emulator video codecs or select another API image.`);
+      }
+      console.log("Android local reference video decoder passed: " + reference.trim());
+    }
 
     const deviceIdPath = path.join(root, "android-device-id");
     run(process.execPath, [
@@ -340,7 +364,6 @@ const main = async (): Promise<void> => {
     // The ordinary Android transfer suite covers 128 MiB. This fixture stays
     // smaller so it can prove multi-block journal recovery plus a full
     // DocumentsProvider hash within emulator time limits.
-    const playbackOnly = process.env.SYNCPEER_ANDROID_PEER_PLAYBACK_ONLY === "1";
     const largeFileSize = (playbackOnly ? 16 : 4) * 1024 * 1024;
     const env = {
       ...process.env,
@@ -358,6 +381,18 @@ const main = async (): Promise<void> => {
       SYNCPEER_PEER_GUI_URL: fixture.syncGuiUrl,
       SYNCPEER_PEER_API_KEY: fixture.apiKey,
     };
+    if (keepassOnly || keepassInterruptOnly) {
+      createKeepassFixture(path.join(fixture.encryptedSharePath, keepassFilename));
+      const scan = await fetch(`${fixture.syncGuiUrl}/rest/db/scan?folder=${encodeURIComponent(fixture.fixture.encryptedFolderId)}`,
+        { method: "POST", headers: { "X-API-Key": fixture.apiKey } });
+      if (!scan.ok) throw new Error("Could not index KDBX fixture.");
+      await runPhase(keepassInterruptOnly ? "--peer-keepass-interrupt" : "--peer-keepass", {
+        ...env, SYNCPEER_KEEPASS_DEVICE_ID: deviceId,
+      });
+      console.log(keepassInterruptOnly ? "Android interrupted KDBX SAF write acceptance passed."
+        : "KeePass2Android real-peer acceptance passed.");
+      return;
+    }
     if (switchApproval) {
       if (!secondFixture || !discovery) {
         throw new Error("Two-peer approval requires two fixtures and pinned automatic discovery.");
@@ -530,6 +565,7 @@ const main = async (): Promise<void> => {
     if (playbackOnly || process.env.SYNCPEER_ANDROID_PEER_TRANSFER_ONLY === "1") {
       await runPhase("--verify-transfer-no-power-cut", env);
       console.log(`Android ${largeFileSize / 1048576} MiB transfer integrity E2E passed without a power cut; total test interval ${Math.round(performance.now() - transferStarted)}ms (includes setup, publication and digest).`);
+      if (playbackOnly) await runPhase("--verify-sustained-playback", env);
       return;
     }
     await killEmulatorAbruptly(emulator);
@@ -585,6 +621,17 @@ const main = async (): Promise<void> => {
           .filter(line => /AndroidRuntime|FATAL EXCEPTION|chromium|Tauri\/Console|WebViewFactory|crash/i.test(line))
           .slice(-60).join("\n");
         console.error("Android failure log:", failureLog);
+        if (keepassOnly || keepassInterruptOnly) {
+          const pickerLog = adb(["logcat", "-d", "-t", "4000"]).split("\n")
+            .filter(line => /DocumentsUI|DocumentsProvider|DocumentsContract|RootsCache|PickActivity|KP2A|FileNotFoundException/i.test(line))
+            .slice(-60).join("\n");
+          console.error("Synthetic Android picker and KeePass diagnostics:", pickerLog);
+        }
+        if (playbackOnly) {
+          const mediaLog = adb(["logcat", "-d", "-s", "MediaMetadataRetriever:V", "StagefrightMetadataRetriever:V", "MediaCodec:W", "ACodec:W", "MPEG4Extractor:W", "OMXNodeInstance:W"]).split("\n")
+            .slice(-80).join("\n");
+          console.error("Android media failure log:", mediaLog);
+        }
       } catch (diagnosticError) {
         console.error("Android failure diagnostics unavailable.", diagnosticError);
       }

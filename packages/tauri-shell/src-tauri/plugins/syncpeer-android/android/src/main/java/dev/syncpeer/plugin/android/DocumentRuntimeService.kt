@@ -77,6 +77,9 @@ class DocumentRuntimeService : Service() {
   private var lastDiagnosticPeerPhase: String? = null
   private val slowLoggedAtMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
   @Volatile private var foregroundStarted = false
+  // SAF descriptors belong to external applications, not the peer session.
+  // Track them on the main thread; do not keep the network connected for playback.
+  private val documentLeases = mutableSetOf<Any>()
   @Volatile private var uiIsVisible = false
   @Volatile private var backgroundSyncArmed = false
   // Short-lived keepalive is independent of the opt-in for continuous favorite sync.
@@ -125,6 +128,25 @@ class DocumentRuntimeService : Service() {
     fun status(): CompletableFuture<DocumentRuntimeStatus> = initialized.thenCompose { initial ->
       recovery?.thenApply { it.copy(summary = vaultSummary ?: it.summary) }
         ?: CompletableFuture.completedFuture(terminalStatus ?: initial.copy(summary = vaultSummary ?: initial.summary))
+    }
+
+    internal fun retainDocumentLease(token: Any) = runOnMain {
+      if (destroying) return@runOnMain
+      documentLeases.add(token)
+      if (!uiIsVisible) keepDocumentForeground()
+    }
+
+    internal fun releaseDocumentLease(token: Any) = runOnMain {
+      if (!documentLeases.remove(token) || documentLeases.isNotEmpty()) return@runOnMain
+      DiagnosticLogJournal.recordNative(applicationContext, "native.document.lease.last_closed")
+      if (foregroundStarted && !backgroundSyncArmed && !backgroundGraceActive() &&
+        (uiIsVisible || sessionPhase == "idle") &&
+        runCatching { transferJobs.pending().isEmpty() }.getOrDefault(false)) {
+        foregroundStarted = false
+        ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
+        publishSessionStatus()
+      }
     }
 
     internal fun restartForTesting(): CompletableFuture<DocumentRuntimeStatus> = startRecovery()
@@ -279,7 +301,7 @@ class DocumentRuntimeService : Service() {
           "locked" -> "Open Syncpeer to unlock folder storage."
           else -> "Preparing folder storage."
         }
-        if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "rename", "flush", "release", "finishDownload", "remove", "attachDownloads")) {
+        if (input.optString("operation") in listOf("rememberFolder", "register", "createVault", "unlock", "lock", "create", "rename", "flush", "release", "finishDownload", "remove", "discardCachedFile", "attachDownloads")) {
           contentResolver.notifyChange(DocumentsContract.buildRootsUri("$packageName.documents"), null)
         }
         if (input.optString("operation") in listOf("release", "remove", "rename", "saveProfileSettings", "recordFavoriteResolution", "clearFavoriteSyncEntry")) requestFavoriteSync()
@@ -296,6 +318,7 @@ class DocumentRuntimeService : Service() {
             stopFavoriteSyncSchedule()
             beginBackgroundGrace()
           }
+          if (documentLeases.isNotEmpty()) keepDocumentForeground()
           // A user-requested transfer continues independently of background favorites.
           if (runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)) {
             ensureForeground()
@@ -312,7 +335,7 @@ class DocumentRuntimeService : Service() {
           uiIsVisible = true
           replayTransferJobs()
           if (sessionPhase == "connected") startFavoriteSyncSchedule()
-          if (foregroundStarted) {
+          if (foregroundStarted && documentLeases.isEmpty()) {
             foregroundStarted = false
             ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
             SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
@@ -412,7 +435,7 @@ class DocumentRuntimeService : Service() {
                 // started manual transfer. Keep its foreground service until
                 // the persistent job journal reports no remaining work.
                 val manualTransferActive = runCatching { transferJobs.pending().isNotEmpty() }.getOrDefault(false)
-                if (foregroundStarted && !manualTransferActive && !backgroundGraceActive()) {
+                if (foregroundStarted && !manualTransferActive && !backgroundGraceActive() && documentLeases.isEmpty()) {
                   foregroundStarted = false
                   ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                   SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
@@ -565,7 +588,7 @@ class DocumentRuntimeService : Service() {
       // A superseded stop settles with the superseding request's phase; only an idle
       // service may be stopped without killing that newer session.
       result.whenComplete { status, _ ->
-        mainHandler.post { if (status?.optString("phase") == "idle") stopSelf() }
+        mainHandler.post { if (status?.optString("phase") == "idle" && documentLeases.isEmpty()) stopSelf() }
       }
       return result
     }
@@ -1284,10 +1307,16 @@ class DocumentRuntimeService : Service() {
       sessionPhase = "idle"
       peerPhase = null
       peerError = null
-      foregroundStarted = false
+      if (documentLeases.isNotEmpty() && !uiIsVisible) {
+        keepDocumentForeground()
+        DiagnosticLogJournal.recordNative(applicationContext, "native.document.lease.peer_stopped", "info",
+          JSONObject().put("count", documentLeases.size))
+      } else {
+        foregroundStarted = false
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        SyncpeerSessionNotifications.cancel(this)
+      }
       publishSessionStatus()
-      ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-      SyncpeerSessionNotifications.cancel(this)
       result.complete(sessionStatus())
     }
   }
@@ -1333,11 +1362,22 @@ class DocumentRuntimeService : Service() {
     if (pending) return // Manual transfer remains foreground-owned until completion.
     if (sessionStarted || sessionPhase in setOf("connected", "connecting", "starting", "reconnecting", "waiting")) {
       stopSession(persist = false)
-    } else if (foregroundStarted) {
+    } else if (foregroundStarted && documentLeases.isEmpty()) {
       foregroundStarted = false
       ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
       SyncpeerSessionNotifications.cancel(this)
       publishSessionStatus()
+    }
+  }
+
+  private fun keepDocumentForeground() {
+    try {
+      ensureForeground()
+      if (foregroundStarted && sessionPhase == "idle") SyncpeerSessionNotifications.update(this,
+        "Syncpeer document access", "Another app is using an open Syncpeer document.")
+    } catch (error: Exception) {
+      DiagnosticLogJournal.recordNative(applicationContext, "native.document.lease.foreground_failed", "warning",
+        JSONObject().put("category", error.javaClass.simpleName.take(48)))
     }
   }
 
@@ -1376,7 +1416,9 @@ class DocumentRuntimeService : Service() {
         if (!request.isNullOrBlank()) scheduleBackgroundSession(request, persist = true)
       }
       SyncpeerSessionConstants.ACTION_STOP -> {
-        stopSession(persist = true).whenComplete { _, _ -> mainHandler.post { stopSelf(startId) } }
+        stopSession(persist = true).whenComplete { _, _ -> mainHandler.post {
+          if (documentLeases.isEmpty()) stopSelf(startId)
+        } }
       }
       null -> {
         // START_STICKY restarts arrive without the original Intent.  The
@@ -1484,7 +1526,7 @@ class DocumentRuntimeService : Service() {
       ::executeStorageRequest, ::executeNetworkRequest, terminated,
     )
     return try {
-      opening.get(15, TimeUnit.SECONDS)
+      opening.get(WEBVIEW_STARTUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     } catch (error: Exception) {
       if (!opening.completeExceptionally(error)) opening.getNow(null)?.close()
       throw error
@@ -1617,7 +1659,7 @@ class DocumentRuntimeService : Service() {
               DiagnosticLogJournal.recordNative(applicationContext, "native.session.transfer.background_complete", "info")
               if (sessionStarted || sessionPhase in setOf("connected", "starting", "reconnecting", "waiting")) {
                 stopSession(persist = false)
-              } else if (foregroundStarted) {
+              } else if (foregroundStarted && documentLeases.isEmpty()) {
                 foregroundStarted = false
                 ServiceCompat.stopForeground(this@DocumentRuntimeService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 SyncpeerSessionNotifications.cancel(this@DocumentRuntimeService)
@@ -1886,6 +1928,16 @@ class DocumentRuntimeService : Service() {
 
   override fun onBind(intent: Intent): IBinder = binder
 
+  override fun onTrimMemory(level: Int) {
+    super.onTrimMemory(level)
+    // Record only bounded numeric process metrics, never document identifiers.
+    val memory = Runtime.getRuntime()
+    DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.memory_pressure", "warning",
+      JSONObject().put("level", level).put("heapUsedBytes", memory.totalMemory() - memory.freeMemory())
+        .put("heapMaxBytes", memory.maxMemory()).put("nativeAllocatedBytes", android.os.Debug.getNativeHeapAllocatedSize())
+        .put("sessionPhase", sessionPhase).put("uiVisible", uiIsVisible))
+  }
+
   override fun onDestroy() {
     destroying = true
     mainHandler.removeCallbacks(backgroundGraceRunnable)
@@ -1928,6 +1980,9 @@ class DocumentRuntimeService : Service() {
 
   private companion object {
     const val SESSION_PROTOCOL_VERSION = 1
+    // Cold renderer startup on older Android can legitimately exceed 15s.
+    // Avoid repeatedly destroying an engine just before its ready handshake.
+    const val WEBVIEW_STARTUP_TIMEOUT_SECONDS = 30L
     const val BACKGROUND_GRACE_MS = 90_000L
     const val FAVORITE_SYNC_INTERVAL_MS = 15_000L
     /** A session teardown may not hold the shared document worker behind a dead network. */

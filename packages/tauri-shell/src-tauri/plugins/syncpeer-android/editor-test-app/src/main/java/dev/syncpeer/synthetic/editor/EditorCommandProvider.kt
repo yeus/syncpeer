@@ -12,6 +12,9 @@ import java.security.MessageDigest
 
 class EditorCommandProvider : ContentProvider() {
   override fun onCreate(): Boolean = true
+  // Test-only: hold the descriptor across the command response, deliberately
+  // omitting fsync and close until the harness kills the document runtime.
+  private var interruptedWriter: android.os.ParcelFileDescriptor.AutoCloseOutputStream? = null
 
   override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
     val resolver = checkNotNull(context).contentResolver
@@ -19,6 +22,20 @@ class EditorCommandProvider : ContentProvider() {
     val name = arg.orEmpty()
     val result = when (method) {
       "status" -> tree?.toString() ?: ""
+      "probeVideoDecoder" -> {
+        val bytes = android.util.Base64.decode(checkNotNull(extras?.getString("fixture")), android.util.Base64.DEFAULT)
+        check(bytes.size in 1..1_048_576) { "Unexpected synthetic fixture size" }
+        val reference = java.io.File.createTempFile("synthetic-video-", ".mp4", context!!.cacheDir)
+        val started = android.os.SystemClock.elapsedRealtime()
+        try {
+          reference.writeBytes(bytes)
+          android.os.ParcelFileDescriptor.open(reference, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+            .use { decodeVideoDescriptor(it) }
+          "3:${android.os.SystemClock.elapsedRealtime() - started}"
+        } finally { reference.delete() }
+      }
+      "saved", "opened" -> context!!.getSharedPreferences("editor", android.content.Context.MODE_PRIVATE)
+        .getString(method, "").orEmpty()
       "create" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
         check(findChild(tree, name) == null) { "Synthetic document already exists" }
@@ -38,6 +55,26 @@ class EditorCommandProvider : ContentProvider() {
           }
         }
         content
+      }
+      "holdTruncatedWrite" -> {
+        require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
+        check(name.endsWith(".kdbx") && interruptedWriter == null)
+        val document = checkNotNull(findChild(tree, name))
+        val payload = android.util.Base64.decode(extras?.getString("fixture").orEmpty(), android.util.Base64.DEFAULT)
+        require(payload.size <= 32768)
+        val output = android.os.ParcelFileDescriptor.AutoCloseOutputStream(
+          checkNotNull(resolver.openFileDescriptor(document, "rwt")))
+        interruptedWriter = output
+        output.write(payload)
+        payload.size.toString()
+      }
+      "listNames" -> {
+        require(tree != null) { "A granted tree is required" }
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+        checkNotNull(resolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+          null, null, null)).use { cursor ->
+          generateSequence { if (cursor.moveToNext()) cursor.getString(0) else null }.joinToString("|")
+        }
       }
       "read" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
@@ -89,24 +126,60 @@ class EditorCommandProvider : ContentProvider() {
         }
         listOf(listedType, queriedType, resolver.getType(document)).joinToString("|")
       }
-      "decodeVideo" -> {
+      "decodeVideo", "decodeVideoReference" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
         val document = checkNotNull(findChild(tree, name)) { "Synthetic video is missing" }
         val started = android.os.SystemClock.elapsedRealtime()
+        if (method == "decodeVideoReference") {
+          // Diagnostic control only: compare the same synthetic bytes on a
+          // regular local file. Never treat this as a successful SAF decode.
+          val reference = java.io.File.createTempFile("synthetic-video-", ".mp4", context!!.cacheDir)
+          try {
+            resolver.openFileDescriptor(document, "r")!!.use { descriptor ->
+              val size = descriptor.statSize
+              check(size in 1L..1_048_576L) { "Unexpected synthetic reference size: $size" }
+              java.io.FileInputStream(descriptor.fileDescriptor).use { input ->
+                reference.outputStream().use { output -> check(input.copyTo(output) == size) }
+              }
+            }
+            android.os.ParcelFileDescriptor.open(reference, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+              .use { decodeVideoDescriptor(it) }
+          } finally { reference.delete() }
+        } else {
+          resolver.openFileDescriptor(document, "r")!!.use { decodeVideoDescriptor(it) }
+        }
+        "3:${android.os.SystemClock.elapsedRealtime() - started}"
+      }
+      "holdVideo" -> {
+        require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
+        val document = checkNotNull(findChild(tree, name)) { "Synthetic video is missing" }
+        val started = android.os.SystemClock.elapsedRealtime()
+        var frames = 0
+        var maxReadMs = 0L
         val retriever = android.media.MediaMetadataRetriever()
         try {
           resolver.openFileDescriptor(document, "r")!!.use { descriptor ->
-            retriever.setDataSource(descriptor.fileDescriptor)
-            val duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)!!.toLong()
-            check(duration >= 1500) { "Synthetic video duration is invalid" }
-            for (time in listOf(0L, 1_000_000L, 500_000L)) {
-              val frame = checkNotNull(retriever.getFrameAtTime(time, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC))
-              try { check(frame.width == 64 && frame.height == 64) { "Invalid decoded frame" } }
+            val length = descriptor.statSize
+            check(length > 0) { "Synthetic video descriptor has invalid length: $length" }
+            retriever.setDataSource(descriptor.fileDescriptor, 0L, length)
+            val buffer = ByteArray(16)
+            while (android.os.SystemClock.elapsedRealtime() - started < 105_000L) {
+              val readStarted = android.os.SystemClock.elapsedRealtime()
+              // Native pread forces a real proxy read even if the decoder cached the tiny fixture.
+              check(android.system.Os.pread(descriptor.fileDescriptor, buffer, 0, buffer.size, 0L) == buffer.size)
+              maxReadMs = maxOf(maxReadMs, android.os.SystemClock.elapsedRealtime() - readStarted)
+              val frame = checkNotNull(retriever.getFrameAtTime((frames % 2) * 1_000_000L,
+                android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)) {
+                "Decoder returned no video frame after $frames successful frames"
+              }
+              try { check(frame.width == 64 && frame.height == 64) }
               finally { frame.recycle() }
+              frames++
+              android.os.SystemClock.sleep(4_000L)
             }
           }
-          "3:${android.os.SystemClock.elapsedRealtime() - started}"
         } finally { retriever.release() }
+        "$frames:${android.os.SystemClock.elapsedRealtime() - started}:$maxReadMs"
       }
       "digest" -> {
         require(tree != null && validName(name)) { "A granted tree and safe file name are required" }
@@ -127,6 +200,26 @@ class EditorCommandProvider : ContentProvider() {
       else -> error("Unknown synthetic editor command")
     }
     return Bundle().apply { putString("result", result) }
+  }
+
+  private fun decodeVideoDescriptor(descriptor: android.os.ParcelFileDescriptor) {
+    val length = descriptor.statSize
+    check(length > 0) { "Synthetic video descriptor has invalid length: $length" }
+    val retriever = android.media.MediaMetadataRetriever()
+    try {
+      retriever.setDataSource(descriptor.fileDescriptor, 0L, length)
+      val duration = checkNotNull(retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)) {
+        "Synthetic video duration is missing (descriptor length=$length)"
+      }.toLong()
+      check(duration >= 1500) { "Synthetic video duration is invalid: $duration" }
+      for (time in listOf(0L, 1_000_000L, 500_000L)) {
+        val frame = checkNotNull(retriever.getFrameAtTime(time, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)) {
+          "Decoder returned no video frame at ${time}us (descriptor length=$length, duration=$duration)"
+        }
+        try { check(frame.width == 64 && frame.height == 64) { "Invalid decoded frame: ${frame.width}x${frame.height}" } }
+        finally { frame.recycle() }
+      }
+    } finally { retriever.release() }
   }
 
   private fun storedTree(): Uri? = checkNotNull(context)

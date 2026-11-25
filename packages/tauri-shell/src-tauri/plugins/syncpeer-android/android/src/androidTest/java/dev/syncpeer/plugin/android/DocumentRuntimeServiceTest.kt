@@ -35,6 +35,9 @@ class DocumentRuntimeServiceTest {
       val icon = cursor.getInt(cursor.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_ICON))
       // Single icon source: the launcher icon generated from icon.svg, never a second copy.
       assertEquals("the root must reuse the application icon", context.applicationInfo.icon, icon)
+      val flags = cursor.getInt(cursor.getColumnIndexOrThrow(DocumentsContract.Root.COLUMN_FLAGS))
+      assertTrue("Save As must include the Syncpeer root",
+        flags and DocumentsContract.Root.FLAG_SUPPORTS_CREATE != 0)
       if (icon != 0) assertNotNull(context.resources.getDrawable(icon, null))
     }
   }
@@ -104,6 +107,15 @@ class DocumentRuntimeServiceTest {
       val afterOpen = command("list", JSONObject().put("id", folder)) as JSONArray
       assertTrue("Opening the downloaded document must not hide or delete it",
         (0 until afterOpen.length()).any { afterOpen.getJSONObject(it).getString("id") == downloadedId })
+      // The open request's cancellation signal must not revoke an acquired FD.
+      val signal = android.os.CancellationSignal()
+      resolver.openFileDescriptor(downloadUri, "r", signal)!!.use { descriptor ->
+        signal.cancel()
+        assertEquals(4L, descriptor.statSize)
+        java.io.FileInputStream(descriptor.fileDescriptor).use {
+          assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes())
+        }
+      }
       resolver.openInputStream(downloadUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
       val renamedUri = DocumentsContract.renameDocument(resolver, downloadUri, "renamed.bin")!!
       resolver.openInputStream(renamedUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }

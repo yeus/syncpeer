@@ -8,7 +8,9 @@ import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
 import { normalizeDeviceId } from "@syncpeer/core/browser";
 import { createBrowserBepSchemaPlugin } from "./vite-plugins/browserBepSchema.mjs";
 import { measureConnectionReadiness, probeServiceReadiness } from "./connection-performance.mjs";
-import { videoFixtureName } from "./lan-test/video-fixture.mjs";
+import { videoFixtureBytes, videoFixtureName } from "./lan-test/video-fixture.mjs";
+import { runKeepassAcceptance } from "./lan-test/keepass-android.mjs";
+import { runKeepassInterruptedSave } from "./lan-test/keepass-interrupt.mjs";
 
 const cliArguments = process.argv.slice(2);
 const hasArgument = (name) => cliArguments.includes(name);
@@ -70,13 +72,13 @@ const peerGuiUrl = process.env.SYNCPEER_PEER_GUI_URL?.trim() || "";
 const peerApiKey = process.env.SYNCPEER_PEER_API_KEY?.trim() || "";
 const deviceSerial = process.env.ANDROID_SERIAL?.trim() || "";
 
-const runAdb = (args, timeout = 30_000) => {
+const runAdb = (args, timeout = 30_000, stderr = "pipe") => {
   try {
     return execFileSync("adb", args[0] === "devices" || !deviceSerial
       ? args
       : ["-s", deviceSerial, ...args], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", stderr],
       timeout,
     });
   } catch (error) {
@@ -709,7 +711,9 @@ const grantEditorFolder = async () => {
   runAdb(["shell", "am", "force-stop", editorPackage]);
   // A stale tree preference from a revoked earlier grant would let
   // waitForEditorGrant pass without a live persistable permission.
-  runAdb(["shell", "pm", "clear", editorPackage]);
+  // PackageManager can be slow on a freshly booted software emulator.
+  const cleared = runAdb(["shell", "pm", "clear", editorPackage], 90_000);
+  if (cleared.trim() !== "Success") throw new Error(`Could not clear test editor: ${cleared}`);
   runAdb(["shell", "am", "start", "-n", `${editorPackage}/.GrantActivity`]);
   try {
     await tapDocumentUiText(targetFolderTitle, 30_000);
@@ -740,7 +744,9 @@ const editorCommand = (method, name = "", extras = {}) => {
   }
   // Reading a multi-MiB file through the Android proxy descriptor requires
   // multiple native/TypeScript round trips; do not use the metadata timeout.
-  const output = runAdb(args, ["digest", "decodeVideo"].includes(method) ? 150_000 : 30_000).trim();
+  // Android's content CLI can report an exception on stderr with exit status 0.
+  // Preserve the synthetic provider's diagnostics rather than reporting only an empty result.
+  const output = runAdb(args, ["digest", "decodeVideo", "holdVideo"].includes(method) ? 150_000 : 30_000, "inherit").trim();
   const result = output.match(/result=([^}]*)/)?.[1];
   if (result === undefined) throw new Error(`Synthetic editor ${method} returned ${output}.`);
   return result;
@@ -972,12 +978,116 @@ const preparePeerPowerCutSession = async () => {
   }
 };
 
+/** Use Android's native Back dispatcher, not window.history.back() or breadcrumbs,
+ * to exercise the same app history consumed by the system edge gesture. */
+const verifyAndroidFolderBackHistory = async (cdp) => {
+  const expectLocation = (folder, path, label, rowId) => waitForUiCondition(cdp, `(() => {
+    const route = new URLSearchParams(location.hash.slice(1));
+    return route.get("tab") === "folders" &&
+      (route.get("folder") ?? "") === ${JSON.stringify(folder)} &&
+      (route.get("path") ?? "") === ${JSON.stringify(path)} &&
+      document.querySelector(".crumb-current")?.textContent?.trim() === ${JSON.stringify(label)} &&
+      !!document.querySelector(${JSON.stringify(`[data-testid="${rowId}"]`)});
+  })()`, `folder history: ${label}`, 45_000);
+  const root = () => expectLocation(targetFolderId, "", targetFolderTitle, "folder-entry-navigation-parent");
+  const parent = () => expectLocation(targetFolderId, "navigation-parent", "navigation-parent",
+    "folder-entry-navigation-parent/navigation-child");
+  const child = () => expectLocation(targetFolderId, "navigation-parent/navigation-child", "navigation-child",
+    "folder-entry-navigation-parent/navigation-child/fixture.txt");
+  const back = () => runAdb(["shell", "input", "keyevent", "KEYCODE_BACK"]);
+  await root();
+  await clickUiTestId(cdp, "folder-entry-navigation-parent");
+  await parent();
+  await clickUiTestId(cdp, "folder-entry-navigation-parent/navigation-child");
+  await child();
+  // Jump upward explicitly, then Back must restore the deeper previous path.
+  await cdp.evaluate(`[...document.querySelectorAll(".crumb-button")]
+    .find(element => element.textContent?.trim() === "navigation-parent").click()`);
+  await parent();
+  back();
+  await child();
+  back();
+  await parent();
+  back();
+  await root();
+  back();
+  await expectLocation("", "", "All Syncthing Folders", `folder-root-${targetFolderId}`);
+  await assertForeground();
+  console.log("Android native Back restores nested directory, breadcrumb jump and folder overview history.");
+};
+
+const verifyFavoriteAndSavePicker = async (cdp) => {
+  await clickUiTestId(cdp, "tab-devices");
+  await waitForUiCondition(cdp, '[...document.querySelectorAll(".status-chip.online")].some(chip => chip.textContent.trim() === "connected")',
+    "connected peer chip with matching text and color", 15_000);
+  await openAndroidFolder(cdp, false);
+  await waitForAndroidFileRow(cdp, targetFileName);
+  const selected = await cdp.evaluate(`(() => {
+    const row = document.querySelector(${JSON.stringify(`[data-testid="folder-entry-${targetFileName}"]`)})?.closest("li");
+    const star = row?.querySelector('[aria-label="Toggle favorite"]');
+    if (!star || star.getAttribute("aria-pressed") === "true") return false;
+    star.click();
+    return true;
+  })()`);
+  if (!selected) throw new Error("Could not select uncached file through the UI star.");
+  await waitForUiCondition(cdp, `document.querySelector(${JSON.stringify(`[data-testid="folder-entry-${targetFileName}"]`)})?.closest("li")?.querySelector('[aria-label="Toggle favorite"]')?.getAttribute("aria-pressed") === "true"`,
+    "favorite selection", 15_000);
+  const deadline = Date.now() + 60_000;
+  let cached = false;
+  while (Date.now() < deadline) {
+    const statuses = await documentCommand(cdp, { operation: "cachedStatuses", folderId: targetFolderId, paths: [targetFileName] });
+    if (statuses[0]?.available) { cached = true; break; }
+    await wait(500);
+  }
+  if (!cached) throw new Error("A UI-selected favorite was not automatically downloaded.");
+  console.log("Android UI star automatically downloaded an uncached file.");
+  // Separate editor uses the OS Save As picker, not a direct provider call.
+  runAdb(["shell", "am", "start", "-n", `${editorPackage}/.GrantActivity`, "--ez", "saveAs", "true"]);
+  await tapDocumentUiContentDescription("Show roots", 20_000);
+  await tapDocumentUiText("Syncpeer", 30_000);
+  await tapDocumentUiText(targetFolderTitle, 30_000);
+  await tapDocumentUiText("Save", 30_000);
+  const savedDeadline = Date.now() + 30_000;
+  let saved = "";
+  while (Date.now() < savedDeadline) {
+    saved = editorCommand("saved");
+    if (saved) break;
+    await wait(500);
+  }
+  if (!saved.startsWith(`content://${packageName}.documents/`)) throw new Error("Save As did not write/read back the selected document: " + saved);
+  console.log("Android Save As picker created and wrote an encrypted Syncpeer document.");
+  await assertForeground();
+  await waitForAndroidFileRow(cdp, "save-as-fixture.txt");
+  // This must not require starring the newly saved file or its parent folder.
+  await waitForUiCondition(cdp, `document.querySelector(${JSON.stringify('[data-testid="folder-entry-save-as-fixture.txt"]')})?.closest("li")?.querySelector('[aria-label="Toggle favorite"]')?.getAttribute("aria-pressed") === "false"`,
+    "new Save As file visible without favorite selection", 30_000);
+  await waitForHostFile("save-as-fixture.txt", "saved-from-picker");
+  await clickUiTestId(cdp, `folder-entry-${targetFileName}`);
+  await tapDocumentUiText("Syncpeer synthetic document editor", 30_000);
+  const openDeadline = Date.now() + 60_000;
+  let opened = "";
+  while (Date.now() < openDeadline) {
+    opened = editorCommand("opened");
+    if (opened) break;
+    await wait(500);
+  }
+  if (opened !== "ok") throw new Error("Direct file editor could not save in place: " + opened);
+  await waitForHostFile(targetFileName, "edited-from-syncpeer");
+  console.log("Android directly opened favorite edited in place, read back and uploaded to Syncthing.");
+};
+
 /** True packaged Android-to-Syncthing smoke: discovery, TLS/BEP and remote folder index. */
 const runPeerConnectSmoke = async () => {
   const cdp = await launchAndroidApp(true);
   try {
     const localOnly = process.env.SYNCPEER_ANDROID_PEER_LOCAL_VAULT_ONLY === "1";
     // Test first-run automatic device protection separately from explicit password-vault setup.
+    if (process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1") {
+      if (!peerHostFolder) throw new Error("Navigation requires the disposable host fixture.");
+      fs.mkdirSync(`${peerHostFolder}/navigation-parent/navigation-child`, { recursive: true });
+      fs.writeFileSync(`${peerHostFolder}/navigation-parent/navigation-child/fixture.txt`, "navigation fixture");
+      await scanPeerFolder();
+    }
     if (!localOnly) await ensurePeerDocumentVault(cdp);
     if (!await openAndroidConnection(cdp)) throw new Error("Android real-peer connection did not open.");
     if (localOnly) {
@@ -1012,6 +1122,8 @@ const runPeerConnectSmoke = async () => {
         throw new Error(`Encrypted folder was not attached after password entry: ${JSON.stringify(folder)}`);
       }
       await waitForAndroidFileRow(cdp, targetFileName);
+      await verifyAndroidFolderBackHistory(cdp);
+      await verifyFavoriteAndSavePicker(cdp);
       console.log("Android encrypted peer folder unlocked, attached, and remote file indexed.");
     }
     console.log(`Android ${discoveryMode} real-peer connection and remote folder index passed.`);
@@ -1318,6 +1430,10 @@ const prepareConcurrentPlayback = async () => {
   const deadline = Date.now() + downloadTimeoutMs;
   while (Date.now() < deadline) {
     if (editorCommand("stat", videoFixtureName) === "true") {
+      const expected = `${videoFixtureBytes.length}:${createHash("sha256").update(videoFixtureBytes).digest("hex")}`;
+      const actual = editorCommand("digest", videoFixtureName);
+      if (actual !== expected) throw new Error(`Cached video integrity mismatch: expected ${expected}, got ${actual}`);
+      console.log("Cached video SHA-256 verified before decoder baseline.");
       const baseline = editorCommand("decodeVideo", videoFixtureName);
       if (!/^3:\d+$/.test(baseline)) throw new Error("Video decode did not return three frames.");
       console.log("Offline video decode baseline (frames:ms): " + baseline);
@@ -1336,6 +1452,31 @@ const verifyConcurrentPlayback = async () => {
   if (editorCommand("stat", targetLargeFileName) !== "false")
     throw new Error("Transfer finished before overlap could be verified; increase the fixture size.");
   console.log("Video decoded and sought three frames while background download remained unpublished (frames:ms): " + decoded);
+};
+
+/** Hold the SAME proxy descriptor beyond the 90s peer-session grace period. */
+const verifySustainedPlayback = async () => {
+  const cdp = await launchAndroidApp(true);
+  try {
+    await waitForEditorGrant();
+    const settings = await documentCommand(cdp, { operation: "profileSettings" });
+    await documentCommand(cdp, { operation: "saveProfileSettings", settings: {
+      ...settings, profile: { ...settings.profile, keepSyncingInBackground: false },
+    } });
+    if (!await openAndroidConnection(cdp)) throw new Error("Playback grace test could not connect.");
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
+      "connected before playback grace", 45_000);
+    runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+    await waitForSessionService(true, 20_000);
+    const result = editorCommand("holdVideo", videoFixtureName);
+    if (!/^\d+:\d+:\d+$/.test(result)) throw new Error("Sustained video probe failed: " + result);
+    const [frames, elapsedMs, maxReadMs] = result.split(":").map(Number);
+    if (frames < 10 || elapsedMs < 100_000) throw new Error("Sustained video probe was too short.");
+    await waitForSessionService(false, 20_000);
+    console.log("Same open Android video descriptor survived peer grace expiration (frames:ms:maxReadMs): " + result);
+    if (maxReadMs > 3_000) throw new Error("Sustained provider read latency exceeded three seconds.");
+  } finally { cdp.close(); }
 };
 
 const verifyPeerTransferPowerCut = async (afterPowerCut = true) => {
@@ -3839,6 +3980,53 @@ const main = async () => {
     await runPeerCrossAppWorkflow();
     return;
   }
+  if (hasArgument("--peer-keepass-interrupt")) {
+    await preparePeerPowerCutSession();
+    await runKeepassInterruptedSave({
+      runAdb, wait, editorCommand, peerHostFolder,
+      restartDocumentRuntime: async () => {
+        // Stop the runtime before dropping the writer; the latter would otherwise
+        // cause Android to invoke onRelease and commit the partial bytes.
+        runAdb(["shell", "am", "force-stop", packageName]);
+        await waitForPackageStopped();
+        runAdb(["shell", "am", "force-stop", "dev.syncpeer.synthetic.editor"]);
+        const cdp = await launchAndroidApp(true);
+        try {
+          await ensurePeerDocumentVault(cdp);
+          if (!await openAndroidConnection(cdp)) throw new Error("Interrupted KDBX: peer did not reconnect.");
+          runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+          await waitForSessionService(true, 30_000);
+          await waitForSessionNotificationText("Peer session connected; selected sync is ready.", 120_000);
+        } finally { cdp.close(); }
+        await waitForEditorGrant();
+      },
+    });
+    return;
+  }
+  if (hasArgument("--peer-keepass")) {
+    await preparePeerPowerCutSession();
+    await runKeepassAcceptance({
+      runAdb, wait, captureUiHierarchy, recoverEmulatorAnr, nodeBounds,
+      tapDocumentUiText, tapDocumentUiContentDescription, editorCommand,
+      scanPeerFolder, peerHostFolder, peerGuiUrl, peerApiKey, targetFolderTitle,
+      readFavoriteState: async () =>
+        (await freshDocumentCommand({ operation: "favoriteSyncState", folderId: targetFolderId })).entries["syncpeer-acceptance.kdbx"],
+      rebootAndReconnect: async () => {
+        runAdb(["reboot"], 10_000);
+        await waitForAndroidBoot();
+        runAdb(["shell", "input", "keyevent", "82"]);
+        runAdb(["reverse", `tcp:${directPort}`, `tcp:${directPort}`]);
+        const cdp = await launchAndroidApp(true);
+        try {
+          if (!await openAndroidConnection(cdp)) throw new Error("KeePass reboot: peer did not reconnect.");
+          runAdb(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+          await waitForSessionService(true, 30_000);
+          await waitForSessionNotificationText("Peer session connected; selected sync is ready.", 120_000);
+        } finally { cdp.close(); }
+      },
+    });
+    return;
+  }
   if (hasArgument("--session-policy-transition")) {
     await runSessionPolicyTransition();
     return;
@@ -3857,6 +4045,10 @@ const main = async () => {
   }
   if (hasArgument("--verify-concurrent-playback")) {
     await verifyConcurrentPlayback();
+    return;
+  }
+  if (hasArgument("--verify-sustained-playback")) {
+    await verifySustainedPlayback();
     return;
   }
   if (hasArgument("--prepare-transfer-power-cut")) {

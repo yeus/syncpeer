@@ -125,7 +125,9 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       add(Root.COLUMN_DOCUMENT_ID, ROOT_DOCUMENT_ID)
       add(Root.COLUMN_TITLE, "Syncpeer")
       add(Root.COLUMN_SUMMARY, summary())
-      add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_IS_CHILD)
+      // DocumentsUI filters ACTION_CREATE_DOCUMENT roots by this flag.
+      // The virtual root itself remains non-creatable; attached folders accept writes.
+      add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_CREATE)
       add(Root.COLUMN_MIME_TYPES, "*/*")
       add(Root.COLUMN_AVAILABLE_BYTES, null)
       add(Root.COLUMN_ICON, applicationIcon())
@@ -249,16 +251,29 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     signal?.throwIfCanceled()
     if (Build.VERSION.SDK_INT < 26) throw FileNotFoundException(summary())
     val handle = (command(JSONObject().put("operation", "open").put("id", documentId).put("mode", mode)) as Number).toInt()
+    val lease = Any()
+    val owner = runtime
+    owner?.retainDocumentLease(lease)
     val callback = object : ProxyFileDescriptorCallback() {
       private var released = false
       private fun request(operation: String, offset: Long = 0, size: Int = 0, data: ByteArray? = null): Any? {
         try {
-          signal?.throwIfCanceled()
+          // Cancellation belongs to openDocument, not to the lifetime of an
+          // already-returned proxy descriptor held by another application.
           val input = JSONObject().put("operation", operation).put("handle", handle).put("offset", offset).put("size", size)
           if (operation == "read") input.put("encoding", "base64")
-          if (data != null) input.put("bytes", JSONArray(data.take(size).map { it.toInt() and 255 }))
+          if (data != null) {
+            input.put("encoding", "base64")
+            input.put("bytes", android.util.Base64.encodeToString(data, 0, size, android.util.Base64.NO_WRAP))
+          }
           return command(input)
-        } catch (_: Exception) { throw ErrnoException(operation, OsConstants.EIO) }
+        } catch (error: Exception) {
+          context?.let { app ->
+            DiagnosticLogJournal.recordNative(app, "native.provider.io_failed", "warning",
+              JSONObject().put("operation", operation).put("errorType", error.javaClass.simpleName.take(48)))
+          }
+          throw ErrnoException(operation, OsConstants.EIO)
+        }
       }
       override fun onGetSize(): Long = (request("size") as Number).toLong()
       override fun onRead(offset: Long, size: Int, data: ByteArray): Int {
@@ -278,15 +293,21 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       override fun onRelease() {
         if (released) return
         released = true
-        runCatching { command(JSONObject().put("operation", "release").put("handle", handle)) }
+        try { command(JSONObject().put("operation", "release").put("handle", handle)) }
+        catch (error: Exception) {
+          context?.let { app -> DiagnosticLogJournal.recordNative(app, "native.provider.release_failed", "warning",
+            JSONObject().put("errorType", error.javaClass.simpleName.take(48))) }
+        } finally { owner?.releaseDocumentLease(lease) }
       }
     }
     try {
+      signal?.throwIfCanceled()
       // Truncation is already durable in the core journal.
       val manager = context!!.getSystemService(Context.STORAGE_SERVICE) as StorageManager
       return manager.openProxyFileDescriptor(ParcelFileDescriptor.parseMode(mode), callback, Handler(ioThread.looper))
     } catch (error: Exception) {
-      command(JSONObject().put("operation", "release").put("handle", handle).put("abort", true))
+      try { command(JSONObject().put("operation", "release").put("handle", handle).put("abort", true)) }
+      finally { owner?.releaseDocumentLease(lease) }
       throw error
     }
   }
@@ -302,7 +323,8 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       throw FileNotFoundException(documentRuntimeFailureMessage(error.message.orEmpty()))
     }
     val status = try {
-      owner.status().get(30, TimeUnit.SECONDS)
+      // Allow the bounded 30s WebView startup plus storage/bootstrap overhead.
+      owner.status().get(45, TimeUnit.SECONDS)
     } catch (error: Exception) {
       throw FileNotFoundException(documentRuntimeFailureMessage(error.message.orEmpty()))
     }

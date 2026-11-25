@@ -336,6 +336,56 @@ npm run android:emulator:modern
 npm run test:android:modern-smoke
 ```
 
+### KeePass2Android SAF acceptance
+
+Run the dedicated real-peer gate with a disposable x86_64 Android 36 emulator,
+the Android E2E APK and synthetic editor APK built by the existing Android
+workflow, and `keepassxc-cli` on the host PATH:
+
+```bash
+npm run test:android:peer:keepass
+```
+
+On NixOS, use `nix shell nixpkgs#keepassxc` from the Syncpeer development
+shell if the CLI is not installed. The harness downloads the official
+KeePass2Android Offline v1.15-r6 x86_64 APK and checks its pinned SHA-256.
+Set `SYNCPEER_KEEPASS_APK` to reuse that exact APK and optionally
+`SYNCPEER_KEEPASSXC_CLI` to select a CLI executable. The test never accepts
+a personal database or physical device. It uses the OS file picker to grant
+the real application access and validates host entries with KeePassXC, not
+just file sizes or modification timestamps. The synthetic editor independently
+hashes published SAF documents. The test requires bidirectional and offline
+saves, a new host edit after Android reboot without reselecting the database,
+a multi-block database with a deterministic 4 MiB attachment, and explicit
+conflict preservation. It does not implement automatic KDBX merge.
+
+The independent core recovery gate runs without Android:
+
+```bash
+npm run test:keepass:recovery
+```
+
+It checks four controlled interruptions: after truncate, during an incomplete
+write, after all writes but before close, and after fsync. It restarts the
+encrypted document runtime against the same backing storage and uses KeePassXC
+to decrypt the resulting primary and recovered complete database (including
+attachment contents). An interrupted uncommitted truncating replacement
+preserves the previous nonempty primary and saves its acknowledged bytes
+as a separate conflict copy, even without versioning or favorite selection.
+A fully written draft without a publication request is still uncertain.
+This is a core storage fault simulation. The separate packaged Android gate
+uses a synthetic editor with a real open SAF file descriptor and force-stops
+the document runtime before the writer can close:
+
+```bash
+npm run test:android:peer:keepass-interrupt
+```
+
+An editor process dying while the provider survives may cause Android to
+deliver a normal descriptor release; SAF does not provide a reliable success
+signal that distinguishes this from an intentional close. This fault model
+is separate from a document-runtime crash and is not covered by these gates.
+
 ## Diagnostics and E2E Test Suites
 
 The repository has two test umbrellas:

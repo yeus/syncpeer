@@ -17,6 +17,8 @@ export interface SyncpeerProfileSettings {
     preserveLocalChanges: boolean;
     cache: { percent: number; minimumBytes: number; maximumBytes: number; overrideBytes?: number };
     allowMetered: boolean;
+    /** When enabled, automatic background work waits for external power. */
+    requireCharging?: boolean;
     autoMount: boolean;
     keepSyncingInBackground: boolean;
   };
@@ -39,6 +41,7 @@ export const defaultProfileSettings = (): SyncpeerProfileSettings => ({
     preserveLocalChanges: true,
     cache: { percent: 5, minimumBytes: 512 * 1024 * 1024, maximumBytes: 5 * 1024 * 1024 * 1024 },
     allowMetered: false,
+    requireCharging: false,
     autoMount: false,
     keepSyncingInBackground: false,
   },
@@ -89,6 +92,7 @@ export function normalizeProfileSettings(value: unknown): SyncpeerProfileSetting
     typeof profile.preserveLocalChanges !== "boolean" || typeof profile.allowMetered !== "boolean" ||
     typeof profile.autoMount !== "boolean" ||
     (profile.keepSyncingInBackground !== undefined && typeof profile.keepSyncingInBackground !== "boolean") ||
+    (profile.requireCharging !== undefined && typeof profile.requireCharging !== "boolean") ||
     !profile.cache || typeof profile.cache !== "object") {
     throw new Error("Invalid profile settings.");
   }
@@ -110,6 +114,7 @@ export function normalizeProfileSettings(value: unknown): SyncpeerProfileSetting
   }));
   return { format: 1, profile: { versioning: profile.versioning as FolderVersioningMode,
     preserveLocalChanges: profile.preserveLocalChanges, cache: { ...cache }, allowMetered: profile.allowMetered,
+    requireCharging: profile.requireCharging === true,
     autoMount: profile.autoMount, keepSyncingInBackground: profile.keepSyncingInBackground === true }, folders, devices };
 }
 

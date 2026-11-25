@@ -8,7 +8,7 @@
     FileEntrySortMode,
   } from "@syncpeer/core/browser";
   import { activeDownloadForFile, folderUnlockError, type AppState } from "../app/state.ts";
-  import { connectedFolderStatus, directoryPlaceholder, folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
+  import { directoryPlaceholder, folderRootEmptyNotice, shouldRenderFolderRootList } from "../app/connectionNotices.ts";
   import LayoutGrid from "lucide-svelte/icons/layout-grid";
   import List from "lucide-svelte/icons/list";
   import FolderOpen from "lucide-svelte/icons/folder-open";
@@ -16,7 +16,7 @@
   import Breadcrumbs from "./Breadcrumbs.svelte";
   import FileSystemListItem from "./FileSystemListItem.svelte";
   import Panel from "./Panel.svelte";
-  import StatusChip from "./StatusChip.svelte";
+  import Filter from "lucide-svelte/icons/filter";
 
   interface Props {
     app: AppState;
@@ -255,44 +255,16 @@
     locked: Boolean(app.session.currentFolderId && isFolderLocked(app.session.currentFolderId) && !app.session.isLocalDirectory),
   }));
 
-  let folderViewStatus = $derived.by(() => {
-    if (app.session.isConnected && !app.session.isOfflineSnapshot) {
-      return { tone: "online" as const, label: connectedFolderStatus(
-        rootFolders.map(folder => ({
-          locked: isFolderLocked(folder.id),
-          indexReceived: folder.stats?.indexReceived === true,
-        })),
-      ) };
-    }
-    const seen = app.session.offlineLastSeenAtMs;
-    return {
-      tone: "offline" as const,
-      label: seen
-        ? `Offline · last seen ${new Date(seen).toLocaleString()}`
-        : "Offline",
-    };
-  });
+  let showFilters = $state(false);
 
   let rootEmptyNotice = $derived(
     folderRootEmptyNotice(app.session.isConnected, rootRows.length),
   );
 </script>
-<Panel title="Folders">
+<Panel>
   {#if !shouldRenderFolderRootList(app.session.isConnected, rootRows.length)}
     <p class="empty" data-testid="folder-root-empty-notice">{rootEmptyNotice}</p>
   {:else}
-    <div class="status-row">
-      <span data-testid="folder-view-status">
-        <StatusChip tone={folderViewStatus.tone}>{folderViewStatus.label}</StatusChip>
-      </span>
-      {#if app.session.remoteDevice}
-        <span>{app.session.remoteDevice.deviceName}</span>
-      {/if}
-      {#if app.session.lastUpdatedAt}
-        <span>Updated {app.session.lastUpdatedAt}</span>
-      {/if}
-    </div>
-
     <Breadcrumbs
       currentFolderId={app.session.currentFolderId}
       segments={breadcrumbs}
@@ -302,6 +274,7 @@
 
 
     {#if app.session.currentFolderId}
+      {#if showFilters}
       <div class="directory-tools">
         <label>
           Filter by name
@@ -328,6 +301,7 @@
           </select>
         </label>
       </div>
+      {/if}
       <div class="actions">
         <input id="folder-upload-input" class="upload-input" type="file" multiple onchange={onHandleUploadSelected} />
         <button class="primary" onclick={onHandleUploadClick}>
@@ -342,6 +316,7 @@
           <FolderOpen size={16} />
           Open Local
         </button>
+        <button class="ghost compact-toggle" data-testid="folder-filter-toggle" aria-label="Filter and sort" title="Filter and sort" aria-expanded={showFilters} class:active={showFilters || Boolean(directoryNameFilter.trim()) || directorySortMode !== "name"} onclick={() => { showFilters = !showFilters; }}><Filter size={18} /></button>
         <div class="view-toggle" role="group" aria-label="Directory view mode">
           <button
             class={`ghost compact-toggle ${directoryViewMode === "list" ? "active" : ""}`}
@@ -484,15 +459,6 @@
     gap: 0.15rem;
   }
 
-  .status-row {
-    display: flex;
-    gap: 0.45rem;
-    align-items: center;
-    flex-wrap: wrap;
-    font-size: 0.82rem;
-    color: var(--text-secondary);
-    margin-bottom: 0.45rem;
-  }
 
   .directory-tools {
     display: grid;

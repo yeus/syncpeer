@@ -15,7 +15,7 @@ import { createFreshEncryptedProfile } from "./profile-setup.js";
 import { startLocalRelay } from "./relay.js";
 import { generateSyncthingIdentity } from "./syncthing.js";
 import { clickButtonByText, openFolderSettings, readSessionEventNames, selectDiscoveryMode,
-  setDirectConnectionFields } from "./ui-helpers.js";
+  setDirectConnectionFields, openSettingsSection, closeSettings, readCurrentDeviceId, setAutomaticConnectionPaused, type TauriBrowser } from "./ui-helpers.js";
 
 const folderId = "syncpeer-crossapp-folder"; // synthetic disposable emulator fixture
 const password = "synthetic-crossapp-folder-password";
@@ -175,7 +175,7 @@ async function createDesktopEncryptedFolder(label: string): Promise<string> {
     if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
     tab.click();
   });
-  await clickButtonByText(browser, "New folder");
+  await clickButtonByText(browser, "New shared folder");
   await $("//label[contains(., 'New folder name')]/input").setValue(label);
   const create = $("button=Create folder");
   await create.waitForEnabled({ timeout: 30_000 });
@@ -263,7 +263,7 @@ async function attachSharedFolder() {
       });
       await browser.execute(() => {
         const root = document.querySelector(".breadcrumbs .crumb-button");
-        if (root instanceof HTMLButtonElement && root.textContent?.includes("All Syncthing Folders")) root.click();
+        if (root instanceof HTMLButtonElement && root.dataset.testid === "folder-root-back") root.click();
       });
       const root = $(`[data-testid='folder-root-${folderId}']`);
       try { await root.waitForExist({ timeout: 120_000 }); }
@@ -379,7 +379,7 @@ describe("Packaged desktop to Android pairing", () => {
     assert.ok(serial?.startsWith("emulator-"));
     await clickButtonByText(browser, "Back");
     await $("[data-testid='tab-devices']").click();
-    const ownerId = (await $("[data-testid='current-device-id']").getText()).trim();
+    const ownerId = await readCurrentDeviceId(browser as unknown as TauriBrowser);
     assert.ok(ownerId);
 
     const desktopFolderLabel = "desktop-originated-credential";
@@ -398,13 +398,10 @@ describe("Packaged desktop to Android pairing", () => {
       execFileSync("adb", ["-s", serial, "forward", `tcp:${forwardedPort}`,
         `tcp:${androidListenPort}`]);
       await browser.execute(() => { window.prompt = () => "synthetic-desktop-crossapp"; });
-      await browser.execute(() => {
-        const toggle = document.querySelector("[data-testid='connection-settings-toggle']");
-        if (!(toggle instanceof HTMLButtonElement)) throw new Error("Connection settings are unavailable.");
-        if (toggle.getAttribute("aria-expanded") !== "true") toggle.click();
-      });
+      await openSettingsSection(browser, "network");
       await setDirectConnectionFields(browser, { remoteId: androidId, host: "127.0.0.1",
         remotePort: forwardedPort, listenPort });
+      await closeSettings(browser);
 
       const androidConnection = spawn(process.execPath,
         ["scripts/test-android-e2e.mjs", "--connect-whole-folder"], {
@@ -468,7 +465,7 @@ describe("Packaged desktop to Android pairing", () => {
         await $("[data-testid='tab-devices']").waitForExist({ timeout: 30_000 });
       }
       await $("[data-testid='tab-devices']").click();
-      const ownerId = (await $("[data-testid='current-device-id']").getText()).trim();
+      const ownerId = await readCurrentDeviceId(browser as unknown as TauriBrowser);
       assert.ok(ownerId);
       const androidIdRoot = await mkdtemp(path.join(tmpdir(), "syncpeer-relay-android-id-"));
       let androidId = "";
@@ -491,17 +488,7 @@ describe("Packaged desktop to Android pairing", () => {
         SYNCPEER_E2E_FILE_CONTENT: "relay-android",
       });
 
-      await browser.execute(() => {
-        const settings = document.querySelector("[data-testid='connection-settings-toggle']");
-        if (!(settings instanceof HTMLButtonElement)) throw new Error("Connection settings are unavailable.");
-        if (settings.getAttribute("aria-expanded") !== "true") settings.click();
-        const expert = document.querySelector("[data-testid='expert-view']");
-        if (!(expert instanceof HTMLInputElement)) throw new Error("Expert connection controls are unavailable.");
-        if (!expert.checked) expert.click();
-        const details = document.querySelector("[data-testid='connection-status-toggle']");
-        if (!(details instanceof HTMLButtonElement)) throw new Error("Connection status details are unavailable.");
-        if (details.getAttribute("aria-expanded") !== "true") details.click();
-      });
+      await setAutomaticConnectionPaused(browser, true);
       const connectionControl = $("[data-testid='expert-connection-control']");
       await connectionControl.waitForExist({ timeout: 5_000 });
       if ((await connectionControl.getText()).includes("Pause automatic connection")) {
@@ -520,6 +507,7 @@ describe("Packaged desktop to Android pairing", () => {
         return true;
       }, discovery.relayPoolUrl);
       assert.equal(hookInstalled, true, "Packaged desktop relay-pool test hook is unavailable.");
+      await openSettingsSection(browser, "network");
       await selectDiscoveryMode(browser, "global");
       await browser.$("[data-testid='connection-discovery-server']").waitForExist({ timeout: 5_000 });
       await browser.execute(({ remoteId, discoveryServer }) => {
@@ -539,6 +527,7 @@ describe("Packaged desktop to Android pairing", () => {
         if (!relayFallback.checked) relayFallback.click();
       }, { remoteId: androidId, discoveryServer: discovery.discoveryServer });
 
+      await closeSettings(browser);
 
       const androidRelay = spawn(process.execPath,
         ["scripts/test-android-e2e.mjs", "--connect-whole-folder"], {

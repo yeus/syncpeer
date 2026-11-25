@@ -1,7 +1,6 @@
 <script lang="ts">
-  import Pencil from "lucide-svelte/icons/pencil";
+  import MonitorSmartphone from "lucide-svelte/icons/monitor-smartphone";
   import Plus from "lucide-svelte/icons/plus";
-  import Trash2 from "lucide-svelte/icons/trash-2";
   import ListRow from "./ListRow.svelte";
   import StatusChip from "./StatusChip.svelte";
   import { formatSyncthingDeviceId } from "../app/devicePolicies.ts";
@@ -12,6 +11,9 @@ export interface SavedDeviceRow {
     id: string;
     name: string;
     deviceId: string;
+    connectionLabel?: string;
+    paused?: boolean;
+    selected?: boolean;
     isConnected: boolean;
     isConnecting: boolean;
     directTcpPreparing: boolean;
@@ -62,6 +64,10 @@ export interface SavedDeviceRow {
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
+    onPauseConnection?: () => void;
+    onResumeConnection?: () => void;
+    onOpenNetwork?: () => void;
+    onOpenDiagnostics?: () => void;
     onAddAdvertisedDevice: (deviceId: string) => void;
   }
 
@@ -72,111 +78,64 @@ export interface SavedDeviceRow {
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
+    onPauseConnection, onResumeConnection, onOpenNetwork, onOpenDiagnostics,
     onAddAdvertisedDevice,
   }: Props = $props();
   let peerUi = $derived(row.kind === "saved" ? savedPeerUiState(row) : null);
 </script>
 
 <ListRow peerLayout>
+  <span hidden data-saved-peer-id={row.kind === "saved" ? row.deviceId : undefined} data-selected-peer={row.kind === "saved" && row.selected ? row.deviceId : undefined}></span>
   <div class="item-title-row">
-    <div class="item-name-wrap">
-      <div class="item-title">{row.name}</div>
-      {#if row.kind === "saved"}
-        <button
-          class="name-edit-button"
-          onclick={() => onEditSavedDeviceName(row.deviceId)}
-          aria-label="Edit saved device name"
-          title="Edit device name"
-        >
-          <Pencil size={12} />
-        </button>
-      {/if}
-    </div>
-
-    {#if row.kind === "saved" && row.isIntroducer}
-      <StatusChip small>introducer</StatusChip>
-    {/if}
+    <MonitorSmartphone size={22} aria-hidden="true" />
+    <div class="item-name-wrap"><div class="item-title">{row.name}</div></div>
     {#if row.kind === "saved" && peerUi}
-      <StatusChip tone={peerUi.tone} small
-        title={!row.confirmed ? "No successful connection yet. Remote approval may still be required; check the other device." : undefined}>
-        {peerUi.label}
-      </StatusChip>
-    {/if}
-    {#if row.kind === "saved" && row.isLanDetected}
-      <StatusChip small>lan</StatusChip>
-    {/if}
-    {#if row.kind === "saved" && row.connectError && !row.isConnected}
-      <StatusChip tone="offline" small>connection error</StatusChip>
-    {/if}
-    {#if row.kind === "advertised"}
-      <StatusChip tone="offline" small>not approved</StatusChip>
-    {/if}
-    {#if row.kind === "candidate" && row.incomingRequest}
-      <StatusChip tone="offline" small>approval requested</StatusChip>
-    {:else if row.kind === "candidate" || row.kind === "local-candidate"}
-      <StatusChip small>{row.kind === "candidate" ? "discovered" : "unidentified"}</StatusChip>
+      <StatusChip tone={peerUi.tone} small>{row.paused ? "Paused" : row.connectionLabel ?? (row.connectError && row.confirmed && !row.isConnected && !row.isConnecting ? "Connection error" : peerUi.label)}</StatusChip>
+    {:else if row.kind === "candidate" && row.incomingRequest}
+      <StatusChip small>Approval requested</StatusChip>
+    {:else if row.kind === "advertised"}
+      <StatusChip small>Not approved</StatusChip>
     {/if}
   </div>
 
   {#if row.kind === "saved" && !row.confirmed}
-    <div class="item-meta" data-testid="peer-first-connection-guidance">
-      Added locally. On the other device, add this device's ID or approve its incoming request.
-      {#if row.isConnecting} Connection attempt in progress; remote approval is not yet confirmed.{:else} A connection request may not have reached the other device yet.{/if}
-    </div>
+    <div class="item-meta" data-testid="peer-first-connection-guidance">Added locally. Approve this device on the other peer.</div>
   {/if}
-  {#if row.kind === "saved" && row.connectError && !row.isConnected}
-    <div class="item-meta" role="alert">{row.connectError}</div>
-  {/if}
-  <div class="item-meta peer-id-summary" title={formatSyncthingDeviceId(row.deviceId)}>
-    ID: {row.deviceId.length === 52 ? `${row.deviceId.slice(0, 7)}…${row.deviceId.slice(-7)}` : row.deviceId}
-  </div>
-
-  {#each row.metaLines as line, index (index)}
-    {#if line}
-      <div class="item-meta">{line}</div>
-    {/if}
-  {/each}
   <details class="peer-details">
-    <summary>Device ID and connection details</summary>
+    <summary>Device details</summary>
     <div class="peer-detail-content">
       <div class="item-meta peer-id-full">{formatSyncthingDeviceId(row.deviceId)}</div>
-      {#each row.detailLines as line, index (index)}
+      {#if row.kind === "saved"}
+        {#if row.connectError && !row.isConnected}<div class="item-meta" role="alert">{row.connectError}</div>{/if}
+        <div class="peer-actions">
+          {#if row.isConnected}<button class="ghost" onclick={() => onUseSavedDevice(row.deviceId)}>Reconnect</button>{/if}
+          {#if row.selected && onPauseConnection && onResumeConnection}<button class="ghost" onclick={row.paused ? onResumeConnection : onPauseConnection}>{row.paused ? "Resume synchronization" : "Pause synchronization"}</button>{/if}
+          <button class="ghost" aria-label="Edit saved device name" onclick={() => onEditSavedDeviceName(row.deviceId)}>Rename</button>
+          <button class="ghost" data-testid="peer-direct-tcp" disabled={row.directTcpPreparing}
+            onclick={() => { void onConnectDirectTcp(row.deviceId); }}>{row.directTcpPreparing ? "Finding LAN address…" : "Direct TCP"}</button>
+          <button class="ghost" onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}>{row.isIntroducer ? "Introducer (review)" : "Mark introducer"}</button>
+          {#if onOpenNetwork && row.selected}<button class="ghost" onclick={onOpenNetwork}>Connection settings</button>{/if}
+          {#if onOpenDiagnostics}<button class="ghost" onclick={onOpenDiagnostics}>Troubleshoot connection</button>{/if}
+          <button class="ghost" aria-label="Remove saved device" onclick={() => onRemoveSavedDevice(row.deviceId)}>Remove device</button>
+        </div>
+      {/if}
+      {#each [...row.metaLines, ...row.detailLines] as line, index (index)}
         <div class="item-meta">{line}</div>
       {/each}
     </div>
   </details>
 
   <svelte:fragment slot="actions">
-    {#if row.kind === "candidate" || (row.kind === "saved" && peerUi?.canConnect)}
+    {#if row.kind === "candidate" || (row.kind === "saved" && !row.isConnected && !row.paused && peerUi?.canConnect)}
       <button
         class="primary"
         onclick={() => onUseSavedDevice(row.deviceId)}
       >
-        {row.kind === "candidate" ? row.incomingRequest ? "Approve peer" : "Add peer" : row.isConnected ? "Reconnect" : "Connect"}
+        {row.kind === "candidate" ? row.incomingRequest ? "Approve peer" : "Add peer" : "Connect"}
       </button>
     {/if}
     {#if row.kind === "saved"}
-        <button
-          class="ghost"
-          data-testid="peer-direct-tcp"
-          aria-label={`Connect ${row.name} over direct LAN TCP`}
-          disabled={row.directTcpPreparing}
-          title="Use the saved peer identity and its known LAN IPv4 address; bypass discovery during the actual TCP connection"
-          onclick={() => { void onConnectDirectTcp(row.deviceId); }}
-        >{row.directTcpPreparing ? "Finding LAN address…" : "Direct TCP"}</button>
-        <button
-          class="ghost"
-          onclick={() => onSetSavedDeviceIntroducer(row.deviceId, !row.isIntroducer)}
-        >
-          {row.isIntroducer ? "Introducer (review)" : "Mark introducer"}
-        </button>
-        <button
-          class="icon icon-only"
-          onclick={() => onRemoveSavedDevice(row.deviceId)}
-          aria-label="Remove saved device"
-        >
-          <Trash2 size={16} />
-        </button>
+      <!-- Advanced peer controls are in the disclosure above. -->
     {:else if row.kind === "advertised"}
       <button
         class="primary icon icon-only"
@@ -193,6 +152,7 @@ export interface SavedDeviceRow {
 </ListRow>
 
 <style>
+  .peer-actions { display:flex; flex-wrap:wrap; gap:0.4rem; margin:0.45rem 0; }
   .item-title-row {
     display: flex;
     align-items: center;
@@ -207,11 +167,6 @@ export interface SavedDeviceRow {
     min-width: 0;
   }
 
-  .peer-id-summary {
-    font-family: var(--font-mono);
-    font-size: 0.76rem;
-    margin: 0.25rem 0;
-  }
 
   .peer-details {
     margin-top: 0.35rem;
@@ -242,22 +197,5 @@ export interface SavedDeviceRow {
     font-family: var(--font-mono);
   }
 
-  .name-edit-button {
-    border: none;
-    background: transparent;
-    min-height: 1rem;
-    width: 1rem;
-    min-width: 1rem;
-    padding: 0;
-    color: var(--text-muted);
-    border-radius: var(--radius-xs);
-  }
 
-  .name-edit-button:hover:not(:disabled) {
-    border-color: transparent;
-    background: var(--button-hover-bg);
-  }
-  @media (pointer: coarse) {
-    .name-edit-button { min-width: 44px; min-height: 44px; }
-  }
 </style>

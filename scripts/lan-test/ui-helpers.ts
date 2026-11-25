@@ -29,22 +29,29 @@ export async function completeFirstRunDeviceName(
   await peer.$("[data-testid='tab-devices']").waitForExist({ timeout: 30_000 });
 }
 
-/** Open space/device controls through the existing general Settings section. */
+/** Navigate the real Settings hierarchy, including returning to the original tab. */
+export async function closeSettings(peer: WebdriverIO.Browser) {
+  for (let depth = 0; depth < 4; depth++) {
+    const back = peer.$("[data-testid='settings-back'], [data-testid='about-back'], [data-testid='diagnostics-back']");
+    if (!await back.isExisting()) return;
+    await back.click();
+    await peer.pause(100);
+  }
+}
+export async function openSettingsSection(peer: WebdriverIO.Browser, section: string) {
+  if (await peer.$(`[data-testid='settings-${section}']`).isExisting()) return;
+  if (!await peer.$("[data-testid='settings-overview']").isExisting()) {
+    await closeSettings(peer);
+    await completeFirstRunDeviceName(peer);
+    await peer.$("[data-testid='connection-settings-toggle']").click();
+  }
+  const selector = section === "personal-space" ? "general-settings" : `open-settings-${section}`;
+  await peer.$(`[data-testid='${selector}']`).waitForExist({ timeout: 30_000 });
+  await peer.$(`[data-testid='${selector}']`).click();
+  await peer.$(section === "about" ? "[data-testid='about-page']" : `[data-testid='settings-${section}']`).waitForExist({ timeout: 30_000 });
+}
 export async function openGeneralSettings(peer: WebdriverIO.Browser) {
-  if (await peer.$("[data-testid='general-settings-page']").isExisting()) return;
-  await completeFirstRunDeviceName(peer);
-  await peer.execute(() => {
-    (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
-  });
-  await peer.$("[data-testid='connection-settings-toggle']").waitForExist({ timeout: 30_000 });
-  await peer.execute(() => {
-    const toggle = document.querySelector("[data-testid='connection-settings-toggle']") as HTMLButtonElement;
-    if (toggle.getAttribute("aria-expanded") !== "true") toggle.click();
-  });
-  await peer.$("[data-testid='general-settings']").waitForExist({ timeout: 30_000 });
-  await peer.execute(() => {
-    (document.querySelector("[data-testid='general-settings']") as HTMLButtonElement).click();
-  });
+  await openSettingsSection(peer, "personal-space");
   await peer.$("[data-testid='general-settings-page']").waitForExist({ timeout: 30_000 });
 }
 
@@ -65,9 +72,8 @@ export async function openFolderSettings(peer: WebdriverIO.Browser, folder: stri
     if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");
     tab.click();
   });
-  await peer.$(".breadcrumbs").waitForExist({ timeout: 30_000 });
   await peer.execute(() => {
-    const root = document.querySelector("button.crumb-button");
+    const root = document.querySelector("[data-testid=folder-root-back]");
     if (root instanceof HTMLButtonElement) root.click();
   });
   await peer.waitUntil(async () => peer.execute((selected: string) => {
@@ -97,8 +103,11 @@ export const waitForText = async (
  * The Devices tab renders an "Unavailable" placeholder until the native
  * identity resolves, so wait for the real device ID instead of reading once.
  */
-export const readCurrentDeviceId = async (browser: TauriBrowser): Promise<string> => {
-  const element = $("[data-testid='current-device-id']");
+export const readCurrentDeviceId = async (browser: WebdriverIO.Browser): Promise<string> => {
+  await closeSettings(browser);
+  await browser.$("[data-testid='tab-devices']").click();
+  await browser.execute(() => { const details = document.querySelector("details.local-details"); if (details instanceof HTMLDetailsElement) details.open = true; });
+  const element = browser.$("[data-testid='current-device-id']");
   await browser.waitUntil(
     async () => /^[A-Z2-7-]{40,}$/.test(await element.getText()),
     { timeout: 60_000, timeoutMsg: "The Tauri device identity never became available." },
@@ -140,6 +149,10 @@ export const clickButtonByText = async (
   browser: WebdriverIO.Browser,
   label: string,
 ): Promise<void> => {
+  if (label === "Back" && await browser.$("[data-testid='settings-back']").isExisting()) {
+    await closeSettings(browser);
+    return;
+  }
   const state = await browser.execute((text: string) => {
     const button = [...document.querySelectorAll("button")]
       .find(element => element.textContent?.trim() === text);
@@ -203,6 +216,7 @@ export const selectDiscoveryMode = async (
 export const setDirectConnectionFields = async (browser: WebdriverIO.Browser, settings: {
   remoteId: string; host: string; remotePort: number; listenPort: number;
 }): Promise<void> => {
+  await openSettingsSection(browser, "network");
   await selectDiscoveryMode(browser, "direct");
   await browser.execute(({ remoteId, host, remotePort, listenPort }) => {
     for (const [testId, value] of [
@@ -255,6 +269,7 @@ export const connectUntilApproved = async (
   browser: TauriBrowser,
   timeout = 10 * 60_000,
 ): Promise<void> => {
+  await closeSettings(browser);
   const status = $("[data-testid='connection-status']");
   const deadline = Date.now() + timeout;
   let lastState = "";
@@ -291,25 +306,12 @@ export const setAutomaticConnectionPaused = async (
   browser: WebdriverIO.Browser,
   paused: boolean,
 ): Promise<void> => {
-  await browser.$("[data-testid='tab-devices']").waitForExist({ timeout: 5_000 });
-  await browser.execute(() => {
-    const tab = document.querySelector("[data-testid='tab-devices']");
-    if (!(tab instanceof HTMLButtonElement)) throw new Error("Device tab is unavailable.");
-    tab.click();
-  });
-  for (const testId of ["connection-settings-toggle", "expert-view", "connection-status-toggle"]) {
-    await browser.$(`[data-testid='${testId}']`).waitForExist({ timeout: 5_000 });
-    await browser.execute((id: string) => {
-      const control = document.querySelector(`[data-testid='${id}']`);
-      if (id === "expert-view" && control instanceof HTMLInputElement) {
-        if (!control.checked) control.click();
-      } else if (control instanceof HTMLButtonElement) {
-        if (control.getAttribute("aria-expanded") !== "true") control.click();
-      } else {
-        throw new Error(`Connection control ${id} is unavailable.`);
-      }
-    }, testId);
-  }
+  await openSettingsSection(browser, "appearance");
+  const expert = browser.$("[data-testid='expert-view']");
+  if (!await expert.isSelected()) await expert.click();
+  await closeSettings(browser);
+  const details = browser.$("[data-testid='connection-status-toggle']");
+  if (await details.getAttribute("aria-expanded") !== "true") await details.click();
   const control = browser.$("[data-testid='expert-connection-control']");
   await control.waitForEnabled({ timeout: 5_000 });
   const expected = paused ? "Resume automatic connection" : "Pause automatic connection";
@@ -342,12 +344,7 @@ export const readCachedHash = async (
 export const readSessionEventNames = async (
   browser: TauriBrowser,
 ): Promise<string[]> => {
-  await browser.execute(() => {
-    const tab = document.querySelector("[data-testid='tab-devices']");
-    if (!(tab instanceof HTMLButtonElement)) throw new Error("Device tab is unavailable.");
-    tab.click();
-  });
-  await browser.pause(50);
+  await openSettingsSection(browser, "diagnostics");
   const events = await browser.execute(() =>
     [...document.querySelectorAll(".item-meta")]
       .map((element) => element.textContent?.trim() ?? "")
@@ -356,6 +353,7 @@ export const readSessionEventNames = async (
       .filter(Boolean)
       .slice(0, 80),
   );
+  await closeSettings(browser);
   await browser.execute(() => {
     const tab = document.querySelector("[data-testid='tab-folders']");
     if (!(tab instanceof HTMLButtonElement)) throw new Error("Folder tab is unavailable.");

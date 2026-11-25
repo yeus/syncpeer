@@ -1,3 +1,4 @@
+import { PIM_TAB_VISIBLE } from "./features.ts";
 import {
   breadcrumbSegments,
   buildConnectionDetails,
@@ -302,10 +303,11 @@ export const createInitialState = (persisted = loadPersistedState()) => {
     activeTab:
       persisted?.activeTab === "devices" ||
       persisted?.activeTab === "folders" ||
-      persisted?.activeTab === "pim"
+      (PIM_TAB_VISIBLE && persisted?.activeTab === "pim")
         ? persisted.activeTab
         : ("favorites" as const),
     currentPage: "main" as "main" | "diagnostics" | "about" | "general-settings" | "new-folder" | "folder-settings" | "versions",
+    settingsSection: "personal-space" as import("./settingsSections.ts").SettingsSection,
     folderSettingsId: "",
     connection: {
       host: initialConnection.host,
@@ -446,7 +448,8 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       snapshots: {} as Record<string, OfflineFolderSnapshot>,
     },
     ui: {
-      isSettingsExpanded: false,
+      showAddDevice: false,
+      showDiscoveredDevices: false,
       isConnectionDetailsExpanded: false,
       isLogPanelExpanded: false,
       isDeviceBackupExpanded: false,

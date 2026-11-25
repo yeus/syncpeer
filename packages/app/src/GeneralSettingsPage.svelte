@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import type { PairingInvitation, SyncpeerProfileSettings } from "@syncpeer/core/browser";
+  import type { SettingsSection } from "./app/settingsSections.ts";
   import { createOwnedRecoveryKit, type createDocumentFilesystem } from "@syncpeer/core/filesystem";
   import { formatProfileCreationError } from "./app/storageErrors.ts";
   import { generateMasterPassword } from "./app/passwords.ts";
@@ -26,7 +27,7 @@
     { label: "Background execution", target: "app" as const,
       status: androidReadiness.backgroundRestricted ? "Restricted by Android" : "Not restricted" },
     { label: "Battery optimization", target: "battery" as const,
-      status: androidReadiness.batteryOptimizationExempt ? "Exempt" : "System-managed (optional exemption)" },
+      status: androidReadiness.batteryOptimizationExempt ? "Unrestricted" : "Optimized (system-managed)" },
     { label: "Battery saver", target: "power-saver" as const,
       status: androidReadiness.powerSaverEnabled ? "On (can delay synchronization)" : "Off" },
     { label: "Data saver", target: "data-saver" as const,
@@ -45,9 +46,12 @@
     catch { androidReadinessError = "Could not open Android system settings."; }
   }
 
-  let { onBack, onOpenFolderSettings, onUnlock, onUnlockBiometric, onRotateMasterPassword, onSettingsSaved,
+  let { section = "personal-space", embedded = false, backgroundControls = isAndroid, onBack, onOpenFolderSettings, onUnlock, onUnlockBiometric, onRotateMasterPassword, onSettingsSaved,
     onTrustedDevicesChanged, getDefaultDeviceId, onStartPairing, onJoinPairing,
     onPairedDevice, biometric, command }: {
+    section?: SettingsSection;
+    backgroundControls?: boolean;
+    embedded?: boolean;
     onBack: () => void;
     onOpenFolderSettings: (folderId: string) => void;
     onUnlock: () => Promise<void>;
@@ -85,6 +89,7 @@
     status = await command<NonNullable<typeof status>>({ operation: "status" });
     if (status.vault.phase !== "unlocked") { settings = null; return; }
     settings = await command<SyncpeerProfileSettings>({ operation: "profileSettings" });
+    if (section !== "personal-space") return;
     const membership = await command<{ localDeviceId: string | null; devices: typeof trustedDevices }>
       ({ operation: "ownedDevices" });
     trustedDevices = membership.devices;
@@ -265,7 +270,7 @@
   onMount(() => {
     void refresh().catch(() => { error = "Personal-space settings are unavailable."; });
     void biometric?.status().then(value => { biometricState = value; }).catch(() => {});
-    if (!isAndroid) return;
+    if (!isAndroid || section !== "synchronization") return;
     const onVisible = () => {
       if (document.visibilityState === "visible") void refreshAndroidReadiness();
     };
@@ -278,36 +283,11 @@
     };
   });
 </script>
-<main class="panel settings-page" data-testid="general-settings-page">
-  <button onclick={onBack}>Back</button>
-  <h1>Settings</h1>
-  {#if isAndroid}
-    <section data-testid="android-permissions" aria-label="Android permissions and restrictions">
-      <h2>Android permissions &amp; restrictions</h2>
-      <p class="hint">These are system settings, not proof of a live peer connection. Battery optimization is optional. Android Doze and vendor restrictions may still delay background synchronization.</p>
-      <button type="button" class="ghost" onclick={() => void refreshAndroidReadiness()}>Refresh status</button>
-      {#if androidReadinessError}<p role="alert">{androidReadinessError}</p>{/if}
-      {#if androidReadiness}
-        {#each androidReadinessRows as row (row.label)}
-          <div class="android-readiness-row">
-            <div><strong>{row.label}</strong><p class="hint">{row.status}</p></div>
-            <button type="button" class="ghost" aria-label={`Change ${row.label}`}
-              onclick={() => void openAndroidSettings(row.target)}>Change</button>
-          </div>
-        {/each}
-      {:else if !androidReadinessError}
-        <p role="status">Checking Android settings…</p>
-      {/if}
-    </section>
-  {/if}
-  {#if status?.vault.phase === "locked"}
-    <p class="hint">Your private storage is locked. Unlock it to manage local credentials or Personal Space.</p>
-  {/if}
+<section class="panel settings-page" data-testid="general-settings-page">
+  {#if !embedded}<button onclick={onBack}>Back</button><h1>Settings</h1>{/if}
   {#if error}<p role="alert">{error}</p>{/if}
-  <section data-testid="personal-space-settings">
-    <h2>Personal space</h2>
-    <p>Optional encrypted Syncthing folder for settings, credentials and policy synchronization. Local device-protected storage works without Personal Space.</p>
   {#if status?.vault.phase === "locked"}
+    <p class="hint">Your private storage is locked. Unlock to manage device settings and credentials.</p>
     <form onsubmit={event => { event.preventDefault(); void unlock(); }}>
       <PasswordInput label="Unlock personal space" secretLabel="personal-space master password"
         bind:value={password} autocomplete="current-password" required />
@@ -319,8 +299,12 @@
       </button>
     {/if}
   {:else if status?.vault.phase === "uninitialized"}
-    <p role="status">Device-protected local storage is still being prepared. Syncpeer creates it automatically; no vault password is needed.</p>
-  {:else if status?.vault.phase === "unlocked" && !status.vault.personalSpaceEnabled}
+    <p role="status">Device-protected local storage is being prepared. Syncpeer creates it automatically.</p>
+  {/if}
+  {#if section === "personal-space"}
+  <section data-testid="personal-space-settings">
+    <p>Optional encrypted Syncthing folder for settings, credentials and policy synchronization. Local device-protected storage works without Personal Space.</p>
+    {#if status?.vault.phase === "unlocked" && !status.vault.personalSpaceEnabled}
     <details data-testid="optional-personal-space-setup">
       <summary>Set up Personal Space</summary>
     <form onsubmit={event => { event.preventDefault(); void createProfile(); }}>
@@ -357,7 +341,7 @@
       {#if pairingMessage}<p role="status">{pairingMessage}</p>{/if}
     </section>
     </details>
-  {:else if status?.vault.phase === "unlocked"}
+    {:else if status?.vault.phase === "unlocked"}
     {#if conflictedFolders.length}
       <section>
         <h3>Folder settings need a choice</h3>
@@ -408,12 +392,97 @@
         </ul>
       </section>
     {/if}
+    {/if}
+  </section>
+  {:else if section === "synchronization"}
+    {#if !backgroundControls}
+      <p class="hint">Android background synchronization policies are available on Android devices.</p>
+    {:else if status?.vault.phase === "unlocked"}
+    {#if settings}
+      <fieldset disabled={busy}>
+        <legend>Background synchronization</legend>
+        <label><input data-testid="background-sync-enabled" type="checkbox" checked={settings.profile.keepSyncingInBackground}
+          onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
+            keepSyncingInBackground: event.currentTarget.checked } })} />
+          Synchronize when Syncpeer is not open</label>
+        <p role="status" class="hint">{settings.profile.keepSyncingInBackground
+          ? "Enabled. Android restrictions and the selected policy still apply."
+          : "Disabled. Peer connections are retained briefly, but automatic background sync is off."}</p>
+        <label>Synchronization policy
+          <select data-testid="background-sync-policy" disabled={!settings.profile.keepSyncingInBackground}
+            value={settings.profile.requireCharging ? "saving" : settings.profile.allowMetered ? "always" : "balanced"}
+            onchange={event => {
+              const policy = event.currentTarget.value;
+              void saveSettings({ ...settings!, profile: { ...settings!.profile,
+                requireCharging: policy === "saving", allowMetered: policy === "always" } });
+            }}>
+            <option value="saving">Battery saving — unmetered network, charging only</option>
+            <option value="balanced">Balanced — unmetered network, even on battery</option>
+            <option value="always">Always synchronize — includes cellular and metered networks</option>
+          </select>
+        </label>
+      </fieldset>
+    {/if}
+    {/if}
+    {#if isAndroid}
+    <section data-testid="android-permissions" aria-label="Android permissions and restrictions">
+      <h2>Android permissions &amp; restrictions</h2>
+      <p class="hint">For reliable background synchronization, unrestricted battery usage is recommended. Optimized mode is supported, but Android may delay or suspend work. Syncpeer always respects system restrictions.</p>
+      <button type="button" class="ghost" onclick={() => void refreshAndroidReadiness()}>Refresh status</button>
+      {#if androidReadinessError}<p role="alert">{androidReadinessError}</p>{/if}
+      {#if androidReadiness}
+        {#each androidReadinessRows as row (row.label)}
+          <div class="android-readiness-row">
+            <div><strong>{row.label}</strong><p class="hint">{row.status}</p></div>
+            <button type="button" class="ghost" aria-label={`Change ${row.label}`}
+              onclick={() => void openAndroidSettings(row.target)}>Change</button>
+          </div>
+        {/each}
+      {:else if !androidReadinessError}
+        <p role="status">Checking Android settings…</p>
+      {/if}
+    </section>
+    {/if}
+  {:else if section === "storage"}
+    {#if status?.vault.phase === "unlocked" && settings}
+      <section data-testid="device-settings">
+        <h2>Version history and cache</h2>
+        <label>Version history
+          <select value={settings.profile.versioning} onchange={event => void saveSettings({ ...settings!, profile: {
+            ...settings!.profile, versioning: event.currentTarget.value as SyncpeerProfileSettings["profile"]["versioning"] } })}>
+            <option value="staggered">Staggered (recommended)</option>
+            <option value="simple">Simple</option>
+            <option value="trash">Trash can</option>
+            <option value="disabled">Disabled</option>
+          </select>
+        </label>
+        <label><input type="checkbox" checked={settings.profile.preserveLocalChanges}
+          onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
+            preserveLocalChanges: event.currentTarget.checked } })} /> Preserve locally initiated replacements and deletions</label>
+        <label>Cache override (MiB, blank for adaptive 5%)
+          <input type="number" min="0" value={settings.profile.cache.overrideBytes === undefined ? "" : settings.profile.cache.overrideBytes / 1048576}
+            onchange={event => { const value = event.currentTarget.value.trim(); void saveSettings({ ...settings!, profile: {
+              ...settings!.profile, cache: { ...settings!.profile.cache,
+                ...(value ? { overrideBytes: Math.floor(Number(value) * 1048576) } : { overrideBytes: undefined }) } } }); }} />
+        </label>
+      </section>
+    {/if}
+  {:else if section === "security"}
+    {#if status?.vault.phase === "unlocked"}
+    {#if biometricState}
+      <p>Biometric unlock is {biometricState.enabled ? "enabled" : "disabled"}.</p>
+      <button disabled={busy || !biometricState.available} onclick={() => void toggleBiometric()}>
+        {biometricState.enabled ? "Disable biometric unlock" : "Enable biometric unlock"}
+      </button>
+    {/if}
+      {#if status.vault.personalSpaceEnabled}
     <form onsubmit={event => { event.preventDefault(); void saveMasterPassword(); }}>
       <PasswordInput label="Change personal-space master password" secretLabel="master password"
         bind:value={masterPassword} autocomplete="new-password" minlength={16} required />
       <button disabled={busy || !masterPassword}>Change master password</button>
     </form>
-  {/if}
+      {/if}
+    {/if}
   {#if status?.vault.personalSpaceEnabled || status?.vault.phase === "uninitialized"}
     <section>
       <h2>Personal-space backup</h2>
@@ -436,54 +505,9 @@
       {/if}
     </section>
   {/if}
-  </section>
-  {#if status?.vault.phase === "unlocked"}
-    <section data-testid="device-settings">
-      <h2>This device</h2>
-      <p>These synchronization defaults and biometric unlock settings apply to this device.</p>
-    {#if biometricState}
-      <p>Biometric unlock is {biometricState.enabled ? "enabled" : "disabled"}.</p>
-      <button disabled={busy || !biometricState.available} onclick={() => void toggleBiometric()}>
-        {biometricState.enabled ? "Disable biometric unlock" : "Enable biometric unlock"}
-      </button>
-    {/if}
-    {#if settings}
-      <section>
-        <h3>Synchronization defaults</h3>
-        <label>Version history
-          <select value={settings.profile.versioning} onchange={event => void saveSettings({ ...settings!, profile: {
-            ...settings!.profile, versioning: event.currentTarget.value as SyncpeerProfileSettings["profile"]["versioning"] } })}>
-            <option value="staggered">Staggered (recommended)</option>
-            <option value="simple">Simple</option>
-            <option value="trash">Trash can</option>
-            <option value="disabled">Disabled</option>
-          </select>
-        </label>
-        <label><input type="checkbox" checked={settings.profile.preserveLocalChanges}
-          onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
-            preserveLocalChanges: event.currentTarget.checked } })} /> Preserve locally initiated replacements and deletions</label>
-        <label><input type="checkbox" checked={settings.profile.allowMetered}
-          onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
-            allowMetered: event.currentTarget.checked } })} /> Allow background sync on metered/mobile networks</label>
-        {#if biometric}
-          <label><input type="checkbox" checked={settings.profile.keepSyncingInBackground}
-            onchange={event => void saveSettings({ ...settings!, profile: { ...settings!.profile,
-              keepSyncingInBackground: event.currentTarget.checked } })} />
-            Keep syncing in background on this Android device</label>
-          <p class="muted">Connections are retained for up to 90 seconds after switching apps or locking the screen by default. Enable continuous background sync for longer sessions (subject to Android power restrictions).</p>
-        {/if}
-        <label>Cache override (MiB, blank for adaptive 5%)
-          <input type="number" min="0" value={settings.profile.cache.overrideBytes === undefined ? "" : settings.profile.cache.overrideBytes / 1048576}
-            onchange={event => { const value = event.currentTarget.value.trim(); void saveSettings({ ...settings!, profile: {
-              ...settings!.profile, cache: { ...settings!.profile.cache,
-                ...(value ? { overrideBytes: Math.floor(Number(value) * 1048576) } : { overrideBytes: undefined }) } } }); }} />
-        </label>
-      </section>
-    {/if}
-    </section>
   {/if}
   {#if status?.vault.issue}<p role="status">{status.vault.issue}</p>{/if}
-</main>
+</section>
 
 <style>
   .android-readiness-row {

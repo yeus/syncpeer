@@ -23,7 +23,7 @@
 
 <main class="panel settings-page" data-testid="new-folder-page">
   <button onclick={onBack}>Back</button>
-  <h1>New folder</h1>
+  <h1>New shared folder</h1>
   {#if error}<p role="alert">{error}</p>{/if}
   {#if phase === "unlocked"}
     <form onsubmit={event => { event.preventDefault(); void createFolder(); }}>

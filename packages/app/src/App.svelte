@@ -1,5 +1,6 @@
 <svelte:options runes={true} />
 <script lang="ts">
+  import { PIM_TAB_VISIBLE } from "./app/features.ts";
   import { onDestroy, onMount, tick } from "svelte";
   import { invoke, addPluginListener } from "@tauri-apps/api/core";
   import {
@@ -17,6 +18,8 @@
   import DiagnosticsPage from "./DiagnosticsPage.svelte";
   import AppHeader from "./components/AppHeader.svelte";
   import DeviceTab from "./components/DeviceTab.svelte";
+  import DeviceSettingsPanels from "./components/DeviceSettingsPanels.svelte";
+  import SettingsPage from "./components/SettingsPage.svelte";
   import DeviceNameOnboarding from "./components/DeviceNameOnboarding.svelte";
   import FavoritesTab from "./components/FavoritesTab.svelte";
   import FoldersTab from "./components/FoldersTab.svelte";
@@ -393,6 +396,8 @@
   const openFirstPeerSetup = async (manual: boolean) => {
     dismissFirstPeerInvitation();
     actions.switchTab("devices");
+    app.ui.showAddDevice = manual;
+    app.ui.showDiscoveredDevices = !manual;
     if (!manual) void actions.discoverLocalDevices();
     await tick();
     if (manual) document.querySelector<HTMLInputElement>('[data-testid="new-peer-device-id"]')?.focus();
@@ -549,7 +554,7 @@
   let activeDownloadProgressPercent = $derived(downloadProgressPercent(activeDownloads));
   let activeDownloadSummary = $derived(downloadSummary(activeDownloads));
   let contentScrollKey = $derived(
-    `${app.currentPage}:${app.activeTab}:${app.session.currentFolderId}:${app.session.currentPath}`,
+    `${app.currentPage}:${app.settingsSection}:${app.activeTab}:${app.session.currentFolderId}:${app.session.currentPath}`,
   );
 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -1069,6 +1074,8 @@
       transferSummary={activeDownloadSummary}
       transferNotice={app.ui.downloadNotice}
       transferPercent={activeDownloadProgressPercent}
+      updatedAt={app.activeTab === "folders" ? app.session.lastUpdatedAt : ""}
+      onOpenSettings={() => actions.openGeneralSettings("overview")}
       onToggleDetails={() => {
         app.ui.isConnectionDetailsExpanded = !app.ui.isConnectionDetailsExpanded;
       }}
@@ -1191,7 +1198,7 @@
             Restoring saved peers from protected storage…
           </section>
         {:else}
-        <DeviceTab
+        <DeviceTab onOpenSettingsSection={actions.openGeneralSettings}
           {app}
           advertisedDevices={currentAdvertisedDevices}
           advertisedFolders={currentAdvertisedFolders}
@@ -1200,21 +1207,9 @@
           isLanDiscoveredDevice={(deviceId) => isLanDiscoveredDevice(app, deviceId)}
           onUseSavedDevice={actions.useSavedDevice}
           onConnectDirectTcp={actions.connectSavedDeviceDirectTcp}
-          onResetDiscoveryServer={actions.resetDiscoveryServer}
-          onClearAllCache={actions.clearAllCache}
-          onClearOfflineFolderState={actions.clearOfflineFolderState}
-          onOpenDiagnosticsPage={actions.openDiagnosticsPage}
-          onOpenAboutPage={actions.openAboutPage}
-          onOpenGeneralSettings={folderCredentials ? actions.openGeneralSettings : undefined}
           onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
-          {logExportStatus}
-          onCopySessionLogs={() => exportLogsWithHistory("copy", actions.copySessionLogs)}
-          onSaveSessionLogs={logFile ? () => exportLogsWithHistory("save", actions.saveSessionLogs) : undefined}
-          onShareSessionLogs={logFile ? () => exportLogsWithHistory("share", actions.shareSessionLogs) : undefined}
           onEditLocalDeviceName={actions.editLocalDeviceName}
-          onRegenerateDeviceId={actions.regenerateDeviceId}
-          onCopyIdentityBackupSecret={actions.copyIdentityBackupSecret}
-          onRestoreIdentityRecovery={actions.restoreIdentityRecovery}
+          onDiscoverDevices={actions.discoverLocalDevices}
           onAddSavedDevice={actions.addSavedDevice}
           onApproveAdvertisedDevice={actions.approveAdvertisedDevice}
           onApproveFolderSync={folder => { actions.approveFolderSync(folder); scheduleFolderSync(app.session.folders); }}
@@ -1222,7 +1217,8 @@
           onEditSavedDeviceName={actions.editSavedDeviceName}
           onSetSavedDeviceIntroducer={actions.setSavedDeviceIntroducer}
           onRemoveSavedDevice={actions.removeSavedDevice}
-          onConnectionSettingsChanged={actions.scheduleConnectionSettingsApply}
+          onPauseConnection={actions.disconnect}
+          onResumeConnection={actions.connect}
         />
         {/if}
       {/if}
@@ -1260,8 +1256,8 @@
       {/if}
 
       {#if app.activeTab === "folders"}
-        {#if appInfo.runtimeSurface === "android-ui" || appInfo.runtimeSurface === "desktop-ui"}
-          <button class="new-folder-action" data-testid="new-folder" onclick={actions.openNewFolder}>New folder</button>
+        {#if !app.session.currentFolderId && (appInfo.runtimeSurface === "android-ui" || appInfo.runtimeSurface === "desktop-ui")}
+          <button class="new-folder-action" data-testid="new-folder" onclick={actions.openNewFolder}>New shared folder</button>
         {/if}
         <FoldersTab
           {app}
@@ -1338,6 +1334,7 @@
         <Smartphone size={18} aria-hidden="true" />
         <span class="tab-label">Devices</span>
       </button>
+      {#if PIM_TAB_VISIBLE}
       <button
         data-testid="tab-pim"
         type="button"
@@ -1348,6 +1345,7 @@
         <CalendarDays size={18} aria-hidden="true" />
         <span class="tab-label">PIM</span>
       </button>
+      {/if}
     </nav>
   </div>
 {:else if app.currentPage === "diagnostics"}
@@ -1362,7 +1360,13 @@
     onSharePeerSupportBundle={logFile?.share ? sharePeerSupportBundle : undefined}
   />
 {:else if app.currentPage === "general-settings"}
-  <GeneralSettingsPage onBack={actions.closeGeneralSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
+  <SettingsPage section={app.settingsSection} onBack={actions.closeGeneralSettings} onSelect={section => {
+    if (section === "about") actions.openAboutPage();
+    else actions.openGeneralSettings(section);
+  }}>
+    {#if app.settingsSection === "personal-space" || app.settingsSection === "synchronization" || app.settingsSection === "storage" || app.settingsSection === "security"}
+      {#key app.settingsSection}
+  <GeneralSettingsPage embedded section={app.settingsSection} onBack={actions.closeGeneralSettings} onUnlock={loadFolderCredentials} onUnlockBiometric={unlockWithBiometric}
     onOpenFolderSettings={actions.openFolderSettings}
     command={documentCommand}
     onStartPairing={advertisedHost => client.startPairingInvitation({ advertisedHost, port: 0,
@@ -1378,12 +1382,36 @@
     }}
     onSettingsSaved={applyProfileSettings}
     onRotateMasterPassword={rotateMasterPassword} {biometric} />
+      {/key}
+    {/if}
+    {#if app.settingsSection !== "overview" && app.settingsSection !== "personal-space" && app.settingsSection !== "synchronization"}
+      <DeviceSettingsPanels section={app.settingsSection}
+        {app}
+        onUseSavedDevice={actions.useSavedDevice}
+          onResetDiscoveryServer={actions.resetDiscoveryServer}
+          onClearAllCache={actions.clearAllCache}
+          onClearOfflineFolderState={actions.clearOfflineFolderState}
+          onOpenDiagnosticsPage={actions.openDiagnosticsPage}
+          onCopyCurrentDeviceId={actions.copyCurrentDeviceId}
+          {logExportStatus}
+          onCopySessionLogs={() => exportLogsWithHistory("copy", actions.copySessionLogs)}
+          onSaveSessionLogs={logFile ? () => exportLogsWithHistory("save", actions.saveSessionLogs) : undefined}
+          onShareSessionLogs={logFile ? () => exportLogsWithHistory("share", actions.shareSessionLogs) : undefined}
+          onEditLocalDeviceName={actions.editLocalDeviceName}
+          onRegenerateDeviceId={actions.regenerateDeviceId}
+          onCopyIdentityBackupSecret={actions.copyIdentityBackupSecret}
+          onRestoreIdentityRecovery={actions.restoreIdentityRecovery}
+          onConnectionSettingsChanged={actions.scheduleConnectionSettingsApply}
+        />
+    {/if}
+  </SettingsPage>
 {:else if app.currentPage === "folder-settings"}
   {@const selectedFolder = folderState(app, app.folderSettingsId)
     ?? app.localFolders.find(folder => folder.id === app.folderSettingsId)}
   {#key app.folderSettingsId}
     <FolderSettingsPage folderId={app.folderSettingsId} folderLabel={selectedFolder?.label ?? app.folderSettingsId}
       encrypted={Boolean(selectedFolder?.encrypted)} managedStorage={Boolean(folderCredentials)}
+      locked={folderIsLocked(app, app.folderSettingsId)}
       passwordDraft={app.passwords.drafts[app.folderSettingsId] ?? activePasswords[app.folderSettingsId] ?? ""}
       passwordSaved={activePasswords[app.folderSettingsId] ?? ""} passwordError={selectedFolder?.passwordError ?? ""}
       actionError={app.ui.recentError ?? ""}

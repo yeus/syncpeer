@@ -8,6 +8,7 @@ import { browser } from "@wdio/globals";
 import { preferredPeerDirection } from "../../packages/core/src/sync/peerSessionManager.js";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
 import {
+  closeSettings, readCurrentDeviceId,
   completeFirstRunDeviceName,
   openOptionalPersonalSpaceSetup,
   openFolderSettings,
@@ -647,34 +648,10 @@ describe("Two isolated packaged desktop apps", () => {
       completeFirstRunDeviceName(joiner, "Synthetic joiner"),
     ]);
     await Promise.all(
-      [owner, joiner].map(async (peer) => {
-        await peer
-          .$("[data-testid='tab-devices']")
-          .waitForExist({ timeout: 60_000 });
-        await peer.execute(() => {
-          (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
-        });
-        await peer
-          .$("[data-testid='current-device-id']")
-          .waitForExist({ timeout: 60_000 });
-        await peer.waitUntil(
-          async () =>
-            /^[A-Z2-7-]{40,}$/.test(
-              await peer.$("[data-testid='current-device-id']").getText(),
-            ),
-          {
-            timeout: 60_000,
-            timeoutMsg: "The protected device identity did not finish loading.",
-          },
-        );
-      }),
+      [owner, joiner].map(peer => readCurrentDeviceId(peer)),
     );
-    const ownerId = await owner
-      .$("[data-testid='current-device-id']")
-      .getText();
-    const joinerId = await joiner
-      .$("[data-testid='current-device-id']")
-      .getText();
+    const ownerId = await owner.$("[data-testid='current-device-id']").getText();
+    const joinerId = await joiner.$("[data-testid='current-device-id']").getText();
     assert.match(ownerId, /^[A-Z2-7-]{40,}$/);
     assert.match(joinerId, /^[A-Z2-7-]{40,}$/);
     assert.notEqual(ownerId, joinerId);
@@ -860,17 +837,11 @@ describe("Two isolated packaged desktop apps", () => {
     console.log("Packaged folder test: leaving pairing screens.");
     for (const peer of [owner, joiner]) {
       await acceptPendingApproval(peer);
-      const back = peer.$("button=Back");
-      await back.waitForExist({ timeout: 30_000 });
-      await back.click();
+      await closeSettings(peer);
       await peer.$("[data-testid='tab-devices']").click();
     }
     const [ownerId, joinerId] = await Promise.all(
-      [owner, joiner].map(async (peer) => {
-        const deviceId = peer.$("[data-testid='current-device-id']");
-        await deviceId.waitForExist({ timeout: 60_000 });
-        return deviceId.getText();
-      }),
+      [owner, joiner].map(peer => readCurrentDeviceId(peer)),
     );
     await owner.$("[data-testid='tab-folders']").click();
     const newFolder = owner.$("[data-testid='new-folder']");

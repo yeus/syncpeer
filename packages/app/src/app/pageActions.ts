@@ -1,3 +1,4 @@
+import { PIM_TAB_VISIBLE } from "./features.ts";
 import type { SyncpeerSessionStore } from "@syncpeer/core/browser";
 import { hasAutoConnectTarget } from "./syncPolicies.ts";
 import { pushSessionLog, type AppState } from "./state.ts";
@@ -32,6 +33,7 @@ let foregroundPass: ForegroundPass | null = null;
 const switchTab = (tab: AppState["activeTab"], event?: MouseEvent) => {
   event?.preventDefault();
   event?.stopPropagation();
+  if (tab === "pim" && !PIM_TAB_VISIBLE) return;
   if (state.activeTab === tab) return;
   state.activeTab = tab;
   pushSessionLog(state, "info", "ui.tab.switch", `Switched tab to ${tab}`);
@@ -160,7 +162,10 @@ const closeAboutPage = () => {
     closeDiagnosticsPage,
     openAboutPage,
     closeAboutPage,
-    openGeneralSettings: () => { state.currentPage = "general-settings"; },
+    openGeneralSettings: (section: AppState["settingsSection"] = "personal-space") => {
+      state.settingsSection = typeof section === "string" ? section : "personal-space";
+      state.currentPage = "general-settings";
+    },
     closeGeneralSettings: () => { state.currentPage = "main"; },
     openNewFolder: () => { state.currentPage = "new-folder"; },
     closeNewFolder: () => { state.currentPage = "main"; },

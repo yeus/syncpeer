@@ -9,13 +9,21 @@
   import FolderSettingsPage from "../src/FolderSettingsPage.svelte";
   import NewFolderPage from "../src/NewFolderPage.svelte";
   import DeviceTab from "../src/components/DeviceTab.svelte";
+  import AppHeader from "../src/components/AppHeader.svelte";
+  import SettingsPage from "../src/components/SettingsPage.svelte";
+  import DeviceSettingsPanels from "../src/components/DeviceSettingsPanels.svelte";
+  import type { SettingsSection } from "../src/app/settingsSections.ts";
   import FileSystemListItem from "../src/components/FileSystemListItem.svelte";
 
   let app = $state(createInitialState(null));
   let page = $state("main"), phase = $state("unlocked");
+  let section = $state<SettingsSection>("personal-space"), fromOverview = $state(false);
+  function openSettings(next: SettingsSection = "personal-space") { section = next; fromOverview = next === "overview"; page = "general"; }
+  function settingsBack() { if (section !== "overview" && fromOverview) section = "overview"; else page = "main"; }
   let personalSpaceEnabled = $state(false);
   let managedStorage = $state(true), selectedFolderId = $state("photos");
   let password = $state("synthetic-folder-password");
+  let folderLocked = $state(true);
   let diagnosticsCopied = $state(false);
   let generationLoggerBroken = $state(false);
   let biometricStatusChecks = $state(0);
@@ -71,36 +79,47 @@
   <DeviceNameOnboarding suggestedName="synthetic-device"
     onSave={name => { app.connection.deviceName = name; app.ui.deviceNameConfirmed = true; }} />
 {:else if page === "main"}
+  <AppHeader phase="idle" connected={false} paused={false} expanded={false} onToggleDetails={() => {}} onOpenSettings={() => openSettings("overview")} />
   <DeviceTab {app} advertisedDevices={[]} advertisedFolders={[]}
     isSavedDeviceAwaitingRemoteApproval={() => false} isLanDiscoveredDevice={() => false}
-    onUseSavedDevice={() => {}} onResetDiscoveryServer={() => {}} onClearAllCache={() => {}} onClearOfflineFolderState={() => {}}
-    onOpenDiagnosticsPage={() => {}} onOpenAboutPage={() => {}} onCopyCurrentDeviceId={() => {}} onCopySessionLogs={() => {}}
-    onEditLocalDeviceName={() => {}} onRegenerateDeviceId={() => {}} onCopyIdentityBackupSecret={() => {}}
-    onRestoreIdentityRecovery={() => {}} onAddSavedDevice={() => {}} onApproveAdvertisedDevice={() => {}}
+    onUseSavedDevice={() => {}} onConnectDirectTcp={async () => {}} onDiscoverDevices={async () => {}}
+    onCopyCurrentDeviceId={() => {}} onEditLocalDeviceName={() => {}} onAddSavedDevice={() => {}} onApproveAdvertisedDevice={() => {}}
     onApproveFolderSync={() => {}} onRevokeFolderSync={() => {}}
     onEditSavedDeviceName={() => {}} onSetSavedDeviceIntroducer={() => {}} onRemoveSavedDevice={() => {}}
-    onConnectionSettingsChanged={() => {}} onOpenGeneralSettings={() => { page = "general"; }} />
-  <button data-testid="new-folder" onclick={() => { page = "new"; }}>New folder</button>
+    onOpenSettingsSection={openSettings} />
+  <button data-testid="new-folder" onclick={() => { page = "new"; }}>New shared folder</button>
+  <button data-testid="lock-folder-fixture" onclick={() => { folderLocked = true; }}>Lock folder fixture</button>
   <ul><FileSystemListItem item={{ kind: "root-folder", folderId: "photos", name: "Photos", readOnly: false,
-    encrypted: true, lockLabel: "unlocked", passwordError: "", locked: false, isFavorite: false,
+    encrypted: true, lockLabel: folderLocked ? "locked" : "unlocked", passwordError: "", locked: folderLocked, isFavorite: false,
     hasCachedRoot: false, statsText: "synthetic folder" }} isOpeningCachedFile={false}
     isRemovingCachedFile={false} isClearingCache={false}
     onOpenFolderSettings={id => { selectedFolderId = id; page = "folder"; }} /></ul>
 {:else if page === "general"}
-  <GeneralSettingsPage {command} onBack={() => { page = "main"; }} onUnlock={async () => {}}
-    onOpenFolderSettings={id => { selectedFolderId = id; page = "folder"; }}
-    onUnlockBiometric={async () => {}} onRotateMasterPassword={async value => { record({ operation: "changeMasterPassword", value }); }}
-    onSettingsSaved={() => {}} onTrustedDevicesChanged={async () => {}} getDefaultDeviceId={async () => "synthetic-device"}
-    onStartPairing={async () => { throw new Error("Pairing is outside this synthetic fixture."); }}
-    onJoinPairing={async () => { throw new Error("Pairing is outside this synthetic fixture."); }} onPairedDevice={() => {}} />
+  <SettingsPage {section} onBack={settingsBack} onSelect={next => { section = next; }}>
+    {#if section === "personal-space" || section === "synchronization" || section === "storage" || section === "security"}
+      {#key section}
+      <GeneralSettingsPage {command} {section} embedded backgroundControls onBack={settingsBack} onUnlock={async () => {}}
+        onOpenFolderSettings={id => { selectedFolderId = id; page = "folder"; }}
+        onUnlockBiometric={async () => {}} onRotateMasterPassword={async value => { record({ operation: "changeMasterPassword", value }); }}
+        onSettingsSaved={() => {}} onTrustedDevicesChanged={async () => {}} getDefaultDeviceId={async () => "synthetic-device"}
+        onStartPairing={async () => { throw new Error("Pairing is outside this synthetic fixture."); }}
+        onJoinPairing={async () => { throw new Error("Pairing is outside this synthetic fixture."); }} onPairedDevice={() => {}} />
+      {/key}
+    {/if}
+    <DeviceSettingsPanels {app} {section}
+      onResetDiscoveryServer={() => {}} onClearAllCache={() => {}} onClearOfflineFolderState={() => {}}
+      onOpenDiagnosticsPage={() => {}} onCopyCurrentDeviceId={() => {}} onCopySessionLogs={() => {}}
+      onEditLocalDeviceName={() => {}} onRegenerateDeviceId={() => {}} onCopyIdentityBackupSecret={() => {}}
+      onRestoreIdentityRecovery={() => {}} onUseSavedDevice={() => {}} onConnectionSettingsChanged={() => {}} />
+  </SettingsPage>
 {:else if page === "folder"}
   <FolderSettingsPage folderId={selectedFolderId} folderLabel={selectedFolderId === "photos" ? "Photos" : "Documents"}
-    encrypted={true} {managedStorage}
+    encrypted={true} locked={folderLocked} {managedStorage}
     passwordDraft={password} passwordSaved={password} passwordError="" actionError="" peerId="synthetic-owned-peer"
-    {command} onBack={() => { page = "main"; }} onOpenGeneralSettings={() => { page = "general"; }}
+    {command} onBack={() => { page = "main"; }} onOpenGeneralSettings={() => openSettings()}
     onUpdatePassword={(_id, value) => { password = value; }}
-    onSavePassword={async id => { record({ operation: "saveFolderPassword", folderId: id, password }); }}
-    onClearPassword={async id => { password = ""; record({ operation: "clearFolderPassword", folderId: id }); }}
+    onSavePassword={async id => { record({ operation: "saveFolderPassword", folderId: id, password }); folderLocked = false; }}
+    onClearPassword={async id => { password = ""; folderLocked = true; record({ operation: "clearFolderPassword", folderId: id }); }}
     onImport={async () => {}} onMigrate={async (id, target) => { record({ operation: "migrate", folderId: id, target }); }}
     onRelease={async () => {}} onSettingsSaved={() => {}} />
 {:else if page === "onboarding"}
@@ -116,13 +135,13 @@
     onSkip={() => { page = "main"; }}
     onCopyDiagnostics={async () => { diagnosticsCopied = true; }}
     onGenerationEvent={(stage, reason) => { if (generationLoggerBroken) throw new Error("Synthetic diagnostic logger failure."); record({ operation: "generationEvent", stage, reason }); }}
-    onOpenSettings={() => { page = "general"; }} />
+    onOpenSettings={() => openSettings()} />
 {:else if page === "first-peer-folder"}
   <section data-testid="synthetic-first-peer-folder">
     <h2>Peer folders (synthetic)</h2>
     <p>Sample documents shared by another device</p>
   </section>
 {:else}
-  <NewFolderPage {command} onBack={() => { page = "main"; }} onOpenGeneralSettings={() => { page = "general"; }}
+  <NewFolderPage {command} onBack={() => { page = "main"; }} onOpenGeneralSettings={() => openSettings()}
     onCreate={async label => { record({ operation: "createFolder", label }); }} />
 {/if}

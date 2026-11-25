@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { browser } from "@wdio/globals";
 import { createFreshEncryptedProfile } from "./profile-setup.js";
-import { clickButtonByText, completeFirstRunDeviceName, openGeneralSettings } from "./ui-helpers.js";
+import { clickButtonByText, completeFirstRunDeviceName, openGeneralSettings, openSettingsSection, readCurrentDeviceId } from "./ui-helpers.js";
 
 async function importBackup(peer: WebdriverIO.Browser, backup: string, password: string) {
   await peer.$("//label[contains(., 'Or paste encrypted backup')]/textarea").setValue(backup);
@@ -62,21 +62,10 @@ describe("Packaged desktop offline recovery", () => {
       completeFirstRunDeviceName(owner, "Synthetic recovery owner"),
       completeFirstRunDeviceName(joiner, "Synthetic recovery joiner"),
     ]);
-    await Promise.all([owner, joiner].map(async peer => {
-      const devices = peer.$("[data-testid='tab-devices']");
-      await devices.waitForExist({ timeout: 60_000 });
-      await peer.execute(() => {
-        (document.querySelector("[data-testid='tab-devices']") as HTMLButtonElement).click();
-      });
-      const identity = peer.$("[data-testid='current-device-id']");
-      await identity.waitForExist({ timeout: 60_000 });
-      await peer.waitUntil(async () => /^[A-Z2-7-]{40,}$/.test(await identity.getText()),
-        { timeout: 60_000, timeoutMsg: "The synthetic protected identity did not load." });
-    }));
-    ownerId = await owner.$("[data-testid='current-device-id']").getText();
-    replacementId = await joiner.$("[data-testid='current-device-id']").getText();
+    [ownerId, replacementId] = await Promise.all([owner, joiner].map(peer => readCurrentDeviceId(peer)));
     assert.notEqual(ownerId, replacementId);
     kit = await createFreshEncryptedProfile(owner);
+    await openSettingsSection(owner, "security");
     await owner.$("//label[contains(., 'Backup recovery password')]/input")
       .setValue("synthetic-backup-recovery-password");
     await owner.$("button=Export encrypted backup").waitForEnabled({ timeout: 30_000 });
@@ -87,7 +76,7 @@ describe("Packaged desktop offline recovery", () => {
     assert.equal(JSON.parse(backup).format, 1);
     assert.equal(backup.includes("synthetic-release-smoke-master-password"), false);
     assert.equal(backup.includes(JSON.parse(kit).publicKey), false);
-    await openGeneralSettings(joiner);
+    await openSettingsSection(joiner, "security");
   });
 
   it("rejects a wrong password and corrupt backup without occupying the new profile", async () => {
@@ -101,6 +90,7 @@ describe("Packaged desktop offline recovery", () => {
     await expectFailure(joiner, /Backup operation failed/);
     assert.ok(await joiner.$("button=Import backup into this new profile").isExisting());
     await importBackup(joiner, backup, "synthetic-backup-recovery-password");
+    await openGeneralSettings(joiner);
     await joiner.$("button=Enroll this replacement device").waitForExist({ timeout: 30_000 });
     assert.deepEqual(await membershipRows(joiner), [{ deviceId: ownerId, state: "active" }]);
   });

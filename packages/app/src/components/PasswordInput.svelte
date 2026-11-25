@@ -8,6 +8,7 @@
   interface Props {
     value?: string;
     label: string;
+    hideLabel?: boolean;
     secretLabel?: string;
     id?: string;
     autocomplete?: FullAutoFill;
@@ -22,7 +23,7 @@
     children?: Snippet;
   }
 
-  let { value = $bindable(""), label, secretLabel = label, id, autocomplete = "off",
+  let { value = $bindable(""), label, hideLabel = false, secretLabel = label, id, autocomplete = "off",
     disabled = false, required = false, minlength, maxlength, placeholder, testId,
     autofocus = false, onValueChange, children }: Props = $props();
   const generatedId = $props.id();
@@ -36,10 +37,11 @@
 </script>
 
 <div class="password-field">
-  <label for={inputId}>{label}</label>
+  {#if !hideLabel}<label for={inputId}>{label}</label>{/if}
   <div class="password-control">
     <input
       bind:this={input}
+      aria-label={hideLabel ? label : undefined}
       id={inputId}
       type={visible ? "text" : "password"}
       bind:value

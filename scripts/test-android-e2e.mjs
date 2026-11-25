@@ -522,6 +522,34 @@ const clickUiTestId = async (cdp, testId) => {
 })()`);
   if (!clicked) throw new Error(`Android UI control not found: ${testId}`);
 };
+const closeAndroidSettings = async cdp => {
+  for (let depth = 0; depth < 4; depth++) {
+    const back = await cdp.evaluate('document.querySelector("[data-testid=settings-back]") !== null');
+    if (!back) return;
+    await clickUiTestId(cdp, "settings-back");
+    await wait(150);
+  }
+  throw new Error("Could not return from Android settings.");
+};
+const openAndroidSettingsSection = async (cdp, section) => {
+  if (await cdp.evaluate(`document.querySelector("[data-testid=settings-${section}]") !== null`)) return;
+  if (!await cdp.evaluate('document.querySelector("[data-testid=settings-overview]") !== null')) {
+    await closeAndroidSettings(cdp);
+    await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=connection-settings-toggle]")', "settings gear");
+    await clickUiTestId(cdp, "connection-settings-toggle");
+  }
+  const id = section === "personal-space" ? "general-settings" : `open-settings-${section}`;
+  await waitForUiCondition(cdp, `!!document.querySelector("[data-testid=${id}]")`, "settings category");
+  await clickUiTestId(cdp, id);
+  await waitForUiCondition(cdp, `!!document.querySelector("[data-testid=settings-${section}]")`, section + " settings");
+};
+const openAndroidAddDevice = async cdp => {
+  await closeAndroidSettings(cdp);
+  await clickUiTestId(cdp, "tab-devices");
+  if (!await cdp.evaluate('!!document.querySelector("[data-testid=new-peer-device-id]")')) await clickUiTestId(cdp, "open-add-device");
+  await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=new-peer-device-id]")', "add device form");
+};
+
 
 const setUiValue = async (cdp, testId, value) => {
   const updated = await cdp.evaluate(`(() => {
@@ -986,7 +1014,7 @@ const verifyAndroidFolderBackHistory = async (cdp) => {
     return route.get("tab") === "folders" &&
       (route.get("folder") ?? "") === ${JSON.stringify(folder)} &&
       (route.get("path") ?? "") === ${JSON.stringify(path)} &&
-      document.querySelector(".crumb-current")?.textContent?.trim() === ${JSON.stringify(label)} &&
+      (document.querySelector(".crumb-current")?.textContent?.trim() ?? "") === ${JSON.stringify(label)} &&
       !!document.querySelector(${JSON.stringify(`[data-testid="${rowId}"]`)});
   })()`, `folder history: ${label}`, 45_000);
   const root = () => expectLocation(targetFolderId, "", targetFolderTitle, "folder-entry-navigation-parent");
@@ -1011,14 +1039,14 @@ const verifyAndroidFolderBackHistory = async (cdp) => {
   back();
   await root();
   back();
-  await expectLocation("", "", "All Syncthing Folders", `folder-root-${targetFolderId}`);
+  await expectLocation("", "", "", `folder-root-${targetFolderId}`);
   await assertForeground();
   console.log("Android native Back restores nested directory, breadcrumb jump and folder overview history.");
 };
 
 const verifyFavoriteAndSavePicker = async (cdp) => {
   await clickUiTestId(cdp, "tab-devices");
-  await waitForUiCondition(cdp, '[...document.querySelectorAll(".status-chip.online")].some(chip => chip.textContent.trim() === "connected")',
+  await waitForUiCondition(cdp, '[...document.querySelectorAll(".status-chip.online")].some(chip => /^connected/i.test(chip.textContent.trim()))',
     "connected peer chip with matching text and color", 15_000);
   await openAndroidFolder(cdp, false);
   await waitForAndroidFileRow(cdp, targetFileName);
@@ -1139,18 +1167,9 @@ const runPeerStartupAutoConnect = async () => {
       'document.querySelector("[data-testid=tab-devices]") !== null',
       "restored device UI", 60_000);
     await clickUiTestId(cdp, "tab-devices");
-    // Saved Devices belongs to the collapsible advanced settings panel.
-    // Expanding it is observational and must not trigger a peer reconnect.
+    // Observe the restored saved peer without changing the selected connection.
     await waitForUiCondition(cdp,
-      'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
-      "restored settings toggle", 20_000);
-    if (!await cdp.evaluate(
-      'document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"')) {
-      await clickUiTestId(cdp, "connection-settings-toggle");
-    }
-    await waitForUiCondition(cdp,
-      `Array.from(document.querySelectorAll('[data-testid="connection-saved-device"] option'))` +
-        `.some(option => option.value.replace(/[^A-Z2-7]/gi, "").toUpperCase() === ${JSON.stringify(normalizeDeviceId(serverDeviceId))})`,
+      `[...document.querySelectorAll("[data-saved-peer-id]")].some(row => row.dataset.savedPeerId.replace(/[^A-Z2-7]/gi, "").toUpperCase() === ${JSON.stringify(normalizeDeviceId(serverDeviceId))})`,
       "restored encrypted peer roster", 60_000);
     const rosterReadyAt = Date.now();
     const deadline = rosterReadyAt + 20_000;
@@ -1274,13 +1293,8 @@ const runPeerSwitchApproval = async () => {
       "two-peer initial device UI", 30_000);
     await completeAndroidDeviceNaming(cdp, "Two-peer Android test");
     await clickUiTestId(cdp, "tab-devices");
-    await waitForUiCondition(cdp,
-      'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
-      "encrypted peer state restored before adding peer A", 90_000);
-    if (!await cdp.evaluate(
-      'document.querySelector("[data-testid=connection-discovery-mode]") !== null')) {
-      await clickUiTestId(cdp, "connection-settings-toggle");
-    }
+    await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=open-add-device]")', "encrypted peer state restored", 90_000);
+    await openAndroidSettingsSection(cdp, "network");
     await waitForUiCondition(cdp,
       'document.querySelector("[data-testid=connection-discovery-server]") !== null',
       "automatic discovery settings", 20_000);
@@ -1290,6 +1304,7 @@ const runPeerSwitchApproval = async () => {
     await setUiValue(cdp, "connection-remote-id", serverDeviceId);
 
     const addPeer = async (remoteId) => {
+      await openAndroidAddDevice(cdp);
       const added = await cdp.evaluate(`(() => {
         const editor = document.querySelector(".saved-device-editor");
         const input = editor?.querySelector('input[type="text"]');
@@ -1304,8 +1319,7 @@ const runPeerSwitchApproval = async () => {
       })()`);
       if (!added) throw new Error("Could not add the next Android peer.");
       await waitForUiCondition(cdp,
-        `[...document.querySelectorAll('[data-testid="connection-saved-device"] option')]
-          .some(option => option.value === ${JSON.stringify(normalizeDeviceId(remoteId))})`,
+        `[...document.querySelectorAll("[data-saved-peer-id]")].some(row => row.dataset.savedPeerId === ${JSON.stringify(normalizeDeviceId(remoteId))})`,
         "peer saved locally", 20_000);
     };
 
@@ -1332,9 +1346,8 @@ const runPeerSwitchApproval = async () => {
     } catch (error) {
       const ui = await observeCdp(cdp, `(() => ({
         status: document.querySelector("[data-testid=connection-status]")?.textContent?.trim(),
-        selected: document.querySelector("[data-testid=connection-saved-device]")?.value,
-        remoteId: document.querySelector("[data-testid=connection-remote-id]")?.value,
-        saved: [...document.querySelectorAll("[data-testid=connection-saved-device] option")].map(option => option.value),
+        selected: document.querySelector("[data-selected-peer]")?.dataset.selectedPeer,
+        saved: [...document.querySelectorAll("[data-saved-peer-id]")].map(row => row.dataset.savedPeerId),
         guidance: document.querySelectorAll("[data-testid=peer-first-connection-guidance]").length,
         chips: [...document.querySelectorAll(".item-title-row")].slice(-8).map(row => row.innerText?.slice(0, 160)),
         error: document.querySelector("p.error")?.textContent?.trim(),
@@ -1346,7 +1359,7 @@ const runPeerSwitchApproval = async () => {
     await waitForUiCondition(cdp,
       `(() => {
         const status = document.querySelector("[data-testid=connection-status]")?.textContent?.trim();
-        const selected = document.querySelector("[data-testid=connection-saved-device]")?.value;
+        const selected = document.querySelector("[data-selected-peer]")?.dataset.selectedPeer;
         return status === "Connected" && selected === ${JSON.stringify(normalizeDeviceId(secondDeviceId))};
       })()`, "peer B connected and selected", connectionTimeoutMs);
     const currentPids = runAdb(["shell", "pidof", packageName]).trim().split(/\s+/);
@@ -2152,15 +2165,12 @@ const fixtureBlobHash = () => {
 };
 
 const setAndroidAutomaticConnectionPaused = async (cdp, paused) => {
-  await clickUiTestId(cdp, "tab-devices");
-  const settingsExpanded = await cdp.evaluate(
-    'document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"',
-  );
-  if (!settingsExpanded) await clickUiTestId(cdp, "connection-settings-toggle");
+  await openAndroidSettingsSection(cdp, "appearance");
   const expertEnabled = await cdp.evaluate(
     'document.querySelector("[data-testid=expert-view]")?.checked === true',
   );
   if (!expertEnabled) await clickUiTestId(cdp, "expert-view");
+  await closeAndroidSettings(cdp);
   const detailsExpanded = await cdp.evaluate(
     'document.querySelector("[data-testid=connection-status-toggle]")?.getAttribute("aria-expanded") === "true"',
   );
@@ -2230,16 +2240,9 @@ const openAndroidConnection = async (cdp) => {
   await completeAndroidDeviceNaming(cdp, "Android E2E device");
   await waitForUiCondition(cdp, 'document.querySelector("[data-testid=tab-devices]") !== null', "device tab", 30_000);
   await clickUiTestId(cdp, "tab-devices");
-  await waitForUiCondition(cdp,
-    'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
-    "encrypted peer state restored", 90_000);
-  const settingsVisible = await cdp.evaluate(
-    "document.querySelector('[data-testid=\"connection-discovery-mode\"]') !== null",
-  );
-  if (!settingsVisible) {
-    await clickUiTestId(cdp, "connection-settings-toggle");
-    await waitForUiText(cdp, "Remote Device ID", 10_000);
-  }
+  await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=open-add-device]")', "encrypted peer state restored", 90_000);
+  const initiallyConnected = await cdp.evaluate('document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"');
+  await openAndroidSettingsSection(cdp, "network");
   // Add Device connects immediately. Configure the pinned server before
   // adding a device, rather than racing an old default-server attempt.
   // Only an existing active session needs an explicit disconnect; pausing a
@@ -2278,10 +2281,10 @@ const openAndroidConnection = async (cdp) => {
     await setAndroidAutomaticConnectionPaused(cdp, false);
     return await awaitAndroidConnection(cdp);
   }
-  const initiallyConnected = await cdp.evaluate(
-    'document.querySelector("[data-testid=connection-status]")?.textContent?.trim() === "Connected"',
-  );
-  if (initiallyConnected) await setAndroidAutomaticConnectionPaused(cdp, true);
+  if (initiallyConnected) {
+    await setAndroidAutomaticConnectionPaused(cdp, true);
+    await openAndroidSettingsSection(cdp, "network");
+  }
   // Direct mode also requires an explicitly saved peer; entering the ID alone
   // does not authorize auto-connection under the current peer policy.
   if (peerSaved) await setUiValue(cdp, "connection-saved-device", "");
@@ -2309,6 +2312,7 @@ const openAndroidConnection = async (cdp) => {
     5_000,
   );
   if (!peerSaved) {
+    await openAndroidAddDevice(cdp);
     const added = await cdp.evaluate(`(() => {
       const button = [...document.querySelectorAll("button")]
         .find(element => element.textContent?.trim() === "Add Device");
@@ -2322,6 +2326,7 @@ const openAndroidConnection = async (cdp) => {
       return true;
     })()`);
     if (!added) throw new Error("Android UI could not save the managed Syncthing peer.");
+    await openAndroidSettingsSection(cdp, "network");
     // Saving a new peer selects automatic discovery. Restore whichever transport
     // this scenario requested, not only direct mode (the relay test uses global).
     await setUiValue(cdp, "connection-discovery-mode", discoveryMode);
@@ -2404,9 +2409,9 @@ const readAndroidFolderState = async (cdp) => {
 };
 
 const readAndroidSessionEvents = async (cdp) => {
-  try { await clickUiTestId(cdp, "tab-devices"); }
+  try { await openAndroidSettingsSection(cdp, "diagnostics"); }
   catch { return []; }
-  return cdp.evaluate(`(() => {
+  const events = await cdp.evaluate(`(() => {
     const summary = [...document.querySelectorAll("summary")]
       .find(element => element.textContent?.includes("View logs"));
     const list = summary?.parentElement?.querySelector("ul.list");
@@ -2439,6 +2444,8 @@ const readAndroidSessionEvents = async (cdp) => {
       .filter(Boolean)
       .slice(0, 60);
   })()`).catch(() => []);
+  await closeAndroidSettings(cdp);
+  return events;
 };
 
 const ensureAndroidFolderAttached = async (cdp) => {
@@ -2492,11 +2499,7 @@ const ensureAndroidFolderAttached = async (cdp) => {
 
 const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true) => {
   if (clearCache) {
-    await clickUiTestId(cdp, "tab-devices");
-    const settingsExpanded = await cdp.evaluate(
-      'document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"',
-    );
-    if (!settingsExpanded) await clickUiTestId(cdp, "connection-settings-toggle");
+    await openAndroidSettingsSection(cdp, "storage");
     await clickUiTestId(cdp, "clear-cache-button");
     await waitForUiCondition(
       cdp,
@@ -2504,11 +2507,11 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
       "cleared Android cache",
       30_000,
     );
+    await closeAndroidSettings(cdp);
   }
   await clickUiTestId(cdp, "tab-folders");
   const returnedToRoot = await cdp.evaluate(`(() => {
-    const root = [...document.querySelectorAll(".crumb-button")]
-      .find((element) => element.textContent?.trim() === "All Syncthing Folders");
+    const root = document.querySelector("[data-testid=folder-root-back]");
     if (!(root instanceof HTMLElement)) return false;
     root.dispatchEvent(new MouseEvent("click", {
       bubbles: true,
@@ -2521,11 +2524,8 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
     await waitForUiCondition(
       cdp,
       `(() => {
-        if (document.querySelector(".crumb-current")?.textContent?.trim() === "All Syncthing Folders") {
-          return true;
-        }
-        const root = [...document.querySelectorAll(".crumb-button")]
-          .find((element) => element.textContent?.trim() === "All Syncthing Folders");
+        if (!document.querySelector("[data-testid=folder-root-back]")) return true;
+        const root = document.querySelector("[data-testid=folder-root-back]");
         root?.dispatchEvent(new MouseEvent("click", {
           bubbles: true,
           cancelable: true,
@@ -2549,6 +2549,9 @@ const openAndroidFolder = async (cdp, clearCache = false, attachDocuments = true
     );
     if (!inputVisible && editVisible) {
       await clickUiTestId(cdp, editButton);
+      if (await cdp.evaluate('!!document.querySelector("[data-testid=folder-password-toggle]")')) {
+        await clickUiTestId(cdp, "folder-password-toggle");
+      }
       await waitForUiCondition(
         cdp,
         `document.querySelector(${JSON.stringify(`[data-testid="${passwordInput}"]`)}) !== null`,
@@ -2596,7 +2599,7 @@ const waitForAndroidFileRow = async (cdp, name, timeout = 90_000) => {
   while (Date.now() < deadline) {
     if (await cdp.evaluate(`document.body?.innerText?.includes(${JSON.stringify(name)}) === true`)) return;
     const atRoot = await cdp.evaluate(
-      'document.querySelector(".crumb-current")?.textContent?.trim() === "All Syncthing Folders"',
+      '!document.querySelector("[data-testid=folder-root-back]") && !!document.querySelector("[data-testid^=folder-root-]")',
     );
     if (atRoot) await clickUiItem(cdp, targetFolderTitle);
     await wait(250);
@@ -2909,12 +2912,11 @@ const runOptionalAndroidNetworkWorkflow = async () => {
 const runAndroidFilesystemChecks = async (cdp) => {
   if (requireDocumentRuntime) {
     await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=tab-devices]")', "application navigation ready");
-    await clickUiTestId(cdp, "tab-devices");
-    if (!await cdp.evaluate('document.querySelector("[data-testid=connection-settings-toggle]")?.getAttribute("aria-expanded") === "true"')) {
-      await clickUiTestId(cdp, "connection-settings-toggle");
-    }
-    await clickUiTestId(cdp, "document-vault-status");
-    await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=document-vault-phase]")', "document vault status from service");
+    await openAndroidSettingsSection(cdp, "personal-space");
+    await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=personal-space-settings]")', "personal space settings");
+    const status = await tauriInvoke(cdp, "syncpeer_document_command", { request: { operation: "status" } });
+    if (!status.result?.vault?.phase) throw new Error("Native document vault status unavailable.");
+    await closeAndroidSettings(cdp);
     console.log("Android Settings reaches the service-owned document vault.");
   }
   const built = await build({
@@ -3033,20 +3035,8 @@ const openGeneralSettings = async (cdp) => {
   await completeAndroidDeviceNaming(cdp, "Syncpeer pairing test device");
   await waitForUiCondition(cdp,
     'document.querySelector("[data-testid=tab-devices]") !== null', "devices tab", 60_000);
-  await clickUiTestId(cdp, "tab-devices");
-  await waitForUiCondition(cdp,
-    'document.querySelector("[data-testid=connection-settings-toggle]") !== null',
-    "device controls after protected-state hydration", 90_000);
-  await cdp.evaluate(`(() => {
-    const toggle = document.querySelector("[data-testid=connection-settings-toggle]");
-    if (toggle?.getAttribute("aria-expanded") !== "true") toggle?.click();
-  })()`);
-  await waitForUiCondition(cdp,
-    'document.querySelector("[data-testid=general-settings]") !== null',
-    "personal-space settings button", 60_000);
-  await clickUiTestId(cdp, "general-settings");
-  await waitForUiCondition(cdp,
-    'document.querySelector("[data-testid=general-settings-page]") !== null', "general settings page");
+  await openAndroidSettingsSection(cdp, "personal-space");
+  await waitForUiCondition(cdp, '!!document.querySelector("[data-testid=general-settings-page]")', "general settings page");
 };
 
 const pairingSectionControl = (heading, selector) => `(() => {

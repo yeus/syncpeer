@@ -2,6 +2,7 @@
   import type { ServiceSessionPhase, SessionState } from "@syncpeer/core/browser";
   import { connectionStatusLabel, connectionStatusTone } from "../lib/connectionStatus.ts";
   import ChevronDown from "lucide-svelte/icons/chevron-down";
+  import Settings from "lucide-svelte/icons/settings";
   import appIcon from "../../../../icon.svg?url";
 
   interface Props {
@@ -13,12 +14,14 @@
     expanded: boolean;
     transferSummary?: string;
     transferNotice?: string;
+    updatedAt?: string;
     transferPercent?: number;
     onToggleDetails: () => void;
+    onOpenSettings?: () => void;
   }
 
   let { phase, connected, peerPhase = null, peerError = null, paused, expanded,
-    transferSummary = "", transferNotice = "", transferPercent = 0, onToggleDetails }: Props = $props();
+    transferSummary = "", transferNotice = "", transferPercent = 0, updatedAt = "", onToggleDetails, onOpenSettings }: Props = $props();
 
   let label = $derived.by(() => connectionStatusLabel({ phase, connected, peerPhase, paused }));
 
@@ -31,6 +34,7 @@
     <img src={appIcon} alt="" aria-hidden="true" />
     <span>Syncpeer</span>
   </div>
+  <div class="header-actions">
   <button
     type="button"
     class="connection-status"
@@ -46,7 +50,12 @@
     <span data-testid="connection-status">{label}</span>
     <ChevronDown size={16} class={expanded ? "expanded" : ""} aria-hidden="true" />
   </button>
+  {#if onOpenSettings}
+    <button class="settings-button" type="button" data-testid="connection-settings-toggle" aria-label="Settings" title="Settings" onclick={onOpenSettings}><Settings size={22} /></button>
+  {/if}
   </div>
+  </div>
+  {#if updatedAt}<div class="header-updated" data-testid="header-updated">Updated {updatedAt}</div>{/if}
   {#if transferSummary || transferNotice}
     <div class="header-transfer" data-testid="header-transfer">
       <div class="transfer-text" role="status" title={transferSummary || transferNotice}>
@@ -77,6 +86,9 @@
     padding: 0.45rem 0.75rem;
   }
 
+  .header-actions { display:flex; align-items:center; gap:0.25rem; }
+  .settings-button { min-height:44px; min-width:44px; border:0; background:transparent; color:var(--text-strong); }
+  .header-updated { font-size:0.75rem; color:var(--text-secondary); padding:0 0.75rem 0.35rem; text-align:right; }
   .header-transfer {
     display: flex;
     flex-direction: column;

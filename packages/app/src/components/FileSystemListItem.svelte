@@ -159,7 +159,7 @@
   };
 
   const canClickMain = (value: FileSystemItem) => {
-    if (value.kind === "root-folder") return !value.locked || value.canBrowseLocally;
+    if (value.kind === "root-folder") return !value.locked || Boolean(onOpenFolderSettings) || value.canBrowseLocally;
     return true;
   };
 
@@ -167,7 +167,8 @@
     const target = event?.target instanceof HTMLElement ? event.target : null;
     if (target?.closest("button,input,select,textarea,label,a")) return;
     if (value.kind === "root-folder") {
-      onOpenFolderRoot(value.folderId);
+      if (value.locked && onOpenFolderSettings) onOpenFolderSettings(value.folderId);
+      else onOpenFolderRoot(value.folderId);
       return;
     }
     if (value.kind === "folder-entry") {

@@ -10,6 +10,7 @@ import {
 } from "./fixture-data.ts";
 import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
 import {
+  openSettingsSection, closeSettings, readCurrentDeviceId,
   openFolderSettings,
   clickButtonByText,
   clickDownloadButton,
@@ -173,31 +174,7 @@ const clickTestId = async (testId: string): Promise<void> => {
   }, testId);
 };
 
-const openConnectionSettings = async (): Promise<void> => {
-  const settings = $("[data-testid='connection-settings-toggle']");
-  const mode = $("[data-testid='connection-discovery-mode']");
-  if (
-    await settings.getAttribute("aria-expanded") !== "true" &&
-    !(await mode.isExisting())
-  ) {
-    await tauriBrowser.execute(() => {
-      const button = document.querySelector(
-        "[data-testid='connection-settings-toggle']",
-      ) as HTMLButtonElement | null;
-      button?.click();
-    });
-  }
-  await tauriBrowser.waitUntil(
-    async () => {
-      if (await mode.isExisting()) return true;
-      return mode.isExisting();
-    },
-    {
-      timeout: 5_000,
-      timeoutMsg: "Timed out waiting for connection settings to render.",
-    },
-  );
-};
+const openConnectionSettings = async (): Promise<void> => openSettingsSection(tauriBrowser, "network");
 
 const configureGlobalConnection = async (): Promise<void> => {
   await clickTestId("tab-devices");
@@ -214,6 +191,7 @@ const configureGlobalConnection = async (): Promise<void> => {
       timeoutMs: await $("[data-testid='connection-timeout']").getValue(),
     }),
   );
+  await closeSettings(tauriBrowser);
 };
 
 const disconnectIfConnected = async (): Promise<void> => {
@@ -277,9 +255,7 @@ const fetchNativeDiscovery = () => tauriBrowser.tauri.execute(async (tauri, requ
 describe("Syncpeer Tauri UI smoke", () => {
   it("renders the native identity and connection mode controls", async () => {
     await clickTestId("tab-devices");
-    const currentDeviceId = $("[data-testid='current-device-id']");
-    await currentDeviceId.waitForExist({ timeout: 60_000 });
-    const deviceId = await currentDeviceId.getText();
+    const deviceId = await readCurrentDeviceId(tauriBrowser);
     assert.match(deviceId, /^[A-Z2-7-]{40,}$/);
     console.log("\nSyncpeer UI client device ID: " + deviceId);
     console.log("Approve this pending device in the server terminal.\n");
@@ -292,11 +268,12 @@ describe("Syncpeer Tauri UI smoke", () => {
     await waitForText(tauriBrowser, "Host");
     await selectDiscoveryMode(tauriBrowser, "global");
     await waitForText(tauriBrowser, "Global discovery ignores manual host/port.");
+    await closeSettings(tauriBrowser);
   });
 
   it("applies light, dark, automatic, and custom theme settings", async () => {
     await clickTestId("tab-devices");
-    await openConnectionSettings();
+    await openSettingsSection(tauriBrowser, "appearance");
     const setThemeMode = async (mode: "auto" | "light" | "dark") => {
       await tauriBrowser.execute((nextMode: string) => {
         const select = document.querySelector("[data-testid='theme-mode']") as HTMLSelectElement;
@@ -335,6 +312,7 @@ describe("Syncpeer Tauri UI smoke", () => {
     });
     assert.deepEqual(colors.map((color) => color.toUpperCase()), ["#123456", "#ABCDEF"]);
     await setThemeMode("auto");
+    await closeSettings(tauriBrowser);
   });
 
   it("keeps connection state in the header and reveals details on demand", async () => {
@@ -355,6 +333,7 @@ describe("Syncpeer Tauri UI smoke", () => {
   it("resets folder scroll when returning to a password-backed folder view", async () => {
     await seedOfflineFolderState();
     try {
+      await $("[data-testid=folder-filter-toggle]").click();
       await $(`[data-testid='folder-name-filter']`).waitForExist({ timeout: 10_000 });
       const nestedFolder = await $(`[data-testid='folder-entry-nested']`);
       assert.ok(
@@ -512,9 +491,7 @@ describe("Syncpeer Tauri UI smoke", () => {
 
   it("shows reproducible build and runtime metadata in About", async () => {
     await clickTestId("tab-devices");
-    const aboutButton = $("[data-testid='open-about']");
-    await aboutButton.waitForExist({ timeout: 10_000 });
-    await aboutButton.click();
+    await openSettingsSection(tauriBrowser, "about");
     await $("[data-testid='about-page']").waitForExist({ timeout: 10_000 });
     assert.match(await $("[data-testid='about-version']").getText(), /.+/);
     assert.match(await $("[data-testid='about-commit']").getText(), /[0-9a-f]{8,}|unknown/i);
@@ -523,6 +500,7 @@ describe("Syncpeer Tauri UI smoke", () => {
     await $("[data-testid='about-copy']").click();
     await $("[data-testid='about-copy-notice']").waitForExist({ timeout: 5_000 });
     await $("[data-testid='about-back']").click();
+    await closeSettings(tauriBrowser);
     await $("[data-testid='connection-status-toggle']").waitForExist({ timeout: 10_000 });
   });
 
@@ -536,6 +514,7 @@ describe("Syncpeer Tauri UI smoke", () => {
 
   it("runs all registered diagnostics through the Tauri UI", async () => {
     await clickTestId("tab-devices");
+    await openSettingsSection(tauriBrowser, "diagnostics");
     const diagnosticsButton = $("[data-testid='open-diagnostics']");
     await diagnosticsButton.waitForExist({ timeout: 10_000 });
     await diagnosticsButton.click();
@@ -553,6 +532,7 @@ describe("Syncpeer Tauri UI smoke", () => {
     assert.match(String(await result.getValue()), /"allPassed": true/);
     assert.match(String(await result.getValue()), /"buildInfo":/);
     await $("[data-testid='diagnostics-back']").click();
+    await closeSettings(tauriBrowser);
     await $("[data-testid='connection-status-toggle']").waitForExist({ timeout: 10_000 });
   });
 
@@ -676,12 +656,8 @@ describe("Syncpeer Tauri UI smoke", () => {
 
       await disconnectIfConnected();
       await clickTestId("tab-folders");
-      await waitForText(tauriBrowser, "Offline · last seen", 5_000);
       await waitForText(tauriBrowser, targetFileName, 5_000);
-      assert.match(
-        await $("[data-testid='folder-view-status']").getText(),
-        /Offline · last seen/,
-      );
+      assert.notEqual(await $("[data-testid=connection-status]").getText(), "Connected");
       await returnToFolderRoot();
       await waitForText(tauriBrowser, targetFolderTitle, 5_000);
       await clickItemTitle(tauriBrowser, targetFolderTitle);

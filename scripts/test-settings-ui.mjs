@@ -39,8 +39,17 @@ async function runSettingsUiTest(browser) {
   const text = () => browser.$("body").getText();
   const calls = async () => JSON.parse(await browser.$("[data-testid='calls']").getHTML(false));
   const back = async () => {
-    await click("[data-testid$='settings-page'] > button, [data-testid='new-folder-page'] > button");
+    const selector = "[data-testid='settings-back']";
+    if (await browser.$(selector).isExisting()) {
+      await click(selector);
+      if (await browser.$(selector).isExisting()) await click(selector);
+    } else await click("[data-testid$='settings-page'] > button, [data-testid='new-folder-page'] > button");
     await waitFor("[data-testid='folder-settings-photos']");
+  };
+  const openSettings = async section => {
+    await click("[data-testid='connection-settings-toggle']");
+    await waitFor("[data-testid='settings-overview']");
+    await click(section === "personal-space" ? "[data-testid='general-settings']" : `[data-testid='open-settings-${section}']`);
   };
 
   await waitFor("[data-testid='device-name-onboarding']");
@@ -55,12 +64,17 @@ async function runSettingsUiTest(browser) {
   await browser.$("[data-testid='local-name-entry']").setValue("Synthetic Laptop");
   await click("[data-testid='save-local-device-name']");
   await browser.$("[data-testid='device-name-onboarding']").waitForExist({ reverse: true });
-  assert.match(await text(), /Advertised name: Synthetic Laptop/);
+  assert.match(await text(), /Synthetic Laptop/);
   await click("[data-testid='reset-local-name-fixture']");
   await waitFor("[data-testid='device-name-onboarding']");
   await browser.$("[data-testid='local-name-entry']").setValue("Renamed Laptop");
   await click("[data-testid='save-local-device-name']");
   await browser.$("[data-testid='device-name-onboarding']").waitForExist({ reverse: true });
+  assert.equal(await browser.$("[data-testid='new-peer-device-id']").isExisting(), false);
+  await click("[data-testid='open-add-device']");
+  await waitFor("[data-testid='new-peer-device-id']");
+  await click("[data-testid='open-add-device']");
+  await openSettings("security");
   console.log("Passed: device naming is a full-screen first-run step with no other app controls.");
   await browser.execute(() => {
     const detail = [...document.querySelectorAll("summary")]
@@ -78,10 +92,13 @@ async function runSettingsUiTest(browser) {
   await click("[data-testid='device-identity-backup-secret-visibility']");
   assert.equal(await backupSecret.getAttribute("type"), "password");
   await clickText("Hide Restore");
+  await back();
   console.log("Passed: device identity backup secrets are hidden by default and revealable.");
   assert.equal(await browser.$("[data-testid='folder-password-photos']").isExisting(), false);
   assert.equal(await browser.$("[aria-label='Forget saved folder password']").isExisting(), false);
-  await click("[data-testid='folder-settings-photos']");
+  await click("[data-testid=folder-root-photos]");
+  await waitFor("[data-testid=folder-settings-page]");
+  assert.match(await browser.$("[data-testid=folder-settings-page] h1").getText(), /Folder settings: Photos/);
   await waitFor("textarea");
   assert.equal(await browser.$("textarea").getValue(), "photos-only");
   assert.doesNotMatch(await text(), /documents-only|Personal-space backup|Change master password|Synchronization defaults|synthetic-never-rendered-credential/);
@@ -110,16 +127,26 @@ async function runSettingsUiTest(browser) {
   await click("[data-testid='unlock-folder-photos']");
   assert.equal((await calls()).findLast(call => call.operation === "saveFolderPassword").folderId, "photos");
   await back();
+  await click("[data-testid='folder-settings-photos']");
+  await waitFor("[data-testid='folder-password-toggle']");
+  assert.equal(await browser.$("[data-testid='folder-password-photos']").isExisting(), false);
+  await click("[data-testid='folder-password-toggle']");
+  await waitFor("[data-testid='folder-password-photos']");
+  const sameRow = await browser.execute(() => {
+    const unlock = document.querySelector("[data-testid='unlock-folder-photos']").getBoundingClientRect();
+    const forget = document.querySelector("[aria-label='Forget saved folder password']").getBoundingClientRect();
+    return unlock.top === forget.top;
+  });
+  assert.equal(sameRow, true);
+  await click("[data-testid='folder-password-toggle']");
+  assert.equal(await browser.$("[data-testid='folder-password-photos']").isExisting(), false);
+  await back();
+  console.log("Passed: locked folder row routes to settings; verified passwords are collapsed with inline actions.");
   console.log("Passed: folder menu scopes passwords, policies and exclusions to the selected folder.");
 
-  await click("[data-testid='connection-settings-toggle']");
-  await click("[data-testid='general-settings']");
+  await openSettings("storage");
   await waitFor("[data-testid='device-settings'] select");
-  assert.match(await text(), /Personal space/);
-  assert.match(await text(), /Set up Personal Space/);
-  assert.doesNotMatch(await text(), /Personal-space backup/);
-  assert.match(await text(), /This device/);
-  assert.doesNotMatch(await text(), /Ignored patterns|Whole-folder retention|Reattach encrypted local storage/);
+  assert.doesNotMatch(await text(), /Set up Personal Space|Personal-space backup|Ignored patterns/);
   await browser.execute(() => {
     const select = document.querySelector("[data-testid='device-settings'] select");
     select.value = "simple";
@@ -128,17 +155,36 @@ async function runSettingsUiTest(browser) {
   await browser.waitUntil(async () => (await calls()).findLast(call => call.operation === "saveProfileSettings")
     ?.settings.profile.versioning === "simple");
   await back();
+  await openSettings("synchronization");
+  await waitFor("[data-testid='background-sync-enabled']");
+  await click("[data-testid='background-sync-enabled']");
+  for (const [policy, charging, metered] of [["saving", true, false], ["always", false, true], ["balanced", false, false]]) {
+    await browser.$("[data-testid='background-sync-policy']").waitForEnabled();
+    await browser.execute(value => {
+      const select = document.querySelector("[data-testid='background-sync-policy']");
+      select.value = value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    }, policy);
+    await browser.waitUntil(async () => {
+      const profile = (await calls()).findLast(call => call.operation === "saveProfileSettings")?.settings.profile;
+      return profile?.keepSyncingInBackground && profile.requireCharging === charging && profile.allowMetered === metered;
+    });
+  }
+  await back();
+  await openSettings("personal-space");
+  await waitFor("[data-testid='optional-personal-space-setup']");
+  assert.doesNotMatch(await text(), /Personal-space backup|Version history and cache/);
+  await back();
   await click("[data-testid='personal-space-enabled-fixture']");
-  await click("[data-testid='general-settings']");
-  await waitFor("[data-testid='device-settings'] select");
-  assert.match(await text(), /Personal-space backup/);
+  await openSettings("personal-space");
+  await browser.$("button=Open settings for Documents").waitForExist();
   await clickText("Open settings for Documents");
   await waitFor("textarea");
   assert.equal(await browser.$("textarea").getValue(), "documents-only");
   assert.match(await text(), /documents-only-conflict/);
   assert.doesNotMatch(await text(), /photos-updated/);
   await back();
-  console.log("Passed: personal-space controls and device defaults are reachable through general Settings.");
+  console.log("Passed: global settings categories, background policies and scoped folder settings.");
 
   await click("[data-testid='lock-fixture']");
   await click("[data-testid='folder-settings-photos']");
@@ -148,7 +194,7 @@ async function runSettingsUiTest(browser) {
   await browser.$("input[autocomplete='current-password']").waitForExist();
   await browser.$("input[autocomplete='current-password']").setValue("synthetic-local-master-password");
   await clickText("Unlock");
-  await waitFor("[data-testid='device-settings'] select");
+  await browser.$("input[autocomplete='current-password']").waitForExist({ reverse: true });
   assert.ok((await calls()).some(call => call.operation === "unlock"));
   await back();
   await click("[data-testid='new-folder']");
@@ -170,6 +216,7 @@ async function runSettingsUiTest(browser) {
   console.log("Passed: uninitialized device storage cannot bypass automatic local-vault setup.");
   await back();
   await click("[data-testid='browser-fixture']");
+  await click("[data-testid=lock-folder-fixture]");
   const priorCalls = (await calls()).length;
   await click("[data-testid='folder-settings-photos']");
   await waitFor("[data-testid='folder-password-photos']");

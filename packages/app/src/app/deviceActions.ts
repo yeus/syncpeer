@@ -233,7 +233,6 @@ class DeviceActionsRuntime {
         port: endpoint?.port ?? 22000,
       });
       if (!endpoint) {
-        this.state.ui.isSettingsExpanded = true;
         this.state.devices.directTcpNotice =
           "No recent LAN IPv4 address for this peer. Enter its host below; its device ID is already selected.";
         return;

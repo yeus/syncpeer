@@ -377,8 +377,7 @@ class TauriAdapters {
     ReturnType<NonNullable<SyncpeerPlatformAdapter["ownedDevices"]>>
   > | null = null;
   /** Profile network policy; refreshed when profile settings change. */
-  private allowMeteredCache: boolean | null = null;
-  private keepSyncingInBackgroundCache: boolean | null = null;
+  private backgroundPolicyCache: { enabled: boolean; allowMetered: boolean; requireCharging: boolean } | null = null;
   private serviceSessionRpc: ReturnType<typeof createServiceSessionRpcClient> | null = null;
 
   constructor(options?: CreateTauriAdaptersOptions) {
@@ -422,8 +421,7 @@ class TauriAdapters {
   private invalidateSessionConfiguration() {
     // Membership, folder and profile changes also invalidate the cached vault reads.
     this.ownedDevicesCache = null;
-    this.allowMeteredCache = null;
-    this.keepSyncingInBackgroundCache = null;
+    this.backgroundPolicyCache = null;
     this.configurationRevision++;
     for (const listener of this.sessionConfigurationListeners) listener();
   }
@@ -502,8 +500,7 @@ class TauriAdapters {
       // to run here as well; without it a live session kept stale folder and trust
       // views after pairing, revocation or credential changes.
       if (request.operation === "saveProfileSettings") {
-        this.allowMeteredCache = null;
-        this.keepSyncingInBackgroundCache = null;
+        this.backgroundPolicyCache = null;
         const next = request.settings as SyncpeerProfileSettings | undefined;
         if (next?.profile?.keepSyncingInBackground !== true) {
           await this.disarmBackgroundSession();
@@ -652,18 +649,23 @@ class TauriAdapters {
   }
 
   private async androidBackgroundSessionRequest(options: Omit<ConnectOptions, "sharedFolders">) {
-    if (this.keepSyncingInBackgroundCache === null || this.allowMeteredCache === null) {
+    if (this.backgroundPolicyCache === null) {
       try {
-        const settings = await this.documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
-        this.allowMeteredCache = settings.profile.allowMetered === true;
-        this.keepSyncingInBackgroundCache = settings.profile.keepSyncingInBackground === true;
+        const { profile } = await this.documentRequest<SyncpeerProfileSettings>({ operation: "profileSettings" });
+        this.backgroundPolicyCache = {
+          enabled: profile.keepSyncingInBackground === true,
+          allowMetered: profile.allowMetered === true,
+          requireCharging: profile.requireCharging === true,
+        };
       } catch {
         // A locked vault may not reveal the policy: do not opt into background work.
         return null;
       }
     }
-    if (!this.keepSyncingInBackgroundCache) return null;
-    return { operation: "connect", options: { ...options, allowMetered: this.allowMeteredCache } };
+    const policy = this.backgroundPolicyCache;
+    if (!policy.enabled) return null;
+    return { operation: "connect", options: { ...options, allowMetered: policy.allowMetered,
+      requireCharging: policy.requireCharging } };
   }
 
   private async releaseLocalCopy(folderId: string, mode: "safe" | "dangerous", confirmedText: string,

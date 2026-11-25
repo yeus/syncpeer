@@ -91,7 +91,6 @@ test("missing LAN address opens Direct TCP host settings without dialing or borr
   assert.equal(state.connection.remoteId, A);
   assert.equal(state.connection.host, "");
   assert.equal(state.connection.discoveryMode, "direct");
-  assert.equal(state.ui.isSettingsExpanded, true);
   assert.match(state.devices.directTcpNotice, /No recent LAN IPv4 address/);
 });
 

@@ -16,4 +16,13 @@ test("background syncing is opt-in and old profiles migrate safely", () => {
   assert.throws(() => normalizeProfileSettings({
     ...defaults, profile: { ...defaults.profile, keepSyncingInBackground: "yes" },
   }));
+  assert.equal(defaults.profile.requireCharging, false);
+  delete previous.profile.requireCharging;
+  assert.equal(normalizeProfileSettings(previous).profile.requireCharging, false);
+  assert.equal(normalizeProfileSettings({
+    ...defaults, profile: { ...defaults.profile, requireCharging: true },
+  }).profile.requireCharging, true);
+  assert.throws(() => normalizeProfileSettings({
+    ...defaults, profile: { ...defaults.profile, requireCharging: "yes" },
+  }));
 });

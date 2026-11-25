@@ -9,6 +9,7 @@ import {
 } from "./fixture-data.ts";
 import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
 import {
+  openSettingsSection, readCurrentDeviceId,
   connectUntilApproved,
   readCachedHash,
   selectDiscoveryMode,
@@ -30,14 +31,13 @@ describe("Syncpeer long-running development server", () => {
   it("connects after CLI approval and transfers the fixture", async () => {
     await $("[data-testid='tab-devices']").click();
     await waitForText(lanBrowser, "This Device", 60_000);
-    const clientDeviceId = await $("[data-testid='current-device-id']").getText();
+    const clientDeviceId = await readCurrentDeviceId(lanBrowser);
     assert.match(clientDeviceId, /^[A-Z2-7-]{40,}$/);
     console.log("\nSyncpeer client device ID: " + clientDeviceId);
     console.log("Approve this pending device in the server terminal.\n");
 
     await $("[data-testid='tab-devices']").click();
-    const settings = $("[data-testid='connection-settings-toggle']");
-    if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
+    await openSettingsSection(lanBrowser, "network");
     await selectDiscoveryMode(lanBrowser, "global");
     await setValue("connection-discovery-server", discoveryServer());
     await setValue("connection-remote-id", serverDeviceId);

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { BreadcrumbSegment } from "@syncpeer/core/browser";
+  import ArrowLeft from "lucide-svelte/icons/arrow-left";
 
   interface Props {
     currentFolderId: string;
@@ -11,12 +12,9 @@
   let { currentFolderId, segments, onRoot, onSelect }: Props = $props();
 </script>
 
+{#if currentFolderId}
 <div class="breadcrumbs">
-  {#if !currentFolderId}
-    <span class="crumb-current">All Syncthing Folders</span>
-  {:else}
-    <button class="crumb-button" onclick={onRoot}>All Syncthing Folders</button>
-    <span class="crumb-separator">&gt;</span>
+    <button class="crumb-button" data-testid="folder-root-back" aria-label="Back to shared folders" title="Back to shared folders" onclick={onRoot}><ArrowLeft size={18} /></button>
     {#each segments as segment, index (segment.key)}
       {#if index < segments.length - 1}
         {#if segment.ellipsis}
@@ -31,8 +29,8 @@
         <span class="crumb-current">{segment.label}</span>
       {/if}
     {/each}
-  {/if}
 </div>
+{/if}
 
 <style>
   .breadcrumbs {

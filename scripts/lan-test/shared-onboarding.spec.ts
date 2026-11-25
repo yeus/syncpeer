@@ -57,7 +57,8 @@ describe("Shared Tauri first-run onboarding", () => {
     await optional.waitForExist({ timeout: 20_000 });
     await optional.$("summary").click();
     assert.equal(await optional.$("form input[autocomplete='new-password']").isDisplayed(), true);
-    await browser.$("[data-testid='general-settings-page'] > button").click();
+    await browser.$("[data-testid='settings-back']").click();
+    await browser.$("[data-testid='settings-back']").click();
     await browser.$("[data-testid='tab-devices']").waitForDisplayed({ timeout: 20_000 });
   });
 

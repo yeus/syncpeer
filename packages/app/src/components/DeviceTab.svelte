@@ -1,38 +1,26 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { peerRegistryViews, sameDeviceId, type AdvertisedDeviceItem, type AdvertisedFolderItem } from "@syncpeer/core/browser";
-  import PasswordInput from "./PasswordInput.svelte";
+  import Smartphone from "lucide-svelte/icons/smartphone";
+  import ChevronRight from "lucide-svelte/icons/chevron-right";
+  import type { SettingsSection } from "../app/settingsSections.ts";
   import DeviceListItem from "./DeviceListItem.svelte";
   import Panel from "./Panel.svelte";
-  import ListRow from "./ListRow.svelte";
-  import StatusChip from "./StatusChip.svelte";
-  import { formatBuildTimeLocal, getAppBuildInfo } from "../lib/appInfo.ts";
   import { formatSyncthingDeviceId } from "../app/devicePolicies.ts";
   import { downloadTransportText, type AppState } from "../app/state.ts";
 
   interface Props {
     app: AppState;
+    onOpenSettingsSection: (section: SettingsSection) => void;
     advertisedDevices: AdvertisedDeviceItem[];
     advertisedFolders: AdvertisedFolderItem[];
     isSavedDeviceAwaitingRemoteApproval: (deviceId: string) => boolean;
     isLanDiscoveredDevice: (deviceId: string) => boolean;
     onUseSavedDevice: (deviceId: string) => void;
     onConnectDirectTcp: (deviceId: string) => Promise<void>;
-    onResetDiscoveryServer: () => void;
-    onClearAllCache: () => void;
-    onClearOfflineFolderState: () => void;
-    onOpenDiagnosticsPage: () => void;
-    onOpenAboutPage: () => void;
-    onOpenGeneralSettings?: () => void;
     onCopyCurrentDeviceId: () => void;
-    onCopySessionLogs: () => void;
-    onSaveSessionLogs?: () => void;
-    onShareSessionLogs?: () => void;
-    logExportStatus?: "preparing" | "copying" | "saving" | "sharing" | null;
     onEditLocalDeviceName: () => void;
-    onRegenerateDeviceId: () => void;
-    onCopyIdentityBackupSecret: () => void;
-    onRestoreIdentityRecovery: () => void;
+    onDiscoverDevices: () => Promise<void>;
     onAddSavedDevice: () => void;
     onApproveAdvertisedDevice: (device: AdvertisedDeviceItem) => void;
     onApproveFolderSync: (folder: AdvertisedFolderItem) => void;
@@ -40,32 +28,22 @@
     onEditSavedDeviceName: (deviceId: string) => void;
     onSetSavedDeviceIntroducer: (deviceId: string, next: boolean) => void;
     onRemoveSavedDevice: (deviceId: string) => void;
-    onConnectionSettingsChanged: () => void;
+    onPauseConnection?: () => void;
+    onResumeConnection?: () => void;
   }
 
   let {
     app,
+    onOpenSettingsSection,
     advertisedDevices,
     advertisedFolders,
     isSavedDeviceAwaitingRemoteApproval,
     isLanDiscoveredDevice,
     onUseSavedDevice,
     onConnectDirectTcp,
-    onResetDiscoveryServer,
-    onClearAllCache,
-    onClearOfflineFolderState,
-    onOpenDiagnosticsPage,
-    onOpenAboutPage,
-    onOpenGeneralSettings,
     onCopyCurrentDeviceId,
-    onCopySessionLogs,
-    onSaveSessionLogs,
-    onShareSessionLogs,
-    logExportStatus = null,
     onEditLocalDeviceName,
-    onRegenerateDeviceId,
-    onCopyIdentityBackupSecret,
-    onRestoreIdentityRecovery,
+    onDiscoverDevices,
     onAddSavedDevice,
     onApproveAdvertisedDevice,
     onApproveFolderSync,
@@ -73,13 +51,10 @@
     onEditSavedDeviceName,
     onSetSavedDeviceIntroducer,
     onRemoveSavedDevice,
-    onConnectionSettingsChanged,
+    onPauseConnection,
+    onResumeConnection,
   }: Props = $props();
 
-  let previousRunPanelExpanded = $state(false);
-  const appInfo = getAppBuildInfo();
-
-  const buildTimeLocalLabel = formatBuildTimeLocal(appInfo.buildTimeUtc);
 
   let advertisedById = $derived.by(() => new Map(
     advertisedDevices
@@ -133,6 +108,9 @@
         kind: "saved" as const, id: view.deviceId, name: view.name,
         confirmed: view.confirmed,
         deviceId: view.deviceId, isConnected: view.connected,
+        connectionLabel: view.connected && app.session.connectionTransport === "relay" ? "Connected via relay" : view.connected && app.session.connectionScope === "lan" ? "Connected via LAN" : undefined,
+        paused: app.ui.autoConnectPaused && sameDeviceId(app.connection.remoteId, view.deviceId),
+        selected: sameDeviceId(app.connection.remoteId, view.deviceId),
         isConnecting: !view.connected && Boolean(connectingTargetId) && sameDeviceId(connectingTargetId, view.deviceId),
         directTcpPreparing: sameDeviceId(app.devices.directTcpPreparingDeviceId, view.deviceId),
         connectError: app.devices.connectionErrors[view.deviceId] ?? "",
@@ -164,6 +142,7 @@
   const connectDirectTcp = async (deviceId: string) => {
     await onConnectDirectTcp(deviceId);
     if (!app.devices.directTcpNotice) return;
+    onOpenSettingsSection?.("network");
     await tick();
     const hostInput = document.querySelector<HTMLInputElement>('[data-testid="connection-host"]');
     hostInput?.scrollIntoView({ block: "center" });
@@ -178,384 +157,27 @@
 </script>
 
 <Panel title="Devices">
-  <div class="top-actions">
-    <button
-      class="ghost small"
-      data-testid="connection-settings-toggle"
-      onclick={() => {
-        app.ui.isSettingsExpanded = !app.ui.isSettingsExpanded;
-      }}
-      aria-expanded={app.ui.isSettingsExpanded}
-    >
-      Settings
-    </button>
-    <button
-      class="ghost small"
-      data-testid="open-diagnostics"
-      onclick={onOpenDiagnosticsPage}
-    >Diagnostics</button>
-    <button
-      class="ghost small"
-      data-testid="open-about"
-      onclick={onOpenAboutPage}
-    >About</button>
-  </div>
-
-
   <div class="this-device-summary">
-    <div class="item-title-row">
-      <span class="item-title">This Device</span>
-      {#if app.devices.isLoadingCurrentDeviceId}
-        <StatusChip small>loading...</StatusChip>
-      {/if}
+    <Smartphone size={28} aria-hidden="true" />
+    <div class="device-name">
+      <div class="item-title">This device</div>
+      <div class="item-meta">{app.connection.deviceName.trim() || "Unnamed device"}</div>
     </div>
-    <div class="item-meta" data-testid="current-device-id">{formatSyncthingDeviceId(app.devices.currentDeviceId) || "Unavailable"}</div>
-    <div class="item-meta">
-      Advertised name: {app.connection.deviceName.trim() || "syncpeer-ui"}
-    </div>
-    <div class="item-meta">
-      Version: {appInfo.appVersion}
-    </div>
-    <div class="item-meta">
-      Commit: <code>{appInfo.buildCommit}</code>
-    </div>
-    <div class="item-meta">
-      Built (local): {buildTimeLocalLabel}
-    </div>
-    {#if app.devices.identityNotice}
-      <div class="item-meta">{app.devices.identityNotice}</div>
-    {/if}
+    <button class="ghost" onclick={onCopyCurrentDeviceId}>Copy ID</button>
   </div>
-
-  <p class="hint" data-testid="local-discovery-health" role="status">
-    {#if app.devices.isDiscoveringLanDevices}Scanning the local network…
-    {:else if app.devices.localDiscoveryHealth === "partial"}Partial LAN discovery
-    {:else if app.devices.localDiscoveryHealth === "unavailable"}LAN discovery unavailable
-    {:else if app.devices.localDiscoveryHealth === "available"}LAN discovery available
-    {:else}LAN discovery not yet checked{/if}
-  </p>
-  <p class="hint">LAN discovery only finds reachable devices on the same multicast-capable network. For a peer outside your LAN, enter its device ID below and use automatic/global discovery or a configured direct/relay address. Discovery does not approve a peer.</p>
-  {#if app.devices.localDiscoveryNotice}
-    <p class="hint" data-testid="local-discovery-notice">
-      {app.devices.localDiscoveryNotice}
-    </p>
-  {/if}
-
-  <details bind:open={app.ui.isDeviceBackupExpanded}>
+  <details class="local-details">
     <summary>This Device Details</summary>
-    <div class="actions">
-      <button type="button" class="ghost" onclick={onCopyCurrentDeviceId}>Copy ID</button>
-      <button type="button" class="ghost" onclick={onEditLocalDeviceName}>Edit Name</button>
-      <button
-        type="button"
-        class="ghost"
-        onclick={onRegenerateDeviceId}
-        disabled={app.devices.isRegeneratingDeviceId}
-      >
-        {app.devices.isRegeneratingDeviceId ? "Generating..." : "Generate New ID"}
-      </button>
-      <button
-        type="button"
-        class="ghost"
-        onclick={onCopyIdentityBackupSecret}
-        disabled={app.devices.isExportingIdentityRecovery}
-      >
-        {app.devices.isExportingIdentityRecovery ? "Copying..." : "Copy Backup Secret"}
-      </button>
-      <button
-        type="button"
-        class="ghost"
-        onclick={() => {
-          app.ui.showRestoreFromBackup = !app.ui.showRestoreFromBackup;
-          app.ui.recentError = null;
-        }}
-      >
-        {app.ui.showRestoreFromBackup
-          ? "Hide Restore"
-          : "Restore From Backup Secret"}
-      </button>
-    </div>
-
-    {#if app.ui.showRestoreFromBackup}
-      <PasswordInput label="Backup Secret" secretLabel="device identity backup secret"
-        testId="device-identity-backup-secret" bind:value={app.devices.identityRecoverySecret}
-        placeholder="Paste backup secret here" autocomplete="off" />
-      <div class="actions">
-        <button
-          type="button"
-          class="ghost"
-          onclick={onRestoreIdentityRecovery}
-          disabled={app.devices.isRestoringIdentityRecovery}
-        >
-          {app.devices.isRestoringIdentityRecovery ? "Restoring..." : "Restore Device ID"}
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={() => {
-            app.devices.identityRecoverySecret = "";
-            app.ui.recentError = null;
-          }}
-          disabled={!app.devices.identityRecoverySecret.trim()}
-        >
-          Clear Input
-        </button>
-      </div>
-    {/if}
+    <p class="item-meta" data-testid="current-device-id">{formatSyncthingDeviceId(app.devices.currentDeviceId) || "Unavailable"}</p>
+    <button class="ghost" onclick={onEditLocalDeviceName}>Edit Name</button>
+    <button class="ghost" onclick={() => onOpenSettingsSection("security")}>Identity and recovery</button>
+    {#if app.devices.identityNotice}<p class="hint">{app.devices.identityNotice}</p>{/if}
   </details>
-
-  {#if app.ui.isSettingsExpanded}
-    <div class="settings-block">
-      {#if onOpenGeneralSettings}
-        <button data-testid="general-settings" onclick={onOpenGeneralSettings}>Personal space and device settings</button>
-      {/if}
-      <div class="appearance-settings" data-testid="appearance-settings">
-        <h3>Appearance</h3>
-        <div class="appearance-grid">
-          <label>
-            Theme
-            <select data-testid="theme-mode" bind:value={app.ui.theme.mode}>
-              <option value="auto">Automatic</option>
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-            </select>
-          </label>
-          <label>
-            Primary color
-            <span class="color-field">
-              <input
-                data-testid="theme-primary-color"
-                type="color"
-                bind:value={app.ui.theme.primaryColor}
-              />
-              <code>{app.ui.theme.primaryColor}</code>
-            </span>
-          </label>
-          <label>
-            Secondary color
-            <span class="color-field">
-              <input
-                data-testid="theme-secondary-color"
-                type="color"
-                bind:value={app.ui.theme.secondaryColor}
-              />
-              <code>{app.ui.theme.secondaryColor}</code>
-            </span>
-          </label>
-          <label class="checkbox-row expert-toggle">
-            <input
-              data-testid="expert-view"
-              type="checkbox"
-              bind:checked={app.ui.expertView}
-            />
-            <span>Expert view</span>
-          </label>
-        </div>
-      </div>
-      <form
-        class="settings"
-        onchange={() => {
-          app.devices.directTcpNotice = "";
-          onConnectionSettingsChanged();
-        }}
-        onsubmit={(event) => {
-          event.preventDefault();
-        }}
-      >
-        <label>
-          Discovery Method
-          <select data-testid="connection-discovery-mode" bind:value={app.connection.discoveryMode}
-            onchange={() => {
-              if (app.connection.discoveryMode !== "direct") app.connection.quicOnly = false;
-            }}>
-            <option value="automatic">Automatic (default)</option>
-            <option value="global">Global Discovery</option>
-            <option value="lan">LAN Discovery</option>
-            <option value="direct">Direct Host/Port</option>
-          </select>
-        </label>
-
-        {#if app.connection.discoveryMode === "automatic" || app.connection.discoveryMode === "global"}
-          <label>
-            Discovery Server
-            <input data-testid="connection-discovery-server" type="text" bind:value={app.connection.discoveryServer} />
-          </label>
-        {/if}
-
-        {#if app.connection.discoveryMode === "lan"}
-          <p class="hint">
-            LAN discovery uses Syncthing's local UDP discovery. Both devices must
-            be on the same LAN or multicast-capable network.
-          </p>
-        {/if}
-
-        {#if app.connection.discoveryMode === "direct" || app.connection.discoveryMode === "automatic"}
-          <label>
-            Host
-            <input
-              data-testid="connection-host"
-              type="text"
-              bind:value={app.connection.host}
-              placeholder="e.g. 192.168.1.10"
-            />
-          </label>
-          {#if app.connection.discoveryMode === "direct" && app.devices.directTcpNotice}
-            <p class="hint" role="status" data-testid="direct-tcp-address-notice">{app.devices.directTcpNotice}</p>
-          {/if}
-
-          <label>
-            Port
-            <input
-              data-testid="connection-port"
-              type="number"
-              bind:value={app.connection.port}
-              min="1"
-              max="65535"
-            />
-          </label>
-        {:else if app.connection.discoveryMode === "global"}
-          <div class="hint">
-            Global discovery ignores manual host/port. Syncpeer uses Syncthing's
-            current official lookup and announcement services automatically.
-          </div>
-        {/if}
-        {#if app.connection.discoveryMode === "direct"}
-          <label class="checkbox-row">
-            <input
-              data-testid="connection-direct-quic"
-              type="checkbox"
-              bind:checked={app.connection.quicOnly}
-            />
-            <span>Use QUIC instead of TCP for this direct connection</span>
-          </label>
-        {/if}
-
-        {#if app.connection.discoveryMode === "automatic"}
-          <div class="hint">
-            Automatic mode races saved, LAN, global, direct, and relay paths and keeps the best available connection.
-          </div>
-        {/if}
-
-        <label>
-          Incoming TCP port
-          <input
-            data-testid="connection-listen-port"
-            type="number"
-            bind:value={app.connection.listenPort}
-            min="1"
-            max="65535"
-          />
-        </label>
-        <div class="hint">Other peers can reach this device on this port when LAN access is available. Default: 22000.</div>
-
-        <label>
-          Saved Devices
-          <select data-testid="connection-saved-device" bind:value={app.devices.selectedSavedDeviceId}>
-            <option value="">Manual entry</option>
-            {#each app.devices.savedDevices as device (device.id)}
-              <option value={device.id}>{device.name}</option>
-            {/each}
-          </select>
-        </label>
-
-        <label>
-          Remote Device ID
-          <input
-            data-testid="connection-remote-id"
-            type="text"
-            bind:value={app.connection.remoteId}
-            placeholder="ABCD123-... (required for discovery modes)"
-            spellcheck="false"
-            autocapitalize="characters"
-            autocomplete="off"
-            autocorrect="off"
-          />
-        </label>
-
-        <label>
-          TLS Certificate (optional)
-          <input
-            data-testid="connection-cert"
-            type="text"
-            bind:value={app.connection.cert}
-            placeholder="Auto uses this device's protected certificate"
-          />
-        </label>
-
-        <label>
-          TLS Key (optional)
-          <input
-            data-testid="connection-key"
-            type="text"
-            bind:value={app.connection.key}
-            placeholder="Auto uses this device's protected key"
-          />
-        </label>
-
-        <label>
-          Timeout (ms)
-          <input
-            data-testid="connection-timeout"
-            type="number"
-            bind:value={app.connection.timeoutMs}
-            min="1000"
-            step="1000"
-          />
-        </label>
-
-        <label class="checkbox-row">
-          <input
-            data-testid="connection-relay-fallback"
-            type="checkbox"
-            bind:checked={app.connection.enableRelayFallback}
-          />
-          <span>Enable relay fallback (Syncthing relay://)</span>
-        </label>
-
-        <p class="hint">New devices and offered folders always require explicit approval.</p>
-
-        <div class="hint version-meta">
-          Version: <strong>{appInfo.appVersion}</strong> | Commit: <code>{appInfo.buildCommit}</code> | Built (local): {buildTimeLocalLabel} | Mode: {appInfo.buildMode} | Runtime: {appInfo.runtimeEnvironment}/{appInfo.runtimeSurface}
-        </div>
-
-      </form>
-
-      <div class="actions">
-      <button
-          type="button"
-          class="ghost"
-          onclick={() => onUseSavedDevice(app.devices.selectedSavedDeviceId)}
-          disabled={app.devices.selectedSavedDeviceId === ""}
-        >
-          Connect to Selected Peer
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={onResetDiscoveryServer}
-          disabled={app.connection.discoveryMode !== "global" && app.connection.discoveryMode !== "automatic"}
-        >
-          Use Official Discovery Server
-        </button>
-        <button
-          type="button"
-          class="ghost"
-          data-testid="clear-cache-button"
-          onclick={onClearAllCache}
-          disabled={app.favorites.isClearingCache}
-        >
-          {app.favorites.isClearingCache ? "Clearing Cache..." : "Clear Cache"}
-        </button>
-        <button type="button" class="ghost" onclick={onClearOfflineFolderState}>
-          Clear Offline Folder State
-        </button>
-      </div>
-    </div>
-  {/if}
 </Panel>
 
-<Panel title="Add Device">
-  <div class="saved-device-editor">
+<Panel title="My peers">
+  <button class="primary" data-testid="open-add-device" onclick={() => { app.ui.showAddDevice = !app.ui.showAddDevice; }} aria-expanded={app.ui.showAddDevice}>{app.ui.showAddDevice ? "Cancel" : "+ Add device"}</button>
+  {#if app.ui.showAddDevice}
+      <div class="saved-device-editor">
     <label>
       Device ID
       <input
@@ -582,41 +204,57 @@
         placeholder="Leave blank to use device advertised name later"
       />
     </label>
-    <label class="checkbox-row">
-      <input
-        type="checkbox"
-        bind:checked={app.devices.newSavedDeviceIsIntroducer}
-      />
-      <span>Treat as introducer</span>
-    </label>
+    <details><summary>Advanced</summary>
+      <label class="checkbox-row"><input type="checkbox" bind:checked={app.devices.newSavedDeviceIsIntroducer} /> Treat as introducer</label>
+    </details>
     <div class="actions">
-      <button type="button" class="primary" onclick={onAddSavedDevice}
+      <button type="button" class="primary" onclick={() => { onAddSavedDevice(); if (!app.devices.newSavedDeviceId) app.ui.showAddDevice = false; }}
         >Add Device</button
       >
     </div>
   </div>
+  {/if}
+  <ul class="list peer-list">
+    {#each deviceRows.filter(row => row.kind === "saved") as row (row.id)}
+      <DeviceListItem {row} {onUseSavedDevice} onConnectDirectTcp={connectDirectTcp}
+        {onEditSavedDeviceName} {onSetSavedDeviceIntroducer} {onRemoveSavedDevice}
+        onAddAdvertisedDevice={addAdvertisedDevice} {onPauseConnection} {onResumeConnection}
+        onOpenNetwork={() => onOpenSettingsSection("network")} onOpenDiagnostics={() => onOpenSettingsSection("diagnostics")} />
+    {:else}
+      <li class="empty">No peers yet. Add a device to get started.</li>
+    {/each}
+  </ul>
 </Panel>
 
-<Panel title="Peers">
-  <p class="hint">Discovery does not grant access. Add a peer explicitly, then approve its offered folders. Sources are retained for 24 hours after last seen.</p>
+{#if deviceRows.some(row => row.kind === "candidate" && row.incomingRequest)}
+<Panel title="Incoming requests">
   <ul class="list peer-list">
-
-    {#if deviceRows.length === 0}
-      <li class="empty">No peers yet. Add a saved device or wait for introductions.</li>
-    {:else}
-      {#each deviceRows as row (row.id)}
-        <DeviceListItem
-          {row}
-          onUseSavedDevice={onUseSavedDevice}
-          onConnectDirectTcp={connectDirectTcp}
-          onEditSavedDeviceName={onEditSavedDeviceName}
-          onSetSavedDeviceIntroducer={onSetSavedDeviceIntroducer}
-          onRemoveSavedDevice={onRemoveSavedDevice}
-          onAddAdvertisedDevice={addAdvertisedDevice}
-        />
-      {/each}
-    {/if}
+    {#each deviceRows.filter(row => row.kind === "candidate" && row.incomingRequest) as row (row.id)}
+      <DeviceListItem {row} {onUseSavedDevice} onConnectDirectTcp={connectDirectTcp}
+        {onEditSavedDeviceName} {onSetSavedDeviceIntroducer} {onRemoveSavedDevice}
+        onAddAdvertisedDevice={addAdvertisedDevice} />
+    {/each}
   </ul>
+</Panel>
+{/if}
+
+<Panel>
+  <button class="discovery-toggle ghost" data-testid="discover-devices" onclick={() => { app.ui.showDiscoveredDevices = !app.ui.showDiscoveredDevices; if (app.ui.showDiscoveredDevices) void onDiscoverDevices(); }} aria-expanded={app.ui.showDiscoveredDevices}>
+    <span>Discover devices</span>
+    <span class="item-meta">{deviceRows.filter(row => row.kind !== "saved" && !(row.kind === "candidate" && row.incomingRequest)).length} available</span>
+    <ChevronRight size={16} />
+  </button>
+  {#if app.ui.showDiscoveredDevices}
+    <p class="hint" data-testid="local-discovery-health" role="status">{app.devices.isDiscoveringLanDevices ? "Scanning the local network…" : app.devices.localDiscoveryHealth === "unavailable" ? "LAN discovery unavailable" : "Discovery does not grant access."}</p>
+    {#if app.devices.localDiscoveryNotice}<p class="hint" data-testid="local-discovery-notice">{app.devices.localDiscoveryNotice}</p>{/if}
+    <ul class="list peer-list">
+      {#each deviceRows.filter(row => row.kind !== "saved" && !(row.kind === "candidate" && row.incomingRequest)) as row (row.id)}
+        <DeviceListItem {row} {onUseSavedDevice} onConnectDirectTcp={connectDirectTcp}
+          {onEditSavedDeviceName} {onSetSavedDeviceIntroducer} {onRemoveSavedDevice}
+          onAddAdvertisedDevice={addAdvertisedDevice} />
+      {:else}<li class="empty">No new devices discovered.</li>{/each}
+    </ul>
+  {/if}
 </Panel>
 
 {#if advertisedFolders.length}
@@ -637,227 +275,14 @@
     </ul>
   </Panel>
 {/if}
-
-<Panel title="Session Logs">
-  <div class="actions">
-    <button type="button" class="ghost" disabled={logExportStatus !== null} onclick={onCopySessionLogs}
-      >Copy Logs</button
-    >
-    {#if onSaveSessionLogs}
-      <button type="button" class="ghost" data-testid="save-session-logs" disabled={logExportStatus !== null} onclick={onSaveSessionLogs}
-        >Save Logs</button
-      >
-    {/if}
-    {#if onShareSessionLogs}
-      <button type="button" class="ghost" data-testid="share-session-logs" disabled={logExportStatus !== null} onclick={onShareSessionLogs}
-        >Share Logs</button
-      >
-    {/if}
-  {#if logExportStatus !== null}
-    <p role="status" data-testid="session-log-export-status" class="hint">
-      {logExportStatus === "preparing"
-        ? "Preparing encrypted previous-run history for export…"
-        : logExportStatus === "sharing" ? "Opening Android share sheet…"
-        : logExportStatus === "saving" ? "Saving logs…" : "Copying logs…"}
-    </p>
-  {/if}
-  </div>
-  <p class="hint">Android encrypted journal: {app.logs.journalStarted ? "writing enabled" : "not confirmed"}. Previous runs: {app.logs.historyAvailable ? `${app.logs.previousRunItems.length} entries recovered` : "not loaded"}. Save/Share retrieves history; installed updates preserve data, uninstalling does not.</p>
-  {#if app.logs.historyError}
-    <p class="hint" role="status">{app.logs.historyError}</p>
-  {/if}
-  {#if app.logs.historyAvailable && app.logs.previousRunItems.length > 0}
-    <details data-testid="previous-session-logs" bind:open={previousRunPanelExpanded}>
-      <summary>Previous runs ({app.logs.previousRunItems.length} entries)
-        {#if app.logs.previousRunStartedAtMs}
-          · {new Date(app.logs.previousRunStartedAtMs).toLocaleString()}
-        {/if}
-      </summary>
-      {#if previousRunPanelExpanded}
-      {#if app.logs.previousRunItems.length > 250}
-        <p class="item-meta">Showing 250 recent entries; Save or Share Logs includes all recovered entries.</p>
-      {/if}
-      <ul class="list">
-        {#each app.logs.previousRunItems.slice(0, 250) as item (item.id)}
-          <ListRow>
-            <div class="item-meta">
-              {new Date(item.timestampMs).toLocaleString()} | {item.level.toUpperCase()} | {item.event}
-            </div>
-            <div class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}>{item.message}</div>
-            {#if item.details !== undefined}
-              <pre class="log-details">{JSON.stringify(item.details, null, 2)}</pre>
-            {/if}
-          </ListRow>
-        {/each}
-      </ul>
-      {/if}
-    </details>
-  {/if}
-  <details bind:open={app.ui.isLogPanelExpanded}>
-    <summary>View logs ({app.logs.items.length})</summary>
-    {#if app.ui.isLogPanelExpanded}
-      {#if app.logs.items.length > 250}
-        <p class="item-meta">Showing the latest 250 entries. Save or Share Logs includes all {app.logs.items.length} cached entries.</p>
-      {/if}
-      <ul class="list">
-      {#if app.logs.items.length === 0}
-        <li class="empty">No session logs yet.</li>
-      {:else}
-        {#each app.logs.items.slice(0, 250) as item (item.id)}
-          <ListRow>
-            <div class="item-meta">
-              {new Date(item.timestampMs).toLocaleTimeString()} | {item.level.toUpperCase()}
-              | {item.event}
-            </div>
-            <div
-              class={`item-meta ${item.level === "error" ? "log-error" : item.level === "warning" ? "log-warning" : ""}`}
-            >
-              {item.message}
-            </div>
-            {#if item.details !== undefined}
-              <pre class="log-details">{JSON.stringify(
-                  item.details,
-                  null,
-                  2,
-                )}</pre>
-            {/if}
-          </ListRow>
-        {/each}
-      {/if}
-    </ul>
-    {/if}
-  </details>
-</Panel>
-
 <style>
-  .peer-list :global(.list-item.peer-layout + .list-item.peer-layout) {
-    border-top: 1px solid var(--border-list-divider);
-  }
-
-  .appearance-settings {
-    padding-bottom: 0.7rem;
-    border-bottom: 0;
-  }
-
-  .appearance-settings h3 {
-    margin: 0 0 0.55rem;
-    font-size: 0.9rem;
-  }
-
-  .appearance-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
-    gap: 0.55rem;
-    align-items: end;
-  }
-
-  .color-field {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    min-height: 42px;
-  }
-
-  .color-field input {
-    width: 3rem;
-    height: 2.35rem;
-    padding: 0.15rem;
-  }
-
-  .color-field code {
-    color: var(--text-secondary);
-    font-size: 0.76rem;
-  }
-
-  .expert-toggle {
-    min-height: 42px;
-  }
-
-  .top-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-bottom: 0.5rem;
-    flex-wrap: wrap;
-  }
-
-  .top-actions .small {
-    min-height: 30px;
-    padding: 0.15rem 0.45rem;
-    font-size: 0.8rem;
-  }
-
-
-  .this-device-summary {
-    border: 0;
-    border-radius: var(--radius-md);
-    padding: 0.5rem 0.6rem;
-    background: var(--bg-surface-muted);
-    margin-bottom: 0.5rem;
-  }
-
-  .settings-block {
-    margin-top: 0.75rem;
-    display: grid;
-    gap: 0.75rem;
-  }
-
-  .version-meta {
-    margin-top: 0.35rem;
-    line-height: 1.4;
-  }
-
-  .saved-device-editor {
-    display: grid;
-    gap: 0.45rem;
-  }
-
-  .settings-divider {
-    grid-column: 1 / -1;
-    border: 0;
-    margin: 0.25rem 0;
-  }
-
-  .actions {
-    display: flex;
-    gap: 0.45rem;
-    margin-top: 0.45rem;
-    flex-wrap: wrap;
-  }
-
-  form.settings {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
-    gap: 0.45rem;
-    margin-top: 0.45rem;
-  }
-
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-  }
-
-  .checkbox-row {
-    flex-direction: row;
-    align-items: center;
-    gap: 0.45rem;
-    min-height: 42px;
-  }
-
-  .checkbox-row input[type="checkbox"] {
-    width: 18px;
-    height: 18px;
-    margin: 0;
-  }
-
-  @media (pointer: coarse) {
-    .top-actions .small { min-height: 44px; }
-  }
-
-  @media (max-width: 640px) {
-    form.settings {
-      grid-template-columns: 1fr;
-    }
-  }
+  .this-device-summary { display:flex; align-items:center; gap:0.75rem; padding:0.45rem 0; }
+  .device-name { flex:1; min-width:0; }
+  .local-details { margin-top:0.35rem; }
+  .discovery-toggle { display:flex; width:100%; align-items:center; justify-content:space-between; gap:0.5rem; text-align:left; }
+  .peer-list :global(.list-item.peer-layout + .list-item.peer-layout) { border-top:1px solid var(--border-list-divider); }
+  .saved-device-editor { display:grid; gap:0.45rem; margin-top:0.75rem; }
+  .actions { display:flex; flex-wrap:wrap; gap:0.45rem; }
+  label { display:flex; flex-direction:column; gap:0.25rem; }
+  .checkbox-row { flex-direction:row; align-items:center; }
 </style>

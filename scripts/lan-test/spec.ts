@@ -9,6 +9,7 @@ import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.
 import { coordinatorRequest } from "./coordinator.ts";
 import type { LanFixture } from "./protocol.ts";
 import {
+  openSettingsSection,
   openFolderSettings,
   clickDownloadButton,
   clickItemTitle,
@@ -92,8 +93,7 @@ const connect = async (
   options: { identity?: { cert: string; key: string }; quicOnly?: boolean } = {},
 ): Promise<void> => {
   await clickTestId("tab-devices");
-  const settings = $("[data-testid='connection-settings-toggle']");
-  if (await settings.getAttribute("aria-expanded") !== "true") await settings.click();
+  await openSettingsSection(lanBrowser, "network");
   await selectDiscoveryMode(lanBrowser, mode);
   if (mode === "direct") {
     const quicOnly = $("[data-testid='connection-direct-quic']");
@@ -283,6 +283,7 @@ describe("Syncpeer LAN integration", () => {
   });
 
   it("sorts and filters folder entries", async () => {
+    await $("[data-testid=folder-filter-toggle]").click();
     await setValue("folder-name-filter", "hello");
     await waitForText(lanBrowser, "hello.txt");
     assert.equal((await lanBrowser.getPageSource()).includes("blob.bin"), false);

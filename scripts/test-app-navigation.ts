@@ -162,6 +162,11 @@ test("serializes and validates the navigation route in the URL fragment", () => 
   assert.equal(routeFromHash("#v=1&page=folder-settings&tab=folders")?.page, "general-settings");
 });
 
+test("hidden PIM tab falls back without deleting persisted PIM data", () => {
+  assert.equal(createInitialState({ activeTab: "pim" }).activeTab, "favorites");
+  assert.equal(routeFromHash("#v=1&page=main&tab=pim")?.tab, "favorites");
+});
+
 test("records a route after synchronous session updates", async () => {
   const state = createInitialState(null);
   const navigation = { sync: undefined as (() => void) | undefined };
@@ -348,6 +353,27 @@ test("general settings and folder creation have distinct routes and restore on B
   await flush();
   assert.equal(state.currentPage, "main");
 });
+test("settings categories have independent routes and Back restores the originating folder", async () => {
+  const state = createInitialState(null);
+  const { actions, location } = createActions(state);
+  actions.startNavigation();
+  await actions.openFolderRoot("photos");
+  state.session.currentPath = "holiday";
+  actions.syncNavigationRoute();
+  actions.openGeneralSettings("overview");
+  assert.equal(routeFromHash(location.hash)?.section, "overview");
+  actions.openGeneralSettings("synchronization");
+  assert.equal(routeFromHash(location.hash)?.section, "synchronization");
+  actions.closeGeneralSettings();
+  await flush();
+  assert.equal(state.settingsSection, "overview");
+  actions.closeGeneralSettings();
+  await flush();
+  assert.equal(state.currentPage, "main");
+  assert.equal(state.session.currentFolderId, "photos");
+  assert.equal(state.session.currentPath, "holiday");
+});
+
 
 test("general settings and creation deep links do not carry a browsing folder", async () => {
   for (const page of ["general-settings", "new-folder"]) {

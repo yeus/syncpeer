@@ -1,6 +1,8 @@
+import { PIM_TAB_VISIBLE } from "./features.ts";
 import { normalizePath } from "@syncpeer/core/browser";
 import type { AppActions } from "./actions.ts";
 import type { AppState } from "./state.ts";
+import { settingsSection, type SettingsSection } from "./settingsSections.ts";
 
 const ROUTE_VERSION = "1";
 const NAVIGATION_STATE = "syncpeer.navigation";
@@ -11,6 +13,7 @@ export type AppRoute = {
   folderId: string;
   path: string;
   versionPath?: string;
+  section?: SettingsSection;
 };
 
 type NavigationHistory = Pick<History, "pushState" | "replaceState" | "back"> & {
@@ -68,7 +71,8 @@ export const routeFromState = (state: AppState): AppRoute => {
   };
   switch (state.currentPage) {
     case "folder-settings": return { ...route, folderId: state.folderSettingsId.trim(), path: "" };
-    case "general-settings":
+    case "general-settings": return { ...route, folderId: "", path: "",
+      ...(state.settingsSection !== "personal-space" ? { section: state.settingsSection } : {}) };
     case "new-folder": return { ...route, folderId: "", path: "" };
     default: return route;
   }
@@ -79,7 +83,8 @@ export const routeEquals = (left: AppRoute, right: AppRoute): boolean =>
   left.tab === right.tab &&
   left.folderId === right.folderId &&
   left.path === right.path &&
-  normalizePath(left.versionPath ?? "") === normalizePath(right.versionPath ?? "");
+  normalizePath(left.versionPath ?? "") === normalizePath(right.versionPath ?? "") &&
+  (left.section ?? "personal-space") === (right.section ?? "personal-space");
 
 export const routeToHash = (route: AppRoute): string => {
   const params = new URLSearchParams({
@@ -89,6 +94,7 @@ export const routeToHash = (route: AppRoute): string => {
   });
   if (route.folderId) params.set("folder", route.folderId);
   if (route.path && route.folderId) params.set("path", normalizePath(route.path));
+  if (route.page === "general-settings" && route.section) params.set("section", route.section);
   if (route.page === "versions" && route.versionPath) params.set("version", normalizePath(route.versionPath));
   return `#${params.toString()}`;
 };
@@ -97,18 +103,22 @@ export const routeFromHash = (hash: string): AppRoute | null => {
   if (!hash.startsWith("#")) return null;
   const params = new URLSearchParams(hash.slice(1));
   const page = params.get("page") ?? "main";
-  const tab = params.get("tab") ?? "favorites";
+  const requestedTab = params.get("tab") ?? "favorites";
+  const tab = requestedTab === "pim" && !PIM_TAB_VISIBLE ? "favorites" : requestedTab;
   if (params.get("v") !== ROUTE_VERSION || !isPage(page) || !isTab(tab)) return null;
   const folderId = page === "general-settings" || page === "new-folder" ? "" : params.get("folder")?.trim() ?? "";
   if (page === "folder-settings" && !folderId) {
     // Older links opened the combined profile/folder settings screen.
     return { page: "general-settings", tab, folderId: "", path: "" };
   }
+  if (page === "general-settings" && params.get("section") === "about") return { page: "about", tab, folderId: "", path: "" };
   return {
     page,
     tab,
     folderId,
     path: folderId ? normalizePath(params.get("path") ?? "") : "",
+    ...(page === "general-settings" && settingsSection(params.get("section")) !== "personal-space"
+      ? { section: settingsSection(params.get("section")) } : {}),
     ...(page === "versions" && folderId && params.get("version")
       ? { versionPath: normalizePath(params.get("version")!) } : {}),
   };
@@ -137,6 +147,7 @@ const routeFromNavigationState = (value: unknown): AppRoute | null =>
 const applyPageAndTab = (state: AppState, route: AppRoute): void => {
   state.currentPage = route.page;
   state.activeTab = route.tab;
+  if (route.page === "general-settings") state.settingsSection = route.section ?? "personal-space";
   if (route.page === "folder-settings") state.folderSettingsId = route.folderId;
   if (route.page === "versions" && route.versionPath) {
     state.versions.folderId = route.folderId;

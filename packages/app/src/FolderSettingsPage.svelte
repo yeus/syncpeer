@@ -5,11 +5,12 @@
   import { safeNativeFailureText } from "./app/storageErrors.ts";
   import { formatSyncthingDeviceId } from "./app/devicePolicies.ts";
   import PasswordInput from "./components/PasswordInput.svelte";
-  let { folderId, folderLabel, encrypted, passwordDraft, passwordSaved, passwordError, actionError,
+  let { folderId, folderLabel, encrypted, locked = true, passwordDraft, passwordSaved, passwordError, actionError,
     managedStorage, onBack, onOpenGeneralSettings, onUpdatePassword, onSavePassword, onClearPassword,
     onImport, peerId, onMigrate, onRelease, onSettingsSaved, command }: {
     folderId: string;
     folderLabel: string;
+    locked?: boolean;
     encrypted: boolean;
     passwordDraft: string;
     passwordSaved: string;
@@ -44,6 +45,7 @@
   let patternDraft = $state("");
   let importPassword = $state(""), importApproved = $state(false);
   let folder = $derived(status?.folders.find(value => value.id === folderId));
+  let showPassword = $state(false);
 
   async function changePassword(mode: "save" | "forget") {
     busy = true; error = "";
@@ -167,21 +169,28 @@
 </script>
 <main class="panel settings-page" data-testid="folder-settings-page" data-folder-id={folderId}>
   <button onclick={onBack}>Back</button>
-  <h1>Folder settings</h1>
-  <p>{folderLabel || folderId}</p>
+  <h1>Folder settings: {folderLabel || folderId}</h1>
   {#if error}<p role="alert">{error}</p>{/if}
   {#if actionError}<p role="alert">{actionError}</p>{/if}
   {#if encrypted}
     <section>
-      <h2>Folder password</h2>
-      {#if passwordError}<p role="alert">{passwordError}</p>{/if}
-      <PasswordInput label="Folder Password" testId={`folder-password-${folderId}`}
-        secretLabel="folder password" value={passwordDraft} autocomplete="off"
-        onValueChange={value => onUpdatePassword(folderId, value)} />
-      <button class="primary" disabled={busy} data-testid={`unlock-folder-${folderId}`} onclick={() => void changePassword("save")}
-        aria-label="Unlock folder">Save and unlock folder</button>
-      <button onclick={() => void changePassword("forget")} disabled={busy || !passwordSaved}
-        aria-label="Forget saved folder password">Forget saved folder password</button>
+      {#if !locked && !passwordError}
+        <button class="ghost" data-testid="folder-password-toggle" aria-expanded={showPassword} onclick={() => { showPassword = !showPassword; }}>Folder password · unlocked {showPassword ? "▴" : "▾"}</button>
+      {:else}
+        <h2>Folder password</h2>
+      {/if}
+      {#if locked || passwordError || showPassword}
+        {#if passwordError}<p role="alert">{passwordError}</p>{/if}
+        <PasswordInput label="Folder password" hideLabel testId={`folder-password-${folderId}`}
+          secretLabel="folder password" value={passwordDraft} autocomplete="off"
+          onValueChange={value => onUpdatePassword(folderId, value)} />
+        <div class="password-actions">
+          <button class="primary" disabled={busy} data-testid={`unlock-folder-${folderId}`} onclick={() => void changePassword("save")}
+            aria-label="Unlock folder">Save and unlock</button>
+          <button onclick={() => void changePassword("forget")} disabled={busy || !passwordSaved}
+            aria-label="Forget saved folder password">Forget password</button>
+        </div>
+      {/if}
     </section>
   {/if}
   {#if managedStorage && status && status.vault.phase !== "unlocked"}
@@ -219,6 +228,7 @@
       (value.kind === "safe" ? value.proposal.folderId : value.exception.folderId) === folder.id).at(-1)}
   <section>
       <h2>Local storage</h2>
+      <p class="hint">Manage this device’s stored copy independently of the remote shared folder. Registration alone does not download every file.</p>
       {#if status?.pendingLocalReleases.includes(folder.id)}
         <p>Local-copy cleanup is unfinished. Syncpeer will retry after the next unlock; this folder cannot be reattached yet.</p>
       {:else if folder.browseOnly}<p>Browse-only: no complete local copy is stored or shared.</p>{/if}
@@ -308,3 +318,6 @@
   {/if}
   {#if status?.vault.issue}<p role="status">{status.vault.issue}</p>{/if}
 </main>
+<style>
+  .password-actions { display:flex; align-items:center; flex-wrap:wrap; gap:0.45rem; }
+</style>

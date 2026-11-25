@@ -11,9 +11,11 @@ const validate = (value: NonNullable<CachedFileRecord["syncBaseline"]>) => {
   if (!value || !/^[a-f0-9]{64}$/.test(value.hash) || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 0 ||
     !Number.isSafeInteger(value.modifiedMs) || value.modifiedMs < 0 ||
     (value.versionKey !== undefined && (typeof value.versionKey !== "string" || value.versionKey.length > 4096 ||
-      !/^(?:\d+:\d+(?:,\d+:\d+)*)?$/.test(value.versionKey)))) throw new Error("Invalid document sync baseline.");
+      !/^(?:\d+:\d+(?:,\d+:\d+)*)?$/.test(value.versionKey))) ||
+    (value.localDeletion !== undefined && value.localDeletion !== true)) throw new Error("Invalid document sync baseline.");
   return { hash: value.hash, sizeBytes: value.sizeBytes, modifiedMs: value.modifiedMs,
-    ...(value.versionKey === undefined ? {} : { versionKey: value.versionKey }) };
+    ...(value.versionKey === undefined ? {} : { versionKey: value.versionKey }),
+    ...(value.localDeletion === true ? { localDeletion: true as const } : {}) };
 };
 export async function loadDocumentBaseline(bytes: ReplicaByteStorage, folderKey: Uint8Array, path: string) {
   const name = await nameFor(path, folderKey), entry = await bytes.stat(name);

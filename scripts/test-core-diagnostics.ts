@@ -928,8 +928,12 @@ await new Promise((resolve) => setTimeout(resolve, 0));
 assert.deepEqual(pipelinedRequests, [0, 1, 2, 3, 4, 5]);
 pipelinedResolvers.get(1)?.(pipelinedPayload.slice(1, 2));
 await new Promise((resolve) => setTimeout(resolve, 0));
+assert.deepEqual(pipelinedRequests, [0, 1, 2, 3, 4, 5],
+  "A completed out-of-order block must not expand the bounded reorder window");
+pipelinedResolvers.get(0)?.(pipelinedPayload.slice(0, 1));
+await new Promise((resolve) => setTimeout(resolve, 0));
 assert.deepEqual(pipelinedRequests, [0, 1, 2, 3, 4, 5, 6]);
-for (const offset of [0, 2, 3, 4, 5, 6]) {
+for (const offset of [2, 3, 4, 5, 6]) {
   pipelinedResolvers.get(offset)?.(pipelinedPayload.slice(offset, offset + 1));
 }
 await pipelinedDownload;

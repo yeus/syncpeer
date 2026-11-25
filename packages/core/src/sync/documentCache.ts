@@ -601,7 +601,7 @@ class DocumentCache {
 
   private async removeCachedFile(folderId: string, path: string) {
     const folder = await this.owner(folderId);
-    return folder ? this.request<boolean>({ operation: "remove", id: this.documentId(folder, path) })
+    return folder ? this.request<boolean>({ operation: "discardCachedFile", id: this.documentId(folder, path) })
       : await this.options.legacy.removeCachedFile?.(folderId, path) ?? false;
   }
 

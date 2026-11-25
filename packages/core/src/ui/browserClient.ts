@@ -185,7 +185,9 @@ export interface CachedFileRecord {
   modifiedMs?: number;
   /** Version of the current authenticated local replica entry, when available. */
   localVersionKey?: string;
-  syncBaseline?: { hash: string; sizeBytes: number; modifiedMs: number; versionKey?: string };
+  /** A writer has not yet finished publishing this document. */
+  localWriteOpen?: boolean;
+  syncBaseline?: { hash: string; sizeBytes: number; modifiedMs: number; versionKey?: string; localDeletion?: true };
   /** Writable providers cannot safely infer a remote baseline from local timestamps. */
   syncBaselineRequired?: boolean;
 }

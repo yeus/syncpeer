@@ -1,4 +1,4 @@
-import { encodeBase64 } from "../transfer/base64.js";
+import { decodeBase64, encodeBase64 } from "../transfer/base64.js";
 import type { createDocumentFilesystem } from "./documentFilesystem.js";
 
 /** Changes that can invalidate a listener's prepared peer-specific folder view. */
@@ -227,10 +227,15 @@ async function readDocument({ documents, integer, command }: DocumentCommandCont
 
 async function writeDocument({ documents, command, integer }: DocumentCommandContext) {
   const value = command.bytes;
-  if (!Array.isArray(value) || value.length > 131072 || value.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid document bytes.");
-  const bytes = new Uint8Array(value);
+  let bytes: Uint8Array;
+  if (command.encoding === "base64" && typeof value === "string") {
+    bytes = decodeBase64(value, 131072);
+  } else {
+    if (!Array.isArray(value) || value.length > 131072 || value.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) throw new Error("Invalid document bytes.");
+    bytes = new Uint8Array(value);
+  }
   try { await documents.write(integer("handle"), integer("offset"), bytes); return bytes.length; }
-  finally { bytes.fill(0); value.fill(0); }
+  finally { bytes.fill(0); if (Array.isArray(value)) value.fill(0); }
 }
 
 async function writeDocumentBatch({ documents, command, integer }: DocumentCommandContext) {
@@ -319,6 +324,7 @@ const commandHandlers: Record<string, CommandHandler> = {
   digest: ({ documents, integer }) => documents.digest(integer("handle")),
   copyRanges: ({ documents, integer, ranges }) => documents.copyRanges(integer("handle"), ranges()),
   digestRanges,
+  discardCachedFile: ({ documents, text }) => documents.discardCachedFile(text("id")),
   remove: ({ documents, text }) => documents.remove(text("id")),
   rename: ({ documents, text }) => documents.rename(text("id"), text("name")),
   setSyncBaseline: ({ documents, text, integer }) => documents.setSyncBaseline(text("id"), { hash: text("hash"), sizeBytes: integer("sizeBytes"), modifiedMs: integer("modifiedMs") }),

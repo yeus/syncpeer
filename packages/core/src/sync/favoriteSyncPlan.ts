@@ -8,6 +8,8 @@ export interface FavoriteSyncBaseline {
   sizeBytes: number;
   modifiedMs: number;
   versionKey?: string;
+  /** Recorded only after an explicit document deletion, never cache eviction. */
+  localDeletion?: true;
 }
 
 export interface FavoriteRemoteVersion {
@@ -22,6 +24,8 @@ export interface FavoriteLocalVersion {
 
 export interface FavoriteCandidate {
   path: string;
+  /** Local document publication outside the favorite download selection. */
+  uploadOnly?: boolean;
   remote?: FavoriteRemoteVersion;
   local?: { sizeBytes: number; modifiedMs: number; baseline?: FavoriteSyncBaseline };
 }

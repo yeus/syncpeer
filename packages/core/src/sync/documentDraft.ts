@@ -25,7 +25,8 @@ type DownloadDraft = Omit<FileDownloadMetadata, "blocks"> & {
 };
 type DownloadDraftInput = Omit<DownloadDraft, "ranges"> & { blocks?: readonly RangeDigest[] };
 type DraftHead = { format: 1; path: string; baseSize: number; size: number; dirty: boolean;
-  version: BepVersionVector | null; chunkSize?: number; recover?: boolean; download?: DownloadDraft };
+  version: BepVersionVector | null; chunkSize?: number; recover?: boolean; download?: DownloadDraft;
+  publishRequested?: boolean };
 type DraftOptions = {
   folderId: string; folderKey: Uint8Array; replica: LocalFolderReplica;
   randomBytes: (size: number) => Uint8Array | Promise<Uint8Array>;
@@ -155,6 +156,7 @@ class DocumentDraft {
   assertReplicaPath(head.path);
   const chunkSize = head.chunkSize ?? LEGACY_DRAFT_CHUNK_SIZE;
   if (head.format !== 1 || isInternalReplicaPath(head.path) || typeof head.dirty !== "boolean" ||
+    (head.publishRequested !== undefined && typeof head.publishRequested !== "boolean") ||
     (chunkSize !== LEGACY_DRAFT_CHUNK_SIZE && chunkSize !== DRAFT_CHUNK_SIZE) ||
     ![head.baseSize, head.size].every(size => Number.isSafeInteger(size) && size >= 0) || !validDownload(head.download) ||
     (head.download && (head.download.folderId !== options.folderId || head.download.path !== head.path ||
@@ -265,15 +267,21 @@ class DocumentDraft {
       const current = (await this.options.replica.scan()).find(file => file.name === target);
       const sameVersion = !current ? version === null
         : version !== null && compareConcurrentVersionCounters(current.version ?? {}, version) === 0;
-      if (!sameVersion) {
+      // A truncating writer can die before it has emitted the entire file.
+      // Authentication of its journal does not prove application completeness.
+      // Preserve an existing nonempty primary unless close/fsync requested
+      // publication. Retain even a complete uncommitted rewrite separately.
+      const uncertainReplacement = !this.head.publishRequested && this.head.baseSize === 0 &&
+        current && !current.deleted && Number(current.size ?? 0) > 0;
+      if (!sameVersion || uncertainReplacement) {
         if (await this.matches(target)) {
-          this.head = { ...this.head, version: current!.version ?? {}, dirty: false };
+          this.head = { ...this.head, version: current!.version ?? {}, dirty: false, publishRequested: false };
           await this.saveHead();
           return;
         }
         target = `${this.head.path}.sync-conflict-${this.prefix.slice(".syncpeer-draft-".length)}`;
         if (await this.matches(target)) {
-          this.head = { ...this.head, dirty: false };
+          this.head = { ...this.head, dirty: false, publishRequested: false };
           await this.saveHead();
           return;
         }
@@ -281,6 +289,10 @@ class DocumentDraft {
       }
     }
 
+    if (!recover && !this.head.download && !this.head.publishRequested) {
+      this.head = { ...this.head, publishRequested: true };
+      await this.saveHead();
+    }
     const expectedBlocks = recover ? undefined : this.downloadBlocks;
     const reusableBlocks = expectedBlocks && hasReplicaBlockLayout(expectedBlocks, this.head.size)
       ? expectedBlocks : undefined;
@@ -392,7 +404,7 @@ class DocumentDraft {
       if (this.head.download && !publishedDigest) {
         throw new Error("Document publication did not verify the complete download.");
       }
-      this.head = { ...this.head, version: result.version ?? {}, dirty: false };
+      this.head = { ...this.head, version: result.version ?? {}, dirty: false, publishRequested: false };
       await this.saveHead();
       return publishedDigest;
     } finally {

@@ -1138,6 +1138,7 @@ class BepSession {
     for (const folderId of changed) {
       const state = this.folders.get(folderId);
       if (!state?.encrypted || this.sharedFolders.has(folderId)) continue;
+      state.indexReceived = false;
       state.files.clear();
       state.folderCrypto = undefined;
       state.needsPassword = true;
@@ -1156,6 +1157,7 @@ class BepSession {
         if (pending) {
           const applied = await this.applyIndexFiles(state, folderId, [...pending.values()]);
           this.log("untrusted.folder.hydrated", { count: applied.decryptedStored });
+          state.indexReceived = !state.needsPassword && !state.passwordError;
         }
       } catch (error) {
         state.needsPassword = true;
@@ -1925,8 +1927,11 @@ class BepSession {
       hasFolderCrypto: !!state.folderCrypto,
       needsPassword: state.needsPassword,
     });
-    state.indexReceived = true;
+    // Encrypted FileInfo application is asynchronous. A partial index must
+    // never be advertised as ready to consumers that propagate deletions.
+    state.indexReceived = false;
     const applied = await this.applyIndexFiles(state, folderId, files);
+    state.indexReceived = true;
     this.log("index.applied", {
       folderId,
       encrypted: state.encrypted,

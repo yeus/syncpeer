@@ -424,6 +424,15 @@ export class RemoteFs {
     }));
   }
 
+  /** Direct index evidence, including tombstones. A missing record is not a deletion. */
+  async indexedFile(folderId: string, path: string): Promise<FileEntry | null> {
+    const folder = this.folders.get(folderId);
+    if (!folder?.indexReceived || folder.needsPassword || folder.passwordError || folder.stopReason) return null;
+    const normalized = normalizePath(path);
+    const stored = folder.files.get(normalized) ?? resolveStoredFile(folder, normalized);
+    return stored ? toEntry(normalized, stored.indexFile) : null;
+  }
+
   async requestFolderIndex(folderId: string): Promise<void> {
     const normalizedFolderId = String(folderId ?? "").trim();
     if (!normalizedFolderId) return;

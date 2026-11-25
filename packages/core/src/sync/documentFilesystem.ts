@@ -185,7 +185,7 @@ const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation 
 // queue for a writable handle or a partially downloaded file.
 const runPublishedRead = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation = "publishedRead"): Promise<T> => {
   if (runtime.closed) return Promise.reject(new Error("Documents are closed."));
-  if (!["downloadWrite", "downloadCommit", "digestCachedFiles", "beginDownload"].includes(runtime.activeQueueOperation ?? "")) {
+  if (!["downloadWrite", "downloadCommit", "digestCachedFiles", "beginDownload", "cachedFiles", "directorySnapshot"].includes(runtime.activeQueueOperation ?? "")) {
     return runQueued(runtime, fn, operation);
   }
   if (runtime.concurrentReads.size >= 8) return runQueued(runtime, fn, operation);
@@ -682,6 +682,8 @@ const cachedFilesAction = async (
       files.push({ key: cachedFileKey(folder.id, info.name), folderId: folder.id, path: info.name,
         name: info.name.split("/").at(-1)!, sizeBytes: Number(info.size ?? 0), modifiedMs, cachedAtMs: modifiedMs,
         localPath: "syncpeer-document:" + JSON.stringify([folder.storageId, info.name]),
+        localWriteOpen: [...runtime.handles.values()].some(handle => handle.writer && !handle.download &&
+          handle.documentId === JSON.stringify([folder.storageId, info.name])),
         localVersionKey: versionVectorKey(info.version ?? {}),
         syncBaselineRequired: true,
         syncBaseline: await loadDocumentBaseline(runtime.storage.get(folder.storageId)!, runtime.folderKeys.get(folder.storageId)!, info.name) });
@@ -736,7 +738,14 @@ const removeDocumentAction = async (runtime: DocumentRuntime, id: string) => {
     ? current.filter(info => !info.deleted && (info.name === file.path || info.name.startsWith(file.path + "/")))
       .map(info => info.name)
     : [file.path];
+  // Record explicit deletion intent only after the local mutation succeeds.
+  // Missing bytes discovered by an index scan alone must never delete a peer copy.
   await removeReplicaPaths(file.replica, file.folder.id, paths);
+  for (const path of paths) {
+    const target = JSON.stringify([file.folder.storageId, path]);
+    const baseline = await loadSyncBaselineAction(runtime, target);
+    if (baseline) await setSyncBaselineAction(runtime, target, { ...baseline, localDeletion: true });
+  }
   return true;
 };
 
@@ -1125,6 +1134,8 @@ const collectVersion = async (
 const listVersionsAction = async (runtime: DocumentRuntime, id: string) => {
   const { folder, path, bytes } = resolveDocument(runtime, id);
   if (!path) throw new Error("Choose a file to view its versions.");
+  // An unused version archive is not created until the first archived edit.
+  if (!await bytes.stat(".stversions")) return [];
   const roots = await bytes.listDirectory(".stversions");
   const versions: Array<{ id: string; modifiedMs: number; sizeBytes: number }> = [];
   for (const root of roots) {
@@ -1159,6 +1170,7 @@ const collectCacheCandidates = async (
   const replica = runtime.registry!.getReplica(folder.id)!;
   const bytes = runtime.storage.get(folder.storageId)!, key = runtime.folderKeys.get(folder.storageId)!;
   const access = await loadCacheAccess(bytes, key);
+  const openDocuments = new Set([...runtime.handles.values()].map(handle => handle.documentId));
   const folderSettings = settings.folders[folder.id] ?? defaultFolderSettings();
   for (const info of await replica.scan()) {
     if (info.deleted || info.invalid || Number(info.type ?? 0) !== 0 || isInternalReplicaPath(info.name)) continue;
@@ -1171,7 +1183,9 @@ const collectCacheCandidates = async (
       : await hashReplicaFile(replica, info.name) === baseline!.hash);
     candidates.push({ key: cachedFileKey(folder.id, info.name), folder, path: info.name,
       sizeBytes: Number(info.size ?? 0), lastAccessedMs: access[info.name] ??
-        Number(info.modified_s ?? 0) * 1000, protected: selected.status === "favorite" || !unchanged });
+        Number(info.modified_s ?? 0) * 1000,
+      protected: openDocuments.has(JSON.stringify([folder.storageId, info.name])) ||
+        selected.status === "favorite" || !unchanged });
   }
 };
 const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
@@ -1187,11 +1201,26 @@ const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
   const evicted = planCacheEvictions(candidates, quotaBytes);
   for (const key of evicted) {
     const candidate = candidates.find(value => value.key === key)!;
+    // Eviction is not a user deletion; selecting it again must download.
+    await clearSyncBaselineAction(runtime, JSON.stringify([candidate.folder.storageId, candidate.path]));
     await removeReplicaPaths(runtime.registry.getReplica(candidate.folder.id)!, candidate.folder.id, [candidate.path]);
   }
   return { quotaBytes, cachedBytes: candidates.reduce((total, value) => total + value.sizeBytes, 0),
     protectedBytes: candidates.filter(value => value.protected).reduce((total, value) => total + value.sizeBytes, 0), evicted };
 };
+/** Discard an unmodified cache entry, never a favorite or unsynced edit. */
+const discardCachedFileAction = async (runtime: DocumentRuntime, id: string) => {
+  const file = resolveDocument(runtime, id);
+  const settings = await effectiveProfileSettings(runtime);
+  const candidates: CacheCandidate[] = [];
+  await collectCacheCandidates(runtime, settings, file.folder, candidates);
+  const candidate = candidates.find(value => value.path === file.path);
+  if (!candidate) return false;
+  if (candidate.protected) throw new Error("Close the document, remove its favorite selection, and synchronize local edits before discarding the download.");
+  await clearSyncBaselineAction(runtime, id);
+  return removeDocumentAction(runtime, id);
+};
+
 
 const createLifecycleActions = (runtime: DocumentRuntime) => ({
   initialize: () => runQueued(runtime, () => initializeFilesystem(runtime)),
@@ -1681,15 +1710,25 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
   loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) =>
     runQueued(runtime, () => loadDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path)),
   saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string, snapshot: StoredDirectorySnapshot) =>
-    runQueued(runtime, () => saveDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path, snapshot)),
+    runQueued(runtime, () => saveDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path, snapshot), "directorySnapshot"),
 });
 
 const createDirectoryActions = (runtime: DocumentRuntime) => ({
-  cachedFiles: (folderId?: string) => runQueued(runtime, () => cachedFilesAction(runtime, folderId)),
+  cachedFiles: (folderId?: string) => runQueued(runtime, () => cachedFilesAction(runtime, folderId), "cachedFiles"),
+  discardCachedFile: (id: string) => runQueued(runtime, () => discardCachedFileAction(runtime, id)),
   digestCachedFiles: (files: readonly { folderId: string; path: string }[]) =>
     runQueued(runtime, () => digestCachedFilesAction(runtime, files), "digestCachedFiles"),
   cachedStatuses: (folderId: string, paths: string[]) => runPublishedRead(runtime, () => cachedStatusesAction(runtime, folderId, paths)),
   remove: (id: string) => runQueued(runtime, () => removeDocumentAction(runtime, id)),
+  removeSyncedFile: (id: string, version: string) => runQueued(runtime, async () => {
+    if ([...runtime.handles.values()].some(handle => handle.documentId === id)) return false;
+    const file = resolveDocument(runtime, id);
+    const current = (await file.replica.scan()).find(info => info.name === file.path && !info.deleted && !info.invalid);
+    if (!current || Number(current.type ?? 0) !== 0 || versionVectorKey(current.version ?? {}) !== version) return false;
+    await file.replica.edit!({ method: "delete", folderId: file.folder.id, path: file.path,
+      modifiedMs: Date.now(), expectedVersion: current.version ?? {} });
+    return true;
+  }),
   rename: (id: string, name: string) => runQueued(runtime, () => renameDocumentAction(runtime, id, name)),
   stat: (id: string) => runPublishedRead(runtime, () => statById(runtime, id)),
   list: (id: string) => runPublishedRead(runtime, () => listEntriesAction(runtime, id)),

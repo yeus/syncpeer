@@ -511,8 +511,25 @@ test("directory catalogs stay encrypted and cache eviction preserves favorites a
   const writer = await documents.open(edited.id, "rw");
   await documents.write(writer, 0, Uint8Array.of(9));
   await documents.release(writer);
+  const evictable = (await documents.list(folder.id)).find(entry => entry.name === "evictable.txt")!;
+  const reader = await documents.open(evictable.id, "r");
+  const protectedResult = await documents.enforceCacheQuota();
+  assert.deepEqual(protectedResult.evicted, []);
+  assert.equal(protectedResult.protectedBytes, 9);
+  assert.deepEqual(await documents.read(reader, 0, 3), Uint8Array.of(1, 2, 3));
+  await assert.rejects(documents.discardCachedFile(evictable.id), /Close the document/);
+  await assert.rejects(documents.discardCachedFile(edited.id), /local edits/);
+  const favorite = (await documents.list(folder.id)).find(entry => entry.name === "favorite.txt")!;
+  await assert.rejects(documents.discardCachedFile(favorite.id), /favorite selection/);
+  await documents.release(reader);
   const result = await documents.enforceCacheQuota();
   assert.deepEqual(result.evicted, ["folder:evictable.txt"]);
+  assert.equal(await documents.syncBaseline(evictable.id), undefined);
+  const download = await documents.beginDownload("folder", "evictable.txt", 3, 1);
+  await documents.write(download, 0, Uint8Array.of(1, 2, 3));
+  await documents.finishDownload(download);
+  assert.equal(await documents.discardCachedFile(evictable.id), true);
+  assert.equal(await documents.syncBaseline(evictable.id), undefined);
   assert.deepEqual((await documents.cachedFiles()).map(file => file.path).sort(), ["edited.txt", "favorite.txt"]);
   for (const root of roots.values()) for (const entry of root.files.values()) {
     assert.equal(Buffer.from(entry.bytes).includes(Buffer.from("remote-only.txt")), false);
@@ -536,6 +553,7 @@ test("opening a downloaded encrypted file without edits never removes it from Do
     const [folder] = await documents.list("syncpeer-root");
     const file = (await documents.list(folder.id)).find(value => value.name === "database.kdbx")!;
     assert.ok(file, "Downloaded file should be visible before opening.");
+    assert.deepEqual(await documents.versions(file.id), [], "An absent archive directory means no history.");
     const opened = await documents.open(file.id, "rw");
     assert.deepEqual(await documents.read(opened, 0, 4), content);
     await documents.release(opened);

@@ -3,7 +3,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import type { RemoteFs } from "../core/model/remoteFs.js";
 import type { CachedFileRecord, FavoriteRecord } from "../ui/browserClient.js";
 import { favoriteKey, normalizePath } from "../ui/helpers.js";
-import type { FileDownloadSink, FileUploadSource } from "../transfer/stream.js";
+import { createSha256DownloadSink, type FileDownloadSink, type FileUploadSource } from "../transfer/stream.js";
 import type { DocumentFilesystem } from "./documentFilesystem.js";
 import type { FolderRegistration } from "./folderRegistry.js";
 import { favoriteRetryDelayMs, type FavoriteRename,
@@ -11,9 +11,11 @@ import { favoriteRetryDelayMs, type FavoriteRename,
 import { applyFavoriteRename, planFavoriteCandidates, planFavoriteRename,
   planFavoriteRenames, planFavoriteSync, type FavoriteCandidate,
   type FavoriteRemoteVersion } from "./favoriteSyncPlan.js";
-import { collectFavoriteFiles, type FavoriteExclusion } from "../ui/favoriteSelection.js";
+import { classifyFavoritePath, collectFavoriteFiles, type FavoriteExclusion } from "../ui/favoriteSelection.js";
 import type { FileEntry } from "../core/model/remoteFs.js";
 import { writeDocumentDownload } from "./documentDownloadWrites.js";
+import { defaultFolderSettings } from "./profileSettings.js";
+import { isInternalReplicaPath } from "./replicaPaths.js";
 
 type Baseline = NonNullable<CachedFileRecord["syncBaseline"]>;
 
@@ -152,7 +154,8 @@ const uploadFavorite = async (context: FavoriteContext, path: string,
       { modifiedMs, waitForRemote: true, expectedHash: local.hash,
         onProgress: progress => context.reportTransfer?.("upload", progress.processedBytes, progress.totalBytes) });
     context.reportTransfer?.("upload", source.size, source.size);
-    const baseline = { hash: local.hash, sizeBytes: source.size, modifiedMs };
+    const baseline = { hash: local.hash, sizeBytes: source.size, modifiedMs,
+      versionKey: context.cached.get(path)?.localVersionKey };
     await context.documents.setSyncBaseline(id, baseline);
     return baseline;
   } finally { await source.close?.(); }
@@ -178,9 +181,30 @@ const runUpload = async (context: FavoriteContext, path: string, local: { hash: 
   return { folderId: context.folderId, path, result: "uploaded" };
 };
 
-const runDeleteRemote = async (context: FavoriteContext, path: string): Promise<FavoriteSyncResult> => {
+/** Destructive operations must verify bytes, not just size and timestamp.
+ * The sink hashes the verified stream without materializing or caching it.
+ */
+const matchesRemoteBaseline = async (context: FavoriteContext, path: string, baseline: Baseline): Promise<boolean> => {
+  const { sink, digestHex } = createSha256DownloadSink({
+    begin: () => {}, write: () => {}, commit: () => {}, abort: () => {},
+  });
+  await context.remoteFs.readFileToSink(context.folderId, path, sink);
+  return digestHex() === baseline.hash;
+};
+
+const runDeleteRemote = async (context: FavoriteContext, path: string, baseline: Baseline): Promise<FavoriteSyncResult> => {
+  if (!await matchesRemoteBaseline(context, path, baseline)) {
+    const entry = await recordIssue(context, path, "conflict", "Peer content changed since the last sync; deletion was cancelled.");
+    return { folderId: context.folderId, path, result: "conflict", message: entry.message };
+  }
   await setEntry(context, path, { phase: "deleting-remote", attempts: context.entries[path]?.attempts ?? 0,
     updatedAtMs: context.nowMs, nextAttemptMs: 0 });
+  const id = documentId(context.storageId, path);
+  const current = await context.documents.syncBaseline(id);
+  const [status] = await context.documents.cachedStatuses(context.folderId, [path]);
+  if (status?.available || !current?.localDeletion || current.hash !== baseline.hash) {
+    return { folderId: context.folderId, path, result: "waiting", message: "Local deletion intent changed; replanning." };
+  }
   await context.remoteFs.deleteFile(context.folderId, path, { modifiedMs: context.nowMs, waitForRemote: true });
   await clearFavoriteRecords(context, path);
   await markSynced(context, path);
@@ -188,9 +212,13 @@ const runDeleteRemote = async (context: FavoriteContext, path: string): Promise<
 };
 
 const runDeleteLocal = async (context: FavoriteContext, path: string): Promise<FavoriteSyncResult> => {
-  await setEntry(context, path, { phase: "deleting-local", attempts: context.entries[path]?.attempts ?? 0,
-    updatedAtMs: context.nowMs, nextAttemptMs: 0 });
-  await context.documents.remove(documentId(context.storageId, path));
+  const id = documentId(context.storageId, path);
+  const version = context.cached.get(path)?.localVersionKey;
+  const evidence = await context.remoteFs.indexedFile(context.folderId, path);
+  if (!evidence?.deleted || evidence.invalid || !version ||
+      !await context.documents.removeSyncedFile(id, version)) {
+    return { folderId: context.folderId, path, result: "waiting", message: "Deletion is not yet verified or the local document is in use." };
+  }
   await clearFavoriteRecords(context, path);
   await markSynced(context, path);
   return { folderId: context.folderId, path, result: "deleted-local" };
@@ -222,16 +250,26 @@ const renameFavorite = async (context: FavoriteContext, from: string, to: string
   const remoteTarget = await readRemoteVersion(context.remoteFs, context.folderId, to);
   const targetBaseline = await context.documents.syncBaseline(documentId(context.storageId, to));
   const published = !!targetBaseline && !!remoteTarget &&
-    remoteTarget.size === targetBaseline.sizeBytes && remoteTarget.modifiedMs === targetBaseline.modifiedMs;
+    remoteTarget.size === targetBaseline.sizeBytes && remoteTarget.modifiedMs === targetBaseline.modifiedMs &&
+    targetBaseline.hash === localHash && await matchesRemoteBaseline(context, to, targetBaseline);
+  const conflict = async (message: string): Promise<FavoriteSyncResult> => {
+    const entry = await recordIssue(context, from, "conflict", message);
+    return { folderId: context.folderId, path: from, result: "conflict", message: entry.message };
+  };
   const action = planFavoriteRename({ local: { size: local.sizeBytes, hash: localHash },
     remoteSource, remoteTarget, baseline, resumeTarget: published });
-  if (action.kind === "conflict") {
-    const entry = await recordIssue(context, from, "conflict", action.message);
-    return { folderId: context.folderId, path: from, result: "conflict", message: entry.message };
+  if (action.kind === "conflict") return conflict(action.message);
+  if (action.removeRemote && (!baseline || !await matchesRemoteBaseline(context, from, baseline))) {
+    return conflict("Peer content changed since the last sync; rename was cancelled.");
   }
   await setEntry(context, to, { phase: "uploading", attempts: 0, updatedAtMs: context.nowMs, nextAttemptMs: 0 });
   if (!published) await uploadFavorite(context, to, { hash: localHash });
   if (action.removeRemote) {
+    // Publishing a large target may take time; verify the source again before
+    // tombstoning it, rather than relying on the earlier planning snapshot.
+    if (!baseline || !await matchesRemoteBaseline(context, from, baseline)) {
+      return conflict("Peer content changed during rename publication; both copies were preserved.");
+    }
     await context.remoteFs.deleteFile(context.folderId, from, { modifiedMs: context.nowMs, waitForRemote: true });
   }
   await context.documents.clearSyncBaseline(documentId(context.storageId, from)).catch(() => {});
@@ -244,6 +282,17 @@ const runRenames = async (context: FavoriteContext, results: FavoriteSyncResult[
   const renames = [...context.renames];
   const pairs = planFavoriteRenames([...context.cached.keys()], renames);
   const paired = new Set(pairs.map(pair => pair.from));
+  // An interrupted rename with no cached target is not a deletion request.
+  // Keep its durable rename intent and the original peer copy for recovery.
+  for (const rename of renames.filter(entry => !paired.has(entry.from))) {
+    const baseline = await context.documents.syncBaseline(documentId(context.storageId, rename.from));
+    if (!baseline) continue; // Directory rename roots have no file baseline.
+    const remote = await readRemoteVersion(context.remoteFs, context.folderId, rename.from);
+    if (!remote) continue;
+    const entry = await recordIssue(context, rename.from, "conflict", "Renamed local document is missing; the original peer copy was preserved.");
+    results.push({ folderId: context.folderId, path: rename.from, result: "conflict", message: entry.message });
+  }
+  if (results.length) return false;
   let failed = false;
   for (const pair of pairs) {
     try { results.push(await renameFavorite(context, pair.from, pair.to)); }
@@ -255,13 +304,6 @@ const runRenames = async (context: FavoriteContext, results: FavoriteSyncResult[
     }
   }
   if (failed) return false;
-  for (const rename of renames.filter(entry => !paired.has(entry.from))) {
-    const remote = await readRemoteVersion(context.remoteFs, context.folderId, rename.from);
-    const baseline = await context.documents.syncBaseline(documentId(context.storageId, rename.from));
-    const action = planFavoriteSync({ remote, baseline });
-    if (action.kind === "delete-remote") results.push(await runDeleteRemote(context, rename.from));
-    else if (action.kind === "conflict") await recordIssue(context, rename.from, "conflict", action.message);
-  }
   await updateFavoritePaths(context, renames);
   await context.documents.clearFavoriteRenames(context.folderId, renames.flatMap(rename => [rename.from, rename.to]));
   context.renames = [];
@@ -298,6 +340,9 @@ const runResolution = async (context: FavoriteContext, candidate: FavoriteCandid
 
 const planAndRunCandidate = async (context: FavoriteContext, candidate: FavoriteCandidate): Promise<FavoriteSyncResult> => {
   const path = candidate.path, id = documentId(context.storageId, path);
+  if (context.cached.get(path)?.localWriteOpen) return {
+    folderId: context.folderId, path, result: "waiting", message: "Document is still open for writing.",
+  };
   const pending = context.entries[path];
   if (pending?.resolution) {
     if (pending.nextAttemptMs > context.nowMs) {
@@ -307,6 +352,22 @@ const planAndRunCandidate = async (context: FavoriteContext, candidate: Favorite
     return runResolution(context, candidate, pending.resolution);
   }
   const baseline = candidate.local?.baseline ?? await context.documents.syncBaseline(id);
+  // An absent listing is not a remote tombstone. Preserve the local bytes.
+  if (!candidate.uploadOnly && candidate.local && baseline && !candidate.remote) {
+    const evidence = await context.remoteFs.indexedFile(context.folderId, path);
+    if (!evidence?.deleted || evidence.invalid) return {
+      folderId: context.folderId, path, result: "waiting", message: "Waiting for verified peer deletion or file metadata.",
+    };
+  }
+  if (!candidate.local && candidate.remote && baseline && !baseline.localDeletion) {
+    // An unrecorded local disappearance (eviction, interruption or storage
+    // failure) is not authority to delete the peer's original.
+    return runDownload(context, path, candidate.remote, null);
+  }
+  if (candidate.local && baseline?.localDeletion) {
+    // A recreated local document supersedes the old delete intent.
+    await context.documents.setSyncBaseline(id, { ...baseline, localDeletion: undefined });
+  }
   // Reuse the authenticated baseline only for a no-op. Uploads, replacements,
   // deletions and resolutions still verify actual content, not size or mtime.
   const cached = context.cached.get(path);
@@ -315,6 +376,27 @@ const planAndRunCandidate = async (context: FavoriteContext, candidate: Favorite
     candidate.remote.modifiedMs === baseline.modifiedMs;
   const local = candidate.local ? { size: candidate.local.sizeBytes,
     hash: unchanged ? baseline.hash : await hashLocal(context, path) } : undefined;
+  if (candidate.uploadOnly && local) {
+    // Local edits outside the favorite selection are upload-only. Never
+    // download an unrelated peer change or propagate a deletion implicitly.
+    if (baseline && local.hash === baseline.hash) {
+      await context.documents.setSyncBaseline(id, { ...baseline, localDeletion: undefined, versionKey: cached?.localVersionKey });
+      return { folderId: context.folderId, path, result: "unchanged" };
+    }
+    const evidence = await context.remoteFs.indexedFile(context.folderId, path);
+    const conflict = evidence && (evidence.invalid || evidence.type !== "file" ||
+      (!baseline && !evidence.deleted) || (baseline && (evidence.deleted ||
+        evidence.size !== baseline.sizeBytes || evidence.modifiedMs !== baseline.modifiedMs ||
+        !await matchesRemoteBaseline(context, path, baseline))));
+    if (conflict || (baseline && !evidence)) {
+      const entry = await recordIssue(context, path, "conflict", "Local document and peer contents differ; both copies were preserved.");
+      return { folderId: context.folderId, path, result: "conflict", message: entry.message };
+    }
+    if ((await context.remoteFs.getFolderSyncState(context.folderId))?.indexReceived !== true)
+      return { folderId: context.folderId, path, result: "waiting", message: "Waiting for peer index." };
+    context.reportTransfer?.("upload");
+    return runUpload(context, path, local);
+  }
   const action = planFavoriteSync({ local, remote: candidate.remote, baseline });
   switch (action.kind) {
     case "unchanged":
@@ -322,7 +404,14 @@ const planAndRunCandidate = async (context: FavoriteContext, candidate: Favorite
       return { folderId: context.folderId, path, result: "unchanged" };
     case "download": context.reportTransfer?.("download"); return runDownload(context, path, candidate.remote!, action.expectedLocalHash);
     case "upload": context.reportTransfer?.("upload"); return runUpload(context, path, local!);
-    case "delete-remote": context.reportTransfer?.("delete"); return runDeleteRemote(context, path);
+    case "delete-remote": {
+      const evidence = await context.remoteFs.indexedFile(context.folderId, path);
+      if (!evidence || evidence.deleted || evidence.invalid || evidence.type !== "file" ||
+          evidence.size !== baseline?.sizeBytes || evidence.modifiedMs !== baseline.modifiedMs)
+        return { folderId: context.folderId, path, result: "waiting", message: "Waiting for verified peer metadata before deletion." };
+      context.reportTransfer?.("delete");
+      return runDeleteRemote(context, path, baseline!);
+    }
     case "delete-local": context.reportTransfer?.("delete"); return runDeleteLocal(context, path);
     default: {
       const entry = await recordIssue(context, path, "conflict", action.message);
@@ -445,6 +534,23 @@ const syncFolderFavorites = async (args: {
     exclusions: activeExclusions, patterns: activePatterns,
     remote, local: cached.map(file => ({ path: file.path, sizeBytes: file.sizeBytes, modifiedMs: file.modifiedMs ?? file.cachedAtMs })),
     baselines });
+  // A Save As or edit in an attached folder is explicit local publication,
+  // not a request to favorite or download all remote contents. All downloaded
+  // documents have an authenticated baseline; version changes identify edits.
+  const selected = new Set(candidates.map(candidate => candidate.path));
+  const rootSelection: FavoriteRecord[] = [{ folderId: folder.id, path: "", name: folder.label,
+    key: favoriteKey(folder.id, "", "folder"), kind: "folder" }];
+  for (const file of cached) {
+    if (selected.has(file.path) || isInternalReplicaPath(file.path) ||
+        (file.syncBaseline && file.syncBaseline.versionKey === file.localVersionKey && !file.syncBaseline.localDeletion)) continue;
+    const target = { folderId: folder.id, path: file.path, kind: "file" as const };
+    if (classifyFavoritePath(target, rootSelection, activeExclusions, activePatterns).status !== "favorite") continue;
+    const indexed = await remoteFs.indexedFile(folder.id, file.path);
+    candidates.push({ path: file.path, uploadOnly: true,
+      ...(indexed && !indexed.deleted && !indexed.invalid && indexed.type === "file"
+        ? { remote: { size: indexed.size, modifiedMs: indexed.modifiedMs } } : {}),
+      local: { sizeBytes: file.sizeBytes, modifiedMs: file.modifiedMs ?? file.cachedAtMs, baseline: file.syncBaseline } });
+  }
   itemCount = candidates.length;
   for (const [index, candidate] of candidates.entries()) {
     // Never interrupt a publication, deletion, or rename transaction. Discard
@@ -481,8 +587,9 @@ export async function syncServiceFileFavorites(
     .map(folder => [folder.id, folder]));
   const folderInfos = new Map((await remoteFs.listFolders()).map(folder => [folder.id, folder]));
   const results: FavoriteSyncResult[] = [];
-  const targets = Object.entries(settings.folders).filter(([folderId, value]) =>
-    registered.has(folderId) && !value.paused && value.favorites.length > 0);
+  const targets = [...registered.keys()].filter(folderId => folderInfos.has(folderId))
+    .map(folderId => [folderId, settings.folders[folderId] ?? defaultFolderSettings()] as const)
+    .filter(([, value]) => !value.paused);
   const report = (progress: FavoriteSyncProgress) => {
     // Diagnostics must never be allowed to break synchronization.
     try { options.onProgress?.(progress); } catch { /* nonessential */ }

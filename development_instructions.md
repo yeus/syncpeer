@@ -53,14 +53,17 @@ This project should prefer explicit, minimal, functional-style architecture.
   - active transfer under load,
   - explicit state transition correctness.
 
-## Release Candidate Policy
+## Release Lifecycle Policy
 
-- Release candidates are the boundary between automated acceptance and real-world validation.
-- Do not publish an RC until every test and acceptance gate that can reasonably be run automatically in local development, CI, the sandbox, emulators, synthetic fixtures, or explicitly configured external test infrastructure has passed for the intended release scope.
-- Before an RC, reconcile `SYSTEM_DEFINITION.csv` so automated evidence and known limitations are current, and do not carry a known reproducible automated blocker into the RC.
-- RC validation is specifically for evidence that requires or materially benefits from real environments: physical devices, real user workflows, real networks/NAT/firewalls, install/upgrade behavior, true lifecycle/power-loss conditions, interoperability, usability, and similar field conditions.
-- Failures discovered during RC validation must be fixed and the relevant automated regression added where practical before the stable release.
-- The stable release is prepared only after the RC has received sufficient real-device/real-world validation and no release-blocking issue remains.
+- Follow the development → numbered alpha → numbered RC → stable lifecycle in AGENTS.md.
+- Complete every feasible automated acceptance gate for the intended release scope before
+  preparing alpha. Keep SYSTEM_DEFINITION.csv current; never carry a known automated blocker.
+- Use alpha for maintainer manual acceptance, including actual installation, pairing,
+  synchronization and recovery. Iterate alpha versions until accepted.
+- Only then publish rc.1 for sustained field validation: real devices, networks/NAT/firewalls,
+  lifecycle/power loss, interoperability, OEM power management and actual workflows.
+- Fix RC defects with regressions where practical, repeat relevant acceptance, and issue later
+  numbered candidates. Stable requires accepted field evidence and no release blockers.
 
 ## Style and Quality
 

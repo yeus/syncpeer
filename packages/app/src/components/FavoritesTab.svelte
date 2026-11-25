@@ -94,7 +94,15 @@
           downloadProgressText: activeDownload?.text ?? "",
           downloadProgressPercent: activeDownload?.progressPercent ?? 0,
           syncPhase: syncState?.phase,
-          syncMessage: syncState?.message,
+          syncMessage: syncState?.message ?? (app.favorites.pausedFolderIds.has(favorite.folderId)
+            ? "Folder synchronization paused"
+            : !app.session.isConnected ? "Waiting for peer connection"
+            : app.localFolders.some(folder => folder.id === favorite.folderId && folder.browseOnly)
+              ? "Local storage released; reconnect folder storage to sync"
+              : favorite.kind === "folder" ? "Selected for recursive synchronization"
+              : syncState?.phase === "synced" && app.favorites.cachedFileKeys.has(`${favorite.folderId}:${favorite.path}`)
+                ? "Synchronized"
+                : "Waiting for synchronization"),
           syncRetryText: retryInMs > 0 ? formatRetryDelay(retryInMs) : "",
         };
       },

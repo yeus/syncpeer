@@ -32,12 +32,13 @@ export const directoryPlaceholder = ({
 };
 
 /** An unconfirmed peer may need remote approval, but the local UI cannot verify that. */
-export const savedPeerUiState = ({ connected, connecting, confirmed }: {
-  connected: boolean; connecting: boolean; confirmed: boolean;
+export const savedPeerUiState = ({ isConnected, isConnecting, confirmed }: {
+  isConnected: boolean; isConnecting: boolean; confirmed: boolean;
 }) => ({
-  label: connected ? "connected" : !confirmed ? "Waiting for approval"
-    : connecting ? "connecting…" : "offline",
-  canConnect: !connecting,
+  label: isConnected ? "connected" : !confirmed ? "Waiting for approval"
+    : isConnecting ? "connecting…" : "offline",
+  tone: isConnected ? "online" as const : "offline" as const,
+  canConnect: !isConnecting,
 });
 
 /** Network connectivity does not prove metadata or bytes are synchronized. */

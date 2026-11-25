@@ -36,15 +36,17 @@ test("directory refresh never replaces an existing listing with a placeholder", 
   assert.match(directoryPlaceholder({ hasEntries: true, loading: false, status: "locked" }) ?? "", /locked/i);
 });
 
-test("an unconfirmed active peer attempt shows likely approval and hides redundant Connect", () => {
-  assert.deepEqual(savedPeerUiState({ connected: false, connecting: true, confirmed: false }),
-    { label: "Waiting for approval", canConnect: false });
-  assert.deepEqual(savedPeerUiState({ connected: false, connecting: false, confirmed: false }),
-    { label: "Waiting for approval", canConnect: true });
-  assert.deepEqual(savedPeerUiState({ connected: false, connecting: true, confirmed: true }),
-    { label: "connecting…", canConnect: false });
-  assert.deepEqual(savedPeerUiState({ connected: true, connecting: false, confirmed: true }),
-    { label: "connected", canConnect: true });
+test("saved peer status uses the row's connection flags for both label and color", () => {
+  assert.deepEqual(savedPeerUiState({ isConnected: false, isConnecting: true, confirmed: false }),
+    { label: "Waiting for approval", tone: "offline", canConnect: false });
+  assert.deepEqual(savedPeerUiState({ isConnected: false, isConnecting: false, confirmed: false }),
+    { label: "Waiting for approval", tone: "offline", canConnect: true });
+  assert.deepEqual(savedPeerUiState({ isConnected: false, isConnecting: true, confirmed: true }),
+    { label: "connecting…", tone: "offline", canConnect: false });
+  assert.deepEqual(savedPeerUiState({ isConnected: true, isConnecting: false, confirmed: true }),
+    { label: "connected", tone: "online", canConnect: true });
+  assert.deepEqual(savedPeerUiState({ isConnected: false, isConnecting: false, confirmed: true }),
+    { label: "offline", tone: "offline", canConnect: true });
 });
 
 test("connected folder status does not claim synchronization before indexes and unlock", () => {

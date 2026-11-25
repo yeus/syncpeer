@@ -194,10 +194,15 @@ export const loadDirectorySideEffects = async (
   state.session.lastUpdatedAt = nowTime();
   // Preserve the last valid remote listing before any optional cache-status I/O.
   saveOfflineDirectorySnapshot(state, sourceDeviceId);
-  await refreshCachedStatuses(state, client, folderId, entries.map(entry => entry.path));
-  // A registered browse-only folder has no writable local replica. Only
-  // download-attached/local document folders can persist offline snapshots.
+  // The remote snapshot stays remote-only; local documents are an independent overlay.
   const local = state.localFolders.find(folder => folder.id === folderId);
+  const localEntries = local && !local.browseOnly
+    ? await client.listLocalDirectory(folderId, path).catch(() => null) : null;
+  if (state.session.currentFolderId !== folderId || state.session.currentPath !== path ||
+      activeSourceDeviceId(state) !== sourceDeviceId) return;
+  state.session.localDirectoryOverlay = localEntries ? { folderId, path, sourceDeviceId, entries: localEntries } : null;
+  await refreshCachedStatuses(state, client, folderId, [...new Set([...entries, ...(localEntries ?? [])].map(entry => entry.path))]);
+  // A registered browse-only folder has no writable local replica.
   if (!local || local.browseOnly) return;
   await client.saveDirectorySnapshot(folderId, sourceDeviceId, path,
     { entries, versionKey, loadedAtMs: Date.now() });

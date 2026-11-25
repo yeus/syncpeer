@@ -408,6 +408,9 @@
         {:else}
           <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
         {/if}
+        {#if (!item.syncPhase || item.syncPhase === "synced") && item.syncMessage}
+          <div class="item-meta">{item.syncMessage}</div>
+        {/if}
         {#if item.syncPhase && item.syncPhase !== "synced"}
           <div class="item-meta" data-testid={`favorite-sync-${item.path}`}>
             {#if item.syncPhase === "conflict"}Conflict
@@ -504,6 +507,9 @@
         <div class="item-meta item-progress-text">Download: {item.downloadProgressText}</div>
       {:else}
         <div class="item-meta">{item.folderId}:{item.path || "/"}</div>
+      {/if}
+      {#if (!item.syncPhase || item.syncPhase === "synced") && item.syncMessage}
+        <div class="item-meta">{item.syncMessage}</div>
       {/if}
       {#if item.syncPhase && item.syncPhase !== "synced"}
         <div class="item-meta" data-testid={`favorite-sync-${item.path}`}>

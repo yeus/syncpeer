@@ -97,7 +97,7 @@ export interface SavedDeviceRow {
       <StatusChip small>introducer</StatusChip>
     {/if}
     {#if row.kind === "saved" && peerUi}
-      <StatusChip tone={row.isConnected ? "online" : "offline"} small
+      <StatusChip tone={peerUi.tone} small
         title={!row.confirmed ? "No successful connection yet. Remote approval may still be required; check the other device." : undefined}>
         {peerUi.label}
       </StatusChip>

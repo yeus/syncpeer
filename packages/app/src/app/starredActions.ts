@@ -19,6 +19,7 @@ import {
 } from "./actionSupport.ts";
 import { updateCachedKey } from "./downloadPolicies.ts";
 import { pushSessionLog, type AppState } from "./state.ts";
+import { refreshCachedStatuses } from "./cacheStatusActions.ts";
 import type { TransferRuntime } from "./transferRuntime.ts";
 
 type StarredActionArgs = {
@@ -507,7 +508,7 @@ const syncStarredFiles = async (args: StarredActionArgs): Promise<void> => {
   await new StarredSyncRun(args).run();
 };
 
-const loadFavoriteSyncStates = async ({ state, client }: StarredActionArgs) => {
+const loadFavoriteSyncStates = async ({ state, client, androidServiceOwned }: StarredActionArgs) => {
   if (!client.listFavoriteSyncStates) return;
   const folderIds = [...new Set(state.favorites.items.map(item => item.folderId))];
   if (folderIds.length === 0) {
@@ -519,6 +520,15 @@ const loadFavoriteSyncStates = async ({ state, client }: StarredActionArgs) => {
     const states = await client.listFavoriteSyncStates(folderIds);
     state.sync.favoriteSyncStates = Object.fromEntries(states.flatMap(snapshot =>
       snapshot.entries.map(entry => [`${snapshot.folderId}:${entry.path}`, entry])));
+    // Native service downloads do not use the UI transfer tracker. Refresh
+    // the cached badges for favorites even when their directory isn't open.
+    if (androidServiceOwned) {
+      for (const folderId of folderIds) {
+        const paths = state.favorites.items.filter(item => item.folderId === folderId && item.kind === "file")
+          .map(item => item.path);
+        await refreshCachedStatuses(state, client, folderId, paths).catch(() => undefined);
+      }
+    }
   } catch (error) {
     reportActionError(state, "favorite.sync_state.failed", error);
   } finally {

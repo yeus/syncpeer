@@ -11,7 +11,7 @@ import {
   routeToHash,
   type AppRoute,
 } from "../packages/app/src/app/navigation.ts";
-import { createInitialState, type AppState } from "../packages/app/src/app/state.ts";
+import { createInitialState, visibleDirectoryEntries, type AppState } from "../packages/app/src/app/state.ts";
 
 type Listener = () => void;
 
@@ -211,6 +211,80 @@ test("Back reverses tab and folder actions in chronological order", async () => 
   assert.equal(state.activeTab, "favorites");
   assert.equal(state.session.currentFolderId, "");
   stop();
+});
+
+test("async folder navigation records the previous directory instead of replacing it", async () => {
+  const state = createInitialState(null);
+  state.activeTab = "folders";
+  const harness = createHistoryHarness();
+  let release!: () => void;
+  let gate = Promise.resolve();
+  const base = createBaseActions(state);
+  let notify = () => {};
+  const visit = async (folderId: string, path: string) => {
+    await gate;
+    state.session.currentFolderId = folderId;
+    state.session.currentPath = path;
+    notify();
+  };
+  const actions = createNavigableAppActions({
+    ...harness, state, actions: {
+      ...base,
+      openFolderRoot: folderId => visit(folderId, ""),
+      openDirectory: path => visit("photos", path),
+      goToBreadcrumb: segment => visit(segment.targetFolderId, segment.targetPath),
+    },
+  });
+  notify = actions.syncNavigationRoute;
+  actions.startNavigation();
+  gate = new Promise<void>(resolve => { release = resolve; });
+  const opening = actions.openFolderRoot("photos");
+  assert.equal(harness.entries.length, 1);
+  release();
+  await opening;
+  assert.equal(harness.entries.length, 2);
+  await actions.openDirectory("holiday");
+  await actions.openDirectory("holiday/beach");
+  await actions.goToBreadcrumb({ key: "holiday", label: "holiday",
+    targetFolderId: "photos", targetPath: "holiday" });
+  assert.equal(harness.entries.length, 5);
+  for (const [folder, path] of [["photos", "holiday/beach"], ["photos", "holiday"], ["photos", ""], ["", ""]]) {
+    harness.history.back();
+    await flush();
+    assert.equal(state.session.currentFolderId, folder);
+    assert.equal(state.session.currentPath, path);
+    assert.equal(state.activeTab, "folders");
+    assert.equal(harness.location.hash, routeToHash(routeFromState(state)));
+  }
+});
+
+test("offline asynchronous navigation without a session notification still records history", async () => {
+  const state = createInitialState(null);
+  state.activeTab = "folders";
+  const harness = createHistoryHarness();
+  const actions = createNavigableAppActions({
+    ...harness, state, actions: {
+      ...createBaseActions(state),
+      openFolderRoot: async folderId => {
+        await Promise.resolve();
+        state.session.currentFolderId = folderId;
+      },
+      openDirectory: async path => {
+        await Promise.resolve();
+        state.session.currentPath = path;
+      },
+    },
+  });
+  actions.startNavigation();
+  await actions.openFolderRoot("photos");
+  await actions.openDirectory("holiday");
+  assert.equal(harness.entries.length, 3);
+  harness.history.back();
+  await flush();
+  assert.equal(state.session.currentPath, "");
+  harness.history.back();
+  await flush();
+  assert.equal(state.session.currentFolderId, "");
 });
 
 test("folder settings have a URL and Back restores the previous folder without adding a tab", async () => {
@@ -433,4 +507,17 @@ test("a service-connected peer needs no redundant foreground LAN discovery or re
   await actions.onAppForeground();
   await actions.onNetworkOnline();
   assert.deepEqual(calls, ["foreground:true", "online:true"]);
+});
+
+test("folder view merges local Save As documents with the remote list and hides .stfolder", () => {
+  const state = createInitialState(null);
+  state.session.currentFolderId = "folder";
+  const file = (path: string, size: number) => ({ path, name: path.split("/").at(-1)!, type: "file" as const, size, modifiedMs: 1 });
+  state.session.entries = [file("remote.txt", 1), file("same.txt", 2),
+    { ...file(".stfolder", 0), type: "directory" }];
+  state.session.localDirectoryOverlay = { folderId: "folder", path: "", sourceDeviceId: "", entries: [file("saved.txt", 3), file("same.txt", 4)] };
+  assert.deepEqual(visibleDirectoryEntries(state).map(entry => [entry.path, entry.size]),
+    [["remote.txt", 1], ["same.txt", 2], ["saved.txt", 3]]);
+  state.session.currentPath = "other";
+  assert.equal(visibleDirectoryEntries(state).some(entry => entry.path === "saved.txt"), false);
 });

@@ -359,6 +359,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
       currentFolderId: "",
       currentPath: "",
       entries: [] as FileEntry[],
+      localDirectoryOverlay: null as { folderId: string; path: string; sourceDeviceId: string; entries: FileEntry[] } | null,
       currentFolderVersionKey: "",
       lastUpdatedAt: "",
       activeConnectDeviceId: "",
@@ -980,12 +981,17 @@ export const connectTargetLabel = (state: AppState) => {
   return savedName ? `${savedName} (${targetId})` : targetId;
 };
 
-export const visibleDirectoryEntries = (state: AppState) =>
-  sortAndFilterFileEntries(
-    state.session.entries,
-    state.ui.directorySortMode,
-    state.ui.directoryNameFilter,
-  );
+export const visibleDirectoryEntries = (state: AppState) => {
+  const { entries, localDirectoryOverlay, currentFolderId, currentPath } = state.session;
+  const merged = new Map(entries.map(entry => [entry.path, entry]));
+  if (localDirectoryOverlay?.folderId === currentFolderId && localDirectoryOverlay.path === currentPath &&
+      localDirectoryOverlay.sourceDeviceId === activeSourceDeviceId(state)) {
+    for (const entry of localDirectoryOverlay.entries) {
+      if (!merged.has(entry.path)) merged.set(entry.path, entry);
+    }
+  }
+  return sortAndFilterFileEntries([...merged.values()], state.ui.directorySortMode, state.ui.directoryNameFilter);
+};
 
 export const directoryTotalPages = (state: AppState) =>
   Math.max(1, Math.ceil(visibleDirectoryEntries(state).length / state.ui.directoryPageSize));

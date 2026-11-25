@@ -40,6 +40,7 @@ export const sortAndFilterFileEntries = (
 ): FileEntry[] => {
   const query = nameFilter.trim().toLocaleLowerCase();
   return entries
-    .filter((entry) => query === "" || entry.name.toLocaleLowerCase().includes(query))
+    .filter(entry => entry.path.split("/")[0] !== ".stfolder" &&
+      (query === "" || entry.name.toLocaleLowerCase().includes(query)))
     .sort(compareEntries(sortMode));
 };

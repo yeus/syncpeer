@@ -153,6 +153,7 @@ type NavigationRuntime = {
   readonly events: NavigationEvents;
   started: boolean;
   restoring: boolean;
+  pendingAction: { key: string | null } | null;
   recording: boolean;
   restoreToken: number;
   sequence: number;
@@ -165,6 +166,7 @@ type NavigationHistoryOperations = {
   readonly replaceRoute: (route: AppRoute) => void;
   readonly syncCurrentRoute: () => void;
   readonly pushCurrentRoute: () => string | null;
+  readonly recordCurrentRoute: () => void;
   readonly reconcileRoute: (key: string) => void;
 };
 
@@ -179,6 +181,7 @@ const createNavigationRuntime = (args: {
   started: false,
   restoring: false,
   recording: false,
+  pendingAction: null,
   restoreToken: 0,
   sequence: 0,
   pendingRoute: null,
@@ -199,6 +202,10 @@ const createHistoryOperations = (runtime: NavigationRuntime): NavigationHistoryO
       runtime.restoring ||
       runtime.recording
     ) return;
+    if (runtime.pendingAction) {
+      recordCurrentRoute();
+      return;
+    }
     const route = currentRoute();
     if (
       runtime.location.hash !== routeToHash(route) ||
@@ -218,7 +225,13 @@ const createHistoryOperations = (runtime: NavigationRuntime): NavigationHistoryO
     const route = currentRoute();
     if (runtime.location.hash !== routeToHash(route)) replaceRoute(route);
   };
-  return { currentState, replaceRoute, syncCurrentRoute, pushCurrentRoute, reconcileRoute };
+  const recordCurrentRoute = (): void => {
+    const pending = runtime.pendingAction;
+    if (!pending) return;
+    if (pending.key) reconcileRoute(pending.key);
+    else pending.key = pushCurrentRoute();
+  };
+  return { currentState, replaceRoute, syncCurrentRoute, pushCurrentRoute, reconcileRoute, recordCurrentRoute };
 };
 
 const createNavigationRecorder = (
@@ -235,22 +248,31 @@ const createNavigationRecorder = (
     action: (...values: Args) => Result,
   ) => (...values: Args): Result => {
     cancelRestore();
+    historyOperations.recordCurrentRoute();
+    const pending = { key: null as string | null };
+    runtime.pendingAction = pending;
     runtime.pendingRoute = null;
     runtime.routeCameFromUrl = false;
     runtime.recording = true;
     let result: Result;
     try {
       result = action(...values);
+    } catch (error) {
+      runtime.pendingAction = null;
+      throw error;
     } finally {
       runtime.recording = false;
     }
-    const key = historyOperations.pushCurrentRoute();
-    if (key && result instanceof Promise) {
-      void result.then(
-        () => historyOperations.reconcileRoute(key),
-        () => historyOperations.reconcileRoute(key),
-      );
-    }
+    historyOperations.recordCurrentRoute();
+    const finish = () => {
+      // An async directory action may change the route after its first await.
+      // Only its own current history entry may be created or reconciled.
+      if (runtime.pendingAction !== pending) return;
+      historyOperations.recordCurrentRoute();
+      runtime.pendingAction = null;
+    };
+    if (result instanceof Promise) void result.then(finish, finish);
+    else finish();
     return result;
   };
   return { recordAction };
@@ -320,6 +342,7 @@ const createRouteOperations = (
     return restoreRoute(requested, finalize);
   };
   const handlePopState = (): void => {
+    runtime.pendingAction = null;
     const route = routeFromHash(runtime.location.hash);
     if (!route) {
       historyOperations.syncCurrentRoute();
@@ -343,6 +366,7 @@ const createRouteOperations = (
     }
     runtime.events.addEventListener("popstate", handlePopState);
     return () => {
+      runtime.pendingAction = null;
       runtime.events.removeEventListener("popstate", handlePopState);
       runtime.started = false;
     };

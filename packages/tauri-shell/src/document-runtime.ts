@@ -23,7 +23,7 @@ import { startIncomingPeerService } from "../../core/src/sync/incomingPeerServic
 import { resolveFolderPasswordsForDevice } from "../../core/src/ui/sessionPasswords.js";
 import { resolveApprovedPeerDeviceIds, resolveIncomingPeerDeviceIds } from "../../core/src/sync/personalSpaceSharing.js";
 import { sameDeviceId } from "../../core/src/ui/helpers.js";
-import { syncServiceFileFavorites, type FavoriteSyncProgress } from "../../core/src/sync/serviceFavoriteSync.js";
+import { syncServiceFileFavorites, createFavoriteSyncMemo, type FavoriteSyncProgress } from "../../core/src/sync/serviceFavoriteSync.js";
 import { executeServiceRemoteCommand } from "../../core/src/sync/serviceRemoteCommands.js";
 import { createServiceDownloadBridge } from "../../core/src/sync/serviceDownloadBridge.js";
 import { createServiceTransferJobs } from "../../core/src/sync/serviceTransferJobs.js";
@@ -213,6 +213,7 @@ async function createDocuments(android: AndroidRuntime, onBootstrapStage: (stage
   onBootstrapStage("filesystem-initialize");
   await documents.initialize();
   onBootstrapStage("ready");
+  const favoriteMemo = createFavoriteSyncMemo();
   return {
     command: (input: unknown) => dispatchDocumentCommandWithSessionConfiguration(
       documents, input, invalidateSessionConfiguration),
@@ -236,7 +237,7 @@ async function createDocuments(android: AndroidRuntime, onBootstrapStage: (stage
     read: documents.read,
     syncFavorites: (remoteFs: Parameters<typeof syncServiceFileFavorites>[1], excludeFolderIds: readonly string[],
       onProgress?: (progress: FavoriteSyncProgress) => void, shouldYield?: () => boolean) =>
-      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds, onProgress, shouldYield }),
+      syncServiceFileFavorites(documents, remoteFs, { excludeFolderIds, onProgress, shouldYield, memo: favoriteMemo }),
   };
 }
 
@@ -283,6 +284,8 @@ class AndroidSessionRuntime {
   });
 
   private readonly transferScheduler = createServiceTransferScheduler();
+  private lastInteractiveDirectory = "";
+  private lastMemorySampleAtMs = 0;
   private readonly transferJobs: ReturnType<typeof createServiceTransferJobs>;
   private peerStatusUnsubscribe: (() => void) | null = null;
 
@@ -656,9 +659,21 @@ class AndroidSessionRuntime {
           if (scheduled !== null) clearTimeout(scheduled);
           dispatch();
         } else if (scheduled === null) scheduled = setTimeout(dispatch, delay);
-      }, shouldYield);
+      }, () => shouldYield() || session.isClosed() || this.lifecycle.getSession() !== session);
     } finally {
       if (scheduled !== null) clearTimeout(scheduled);
+      const now = Date.now();
+      if (now - this.lastMemorySampleAtMs >= 60_000) {
+        this.lastMemorySampleAtMs = now;
+        // Chromium may expose this, but JavaScriptSandbox generally does not.
+        const memory = (globalThis.performance as (Performance & { memory?: {
+          usedJSHeapSize: number; totalJSHeapSize: number; jsHeapSizeLimit: number;
+        } }) | undefined)?.memory;
+        void this.nativeRequest({ operation: "diagnostic", event: "core.runtime.memory_sample",
+          ...session.remoteFs.indexDiagnostics(), jsHeapAvailable: !!memory,
+          jsHeapUsedBytes: memory?.usedJSHeapSize ?? 0, jsHeapTotalBytes: memory?.totalJSHeapSize ?? 0,
+          jsHeapLimitBytes: memory?.jsHeapSizeLimit ?? 0 }).catch(() => undefined);
+      }
       dispatch();
     }
   });
@@ -778,8 +793,13 @@ class AndroidSessionRuntime {
           throw new Error("The active peer session cannot update folder credentials.");
         }
         const folderPasswords = request.folderPasswords as Record<string, string>;
-        await session.updateFolderPasswords(folderPasswords);
+        // Persist the requested credential view before hydration, so reconnects
+        // cannot reuse stale options if the peer closes during a large unlock.
+        const unchanged = JSON.stringify(this.activeOptions?.folderPasswords ?? {}) === JSON.stringify(folderPasswords);
         if (this.activeOptions) this.activeOptions = { ...this.activeOptions, folderPasswords: { ...folderPasswords } };
+        // Credential changes interrupt background planning but never a committed write.
+        await (unchanged ? session.updateFolderPasswords(folderPasswords) :
+          this.transferScheduler.runInteractive(() => session.updateFolderPasswords!(folderPasswords)));
         return { updated: true };
       }
       case "transferJobStart": return this.transferJobs.start({
@@ -800,6 +820,13 @@ class AndroidSessionRuntime {
         const session = this.lifecycle.getSession();
         if (!session || session.isClosed()) {
           throw new Error("No service-owned peer session is connected.");
+        }
+        if (request.operation === "readDir" && (request.offset ?? 0) === 0) {
+          const key = JSON.stringify([request.folderId, request.path]);
+          if (key !== this.lastInteractiveDirectory) {
+            this.lastInteractiveDirectory = key;
+            return this.transferScheduler.runInteractive(() => executeServiceRemoteCommand(session, request));
+          }
         }
         return executeServiceRemoteCommand(session, request);
       }

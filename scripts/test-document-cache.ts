@@ -335,6 +335,29 @@ test("cached status reads do not touch encrypted storage while the vault is lock
   assert.deepEqual(requests, ["cacheRegistrations"]);
 });
 
+test("concurrent cached status requests share one fresh registry read", async () => {
+  let reads = 0, locked = false;
+  const cache = createDocumentCache({ enabled: () => true,
+    request: async <T>(input: Record<string, unknown>) => {
+      if (input.operation === "cacheRegistrations") {
+        reads++;
+        await new Promise(resolve => setTimeout(resolve, 5));
+        return { vault: { phase: locked ? "locked" : "unlocked" },
+          folders: [{ id: "photos", downloads: true }] } as T;
+      }
+      if (input.operation === "cachedStatuses") return [] as T;
+      throw new Error("Unexpected command");
+    },
+    legacy: {}, openLegacySource: async () => { throw new Error("No legacy files"); }, show: async () => {},
+  });
+  await Promise.all(Array.from({ length: 9 }, () => cache.platformAdapter.getCachedStatuses!("photos", [""])));
+  assert.equal(reads, 1);
+  locked = true;
+  assert.deepEqual(await cache.platformAdapter.getCachedStatuses!("photos", [""]), []);
+  assert.equal(reads, 2, "No stale registry or vault status survives a completed request");
+});
+
+
 test("opening a folder waits for encrypted attachment migration to finish", async () => {
   let releaseAttach!: () => void;
   let markAttachStarted!: () => void;

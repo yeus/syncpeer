@@ -280,6 +280,7 @@ const renameFavorite = async (context: FavoriteContext, from: string, to: string
 
 const runRenames = async (context: FavoriteContext, results: FavoriteSyncResult[]): Promise<boolean> => {
   const renames = [...context.renames];
+  if (!renames.length) return true;
   const pairs = planFavoriteRenames([...context.cached.keys()], renames);
   const paired = new Set(pairs.map(pair => pair.from));
   // An interrupted rename with no cached target is not a deletion request.
@@ -448,15 +449,28 @@ const favoriteFolderResults = (folderId: string, favorites: readonly FavoriteRec
   result: FavoriteSyncResult["result"], message: string): FavoriteSyncResult[] =>
   favorites.map(favorite => ({ folderId, path: normalizePath(favorite.path), result, message }));
 
+// Only reuse a fully successful, unchanged run, and periodically audit even
+// private storage to recover from unexpected external corruption/disappearance.
+export const createFavoriteSyncMemo = () => new WeakMap<RemoteFs, Map<string, {
+  remote: number; local: number; storageId: string; settings: string; checkedAtMs: number;
+}>>();
+const FULL_RECONCILIATION_INTERVAL_MS = 120_000;
+
 const collectRemoteFavorites = async (args: {
   remoteFs: RemoteFs;
   folderId: string;
   favorites: readonly FavoriteRecord[];
   exclusions: readonly FavoriteExclusion[];
   patterns: readonly string[];
+  shouldYield?: () => boolean;
   onDirectory?: (path: string, entries: FileEntry[]) => Promise<void> | void;
 }) => collectFavoriteFiles({ folderId: args.folderId, favorites: args.favorites, exclusions: args.exclusions,
-  patterns: args.patterns, readDir: path => args.remoteFs.readDir(args.folderId, path),
+  patterns: args.patterns, readDir: async path => {
+    if (args.shouldYield?.()) throw new Error("Interactive work has priority.");
+    const entries = await args.remoteFs.readDir(args.folderId, path);
+    if (args.shouldYield?.()) throw new Error("Interactive work has priority.");
+    return entries;
+  },
   ...(args.onDirectory ? { onDirectory: args.onDirectory } : {}) });
 
 const syncFolderFavorites = async (args: {
@@ -467,6 +481,7 @@ const syncFolderFavorites = async (args: {
   exclusions: FavoriteExclusion[];
   patterns: string[];
   nowMs: number;
+  onClean?: () => void;
   shouldYield?: () => boolean;
   report?: (stage: FavoriteSyncProgress["stage"], itemOrdinal?: number, itemCount?: number,
     transferredBytes?: number, totalBytes?: number) => void;
@@ -521,8 +536,9 @@ const syncFolderFavorites = async (args: {
   let remote: FileEntry[];
   try {
     remote = await collectRemoteFavorites({ remoteFs, folderId: folder.id, favorites: activeFavorites,
-      exclusions: activeExclusions, patterns: activePatterns, ...(onDirectory ? { onDirectory } : {}) });
+      exclusions: activeExclusions, patterns: activePatterns, shouldYield, ...(onDirectory ? { onDirectory } : {}) });
   } catch (error) {
+    if (shouldYield?.()) return results.concat(deferred());
     const message = error instanceof Error ? error.message : "Folder contents are unavailable.";
     return results.concat(favoriteFolderResults(folder.id, activeFavorites, "unavailable", message));
   }
@@ -567,6 +583,7 @@ const syncFolderFavorites = async (args: {
     context.entries = retained;
     await context.persist();
   }
+  if (!shouldYield?.() && results.every(result => result.result === "unchanged")) args.onClean?.();
   return results;
 };
 
@@ -574,12 +591,19 @@ export async function syncServiceFileFavorites(
   documents: DocumentFilesystem,
   remoteFs: RemoteFs,
   options: { nowMs?: number; excludeFolderIds?: readonly string[];
-    onProgress?: (progress: FavoriteSyncProgress) => void; shouldYield?: () => boolean } = {},
+    onProgress?: (progress: FavoriteSyncProgress) => void; shouldYield?: () => boolean;
+    memo?: ReturnType<typeof createFavoriteSyncMemo> } = {},
 ): Promise<{ skipped?: "locked"; yielded?: true; results: FavoriteSyncResult[] }> {
   if (options.shouldYield?.()) return { yielded: true, results: [] };
   const nowMs = options.nowMs ?? Date.now();
   const status = await documents.status();
   if (status.vault.phase !== "unlocked") return { skipped: "locked", results: [] };
+  const memo = options.memo;
+  let cleanFolders = memo?.get(remoteFs);
+  if (memo && !cleanFolders) {
+    cleanFolders = new Map();
+    memo.set(remoteFs, cleanFolders);
+  }
   const settings = await documents.profileSettings();
   const excluded = new Set(options.excludeFolderIds ?? []);
   const registered = new Map(status.folders
@@ -613,8 +637,26 @@ export async function syncServiceFileFavorites(
           "Folder metadata is unavailable for synchronization."));
         continue;
       }
+      const remoteRevision = remoteFs.folderSyncRevision?.(folderId);
+      const localRevision = documents.favoriteSyncRevision();
+      const selection = JSON.stringify(folderSettings);
+      const previous = cleanFolders?.get(folderId);
+      if (remoteRevision !== undefined && previous && previous.remote === remoteRevision &&
+          previous.local === localRevision && previous.storageId === folder.storageId &&
+          previous.settings === selection && nowMs >= previous.checkedAtMs &&
+          nowMs - previous.checkedAtMs < FULL_RECONCILIATION_INTERVAL_MS) continue;
+      cleanFolders?.delete(folderId);
       results.push(...await syncFolderFavorites({ documents, remoteFs, folder, favorites,
-        exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs, report: emit, shouldYield: options.shouldYield }));
+        exclusions: folderSettings.exclusions, patterns: folderSettings.ignorePatterns, nowMs, report: emit,
+        shouldYield: options.shouldYield,
+        onClean: () => {
+          if (remoteRevision !== undefined && remoteFs.folderSyncRevision?.(folderId) === remoteRevision &&
+              documents.favoriteSyncRevision() === localRevision) cleanFolders?.set(folderId, {
+            remote: remoteRevision, local: localRevision, storageId: folder.storageId,
+            settings: selection, checkedAtMs: nowMs,
+          });
+        },
+      }));
     } catch (error) {
       // A transient failure on one folder must not prevent all other favorites syncing.
       results.push(...favoriteFolderResults(folderId, favorites, "unavailable",

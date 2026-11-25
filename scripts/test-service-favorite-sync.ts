@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/src/sync/documentFilesystem.ts";
-import { syncServiceFileFavorites } from "../packages/core/src/sync/serviceFavoriteSync.ts";
+import { syncServiceFileFavorites, createFavoriteSyncMemo } from "../packages/core/src/sync/serviceFavoriteSync.ts";
 import { createServiceTransferScheduler } from "../packages/core/src/sync/serviceTransferScheduler.ts";
 import type { FileEntry, RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
@@ -171,6 +171,52 @@ test("unchanged favorites reuse their verified version but changed files are has
   } finally { await documents.close(); }
 });
 
+
+test("incremental clean folder skips scans until remote revision, local mutation or audit deadline", async () => {
+  const { documents, storageId } = await createFixture();
+  const { remote, files, requests } = fakeRemote(new Map([["notes.txt", { bytes: encoder.encode("original"), modifiedMs: 10 }]]));
+  let revision = 1, scans = 0, nowMs = 1000;
+  const fs = Object.assign(remote, { folderSyncRevision: () => revision }) as unknown as RemoteFs;
+  const memo = createFavoriteSyncMemo();
+  const original = documents.cachedFiles;
+  documents.cachedFiles = async (...args) => { scans++; return original(...args); };
+  const run = () => syncServiceFileFavorites(documents, fs, { memo, nowMs: nowMs++ });
+  try {
+    await run(); await run();
+    const before = scans;
+    await run();
+    assert.equal(scans, before, "stable folder does not rescan");
+    revision++;
+    await run();
+    assert.equal(scans, before + 1);
+    const id = JSON.stringify([storageId, "notes.txt"]);
+    const writer = await documents.open(id, "rwt");
+    await documents.write(writer, 0, encoder.encode("edited"));
+    await documents.release(writer);
+    await run();
+    assert.deepEqual(requests.uploads.at(-1)?.bytes, encoder.encode("edited"));
+    await run(); await run();
+    const cleanScans = scans;
+    nowMs += 120_001;
+    await run();
+    assert.ok(scans > cleanScans, "periodic full audit remains enabled");
+  } finally { await documents.close(); }
+});
+
+test("interactive folder read bypasses the background queue and latches a yield", async () => {
+  const scheduler = createServiceTransferScheduler();
+  let started!: () => void, release!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const work = scheduler.runFavorite(async shouldYield => {
+    started(); await gate; return shouldYield();
+  });
+  await ready;
+  assert.equal(await scheduler.runInteractive(async () => "listing"), "listing");
+  release();
+  assert.equal(await work, true);
+  assert.equal(await scheduler.runFavorite(async shouldYield => shouldYield()), false);
+});
 
 test("manual transfer runs between favorite transactions and the next pass replans", async () => {
   const { documents, storageId } = await createFixture([{ path: "", name: "Folder", kind: "folder" }]);

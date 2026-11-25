@@ -33,6 +33,7 @@ class DocumentCache {
   private readonly migrating = new Map<string, Promise<void>>();
   private readonly observed = new Map<string, string>();
   private favoritesMigrated = false;
+  private cacheStatusInFlight?: Promise<CacheStatus>;
   private folderQueue = Promise.resolve();
 
   constructor(options: DocumentCacheOptions) {
@@ -43,8 +44,16 @@ class DocumentCache {
     return this.options.request<T>(input);
   }
 
-  private cacheStatus() {
-    return this.request<CacheStatus>({ operation: "cacheRegistrations" });
+  private cacheStatus(): Promise<CacheStatus> {
+    // Concurrent callers share the same read, never a cached/stale registry.
+    if (!this.cacheStatusInFlight) {
+      const pending = this.request<CacheStatus>({ operation: "cacheRegistrations" })
+        .finally(() => {
+          if (this.cacheStatusInFlight === pending) this.cacheStatusInFlight = undefined;
+        });
+      this.cacheStatusInFlight = pending;
+    }
+    return this.cacheStatusInFlight;
   }
 
   private async registrations() {
@@ -559,14 +568,19 @@ class DocumentCache {
 
   private async getCachedStatuses(folderId: string, paths: string[]) {
     if (!this.options.enabled()) return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
-    const status = await this.cacheStatus();
-    const phase = vaultPhase(status);
-    if (phase === "uninitialized") {
-      return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
-    }
-    if (phase !== "unlocked") return [];
-    if (!await this.owner(folderId)) {
-      return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+    for (;;) {
+      await this.waitForMigration(folderId);
+      const status = await this.cacheStatus();
+      if (this.migrating.has(folderId)) continue;
+      const phase = vaultPhase(status);
+      if (phase === "uninitialized") {
+        return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+      }
+      if (phase !== "unlocked") return [];
+      if (!status.folders.some(folder => folder.id === folderId && folder.downloads)) {
+        return await this.options.legacy.getCachedStatuses?.(folderId, paths) ?? [];
+      }
+      break;
     }
     return this.request<CachedFileStatus[]>({ operation: "cachedStatuses", folderId, paths });
   }

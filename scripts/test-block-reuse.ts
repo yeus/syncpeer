@@ -15,6 +15,41 @@ const blocks = [0, 4, 8].map((offset) => ({
   offset, size: 4, hash: sha256(new Uint8Array(4).fill(offset)),
 }));
 
+test("directory statistics scan once and never fingerprint hidden descendants", async () => {
+  let scans = 0, visited = 0;
+  class CountedMap extends Map<string, { indexFile: Record<string, unknown> }> {
+    override *[Symbol.iterator]() {
+      scans++;
+      for (const record of super[Symbol.iterator]()) { visited++; yield record; }
+    }
+  }
+  const files = new CountedMap();
+  const count = 200;
+  for (let i = 0; i < count; i++) {
+    const dir = `dir-${i}`;
+    if (i % 2 === 0) files.set(dir, { indexFile: { type: 1 } });
+    files.set(`${dir}/file.bin`, { indexFile: { size: 42, type: 0,
+      get blocks() { return assert.fail("Statistics must not inspect block plans"); } } });
+    files.set(`${dir}/deleted.bin`, { indexFile: { type: 0, deleted: true } });
+  }
+  const folder = { id: "large", label: "Large", indexReceived: true, advertisedDevices: [], files };
+  const fs = new RemoteFs(new Map([[folder.id, folder]]) as never,
+    async () => assert.fail("No network reads"), async () => {}, () => {});
+  const [overview] = await fs.listFolders();
+  assert.equal(overview.stats?.fileCount, count);
+  assert.equal(overview.stats?.totalBytes, count * 42);
+  assert.equal(scans, 1);
+  const entries = await fs.readDir(folder.id, "");
+  assert.equal(entries.length, count);
+  for (const entry of entries) assert.deepEqual(entry.stats, {
+    fileCount: 1, directoryCount: 0, symlinkCount: 0, invalidCount: 0,
+    totalBytes: 42, indexReceived: true,
+  });
+  assert.equal(scans, 2);
+  assert.equal(visited, files.size * 2, "Each operation visits every index record just once");
+});
+
+
 test("large BEP files have bounded directory fingerprints", async () => {
   const largeBlocks = Array.from({ length: 64 }, (_, index) => ({
     offset: index * 131072, size: 131072, hash: sha256(Uint8Array.of(index)),

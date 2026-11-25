@@ -129,6 +129,7 @@ interface FolderState {
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
+  indexRevision?: number;
   files: Map<string, StoredFileRecord>;
 }
 
@@ -198,13 +199,14 @@ export function isTransportFailure(error: unknown): boolean {
   ].some((fragment) => message.includes(fragment));
 }
 
+function entryType(file: BepFileInfo): FileEntry["type"] {
+  const type = Number(file.type ?? 0);
+  return type === 1 ? "directory" : type === 4 || type === 2 || type === 3 ? "symlink" : "file";
+}
+
 function toEntry(path: string, file: BepFileInfo): FileEntry {
   const rawBlocks = file.blocks ?? file.Blocks;
-  const typeValue = Number(file.type ?? 0);
-  const type =
-    typeValue === 1 ? "directory" :
-    typeValue === 4 || typeValue === 2 || typeValue === 3 ? "symlink" :
-    "file";
+  const type = entryType(file);
 
   const blocks = rawBlocks
     ? rawBlocks.map((b) => ({
@@ -237,37 +239,34 @@ function toEntry(path: string, file: BepFileInfo): FileEntry {
   };
 }
 
+function emptyFolderStats(folder: FolderState): FolderStats {
+  return {
+    fileCount: 0, directoryCount: 0, symlinkCount: 0, invalidCount: 0, totalBytes: 0,
+    indexReceived: Boolean(folder.indexReceived && (!folder.encrypted || (!folder.needsPassword && !folder.passwordError))),
+  };
+}
+
+function accumulateStats(stats: FolderStats, file: BepFileInfo): void {
+  if (file.deleted) return;
+  const type = entryType(file);
+  if (type === "file") {
+    stats.fileCount++;
+    stats.totalBytes += Number(file.size ?? 0);
+  } else if (type === "directory") stats.directoryCount++;
+  else stats.symlinkCount++;
+  if (file.invalid) stats.invalidCount++;
+}
+
 function folderStats(folder: FolderState, path = ""): FolderStats {
   const normalizedPath = normalizePath(path);
   const prefix = normalizedPath ? `${normalizedPath}/` : "";
-  const readableIndex = !folder.encrypted || (!folder.needsPassword && !folder.passwordError);
-  const initial = {
-    fileCount: 0,
-    directoryCount: 0,
-    symlinkCount: 0,
-    invalidCount: 0,
-    totalBytes: 0,
-    indexReceived: Boolean(folder.indexReceived && readableIndex),
-  };
-  return [...folder.files.entries()].reduce((stats, [path, stored]) => {
-    const normalizedEntryPath = normalizePath(path);
-    if (
-      normalizedEntryPath === normalizedPath ||
-      (prefix && !normalizedEntryPath.startsWith(prefix))
-    ) {
-      return stats;
-    }
-    const entry = toEntry(normalizedEntryPath, stored.indexFile);
-    if (entry.deleted) return stats;
-    return {
-      fileCount: stats.fileCount + (entry.type === "file" ? 1 : 0),
-      directoryCount: stats.directoryCount + (entry.type === "directory" ? 1 : 0),
-      symlinkCount: stats.symlinkCount + (entry.type === "symlink" ? 1 : 0),
-      invalidCount: stats.invalidCount + (entry.invalid ? 1 : 0),
-      totalBytes: stats.totalBytes + (entry.type === "file" ? entry.size : 0),
-      indexReceived: stats.indexReceived,
-    };
-  }, initial);
+  const stats = emptyFolderStats(folder);
+  for (const [key, stored] of folder.files) {
+    const entryPath = normalizePath(key);
+    if (entryPath === normalizedPath || (prefix && !entryPath.startsWith(prefix))) continue;
+    accumulateStats(stats, stored.indexFile);
+  }
+  return stats;
 }
 
 function addDirectoryStats(folder: FolderState, entry: FileEntry): FileEntry {
@@ -410,6 +409,23 @@ export class RemoteFs {
   }
 
   /** Complete BEP-visible index for a folder whose current index was received. */
+  /** Changes with applied metadata, including same-sequence updates and local publications.
+   * Undefined means no safe incremental reuse (e.g. a partial or locked index). */
+  folderSyncRevision(folderId: string): number | undefined {
+    const folder = this.folders.get(folderId);
+    return folder?.indexReceived && !folder.needsPassword && !folder.passwordError && !folder.stopReason
+      ? folder.indexRevision : undefined;
+  }
+
+  indexDiagnostics() {
+    let indexEntries = 0, lockedFolders = 0;
+    for (const folder of this.folders.values()) {
+      indexEntries += folder.files.size;
+      if (folder.needsPassword) lockedFolders++;
+    }
+    return { folderCount: this.folders.size, indexEntries, lockedFolders };
+  }
+
   async completeFolderIndex(folderId: string): Promise<BepFileInfo[]> {
     const folder = this.folders.get(folderId);
     if (!folder?.indexReceived || folder.needsPassword || folder.passwordError || folder.stopReason) {
@@ -500,30 +516,35 @@ export class RemoteFs {
     const normalized = normalizePath(path);
     const prefix = normalized ? normalized + "/" : "";
     const out = new Map<string, FileEntry>();
+    const childStats = new Map<string, FolderStats>();
+    // Aggregate descendants in one pass; only direct entries need fingerprints
+    // and block metadata. Never scan the whole folder again for each child.
     for (const [key, value] of folder.files) {
       const keyPath = normalizePath(key);
       if (normalized && !keyPath.startsWith(prefix)) continue;
-      const entry = toEntry(keyPath, value.indexFile);
-      if (entry.deleted) continue;
+      const file = value.indexFile;
+      if (file.deleted) continue;
       const rest = normalized ? keyPath.slice(prefix.length) : keyPath;
       if (!rest) continue;
       const firstSlash = rest.indexOf("/");
       if (firstSlash === -1) {
-        out.set(rest, addDirectoryStats(folder, entry));
+        out.set(rest, toEntry(keyPath, file));
       } else {
         const childName = rest.slice(0, firstSlash);
-        const childPath = normalized ? `${normalized}/${childName}` : childName;
-        if (!out.get(childName)) {
+        const stats = childStats.get(childName) ?? emptyFolderStats(folder);
+        accumulateStats(stats, file);
+        childStats.set(childName, stats);
+        if (!out.has(childName)) {
           out.set(childName, {
             name: childName,
-            path: childPath,
-            type: "directory",
-            size: 0,
-            modifiedMs: 0,
-            stats: folderStats(folder, childPath),
+            path: normalized ? `${normalized}/${childName}` : childName,
+            type: "directory", size: 0, modifiedMs: 0,
           });
         }
       }
+    }
+    for (const [name, entry] of out) {
+      if (entry.type === "directory") entry.stats = childStats.get(name) ?? emptyFolderStats(folder);
     }
     return Array.from(out.values()).sort((a, b) => {
       if (a.type !== b.type) return a.type === "directory" ? -1 : 1;

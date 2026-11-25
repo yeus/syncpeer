@@ -873,7 +873,12 @@ test("locked encrypted folders unlock from cached indexes without a reconnect",
       await outgoing.updateFolderPasswords({ "fixture-camera": folderPassword });
       assert.deepEqual((await outgoing.remoteFs.listFiles("fixture-camera")).map(file => file.path),
         ["camera-test.txt"], "Correcting a wrong password must replay retained encrypted metadata");
-      assert.equal(outgoing.isClosed(), false);
+      await Promise.all([
+        outgoing.updateFolderPasswords({ "fixture-camera": "synthetic-wrong-password" }),
+        outgoing.updateFolderPasswords({ "fixture-camera": folderPassword }),
+      ]);
+      assert.deepEqual((await outgoing.remoteFs.listFiles("fixture-camera")).map(file => file.path),
+        ["camera-test.txt"], "Overlapping credential changes must resolve in request order");
       assert.equal(outgoing.isClosed(), false, "Credential hydration must not tear down the TLS session");
     } finally {
       await outgoing?.close();

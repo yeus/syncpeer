@@ -359,6 +359,7 @@ interface FolderState {
   indexReceived: boolean;
   remoteIndexId?: string;
   remoteMaxSequence?: string;
+  indexRevision?: number;
   files: Map<string, { indexFile: BepFileInfo; request?: { encryptedName: string; fileKey: Uint8Array; encryptedBlocks: BepBlockInfo[] } }>;
 }
 
@@ -978,6 +979,9 @@ class BepSession {
     }
   >();
   private nextId = 1;
+  private nextIndexRevision = 0;
+  private readonly folderMutationTails = new Map<string, Promise<void>>();
+  private passwordUpdates: Promise<void> = Promise.resolve();
   private folders = new Map<string, FolderState>();
   private readyPromise: Promise<void>;
   private readyResolve!: () => void;
@@ -1126,43 +1130,66 @@ class BepSession {
     );
   }
 
+  private withFolderMutation<T>(folderId: string, work: () => Promise<T>): Promise<T> {
+    const task = (this.folderMutationTails.get(folderId) ?? Promise.resolve()).then(work);
+    const tail = task.then(() => undefined, () => undefined);
+    this.folderMutationTails.set(folderId, tail);
+    void tail.then(() => {
+      if (this.folderMutationTails.get(folderId) === tail) this.folderMutationTails.delete(folderId);
+    });
+    return task;
+  }
+
   async updateFolderPasswords(passwords: Record<string, string>): Promise<void> {
+    const requested = { ...passwords };
+    const task = this.passwordUpdates.then(() => this.applyFolderPasswords(requested));
+    this.passwordUpdates = task.then(() => undefined, () => undefined);
+    return task;
+  }
+
+  private async applyFolderPasswords(passwords: Record<string, string>): Promise<void> {
     const updated = new Map(Object.entries(passwords)
       .map(([id, password]) => [id.trim(), password] as const)
       .filter(([id, password]) => !!id && password.length > 0));
     const changed = [...new Set([...this.folderPasswords.keys(), ...updated.keys()])]
       .filter(id => this.folderPasswords.get(id) !== updated.get(id));
-    if (!changed.length) return;
+    if (!changed.length || this.closed) return;
     this.folderPasswords.clear();
     for (const [id, password] of updated) this.folderPasswords.set(id, password);
     for (const folderId of changed) {
-      const state = this.folders.get(folderId);
-      if (!state?.encrypted || this.sharedFolders.has(folderId)) continue;
-      state.indexReceived = false;
-      state.files.clear();
-      state.folderCrypto = undefined;
-      state.needsPassword = true;
-      state.passwordError = undefined;
-      const password = updated.get(folderId);
-      if (!password) continue;
-      try {
-        const crypto = await deriveUntrustedFolderCrypto(folderId, password, this.kdf);
-        if (!await verifyUntrustedPasswordToken(crypto, this.announcedTokens.get(folderId))) {
-          state.passwordError = "Encryption password does not match this folder.";
-          continue;
-        }
-        state.folderCrypto = crypto;
-        state.needsPassword = false;
-        const pending = this.lockedEncryptedIndexes.get(folderId);
-        if (pending) {
-          const applied = await this.applyIndexFiles(state, folderId, [...pending.values()]);
-          this.log("untrusted.folder.hydrated", { count: applied.decryptedStored });
-          state.indexReceived = !state.needsPassword && !state.passwordError;
-        }
-      } catch (error) {
+      await this.withFolderMutation(folderId, async () => {
+        const state = this.folders.get(folderId);
+        if (this.closed || !state?.encrypted || this.sharedFolders.has(folderId)) return;
+        state.indexReceived = false;
+        state.indexRevision = ++this.nextIndexRevision;
+        state.files.clear();
+        state.folderCrypto = undefined;
         state.needsPassword = true;
-        state.passwordError = error instanceof Error ? error.message : String(error);
-      }
+        state.passwordError = undefined;
+        const password = updated.get(folderId);
+        if (!password) return;
+        try {
+          const crypto = await deriveUntrustedFolderCrypto(folderId, password, this.kdf);
+          if (this.closed) return;
+          if (!await verifyUntrustedPasswordToken(crypto, this.announcedTokens.get(folderId))) {
+            state.passwordError = "Encryption password does not match this folder.";
+            return;
+          }
+          state.folderCrypto = crypto;
+          state.needsPassword = false;
+          const pending = this.lockedEncryptedIndexes.get(folderId);
+          if (pending) {
+            const applied = await this.applyIndexFiles(state, folderId, [...pending.values()]);
+            this.log("untrusted.folder.hydrated", { count: applied.decryptedStored });
+            state.indexReceived = !this.closed && !state.needsPassword && !state.passwordError;
+          }
+        } catch (error) {
+          state.needsPassword = true;
+          state.passwordError = error instanceof Error ? error.message : String(error);
+        } finally {
+          state.indexRevision = ++this.nextIndexRevision;
+        }
+      });
     }
   }
 
@@ -1404,7 +1431,7 @@ class BepSession {
     if (this.indexApplyInFlight.has(folderId)) return;
     const task = this.drainIndexQueue(folderId);
     this.indexTasks.add(task);
-    void task.finally(() => this.indexTasks.delete(task));
+    void task.then(() => this.indexTasks.delete(task), () => this.indexTasks.delete(task));
     this.trackStateTask(task);
   }
 
@@ -1417,14 +1444,15 @@ class BepSession {
   }
 
   private async drainIndexQueue(folderId: string): Promise<void> {
-    await this.clusterFoldersTask;
     this.indexApplyInFlight.add(folderId);
     try {
+      await this.clusterFoldersTask;
       while (!this.closed) {
         const next = this.pendingIndexByFolder.get(folderId);
         if (!next) break;
         this.pendingIndexByFolder.delete(folderId);
-        await this.handleIndex(next.index as BepIndex);
+        if (this.sharedFolders.has(folderId)) await this.handleIndex(next.index as BepIndex);
+        else await this.withFolderMutation(folderId, () => this.handleIndex(next.index as BepIndex));
       }
     } finally {
       this.indexApplyInFlight.delete(folderId);
@@ -1659,6 +1687,7 @@ class BepSession {
       indexReceived: preserveIndexState ? previousState.indexReceived : false,
       remoteIndexId: ctx.remoteIndexId,
       remoteMaxSequence: ctx.remoteMaxSequence,
+      indexRevision: ++this.nextIndexRevision,
       files: preserveIndexState ? previousState.files : new Map(),
     };
     this.folders.set(ctx.folderId, state);
@@ -1779,7 +1808,11 @@ class BepSession {
   }
 
   private async prepareClusterFolders(cfg: BepClusterConfig) {
-    for (const folder of cfg.folders ?? []) await this.handleClusterFolder(folder);
+    for (const folder of cfg.folders ?? []) {
+      const folderId = String(folder.id ?? "");
+      if (this.sharedFolders.has(folderId)) await this.handleClusterFolder(folder);
+      else await this.withFolderMutation(folderId, () => this.handleClusterFolder(folder));
+    }
   }
 
   private async finishClusterConfig(cfg: BepClusterConfig) {
@@ -1815,6 +1848,7 @@ class BepSession {
   }
 
   private applyPlainIndexFile(state: FolderState, folderId: string, file: BepFileInfo) {
+    state.indexRevision = ++this.nextIndexRevision;
     state.files.set(file.name, { indexFile: file });
     this.acknowledgePublication(folderId, file.name, file);
   }
@@ -1829,6 +1863,7 @@ class BepSession {
         size: Number(block.size),
         hash: block.hash,
       }));
+      state.indexRevision = ++this.nextIndexRevision;
       state.files.set(originalFile.name, {
         indexFile: originalFile,
         request: { encryptedName, fileKey, encryptedBlocks },
@@ -1851,7 +1886,10 @@ class BepSession {
     let decryptedStored = 0;
     let decryptFailed = 0;
     const replicaFiles: BepFileInfo[] = [];
-    for (const file of files) {
+    for (const [ordinal, file] of files.entries()) {
+      // A long metadata hydration must allow socket keepalive and UI RPC tasks to run.
+      if (ordinal > 0 && ordinal % 128 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+      if (this.closed) throw new Error("Peer closed while applying its folder index.");
       if (!state.encrypted) {
         this.applyPlainIndexFile(state, folderId, file);
         replicaFiles.push(file);
@@ -2331,6 +2369,7 @@ class BepSession {
   private async publishPlaintextUpload(plan: UploadPlan) {
     const fileInfo = this.plaintextUploadInfo(plan);
     plan.throwIfCancelled();
+    plan.folder.indexRevision = ++this.nextIndexRevision;
     plan.folder.files.set(plan.path, { indexFile: fileInfo });
     this.log("upload.prepared", {
       folderId: plan.folderId,
@@ -2372,6 +2411,7 @@ class BepSession {
       elapsedMs: Date.now() - plan.startedAtMs,
       avgRateBps: plan.uploadRateBps(plan.source.size),
     });
+    plan.folder.indexRevision = ++this.nextIndexRevision;
     plan.folder.files.set(plan.path, {
       indexFile: info.originalFileInfo,
       request: {
@@ -2515,6 +2555,7 @@ class BepSession {
       ? await encryptUntrustedFileInfo(folder.folderCrypto.folderKey, originalFileInfo,
         toUint8Array(await this.adapter.randomBytes(24)))
       : fileInfo;
+    folder.indexRevision = ++this.nextIndexRevision;
     folder.files.set(normalizedPath, { indexFile: originalFileInfo });
     const uploaded = this.uploadedFilesByFolder.get(folderId);
     uploaded?.delete(normalizedPath);

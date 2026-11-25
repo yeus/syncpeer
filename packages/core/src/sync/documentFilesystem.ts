@@ -107,6 +107,7 @@ interface DocumentRuntime {
   registry: FolderRegistry | undefined;
   nextHandle: number;
   closed: boolean;
+  syncMutationRevision: number;
   queue: Promise<void>;
   activeQueueOperation?: string;
   readonly concurrentReads: Set<Promise<unknown>>;
@@ -169,12 +170,23 @@ const removeReplicaPaths = async (
   }
 };
 
+// Unknown operations invalidate conservatively. Only explicitly independent
+// reads or UI bookkeeping may leave the reconciliation generation unchanged.
+const syncNeutralOperations = new Set(["status", "profileSettings", "connectionPasswords", "ownedDevices",
+  "publishedRead", "cacheRegistrations", "cachedFiles", "favoriteSyncState", "syncBaseline",
+  "loadDirectorySnapshot", "directorySnapshot", "uiState", "saveUiState"]);
+
 const runQueued = <T>(runtime: DocumentRuntime, fn: () => Promise<T>, operation = "other"): Promise<T> => {
+  const mutates = !syncNeutralOperations.has(operation);
+  if (mutates) runtime.syncMutationRevision++;
   const task = runtime.queue.then(async () => {
     await Promise.allSettled([...runtime.concurrentReads]);
     if (runtime.closed) throw new Error("Documents are closed.");
     runtime.activeQueueOperation = operation;
-    return fn().finally(() => { runtime.activeQueueOperation = undefined; });
+    return fn().finally(() => {
+      if (mutates) runtime.syncMutationRevision++;
+      runtime.activeQueueOperation = undefined;
+    });
   });
   runtime.queue = task.then(() => {}, () => {});
   return task;
@@ -1532,7 +1544,7 @@ const saveEffectiveProfileSettings = async (runtime: DocumentRuntime, next: Sync
 };
 
 const createSettingsActions = (runtime: DocumentRuntime) => ({
-  connectionPasswords: () => runQueued(runtime, () => runtime.vault.connectionPasswords()),
+  connectionPasswords: () => runQueued(runtime, () => runtime.vault.connectionPasswords(), "connectionPasswords"),
   saveConnectionPasswords: (passwords: Record<string, string>) =>
     runQueued(runtime, () => runtime.vault.saveConnectionPasswords(passwords)),
   mergeConnectionPasswords: (passwords: Record<string, string>) =>
@@ -1586,8 +1598,8 @@ const createSettingsActions = (runtime: DocumentRuntime) => ({
   }),
   restoreRecoveryBackup: (backup: Parameters<Vault["restoreRecoveryBackup"]>[0], recoveryPassword: string, password: string) =>
     runQueued(runtime, () => unlockAfterVaultChange(runtime, () => runtime.vault.restoreRecoveryBackup(backup, recoveryPassword, password))),
-  uiState: () => runQueued(runtime, () => runtime.vault.uiState()),
-  saveUiState: (value: unknown) => runQueued(runtime, () => runtime.vault.saveUiState(value)),
+  uiState: () => runQueued(runtime, () => runtime.vault.uiState(), "uiState"),
+  saveUiState: (value: unknown) => runQueued(runtime, () => runtime.vault.saveUiState(value), "saveUiState"),
   rememberFolder: (folder: { id: string; label: string }) =>
     runQueued(runtime, () => rememberFolderAction(runtime, folder)),
   recoverOwnedDevice: (syncthingId: string, kit: Parameters<Vault["recoverOwnedDevice"]>[1], password: string) =>
@@ -1685,7 +1697,7 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
   favoriteSyncState: (folderId: string) => runQueued(runtime, async () => {
     const { bytes, key } = favoriteStateTarget(runtime, folderId);
     return loadFavoriteSyncState(bytes, key);
-  }),
+  }, "favoriteSyncState"),
   saveFavoriteSyncEntries: (folderId: string, entries: Record<string, FavoriteSyncEntry>) =>
     runQueued(runtime, async () => {
       const { bytes, key } = favoriteStateTarget(runtime, folderId);
@@ -1708,7 +1720,7 @@ const createFolderActions = (runtime: DocumentRuntime) => ({
       await saveFavoriteSyncEntries(bytes, { folderKey: key, randomBytes: runtime.options.randomBytes }, entries);
     }),
   loadDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string) =>
-    runQueued(runtime, () => loadDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path)),
+    runQueued(runtime, () => loadDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path), "loadDirectorySnapshot"),
   saveDirectorySnapshot: (folderId: string, sourceDeviceId: string, path: string, snapshot: StoredDirectorySnapshot) =>
     runQueued(runtime, () => saveDirectorySnapshotAction(runtime, folderId, sourceDeviceId, path, snapshot), "directorySnapshot"),
 });
@@ -1746,7 +1758,7 @@ const createHandleActions = (runtime: DocumentRuntime) => ({
   setSyncBaseline: (id: string, baseline: NonNullable<CachedFileRecord["syncBaseline"]>) =>
     runQueued(runtime, () => setSyncBaselineAction(runtime, id, baseline)),
   clearSyncBaseline: (id: string) => runQueued(runtime, () => clearSyncBaselineAction(runtime, id)),
-  syncBaseline: (id: string) => runQueued(runtime, () => loadSyncBaselineAction(runtime, id)),
+  syncBaseline: (id: string) => runQueued(runtime, () => loadSyncBaselineAction(runtime, id), "syncBaseline"),
   digest: (id: number) => runQueued(runtime, () => digestHandleAction(runtime, id)),
   digestRanges: (id: number, source: "cached" | "partial", ranges: readonly { offset: number; size: number }[]) =>
     runQueued(runtime, () => digestRangesAction(runtime, id, source, ranges)),
@@ -1796,6 +1808,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
     settingsRefreshQueued: false,
     nextHandle: 0,
     closed: false,
+    syncMutationRevision: 0,
     queue: Promise.resolve(),
     concurrentReads: new Set(),
     closeTask: undefined,
@@ -1811,6 +1824,7 @@ export const createDocumentFilesystem = (options: DocumentFilesystemOptions) => 
   });
   runtime.configs = createFolderRegistryStorage(options.profile, runtime.vault);
   return {
+    favoriteSyncRevision: () => runtime.syncMutationRevision,
     ...createLifecycleActions(runtime),
     ...createSettingsActions(runtime),
     ...createFolderActions(runtime),

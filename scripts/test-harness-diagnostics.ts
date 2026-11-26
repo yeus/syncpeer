@@ -1,7 +1,7 @@
 import path from "node:path";
 import assert from "node:assert/strict";
 import { isUiE2eBuildMode } from "../packages/app/buildMode.ts";
-import { configureSyncthingNetwork, syncthingListenAddresses, waitForSyncthingGui } from "./lan-test/syncthing.ts";
+import { configureFixtureDiskReserve, configureSyncthingNetwork, syncthingListenAddresses, waitForSyncthingGui } from "./lan-test/syncthing.ts";
 import { lanAppBinary } from "./lan-test/tauri-runner.ts";
 
 const syntheticTarget = path.resolve("synthetic-cargo-target");
@@ -49,6 +49,9 @@ const isolated = configureSyncthingNetwork(optionsXml, false, false);
 for (const tag of ["globalAnnounceEnabled", "localAnnounceEnabled", "relaysEnabled", "natEnabled"]) {
   assert.match(isolated, new RegExp(`<${tag}>false</${tag}>`));
 }
+const reserve = configureFixtureDiskReserve('<minDiskFree unit="%">1</minDiskFree><minHomeDiskFree unit="%">1</minHomeDiskFree>');
+assert.equal(reserve, '<minDiskFree unit="MiB">512</minDiskFree><minHomeDiskFree unit="MiB">512</minHomeDiskFree>');
+
 
 let attempts = 0;
 const ready = await waitForSyncthingGui(async () => {

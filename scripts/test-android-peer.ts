@@ -285,6 +285,11 @@ const main = async (): Promise<void> => {
   const playbackOnly = process.env.SYNCPEER_ANDROID_PEER_PLAYBACK_ONLY === "1";
   const keepassOnly = process.env.SYNCPEER_ANDROID_PEER_KEEPASS_ONLY === "1";
   const keepassInterruptOnly = process.env.SYNCPEER_ANDROID_PEER_KEEPASS_INTERRUPT_ONLY === "1";
+  const connectionOnly = ["CONNECTION_ONLY", "STARTUP_ONLY", "LATENCY_ONLY"]
+    .some(flag => process.env["SYNCPEER_ANDROID_PEER_" + flag] === "1");
+  const unlockOnly = process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1";
+  const requiresEditor = keepassOnly || keepassInterruptOnly || playbackOnly || unlockOnly ||
+    !(approvalOnly || switchApproval || connectionOnly);
   // Host-initiated connections could make acceptance pass without Android
   // dispatching the outbound pairing request.
   const outboundOnly = approvalOnly || switchApproval || discoveryMode !== "direct" ||
@@ -296,14 +301,19 @@ const main = async (): Promise<void> => {
     uninstallIfPresent(editorPackage);
     uninstallIfPresent("dev.syncpeer.plugin.android.test");
     uninstallIfPresent(appPackage);
-    run("adb", ["install", "-r", appApk]);
-    run("adb", ["install", "-r", editorApk]);
+    // A native debug fixture contains unstripped Rust symbols and may require
+    // several minutes to push and install under a software emulator. Keep the
+    // operation bounded without mistaking slow ADB for a product failure.
+    const install = (apk: string) => run("adb", ["-s", emulator!.serial, "install",
+      "--no-streaming", "-r", apk], { timeout: 360_000 });
+    install(appApk);
+    if (requiresEditor) install(editorApk);
     if (keepassApk) {
       if (!adb(["shell", "getprop", "ro.product.cpu.abilist"]).includes("x86_64")) {
         throw new Error("Pinned KeePass2Android APK requires an x86_64 disposable emulator.");
       }
       uninstallIfPresent(keepassPackage);
-      run("adb", ["install", "-r", keepassApk]);
+      install(keepassApk);
     }
     if (playbackOnly) {
       const reference = adb(["shell", "content", "call", "--uri", `content://${editorPackage}.commands`,
@@ -340,6 +350,9 @@ const main = async (): Promise<void> => {
       publicNetwork: false,
       encryptedFolderType: "sendreceive",
       includeBlob: false,
+      prepareEncryptedShare: keepassOnly || keepassInterruptOnly
+        ? directory => createKeepassFixture(path.join(directory, keepassFilename))
+        : undefined,
     });
     run("adb", ["reverse", `tcp:${fixture.fixture.directPort}`, `tcp:${fixture.fixture.directPort}`]);
     if (switchApproval) {
@@ -382,10 +395,10 @@ const main = async (): Promise<void> => {
       SYNCPEER_PEER_API_KEY: fixture.apiKey,
     };
     if (keepassOnly || keepassInterruptOnly) {
-      createKeepassFixture(path.join(fixture.encryptedSharePath, keepassFilename));
-      const scan = await fetch(`${fixture.syncGuiUrl}/rest/db/scan?folder=${encodeURIComponent(fixture.fixture.encryptedFolderId)}`,
-        { method: "POST", headers: { "X-API-Key": fixture.apiKey } });
-      if (!scan.ok) throw new Error("Could not index KDBX fixture.");
+      // The fixture is present before the Syncthing process starts, so the
+      // first index scan includes it without racing folder initialization.
+      await waitForHostIndex(fixture.syncGuiUrl, fixture.apiKey, fixture.fixture.encryptedFolderId,
+        fs.statSync(path.join(fixture.encryptedSharePath, keepassFilename)).size);
       await runPhase(keepassInterruptOnly ? "--peer-keepass-interrupt" : "--peer-keepass", {
         ...env, SYNCPEER_KEEPASS_DEVICE_ID: deviceId,
       });
@@ -478,16 +491,11 @@ const main = async (): Promise<void> => {
       }
     }
 
-    if (process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1" ||
-      process.env.SYNCPEER_ANDROID_PEER_UNLOCK_ONLY === "1" ||
-      process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1" ||
-      process.env.SYNCPEER_ANDROID_PEER_LATENCY_ONLY === "1") {
+    if (connectionOnly || unlockOnly) {
       await runPhase("--peer-connect-smoke", env);
       // Keep startup reconnection in the ordinary automatic-peer CI gate,
       // not only in a manually selected profiling scenario.
-      if (process.env.SYNCPEER_ANDROID_PEER_STARTUP_ONLY === "1" ||
-        process.env.SYNCPEER_ANDROID_PEER_CONNECTION_ONLY === "1" ||
-        process.env.SYNCPEER_ANDROID_PEER_LATENCY_ONLY === "1") {
+      if (connectionOnly) {
         await runPhase("--peer-startup-auto-connect", env);
       }
       if (process.env.SYNCPEER_ANDROID_PEER_LATENCY_ONLY === "1") {
@@ -594,41 +602,43 @@ const main = async (): Promise<void> => {
             .then(response => response.json()) as Promise<{ connections?: Record<string, { connected?: boolean }> }>,
           fetch(`${fixture.syncGuiUrl}/rest/db/status?folder=${encodeURIComponent(fixture.fixture.encryptedFolderId)}`,
             { headers }).then(response => response.json()) as Promise<{
-              localFiles?: number; globalFiles?: number; needFiles?: number; state?: string }>,
+              localFiles?: number; globalFiles?: number; needFiles?: number; state?: string; error?: string }>,
         ]);
         console.error("Synthetic Syncthing failure state:", JSON.stringify({
           connectedPeers: Object.values(connections.connections ?? {}).filter(value => value.connected).length,
           localFiles: folder.localFiles, globalFiles: folder.globalFiles,
           needFiles: folder.needFiles, folderState: folder.state,
+          folderError: folder.error?.replace(/\/[^\s]+/g, "[path]"),
         }));
       } catch { console.error("Synthetic Syncthing failure state could not be read."); }
     }
     if (discovery) console.error("Synthetic discovery observations:",
       { lookups: discovery.lookupCount(), tlsHandshakes: discovery.handshakeCount() });
-    if (process.env.SYNCPEER_ANDROID_FAILURE_DIAGNOSTICS === "1") {
+    if (emulator && process.env.SYNCPEER_ANDROID_FAILURE_DIAGNOSTICS === "1") {
       try {
-        console.error("Android process:", adb(["shell", "pidof", appPackage]).trim());
-        console.error("Android focus:", adb(["shell", "dumpsys", "activity", "activities"])
+        const diagnosticAdb = (args: string[]) => adb(["-s", emulator!.serial, ...args], { timeout: 15_000 });
+        console.error("Android process:", diagnosticAdb(["shell", "pidof", appPackage]).trim());
+        console.error("Android focus:", diagnosticAdb(["shell", "dumpsys", "activity", "activities"])
           .split("\n").filter(line => /mResumedActivity|mCurrentFocus|mFocusedApp/.test(line)).join(" | "));
-        console.error("Android WebView:", adb(["shell", "dumpsys", "webviewupdate"])
+        console.error("Android WebView:", diagnosticAdb(["shell", "dumpsys", "webviewupdate"])
           .split("\n").filter(line => /Current WebView package/.test(line)).join(" | "));
-        const runtimeLog = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"]).split("\n")
+        const runtimeLog = diagnosticAdb(["logcat", "-d", "-s", "SyncpeerRuntime:W"]).split("\n")
           .slice(-60).join("\n");
         console.error("Android SyncpeerRuntime log:", runtimeLog);
         // Bound the logcat output: the complete emulator buffer can exceed
         // Node's execFileSync maxBuffer and hide the original test failure.
-        const failureLog = adb(["logcat", "-d", "-t", "700"]).split("\n")
+        const failureLog = diagnosticAdb(["logcat", "-d", "-t", "700"]).split("\n")
           .filter(line => /AndroidRuntime|FATAL EXCEPTION|chromium|Tauri\/Console|WebViewFactory|crash/i.test(line))
           .slice(-60).join("\n");
         console.error("Android failure log:", failureLog);
         if (keepassOnly || keepassInterruptOnly) {
-          const pickerLog = adb(["logcat", "-d", "-t", "4000"]).split("\n")
+          const pickerLog = diagnosticAdb(["logcat", "-d", "-t", "4000"]).split("\n")
             .filter(line => /DocumentsUI|DocumentsProvider|DocumentsContract|RootsCache|PickActivity|KP2A|FileNotFoundException/i.test(line))
             .slice(-60).join("\n");
           console.error("Synthetic Android picker and KeePass diagnostics:", pickerLog);
         }
         if (playbackOnly) {
-          const mediaLog = adb(["logcat", "-d", "-s", "MediaMetadataRetriever:V", "StagefrightMetadataRetriever:V", "MediaCodec:W", "ACodec:W", "MPEG4Extractor:W", "OMXNodeInstance:W"]).split("\n")
+          const mediaLog = diagnosticAdb(["logcat", "-d", "-s", "MediaMetadataRetriever:V", "StagefrightMetadataRetriever:V", "MediaCodec:W", "ACodec:W", "MPEG4Extractor:W", "OMXNodeInstance:W"]).split("\n")
             .slice(-80).join("\n");
           console.error("Android media failure log:", mediaLog);
         }
@@ -637,7 +647,7 @@ const main = async (): Promise<void> => {
       }
     }
     try {
-      const runtimeEvents = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"])
+      const runtimeEvents = (emulator ? adb(["-s", emulator.serial, "logcat", "-d", "-s", "SyncpeerRuntime:W"], { timeout: 15_000 }) : "")
         .split("\n")
         .flatMap(line => {
           const event = /SyncpeerRuntime.*?:\s+((?:core|document|session)\.[a-z0-9_.-]+)/i.exec(line)?.[1];
@@ -650,7 +660,7 @@ const main = async (): Promise<void> => {
   } finally {
     if (process.env.SYNCPEER_ANDROID_RUNTIME_PROFILE === "1" && emulator) {
       try {
-        const timing = adb(["logcat", "-d", "-s", "SyncpeerRuntime:W"])
+        const timing = adb(["-s", emulator.serial, "logcat", "-d", "-s", "SyncpeerRuntime:W"], { timeout: 15_000 })
           .split("\n")
           .flatMap(line => {
             const match = /document\.runtime\.(queue_slow|execution_slow|async_slow) operation=([A-Za-z]{1,48}) durationMs=(\d+)/.exec(line);

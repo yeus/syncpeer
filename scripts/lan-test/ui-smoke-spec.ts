@@ -9,10 +9,10 @@ import {
   LAN_FIXTURE_HELLO_CONTENT,
 } from "./fixture-data.ts";
 import { normalizeDiscoveryServer } from "../../packages/core/src/ui/discoveryServer.ts";
+import { PIM_TAB_VISIBLE } from "../../packages/app/src/app/features.ts";
 import {
   openSettingsSection, closeSettings, readCurrentDeviceId,
   openFolderSettings,
-  clickButtonByText,
   clickDownloadButton,
   clickItemTitle,
   connectUntilApproved,
@@ -240,11 +240,12 @@ const unlockTargetFolder = async (): Promise<void> => {
   if (!(await passwordInput.isExisting()) && !(await editButton.isExisting())) return;
   if (await editButton.isExisting()) {
     await openFolderSettings(browser, targetFolderId);
+    if (await $("[data-testid='folder-password-toggle']").isExisting()) await clickTestId("folder-password-toggle");
     await passwordInput.waitForExist({ timeout: 5_000 });
   }
   await setValue(`folder-password-${targetFolderId}`, targetFolderPassword);
   await clickTestId(`unlock-folder-${targetFolderId}`);
-  await clickButtonByText(browser, "Back");
+  await $("[data-testid='folder-settings-page']").waitForExist({ reverse: true, timeout: 30_000 });
 };
 
 const fetchNativeDiscovery = () => tauriBrowser.tauri.execute(async (tauri, request) => {
@@ -504,7 +505,11 @@ describe("Syncpeer Tauri UI smoke", () => {
     await $("[data-testid='connection-status-toggle']").waitForExist({ timeout: 10_000 });
   });
 
-  it("marks PIM sync as experimental and disabled by default", async () => {
+  it("enforces the PIM release visibility gate and experimental default when enabled", async () => {
+    if (!PIM_TAB_VISIBLE) {
+      assert.equal(await $("[data-testid='tab-pim']").isExisting(), false);
+      return;
+    }
     await clickTestId("tab-pim");
     const notice = $("[data-testid='pim-experimental-notice']");
     await notice.waitForExist({ timeout: 10_000 });

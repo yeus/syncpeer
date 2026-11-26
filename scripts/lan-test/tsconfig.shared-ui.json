@@ -3,7 +3,8 @@
   "compilerOptions": {
     "module": "NodeNext",
     "noEmit": true,
-    "types": ["node", "mocha", "@wdio/globals/types"]
+    "types": ["node", "mocha", "@wdio/globals/types"],
+    "allowImportingTsExtensions": true
   },
   "files": [
     "shared-onboarding.spec.ts",

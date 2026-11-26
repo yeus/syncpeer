@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import os from "node:os";
+import { sameDeviceId } from "@syncpeer/core/browser";
 import { addKeepassEntry, keepassEntries, keepassFilename, keepassPackage, keepassPassword,
   keepassAttachment, importKeepassAttachment, verifyKeepassAttachment } from "./keepass-fixture.mjs";
 
@@ -10,8 +11,8 @@ import { addKeepassEntry, keepassEntries, keepassFilename, keepassPackage, keepa
 export const runKeepassAcceptance = async ({
   runAdb, wait, captureUiHierarchy, recoverEmulatorAnr, nodeBounds,
   tapDocumentUiText, tapDocumentUiContentDescription, editorCommand,
-  scanPeerFolder, peerHostFolder, peerGuiUrl, peerApiKey, targetFolderTitle,
-  rebootAndReconnect, readFavoriteState,
+  scanPeerFolder, peerHostFolder, peerGuiUrl, peerApiKey, targetFolderId, targetFolderTitle,
+  rebootAndReconnect, listCachedFiles,
 }) => {
   if (!peerHostFolder || !peerGuiUrl || !peerApiKey ||
       runAdb(["shell", "getprop", "ro.kernel.qemu"]).trim() !== "1") {
@@ -22,16 +23,19 @@ export const runKeepassAcceptance = async ({
   const title = (value) => (node) => node.includes(`text="${value}"`);
   const description = (value) => (node) => node.includes(`content-desc="${value}"`);
   const hierarchy = () => captureUiHierarchy("/sdcard/syncpeer-keepass-test.xml");
-  const find = async (predicates, label, click = true, timeout = 60_000) => {
+  const find = async (predicates, label, click = true, timeout = 60_000, reveal) => {
     const deadline = Date.now() + timeout;
     let last = "";
     while (Date.now() < deadline) {
       last = await hierarchy();
       if (recoverEmulatorAnr(last)) { await wait(1_000); continue; }
       const nodes = last.match(/<node\b[^>]*>/g) ?? [];
-      if (nodes.some(candidate => resource("alertTitle")(candidate) && title("Change log")(candidate))) {
+      const dialogTitle = nodes.find(candidate => resource("alertTitle")(candidate));
+      const templates = dialogTitle && title("Add templates?")(dialogTitle);
+      if (templates || (dialogTitle && title("Change log")(dialogTitle))) {
+        const buttonId = templates ? "button2" : "button1";
         const confirm = nodes.find(candidate => candidate.includes('enabled="true"') &&
-          (candidate.includes('resource-id="android:id/button1"') || resource("button1")(candidate)) &&
+          (candidate.includes(`resource-id="android:id/${buttonId}"`) || resource(buttonId)(candidate)) &&
           nodeBounds(candidate));
         if (confirm) {
           const { x, y } = nodeBounds(confirm);
@@ -51,6 +55,7 @@ export const runKeepassAcceptance = async ({
         }
         return node;
       }
+      reveal?.(nodes);
       await wait(400);
     }
     throw new Error(`KeePass UI missing ${label}; visible=${JSON.stringify(
@@ -62,7 +67,22 @@ export const runKeepassAcceptance = async ({
   };
   const launch = () => runAdb(["shell", "monkey", "-p", keepassPackage, "-c", "android.intent.category.LAUNCHER", "1"]);
   const unlock = async () => {
-    await enter("password_edit", keepassPassword);
+    // After a cold launch KP2A opens the keyboard and its collapsing toolbar
+    // can clip the password input below the scroll viewport. Scroll only the
+    // actual KP2A password form, never bypass the persisted SAF database.
+    await find([resource("password_edit"), node =>
+      node.includes(`package="${keepassPackage}"`) && node.includes('class="android.widget.EditText"') &&
+      node.includes('password="true"')], "database password", true, 60_000, nodes => {
+      const scroll = nodes.find(resource("scrollview"));
+      const bounds = scroll?.match(/\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+      if (!bounds || !nodes.some(title("Password"))) return;
+      const [left, top, right, bottom] = bounds.slice(1).map(Number);
+      if (bottom - top < 50) return;
+      const x = Math.round((left + right) / 2), margin = Math.round((bottom - top) / 8);
+      runAdb(["shell", "input", "swipe", String(x), String(bottom - margin),
+        String(x), String(top + margin), "400"]);
+    });
+    runAdb(["shell", "input", "text", keepassPassword]);
     // Hide the keyboard without navigating away from the unlocked database.
     await find([resource("pass_ok")], "unlock database");
     await find([resource("fabAddNew"), resource("fabAddNewEntry"), title("initial-fixture")], "database unlocked", false);
@@ -92,20 +112,20 @@ export const runKeepassAcceptance = async ({
   };
   const expectHost = (...entries) => eventually(
     "host decrypts entries " + entries.join(", "), () => hasHostEntries(...entries));
-  const hostDigest = () => {
-    const bytes = fs.readFileSync(database);
+  const hostDigest = (file = database) => {
+    const bytes = fs.readFileSync(file);
     return `${bytes.length}:${createHash("sha256").update(bytes).digest("hex")}`;
   };
-  const providerDigest = () => editorCommand("digest", keepassFilename);
+  const providerDigest = (name = keepassFilename) => editorCommand("digest", name);
   const expectProvider = () => eventually("SAF published the exact host KDBX bytes",
     () => editorCommand("stat", keepassFilename) === "true" && providerDigest() === hostDigest());
   const restartAndUnlock = async () => {
     runAdb(["shell", "am", "force-stop", keepassPackage]);
     launch();
-    const recent = await find([resource("password_edit"),
+    const recent = await find([resource("pass_ok"),
       node => node.includes(`package="${keepassPackage}"`) && /text="[^"]*syncpeer-acceptance\.kdbx[^"]*"/.test(node)],
     "previously opened database (no picker)", false);
-    if (!resource("password_edit")(recent)) {
+    if (!resource("pass_ok")(recent)) {
       await find([node => node === recent || (node.includes(`package="${keepassPackage}"`) &&
         /text="[^"]*syncpeer-acceptance\.kdbx[^"]*"/.test(node))], "recent database");
     }
@@ -121,13 +141,22 @@ export const runKeepassAcceptance = async ({
     return response;
   };
   const pausePeer = async (paused) => {
-    await rest("/rest/config/devices/" + encodeURIComponent(peerDevice), {
-      method: "PATCH", body: JSON.stringify({ paused }),
+    const { connections } = await (await rest("/rest/system/connections")).json();
+    const device = Object.keys(connections ?? {}).find(id => sameDeviceId(id, peerDevice));
+    if (!device) throw new Error("Expected synthetic peer missing from Syncthing connections.");
+    await rest("/rest/system/" + (paused ? "pause" : "resume") + "?device=" + encodeURIComponent(device), {
+      method: "POST",
     });
     await eventually(paused ? "peer disconnected" : "peer reconnected", async () => {
       const { connections } = await (await rest("/rest/system/connections")).json();
-      return Boolean(connections?.[peerDevice]?.connected) === !paused;
+      return connections?.[device]?.connected === !paused;
     });
+  };
+  const hostIndexedVersion = async () => {
+    const query = new URLSearchParams({ folder: targetFolderId, file: keepassFilename });
+    const { local } = await (await rest("/rest/db/file?" + query)).json();
+    if (!local || local.deleted || !local.version) throw new Error("Synthetic host has no indexed database version.");
+    return JSON.stringify(local.version);
   };
 
   await expectProvider();
@@ -216,6 +245,7 @@ export const runKeepassAcceptance = async ({
   // Syncpeer is format-agnostic. Concurrent changes must be preserved rather
   // than silently overwritten; this is not a claim of an automatic KDBX merge.
   const commonDigest = hostDigest();
+  const commonVersion = await hostIndexedVersion();
   try {
     await pausePeer(true);
     await add("android-conflict");
@@ -225,16 +255,45 @@ export const runKeepassAcceptance = async ({
     addKeepassEntry(database, "linux-conflict");
     const linuxBranch = hostDigest();
     await scanPeerFolder();
+    await eventually("host indexed its concurrent database edit", async () =>
+      await hostIndexedVersion() !== commonVersion);
     await pausePeer(false);
-    await eventually("Syncpeer reports concurrent KDBX changes", async () =>
-      (await readFavoriteState())?.phase === "conflict");
-    if (providerDigest() !== androidBranch || hostDigest() !== linuxBranch ||
-        !hasHostEntries("linux-conflict") || hasHostEntries("android-conflict")) {
-      throw new Error("Conflict did not preserve the independently edited database versions.");
+    // A whole-folder favorite uses the version-vector replica, not the
+    // single-file favorite state machine. Its conflict is a separate file.
+    // Require the exact two independently saved byte streams on BOTH peers.
+    const isDatabaseVersion = name => name === keepassFilename ||
+      name.startsWith(keepassFilename + ".sync-conflict-") ||
+      (name.startsWith(keepassFilename.replace(/\.kdbx$/, ".sync-conflict-")) && name.endsWith(".kdbx"));
+    let observed = { host: [], android: [] };
+    const inspect = async () => {
+      const host = fs.readdirSync(peerHostFolder).filter(isDatabaseVersion)
+        .map(name => ({ name, digest: hostDigest(path.join(peerHostFolder, name)) }));
+      const android = (await listCachedFiles()).map(file => file.path).filter(isDatabaseVersion)
+        .map(name => ({ name, digest: providerDigest(name) }));
+      observed = { host, android };
+      const both = entries => entries.some(file => file.digest === androidBranch) &&
+        entries.some(file => file.digest === linuxBranch);
+      return both(host) && both(android) && hostDigest() === providerDigest();
+    };
+    try {
+      await eventually("both KDBX conflict versions converge byte-for-byte on both peers", inspect);
+    } catch (error) {
+      console.error("KeePass conflict diagnostic:", JSON.stringify({
+        host: observed.host.map(file => ({ name: file.name, android: file.digest === androidBranch, linux: file.digest === linuxBranch })),
+        android: observed.android.map(file => ({ name: file.name, android: file.digest === androidBranch, linux: file.digest === linuxBranch })),
+      }));
+      throw error;
+    }
+    for (const [digest, entry] of [[androidBranch, "android-conflict"], [linuxBranch, "linux-conflict"]]) {
+      const copy = observed.host.find(file => file.digest === digest);
+      const names = keepassEntries(path.join(peerHostFolder, copy.name));
+      if (!names.includes(entry) || !names.includes("android-large") || !names.includes("linux-large")) {
+        throw new Error("A preserved conflict database did not decrypt with the expected entries.");
+      }
     }
     await restartAndUnlock();
-    await assertEntry("android-conflict");
-    console.log("KeePass: concurrent edits detected; Android and Linux versions preserved.");
+    await assertEntry(hostDigest() === androidBranch ? "android-conflict" : "linux-conflict");
+    console.log("KeePass: concurrent edits converged as separate valid KDBX copies on both peers.");
   } finally {
     await rest("/rest/config/devices/" + encodeURIComponent(peerDevice), {
       method: "PATCH", body: JSON.stringify({ paused: false }),

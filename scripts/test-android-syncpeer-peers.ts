@@ -19,7 +19,7 @@ const adb = (serial: string, args: string[], inherit = false) => execFileSync(
   "adb", ["-s", serial, ...args], {
     encoding: "utf8",
     stdio: inherit ? "inherit" : ["ignore", "pipe", "pipe"],
-    timeout: 120_000,
+    timeout: 360_000,
   },
 );
 
@@ -33,17 +33,36 @@ const selectedSerials = () => {
     process.env.SYNCPEER_ANDROID_RESET_EMULATORS === "1",
     serial => adb(serial, ["shell", "getprop", "ro.kernel.qemu"]).trim() === "1");
 };
-
-const waitForBoot = async (serial: string) => {
-  const deadline = Date.now() + 180_000;
-  while (Date.now() < deadline) {
-    try {
-      if (adb(serial, ["shell", "getprop", "sys.boot_completed"]).trim() === "1" &&
-        adb(serial, ["shell", "pm", "path", "android"]).includes("package:")) return;
-    } catch { /* Android may advertise ADB before PackageManager is ready. */ }
+// A newly booted AVD can briefly reappear as "offline" while ADB rotates
+// transport IDs. Never relax the distinct-emulator/reset safety assertions:
+ // only the transient online check is retried, and only for 60 seconds.
+const selectedSerialsWhenOnline = async () => {
+  const deadline = Date.now() + 60_000;
+  while (true) {
+    try { return selectedSerials(); }
+    catch (error) {
+      if (!String(error).includes("Selected emulator is not online.") ||
+          Date.now() >= deadline) throw error;
+    }
     await new Promise(resolve => setTimeout(resolve, 1_000));
   }
-  throw new Error(`Android emulator ${serial} did not finish booting.`);
+};
+
+
+const waitForBoot = async (serial: string) => {
+  const deadline = Date.now() + 300_000;
+  let frameworkReady = false;
+  let packageManagerReady = false;
+  while (Date.now() < deadline) {
+    try {
+      frameworkReady = adb(serial, ["shell", "getprop", "sys.boot_completed"]).trim() === "1";
+      packageManagerReady = adb(serial, ["shell", "pm", "path", "android"]).includes("package:");
+      if (frameworkReady && packageManagerReady) return;
+    } catch { /* ADB can advertise the emulator before the Android framework is ready. */ }
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`Android emulator ${serial} did not finish booting within 300s; ` +
+    `frameworkReady=${frameworkReady}, packageManagerReady=${packageManagerReady}.`);
 };
 
 const phaseEnvironment = (serial: string, remoteDeviceId = "") => ({
@@ -82,7 +101,7 @@ const spawnPhase = (serial: string, args: string[], extra: NodeJS.ProcessEnv = {
 };
 
 const waitForFile = async (file: string, owner: ChildProcess) => {
-  const deadline = Date.now() + 120_000;
+  const deadline = Date.now() + 240_000;
   while (Date.now() < deadline) {
     if (fs.existsSync(file) && fs.statSync(file).size > 0) return;
     if (owner.exitCode !== null || owner.signalCode !== null) {
@@ -90,7 +109,7 @@ const waitForFile = async (file: string, owner: ChildProcess) => {
     }
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  throw new Error("Android pairing owner did not produce an invitation within 120 seconds.");
+  throw new Error("Android pairing owner did not produce an invitation within 240 seconds.");
 };
 const readDeviceId = (serial: string, directory: string) => {
   const output = path.join(directory, `${serial}-device-id`);
@@ -154,7 +173,7 @@ const verify = (serial: string, remoteId: string, name: string,
 const main = async () => {
   if (!fs.existsSync(appApk)) throw new Error(`Android APK is missing: ${appApk}`);
   if (!fs.existsSync(editorApk)) throw new Error(`Android editor APK is missing: ${editorApk}`);
-  const [firstSerial, secondSerial] = selectedSerials();
+  const [firstSerial, secondSerial] = await selectedSerialsWhenOnline();
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-two-android-"));
   const invitation = path.join(directory, "pairing-invitation.json");
   let owner: ReturnType<typeof spawnPhase> | undefined;
@@ -163,8 +182,8 @@ const main = async () => {
     for (const serial of [firstSerial, secondSerial]) {
       try { adb(serial, ["uninstall", appPackage], true); } catch { /* Fresh install is best-effort. */ }
       try { adb(serial, ["uninstall", editorPackage], true); } catch { /* Fresh install is best-effort. */ }
-      adb(serial, ["install", "-r", appApk], true);
-      adb(serial, ["install", "-r", editorApk], true);
+      adb(serial, ["install", "--no-streaming", "-r", appApk], true);
+      adb(serial, ["install", "--no-streaming", "-r", editorApk], true);
       // Some emulator images reject uninstall while preserving the package's
       // private data. Clearing both installed test packages is mandatory here.
       for (const packageName of [appPackage, editorPackage]) {
@@ -232,6 +251,14 @@ const main = async () => {
       SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
       SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2",
       SYNCPEER_ANDROID_DIRECT_PORT: first.port,
+    });
+    runPhase(firstSerial, ["--verify-browse-only-ui"], {
+      SYNCPEER_DEV_SERVER_DEVICE_ID: secondId,
+      SYNCPEER_ANDROID_DISCOVERY_MODE: "direct",
+      SYNCPEER_ANDROID_DIRECT_HOST: "10.0.2.2",
+      SYNCPEER_ANDROID_DIRECT_PORT: first.port,
+      SYNCPEER_E2E_FILE_NAME: "retained.txt",
+      SYNCPEER_E2E_FILE_CONTENT: "retained-by-second-peer",
     });
     verify(secondSerial, firstId, "retained.txt", "retained-by-second-peer");
     runPhase(secondSerial, ["--release-whole-folder-dangerous"], {

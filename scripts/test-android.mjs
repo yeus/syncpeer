@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -72,11 +73,13 @@ export const uninstallIfPresent = (packageName) => {
   } catch {
     return;
   }
-  run("adb", ["uninstall", packageName]);
+  run("adb", ["uninstall", packageName], { timeout: 120_000 });
 };
 
 export const waitForBoot = async (child, avdName, knownSerials = []) => {
-  const deadline = Date.now() + 180_000;
+  // A fresh API 36 Play Store AVD can take longer than three minutes to
+  // bring PackageManager online under parallel software-emulation load.
+  const deadline = Date.now() + 300_000;
   let state = "not started";
   let launchError;
   child.once("error", (error) => {
@@ -96,7 +99,7 @@ export const waitForBoot = async (child, avdName, knownSerials = []) => {
         const name = adb(["-s", serial, "emu", "avd", "name"], { timeout: 10_000 })
           .split(/\r?\n/)[0].trim();
         if (name !== avdName) continue;
-        state = adb(["-s", serial, "shell", "getprop", "sys.boot_completed"], { timeout: 10_000 }).trim();
+        state = adb(["-s", serial, "shell", "getprop", "sys.boot_completed"], { timeout: 10_000 }).trim() || "boot property not set";
         if (state !== "1") continue;
         const packageManager = adb(["-s", serial, "shell", "pm", "path", "android"], { timeout: 10_000 }).trim();
         if (packageManager.startsWith("package:")) return serial;
@@ -136,28 +139,26 @@ export const stopEmulator = async (child, serial) => {
 };
 
 const captureWebViewFixture = (directory) => {
-  const webViewPath = adb(["shell", "pm", "path", "com.google.android.webview"])
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^package:/, "").trim())
-    .find(Boolean);
-  if (!webViewPath) throw new Error("The modern emulator has no Android System WebView APK.");
-
-  const compressedLibrary = path.join(directory, "TrichromeLibrary.apk.gz");
-  const libraryApk = path.join(directory, "TrichromeLibrary.apk");
-  const webViewApk = path.join(directory, "WebViewGoogle.apk");
-  pull(webViewPath, webViewApk);
-  pull("/product/app/TrichromeLibrary/TrichromeLibrary.apk.gz", compressedLibrary);
-  fs.writeFileSync(libraryApk, gunzipSync(fs.readFileSync(compressedLibrary)));
-
-  const packageDetails = adb(["shell", "dumpsys", "package", "com.google.android.webview"]);
-  const version = packageDetails.match(/versionName=([^\s]+)/)?.[1];
-  if (!version) throw new Error("Could not determine the modern WebView version.");
-  const minimumSdk = readApkMinimumSdk(webViewApk);
-  console.log(`Captured modern WebView ${version} (minimum API ${minimumSdk}).`);
+  // Use the paired, immutable APKs in the pinned system image. The active
+  // /data/app path can be replaced by Play Store updates during adb pull.
+  const extract = name => {
+    const compressed = path.join(directory, `${name}.apk.gz`);
+    const apk = path.join(directory, `${name}.apk`);
+    pull(`/product/app/${name}/${name}.apk.gz`, compressed);
+    fs.writeFileSync(apk, gunzipSync(fs.readFileSync(compressed)));
+    return apk;
+  };
+  const libraryApk = extract("TrichromeLibrary");
+  const webViewApk = extract("WebViewGoogle");
+  const { version, minimumSdk } = readApkMetadata(webViewApk);
+  if (readApkMetadata(libraryApk).version !== version) {
+    throw new Error("Pinned WebView and Trichrome library versions do not match.");
+  }
+  console.log(`Captured system-image WebView ${version} (minimum API ${minimumSdk}).`);
   return { libraryApk, webViewApk, version, minimumSdk };
 };
 
-const readApkMinimumSdk = (apk) => {
+const readApkMetadata = (apk) => {
   const buildTools = process.env.ANDROID_HOME
     ? path.join(process.env.ANDROID_HOME, "build-tools")
     : "";
@@ -170,11 +171,10 @@ const readApkMinimumSdk = (apk) => {
   const badging = execFileSync(aapt, ["dump", "badging", apk], {
     encoding: "utf8",
   });
-  const match = badging.match(/^sdkVersion:'(\d+)'/m);
-  if (!match) {
-    throw new Error("Could not read the Android WebView fixture's minimum SDK.");
-  }
-  return Number(match[1]);
+  const sdk = badging.match(/^sdkVersion:\x27(\d+)\x27/m);
+  const version = badging.match(/versionName=\x27([^\x27]+)\x27/);
+  if (!sdk || !version) throw new Error("Could not read WebView fixture APK metadata.");
+  return { minimumSdk: Number(sdk[1]), version: version[1] };
 };
 
 export const webViewSelected = (state, version) => state.includes(
@@ -234,7 +234,38 @@ const runProfile = async (profileName, testArguments, prepareDevice,
   }
 };
 
+export const freshMatrixPrefix = () => `syncpeer-matrix-${process.pid}-${randomBytes(4).toString("hex")}`;
+
+// Isolate automatic acceptance from old emulator userdata and other running
+// test suites. A user-provided AVD prefix is never deleted by this harness.
+const cleanUpMatrixAvds = (prefix) => {
+  if (!/^syncpeer-matrix-\d+-[0-9a-f]{8}$/.test(prefix)) {
+    throw new Error("Refusing to clean up a non-disposable Android AVD prefix.");
+  }
+  let avds;
+  try {
+    avds = new Set(execFileSync("avdmanager", ["list", "avd", "-c"], {
+      encoding: "utf8", timeout: 30_000,
+    }).split(/\r?\n/));
+  } catch (error) {
+    console.warn(`Could not inspect disposable Android AVDs for cleanup: ${String(error)}`);
+    return;
+  }
+  for (const kind of ["modern", "compat", "minimum"]) {
+    const avdName = profile(kind, prefix).avdName;
+    if (!avds.has(avdName)) continue;
+    try {
+      run("avdmanager", ["delete", "avd", "-n", avdName], { timeout: 30_000 });
+    } catch (error) {
+      console.warn(`Could not remove disposable Android AVD ${avdName}: ${String(error)}`);
+    }
+  }
+};
+
 const main = async () => {
+  const configuredPrefix = process.env.SYNCPEER_ANDROID_AVD_PREFIX;
+  const matrixPrefix = configuredPrefix || freshMatrixPrefix();
+  if (!configuredPrefix) process.env.SYNCPEER_ANDROID_AVD_PREFIX = matrixPrefix;
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-webview-"));
   try {
     if (process.argv.includes("--minimum-smoke-only")) {
@@ -280,6 +311,10 @@ const main = async () => {
     ]);
     console.log("Combined Android compatibility and modern smoke tests passed.");
   } finally {
+    if (!configuredPrefix) {
+      cleanUpMatrixAvds(matrixPrefix);
+      delete process.env.SYNCPEER_ANDROID_AVD_PREFIX;
+    }
     fs.rmSync(fixtureDirectory, { recursive: true, force: true });
   }
 };

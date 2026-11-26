@@ -275,17 +275,21 @@ const waitForCdpPage = async (port = 9222) => {
 };
 
 const connectCdp = async () => {
-  let port = Number(process.env.SYNCPEER_ANDROID_CDP_PORT || 9222);
+  let port = Number(process.env.SYNCPEER_ANDROID_CDP_PORT || 0);
   const pid = runAdb(["shell", "pidof", packageName]).trim().split(/\s+/)[0];
   if (!pid) throw new Error(`Could not find the Android process for ${packageName}.`);
   const target = `localabstract:webview_devtools_remote_${pid}`;
   try {
-    runAdb(["forward", `tcp:${port}`, target]);
+    const assigned = runAdb(["forward", "--no-rebind", `tcp:${port}`, target]);
+    if (port === 0) port = Number(assigned.trim());
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+      throw new Error("adb did not allocate a valid WebView debugging port.");
+    }
   } catch (error) {
     // Test runs sometimes inherit a stale forward after an emulator crash.
     // Ask adb for an ephemeral local port rather than retrying the occupied
     // port or attaching to the wrong test's WebView.
-    if (!/cannot bind listener|Address already in use/i.test(String(error))) throw error;
+    if (!/cannot bind listener|Address already in use|cannot rebind/i.test(String(error))) throw error;
     port = Number(runAdb(["forward", "tcp:0", target]).trim());
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
       throw new Error("adb did not allocate a valid WebView debugging port.", { cause: error });
@@ -362,12 +366,13 @@ const connectCdp = async () => {
       }
       if (result?.exceptionDetails) {
         const exception = result.exceptionDetails.exception;
-        throw new Error(
-          exception?.description ||
-          exception?.value ||
-          result.exceptionDetails.text ||
-          JSON.stringify(result.exceptionDetails),
-        );
+        const raw = exception?.description ?? exception?.value ??
+          result.exceptionDetails.text ?? result.exceptionDetails;
+        // CDP often returns a structured error as Runtime.RemoteObject.value;
+        // coercing it via Error(raw) turns the entire useful payload into
+        // "[object Object]" and obscures a real native initialization failure.
+        const detail = typeof raw === "string" ? raw : JSON.stringify(raw) || String(raw);
+        throw new Error(detail.slice(0, 800));
       }
       return result?.result?.value;
     },
@@ -620,24 +625,34 @@ const waitForUiDownloadButton = async (cdp, title, timeout = 30_000) => {
   }
 };
 
-const tauriInvoke = (cdp, command, args = undefined, timeout = 30_000) => cdp.evaluate(`(async () => {
-  const tauri = globalThis.__TAURI__;
-  const internals = globalThis.__TAURI_INTERNALS__;
-  try {
-    if (typeof tauri?.core?.invoke === "function") {
-      return await tauri.core.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)});
+const tauriInvoke = async (cdp, command, args = undefined, timeout = 30_000) => {
+  // Return a tagged result by value from CDP. Throwing inside the browser
+  // forces JSON errors through RemoteObject.exceptionDetails, which sometimes
+  // strips the message and leaves only an opaque [object Object] or {}.
+  const outcome = await cdp.evaluate(`(async () => {
+    const tauri = globalThis.__TAURI__;
+    const internals = globalThis.__TAURI_INTERNALS__;
+    try {
+      const invoke = typeof tauri?.core?.invoke === "function"
+        ? (cmd, options) => tauri.core.invoke(cmd, options)
+        : typeof internals?.invoke === "function"
+          ? (cmd, options) => internals.invoke(cmd, options) : null;
+      if (!invoke) throw new Error("Tauri invoke is unavailable in the Android WebView.");
+      return { ok: true, result: await invoke(${JSON.stringify(command)}, ${JSON.stringify(args)}) };
+    } catch (error) {
+      const message = typeof error === "string"
+        ? error
+        : typeof error?.message === "string"
+          ? error.message
+          : JSON.stringify(error) || String(error);
+      return { ok: false, error: String(message).slice(0, 800) };
     }
-    if (typeof internals?.invoke === "function") {
-      return await internals.invoke(${JSON.stringify(command)}, ${JSON.stringify(args)});
-    }
-    throw new Error("Tauri invoke is unavailable in the Android WebView.");
-  } catch (error) {
-    const message = typeof error === "string"
-      ? error
-      : error?.message || JSON.stringify(error);
-    throw new Error(message);
+  })()`, timeout);
+  if (!outcome || outcome.ok !== true) {
+    throw new Error(outcome?.error || "Android Tauri native command failed.");
   }
-})()`, timeout);
+  return outcome.result;
+};
 
 const captureUiHierarchy = async (path, timeout = 15_000) => {
   const deadline = Date.now() + timeout;
@@ -1692,8 +1707,22 @@ const waitForSessionNotificationText = async (text, timeout = 30_000) => {
   const wanted = normalizeNotificationText(text);
   let count = 0;
   let lastRecords = [];
+  let transientDumpsysErrors = 0;
   while (Date.now() < deadline) {
-    const records = appNotificationRecords().sessionRecords;
+    let records;
+    try {
+      records = appNotificationRecords().sessionRecords;
+    } catch (error) {
+      // Dumpsys occasionally fails on busy cold-boot emulators despite the
+      // authenticated service running. A failed probe is not a missing notice;
+      // keep the existing deadline and fail with evidence if it persists.
+      transientDumpsysErrors++;
+      if (transientDumpsysErrors === 1) {
+        console.warn(`Android notification diagnostic temporarily unavailable: ${String(error)}`);
+      }
+      await wait(1000);
+      continue;
+    }
     lastRecords = records;
     count = records.length;
     if (notificationTextValues(records).some(value =>
@@ -1701,8 +1730,9 @@ const waitForSessionNotificationText = async (text, timeout = 30_000) => {
       records.some(record => normalizeNotificationText(record).includes(wanted))) return;
     // A connected session can immediately replace the ready notice after its
     // first favorite pass; the file convergence checks below still gate success.
-    if (notificationTextValues(records).some(value =>
-      normalizeNotificationText(value).includes("selected files need attention in syncpeer"))) return;
+    if (wanted === normalizeNotificationText("Peer session connected; selected sync is ready.") &&
+      notificationTextValues(records).some(value =>
+        normalizeNotificationText(value).includes("selected files need attention in syncpeer"))) return;
     await wait(250);
   }
   const knownStates = ["Preparing selected folders", "Waiting for a network connection",
@@ -1718,7 +1748,7 @@ const waitForSessionNotificationText = async (text, timeout = 30_000) => {
       .slice(0, 180))[0] ?? "unavailable";
   const normalized = notificationTextValues(lastRecords).map(normalizeNotificationText).slice(0, 3);
   throw new Error(`Expected the connected background-session notification; found ${count}, state=${state}, ` +
-    `wanted=${JSON.stringify(wanted)}, normalized=${JSON.stringify(normalized)}, detail=${detail}.`);
+    `wanted=${JSON.stringify(wanted)}, normalized=${JSON.stringify(normalized)}, detail=${detail}, transientDumpsysErrors=${transientDumpsysErrors}.`);
 };
 
 const clearTransferNotifications = async (cdp) => {
@@ -2283,9 +2313,32 @@ const completeAndroidDeviceNaming = async (cdp, name) => {
   return true;
 };
 
+const readNativeSessionMilestones = async cdp => {
+  const call = request => tauriInvoke(cdp, "syncpeer_android_diagnostic_logs", { request });
+  const { runs } = await call({ operation: "list" });
+  const selected = [...(runs ?? [])].sort((a, b) => b.lastEventAtMs - a.lastEventAtMs).slice(0, 3);
+  const results = [];
+  for (const run of selected) {
+    const { items } = await call({ operation: "recentNative", runId: run.runId, limit: 250 });
+    const events = (items ?? []).filter(item =>
+      /^(native\.(session|peer)|core\.(relay|incoming|session|discovery)|client\.session)\./.test(item.event))
+      .map(item => {
+        let details = {};
+        try { details = typeof item.details === "string" ? JSON.parse(item.details) : item.details ?? {}; }
+        catch { /* Native journal metadata is best-effort; never expose its raw value. */ }
+        const category = details?.category;
+        return { event: item.event,
+          ...(typeof category === "string" && /^[a-z]{2,22}$/.test(category) ? { category } : {}) };
+      }).slice(-100);
+    results.push(events);
+  }
+  return results;
+};
+
 const awaitAndroidConnection = async (cdp) => {
   const deadline = Date.now() + connectionTimeoutMs;
   let lastError = "";
+  let relayPoll = 0;
   while (Date.now() < deadline) {
     const state = await observeCdp(cdp, `(() => ({
       label: document.querySelector("[data-testid=connection-status]")?.textContent?.trim() || "",
@@ -2293,12 +2346,24 @@ const awaitAndroidConnection = async (cdp) => {
     }))()`);
     if (state?.label === "Connected") return true;
     if (state?.error) lastError = state.error;
+    if (relayPoolUrl && relayPoll++ % 2 === 0) {
+      const relayState = await observeCdp(cdp, `(() => ({
+        mode: document.querySelector("[data-testid=connection-discovery-mode]")?.value ?? "hidden",
+        fallback: document.querySelector("[data-testid=connection-relay-fallback]")?.checked ?? null,
+        paused: document.querySelector("[data-testid=expert-connection-control]")?.textContent?.trim() ?? "",
+        recentEvents: window.__syncpeerStateProbe?.()?.syncTrace?.slice(-12).map(item => item.event) ?? [],
+      }))()`).catch(() => ({ unavailable: true }));
+      console.log("Android relay wait (non-sensitive):", JSON.stringify(relayState));
+    }
     await wait(10_000);
   }
   const state = await readAndroidFolderState(cdp);
+  // Only event names and fixed diagnostic categories leave the encrypted
+  // Android journal; never export peer IDs, network endpoints or payloads.
+  const native = await readNativeSessionMilestones(cdp).catch(() => []);
   const events = await readAndroidSessionEvents(cdp);
   throw new Error("Timed out waiting for Android UI connection approval: " +
-    JSON.stringify({ ...state, lastError, events }));
+    JSON.stringify({ ...state, lastError, events, native }));
 };
 
 const openAndroidConnection = async (cdp) => {
@@ -2355,7 +2420,10 @@ const openAndroidConnection = async (cdp) => {
     await setAndroidAutomaticConnectionPaused(cdp, false);
     return await awaitAndroidConnection(cdp);
   }
-  if (initiallyConnected) {
+  if (initiallyConnected || peerSaved) {
+    // A saved peer may already be reconnecting even when the status is not yet
+    // "Connected". Pause that automatic attempt before modifying its transport
+    // controls, otherwise the old attempt's abort races the new session.
     await setAndroidAutomaticConnectionPaused(cdp, true);
     await openAndroidSettingsSection(cdp, "network");
   }
@@ -2409,6 +2477,29 @@ const openAndroidConnection = async (cdp) => {
       await setUiValue(cdp, "connection-port", directPort);
     }
   }
+  if (relayPoolUrl) {
+    // The saved-peer selector and Add Device can replace connection settings.
+    // Install the opt-in relay pool override only after those operations, and
+    // explicitly require relay fallback for this global-discovery fixture.
+    const relayState = await cdp.evaluate(`(() => {
+      const fallback = document.querySelector("[data-testid=connection-relay-fallback]");
+      if (!(fallback instanceof HTMLInputElement)) return { ready: false };
+      if (!fallback.checked) fallback.click();
+      const setter = window.__syncpeerSetRelayPoolUrl;
+      if (typeof setter !== "function") return { ready: false };
+      setter(${JSON.stringify(relayPoolUrl)});
+      return {
+        ready: fallback.checked,
+        mode: document.querySelector("[data-testid=connection-discovery-mode]")?.value,
+        fallback: fallback.checked,
+      };
+    })()`);
+    if (!relayState?.ready || relayState.mode !== discoveryMode ||
+        relayState.fallback !== true) {
+      throw new Error("Android synthetic relay settings were not applied.");
+    }
+    console.log("Android global relay preflight:", JSON.stringify(relayState));
+  }
   const appliedSettings = await cdp.evaluate(`(() => ({
     mode: document.querySelector("[data-testid=connection-discovery-mode]")?.value,
     server: document.querySelector("[data-testid=connection-discovery-server]")?.value,
@@ -2421,6 +2512,9 @@ const openAndroidConnection = async (cdp) => {
     throw new Error(`Android connection settings did not survive setup: ${JSON.stringify(appliedSettings)}`);
   }
   await setAndroidAutomaticConnectionPaused(cdp, false);
+  // Packaged relay acceptance measures the announcement deadline from actual
+  // Android UI configuration, not from process spawn/onboarding time.
+  if (relayPoolUrl) process.send?.({ kind: "relay-settings-applied" });
   return await awaitAndroidConnection(cdp);
 };
 
@@ -3103,6 +3197,12 @@ const openFolderSettings = async (cdp, folderId = targetFolderId) => {
 };
 
 const openGeneralSettings = async (cdp) => {
+  // Pairing owner first opens General Settings to bootstrap the local vault
+  // and then upgrades storage through the native command. The page is already
+  // open on the second call; no tab navigation exists inside this sub-page.
+  if (await cdp.evaluate(
+    '!!document.querySelector("[data-testid=general-settings-page]")',
+  )) return;
   await waitForUiCondition(cdp,
     'document.querySelector("[data-testid=device-name-onboarding]") !== null || document.querySelector("[data-testid=tab-devices]") !== null',
     "device onboarding or navigation", 60_000);
@@ -3159,7 +3259,10 @@ const runPairingInvitation = async (outputPath) => {
   if (!advertisedHost) throw new Error("SYNCPEER_PAIRING_ADVERTISED_HOST is required.");
   const cdp = await launchAndroidApp(true);
   try {
+    // Preserve startup ordering: complete device-protected vault bootstrap
+    // before the real name/onboarding flow and native identity provisioning.
     await ensurePeerDocumentVault(cdp);
+    await openGeneralSettings(cdp);
     const status = await documentCommand(cdp, { operation: "status" });
     if (!status.vault.personalSpaceEnabled) {
       const kit = await createOwnedRecoveryKit(crypto.subtle,
@@ -3168,6 +3271,10 @@ const runPairingInvitation = async (outputPath) => {
       await documentCommand(cdp, { operation: "upgradeToPersonalSpace",
         password: "synthetic-owner-master-password", remember: true,
         localDeviceId, recoveryKey: kit.publicKey });
+      // Native setup bypasses the mounted Svelte settings component's own
+      // createProfile() flow, which normally refreshes its cached status.
+      // Navigate out and back through the real UI to remount and refresh it.
+      await closeAndroidSettings(cdp);
     }
     await openGeneralSettings(cdp);
     await cdp.evaluate("window.confirm = () => true");
@@ -3177,12 +3284,42 @@ const runPairingInvitation = async (outputPath) => {
       "pair another device controls", 30_000);
     await setPairingValue(cdp, heading, "input", advertisedHost);
     await clickPairingButton(cdp, heading, "Create pairing invitation");
-    await waitForUiCondition(cdp,
-      `${pairingSectionControl(heading, "textarea[readonly]")}?.value?.length > 0`,
-      "pairing invitation", 30_000);
+    try {
+      await waitForUiCondition(cdp, `(() => {
+        const invitation = ${pairingSectionControl(heading, "textarea[readonly]")};
+        const error = document.querySelector("[data-testid=general-settings-page] [role=alert]");
+        return Boolean(invitation?.value || error?.textContent?.trim());
+      })()`, "pairing invitation or reported error", 60_000);
+    } catch (error) {
+      const state = await cdp.evaluate(`(() => {
+        const settings = document.querySelector("[data-testid=general-settings-page]");
+        const section = (${pairingSectionControl(heading, "button")})?.closest("section");
+        const action = [...(section?.querySelectorAll("button") ?? [])]
+          .find(button => button.textContent?.trim() === "Create pairing invitation");
+        return {
+          settingsVisible: Boolean(settings), pairingSectionVisible: Boolean(section),
+          buttonDisabled: action?.disabled ?? null,
+          status: [...(section?.querySelectorAll('[role="status"]') ?? [])]
+            .map(row => row.textContent?.trim().slice(0, 120)),
+          alert: [...(settings?.querySelectorAll('[role="alert"]') ?? [])]
+            .map(row => row.textContent?.trim().slice(0, 200)),
+          invitationPresent: Boolean(section?.querySelector("textarea[readonly]")),
+        };
+      })()`).catch(failure => ({ diagnosticsUnavailable: String(failure).slice(0, 120) }));
+      console.error("Android pairing invitation UI state:", JSON.stringify(state));
+      throw error;
+    }
     const invitation = await cdp.evaluate(
       `${pairingSectionControl(heading, "textarea[readonly]")}?.value ?? ""`,
     );
+    if (!invitation) {
+      // The app has already sanitized this error for its own UI. Report it
+      // rather than an opaque 30-second timeout when the native listener fails.
+      const alert = await cdp.evaluate(
+        'document.querySelector("[data-testid=general-settings-page] [role=alert]")?.textContent?.trim().slice(0, 300) ?? ""',
+      );
+      throw new Error(`Android pairing invitation rejected: ${alert || "no visible error"}`);
+    }
     fs.writeFileSync(outputPath, `${invitation}\n`, { mode: 0o600 });
     await waitForUiText(cdp, "Device paired and approved.", 120_000);
     console.log("Android invitation owner confirmed and persisted the paired device.");
@@ -3212,7 +3349,12 @@ const runPairingJoin = async (inputPath) => {
       }
       console.log(`Android pairing identity selected preferred ${requestedDirection} direction.`);
     }
+    await ensurePeerDocumentVault(cdp);
     await openGeneralSettings(cdp);
+    await waitForUiCondition(cdp,
+      'document.querySelector("[data-testid=optional-personal-space-setup]") instanceof HTMLDetailsElement',
+      "available optional Personal Space setup", 30_000);
+    await cdp.evaluate('document.querySelector("[data-testid=optional-personal-space-setup]").open = true');
     await cdp.evaluate("window.confirm = () => true");
     const heading = "Join an existing personal space";
     await waitForUiCondition(cdp,
@@ -3223,7 +3365,34 @@ const runPairingJoin = async (inputPath) => {
       "synthetic-joining-master-password");
     await setPairingChecked(cdp, heading, 'input[type="checkbox"]');
     await clickPairingButton(cdp, heading, "Join personal space");
-    await waitForUiText(cdp, "Personal space joined and device approved.", 120_000);
+    const success = "Personal space joined and device approved.";
+    const joinUiState = `(() => {
+      const root = document.querySelector("[data-testid=general-settings-page]");
+      const section = (${pairingSectionControl(heading, "textarea")})?.closest("section");
+      const action = [...(section?.querySelectorAll("button") ?? [])]
+        .find(button => button.textContent?.trim() === "Join personal space");
+      return {
+        success: Boolean(root?.textContent?.includes(${JSON.stringify(success)})),
+        alert: [...(root?.querySelectorAll('[role="alert"]') ?? [])]
+          .map(row => row.textContent?.trim().slice(0, 180)),
+        busy: action?.disabled ?? null,
+        sectionVisible: Boolean(section),
+      };
+    })()`;
+    try {
+      await waitForUiCondition(cdp, `(() => {
+        const state = ${joinUiState};
+        return state.success || state.alert.some(Boolean);
+      })()`, "joined and approved or explicit pairing failure", 120_000);
+    } catch (error) {
+      console.error("Android pairing join UI state:",
+        JSON.stringify(await cdp.evaluate(joinUiState).catch(() => ({ unavailable: true }))));
+      throw error;
+    }
+    const joinState = await cdp.evaluate(joinUiState);
+    if (!joinState.success) {
+      throw new Error("Android pairing join refused: " + (joinState.alert.filter(Boolean).join(" | ") || "unknown"));
+    }
     console.log("Android joining device confirmed and persisted the personal space.");
   } finally { cdp.close(); }
 };
@@ -3280,11 +3449,14 @@ const runRecoveryAcceptance = async () => {
     try { return await documentCommand(cdp, request); }
     finally { cdp.close(); }
   };
-  const expectFailure = async (request, label) => {
+  const migrating = hasArgument("--recovery-migration");
+  const existingProfileError = /Local profile already exists; recovery cannot replace it\./;
+  const expectFailure = async (request, label, expected) => {
     try {
       await command(request);
     } catch (error) {
-      if (/CDP|WebView debug|WebView CDP/i.test(String(error))) throw error;
+      if (/CDP|WebView debug|WebView CDP/i.test(String(error)) ||
+          (expected && !expected.test(String(error)))) throw error;
       return;
     }
     throw new Error(`Android recovery unexpectedly accepted ${label}.`);
@@ -3296,11 +3468,16 @@ const runRecoveryAcceptance = async () => {
   };
 
   const originalSyncthingId = await launchAndReadDeviceId();
-  const initial = await command({ operation: "status" });
-  if (initial.vault.phase !== "uninitialized") {
-    throw new Error("Android recovery acceptance requires a fresh local profile.");
-  }
-  await command({ operation: "createVault",
+  const waitForLocalVault = async () => {
+    const cdp = await connectCdp();
+    try { await ensurePeerDocumentVault(cdp); } finally { cdp.close(); }
+    const status = await command({ operation: "status" });
+    if (status.vault.phase !== "unlocked" || status.vault.personalSpaceEnabled) {
+      throw new Error("Android recovery acceptance requires a new device-protected local profile.");
+    }
+  };
+  await waitForLocalVault();
+  await command({ operation: "upgradeToPersonalSpace",
     password: "synthetic-android-owner-password", remember: true,
     localDeviceId: originalSyncthingId, recoveryKey: kit.publicKey });
   const backup = await command({ operation: "exportRecoveryBackup", password: recoveryPassword });
@@ -3319,20 +3496,33 @@ const runRecoveryAcceptance = async () => {
   if (!replacementSyncthingId || replacementSyncthingId === originalSyncthingId) {
     throw new Error("Android recovery did not create a distinct replacement device identity.");
   }
+  await waitForLocalVault();
 
   await expectFailure({ operation: "restoreRecoveryBackup", backup,
-    recoveryPassword: "wrong-backup-password", password: replacementPassword }, "wrong backup password");
-  if ((await command({ operation: "status" })).vault.phase !== "uninitialized") {
+    recoveryPassword: "wrong-backup-password", password: replacementPassword }, "wrong backup password",
+    migrating ? undefined : existingProfileError);
+  if ((await command({ operation: "status" })).vault.personalSpaceEnabled) {
     throw new Error("Wrong Android recovery password occupied the fresh profile.");
   }
   const tampered = structuredClone(backup);
   tampered.vault.ciphertext[0] ^= 1;
   await expectFailure({ operation: "restoreRecoveryBackup", backup: tampered,
-    recoveryPassword, password: replacementPassword }, "corrupt backup");
-  if ((await command({ operation: "status" })).vault.phase !== "uninitialized") {
+    recoveryPassword, password: replacementPassword }, "corrupt backup",
+    migrating ? undefined : existingProfileError);
+  if ((await command({ operation: "status" })).vault.personalSpaceEnabled) {
     throw new Error("Corrupt Android recovery backup occupied the fresh profile.");
   }
 
+  // Import into the automatically initialized local vault is explicitly
+  // deferred to 0.7.1 (personal-space-backup-restore-local-v071).
+  // Until then a valid backup must also be rejected, without replacing data.
+  if (!migrating) {
+    await expectFailure({ operation: "restoreRecoveryBackup", backup,
+      recoveryPassword, password: replacementPassword }, "backup over initialized local vault", existingProfileError);
+    await waitForLocalVault();
+    console.log("Android packaged backup export and safe refusal passed; migration into local vault deferred to 0.7.1.");
+    return;
+  }
   await command({ operation: "restoreRecoveryBackup", backup,
     recoveryPassword, password: replacementPassword });
   const restoredMembership = await command({ operation: "ownedDevices" });
@@ -3544,18 +3734,28 @@ const runWholeFolderVerify = async () => {
   const expectMissing = process.env.SYNCPEER_E2E_EXPECT_MISSING === "1";
   const deadline = Date.now() + 120_000;
   let observed;
+  let lastProbeError;
   while (Date.now() < deadline) {
-    const exists = editorCommand("stat", name) === "true";
-    if (!exists && expectMissing) return;
-    if (exists && !expectMissing) {
-      observed = editorCommand("read", name);
-      if (expected === undefined || observed === expected) return;
+    try {
+      const exists = editorCommand("stat", name) === "true";
+      if (!exists && expectMissing) return;
+      if (exists && !expectMissing) {
+        observed = editorCommand("read", name);
+        if (expected === undefined || observed === expected) return;
+      }
+    } catch (error) {
+      // A newly reconnected Android DocumentsProvider can briefly return an
+      // empty Binder Bundle. Keep the exact-byte convergence assertion and
+      // bounded deadline; do not turn a temporary empty reply into success.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!lastProbeError) console.warn(`Android editor read probe transiently failed: ${message}`);
+      lastProbeError = message;
     }
     await wait(500);
   }
   throw new Error(expectMissing
-    ? `Android editor still sees deleted document: ${name}`
-    : `Android editor did not observe convergence: ${name} (${observed ?? "missing"})`);
+    ? `Android editor still sees deleted document: ${name} (${lastProbeError ?? "no probe error"})`
+    : `Android editor did not observe convergence: ${name} (${observed ?? "missing"}; ${lastProbeError ?? "no probe error"})`);
 };
 
 const runWholeFolderConnection = async () => {
@@ -3597,6 +3797,48 @@ const runWholeFolderDangerousRelease = async () => {
       throw new Error("Android local release has no signed dangerous audit record.");
     }
     console.log("Android local copy released while retaining a browse-only folder registration.");
+  } finally { cdp.close(); }
+};
+
+// The provider is browse-only after release, but the UI must retain remote
+// browsing and repeat refresh; explicit download must explain the missing local copy.
+const verifyWholeFolderBrowseOnly = async () => {
+  const { id } = folderTestConfig();
+  const fileName = process.env.SYNCPEER_E2E_FILE_NAME?.trim() || "retained.txt";
+  const cdp = await launchAndroidApp(true);
+  try {
+    const assertBrowseOnly = async (context) => {
+      const status = await documentCommand(cdp, { operation: "status" });
+      if (!status.folders.some(folder => folder.id === id && folder.browseOnly) ||
+        status.pendingLocalReleases.includes(id)) {
+        throw new Error(`Android browse-only state changed during ${context}.`);
+      }
+    };
+    await assertBrowseOnly("post-release startup");
+    if (!await openAndroidConnection(cdp)) throw new Error("Browse-only remote peer did not connect.");
+    await openAndroidFolder(cdp, false, false);
+    await waitForAndroidFileRow(cdp, fileName);
+    await clickUiTestId(cdp, "tab-devices");
+    await clickUiTestId(cdp, "tab-folders");
+    await openAndroidFolder(cdp, false, false);
+    await waitForAndroidFileRow(cdp, fileName);
+    const remoteState = await cdp.evaluate("window.__syncpeerStateProbe?.() ?? null");
+    if (!remoteState?.isConnected || remoteState.currentFolderId !== id) {
+      throw new Error("Browse-only remote directory did not remain usable after tab refresh.");
+    }
+    await waitForUiDownloadButton(cdp, fileName);
+    if (!await clickUiDownload(cdp, fileName)) {
+      throw new Error("Browse-only UI did not render its download action.");
+    }
+    await waitForUiCondition(cdp,
+      `document.body?.innerText?.includes(${JSON.stringify("Reattach local storage in Folder settings")}) === true`,
+      "browse-only reattach guidance instead of impossible service transfer", 30_000);
+    const state = await cdp.evaluate("window.__syncpeerStateProbe?.() ?? null");
+    if (!state?.logs?.some(item => item.event === "download.browse_only.needs_storage")) {
+      throw new Error("Browse-only download did not record the local-storage restriction.");
+    }
+    await assertBrowseOnly("remote browsing and blocked local storage");
+    console.log("Android browse-only remote browsing, tab refresh and actionable download restriction passed.");
   } finally { cdp.close(); }
 };
 
@@ -3845,6 +4087,13 @@ const main = async () => {
   }
   grantNotificationPermission();
 
+  if (hasArgument("--dump-native-session-events")) {
+    const cdp = await launchAndroidApp();
+    try { console.log("Android native connection milestones (redacted):",
+      JSON.stringify(await readNativeSessionMilestones(cdp))); }
+    finally { cdp.close(); }
+    return;
+  }
   if (legacySmoke) {
     await runLegacyAndroidSmoke();
     return;
@@ -4023,6 +4272,10 @@ const main = async () => {
     await runWholeFolderSafeReleaseUi();
     return;
   }
+  if (hasArgument("--verify-browse-only-ui")) {
+    await verifyWholeFolderBrowseOnly();
+    return;
+  }
 
   if (hasArgument("--peer-connect-smoke")) {
     await runPeerConnectSmoke();
@@ -4072,9 +4325,8 @@ const main = async () => {
     await runKeepassAcceptance({
       runAdb, wait, captureUiHierarchy, recoverEmulatorAnr, nodeBounds,
       tapDocumentUiText, tapDocumentUiContentDescription, editorCommand,
-      scanPeerFolder, peerHostFolder, peerGuiUrl, peerApiKey, targetFolderTitle,
-      readFavoriteState: async () =>
-        (await freshDocumentCommand({ operation: "favoriteSyncState", folderId: targetFolderId })).entries["syncpeer-acceptance.kdbx"],
+      scanPeerFolder, peerHostFolder, peerGuiUrl, peerApiKey, targetFolderId, targetFolderTitle,
+      listCachedFiles: () => freshDocumentCommand({ operation: "folderFiles", folderId: targetFolderId }),
       rebootAndReconnect: async () => {
         runAdb(["reboot"], 10_000);
         await waitForAndroidBoot();

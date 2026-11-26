@@ -9,7 +9,7 @@ import { safeNativeFailureText } from "../../packages/app/src/app/storageErrors.
 import { coordinatorRequest } from "./coordinator.ts";
 import type { LanFixture } from "./protocol.ts";
 import {
-  openSettingsSection,
+  openSettingsSection, closeSettings, openSessionLogs,
   openFolderSettings,
   clickDownloadButton,
   clickItemTitle,
@@ -80,7 +80,11 @@ const fixture = async (): Promise<LanFixture> => {
 };
 
 const clickTestId = async (testId: string): Promise<void> => {
-  await $("[data-testid='" + testId + "']").click();
+  await lanBrowser.execute(id => {
+    const button = document.querySelector(`[data-testid='${id}']`);
+    if (!(button instanceof HTMLButtonElement)) throw new Error("Missing button: " + id);
+    button.click();
+  }, testId);
 };
 const appErrorCategory = (issue: string): string =>
   /vault|locked|unlock/i.test(issue) ? "vault access"
@@ -92,15 +96,31 @@ const connect = async (
   mode: "automatic" | "direct" | "lan" | "global",
   options: { identity?: { cert: string; key: string }; quicOnly?: boolean } = {},
 ): Promise<void> => {
+  await closeSettings(lanBrowser);
   await clickTestId("tab-devices");
+  const remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim()
+    || currentFixture.remoteDeviceId;
+  const saved = await lanBrowser.execute(id => [...document.querySelectorAll('[data-saved-peer-id]')]
+    .some(row => (row.getAttribute('data-saved-peer-id') ?? '').replace(/-/g, '').toUpperCase()
+      === id.replace(/-/g, '').toUpperCase()), remoteDeviceId);
+  if (!saved) {
+    await clickTestId("open-add-device");
+    await setValue("new-peer-device-id", remoteDeviceId);
+    await lanBrowser.execute(() => {
+      const add = [...document.querySelectorAll(".saved-device-editor button")]
+        .find(button => button.textContent?.trim() === "Add Device");
+      if (!(add instanceof HTMLButtonElement)) throw new Error("Add Device action unavailable.");
+      add.click();
+    });
+  }
+  await setAutomaticConnectionPaused(lanBrowser, true);
   await openSettingsSection(lanBrowser, "network");
   await selectDiscoveryMode(lanBrowser, mode);
   if (mode === "direct") {
     const quicOnly = $("[data-testid='connection-direct-quic']");
     if (await quicOnly.isSelected() !== (options.quicOnly === true)) await quicOnly.click();
   }
-  const remoteDeviceId = process.env.SYNCPEER_LAN_REMOTE_DEVICE_ID?.trim()
-    || currentFixture.remoteDeviceId;
+
   await setValue("connection-remote-id", remoteDeviceId);
   if (mode === "direct" || mode === "automatic") {
     await setValue("connection-host", currentFixture.serverHost);
@@ -176,7 +196,7 @@ describe("Syncpeer LAN integration", () => {
   it("registers the real Tauri identity", async () => {
     // Complete real onboarding before accessing the main device tabs.
     await createFreshEncryptedProfile(lanBrowser);
-    await $("button=Back").click();
+    await closeSettings(lanBrowser);
     await clickTestId("tab-devices");
     await waitForText(lanBrowser, "This Device", 60_000);
     const deviceId = await readCurrentDeviceId(lanBrowser);
@@ -265,7 +285,7 @@ describe("Syncpeer LAN integration", () => {
       async () => await readCachedHash(lanBrowser, name) === updated.sha256,
       { timeout: 75_000, interval: 1_000, timeoutMsg: "Incremental favorite did not update." },
     );
-    await clickTestId("tab-devices");
+    await openSessionLogs(lanBrowser);
     const counters = await lanBrowser.execute(() => {
       const event = [...document.querySelectorAll(".item-meta")].find(
         (element) => element.textContent?.trim().endsWith("favorites.download.complete"),
@@ -275,22 +295,30 @@ describe("Syncpeer LAN integration", () => {
         networkBytes: number; reusedBytes: number; totalBytes: number;
       } : null;
     });
-    assert.ok(counters, "Automatic download must report transfer counters.");
-    assert.equal(counters.totalBytes, original.length);
-    assert.equal(counters.networkBytes, 128 * 1024, "Only the changed block should be downloaded.");
-    assert.equal(counters.reusedBytes, 384 * 1024);
-    await openFolders();
+    try {
+      assert.ok(counters, "Automatic download must report transfer counters.");
+      assert.equal(counters.totalBytes, original.length);
+      assert.equal(counters.networkBytes, 128 * 1024, "Only the changed block should be downloaded.");
+      assert.equal(counters.reusedBytes, 384 * 1024);
+    } finally {
+      await closeSettings(lanBrowser);
+      await openFolders();
+    }
   });
 
   it("sorts and filters folder entries", async () => {
-    await $("[data-testid=folder-filter-toggle]").click();
+    await clickTestId("folder-filter-toggle");
     await setValue("folder-name-filter", "hello");
     await waitForText(lanBrowser, "hello.txt");
     assert.equal((await lanBrowser.getPageSource()).includes("blob.bin"), false);
 
     await setValue("folder-name-filter", "");
-    const sort = $("[data-testid='folder-sort-mode']");
-    await sort.selectByAttribute("value", "size");
+    await lanBrowser.execute(() => {
+      const sort = document.querySelector("[data-testid='folder-sort-mode']");
+      if (!(sort instanceof HTMLSelectElement)) throw new Error("Sort control unavailable.");
+      sort.value = "size";
+      sort.dispatchEvent(new Event("change", { bubbles: true }));
+    });
     await lanBrowser.waitUntil(async () => {
       const names = await lanBrowser.execute(() =>
         [...document.querySelectorAll(".item-title")]
@@ -458,10 +486,12 @@ describe("Syncpeer LAN integration", () => {
       const passwordInput = $("[data-testid='folder-password-" + currentFixture.encryptedFolderId + "']");
       if (!(await passwordInput.isExisting())) {
         await openFolderSettings(browser, currentFixture.encryptedFolderId);
+        const toggle = $("[data-testid='folder-password-toggle']");
+        if (await toggle.isExisting()) await clickTestId("folder-password-toggle");
       }
       await setValue(`folder-password-${currentFixture.encryptedFolderId}`, currentFixture.encryptedPassword);
       await clickTestId(`unlock-folder-${currentFixture.encryptedFolderId}`);
-      await $("button=Back").click();
+      await $("[data-testid='folder-settings-page']").waitForExist({ reverse: true, timeout: 30_000 });
       await waitForText(lanBrowser, "unlocked", 90_000);
       await clickItemTitle(lanBrowser, currentFixture.encryptedFolderId);
       await waitForText(lanBrowser, "secret.txt", 90_000);

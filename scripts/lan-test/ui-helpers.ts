@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { $ } from "@wdio/globals";
+import { $, browser } from "@wdio/globals";
 import type { Browser as WdioBrowser } from "webdriverio";
 import type { BrowserExtension } from "@wdio/native-types";
 
@@ -34,7 +34,11 @@ export async function closeSettings(peer: WebdriverIO.Browser) {
   for (let depth = 0; depth < 4; depth++) {
     const back = peer.$("[data-testid='settings-back'], [data-testid='about-back'], [data-testid='diagnostics-back']");
     if (!await back.isExisting()) return;
-    await back.click();
+    await peer.execute(() => {
+      const button = document.querySelector("[data-testid='settings-back'], [data-testid='about-back'], [data-testid='diagnostics-back']");
+      if (!(button instanceof HTMLButtonElement)) throw new Error("Settings back button disappeared.");
+      button.click();
+    });
     await peer.pause(100);
   }
 }
@@ -43,11 +47,21 @@ export async function openSettingsSection(peer: WebdriverIO.Browser, section: st
   if (!await peer.$("[data-testid='settings-overview']").isExisting()) {
     await closeSettings(peer);
     await completeFirstRunDeviceName(peer);
-    await peer.$("[data-testid='connection-settings-toggle']").click();
+    // Native WebKit clicks can be lost when the Xvfb window is not active.
+    await peer.execute(() => {
+      const button = document.querySelector("[data-testid='connection-settings-toggle']");
+      if (!(button instanceof HTMLButtonElement)) throw new Error("Settings toggle is unavailable.");
+      button.click();
+    });
+    await peer.$("[data-testid='settings-overview']").waitForExist({ timeout: 30_000 });
   }
   const selector = section === "personal-space" ? "general-settings" : `open-settings-${section}`;
   await peer.$(`[data-testid='${selector}']`).waitForExist({ timeout: 30_000 });
-  await peer.$(`[data-testid='${selector}']`).click();
+  await peer.execute((id: string) => {
+    const button = document.querySelector(`[data-testid='${id}']`);
+    if (!(button instanceof HTMLButtonElement)) throw new Error(`Settings section ${id} is unavailable.`);
+    button.click();
+  }, selector);
   await peer.$(section === "about" ? "[data-testid='about-page']" : `[data-testid='settings-${section}']`).waitForExist({ timeout: 30_000 });
 }
 export async function openGeneralSettings(peer: WebdriverIO.Browser) {
@@ -60,8 +74,14 @@ export async function openOptionalPersonalSpaceSetup(peer: WebdriverIO.Browser) 
   await openGeneralSettings(peer);
   const setup = peer.$("[data-testid='optional-personal-space-setup']");
   await setup.waitForExist({ timeout: 60_000 });
-  if (await setup.getAttribute("open") === null) await setup.$("summary").click();
-  await setup.$("form input[autocomplete='new-password']").waitForDisplayed({ timeout: 30_000 });
+  await peer.execute(() => {
+    const panel = document.querySelector("[data-testid='optional-personal-space-setup']");
+    if (panel instanceof HTMLDetailsElement && !panel.open) panel.querySelector("summary")?.click();
+  });
+  await peer.waitUntil(() => peer.execute(() => {
+    const panel = document.querySelector("[data-testid='optional-personal-space-setup']");
+    return panel instanceof HTMLDetailsElement && panel.open && !!panel.querySelector("form input[autocomplete='new-password']");
+  }), { timeout: 30_000, timeoutMsg: "Personal Space form is not open." });
   return setup;
 }
 
@@ -105,7 +125,11 @@ export const waitForText = async (
  */
 export const readCurrentDeviceId = async (browser: WebdriverIO.Browser): Promise<string> => {
   await closeSettings(browser);
-  await browser.$("[data-testid='tab-devices']").click();
+  await browser.execute(() => {
+    const tab = document.querySelector("[data-testid='tab-devices']");
+    if (!(tab instanceof HTMLButtonElement)) throw new Error("Devices tab is unavailable.");
+    tab.click();
+  });
   await browser.execute(() => { const details = document.querySelector("details.local-details"); if (details instanceof HTMLDetailsElement) details.open = true; });
   const element = browser.$("[data-testid='current-device-id']");
   await browser.waitUntil(
@@ -116,12 +140,16 @@ export const readCurrentDeviceId = async (browser: WebdriverIO.Browser): Promise
 };
 
 export const setValue = async (testId: string, value: string): Promise<void> => {
-  const element = $("[data-testid='" + testId + "']");
-  await element.click();
-  // WebKitWebDriver rejects setValue("") because it omits the required
-  // text parameter. Use the W3C clear-element command for empty values.
-  if (value === "") await element.clearValue();
-  else await element.setValue(value);
+  await $("[data-testid='" + testId + "']").waitForExist({ timeout: 30_000 });
+  // Drive real input/change handlers without depending on Xvfb window focus.
+  await browser.execute(({ testId, value }) => {
+    const field = document.querySelector(`[data-testid='${testId}']`);
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement))
+      throw new Error("Input is unavailable: " + testId);
+    field.value = value;
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    field.dispatchEvent(new Event("change", { bubbles: true }));
+  }, { testId, value });
 };
 
 export const clickItemTitle = async (
@@ -306,12 +334,15 @@ export const setAutomaticConnectionPaused = async (
   browser: WebdriverIO.Browser,
   paused: boolean,
 ): Promise<void> => {
-  await openSettingsSection(browser, "appearance");
-  const expert = browser.$("[data-testid='expert-view']");
-  if (!await expert.isSelected()) await expert.click();
+  // The global pause control is available without Expert view.
+  // Avoid changing a persisted appearance setting during connection tests.
   await closeSettings(browser);
   const details = browser.$("[data-testid='connection-status-toggle']");
-  if (await details.getAttribute("aria-expanded") !== "true") await details.click();
+  if (await details.getAttribute("aria-expanded") !== "true") await browser.execute(() => {
+    const button = document.querySelector("[data-testid='connection-status-toggle']");
+    if (!(button instanceof HTMLButtonElement)) throw new Error("Connection details unavailable.");
+    button.click();
+  });
   const control = browser.$("[data-testid='expert-connection-control']");
   await control.waitForEnabled({ timeout: 5_000 });
   const expected = paused ? "Resume automatic connection" : "Pause automatic connection";
@@ -340,11 +371,26 @@ export const readCachedHash = async (
   if (relativePath === "blob.bin") console.log("Large transfer digest request returned.");
   return digest;
 };
+/** The diagnostics page does not mount the current journal until expanded. */
+export async function openSessionLogs(peer: WebdriverIO.Browser) {
+  await openSettingsSection(peer, "diagnostics");
+  await peer.execute(() => {
+    const panel = [...document.querySelectorAll("details")].find(details =>
+      details.querySelector("summary")?.textContent?.trim().startsWith("View logs ("));
+    if (!(panel instanceof HTMLDetailsElement)) throw new Error("Session log panel unavailable.");
+    if (!panel.open) panel.querySelector("summary")?.click();
+  });
+  await peer.waitUntil(() => peer.execute(() =>
+    [...document.querySelectorAll("details[open] > summary")].some(summary =>
+      summary.textContent?.trim().startsWith("View logs ("))),
+  { timeout: 5_000, timeoutMsg: "Session logs did not expand." });
+}
+
 
 export const readSessionEventNames = async (
   browser: TauriBrowser,
 ): Promise<string[]> => {
-  await openSettingsSection(browser, "diagnostics");
+  await openSessionLogs(browser);
   const events = await browser.execute(() =>
     [...document.querySelectorAll(".item-meta")]
       .map((element) => element.textContent?.trim() ?? "")

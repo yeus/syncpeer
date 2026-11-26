@@ -336,8 +336,14 @@ const configureHome = (home: string, args: {
       : undefined,
     type: args.encryptedFolderType ?? "sendonly",
   });
-  fs.writeFileSync(configPath, xml);
+  fs.writeFileSync(configPath, configureFixtureDiskReserve(xml));
 };
+// Bounded disposable shares need a fixed reserve, not a percentage of
+// the entire multi-terabyte CI volume. Keep a real 512 MiB safety floor.
+export const configureFixtureDiskReserve = (xml: string): string =>
+  xml.replace(/<(minDiskFree|minHomeDiskFree)\b[^>]*>[^<]*<\/\1>/g,
+    (_match, tag: string) => `<${tag} unit="MiB">512</${tag}>`);
+
 
 const startProcess = (
   binary: string,
@@ -452,6 +458,7 @@ export const createLanFixture = async (args: {
   mode: "direct" | "relay" | "quic";
   encryptedFolderType?: "sendonly" | "sendreceive";
   includeBlob?: boolean;
+  prepareEncryptedShare?: (directory: string) => void;
   publicNetwork?: boolean;
 }): Promise<RunningLanFixture> => {
   ensureSyncthingTools();
@@ -484,6 +491,7 @@ export const createLanFixture = async (args: {
   if (args.includeBlob !== false) fs.writeFileSync(path.join(sharePath, "blob.bin"), blob);
   fs.writeFileSync(path.join(encryptedSharePath, "secret.txt"), "encrypted LAN secret\n");
   if (args.includeBlob !== false) fs.writeFileSync(path.join(encryptedSharePath, "blob.bin"), blob);
+  args.prepareEncryptedShare?.(encryptedSharePath);
   const encryptedExpected = {
     path: "secret.txt",
     ...hashFile(path.join(encryptedSharePath, "secret.txt")),

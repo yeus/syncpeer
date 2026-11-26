@@ -15,7 +15,7 @@ import {
   clickButtonByText,
   setAutomaticConnectionPaused,
   setDirectConnectionFields,
-  setUploadBytes,
+  setUploadBytes, openSessionLogs,
 } from "./ui-helpers.js";
 const peers = () =>
   browser as typeof browser & {
@@ -46,10 +46,15 @@ async function focusPeer(peer: WebdriverIO.Browser) {
 
   const focus = spawnSync("python3", ["-c", String.raw`
 import ctypes, re, shutil, subprocess, sys
-dependencies = subprocess.check_output(["ldd", shutil.which("xprop")], text=True)
-lib_path = re.search(r"libX11\.so\.6\s+=>\s+(\S+)", dependencies)
-assert lib_path, "libX11 dependency was not found"
-x11 = ctypes.CDLL(lib_path.group(1))
+try:
+    x11 = ctypes.CDLL("libX11.so.6")
+except OSError:
+    # On NixOS the native library may not be on the loader's default path.
+    # Prefer the current Python ABI over blindly loading another glibc's X11.
+    dependencies = subprocess.check_output(["ldd", shutil.which("xprop")], text=True)
+    lib_path = re.search(r"libX11\.so\.6\s+=>\s+(\S+)", dependencies)
+    assert lib_path, "libX11 dependency was not found"
+    x11 = ctypes.CDLL(lib_path.group(1))
 x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
 x11.XOpenDisplay.restype = ctypes.c_void_p
 x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
@@ -331,7 +336,51 @@ async function acceptPendingApproval(peer: WebdriverIO.Browser) {
 }
 
 
+type JournalEvent = { event: string; details: Record<string, unknown>; row: string };
+const readVisibleJournal = (peer: WebdriverIO.Browser): Promise<JournalEvent[]> =>
+  peer.execute(() => {
+    const panel = [...document.querySelectorAll("details[open]")].find(details =>
+      details.querySelector("summary")?.textContent?.trim().startsWith("View logs ("));
+    if (!panel) throw new Error("Production session journal is not open.");
+    return [...panel.querySelectorAll("ul.list > li")].flatMap(row => {
+      const event = row.querySelector(".item-meta")?.textContent?.trim().split("|").at(-1)?.trim();
+      if (!event || !row.querySelector(".item-meta")?.textContent?.includes("|")) return [];
+      const details = row.querySelector("pre.log-details")?.textContent;
+      return [{ event, details: details ? JSON.parse(details) : {}, row: row.textContent ?? "" }];
+    });
+  });
+const journalBaselines = new WeakMap<WebdriverIO.Browser, string>();
+async function assertProductionReplicaJournal(peer: WebdriverIO.Browser, expectReceive: boolean) {
+  const baseline = journalBaselines.get(peer);
+  if (baseline === undefined) throw new Error("Missing production journal baseline.");
+  await openSessionLogs(peer);
+  try {
+    await peer.waitUntil(async () => {
+      const entries = await readVisibleJournal(peer);
+      const boundary = entries.findIndex(entry => entry.row === baseline);
+      const recent = boundary < 0 ? entries : entries.slice(0, boundary);
+      return recent.some(entry => entry.event === "client.shared_folders.selected" &&
+        entry.details?.internalCount === 1) && (!expectReceive || recent.some(entry =>
+        entry.event === "core.replica.index.receive.done" &&
+        entry.details?.internal === true && entry.details?.changed === true));
+    }, { timeout: 20_000, timeoutMsg: "Production journal did not confirm encrypted settings replica selection/receipt." });
+  } finally {
+    await closeSettings(peer);
+  }
+}
+
 async function captureSelectedFolderCounts(peer: WebdriverIO.Browser) {
+  const instrumented = await peer.execute(() => typeof (window as typeof window & {
+    __syncpeerObserveLogEntries?: unknown }).__syncpeerObserveLogEntries === "function");
+  if (!instrumented) {
+    // The shipping package intentionally has no E2E hooks. Check the same
+    // replica events through the user-facing journal rather than enabling them.
+    await openSessionLogs(peer);
+    try {
+      journalBaselines.set(peer, (await readVisibleJournal(peer))[0]?.row ?? "");
+    } finally { await closeSettings(peer); }
+    return;
+  }
   await peer.execute(() => {
     const observed = window as typeof window & {
       __syncpeerObserveLogEntries?: (
@@ -839,6 +888,9 @@ describe("Two isolated packaged desktop apps", () => {
       await acceptPendingApproval(peer);
       await closeSettings(peer);
       await peer.$("[data-testid='tab-devices']").click();
+      // Use deterministic direct endpoints for this local acceptance case.
+      // Do not compete with an automatic LAN connection while creating the fixture.
+      await setAutomaticConnectionPaused(peer, true);
     }
     const [ownerId, joinerId] = await Promise.all(
       [owner, joiner].map(peer => readCurrentDeviceId(peer)),
@@ -907,8 +959,24 @@ describe("Two isolated packaged desktop apps", () => {
     }
     await owner.$("[data-testid='tab-devices']").click();
     console.log("Packaged folder test: preparing peer connection.");
-    await joiner.$("//label[contains(., 'Device ID')]/input").setValue(ownerId);
-    await joiner.$("button=Add Device").click();
+    const joinerHasOwner = await joiner.execute(id => [...document.querySelectorAll('[data-saved-peer-id]')]
+      .some(row => row.getAttribute('data-saved-peer-id')?.replaceAll('-', '') === id.replaceAll('-', '')), ownerId);
+    if (!joinerHasOwner) {
+      await joiner.execute(() => {
+        const add = document.querySelector<HTMLButtonElement>("[data-testid='open-add-device']");
+        if (!add) throw new Error('Add-device control unavailable.');
+        if (add.getAttribute('aria-expanded') !== 'true') add.click();
+      });
+      await joiner.waitUntil(() => joiner.execute(() => !!document.querySelector("[data-testid='new-peer-device-id']")),
+        { timeout: 10_000, timeoutMsg: 'Add-device form did not open.' });
+      await joiner.execute(id => {
+        const field = document.querySelector<HTMLInputElement>("[data-testid='new-peer-device-id']");
+        if (!field) throw new Error('Device ID field unavailable.');
+        field.value = id;
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+      }, ownerId);
+      await clickButtonByText(joiner, 'Add Device');
+    }
     const ownerPort = await freePort();
     let joinerPort = await freePort();
     while (joinerPort === ownerPort) joinerPort = await freePort();
@@ -1086,12 +1154,32 @@ describe("Two isolated packaged desktop apps", () => {
       const listeners = await Promise.all(
         [ownerPort, joinerPort, 22000].map(isListening),
       );
+      if (journalBaselines.has(owner) && journalBaselines.has(joiner)) {
+        for (const [index, peer] of [owner, joiner].entries()) {
+          try {
+            await openSessionLogs(peer);
+            const entries = await readVisibleJournal(peer);
+            console.log("Production peer diagnostic journal", index,
+              JSON.stringify(entries.filter(entry =>
+                /^(peer\.connect|core\.(incoming|session|bep\.handshake|bep\.cluster_config)|client\.session|session\.flow)/.test(entry.event))
+                .slice(0, 45).map(({ event, details }) => ({
+                  event, stage: details?.stage, direction: details?.direction,
+                  message: details?.message ?? details?.error, reason: details?.reason,
+                  connectedPort: details?.connectedPort, phase: details?.phase,
+                }))));
+          } catch (diagnosticError) { console.log("Journal unavailable:", String(diagnosticError)); }
+        }
+      }
       throw new Error(
         `Packaged desktop connection failed: ${JSON.stringify(phases)}; ` +
           `expected listeners: ${JSON.stringify(listeners)}.`,
         { cause: error },
       );
     }
+    if (journalBaselines.has(owner) && journalBaselines.has(joiner)) {
+      await assertProductionReplicaJournal(owner, false);
+      await assertProductionReplicaJournal(joiner, true);
+    } else {
     for (const peer of [owner, joiner]) {
       const selections = await peer.execute(
         () =>
@@ -1146,6 +1234,7 @@ describe("Two isolated packaged desktop apps", () => {
         { cause: error },
       );
     }
+    }
     // Observe Folders before the joiner changes its selection. A folder-row
     // assertion while Devices is selected cannot prove automatic view refresh.
     await owner.$("[data-testid='tab-folders']").click();
@@ -1194,6 +1283,18 @@ describe("Two isolated packaged desktop apps", () => {
         [...document.querySelectorAll("[data-testid^='folder-root-']")]
           .map(row => row.textContent?.replace(/\s+/g, " ").trim() ?? ""))
         .catch(() => []);
+      for (const [index, peer] of [owner, joiner].entries()) {
+        if (!journalBaselines.has(peer)) continue;
+        try {
+          await openSessionLogs(peer);
+          const entries = await readVisibleJournal(peer);
+          console.log("Production folder refresh journal", index, JSON.stringify(entries.filter(entry =>
+            /^(client\.shared_folders|client\.session|core\.session|core\.replica|core\.index|session\.flow)/.test(entry.event))
+            .slice(0, 60).map(({ event, details }) => ({ event, internal: details?.internal,
+              internalCount: details?.internalCount, fileCount: details?.fileCount,
+              changed: details?.changed, phase: details?.phase, reason: details?.reason }))));
+        } catch (diagnosticError) { console.log("Folder refresh journal unavailable:", String(diagnosticError)); }
+      }
       throw new Error(
         "Packaged automatic peer-view refresh failed: " +
           JSON.stringify({ diagnostics, renderedFolders }) +

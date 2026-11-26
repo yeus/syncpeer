@@ -51,6 +51,9 @@ export const emulatorArguments = (selected, extraArguments = []) => [
   "-gpu", "swiftshader_indirect",
   "-no-audio",
   "-no-metrics",
+  // Modern WebView, debug APK and editor fixtures require ample /data space.
+  // Use a fresh disposable AVD prefix if an existing userdata image is full.
+  "-partition-size", "10240",
   "-no-snapshot-save",
   ...extraArguments,
 ];

@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
+import { createServer } from "node:net";
 import { configureSyncthingNetwork } from "./lan-test/syncthing.ts";
 
 /*
@@ -44,10 +45,33 @@ const encryptedFolderPassword = "correct horse battery staple";
 const lockedEncryptedFolderPassword = "a different folder password";
 const toolsDir = path.resolve(".tools");
 const version = process.env.SYNCTHING_VERSION ?? "v2.1.2";
-const A_SYNC_ADDR = "tcp://127.0.0.1:58300";
-const B_SYNC_ADDR = "tcp://127.0.0.1:58301";
-const A_GUI_ADDR = "127.0.0.1:58384";
-const B_GUI_ADDR = "127.0.0.1:58385";
+// Select isolated listeners for every invocation. Fixed ports can collide with
+// unrelated Syncthing processes and turn a normal startup into a false failure.
+const availableLoopbackPorts = async (count: number): Promise<number[]> => {
+  const ports = new Set<number>();
+  while (ports.size < count) {
+    const server = createServer();
+    const port = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          server.close();
+          reject(new Error("Could not allocate a loopback Syncthing test port."));
+          return;
+        }
+        server.close(error => error ? reject(error) : resolve(address.port));
+      });
+    });
+    ports.add(port);
+  }
+  return [...ports];
+};
+const [A_SYNC_PORT, B_SYNC_PORT, A_GUI_PORT, B_GUI_PORT] = await availableLoopbackPorts(4);
+const A_SYNC_ADDR = `tcp://127.0.0.1:${A_SYNC_PORT}`;
+const B_SYNC_ADDR = `tcp://127.0.0.1:${B_SYNC_PORT}`;
+const A_GUI_ADDR = `127.0.0.1:${A_GUI_PORT}`;
+const B_GUI_ADDR = `127.0.0.1:${B_GUI_PORT}`;
 
 const platformMap = {
   linux: "linux",
@@ -661,7 +685,7 @@ async function waitForInitialSync({ expectedA }) {
   );
 }
 
-function cliArgs({ port = 58301, remoteId, certHome, folderPassword }) {
+function cliArgs({ port = B_SYNC_PORT, remoteId, certHome, folderPassword }) {
   return [
     "--host",
     "127.0.0.1",
@@ -697,7 +721,7 @@ async function runUploadCheck({ aId }) {
   const payload = `hello_from_syncpeer ${new Date().toISOString()}\n`;
   const uploadSourcePath = path.join(root, "hello_from_syncpeer.txt");
   writeFile(uploadSourcePath, payload);
-  const args = cliArgs({ port: 58300, remoteId: aId, certHome: cliNodeHome });
+  const args = cliArgs({ port: A_SYNC_PORT, remoteId: aId, certHome: cliNodeHome });
   execCli(
     [
       ...args,
@@ -736,7 +760,7 @@ async function runUploadCheck({ aId }) {
 async function runIntroducerAdvertisementCheck({ aId, bId }) {
   const result = await waitForFolderDeviceAdvertisement({
     introducerHost: "127.0.0.1",
-    introducerPort: 58300,
+    introducerPort: A_SYNC_PORT,
     introducerDeviceId: aId,
     localCertPath: path.join(cliNodeHome, "cert.pem"),
     localKeyPath: path.join(cliNodeHome, "key.pem"),
@@ -756,7 +780,7 @@ async function runIntroducerAdvertisementCheck({ aId, bId }) {
 async function runUntrustedAdvertisementCheck({ bId, cliUntrustedId }) {
   await waitForFolderDeviceAdvertisement({
     introducerHost: "127.0.0.1",
-    introducerPort: 58301,
+    introducerPort: B_SYNC_PORT,
     introducerDeviceId: bId,
     localCertPath: path.join(cliObserverHome, "cert.pem"),
     localKeyPath: path.join(cliObserverHome, "key.pem"),
@@ -790,7 +814,7 @@ function createSessionOptions(bId) {
   return {
     discoveryMode: "direct",
     host: "127.0.0.1",
-    port: 58301,
+    port: B_SYNC_PORT,
     cert: path.join(cliNodeHome, "cert.pem"),
     key: path.join(cliNodeHome, "key.pem"),
     remoteId: bId,

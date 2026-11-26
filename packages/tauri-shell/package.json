@@ -1,6 +1,6 @@
 {
   "name": "@syncpeer/tauri-shell",
-  "version": "0.6.1-rc.2",
+  "version": "0.7.0-alpha.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -25,20 +25,22 @@
     "prebuild:android:e2e": "npm run icons:ensure:android",
     "build:android:e2e": "bash -lc 'set -euo pipefail; sdk=\"${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}\"; if [ -n \"$sdk\" ] && [ -d \"$sdk/build-tools\" ]; then bt=\"$(ls -1 \"$sdk/build-tools\" | sort -V | tail -n1)\"; if [ -n \"$bt\" ] && [ -x \"$sdk/build-tools/$bt/apksigner\" ]; then export PATH=\"$sdk/build-tools/$bt:$PATH\"; fi; fi; tauri android build --debug --apk --target x86_64 --config src-tauri/tauri.android-e2e.conf.json'",
     "prebuild:android:prod": "npm run icons:ensure:android",
-    "build:android:prod": "bash -lc 'set -euo pipefail; sdk=\"${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}\"; if [ -n \"$sdk\" ] && [ -d \"$sdk/build-tools\" ]; then bt=\"$(ls -1 \"$sdk/build-tools\" | sort -V | tail -n1)\"; if [ -n \"$bt\" ] && [ -x \"$sdk/build-tools/$bt/apksigner\" ]; then export PATH=\"$sdk/build-tools/$bt:$PATH\"; fi; fi; tauri android build --apk --target ${SYNCPEER_ANDROID_TARGET:-aarch64}'",
+    "build:android:prod": "bash -lc 'set -euo pipefail; sdk=\"${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}\"; if [ -n \"$sdk\" ] && [ -d \"$sdk/build-tools\" ]; then bt=\"$(ls -1 \"$sdk/build-tools\" | sort -V | tail -n1)\"; if [ -n \"$bt\" ] && [ -x \"$sdk/build-tools/$bt/apksigner\" ]; then export PATH=\"$sdk/build-tools/$bt:$PATH\"; fi; fi; config=(); if [[ -n \"${SYNCPEER_ANDROID_BUILD_CONFIG:-}\" ]]; then config=(--config \"$SYNCPEER_ANDROID_BUILD_CONFIG\"); fi; tauri android build --apk --target ${SYNCPEER_ANDROID_TARGET:-aarch64} \"${config[@]}\"'",
     "build:android": "npm run build:android:prod"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1",
-    "@types/ungap__structured-clone": "^1.2.0"
+    "@types/ungap__structured-clone": "^1.2.0",
+    "@types/whatwg-url": "13.0.0"
   },
   "dependencies": {
     "@kayahr/text-encoding": "^2.2.0",
-    "@syncpeer/app": "0.6.1-rc.2",
+    "@syncpeer/app": "0.7.0-alpha.1",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@ungap/structured-clone": "^1.4.0",
     "abort-controller": "^3.0.0",
-    "base64-js": "^1.5.1"
+    "base64-js": "^1.5.1",
+    "whatwg-url": "14.2.0"
   }
 }

@@ -50,9 +50,9 @@ class DocumentRuntimeService : Service() {
   // WebView evaluation callbacks arrive on Android's main thread. Keep response
   // decoding, diagnostics and dependent completion callbacks off that thread.
   private val completionWorker = Executors.newSingleThreadExecutor()
-  // A BEP session keeps one blocking read active while writes and closes must
-  // continue independently through the same native transport.
-  private val networkWorker = Executors.newFixedThreadPool(4)
+  // Accept and read requests block independently. Fixed four-worker dispatch
+  // starved BEP Hello writes when direct, relay, and peer reads overlapped.
+  private val networkWorker = createNetworkRequestExecutor()
   private var storage: DocumentRuntimeStorage? = null
   private var network: SessionNetworkTransport? = null
   private var documentsStarted = false
@@ -246,12 +246,16 @@ class DocumentRuntimeService : Service() {
             "ReferenceError", "URIError", "DOMException", "NotAllowedError", "OperationError"];
           const type = error && typeof error.name === "string" ? error.name : "Other";
           const message = error && typeof error.message === "string" ? error.message : "";
-          const category = message.includes("Document storage operation failed")
-            ? "storage-request"
-            : message.includes("Existing metadata requires") ? "protected-metadata-key"
-            : message.includes("Remembered credential key is missing") ? "keystore-key-missing"
-            : message.includes("Document vault is locked") ? "vault-locked"
-            : "other";
+          // Never transmit arbitrary document/vault error messages across
+          // isolated JS. Recognize only this fixed safety refusal.
+          const category = message === "Local profile already exists; recovery cannot replace it."
+            ? "local-profile-exists"
+            : message.includes("Document storage operation failed")
+              ? "storage-request"
+              : message.includes("Existing metadata requires") ? "protected-metadata-key"
+              : message.includes("Remembered credential key is missing") ? "keystore-key-missing"
+              : message.includes("Document vault is locked") ? "vault-locked"
+              : "other";
           return JSON.stringify({__documentFailure: {
             stage: allowedStages.includes(stage) ? stage : "unknown",
             type: allowedTypes.includes(type) ? type : "Other",
@@ -273,13 +277,18 @@ class DocumentRuntimeService : Service() {
             "URIError", "DOMException", "NotAllowedError", "OperationError") } ?: "Other"
           val category = failure.optString("category").takeIf { it in setOf(
             "storage-request", "protected-metadata-key", "keystore-key-missing",
-            "vault-locked", "other") } ?: "other"
+            "vault-locked", "local-profile-exists", "other") } ?: "other"
           DiagnosticLogJournal.recordNative(applicationContext, "native.document.command_failed",
             "error", JSONObject().put("operation",
               input.optString("operation").takeIf { it.matches(Regex("[A-Za-z]{1,48}")) } ?: "other")
               .put("stage", stage).put("errorType", type).put("category", category))
           if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
             Log.w("SyncpeerRuntime", "document command failed: stage=$stage category=$category type=$type")
+          // The only distinguished user-facing error is the fixed refusal of
+          // a destructive backup import. No JS exception string crosses here.
+          if (category == "local-profile-exists" &&
+              input.optString("operation") == "restoreRecoveryBackup")
+            throw IllegalStateException(DOCUMENT_RECOVERY_LOCAL_PROFILE_EXISTS_CODE)
           throw IllegalStateException("Document runtime evaluation failed.")
         }
         val timing = reply.optJSONObject("__documentTimings")
@@ -455,7 +464,8 @@ class DocumentRuntimeService : Service() {
         }
         return result
       }
-      if (operation == "connect") uiIsVisible = true
+      // Connect RPCs may outlive Activity visibility. Only explicit visibility
+      // transitions may change uiIsVisible; a delayed dial must not disable policy.
       if (operation == "disconnect") {
         val prior = synchronized(uiConnectLock) {
           val pending = uiConnectPending
@@ -879,6 +889,7 @@ class DocumentRuntimeService : Service() {
         val request = sessionRequest ?: return
         val input = parseSessionRequest(request) ?: return
         val reason = backgroundPauseReason(input)
+        debugNetworkEvent("policy signal: visible=$uiIsVisible armed=$backgroundSyncArmed phase=$sessionPhase reason=${reason ?: "allowed"}")
         if (reason == null) resumePersistedSessionIfAllowed() else pauseForPolicy(reason)
       }
     }
@@ -1500,29 +1511,55 @@ class DocumentRuntimeService : Service() {
     runtimeHost = if (forceWebViewForTesting || !JavaScriptSandbox.isSupported()) {
       stage("webview_start")
       createWebViewHost(terminated)
-    } else {
-      stage("sandbox_start")
-      val opening = JavaScriptSandbox.createConnectedInstanceAsync(applicationContext)
-      val sandbox = try {
-        opening.get(15, TimeUnit.SECONDS)
-      } catch (error: Exception) {
-        // Do not leak an engine that finishes connecting after the timeout.
-        opening.addListener({ runCatching { opening.get().close() } }, { it.run() })
-        throw error
-      }
-      val featuresAvailable = requiredFeatures.all(sandbox::isFeatureSupported)
-      val webCryptoAvailable = featuresAvailable && sandboxSupportsWebCrypto(sandbox)
-      when (selectDocumentRuntime(true, requiredFeatures, webCryptoAvailable, sandbox::isFeatureSupported)) {
-        DocumentRuntimeKind.SANDBOX -> SandboxDocumentRuntimeHost.create(
-          sandbox, code, storageWorker, networkWorker,
-          ::executeStorageRequest, ::executeNetworkRequest, terminated,
-        )
-        DocumentRuntimeKind.WEB_VIEW -> {
-          sandbox.close()
-          createWebViewHost(terminated)
+    } else sandboxOrWebView(
+      sandbox = {
+        stage("sandbox_start")
+        val opening = JavaScriptSandbox.createConnectedInstanceAsync(applicationContext)
+        val sandbox = try {
+          opening.get(15, TimeUnit.SECONDS)
+        } catch (error: Exception) {
+          // A connection finishing after the timeout must not leak an engine.
+          opening.addListener({ runCatching { opening.get().close() } }, { it.run() })
+          throw error
         }
-      }
-    }
+        try {
+          val featuresAvailable = requiredFeatures.all(sandbox::isFeatureSupported)
+          val webCryptoAvailable = featuresAvailable && sandboxSupportsWebCrypto(sandbox)
+          if (selectDocumentRuntime(true, requiredFeatures, webCryptoAvailable,
+              sandbox::isFeatureSupported) == DocumentRuntimeKind.SANDBOX) {
+            SandboxDocumentRuntimeHost.create(
+              sandbox, code, storageWorker, networkWorker,
+              ::executeStorageRequest, ::executeNetworkRequest, terminated,
+            )
+          } else {
+            sandbox.close()
+            null
+          }
+        } catch (error: Exception) {
+          runCatching { sandbox.close() }
+          throw error
+        }
+      },
+      webView = {
+        stage("webview_start")
+        createWebViewHost(terminated)
+      },
+      onSandboxFailure = { error ->
+        // The failure type is useful, but the provider's exception message can
+        // contain device paths and must not enter exported diagnostics.
+        val type = when (error) {
+          is java.io.FileNotFoundException -> "FileNotFoundException"
+          is TimeoutException -> "TimeoutException"
+          else -> "Other"
+        }
+        runCatching {
+          DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.sandbox_fallback",
+            "warning", JSONObject().put("errorType", type))
+        }
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0)
+          Log.w("SyncpeerRuntime", "sandbox runtime unavailable; trying WebView (type=$type)")
+      },
+    )
     stage("engine_ready")
     documentsStarted = true
     return DocumentRuntimeStatus("locked", "Document access is not configured.")
@@ -1746,7 +1783,14 @@ class DocumentRuntimeService : Service() {
           "core.discovery.full_response", "core.discovery.candidate.try",
           "core.discovery.candidate.connected", "core.discovery.candidate.failed",
            "core.discovery.relay.failed", "core.discovery.connect_strategy",
-           "core.discovery.candidate.order", "core.upload.request.failed", "core.replica.receive.failed",
+           "core.discovery.candidate.order", "core.relay.registered", "core.relay.announced",
+           "core.relay.announcement.failed", "core.relay.presence.failed",
+           "core.incoming.context.no_peer", "core.incoming.context.no_approved_peer",
+           "core.incoming.relay.enabled", "core.incoming.relay.disabled",
+           "core.incoming.listener.reused", "core.incoming.listener.started",
+           "core.incoming.prepare.failed", "core.incoming.failed",
+           "core.relay.pool.start", "core.relay.pool.available",
+           "core.upload.request.failed", "core.replica.receive.failed",
            "core.session.shutdown.begin", "core.session.shutdown.lifecycle_done",
            "core.session.shutdown.listener_done")
       if (allowed) {
@@ -1842,6 +1886,11 @@ class DocumentRuntimeService : Service() {
   @Synchronized private fun recordRecoveryFailure(error: Exception): DocumentRuntimeStatus {
     recoveryFailureCount += 1
     val decision = documentRuntimeRecoveryDecision(recoveryFailureCount, error)
+    if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+      val types = generateSequence(error as Throwable?) { it.cause }
+        .take(4).joinToString(",") { it.javaClass.simpleName }
+      Log.w("SyncpeerRuntime", "document.runtime.recovery_failed attempt=$recoveryFailureCount types=$types")
+    }
     DiagnosticLogJournal.recordNative(applicationContext, "native.runtime.recovery_failed",
       "error", JSONObject().put("attempt", recoveryFailureCount)
         .put("failureType", decision.failureType.toString())

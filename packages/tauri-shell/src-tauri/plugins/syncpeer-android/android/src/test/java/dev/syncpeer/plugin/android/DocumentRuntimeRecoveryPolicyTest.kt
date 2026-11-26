@@ -1,5 +1,7 @@
 package dev.syncpeer.plugin.android
 
+import java.io.FileNotFoundException
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeoutException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -41,5 +43,19 @@ class DocumentRuntimeRecoveryPolicyTest {
     assertFalse(documentRuntimeCanStartSession(ready, isolateAvailable = false))
     assertFalse(documentRuntimeCanStartSession(retrying, isolateAvailable = false))
     assertFalse(documentRuntimeCanStartSession(unsupported, isolateAvailable = false))
+  }
+  @Test fun fixedBackupRefusalSurvivesProviderAndPluginWithoutLeakingOtherErrors() {
+    val original = IllegalStateException(DOCUMENT_RECOVERY_LOCAL_PROFILE_EXISTS_CODE)
+    val provider = ExecutionException("synthetic wrapped failure", original)
+    val safe = documentCommandFailureMessage(provider)
+    assertEquals(DOCUMENT_RECOVERY_LOCAL_PROFILE_EXISTS_CODE, safe)
+    assertEquals(safe, documentCommandFailureMessage(FileNotFoundException(safe)))
+
+    // Arbitrary exception text may contain local paths and must stay masked.
+    assertEquals(
+      "Document operation failed. Check the vault and Android System WebView.",
+      documentCommandFailureMessage(IllegalStateException(
+        "Synthetic path /private/test.txt: $DOCUMENT_RECOVERY_LOCAL_PROFILE_EXISTS_CODE suffix")),
+    )
   }
 }

@@ -25,6 +25,7 @@ import java.io.ByteArrayInputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -53,7 +54,13 @@ private fun dispatchNativeRequest(
       else -> false
     }
   }.getOrDefault(false)
-  if (control) task.run() else executor.execute(task)
+  if (control) task.run()
+  else try { executor.execute(task) }
+  catch (_: RejectedExecutionException) {
+    val id = runCatching { JSONObject(raw).optLong("__portId", -1) }.getOrDefault(-1)
+    runCatching { respond(JSONObject().put("id", id)
+      .put("error", "Native network request capacity exhausted.").toString()) }
+  }
 }
 
 internal interface DocumentRuntimeHost : AutoCloseable {
@@ -239,6 +246,11 @@ internal class WebViewDocumentRuntimeHost private constructor(
     private const val scriptUrl = "https://syncpeer.invalid/syncpeer-documents.js"
     private const val html = """<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><script src="/syncpeer-documents.js"></script>"""
 
+    private fun debugStage(context: Context, stage: String) {
+      if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
+        android.util.Log.w("SyncpeerRuntime", "document.webview.$stage")
+    }
+
     fun create(
       context: Context,
       mainHandler: Handler,
@@ -251,6 +263,7 @@ internal class WebViewDocumentRuntimeHost private constructor(
       val ready = CompletableFuture<WebViewDocumentRuntimeHost>()
       mainHandler.post {
         try {
+          debugStage(context, "create")
           val view = WebView(context)
           ready.whenComplete { _, error ->
             if (error != null) mainHandler.post { view.stopLoading(); view.destroy() }
@@ -259,6 +272,17 @@ internal class WebViewDocumentRuntimeHost private constructor(
           view.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
               if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR && !ready.isDone) {
+                // Only fixed literal error families; never log the actual JS
+                // message, which may include document paths or credentials.
+                val errorText = message.message()
+                val category = listOf("TextEncoder", "TextDecoder", "Buffer", "process",
+                  "structuredClone", "globalThis", "URLSearchParams", "URL", "crypto",
+                  "Cannot read properties", "Unexpected token", "SyntaxError",
+                  "ReferenceError", "TypeError", "SecurityError", "eval",
+                  "postMessage", "addEventListener").firstOrNull {
+                  errorText.contains(it, ignoreCase = true)
+                } ?: "other"
+                debugStage(context, "console_error.category=$category.line=${message.lineNumber().coerceIn(0, 1000000)}")
                 ready.completeExceptionally(IllegalStateException(
                   "Document WebView JavaScript failed at packaged line ${message.lineNumber()}: ${message.message()}",
                 ))
@@ -271,7 +295,9 @@ internal class WebViewDocumentRuntimeHost private constructor(
               storageRequest, networkRequest, ready)
           }
           view.loadUrl(pageUrl)
+          debugStage(context, "load_requested")
         } catch (error: Exception) {
+          debugStage(context, "create_failed_" + error.javaClass.simpleName)
           ready.completeExceptionally(error)
         }
       }
@@ -300,8 +326,14 @@ internal class WebViewDocumentRuntimeHost private constructor(
 
       override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse =
         when (request.url.toString()) {
-          pageUrl -> response("text/html", ByteArrayInputStream(html.toByteArray()))
-          scriptUrl -> response("application/javascript", context.assets.open("syncpeer-documents.js"))
+          pageUrl -> {
+            debugStage(context, "page_requested")
+            response("text/html", ByteArrayInputStream(html.toByteArray()))
+          }
+          scriptUrl -> {
+            debugStage(context, "script_requested")
+            response("application/javascript", context.assets.open("syncpeer-documents.js"))
+          }
           else -> WebResourceResponse("text/plain", "utf-8", 404, "Not Found", emptyMap(),
             ByteArrayInputStream(ByteArray(0)))
         }
@@ -311,7 +343,10 @@ internal class WebViewDocumentRuntimeHost private constructor(
       }
 
       override fun onPageFinished(view: WebView, url: String) {
-        if (url == pageUrl && !ready.isDone) loaded(view)
+        if (url == pageUrl && !ready.isDone) {
+          debugStage(context, "page_finished")
+          loaded(view)
+        }
       }
 
       override fun onReceivedError(
@@ -319,12 +354,16 @@ internal class WebViewDocumentRuntimeHost private constructor(
         request: WebResourceRequest,
         error: WebResourceError,
       ) {
-        if (request.isForMainFrame) ready.completeExceptionally(
+        if (request.isForMainFrame) {
+          debugStage(context, "main_frame_error")
+          ready.completeExceptionally(
           IllegalStateException("Document WebView could not load its packaged runtime."),
-        )
+          )
+        }
       }
 
       override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+        debugStage(context, "renderer_gone")
         if (!ready.isDone) {
           ready.completeExceptionally(IllegalStateException("Document WebView renderer exited."))
         } else {
@@ -355,12 +394,16 @@ internal class WebViewDocumentRuntimeHost private constructor(
         override fun onMessage(port: WebMessagePort, message: WebMessage) {
           val value = message.data ?: return
           val parsed = runCatching { JSONObject(value) }.getOrNull()
-          if (parsed?.optBoolean("ready") == true) ready.complete(host) else host.receive(value)
+          if (parsed?.optBoolean("ready") == true) {
+            debugStage(webView.context, "ready")
+            ready.complete(host)
+          } else host.receive(value)
         }
       }, mainHandler)
       connectNativePort("storage", nativePorts[1], mainHandler, storageExecutor, storageRequest)
       connectNativePort("network", nativePorts[2], mainHandler, networkExecutor, networkRequest)
       webView.postWebMessage(WebMessage("syncpeer-runtime", channels.map { it[1] }.toTypedArray()), origin)
+      debugStage(webView.context, "ports_posted")
     }
 
     private fun connectNativePort(

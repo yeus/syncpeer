@@ -229,7 +229,11 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
         // an unexplained "peer session unavailable" at the plugin boundary.
         val reason = owner.backgroundSessionStatus().optString("error")
           .takeIf { it.isNotBlank() && it != "null" }
-          ?: "The Android peer session is unavailable."
+          ?: safeSessionError(error)
+        // Log only the fixed, sanitized failure category, never the raw exception.
+        if (context!!.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+          android.util.Log.w("SyncpeerRuntime", "session.command.failed reason=" + safeSessionError(error))
+        }
         throw IllegalStateException(prefixedSessionFailure(reason), error)
       }
     } else if (method == "syncpeerReleaseLocalCopy") {

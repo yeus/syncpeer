@@ -105,6 +105,26 @@ test("native bridge and Android journal persist anonymized candidate start, winn
   assert.match(directMode, /core\.discovery\.candidate\.failed/);
 });
 
+test("Android relay registration retains anonymized native diagnostics", async () => {
+  const { readFileSync } = await import("node:fs");
+  const bridge = readFileSync("packages/tauri-shell/src/document-runtime.ts", "utf8");
+  const journal = readFileSync("packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/DocumentRuntimeService.kt", "utf8");
+  for (const event of ["core.relay.registered", "core.relay.announced",
+    "core.relay.announcement.failed", "core.relay.presence.failed",
+    "core.relay.pool.start", "core.relay.pool.available",
+    "core.incoming.context.no_peer", "core.incoming.context.no_approved_peer",
+    "core.incoming.relay.enabled", "core.incoming.relay.disabled",
+    "core.incoming.listener.reused", "core.incoming.listener.started",
+    "core.incoming.prepare.failed", "core.incoming.failed"]) {
+    assert.ok(bridge.includes('"' + event + '"'), "TypeScript native relay diagnostic missing " + event);
+    assert.ok(journal.includes('"' + event + '"'), "Kotlin native relay diagnostic missing " + event);
+  }
+  const safe = safeNativeDiscoveryDiagnostic({ message: "Relay timed out at 192.0.2.42",
+    deviceId: "TOPSECRETDEVICEID", address: "relay://192.0.2.42:22067" });
+  assert.equal(safe.category, "timeout");
+  assert.ok(!JSON.stringify(safe).includes("192.0.2.42"));
+});
+
 test("native diagnostics separate authorization, TLS, DNS, and transport timeouts", () => {
   for (const [message, expected] of [
     ["Peer is not authorized", "authorization"],

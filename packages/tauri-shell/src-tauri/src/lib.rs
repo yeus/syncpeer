@@ -1074,6 +1074,9 @@ const APP_STORAGE_FORMAT_FILE: &str = ".syncpeer-storage-format.json";
 // encryption layout or on-disk semantics change. No pre-1.0 migrations.
 const APP_STORAGE_FORMAT_VERSION: u64 = 2;
 const PRIVATE_STORAGE_UNRECOGNIZED: &str = "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED";
+// A fixed, non-sensitive Android JS sandbox failure category. Do not
+// re-expose arbitrary document exception text from the isolated runtime.
+const LOCAL_PROFILE_EXISTS: &str = "SYNCPEER_LOCAL_PROFILE_EXISTS";
 
 fn private_storage_unrecognized(detail: &str) -> String {
     format!("{PRIVATE_STORAGE_UNRECOGNIZED}: {detail}")
@@ -1081,10 +1084,13 @@ fn private_storage_unrecognized(detail: &str) -> String {
 
 fn preserve_private_storage_failure(error: impl std::fmt::Display, fallback: &str) -> String {
     let message = error.to_string();
-    message
-        .find(PRIVATE_STORAGE_UNRECOGNIZED)
-        .map(|index| message[index..].to_string())
-        .unwrap_or_else(|| fallback.to_string())
+    if let Some(index) = message.find(PRIVATE_STORAGE_UNRECOGNIZED) {
+        return message[index..].to_string();
+    }
+    if message.contains(LOCAL_PROFILE_EXISTS) {
+        return "Local profile already exists; recovery cannot replace it.".to_string();
+    }
+    fallback.to_string()
 }
 
 fn app_storage_marker_is_current(path: &Path) -> Result<bool, String> {
@@ -5821,6 +5827,12 @@ mod tests {
                 "fallback",
             ),
             "SYNCPEER_PRIVATE_STORAGE_UNRECOGNIZED: unsupported marker",
+        );
+        assert_eq!(
+            preserve_private_storage_failure(
+                "plugin error: SYNCPEER_LOCAL_PROFILE_EXISTS", "fallback",
+            ),
+            "Local profile already exists; recovery cannot replace it.",
         );
         assert_eq!(
             preserve_private_storage_failure("other plugin error", "fallback"),

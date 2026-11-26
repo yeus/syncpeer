@@ -114,6 +114,13 @@ const createAndroidSessionAdapter = async (
           "core.discovery.candidate.try", "core.discovery.candidate.connected",
           "core.discovery.candidate.failed", "core.discovery.relay.failed",
           "core.discovery.connect_strategy", "core.discovery.candidate.order",
+          "core.relay.registered", "core.relay.announced",
+          "core.relay.announcement.failed", "core.relay.presence.failed",
+          "core.incoming.context.no_peer", "core.incoming.context.no_approved_peer",
+          "core.incoming.relay.enabled", "core.incoming.relay.disabled",
+          "core.incoming.listener.reused", "core.incoming.listener.started",
+          "core.incoming.prepare.failed", "core.incoming.failed",
+          "core.relay.pool.start", "core.relay.pool.available",
           "core.upload.request.failed", "core.replica.receive.failed",
           "core.session.shutdown.begin", "core.session.shutdown.lifecycle_done",
           "core.session.shutdown.listener_done"].includes(event)) return;
@@ -375,18 +382,27 @@ class AndroidSessionRuntime {
     options: ConnectOptions,
     coreOptions: SyncpeerConnectOptions,
   ): Promise<IncomingContext | null> => {
-    if (!coreOptions.expectedDeviceId) return null;
+    if (!coreOptions.expectedDeviceId) {
+      this.adapter.log?.("core.incoming.context.no_peer", {});
+      return null;
+    }
     const localDeviceId = await deviceIdFromCertificate(this.adapter,
       certificateDerFromPem(coreOptions.certPem));
     const trustedDevices = (await this.documents.ownedDevices()).devices;
     const approvedDeviceIds = resolveIncomingPeerDeviceIds(coreOptions.expectedDeviceId,
       localDeviceId, trustedDevices, options.configuredPeerIds ?? []);
-    if (!approvedDeviceIds.length) { await this.stopIncomingService(); return null; }
+    if (!approvedDeviceIds.length) {
+      this.adapter.log?.("core.incoming.context.no_approved_peer", {});
+      await this.stopIncomingService();
+      return null;
+    }
     const listenPort = options.listenPort ?? 22000;
     if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
       throw new Error("Incoming TCP port must be between 1 and 65535.");
     }
     const automaticRelay = automaticRelayConfiguration(options);
+    this.adapter.log?.(automaticRelay ? "core.incoming.relay.enabled" :
+      "core.incoming.relay.disabled", {});
     const key = JSON.stringify([localDeviceId, approvedDeviceIds,
       coreOptions.certPem, coreOptions.keyPem, listenPort, automaticRelay]);
     return {
@@ -458,6 +474,7 @@ class AndroidSessionRuntime {
       throw new Error("Incoming peer folder preparation changed before the listener started.");
     }
     if (this.incomingService && this.incomingServiceKey === context.key) {
+      this.adapter.log?.("core.incoming.listener.reused", {});
       this.incomingService.updateSessionHandlers(sessionHandlers);
       return this.incomingService;
     }
@@ -472,6 +489,7 @@ class AndroidSessionRuntime {
       }),
     });
     this.incomingServiceKey = context.key;
+    this.adapter.log?.("core.incoming.listener.started", {});
     return this.incomingService;
   };
 
@@ -846,8 +864,17 @@ class AndroidSessionRuntime {
   };
 }
 
-async function startSession(android: AndroidRuntime, documents: Documents) {
-  return (await AndroidSessionRuntime.create(android, documents)).start();
+// As with document bootstrap, concurrent session RPCs must not create
+// competing lifecycle owners or overwrite the authenticated runtime.
+let sessionBootstrap: Promise<ReturnType<AndroidSessionRuntime["start"]>> | undefined;
+function startSession(android: AndroidRuntime, documents: Documents) {
+  sessionBootstrap ??= AndroidSessionRuntime.create(android, documents)
+    .then(runtime => runtime.start())
+    .catch(error => {
+      sessionBootstrap = undefined;
+      throw error;
+    });
+  return sessionBootstrap;
 }
 
 Object.defineProperty(globalThis, "syncpeerDocumentsCore", {

@@ -1,4 +1,5 @@
-import { TextEncoder as PolyfillTextEncoder, TextDecoder as PolyfillTextDecoder } from "@kayahr/text-encoding/no-encodings";
+import "./document-runtime-text-codecs.js";
+import { URL as PolyfillURL, URLSearchParams as PolyfillURLSearchParams } from "whatwg-url";
 import { AbortController as PolyfillAbortController, AbortSignal as PolyfillAbortSignal } from "abort-controller";
 import { fromByteArray, toByteArray } from "base64-js";
 import { installWebViewCompatibility } from "../../core/src/platform/browserCompatibility.js";
@@ -25,9 +26,9 @@ const decodeBase64 = (value: string) => {
   return decoded;
 };
 
-// This isolated entry executes before core's dependencies construct text codecs.
-if (typeof globalThis.TextEncoder !== "function") globalThis.TextEncoder = PolyfillTextEncoder;
-if (typeof globalThis.TextDecoder !== "function") globalThis.TextDecoder = PolyfillTextDecoder;
+if (typeof globalThis.URL !== "function" || typeof globalThis.URLSearchParams !== "function") {
+  Object.assign(globalThis, { URL: PolyfillURL, URLSearchParams: PolyfillURLSearchParams });
+}
 if (typeof globalThis.btoa !== "function") globalThis.btoa = encodeBase64;
 if (typeof globalThis.atob !== "function") globalThis.atob = decodeBase64;
 if (typeof globalThis.AbortController !== "function" || typeof globalThis.AbortSignal !== "function") {

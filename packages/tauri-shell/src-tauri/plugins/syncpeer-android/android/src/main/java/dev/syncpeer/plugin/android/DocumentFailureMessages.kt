@@ -11,6 +11,9 @@ internal const val DOCUMENT_RUNTIME_UNAVAILABLE_MESSAGE =
 private const val DOCUMENT_RUNTIME_UNKNOWN_MESSAGE =
   "Syncpeer's local storage service is unavailable. Reopen Syncpeer to retry."
 
+/** Fixed, non-sensitive JS isolate refusal that may traverse provider IPC. */
+internal const val DOCUMENT_RECOVERY_LOCAL_PROFILE_EXISTS_CODE = "SYNCPEER_LOCAL_PROFILE_EXISTS"
+
 /**
  * Only app-authored summaries may reach the UI. Arbitrary exception text can
  * contain storage paths, file names or credential material.
@@ -19,6 +22,7 @@ private val safeDocumentFailureMessages = setOf(
   DOCUMENT_RUNTIME_RESTARTING_MESSAGE,
   DOCUMENT_RUNTIME_UNAVAILABLE_MESSAGE,
   DOCUMENT_RUNTIME_UNKNOWN_MESSAGE,
+  DOCUMENT_RECOVERY_LOCAL_PROFILE_EXISTS_CODE,
   "Document runtime unavailable.",
 )
 

@@ -617,19 +617,30 @@ fn current_revision(root: &Dir, path: &str) -> io::Result<Option<String>> {
     }
 }
 
-fn flush_parents(root: &Dir, path: &str) -> io::Result<()> {
+fn flush_parent_directories(root: &Dir, path: &str, allow_missing: bool) -> io::Result<()> {
     let mut parent = Path::new(path).parent();
     while let Some(directory) = parent {
         // Capability directory handles may be O_PATH, which cannot be fsynced.
-        root.open(if directory.as_os_str().is_empty() {
+        let relative = if directory.as_os_str().is_empty() {
             Path::new(".")
         } else {
             directory
-        })?
-        .sync_all()?;
+        };
+        match root.open(relative) {
+            Ok(handle) => handle.sync_all()?,
+            // A deletion can remove both its file and its nested parent directory
+            // before a pending-index durability barrier runs. Still fsync every
+            // surviving ancestor, including the selected root, before committing.
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         parent = directory.parent();
     }
     Ok(())
+}
+
+fn flush_parents(root: &Dir, path: &str) -> io::Result<()> {
+    flush_parent_directories(root, path, false)
 }
 
 fn publish_exclusive(root: &Dir, temporary: &str, target: &str) -> io::Result<()> {
@@ -926,7 +937,7 @@ impl ReplicaRoots {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            flush_parents(root, path)?;
+            flush_parent_directories(root, path, true)?;
         }
         Ok(())
     }
@@ -2005,6 +2016,22 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn flush_deleted_nested_paths_syncs_surviving_parents_without_recreating_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut roots = ReplicaRoots::new(state.path().to_path_buf(), [7u8; 32]);
+        let id = roots.register(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join("nested/removed")).unwrap();
+        std::fs::write(temp.path().join("nested/removed/file"), b"test").unwrap();
+        roots.flush(id, &["nested/removed/file".into()]).unwrap();
+        std::fs::remove_file(temp.path().join("nested/removed/file")).unwrap();
+        std::fs::remove_dir(temp.path().join("nested/removed")).unwrap();
+        roots.flush(id, &["nested/removed/file".into()]).unwrap();
+        assert!(!temp.path().join("nested/removed").exists());
+        assert!(roots.flush(id, &["../../outside".into()]).is_err());
     }
 
     #[test]

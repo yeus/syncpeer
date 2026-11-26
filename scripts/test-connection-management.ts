@@ -131,10 +131,33 @@ test("Android service-owned sessions do not let a hidden WebView issue competing
   await lifecycle.setOnline(false);
   await lifecycle.setOnline(true);
   assert.equal(opens, 1, "Network return in the background must not start a WebView dial.");
+  await assert.rejects(lifecycle.ensureSession(), /suspended or offline/);
+  await assert.rejects(lifecycle.connect("synthetic-peer"), /suspended or offline/);
+  assert.equal(opens, 1, "Hidden metadata recovery must not dial either.");
   await lifecycle.setForeground(true);
   assert.equal(opens, 2, "Foreground UI may reattach to the service-owned session.");
   await lifecycle.disconnect();
 });
+test("Android proxy never probes for a replacement transport owned by the native service", async () => {
+  const first = { ...session(), transportKind: "relay" as const };
+  const timer = deferred<void>();
+  let opens = 0;
+  const lifecycle = createConnectionLifecycle<string>({
+    serviceOwnsSession: true,
+    keyFor: peer => peer,
+    open: async () => ++opens === 1 ? first : session(),
+    sleep: () => timer.promise,
+  });
+  try {
+    await lifecycle.connect("synthetic-peer");
+    timer.resolve();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(opens, 1, "Only the native transport lifecycle may probe for upgrades.");
+  } finally {
+    await lifecycle.disconnect();
+  }
+});
+
 
 test("transport configuration changes invalidate browser and Android service session keys", () => {
   const options = { host: "", port: 22000, remoteId: "synthetic-peer",

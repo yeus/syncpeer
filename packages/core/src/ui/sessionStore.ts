@@ -56,6 +56,7 @@ interface SessionActionContext {
   >;
   readonly readDirWithRetry: ReturnType<typeof makeReadDirWithRetryFlow>;
   reloadCurrentDirectory: (options?: ConnectOptions) => Promise<void>;
+  activeConnectEpoch?: number;
   recoverCancelledOpening?: (epoch: number, error: unknown) => void;
 }
 
@@ -223,6 +224,7 @@ const connectAction = async (
   preserveSelectedFolder = false,
 ): Promise<void> => {
   const nextEpoch = ctx.getState().requestEpoch + 1;
+  ctx.activeConnectEpoch = nextEpoch;
   beginConnect(ctx, options, nextEpoch);
   try {
     const remoteFs = await ctx.deps.transport.connectAndSync(options);
@@ -236,6 +238,8 @@ const connectAction = async (
     failConnect(ctx, nextEpoch, error);
     if (!preserveSelectedFolder) ctx.recoverCancelledOpening?.(nextEpoch, error);
     throw error;
+  } finally {
+    if (ctx.activeConnectEpoch === nextEpoch) ctx.activeConnectEpoch = undefined;
   }
   // Directory indexes can arrive after an authenticated BEP session is ready.
   // A directory load failure belongs to the folder view, not the transport.
@@ -717,12 +721,15 @@ const applyLifecycleState = (
     // only start recovery when no connect action is already doing that work.
     const missingRuntime = current.remoteFs === null;
     const lifecycleConnected = lifecycle.phase === "connected";
+    // Lifecycle notifications also set pending.connecting. Only a live action
+    // for this request epoch can actually bind the filesystem.
+    const bindingRuntime = ctx.activeConnectEpoch === current.requestEpoch;
     const pendingConnectionWithoutRuntime =
-      lifecycleConnected && missingRuntime && current.pending.connecting;
+      lifecycleConnected && missingRuntime && bindingRuntime;
     const needsRecovery =
       lifecycleConnected &&
       missingRuntime &&
-      !current.pending.connecting &&
+      !bindingRuntime &&
       current.connectOptions !== null;
     if (needsRecovery) recoveryOptions = { ...current.connectOptions! };
     return {

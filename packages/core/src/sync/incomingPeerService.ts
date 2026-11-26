@@ -4,7 +4,7 @@ import { createPeerSessionManager, type PeerSessionCandidate } from "./peerSessi
 
 import { startAutomaticRelayPresence } from "./automaticRelayPresence.js";
 
-const canonicalId = (value: string) => value.replace(/[^A-Z2-7]/gi, "").toUpperCase();
+import { normalizeDeviceId as canonicalId } from "../ui/helpers.js";
 
 export interface IncomingPeerServiceOptions {
   mode?: "direct" | "relay" | "both";

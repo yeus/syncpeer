@@ -1,5 +1,6 @@
 import { FileInfo, type BepFileInfo } from "../protocol/bep.js";
 import { mergeVersionVectors } from "../protocol/versionVector.js";
+import { withEmptyFileBlock } from "../protocol/emptyFileBlock.js";
 import { decryptEncryptedFilename, decryptUntrustedBytes, deriveUntrustedFileKey, encryptUntrustedFilename, encryptUntrustedBytes, encryptUntrustedBlockHash } from "./untrusted.js";
 
 const safeNonnegativeInteger = (value: unknown, label: string): number => {
@@ -9,7 +10,8 @@ const safeNonnegativeInteger = (value: unknown, label: string): number => {
 };
 
 /** Syncthing's opaque wrapper is shared by BEP publication and disk trailers. */
-export async function encryptUntrustedFileInfo(folderKey: Uint8Array, file: BepFileInfo, nonce: Uint8Array): Promise<BepFileInfo> {
+export async function encryptUntrustedFileInfo(folderKey: Uint8Array, input: BepFileInfo, nonce: Uint8Array): Promise<BepFileInfo> {
+  const file = withEmptyFileBlock(input);
   const fileKey = deriveUntrustedFileKey(folderKey, file.name);
   const counters = mergeVersionVectors(file.version ?? {}, {}).counters ?? [];
   const version = counters.reduce((sum, counter) => sum + BigInt(counter.value), 0n);

@@ -174,7 +174,7 @@ test("unchanged favorites reuse their verified version but changed files are has
 
 test("incremental clean folder skips scans until remote revision, local mutation or audit deadline", async () => {
   const { documents, storageId } = await createFixture();
-  const { remote, files, requests } = fakeRemote(new Map([["notes.txt", { bytes: encoder.encode("original"), modifiedMs: 10 }]]));
+  const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: encoder.encode("original"), modifiedMs: 10 }]]));
   let revision = 1, scans = 0, nowMs = 1000;
   const fs = Object.assign(remote, { folderSyncRevision: () => revision }) as unknown as RemoteFs;
   const memo = createFavoriteSyncMemo();
@@ -741,6 +741,25 @@ test("saves an offline directory snapshot for each visited favorite directory", 
   const nested = await documents.loadDirectorySnapshot("folder", "synthetic-peer", "docs/sub");
   assert.deepEqual(nested?.entries.map(entry => entry.path), ["docs/sub/nested.txt"]);
   await documents.close();
+});
+
+test("favorite upload preserves a same-size peer edit with an unchanged timestamp", async () => {
+  const { documents, storageId } = await createFixture();
+  const original = encoder.encode("original");
+  const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: original, modifiedMs: 10 }]]));
+  try {
+    await cacheRemoteFile(documents, "notes.txt", original, 10);
+    const id = JSON.stringify([storageId, "notes.txt"]);
+    const writer = await documents.open(id, "rwt");
+    await documents.write(writer, 0, encoder.encode("local123"));
+    await documents.release(writer);
+    files.set("notes.txt", { bytes: encoder.encode("peeredit"), modifiedMs: 10 });
+    const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
+    assert.equal(results[0]?.result, "conflict");
+    assert.equal(requests.uploads.length, 0);
+    assert.deepEqual(files.get("notes.txt")?.bytes, encoder.encode("peeredit"));
+    assert.equal((await favoriteState(documents))?.phase, "conflict");
+  } finally { await documents.close(); }
 });
 
 test("applies a recorded keep-local resolution by publishing the local copy", async () => {

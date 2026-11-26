@@ -72,6 +72,15 @@ test("two Syncpeer peers exchange bytes and pair through a local Syncthing relay
         readDefaultIdentity: async () => joiningIdentity,
         importPairingTransfer: async () => { imported = true; },
       } });
+      // Validate relay URLs before any listener exists.
+      await assert.rejects(owner.startPairingInvitation({
+        advertisedHost: "relay://127.0.0.1:22067/sneaky?id=synthetic",
+        confirm: async () => true,
+      }), /Invalid advertised relay pairing address/);
+      await assert.rejects(owner.startPairingInvitation({
+        advertisedHost: "relay://127.0.0.1:22067/#synthetic",
+        confirm: async () => true,
+      }), /Invalid advertised relay pairing address/);
       try {
         pairing = await owner.startPairingInvitation({ advertisedHost: relayAddress,
           confirm: async () => true });

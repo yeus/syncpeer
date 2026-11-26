@@ -17,6 +17,20 @@ test("duplicate direction is deterministic at both ends", () => {
   assert.equal(preferredPeerDirection("A", "B"), "outgoing");
   assert.equal(preferredPeerDirection("B", "A"), "incoming");
 });
+test("formatted and canonical Syncthing IDs arbitrate the same peer", async () => {
+  const local = "A".repeat(52), remote = "B".repeat(52);
+  const formatted = remote.match(/.{13}/g)!.map(chunk => chunk + "C").join("-");
+  const manager = createPeerSessionManager(local);
+  const first = session(), second = session();
+  assert.equal(preferredPeerDirection(local, formatted), "outgoing");
+  assert.equal(await manager.admit({ remoteDeviceId: formatted, direction: "outgoing",
+    connectionId: "first", session: first.value }), true);
+  assert.equal(await manager.admit({ remoteDeviceId: remote, direction: "incoming",
+    connectionId: "second", session: second.value }), false);
+  assert.deepEqual(manager.active().map(item => item.remoteDeviceId), [remote]);
+  await manager.close();
+});
+
 
 test("manager keeps concurrent sessions for different approved devices", async () => {
   const manager = createPeerSessionManager("A");

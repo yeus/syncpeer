@@ -137,7 +137,7 @@ class ConnectionLifecycleRuntime<TOptions> {
   };
 
   private scheduleUpgrade = (sessionGeneration: number): void => {
-    if (!this.active || this.pathRank(this.active) >= 5) return;
+    if (this.deps.serviceOwnsSession || !this.active || this.pathRank(this.active) >= 5) return;
     if (this.upgradeTimerGeneration === sessionGeneration) return;
     this.upgradeTimerGeneration = sessionGeneration;
     void this.sleep(60_000).then(async () => {
@@ -331,6 +331,7 @@ class ConnectionLifecycleRuntime<TOptions> {
     if (this.active && !this.active.isClosed() && this.desired && this.activeKey === this.deps.keyFor(this.desired)) return this.active;
     if (!this.eligible()) throw new Error("Connection is suspended or offline.");
     if (this.opening && this.desired && this.openingKey === this.deps.keyFor(this.desired)) return this.opening;
+    if (this.deps.serviceOwnsSession && !this.foreground) throw new Error("Connection is suspended or offline.");
     this.generation += 1;
     const refreshGeneration = this.generation;
     if (this.opening) {
@@ -357,6 +358,7 @@ class ConnectionLifecycleRuntime<TOptions> {
       const key = this.deps.keyFor(options);
       if (this.active && !this.active.isClosed() && this.activeKey === key) return this.active;
       if (this.opening && this.openingKey === key) return this.opening;
+      if (this.deps.serviceOwnsSession && !this.foreground) throw new Error("Connection is suspended or offline.");
       this.generation += 1;
       const connectGeneration = this.generation;
       this.cancelOpening();

@@ -17,23 +17,45 @@ const responseDelay = (headers: Record<string, string> | undefined, name: string
   return Number.isFinite(delay) && delay > 0 ? Math.min(delay, 2_147_483_647) : fallback;
 };
 
-const relayPort = (address: string): number => Number(new URL(address).port || 22067);
+type RelayPoolCandidate = { address: string; port: number };
+
+function parseRelayPoolCandidate(value: string): RelayPoolCandidate | null {
+  // Chromium WebView treats unknown relay:// as an opaque URL, losing its
+  // authority. Parse under a standard scheme, but retain the original relay
+  // address (including the pool-assigned ID) for the transport.
+  if (!value.startsWith("relay://") || value.includes("\\") ||
+      [...value].some(char => char.charCodeAt(0) <= 0x20 || char.charCodeAt(0) === 0x7f)) {
+    return null;
+  }
+  const address = value.slice("relay://".length);
+  let endpoint: URL;
+  try { endpoint = new URL(`http://${address}`); }
+  catch { return null; }
+  if (!endpoint.hostname || endpoint.username || endpoint.password || endpoint.hash ||
+      endpoint.pathname !== "/" || !endpoint.searchParams.get("id")) return null;
+  const authority = address.split(/[/?#]/, 1)[0]!;
+  if (authority.endsWith(":")) return null;
+  // URL normalizes away the HTTP default port 80, which is a legitimate relay
+  // port and must remain distinct from the relay default of 22067.
+  const explicitPort = /:(\d{1,5})$/.exec(authority);
+  const port = explicitPort ? Number(explicitPort[1]) : 22067;
+  return port >= 1 && port <= 65535 ? { address: value, port } : null;
+}
 
 const poolAddresses = (payload: unknown) => {
   if (!payload || typeof payload !== "object" || !("relays" in payload) || !Array.isArray(payload.relays)) {
     throw new Error("Relay pool response has no relay list.");
   }
-  const addresses = [...new Set(payload.relays.flatMap((entry: unknown) => {
-    if (!entry || typeof entry !== "object" || !("url" in entry) || typeof entry.url !== "string") return [];
-    try {
-      const url = new URL(entry.url);
-      return url.protocol === "relay:" && url.hostname && !url.username && !url.password && !url.hash &&
-        url.searchParams.get("id") ? [url.toString()] : [];
-    } catch { return []; }
-  }))];
+  const candidates = new Map<string, RelayPoolCandidate>();
+  for (const entry of payload.relays) {
+    const candidate = entry && typeof entry === "object" && "url" in entry &&
+      typeof entry.url === "string" ? parseRelayPoolCandidate(entry.url) : null;
+    if (candidate) candidates.set(candidate.address, candidate);
+  }
+  const values = [...candidates.values()];
   return [
-    ...addresses.filter(address => relayPort(address) === 443),
-    ...addresses.filter(address => relayPort(address) !== 443),
+    ...values.filter(candidate => candidate.port === 443),
+    ...values.filter(candidate => candidate.port !== 443),
   ].slice(0, 32);
 };
 async function announce(adapter: SyncpeerHostAdapter,
@@ -65,20 +87,22 @@ async function register(adapter: SyncpeerHostAdapter,
     throw new Error("Relay pools require HTTPS without credentials or fragments.");
   }
   const auth = extractDiscoveryAuth(poolUrl);
+  adapter.log?.("core.relay.pool.start", {});
   const response = await adapter.discoveryFetch(poolUrl, { ...auth, signal });
   if (!response.ok) {
     await wait(responseDelay(response.headers, "retry-after", 60_000), signal);
     throw new Error("Relay pool request failed.");
   }
   const addresses = poolAddresses(await response.json());
+  adapter.log?.("core.relay.pool.available", { candidateCount: addresses.length });
   const groups = [
-    addresses.filter(address => relayPort(address) === 443),
-    addresses.filter(address => relayPort(address) !== 443),
+    addresses.filter(candidate => candidate.port === 443),
+    addresses.filter(candidate => candidate.port !== 443),
   ];
   for (const group of groups) {
     const offset = group.length ? (await adapter.randomBytes(1))[0]! % group.length : 0;
     for (let i = 0; i < group.length && !signal.aborted; i++) {
-      const relayAddress = group[(offset + i) % group.length]!;
+      const relayAddress = group[(offset + i) % group.length]!.address;
       try {
         const listener = await adapter.listenRelay!({ ...options, relayAddress, signal });
         return { listener, relayAddress };

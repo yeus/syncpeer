@@ -41,6 +41,7 @@ import { compareVersionVectors } from "./sync/folderSync.js";
 import type { LocalFolderReplica } from "./sync/replicaIndex.js";
 import { replicaContentSignature } from "./sync/replicaMerge.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./sync/replicaPaths.js";
+import { emptyFileBlock, withEmptyFileBlock } from "./core/protocol/emptyFileBlock.js";
 import { decryptUntrustedFileInfo, encryptUntrustedFileInfo } from "./core/model/untrustedMetadata.js";
 import {
   coalescePendingIndexFrame,
@@ -683,14 +684,26 @@ function parseDiscoveryCandidate(address: unknown): DiscoveredCandidate | null {
     };
   }
   if (value.startsWith("relay://")) {
+    // As with TCP and QUIC above, a WebView need not assign an authority to
+    // nonstandard relay:// URLs. A standard scheme parses the same authority.
+    const address = value.slice("relay://".length);
+    if (value.includes("\\") ||
+        [...value].some(char => char.charCodeAt(0) <= 0x20 || char.charCodeAt(0) === 0x7f)) return null;
     let parsed: URL;
-    try { parsed = new URL(value); }
+    try { parsed = new URL(`http://${address}`); }
     catch { return null; }
+    if (!parsed.hostname || parsed.username || parsed.password || parsed.hash ||
+        parsed.pathname !== "/") return null;
+    const authority = address.split(/[/?#]/, 1)[0]!;
+    if (authority.endsWith(":")) return null;
+    const matchedPort = /:(\d{1,5})$/.exec(authority);
+    const port = matchedPort ? Number(matchedPort[1]) : undefined;
+    if (port !== undefined && (port < 1 || port > 65535)) return null;
     return {
       address: value,
       protocol: "relay",
-      host: parsed.hostname || undefined,
-      port: parsed.port ? Number(parsed.port) : undefined,
+      host: parsed.hostname.replace(/^\[|\]$/g, ""),
+      port,
       scope: "wan",
       source: "global",
     };
@@ -1531,7 +1544,8 @@ class BepSession {
     if (replica?.isPaused?.()) return;
     if (changedOnly && !replica) return;
     if (replica) this.log("shared_folder.index.scan.start");
-    const files = replica ? await replica.scan() : [...folder.files.values()].map(file => file.indexFile);
+    const files = (replica ? await replica.scan() : [...folder.files.values()].map(file => file.indexFile))
+      .map(withEmptyFileBlock);
     if (replica) this.log("shared_folder.index.scan.done", { fileCount: files.length });
     const advertisedFiles = folder.folderCrypto
       ? await Promise.all(files.map(async file => encryptUntrustedFileInfo(
@@ -2079,7 +2093,9 @@ class BepSession {
         key.fill(0);
       }
     }
-    const bytes = await replica.readBlock(file.original.name, Number(original.offset), original.size, original.hash);
+    // The advertised empty block contains no plaintext bytes to fetch from storage.
+    const bytes = original.size === 0 ? new Uint8Array()
+      : await replica.readBlock(file.original.name, Number(original.offset), original.size, original.hash);
     const key = deriveUntrustedFileKey(crypto.folderKey, file.original.name);
     try { return await encryptUntrustedBlock(key, bytes, size => this.adapter.randomBytes(size)); }
     finally { bytes.fill(0); key.fill(0); }
@@ -2239,7 +2255,7 @@ class BepSession {
 
   private async encryptUploadBlock(record: UploadedFileRecord, index: number): Promise<Uint8Array> {
     const plaintext = record.plaintextBlocks[index];
-    const bytes = await record.source.read(plaintext.offset, plaintext.size);
+    const bytes = plaintext.size === 0 ? new Uint8Array() : await record.source.read(plaintext.offset, plaintext.size);
     try {
       if (bytes.length !== plaintext.size) throw new Error("Upload source returned an unexpected length.");
       if (!bytesEqual(toUint8Array(await this.adapter.sha256(bytes)), plaintext.hash)) {
@@ -2312,6 +2328,10 @@ class BepSession {
     digest: ReturnType<typeof sha256.create> | undefined,
     notifyProgress: (processedBytes: number, phase: "preparing" | "publishing") => void,
   ) {
+    if (source.size === 0) {
+      throwIfCancelled();
+      return [emptyFileBlock()];
+    }
     const blocks: UploadedBlock[] = [];
     for (let offset = 0; offset < source.size; offset += blockSize) {
       throwIfCancelled();
@@ -3111,8 +3131,8 @@ async function openQuicSession(
   );
 }
 
-/** Some standard relays reject a fresh join before their session worker is ready.
- * Request a new invitation: its one-use join key cannot be retried. No application bytes have been sent. */
+/** Retry transient relay join and TLS handshake timeouts using a fresh invitation.
+ * No application bytes have been sent. Authentication failures are never retried. */
 export async function connectRelayWithRetry(adapter: SyncpeerHostAdapter, options: SyncpeerRelayConnectOptions) {
   if (!adapter.connectRelay) throw new Error("Relay transport is not available in this host adapter");
   const deadline = Date.now() + (options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 30000);
@@ -3122,7 +3142,7 @@ export async function connectRelayWithRetry(adapter: SyncpeerHostAdapter, option
     if (remaining <= 0) throw new Error("Relay connection timeout budget exhausted");
     try { return await adapter.connectRelay({ ...options, timeoutMs: remaining }); }
     catch (error) {
-      if (attempt >= 2 || !/Relay join failed \(2\):/.test(String(error))) throw error;
+      if (attempt >= 2 || !/Relay join failed \(2\):|Relay TLS handshake timed out\./.test(String(error))) throw error;
       throwIfConnectionAborted(options.signal);
       adapter.log?.("core.relay.join.retry", { attempt: attempt + 1 });
       await new Promise<void>((resolve, reject) => {
@@ -3495,12 +3515,14 @@ class ConnectionAttempt {
     this.relayStartDelayMs = this.relayEnabled && relay.length > 0 && !this.opts.relayOnly
       ? Math.min(2500, Math.max(0, Math.floor(this.totalTimeout * 0.25)))
       : 0;
-    // Bound each wave when discovery returns many dead endpoints. The healthy
-    // last-known-good LAN address and non-cooling candidates are tried first.
+    // The race runs at most three direct handshakes at a time. Reserve time
+    // for *every wave* of advertised addresses, including a healthy candidate
+    // last in a crowded list. The old 2000 ms minimum could exhaust a 4000 ms
+    // overall deadline after only six dead endpoints out of fifteen.
     const crowded = direct.length > 3;
     this.perCandidateTimeout = crowded
-      ? Math.max(2000, Math.min(8000,
-          Math.floor(this.totalTimeout / Math.ceil(direct.length / 3))))
+      ? Math.max(400, Math.min(8000,
+          Math.floor(this.totalTimeout * 0.8 / Math.ceil(direct.length / 3))))
       : Math.max(8000,
           Math.min(30000, Math.floor(this.totalTimeout / Math.max(direct.length || 1, 1))));
     this.adapter.log?.("core.discovery.connect_strategy", {

@@ -18,6 +18,16 @@ test("a relay join race requests a fresh session before retrying", async () => {
   } }, options);
   assert.equal(attempts, 2); assert.equal(value, result);
 });
+test("a transient relay TLS handshake timeout requests a fresh invitation", async () => {
+  let attempts = 0;
+  const value = await connectRelayWithRetry({ ...createNodeHostAdapter(), connectRelay: async () => {
+    if (++attempts === 1) throw new Error("Relay TLS handshake timed out.");
+    return result;
+  } }, options);
+  assert.equal(attempts, 2);
+  assert.equal(value, result);
+});
+
 
 test("relay certificate rejection is never retried", async () => {
   let attempts = 0;

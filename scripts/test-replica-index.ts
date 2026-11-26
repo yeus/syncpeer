@@ -338,3 +338,11 @@ test("pending Syncthing empty-file publication recovers its version without byte
   assert.deepEqual(recovered.files.empty.info.version, pending.version);
   assert.equal(recovered.pending, undefined);
 });
+
+test("legacy empty replica metadata matches Syncthing's authenticated empty block", () => {
+  const legacy = { name: "empty", type: 0, size: 0, blocks: [],
+    version: { counters: [{ id: "2", value: "1" }] } };
+  const remote = { ...legacy, blocks: [{ offset: 0, size: 0, hash: sha256(new Uint8Array()) }] };
+  assert.equal(planReplicaMerge(legacy, remote).action, "keep");
+  assert.equal(planReplicaMerge(remote, legacy).action, "keep");
+});

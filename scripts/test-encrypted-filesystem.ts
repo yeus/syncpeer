@@ -274,7 +274,7 @@ test("Syncthing decrypts files written by core, including an empty file", async 
       await writeEncryptedDiskFile({
         source: { size: bytes.length, readRange: async (offset, size) => bytes.slice(offset, offset + size) },
         fileInfo: { name: `file-${bytes.length}`, type: 0, size: bytes.length, block_size: 131072,
-          blocks: Array.from({ length: Math.max(1, Math.ceil(bytes.length / 131072)) }, (_, i) => {
+          blocks: Array.from({ length: Math.ceil(bytes.length / 131072) }, (_, i) => {
             const offset = i * 131072;
             const chunk = bytes.slice(offset, offset + 131072);
             return { offset, size: chunk.length, hash: sha256(chunk) };

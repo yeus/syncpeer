@@ -1,3 +1,5 @@
+import { normalizeDeviceId } from "../ui/helpers.js";
+
 export type PeerConnectionDirection = "incoming" | "outgoing";
 
 export interface ManagedPeerSession {
@@ -18,9 +20,9 @@ export interface PeerSessionManager<T extends ManagedPeerSession = ManagedPeerSe
   close: () => Promise<void>;
 }
 
-const canonicalId = (value: string) => value.replace(/[^A-Z2-7]/gi, "").toUpperCase();
+const canonicalId = normalizeDeviceId;
 
-/** The lower identity dials and the higher identity accepts, so both ends retain the same socket. */
+/** Prefer the lower identity's outgoing socket when both peers dial. */
 export function preferredPeerDirection(localDeviceId: string, remoteDeviceId: string): PeerConnectionDirection {
   const local = canonicalId(localDeviceId);
   const remote = canonicalId(remoteDeviceId);

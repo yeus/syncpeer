@@ -1,12 +1,13 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import type { BepFileInfo } from "../core/protocol/bep.js";
+import { withEmptyFileBlock } from "../core/protocol/emptyFileBlock.js";
 import { compareConcurrentVersionCounters, mergeVersionVectors } from "../core/protocol/versionVector.js";
 import { compareVersionVectors } from "./folderSync.js";
 
 export const replicaContentSignature = (file: BepFileInfo): string => JSON.stringify({
   type: Number(file.type ?? 0), size: String(file.size ?? 0), deleted: !!file.deleted,
-  blocks: (file.blocks ?? []).map(block => [String(block.offset), block.size, Array.from(block.hash)]),
+  blocks: (withEmptyFileBlock(file).blocks ?? []).map(block => [String(block.offset), block.size, Array.from(block.hash)]),
 });
 
 export function planReplicaMerge(local: BepFileInfo | undefined, remote: BepFileInfo): {

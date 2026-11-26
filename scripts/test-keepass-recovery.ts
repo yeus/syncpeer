@@ -3,6 +3,9 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { advanceVersionVector } from "../packages/core/dist/core/protocol/versionVector.js";
+import { defaultFolderSettings } from "../packages/core/dist/sync/profileSettings.js";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
@@ -13,6 +16,7 @@ import {
 
 const withFixture = async (run: (fixture: {
   original: Buffer; edited: Buffer; validate: (bytes: Uint8Array, updated: boolean) => void;
+  makeConcurrent: () => Buffer;
 }) => Promise<void>) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-kdbx-recovery-"));
   try {
@@ -33,7 +37,13 @@ const withFixture = async (run: (fixture: {
     };
     validate(original, false);
     validate(edited, true);
-    await run({ original, edited, validate });
+    const makeConcurrent = () => {
+      const other = path.join(root, "concurrent.kdbx");
+      fs.writeFileSync(other, original);
+      addKeepassEntry(other, "concurrent-fixture");
+      return fs.readFileSync(other);
+    };
+    await run({ original, edited, validate, makeConcurrent });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 };
 
@@ -138,3 +148,41 @@ for (const [label, bytes] of [["after truncate", 0], ["mid-save", 131072]] as co
     });
   });
 }
+
+test("whole-folder concurrent KDBX edits retain both exact decryptable versions across restart", async () => {
+  await withFixture(async ({ original, edited, validate, makeConcurrent }) => {
+    const concurrent = makeConcurrent();
+    const fixture = await createReplica(original);
+    try {
+      const docs = fixture.documents();
+      const settings = await docs.profileSettings();
+      settings.folders.fixture = { ...defaultFolderSettings(), favorites: [{
+        key: "folder:fixture:", folderId: "fixture", name: "Fixture", path: "", kind: "folder",
+      }] };
+      await docs.saveProfileSettings(settings);
+      const [shared] = await docs.sessionSharedFolders("SYNTHETIC-ORDINARY-PEER");
+      const replica = shared.replica!;
+      const base = (await replica.scan()).find(file => file.name === "fixture.kdbx")!;
+      const handle = await docs.open(fixture.file.id, "rwt");
+      await fixture.write(handle, edited);
+      await docs.release(handle);
+      const local = (await replica.scan()).find(file => file.name === base.name)!;
+      const blocks = [];
+      for (let offset = 0; offset < concurrent.length; offset += 131072) {
+        const block = concurrent.subarray(offset, offset + 131072);
+        blocks.push({ offset, size: block.length, hash: sha256(block) });
+      }
+      const remote = { ...base, size: concurrent.length, blocks,
+        modified_s: Number(local.modified_s) + 1, modified_ns: 0,
+        version: advanceVersionVector(base.version, "43") };
+      assert.equal(await replica.receive!("fixture", [remote], async (_name, offset, size) =>
+        concurrent.subarray(offset, offset + size)), true);
+      await fixture.restart();
+      assert.deepEqual(await fixture.read(), concurrent);
+      const recovered = await fixture.readRecoveredCopy();
+      assert.deepEqual(recovered, edited);
+      validate(recovered, true);
+      validate(await fixture.read(), false);
+    } finally { await fixture.documents().close(); }
+  });
+});

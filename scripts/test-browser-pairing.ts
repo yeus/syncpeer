@@ -9,6 +9,7 @@ import { computeDeviceId } from "../packages/core/dist/core/transport/node.js";
 import { createNodeHostAdapter } from "../packages/core/dist/node.js";
 import { createSyncpeerBrowserClient } from "../packages/core/dist/ui/browserClient.js";
 import { createSyncpeerSessionStore } from "../packages/core/dist/ui/sessionStore.js";
+import { startIncomingPeerService } from "../packages/core/dist/sync/incomingPeerService.js";
 import { createSyncpeerCoreClient, type SyncpeerSessionHandle } from "../packages/core/dist/client.js";
 import { useTemporaryMetadataRoot } from "./node-storage-fixture.ts";
 import { createOwnedDeviceIdentity, openOwnedDeviceSigningKey, signSpaceMembershipUpdate } from
@@ -47,6 +48,21 @@ test("invalid invitation setup never leaks an incoming listener", async () => {
     assert.equal(listening, false);
     await assert.rejects(owner.startPairingInvitation({ advertisedHost: "127.0.0.1",
       expiresInMs: -1, confirm: async () => true }));
+    const validHost = await owner.startPairingInvitation({
+      advertisedHost: "10.0.2.2:23000", confirm: async () => true,
+    });
+    assert.equal(validHost.invitation.endpoint, "10.0.2.2:23000");
+    await validHost.cancel();
+    assert.equal(listening, false);
+    const defaultHttpPort = await owner.startPairingInvitation({
+      advertisedHost: "tcp://10.0.2.2:80", confirm: async () => true,
+    });
+    assert.equal(defaultHttpPort.invitation.endpoint, "10.0.2.2:80");
+    await defaultHttpPort.cancel();
+    assert.equal(listening, false);
+    await assert.rejects(owner.startPairingInvitation({
+      advertisedHost: "10.0.2.2:23000/path", confirm: async () => true,
+    }), /advertised pairing address/);
     assert.equal(listening, false);
   } finally {
     await owner.disconnect();
@@ -259,7 +275,7 @@ test("a reused browser listener advertises current folders and adopts current co
       }));
     }
     assert.equal(listenCount, 1);
-    assert.equal(outgoingAttempts, 0, "The higher-ID peer should wait for its preferred incoming session.");
+    assert.equal(outgoingAttempts, 2, "After a bounded incoming grace, each explicit connect must attempt an outbound connection.");
     assert.deepEqual(requestedPorts, [22999]);
     outgoing = await createSyncpeerCoreClient(adapter).openSession({ ...joiningIdentity,
       host: "127.0.0.1", port, expectedDeviceId: ownerIdentity.deviceId,
@@ -275,6 +291,41 @@ test("a reused browser listener advertises current folders and adopts current co
     await rm(root, { recursive: true, force: true });
   }
 });
+test("higher-ID browser client reaches a passive approved TLS/BEP peer", { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "syncpeer-passive-peer-"));
+  const adapter = createNodeHostAdapter();
+  const [remote, local] = (await Promise.all([identity(root, "one"), identity(root, "two")]))
+    .sort((a, b) => a.deviceId.localeCompare(b.deviceId));
+  const client = createSyncpeerBrowserClient({ hostAdapter: { ...adapter,
+    listenTls: options => adapter.listenTls!({ ...options, host: "127.0.0.1", port: 0 }),
+  }, platformAdapter: { readDefaultIdentity: async () => local } });
+  let listener: Awaited<ReturnType<typeof startIncomingPeerService>> | undefined;
+  const accepted = Promise.withResolvers<void>();
+  try {
+    listener = await startIncomingPeerService(adapter, {
+      ...remote, host: "127.0.0.1", port: 0, localDeviceId: remote.deviceId,
+      approvedDeviceIds: [local.deviceId],
+      connectionOptions: (_id, endpoint) => ({ ...remote, ...endpoint,
+        expectedDeviceId: local.deviceId, discoveryMode: "direct", timeoutMs: 3000,
+        sharedFolders: [{ id: "passive-folder", encryption: { mode: "plaintext" } }] }),
+      onSession: () => accepted.resolve(),
+    });
+    const store = createSyncpeerSessionStore({ transport: client });
+    await store.actions.connect({ host: "127.0.0.1", port: listener.port,
+      remoteId: remote.deviceId, discoveryMode: "direct", timeoutMs: 3000,
+      sharedFolders: [{ id: "passive-folder", encryption: { mode: "plaintext" } }] });
+    assert.equal(store.getState().phase, "connected");
+    assert.ok(store.getState().remoteFs);
+    await accepted.promise;
+    assert.equal(listener.activeSessions().length, 1);
+    assert.equal(listener.activeSessions()[0].direction, "incoming");
+  } finally {
+    await client.disconnect();
+    await listener?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 
 test("incoming fallback resolves an overlapping outbound connection attempt", { timeout: 12000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-reverse-fallback-"));

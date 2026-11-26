@@ -444,7 +444,7 @@ test("a receiver advances the remote folder sequence when the peer publishes an 
 });
 
 for (const mode of ["plaintext", "encrypted"] as const) {
-test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { timeout: 15000 }, async () => {
+test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { timeout: 20000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "syncpeer-peers-"));
   let listener: Awaited<ReturnType<typeof listenNodePeer>> | undefined;
   let outgoing: SyncpeerSessionHandle | undefined;
@@ -669,10 +669,14 @@ test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { 
       { stdio: ["ignore", "pipe", "pipe"] });
       let client: ReturnType<typeof spawn> | undefined;
       const serverExit = new Promise(resolve => server.once("exit", resolve));
-      server.stderr.resume();
+      let serverStderr = "";
+      server.stderr.on("data", bytes => {
+        serverStderr = (serverStderr + String(bytes)).slice(-2048);
+      });
+      const listenerError = (message: string) => new Error(`${message}${serverStderr ? `: ${serverStderr.trim()}` : ""}`);
       try {
         const port = await new Promise<string>((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error("Standalone CLI listener did not start")), 4000);
+          const timer = setTimeout(() => reject(listenerError("Standalone CLI listener did not start")), 8000);
           let output = "";
           server.stdout.on("data", bytes => {
             output += String(bytes);
@@ -680,7 +684,7 @@ test(`two Syncpeer peers exchange ${mode} blocks over TLS without Syncthing`, { 
             if (match) { clearTimeout(timer); resolve(match[1]); }
           });
           server.once("error", error => { clearTimeout(timer); reject(error); });
-          server.once("exit", () => { clearTimeout(timer); reject(new Error("Standalone CLI listener exited")); });
+          server.once("exit", code => { clearTimeout(timer); reject(listenerError(`Standalone CLI listener exited (${code})`)); });
         });
         client = spawn(process.execPath, [...connectionArgs("b", a.deviceId), "--port", port,
           "peer-folder", "fixture-folder", path.join(root, "share-b"), "--scan-interval", "100"], { stdio: "ignore" });

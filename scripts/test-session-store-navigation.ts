@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createSyncpeerSessionStore } from "../packages/core/src/ui/sessionStore.ts";
 import type { RemoteFsLike } from "../packages/core/src/ui/browserClient.ts";
+import type { ConnectionLifecycleState } from "../packages/core/src/ui/connectionLifecycle.ts";
 
 test("a stale directory failure cannot overwrite a newer location", async () => {
   let rejectFirstRead: ((error: Error) => void) | undefined;
@@ -533,4 +534,56 @@ test("a late folder index cannot invalidate an authenticated reconnect", async (
   indexReceived = true;
   await store.actions.reloadCurrentDirectory(options);
   assert.equal(store.getState().directory.status, "ready");
+});
+
+test("a transport retry rebinds the UI after the opening action has failed", async () => {
+  const folder = {
+    id: "retry", label: "Retry", readOnly: false,
+    encrypted: false, needsPassword: false,
+  };
+  const remoteFs: RemoteFsLike = {
+    listFolders: async () => [folder],
+    requestFolderIndex: async () => undefined,
+    setFocusedFolder: () => undefined,
+    waitForFolderIndex: async () => true,
+    readDir: async () => [],
+    readFileFully: async () => new Uint8Array(),
+    writeFileFully: async () => undefined,
+  };
+  let emitLifecycle: ((state: ConnectionLifecycleState) => void) | undefined;
+  const emit = (phase: ConnectionLifecycleState["phase"]) => emitLifecycle?.({
+    phase, attempt: 0, nextRetryAtMs: null, closureReason: null, upgradeStatus: "idle",
+  });
+  let calls = 0;
+  const store = createSyncpeerSessionStore({
+    transport: {
+      connectAndSync: async () => {
+        if (++calls === 1) {
+          emit("connecting");
+          throw new Error("signal is aborted without reason");
+        }
+        return remoteFs;
+      },
+      connectAndGetOverview: async () => ({
+        folders: [folder], device: null, folderSyncStates: [],
+        connectedVia: "fixture", transportKind: "direct-tcp" as const,
+      }),
+      connectAndGetFolderVersions: async () => [],
+      subscribeLifecycle: (listener) => {
+        emitLifecycle = listener;
+        return () => {};
+      },
+    },
+  });
+  await assert.rejects(store.actions.connect({
+    host: "127.0.0.1", port: 22000, deviceName: "retry-fixture",
+    discoveryMode: "direct",
+  }), /signal is aborted/);
+  emit("reconnecting");
+  emit("connected");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls, 2);
+  assert.equal(store.getState().phase, "connected");
+  assert.equal(store.getState().remoteFs, remoteFs);
+  assert.equal(store.getState().pending.connecting, false);
 });

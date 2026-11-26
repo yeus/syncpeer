@@ -113,6 +113,9 @@ test("a failed relay does not close the direct listener and selection tries anot
     return init?.method === "POST" ? response : { ...response, json: async () => ({ relays: [
       { url: "relay://127.0.0.1:22068/?id=UNAVAILABLE" },
       { url: "relay://127.0.0.1:22067/?id=SYNTHETIC" },
+      { url: "relay://127.0.0.1:22067/invalid-path?id=synthetic" },
+      { url: "relay://127.0.0.1:22067/?not-id=synthetic" },
+      { url: "relay://127.0.0.1:0/?id=zero-port" },
       { url: "https://invalid.synthetic.invalid/" },
     ] }) };
   };
@@ -126,6 +129,7 @@ test("a failed relay does not close the direct listener and selection tries anot
     await until(() => f.requests.some(request => request.init?.method === "POST"));
     assert.equal(service.port, 12345);
     assert.equal(f.registrations.length, 1);
+    assert.equal(f.registrations[0], "relay://127.0.0.1:22067/?id=SYNTHETIC");
   } finally { await service.close(); }
 });
 

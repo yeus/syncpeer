@@ -749,61 +749,75 @@ async function prepareBackgroundHandoff(
   }
 }
 
-function tcpEndpoint(value: string, errorMessage: string) {
+function parseTcpAddress(value: string, errorMessage: string) {
+  // WebView URL implementations disagree on the authority/port semantics of
+  // unknown schemes like tcp://. Parse as HTTP (a well-defined authority)
+  // without ever accepting HTTP or HTTPS as a pairing endpoint.
+  const address = value.startsWith("tcp://") ? value.slice("tcp://".length) : value;
+  if ((value.includes("://") && !value.startsWith("tcp://")) || address.endsWith(":")) {
+    throw new Error(errorMessage);
+  }
   let endpoint: URL;
   try {
-    endpoint = new URL(value.includes("://") ? value : `tcp://${value}`);
+    endpoint = new URL(`http://${address}`);
   } catch {
     throw new Error(errorMessage);
   }
-  const port = Number(endpoint.port);
-  if (
-    endpoint.protocol !== "tcp:" || !endpoint.hostname ||
-    !Number.isInteger(port) || port < 1 || port > 65535
-  ) {
+  if (!endpoint.hostname || endpoint.username || endpoint.password ||
+      endpoint.pathname !== "/" || endpoint.search || endpoint.hash) {
     throw new Error(errorMessage);
   }
-  return { host: endpoint.hostname, port };
+  // URL removes an explicit default HTTP port (80). Read the original
+  // validated authority so TCP port 80 is never mistaken for an omitted port.
+  const explicitPort = /:(\d{1,5})$/.exec(address);
+  const port = explicitPort ? Number(explicitPort[1]) : undefined;
+  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    throw new Error(errorMessage);
+  }
+  const normalizedHost = endpoint.hostname;
+  const host = normalizedHost.includes(":") && !normalizedHost.startsWith("[")
+    ? `[${normalizedHost}]` : normalizedHost;
+  return { host, port };
+}
+
+function tcpEndpoint(value: string, errorMessage: string) {
+  const { host, port } = parseTcpAddress(value, errorMessage);
+  if (port === undefined) throw new Error(errorMessage);
+  return { host, port };
 }
 
 const pairingEndpoint = (value: string) =>
   tcpEndpoint(value, "Invalid pairing invitation endpoint.");
 
 function advertisedPairingEndpoint(value: string, fallbackPort: number) {
-  let endpoint: URL;
-  try {
-    endpoint = new URL(value.includes("://") ? value : `tcp://${value}`);
-  } catch {
-    throw new Error("Invalid advertised pairing address.");
-  }
-  if (
-    endpoint.protocol !== "tcp:" || !endpoint.hostname ||
-    (endpoint.pathname !== "" && endpoint.pathname !== "/")
-  ) {
-    throw new Error("Invalid advertised pairing address.");
-  }
-  const port = endpoint.port ? Number(endpoint.port) : fallbackPort;
+  const { host, port: explicitPort } = parseTcpAddress(
+    value, "Invalid advertised pairing address.");
+  const port = explicitPort ?? fallbackPort;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("Invalid advertised pairing address.");
   }
-  const host = endpoint.hostname.includes(":") ? `[${endpoint.hostname}]` : endpoint.hostname;
   return `${host}:${port}`;
 }
 
 function relayPairingEndpoint(value: string) {
+  // Chromium WebView may parse unknown schemes (relay://) as opaque URLs with
+  // no hostname. Validate the authority using HTTP's well-defined URL syntax,
+  // then return the original relay scheme, query token and explicit TCP port.
+  if (!value.startsWith("relay://") || value.includes("\\") ||
+      [...value].some(char => char.charCodeAt(0) <= 0x20 || char.charCodeAt(0) === 0x7f)) {
+    throw new Error("Invalid advertised relay pairing address.");
+  }
   let endpoint: URL;
   try {
-    endpoint = new URL(value);
+    endpoint = new URL(`http://${value.slice("relay://".length)}`);
   } catch {
     throw new Error("Invalid advertised relay pairing address.");
   }
-  if (
-    endpoint.protocol !== "relay:" || !endpoint.hostname || endpoint.username || endpoint.password ||
-    endpoint.hash || (endpoint.pathname !== "" && endpoint.pathname !== "/")
-  ) {
+  if (!endpoint.hostname || endpoint.username || endpoint.password ||
+      endpoint.hash || (endpoint.pathname !== "" && endpoint.pathname !== "/")) {
     throw new Error("Invalid advertised relay pairing address.");
   }
-  return endpoint.toString();
+  return value;
 }
 
 type LocalCandidate = Awaited<
@@ -1510,7 +1524,10 @@ async function waitForPreferredIncoming(
     certificateDerFromPem(coreOptions.certPem),
   );
   if (preferredPeerDirection(localDeviceId, remoteId) !== "incoming") return undefined;
-  const deadline = Date.now() + (coreOptions.timeoutMs ?? 15000);
+  // Direction is a duplicate-session preference, not a reachability constraint.
+  // A passive peer (including ordinary Syncthing) may never dial us.
+  const graceMs = Math.min(750, Math.max(0, (coreOptions.timeoutMs ?? 15000) / 4));
+  const deadline = Date.now() + graceMs;
   while (!signal.aborted && Date.now() < deadline) {
     const active = lifecycle.getSession();
     if (active && sameDeviceId(active.remoteDeviceId, remoteId) && !active.isClosed()) {
@@ -1527,7 +1544,7 @@ async function waitForPreferredIncoming(
     error.name = "AbortError";
     throw error;
   }
-  throw new Error(`Timed out waiting for the preferred incoming connection from ${remoteId}.`);
+  return undefined;
 }
 
 async function openCoreSession(
@@ -1560,9 +1577,7 @@ async function admitOutgoingSession(
   const remoteId = normalized.remoteId;
   const admitted = await service.admitOutgoing(remoteId, session.connectedVia, session);
   if (admitted) return session;
-  const normalizedRemote = remoteId.replace(/[^A-Z2-7]/gi, "").toUpperCase();
-  const selected = service.activeSessions().find((candidate) =>
-    candidate.remoteDeviceId.replace(/[^A-Z2-7]/gi, "").toUpperCase() === normalizedRemote);
+  const selected = service.activeSessions().find(candidate => sameDeviceId(candidate.remoteDeviceId, remoteId));
   if (!selected) {
     throw new Error("The authenticated peer session was replaced before it became active.");
   }
@@ -1776,19 +1791,17 @@ async function setSessionForegroundImpl(
     if (foreground) {
       // The service owns the socket throughout Activity visibility changes.
       ctx.state.backgroundSessionStarted = false;
-      await lifecycle.setForeground(true);
       await ctx.platformAdapter.serviceSessionCommand({ operation: "uiVisible" });
+      await lifecycle.setForeground(true);
       await prepareBackgroundHandoff(ctx.platformAdapter, ctx.state.activeResolvedConnectOptions);
       return;
     }
-    // Tell the native scheduler independently of the WebView's reconnect state.
-    // Background sync is authorized only if the native handoff is prepared.
+    // Disallow new proxy dials before any asynchronous native handoff. Existing
+    // service-owned sockets and in-flight transfers remain attached.
+    await lifecycle.setForeground(false);
     await ctx.platformAdapter.serviceSessionCommand({ operation: "uiHidden" });
     const options = backgroundSessionOptions(ctx.state.activeResolvedConnectOptions);
     if (options) await ctx.platformAdapter.startBackgroundSession?.(options);
-    // Preserve an active transfer across transient Activity visibility changes.
-    // Its completion clears transferActive; only then may the proxy suspend.
-    await lifecycle.setForeground(false);
     return;
   }
   if (foreground) {

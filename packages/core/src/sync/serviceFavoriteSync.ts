@@ -404,7 +404,16 @@ const planAndRunCandidate = async (context: FavoriteContext, candidate: Favorite
       if (context.entries[path]?.phase !== "synced") await markSynced(context, path);
       return { folderId: context.folderId, path, result: "unchanged" };
     case "download": context.reportTransfer?.("download"); return runDownload(context, path, candidate.remote!, action.expectedLocalHash);
-    case "upload": context.reportTransfer?.("upload"); return runUpload(context, path, local!);
+    case "upload": {
+      // Equal size and mtime do not establish that the remote bytes still
+      // match the common baseline. Verify before replacing a peer file.
+      if (baseline && candidate.remote && !await matchesRemoteBaseline(context, path, baseline)) {
+        const entry = await recordIssue(context, path, "conflict", "Local document and peer contents differ; both copies were preserved.");
+        return { folderId: context.folderId, path, result: "conflict", message: entry.message };
+      }
+      context.reportTransfer?.("upload");
+      return runUpload(context, path, local!);
+    }
     case "delete-remote": {
       const evidence = await context.remoteFs.indexedFile(context.folderId, path);
       if (!evidence || evidence.deleted || evidence.invalid || evidence.type !== "file" ||

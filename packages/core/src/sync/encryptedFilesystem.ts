@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import type { BepFileInfo } from "../core/protocol/bep.js";
+import { withEmptyFileBlock } from "../core/protocol/emptyFileBlock.js";
 import { BEP_MAX_BLOCK_SIZE } from "../core/protocol/blockLimits.js";
 import { decryptUntrustedFileInfo, encryptUntrustedFileInfo } from "../core/model/untrustedMetadata.js";
 import { decryptUntrustedBytes, deriveUntrustedFileKey, encryptUntrustedBlock } from "../core/model/untrusted.js";
@@ -58,7 +59,7 @@ export async function createEncryptedDownloadSink(args: {
   signal?: AbortSignal;
 }): Promise<{ sink: FileDownloadSink; encrypted: BepFileInfo }> {
   args.signal?.throwIfAborted();
-  const file = regularFileInfo(args.fileInfo);
+  const file = regularFileInfo(withEmptyFileBlock(args.fileInfo));
   const encrypted = await encryptUntrustedFileInfo(args.folderKey, file, await args.randomBytes(24));
   const { trailer, footer, storedSize } = encodeCiphertextTrailer(encrypted);
   args.signal?.throwIfAborted();

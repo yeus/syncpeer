@@ -669,13 +669,15 @@ const parsedGlobal = await resolveGlobalDiscovery({
     json: async () => ({ addresses: [
       "tcp://[::invalid]:22000", "tcp://example.test:99999",
       "relay://[invalid:::]:22000", "tcp://127.0.0.1:22000",
-      "tcp4://example.test:80", "quic://[::1]:443",
+       "tcp4://example.test:80", "quic://[::1]:443",
+       "relay://relay.example.invalid:22067/?id=SYNTHETIC",
     ] }),
   }),
 }, { expectedDeviceId: remoteCertId, discoveryServer: "https://discovery.test/v2/" });
 assert.deepEqual(parsedGlobal.candidates.map(candidate =>
   [candidate.protocol, candidate.host, candidate.port]), [
-  ["tcp", "127.0.0.1", 22000], ["tcp", "example.test", 80], ["quic", "::1", 443],
+  ["tcp", "127.0.0.1", 22000], ["tcp", "example.test", 80],
+  ["quic", "::1", 443], ["relay", "relay.example.invalid", 22067],
 ]);
 
 const timeoutSocket = createFakeTlsSocket();

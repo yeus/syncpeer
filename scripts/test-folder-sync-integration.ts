@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -14,6 +14,7 @@ try {
   fixture = await createLanFixture({ root: path.join(root, "server"), serverHost: "127.0.0.1", trustedDeviceId: identity.deviceId, mode: "direct", encryptedFolderType: "sendreceive" });
   const selected = path.join(root, "selected");
   await mkdir(selected);
+  await writeFile(path.join(selected, "empty.txt"), "");
   await writeFile(path.join(selected, "upload.txt"), "folder upload confirmed before exit\n");
   const options = ["packages/cli/dist/main.js", "--cert", path.join(identityRoot, "cert.pem"), "--key", path.join(identityRoot, "key.pem"),
     "--host", "127.0.0.1", "--port", String(fixture.fixture.directPort), "--remote-id", fixture.fixture.remoteDeviceId, "--discovery-mode", "direct"];
@@ -32,6 +33,7 @@ try {
     });
   });
   await cli(options, "sync-folder", fixture.fixture.folderId, selected, "--once");
+  assert.equal((await readFile(path.join(fixture.sharePath, "empty.txt"))).length, 0);
   assert.equal(await readFile(path.join(fixture.sharePath, "upload.txt"), "utf8"), "folder upload confirmed before exit\n");
   assert.equal(await readFile(path.join(selected, "hello.txt"), "utf8"), await readFile(path.join(fixture.sharePath, "hello.txt"), "utf8"));
   await cli(options, "delete-file", fixture.fixture.folderId, selected, "hello.txt");
@@ -70,12 +72,37 @@ try {
   encryptedOptions.push("--folder-password", `${fixture.fixture.encryptedFolderId}=${fixture.fixture.encryptedPassword}`);
   const encryptedSelected = path.join(root, "encrypted-selected");
   await mkdir(encryptedSelected);
+  await writeFile(path.join(encryptedSelected, "empty.txt"), "");
   await writeFile(path.join(encryptedSelected, "upload.txt"), "encrypted upload\n");
   await cli(encryptedOptions, "sync-folder", fixture.fixture.encryptedFolderId, encryptedSelected, "--once");
+  assert.equal((await readFile(path.join(fixture.encryptedSharePath, "empty.txt"))).length, 0);
   assert.equal(await readFile(path.join(fixture.encryptedSharePath, "upload.txt"), "utf8"), "encrypted upload\n");
   await cli(encryptedOptions, "delete-file", fixture.fixture.encryptedFolderId, encryptedSelected, "secret.txt");
   await assert.rejects(() => readFile(path.join(fixture.encryptedSharePath, "secret.txt")), { code: "ENOENT" });
-  console.log("Folder CLI plaintext/encrypted publication, remote deletion, and active unsubscribe passed against managed Syncthing.");
+  // Both edits start from the already synchronized upload, with the CLI
+  // disconnected. The ordinary CLI planner keeps conflict copies private.
+  const localEdit = "offline encrypted client edit\n";
+  const remoteEdit = "independent Syncthing edit\n";
+  await writeFile(path.join(encryptedSelected, "upload.txt"), localEdit);
+  await writeFile(path.join(fixture.encryptedSharePath, "upload.txt"), remoteEdit);
+  const scan = await fetch(`${fixture.syncGuiUrl}/rest/db/scan?folder=${encodeURIComponent(fixture.fixture.encryptedFolderId)}`, {
+    method: "POST", headers: { "X-API-Key": fixture.apiKey },
+  });
+  assert.ok(scan.ok, "The independent Syncthing edit must be indexed before reconnecting");
+  await cli(encryptedOptions, "sync-folder", fixture.fixture.encryptedFolderId, encryptedSelected, "--once");
+  const versions = async (directory: string) => {
+    const names = (await readdir(directory)).filter(name => name === "upload.txt" ||
+      name.startsWith("upload.txt.syncpeer-conflict-"));
+    return Promise.all(names.map(name => readFile(path.join(directory, name), "utf8")));
+  };
+  assert.deepEqual((await versions(encryptedSelected)).sort(), [localEdit, remoteEdit].sort(),
+    "The conflict pass must preserve both versions locally");
+  // A subsequent pass must retain the private conflict copy without publishing it.
+  await cli(encryptedOptions, "sync-folder", fixture.fixture.encryptedFolderId, encryptedSelected, "--once");
+  assert.deepEqual((await versions(encryptedSelected)).sort(), [localEdit, remoteEdit].sort());
+  assert.deepEqual(await versions(fixture.encryptedSharePath), [remoteEdit],
+    "Private CLI conflict copies must not be published");
+  console.log("Folder CLI plaintext/encrypted publication, private conflict preservation, remote deletion, and active unsubscribe passed against managed Syncthing.");
 } finally {
   await fixture?.stop();
   await rm(root, { recursive: true, force: true });

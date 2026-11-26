@@ -196,6 +196,30 @@ test("offline recovery backup restores settings with a new device password and n
   const third = createCredentialVault(makeStorage());
   await assert.rejects(third.restoreRecoveryBackup(tampered, "separate-offline-recovery-password", "third-device-password"));
   assert.equal(third.status().phase, "uninitialized");
+  let remembered: string | null = null;
+  const local = createCredentialVault({ ...makeStorage(), rememberedSecret: {
+    isDeviceUnlocked: async () => true, load: async () => remembered,
+    save: async value => { remembered = value; }, remove: async () => { remembered = null; },
+  } });
+  await local.createDeviceProtected();
+  await local.saveUiState({ name: "replacement" });
+  await assert.rejects(local.restoreRecoveryBackup(tampered, "separate-offline-recovery-password", "new-local-password"));
+  assert.equal(local.status().personalSpaceEnabled, false);
+  assert.ok(remembered);
+  await assert.rejects(local.restoreRecoveryBackup(backup, "separate-offline-recovery-password", "new-local-password"), /already exists/);
+  assert.equal(local.status().personalSpaceEnabled, false);
+  assert.deepEqual(await local.uiState(), { name: "replacement" });
+  assert.ok(remembered);
+  await local.close();
+  const occupied = createCredentialVault({ ...makeStorage(), rememberedSecret: {
+    isDeviceUnlocked: async () => true, load: async () => remembered,
+    save: async value => { remembered = value; }, remove: async () => { remembered = null; },
+  } });
+  await occupied.createDeviceProtected();
+  await occupied.addFolder("existing", "existing-folder-secret");
+  await assert.rejects(occupied.restoreRecoveryBackup(backup, "separate-offline-recovery-password", "new-local-password"), /already exists/);
+  assert.equal(await occupied.folderPassword("existing"), "existing-folder-secret");
+  await occupied.close();
 });
 
 test("the separate offline kit enrolls a replacement when every prior device is lost", async () => {

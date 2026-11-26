@@ -52,6 +52,20 @@ test("native download completes without WebView chunk polling, into an encrypted
   assert.deepEqual(events, ["begin", "write:3", "commit"]);
   assert.equal(status.at(-1)?.transferredBytes, 3);
 });
+test("a browse-only folder rejects local writes while another attached folder still transfers", async () => {
+  const { documents, executor, events, status } = fixture();
+  documents.status = (async () => ({ folders: [
+    { id: "released", browseOnly: true, downloads: false },
+    { id: "folder", browseOnly: false, downloads: true },
+  ] })) as never;
+  executor.start({ ...job("abcdefab-0044"), folderId: "released" });
+  await wait(() => status.some(item => item.id === "abcdefab-0044" && item.phase === "failed"));
+  assert.deepEqual(events, []);
+  executor.start(job("abcdefab-0045"));
+  await wait(() => status.some(item => item.id === "abcdefab-0045" && item.phase === "completed"));
+  assert.deepEqual(events, ["begin", "write:3", "commit"]);
+});
+
 test("full received progress is visible before the atomic publication completes", async () => {
   const { documents, executor, status } = fixture();
   let resume!: () => void;

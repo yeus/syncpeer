@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createDeviceActions } from "../packages/app/src/app/deviceActions.ts";
+import { createDirectoryActions } from "../packages/app/src/app/directoryActions.ts";
 import { createInitialSessionState } from "../packages/core/src/ui/sessionPolicies.ts";
 import { formatSyncthingDeviceId } from "../packages/app/src/app/devicePolicies.ts";
 import {
+  advertisedFolders,
   activeDownloadForFile,
   activeDownloadProgressPercent,
   activeDownloadSummary,
@@ -83,6 +86,54 @@ test("introducer folder offers remain unregistered and unbrowsable until individ
   assert.deepEqual(rootFolderEntries(state).map(folder => folder.id), ["one"]);
   state.approvals.syncApprovedFolderKeys.clear();
   assert.deepEqual(rootFolderEntries(state), []);
+});
+
+test("introduced folder approval and revocation persist across encrypted restarts and block browsing", async () => {
+  const offered = [{ id: "one", label: "One", readOnly: false },
+    { id: "two", label: "Two", readOnly: false }] as ReturnType<typeof createInitialState>["session"]["folders"];
+  const attachSession = (state: ReturnType<typeof createInitialState>) => {
+    state.connection.remoteId = PEER_ID;
+    state.session.isConnected = true;
+    state.session.remoteFs = {} as never;
+    state.session.remoteDevice = { id: PEER_ID, deviceName: "Synthetic introducer",
+      clientName: "Syncpeer", clientVersion: "test" };
+    state.session.folders = offered;
+  };
+  const deviceActions = (state: ReturnType<typeof createInitialState>) => createDeviceActions({
+    state, client: {} as never, sessionStore: {} as never,
+    refreshOverview: async () => {}, refreshActiveView: async () => {},
+    refreshCurrentDeviceId: async () => {}, connectToDevice: async () => {},
+    discoverLocalDevices: async () => {},
+  });
+  const restore = (state: ReturnType<typeof createInitialState>) => {
+    const result = createInitialState(null);
+    assert.equal(applySensitiveAppState(result, JSON.parse(JSON.stringify(sensitiveAppState(state)))), true);
+    attachSession(result);
+    return result;
+  };
+  const initial = createInitialState(null);
+  initial.devices.savedDevices = [{ id: PEER_ID, name: "Introducer", isIntroducer: true, createdAtMs: 1 }];
+  attachSession(initial);
+  const one = advertisedFolders(initial).find(folder => folder.folderId === "one");
+  assert.ok(one, "The source must offer folder one for explicit approval.");
+  assert.deepEqual(rootFolderEntries(initial), []);
+  deviceActions(initial).approveFolderSync(one);
+  const approved = restore(initial);
+  assert.deepEqual(connectionDetails(approved).consentedFolderIds, ["one"]);
+  assert.deepEqual(rootFolderEntries(approved).map(folder => folder.id), ["one"]);
+  const restoredOffer = advertisedFolders(approved).find(folder => folder.folderId === "one");
+  assert.ok(restoredOffer);
+  deviceActions(approved).revokeFolderSync(restoredOffer);
+  const revoked = restore(approved);
+  assert.deepEqual(connectionDetails(revoked).consentedFolderIds, [],
+    "Revocation must survive restart and remove native session consent.");
+  assert.deepEqual(rootFolderEntries(revoked), [],
+    "Revoked folder must not reappear after encrypted state hydration.");
+  const browser = createDirectoryActions({ state: revoked, client: {} as never,
+    sessionStore: {} as never, refreshActiveView: async () => {}, syncStarredFiles: async () => {} });
+  assert.equal(await browser.openLocation("one", "", "test.revoked", {}), false);
+  assert.match(revoked.ui.recentError ?? "", /Approve this folder/);
+  assert.deepEqual(advertisedFolders(revoked).filter(folder => folder.approved).map(folder => folder.folderId), []);
 });
 
 test("a fresh installation requires explicit name confirmation, restored name skips first-run", () => {

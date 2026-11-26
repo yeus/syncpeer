@@ -504,6 +504,8 @@
         <button disabled={busy || !recoveryPassword || masterPassword.length < 16 || (!backupFile && !backupText)} onclick={() => void transferBackup(true)}>Import backup into this new profile</button>
       {/if}
     </section>
+  {:else if status?.vault.phase === "unlocked"}
+    <p class="hint">Importing a Personal Space backup into existing device-protected storage is planned for 0.7.1. Existing local data cannot be replaced by a backup.</p>
   {/if}
   {/if}
   {#if status?.vault.issue}<p role="status">{status.vault.issue}</p>{/if}

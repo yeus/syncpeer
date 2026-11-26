@@ -37,6 +37,7 @@ import {
 } from "@syncpeer/core/browser";
 import { normalizeThemePreferences, type ThemePreferences } from "./theme.ts";
 import { isConfiguredDeviceName } from "./suggestedNames.ts";
+import type { SettingsSection } from "./settingsSections.ts";
 
 const APP_STATE_STORAGE_KEY = "syncpeer.ui.state.v1";
 const SESSION_LOG_LIMIT = 4000;
@@ -307,7 +308,7 @@ export const createInitialState = (persisted = loadPersistedState()) => {
         ? persisted.activeTab
         : ("favorites" as const),
     currentPage: "main" as "main" | "diagnostics" | "about" | "general-settings" | "new-folder" | "folder-settings" | "versions",
-    settingsSection: "personal-space" as import("./settingsSections.ts").SettingsSection,
+    settingsSection: "personal-space" as SettingsSection,
     folderSettingsId: "",
     connection: {
       host: initialConnection.host,

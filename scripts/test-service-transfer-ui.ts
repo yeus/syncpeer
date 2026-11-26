@@ -48,3 +48,22 @@ test("Android manual download enqueues a service job without pumping WebView blo
     "show-progress", "open-cached", "unregister-cancel", "clear-progress"]);
   assert.equal(typeof cancel, "function");
 });
+test("Android browse-only downloads give actionable guidance instead of doomed service jobs", async () => {
+  const state = createInitialState({ deviceName: "Synthetic test client" });
+  state.localFolders = [{ id: "folder", label: "Photos", readOnly: false, browseOnly: true }];
+  let connected = 0;
+  let jobs = 0;
+  let notice = "";
+  const actions = createFileActions({ state,
+    client: { startServiceTransferJob: async () => { jobs++; throw new Error("Unexpected transfer"); } } as never,
+    transfers: { setDownloadNotice: (message: string) => { notice = message; } } as never,
+    sessionStore: {} as never,
+    ensureConnectedForTransfer: async () => { connected++; return true; },
+    openCachedFile: async () => {},
+  });
+  await actions.downloadFile("folder", "retained.txt", "retained.txt");
+  assert.equal(connected, 0);
+  assert.equal(jobs, 0);
+  assert.match(notice, /browse-only.*Reattach local storage/i);
+  assert.ok(state.logs.items.some(item => item.event === "download.browse_only.needs_storage"));
+});

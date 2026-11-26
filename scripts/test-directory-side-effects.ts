@@ -29,6 +29,7 @@ const createFixture = (options: { localFolder: boolean; snapshotFails: boolean; 
     ...(options.browseOnly ? { browseOnly: true } : {}) }];
   const snapshotWrites: string[] = [];
   const client = {
+    listLocalDirectory: async () => [],
     getCachedStatuses: async () => [],
     saveDirectorySnapshot: async (folderId: string) => {
       snapshotWrites.push(folderId);
@@ -74,6 +75,25 @@ test("refreshing a registered browse-only folder never writes an unavailable sna
   await loadDirectorySideEffects(state, client);
   assert.deepEqual(snapshotWrites, [],
     "Registered browse-only folders are not writable local replicas.");
+});
+
+test("browse-only periodic refresh preserves remote browsing and writable-folder snapshot behavior", async () => {
+  const { state, client, actions, snapshotWrites } = createFixture({
+    localFolder: true, browseOnly: true, snapshotFails: false,
+  });
+  state.session.folders.push({ id: "writable", label: "Writable", readOnly: false } as never);
+  state.localFolders.push({ id: "writable", label: "Writable", readOnly: false });
+  await loadDirectorySideEffects(state, client);
+  await loadDirectorySideEffects(state, client);
+  assert.deepEqual(snapshotWrites, [], "Repeated browse-only refreshes cannot write a derived local replica.");
+  await actions.openLocation("f1", "photos", "test.browse_only", {});
+  assert.equal(state.ui.recentError, null);
+  assert.equal(state.session.currentFolderId, "f1", "Remote browsing must remain usable after refresh.");
+  assert.deepEqual(snapshotWrites, []);
+  state.session.currentFolderId = "writable";
+  await loadDirectorySideEffects(state, client);
+  assert.deepEqual(snapshotWrites, ["writable"],
+    "Browse-only policy must not suppress snapshots for unrelated writable folders.");
 });
 
 test("session folder projection preserves browse-only storage policy across overview updates", async () => {

@@ -407,6 +407,16 @@ const downloadFile = async (
   pushSessionLog(context.state, "info", "download.action.requested",
     "Requested file download.", { serviceAvailable: !!context.client.startServiceTransferJob });
   if (context.state.favorites.activeDownloads[downloadKey]) return;
+  if (context.client.startServiceTransferJob &&
+    context.state.localFolders.some(folder => folder.id === folderId && folder.browseOnly)) {
+    // Browse-only has no writable document replica. Avoid an impossible native
+    // job and explain how to explicitly reattach local storage instead.
+    pushSessionLog(context.state, "info", "download.browse_only.needs_storage",
+      "Browse-only folder needs reattached encrypted local storage before downloads.");
+    context.transfers.setDownloadNotice(
+      `Cannot download ${name}: folder is browse-only. Reattach local storage in Folder settings.`, 8000);
+    return;
+  }
   const connected = await context.ensureConnectedForTransfer("download");
   pushSessionLog(context.state, "info", "download.action.connection_checked",
     "Connection readiness checked before downloading.", {

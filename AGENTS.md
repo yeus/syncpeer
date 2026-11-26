@@ -28,26 +28,34 @@ takes priority over satisfying a lint rule by adding manual declarations.
 
 For every versioned release, follow this sequence (example target `0.1.0`):
 
-1. **Development (`0.1.0-dev`) — AI implementation and automated acceptance.**
-   Finish all in-scope behavior and every feasible automated check: unit, integration,
-   security-negative, browser/E2E, emulator, type/lint/static, production build,
-   packaging, version consistency and applicable deployment smoke tests. Reuse owning
-   tests, fix failures at their source, and rerun affected checks and the release suite.
-   Do not hand feasible automated work to the maintainer or silently defer scope.
-2. **Alpha (`0.1.0-alpha.1`) — manual pre-RC acceptance.** Only after the automated
-   gate passes, prepare an identifiable, installable alpha with a manual checklist,
-   setup instructions, known limitations, source/dependency revisions and artifact
-   checksums. Alpha is feature-complete for its intended release scope, not an
-   unfinished development snapshot. The maintainer tests usability, actual-device
-   installation/upgrade, live accounts, recovery and other human-dependent behavior.
-   Fix reported defects, add regressions, rerun checks and issue `-alpha.2`, etc.
-   Publish rc.1 only after the maintainer accepts the alpha.
-3. **Release candidate (`0.1.0-rc.1`) — real-world field validation.** Freeze the
-   accepted source and dependency revisions and publish immutable candidate artifacts
-   with explicit authorization. Exercise real devices, networks, workloads, lifecycle,
-   interoperability and applicable store review for an agreed period. Fix blockers,
-   repeat the automated and affected manual gates, and issue `-rc.2`, etc. Never
-   replace a published alpha or RC in place.
+1. **Development (`0.1.0-dev`) — autonomous agent implementation and sandbox acceptance.**
+   Finish all in-scope behavior and every automated check the agent can actually
+   execute in its available sandbox: unit, integration, security-negative,
+   browser/E2E, disposable Android emulators, type/lint/static, production-mode
+   builds, package/payload smoke tests, version consistency and applicable local
+   deployment tests. Fix failures at their source and rerun affected and full
+   release suites. Do not hand feasible sandbox automation to the maintainer.
+2. **Alpha (`0.1.0-alpha.1`) — start of external/maintainer acceptance.**
+   `-alpha.1` marks completion of feasible **autonomous sandbox** implementation
+   and testing, not completion of real-device testing or release CI. Freeze a
+   feature-complete candidate with a manifest, reproducible build instructions,
+   known limitations, exact sandbox evidence, manual checklist and available
+   candidate checksums. With explicit authorization, commit and tag the alpha;
+   the tag may trigger CI to sign/package/publish distributable artifacts.
+   During the alpha phase, verify external CI builds/signing/packaging, intact
+   AppImage runtime and Flatpak on compatible hosts, real-phone installation,
+   upgrade, pairing, synchronization and recovery, and human usability. Those
+   checks **must not be required to declare alpha.1 sandbox-ready** when they
+   cannot be performed autonomously before the candidate exists. Record them
+   as pending alpha acceptance; never mislabel them as passed. Fix defects with
+   regressions, rerun feasible sandbox gates and issue `-alpha.2`, etc. Publish
+   `-rc.1` only after the maintainer accepts the alpha.
+3. **Release candidate (`0.1.0-rc.1`) — real-world field validation.** Freeze
+   accepted source/dependency revisions and publish immutable candidate artifacts
+   with explicit authorization. Exercise sustained transfers, real networks,
+   NAT/relay, OEM power management, handoff, lifecycle and store review for the
+   agreed soak period. Fix blockers, repeat applicable gates and issue `-rc.2`,
+   etc. Never replace a published alpha or RC in place.
 4. **Stable (`0.1.0`) — promote the accepted RC.** Require maintainer acceptance of
    field evidence and no release-blocking defects. Promote the same reviewed behavior
    apart from version metadata and necessary packaging/signing changes; rerun build,
@@ -57,19 +65,25 @@ Use numbered SemVer prereleases (`-alpha.1`, `-rc.1`), not `-a` or a separate be
 stage. The development label is illustrative; do not change existing version metadata,
 release tags or publishing workflows without an explicit task to do so.
 
-### Release evidence
+### Release evidence and phase boundaries
 
-- Record the scope, implementation status, automated results (commands, runner,
-  revision, pass/fail/skip counts), manual alpha acceptance and RC field evidence
-  separately in the owning system definition/release matrix or equivalent documentation.
-  A focused or historical pass is not a current full-suite pass.
-- Document inaccessible hardware/services and genuinely external checks. Do not count
-  an unrun check as passing, or move a failing feasible automated gate to alpha/RC.
-  Reserve checks inherently requiring a released candidate for the RC phase.
-- Preparation, successful checks and readiness do not authorize commits, staging, tags,
-  pushes or production activation. Preserve existing project-specific requirements.
+- Record scope, implementation, sandbox test results (commands, runner, revision,
+  pass/fail/skip counts), CI artifact/signing results, alpha manual acceptance and
+  RC field evidence **separately** in the system definition/release matrix.
+- A focused or historical pass is not a current full-suite pass. Document actual
+  sandbox limitations with reasons; a genuinely runnable failing automated gate
+  is a development blocker, not something to defer by renaming it external.
+- CI workflows requiring a tagged candidate, private release keys, privileged
+  builders or a compatible external OS; physical-device testing; and maintainer
+  usability acceptance belong to the **alpha phase**, after the sandbox gate.
+  CI publication requires explicit authorization and must never be implied by
+  the word "ready". Absence of those external results does not prevent declaring
+  alpha.1 **sandbox-ready**, but does prevent claiming distributable artifacts
+  verified or alpha acceptance complete.
+- Preparation and successful checks never authorize commits, staging, tags,
+  pushes or publication. Preserve project-specific release permissions.
 
-Syncpeer's alpha must cover physical-device installation/upgrade, pairing, basic
-synchronization and recovery. RC field testing covers sustained transfers, real
-networks/NAT/relay, OEM power management, handoff, lifecycle and store review.
-Follow the additional release rules in development_instructions.md.
+Syncpeer's alpha **acceptance** covers physical installation/upgrade, pairing,
+basic synchronization and recovery. These are performed *using alpha artifacts*,
+not prerequisites for reaching alpha.1. RC covers prolonged real-network/device
+field validation. Follow development_instructions.md.

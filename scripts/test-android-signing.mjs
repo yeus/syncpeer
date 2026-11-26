@@ -306,3 +306,74 @@ test('failed packaging restores the generated Gradle file and removes temporary 
   assert.equal(fs.existsSync(path.join(android, 'keystore.properties')), false)
   assert.equal(fs.existsSync(path.join(android, 'app/keystore.properties')), false)
 })
+
+const releaseCopyFixture = (t) => {
+  const setup = fixture(t)
+  const project = path.join(setup.dir, 'packages/tauri-shell/src-tauri')
+  const outputDir = path.join(project, 'gen/android/app/build/outputs/apk/universal/release')
+  const metadata = path.join(outputDir, 'output-metadata.json')
+  const signer = path.join(setup.dir, 'synthetic-apksigner')
+  fs.mkdirSync(outputDir, { recursive: true })
+  fs.writeFileSync(path.join(project, 'tauri.conf.json'),
+    JSON.stringify({ identifier: 'dev.syncpeer.app', version: '0.7.0-alpha.1' }))
+  fs.writeFileSync(metadata, JSON.stringify({
+    applicationId: 'dev.syncpeer.app',
+    elements: [{ versionName: '0.7.0-alpha.1', outputFile: 'app-universal-release-unsigned.apk' }],
+  }))
+  fs.writeFileSync(path.join(outputDir, 'app-universal-release.apk'), 'synthetic-signed-apk')
+  fs.writeFileSync(signer,
+    '#!/bin/sh\necho "Signer #1 certificate SHA-256 digest: ' + 'a'.repeat(64) + '"\n',
+    { mode: 0o755 })
+  const testBuildConfig = path.join(setup.dir, 'synthetic-config.json')
+  fs.writeFileSync(testBuildConfig, JSON.stringify({ version: '0.7.0-alpha.1' }))
+  return { ...setup, metadata, signer, testBuildConfig }
+}
+
+const copyRelease = (setup, additionalEnv = {}) => spawnSync(process.execPath,
+  [path.join(root, 'scripts/copy-android-apk.mjs'), 'release'], {
+    cwd: setup.dir,
+    env: {
+      ...setup.env,
+      SYNCPEER_ANDROID_TARGET: 'x86_64',
+      SYNCPEER_ANDROID_BUILD_CONFIG: setup.testBuildConfig,
+      SYNCPEER_APKSIGNER: setup.signer,
+      SYNCPEER_EXPECTED_ANDROID_CERT_SHA256: 'a'.repeat(64),
+      ...additionalEnv,
+    },
+    encoding: 'utf8',
+  })
+
+test('release copy accepts only a matching signed APK and its versioned Gradle metadata', (t) => {
+  const setup = releaseCopyFixture(t)
+  const result = copyRelease(setup)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(fs.readFileSync(path.join(setup.dir, 'dist/syncpeer-android-release-x86_64.apk'), 'utf8'),
+    'synthetic-signed-apk')
+})
+
+test('release copy rejects wrong signer without publishing an APK', (t) => {
+  const setup = releaseCopyFixture(t)
+  const result = copyRelease(setup, { SYNCPEER_EXPECTED_ANDROID_CERT_SHA256: 'b'.repeat(64) })
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /signing certificate mismatch/i)
+  assert.equal(fs.existsSync(path.join(setup.dir, 'dist')), false)
+})
+
+test('release copy rejects stale version metadata without publishing an APK', (t) => {
+  const setup = releaseCopyFixture(t)
+  const metadata = JSON.parse(fs.readFileSync(setup.metadata, 'utf8'))
+  metadata.elements[0].versionName = '0.6.1-rc.2'
+  fs.writeFileSync(setup.metadata, JSON.stringify(metadata))
+  const result = copyRelease(setup)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /metadata differs/i)
+  assert.equal(fs.existsSync(path.join(setup.dir, 'dist')), false)
+})
+
+test('release packaging refuses certificate override outside the isolated x86_64 harness', (t) => {
+  const setup = releaseCopyFixture(t)
+  const result = copyRelease(setup, { SYNCPEER_ANDROID_TARGET: 'aarch64' })
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /override is only permitted/i)
+  assert.equal(fs.existsSync(path.join(setup.dir, 'dist')), false)
+})

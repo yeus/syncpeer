@@ -202,10 +202,15 @@ npm run build:tauri:bundle:deb
 npm run build:tauri:bundle:flatpak
 ```
 
-AppImage builds use a fresh temporary Cargo/AppDir staging tree and remove it
-after the build. Only the final AppImage is copied into the Tauri bundle
+AppImage builds keep the Cargo target cache under `.tmp/appimage-cache` so
+native artifacts survive packaging retries, and remove stale AppDir staging
+trees before rebuilding. Only the final AppImage is copied into the Tauri bundle
 directory and `dist/`, so read-only Nix store files are not left in Cargo's
 normal target directory.
+On NixOS, use `nix run .#build-appimage` instead of the ordinary npm
+AppImage command: the FHS environment provides the compiler/linker and
+AppImage extraction/GTK staging needed for bundling without FUSE.
+
 
 The Flatpak build uses the GNOME 50 runtime and SDK. In the Nix development
 shell, the `flatpak` and `flatpak-builder` tools are available. The build
@@ -226,8 +231,9 @@ sequence is:
 
 ```bash
 node scripts/release.mjs --check
-node scripts/release.mjs 0.6.0-rc.1 --dry-run
-node scripts/release.mjs 0.6.0-rc.1
+node scripts/release.mjs 0.7.0-alpha.1 --dry-run
+# Only after the automated gate and explicit release authorization:
+node scripts/release.mjs 0.7.0-alpha.1
 ```
 
 The first command verifies that npm, Tauri, Cargo manifests and lockfiles all
@@ -250,17 +256,27 @@ Tags with a pre-release suffix, such as `v0.6.0-rc.1`, are published as
 GitHub pre-releases. Android release signing uses the configured GitHub Actions
 secrets; the keystore must remain the same across releases.
 
-### Release-candidate boundary
+### Alpha and release-candidate boundaries
 
-An RC is cut only after every feasible automated acceptance gate for the
-intended scope is green: focused tests, umbrella suites, emulator coverage,
-packaged acceptance and explicitly opted-in external infrastructure checks.
+Follow the canonical lifecycle in AGENTS.md and development_instructions.md:
+development → numbered alpha → numbered release candidate → stable.
 
-The RC phase is for evidence that materially requires the real world: physical
-devices, ordinary user workflows, real NAT/firewall combinations, installation
-and upgrade behavior, true lifecycle/power-loss conditions, interoperability
-and usability. Problems found during RC validation should receive an automated
-regression where practical before the stable release.
+Before alpha, complete all feasible automated acceptance for the release scope:
+focused tests, headless and E2E umbrellas, security-negative and static checks,
+emulator coverage, production builds, packaging and applicable opt-in external
+infrastructure checks. Record the tested revision, commands, results and skips.
+A successful focused test does not replace the full release gate.
+
+Prepare an identifiable installable alpha with checksums, source/dependency
+revisions, setup instructions, known limitations and a manual checklist.
+The maintainer accepts actual-device installation/upgrade, pairing, basic
+synchronization, recovery and usability before rc.1. Fix defects and rerun
+the relevant automated gates for each numbered alpha.
+
+RCs are immutable candidates for sustained real-world validation: actual
+networks/NAT/firewalls, interoperability, workloads, OEM power management and
+lifecycle, and applicable store review. Stable requires maintainer acceptance
+of the RC field evidence. Preparation alone authorizes no commit, tag or push.
 
 To synchronize Android signing secrets from the host's Linux Secret Service to
 GitHub Actions:
@@ -283,6 +299,18 @@ Secret Service. A missing absolute path from an old computer is not rewritten
 to a same-named file on the new computer; use the stored backup or explicitly
 configure the correct path. You can run the synthetic signing checks with
 `node scripts/test-android-signing.mjs`.
+
+Release packaging checks the APK's Gradle package/version metadata and its
+cryptographic signature before copying it to dist. The expected certificate
+SHA-256 is pinned to the published v0.5.0 APK:
+`936a1e27876644667e52b10d7e7e41b53ac39865ae09a2c7e25d5614664a0e59`.
+A different signer is refused even when Android would accept a fresh install;
+this protects upgrade compatibility. The synthetic upgrade fixture supplies an
+explicit ephemeral override via `SYNCPEER_EXPECTED_ANDROID_CERT_SHA256`, permitted
+only with a test-only build configuration and the x86_64 test target. Release
+ARM64 packaging refuses a certificate override. A production signing-identity
+migration would require a deliberate, reviewed change and documented effects
+on already installed applications.
 
 Run the release build from SyncPeer's own `nix develop` shell, which includes
 JDK 17 `keytool`. The build and secret-sync commands check for `keytool`
@@ -319,7 +347,7 @@ npm run test:android
 ```
 
 It builds the Android E2E APK and runs the repository's compatibility matrix:
-API 24 installation/startup coverage, API 29 compatibility/provider and
+API 26 installation/startup coverage, API 29 compatibility/provider and
 lifecycle checks, and API 36 service/transfer coverage. The workflow also
 exercises the real-peer Android gates used for encrypted replicas and abrupt
 runtime/process recovery where supported. It starts and stops repository-managed
@@ -432,7 +460,9 @@ npm run test:tauri:deb -- path/to/Syncpeer_<version>_amd64.deb
 
 The desktop gate covers fresh protected-profile startup, isolated identities,
 owned-device pairing with matching confirmation codes, and bidirectional
-whole-folder synchronization.
+whole-folder synchronization. Use `--pairing-only`, `--reset-only`, or
+`--smoke-only` for isolated Linux gates. Run packaging and Android acceptance
+serially: concurrent core builds can replace shared output during a test.
 
 With `SYNCPEER_ANDROID_SERIAL` configured, the same runner also exercises
 packaged Android recovery and desktop-to-Android cross-app behavior. The

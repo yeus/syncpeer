@@ -56,14 +56,22 @@ This project should prefer explicit, minimal, functional-style architecture.
 ## Release Lifecycle Policy
 
 - Follow the development → numbered alpha → numbered RC → stable lifecycle in AGENTS.md.
-- Complete every feasible automated acceptance gate for the intended release scope before
-  preparing alpha. Keep SYSTEM_DEFINITION.csv current; never carry a known automated blocker.
-- Use alpha for maintainer manual acceptance, including actual installation, pairing,
-  synchronization and recovery. Iterate alpha versions until accepted.
-- Only then publish rc.1 for sustained field validation: real devices, networks/NAT/firewalls,
-  lifecycle/power loss, interoperability, OEM power management and actual workflows.
-- Fix RC defects with regressions where practical, repeat relevant acceptance, and issue later
-  numbered candidates. Stable requires accepted field evidence and no release blockers.
+- Complete all in-scope functionality and every automated acceptance gate that
+  can run autonomously in the agent's sandbox before marking `-alpha.1`
+  sandbox-ready. Keep SYSTEM_DEFINITION.csv current; fix known feasible failures.
+- `-alpha.1` is the boundary **between autonomous sandbox work and alpha
+  acceptance**. Do not require a physical phone, production signing key,
+  tag-triggered GitHub Actions, compatible-host AppImage/Flatpak checks or
+  maintainer interaction to reach that boundary when unavailable in the sandbox.
+  Document those external checks as pending, not passed.
+- After an explicitly authorized release commit/tag/push, CI may produce signed
+  distributable alpha artifacts. Use the alpha for CI/artifact validation and
+  maintainer manual installation, upgrade, pairing, synchronization and recovery.
+  Iterate numbered alphas until accepted; do not certify an untested artifact.
+- Only then publish `-rc.1` for sustained field validation: networks/NAT/firewalls,
+  lifecycle/power loss, interoperability, OEM power management and actual workloads.
+- Fix RC defects with regressions and repeat applicable acceptance; stable
+  requires accepted field evidence and no release blockers.
 
 ## Style and Quality
 

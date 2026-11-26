@@ -11,6 +11,21 @@ import { webViewSelected } from "./test-android.mjs";
 
 const json = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 
+test("Nix AppImage FHS build includes the compiler and linker", () => {
+  const flake = fs.readFileSync("flake.nix", "utf8");
+  const fhs = flake.match(/appimageFhs = pkgs\.buildFHSEnv \{[\s\S]*?targetPkgs = pkgs: with pkgs; \[([\s\S]*?)\];/)?.[1];
+  assert.match(flake, /appimageFhs = pkgs\.buildFHSEnv \{\s*name = "syncpeer-appimage-fhs";\s*extraOutputsToInstall = \[ "dev" \];/);
+  assert.ok(fhs, "AppImage FHS environment must be defined.");
+  for (const tool of ["gcc", "binutils", "gnumake", "dbus", "perl", "file"]) {
+    assert.ok(fhs.split(/\s+/).includes(tool), `FHS environment missing ${tool}`);
+  }
+  assert.match(flake, /PKG_CONFIG_PATH="\/usr\/lib\/pkgconfig:\/usr\/lib64\/pkgconfig:\/usr\/share\/pkgconfig/);
+  assert.match(flake, /gtkPluginSource = pkgs\.fetchurl \{[\s\S]*?sha256-sPTLxoSgEDqWUfCVW2NerqAJazpmwPWiwqozeWA3UXE=/, "GTK bundler plugin must be revision-pinned.");
+  assert.ok(flake.includes("else ID=nixos; fi"), "The GTK plugin must not require a working host /etc/os-release.");
+  assert.ok(flake.includes('PATH=\\"$shim_dir:/usr/bin:/bin\\"'), "AppImage tooling must not scan inherited host PATH entries.");
+  assert.match(flake, /stale_appdir="\$cargo_target_dir\/release\/bundle\/appimage\/Syncpeer\.AppDir"/, "A cached Cargo target must not retain failed AppImage staging permissions.");
+});
+
 test("Android 0.7.0 supports API 26, 29 and 36 only", () => {
   assert.equal(json("packages/tauri-shell/src-tauri/tauri.conf.json").bundle.android.minSdkVersion, 26,
     "Tauri must regenerate an API-26 Android project rather than reverting to its API-24 default.");
@@ -27,7 +42,6 @@ test("Android 0.7.0 supports API 26, 29 and 36 only", () => {
   assert.match(runner, /runProfile\("minimum"/);
   assert.doesNotMatch(runner, /runProfile\("legacy"/);
   for (const file of [
-    "packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts",
     "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/build.gradle.kts",
     "packages/tauri-shell/src-tauri/plugins/syncpeer-android/editor-test-app/build.gradle.kts",
   ]) assert.match(fs.readFileSync(file, "utf8"), /minSdk = 26/);
@@ -76,8 +90,6 @@ test("Android builds use one launcher and bootstrap generated files first", () =
     assert.equal(scripts[name], "npm run icons:ensure:android");
   }
   assert.equal(scripts["postandroid:init"], undefined);
-  const manifest = fs.readFileSync("packages/tauri-shell/src-tauri/gen/android/app/src/main/AndroidManifest.xml", "utf8");
-  assert.doesNotMatch(manifest, /UnsupportedAndroidActivity|syncpeer_modern_activity/);
 });
 
 const writeSyntheticAndroidProject = (android) => {
@@ -404,6 +416,16 @@ test("Android CI isolates the pinned NDK from runner image upgrades", () => {
   }
 });
 
+test("release AppImage verifies its unchanged Type2 runtime before publishing", () => {
+  const workflow = fs.readFileSync(".github/workflows/release.yml", "utf8");
+  const build = workflow.indexOf("- name: Build AppImage");
+  const verify = workflow.indexOf("- name: Verify intact AppImage runtime");
+  const upload = workflow.indexOf("- name: Upload AppImage");
+  assert.ok(build >= 0 && verify > build && upload > verify,
+    "An AppImage runtime that cannot execute must block release uploads.");
+  assert.match(workflow, /timeout 30s "\$\{images\[0\]\}" --appimage-version/);
+});
+
 test("Android CI configures OpenSSL's NDK ranlib alias", (t) => {
   for (const file of [".github/workflows/android-build.yml", ".github/workflows/release.yml"]) {
     const workflow = fs.readFileSync(file, "utf8");
@@ -701,13 +723,18 @@ test("the synthetic document editor is a separate test-only APK", () => {
   assert.doesNotMatch(editorProvider, /readNBytes/);
 });
 
-test("generated Android Gradle project excludes the synthetic editor", (t) => {
-  const generated = "packages/tauri-shell/src-tauri/gen/android/app/build.gradle.kts";
-  if (!fs.existsSync(generated)) {
-    t.skip("Android Gradle project has not been generated in this checkout");
+test("generated Android project uses API 26 and excludes the synthetic editor and obsolete launcher", (t) => {
+  const root = "packages/tauri-shell/src-tauri/gen/android";
+  if (!fs.existsSync(root)) {
+    t.skip("Android project has not been generated in this checkout");
     return;
   }
-  assert.doesNotMatch(fs.readFileSync(generated, "utf8"), /syncpeer-document-editor/);
+  assert.ok(isAndroidProjectInitialized(root), "A generated Android project must be complete.");
+  const gradle = fs.readFileSync(path.join(root, "app/build.gradle.kts"), "utf8");
+  assert.match(gradle, /minSdk = 26/);
+  assert.doesNotMatch(gradle, /syncpeer-document-editor/);
+  const manifest = fs.readFileSync(path.join(root, "app/src/main/AndroidManifest.xml"), "utf8");
+  assert.doesNotMatch(manifest, /UnsupportedAndroidActivity|syncpeer_modern_activity/);
 });
 
 test("the combined Android workflow provisions WebView without Play Store interaction", () => {
@@ -715,6 +742,9 @@ test("the combined Android workflow provisions WebView without Play Store intera
   assert.match(runner, /captureWebViewFixture/);
   assert.match(runner, /installWebViewFixture/);
   assert.match(runner, /set-webview-implementation/);
+  assert.match(runner, /\/product\/app\//);
+  assert.match(runner, /TrichromeLibrary/);
+  assert.match(runner, /WebViewGoogle/);
 });
 
 test("the Android runtime bridge permits concurrent network reads and writes", () => {
@@ -730,7 +760,14 @@ test("the Android runtime bridge permits concurrent network reads and writes", (
     "packages/tauri-shell/src-tauri/src/android_network.rs",
     "utf8",
   );
-  assert.match(service, /networkWorker = Executors\.newFixedThreadPool\([2-9]\)/);
+  const executor = fs.readFileSync(
+    "packages/tauri-shell/src-tauri/plugins/syncpeer-android/android/src/main/java/dev/syncpeer/plugin/android/NetworkRequestExecutor.kt",
+    "utf8",
+  );
+  assert.match(service, /networkWorker = createNetworkRequestExecutor\(\)/);
+  assert.match(executor, /ThreadPoolExecutor\([\s\S]*?4, 24, 30L, TimeUnit.SECONDS, SynchronousQueue<Runnable>\(\)/);
+  assert.match(executor, /allowCoreThreadTimeOut\(true\)/);
+  assert.doesNotMatch(executor, /LinkedBlockingQueue/);
   assert.doesNotMatch(transport, /@Synchronized\s+fun execute/);
   assert.match(nativeBridge, /set_rust_field\([\s\S]*Arc::new\(AndroidNetwork/);
   assert.match(nativeBridge, /Arc::clone\(&network\)/);
@@ -759,6 +796,9 @@ test("real-peer Android acceptance cannot skip a failed document runtime probe",
   const runner = fs.readFileSync("scripts/test-android-peer.ts", "utf8");
   assert.doesNotMatch(runner, /JS_FEATURE_MESSAGE_PORTS required by the document runtime/);
   assert.match(runner, /throw new Error\("Android document runtime is unavailable/);
+  for (const file of ["scripts/test-android-syncpeer-peers.ts", "scripts/test-tauri-deb.mjs"]) {
+    assert.match(fs.readFileSync(file, "utf8"), /"install", "--no-streaming"/);
+  }
 });
 
 test("Android automatic discovery E2E requires a real outgoing connection and remote index", () => {
@@ -778,6 +818,8 @@ test("Android automatic discovery E2E requires a real outgoing connection and re
   assert.match(runner, /await runPhase\("--peer-connect-smoke"/);
   assert.match(runner, /SYNCPEER_ANDROID_PEER_POWER_CUT_ONLY/);
   assert.match(runner, /await runPhase\("--peer-power-cut-setup"/);
+  assert.match(runner, /"install",\s*"--no-streaming", "-r", apk\], \{ timeout: 360_000 \}/);
+  assert.match(runner, /if \(requiresEditor\) install\(editorApk\)/);
   assert.match(runner, /acquirePeerE2ELock/);
   // Preserve real-device assertions while recovering transient emulator UI and
   // WebView debugger failures without making a pass out of an application error.

@@ -16,10 +16,11 @@ const serial = process.env.SYNCPEER_ANDROID_SERIAL?.trim();
 const crossAppOnly = process.argv.includes("--cross-app-only");
 const resetOnly = process.argv.includes("--reset-only");
 const smokeOnly = process.argv.includes("--smoke-only");
-if (smokeOnly) assert.ok(!resetOnly && !crossAppOnly && !serial,
-  "--smoke-only runs solely the isolated packaged Linux startup gate.");
-if (resetOnly) assert.ok(!crossAppOnly && !serial,
-  "--reset-only runs solely the isolated packaged Linux reset gate.");
+const pairingOnly = process.argv.includes("--pairing-only");
+assert.ok([crossAppOnly, resetOnly, smokeOnly, pairingOnly].filter(Boolean).length <= 1,
+  "Select at most one isolated package acceptance gate.");
+if (resetOnly || smokeOnly || pairingOnly) assert.ok(!serial,
+  "An isolated Linux-only gate must not select an Android target.");
 const skipAndroidRecovery = process.argv.includes("--skip-android-recovery");
 if (crossAppOnly) assert.ok(serial, "--cross-app-only requires SYNCPEER_ANDROID_SERIAL.");
 if (serial) {
@@ -36,7 +37,7 @@ try {
   assert.equal(extracted.status, 0, "The .deb payload could not be extracted.");
   const binary = path.join(packageRoot, "usr", "bin", "tauri-shell");
   assert.ok((await stat(binary)).isFile(), "The .deb payload has no Tauri executable.");
-  if (!crossAppOnly && !resetOnly) {
+  if (!crossAppOnly && !resetOnly && !pairingOnly) {
     const code = await runWithPrivateSecretService("bash", [virtualDesktop, process.execPath,
       "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
       "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {
@@ -48,7 +49,8 @@ try {
       XDG_DATA_DIRS: process.env.SYNCPEER_DEB_XDG_DATA_DIRS ?? "/usr/share",
     });
     assert.equal(code, 0, "The packaged fresh-profile smoke test failed.");
-    if (!smokeOnly) {
+  }
+  if (!crossAppOnly && !resetOnly && !smokeOnly) {
     const pairing = spawnSync("bash", [virtualDesktop, process.execPath, "--import", "tsx",
       path.resolve("node_modules/@wdio/cli/bin/wdio.js"), "run",
       path.resolve("scripts/lan-test/wdio-pairing.conf.ts")], {
@@ -57,9 +59,8 @@ try {
     });
     if (pairing.error) throw pairing.error;
     assert.equal(pairing.status, 0, "The two-instance packaged pairing test failed.");
-    }
   }
-  if (!crossAppOnly && !smokeOnly) {
+  if (!crossAppOnly && !smokeOnly && !pairingOnly) {
     const reset = await runWithPrivateSecretService("bash", [virtualDesktop, process.execPath,
       "--import", "tsx", path.resolve("node_modules/@wdio/cli/bin/wdio.js"),
       "run", path.resolve("scripts/lan-test/wdio.conf.ts")], {
@@ -73,8 +74,16 @@ try {
     assert.equal(reset, 0, "The packaged Linux local-reset and restart acceptance failed.");
   }
   if (serial) {
-    const target = spawnSync("adb", ["-s", serial, "shell", "getprop", "ro.kernel.qemu"],
-      { encoding: "utf8", timeout: 30_000 });
+    // A cold AVD can temporarily be ADB-offline. Wait for transport readiness
+    // without bypassing the later emulator identity and reset safety checks.
+    const targetDeadline = Date.now() + 120_000;
+    let target;
+    do {
+      target = spawnSync("adb", ["-s", serial, "shell", "getprop", "ro.kernel.qemu"],
+        { encoding: "utf8", timeout: 10_000 });
+      if (target.status === 0) break;
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+    } while (Date.now() < targetDeadline);
     if (target.error) throw target.error;
     assert.equal(target.status, 0, "The selected Android emulator is unavailable.");
     assert.equal(target.stdout.trim(), "1", "The selected Android target is not an emulator.");
@@ -101,8 +110,8 @@ try {
     // package versions at once.
     spawnSync("adb", ["-s", serial, "uninstall", "dev.syncpeer.app"],
       { stdio: "ignore", timeout: 120_000 });
-    const installed = spawnSync("adb", ["-s", serial, "install", apk],
-      { stdio: "inherit", timeout: 120_000 });
+    const installed = spawnSync("adb", ["-s", serial, "install", "--no-streaming", apk],
+      { stdio: "inherit", timeout: 360_000 });
     if (installed.error) throw installed.error;
     assert.equal(installed.status, 0, "Android fixture install failed.");
     const clearAndroid = () => {

@@ -82,6 +82,16 @@ jobs:
 
       - name: Build AppImage
         run: npm run build:tauri:bundle:appimage
+      - name: Verify intact AppImage runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(dist/*.AppImage)
+          test "${#images[@]}" -eq 1
+          chmod +x "${images[0]}"
+          timeout 30s "${images[0]}" --appimage-version
+
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4

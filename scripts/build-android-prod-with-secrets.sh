@@ -225,7 +225,7 @@ find_apksigner() {
         return 0
       fi
       selected="$(
-        find "$sdk_root/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner 2>/dev/null \
+        find -L "$sdk_root/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner 2>/dev/null \
           | sort -V \
           | tail -n 1
       )"
@@ -234,7 +234,7 @@ find_apksigner() {
         return 0
       fi
       selected="$(
-        find "$sdk_root" -type f -name apksigner 2>/dev/null \
+        find -L "$sdk_root" -type f -name apksigner 2>/dev/null \
           | sort -V \
           | tail -n 1
       )"
@@ -275,6 +275,9 @@ ensure_apksigner_on_path() {
     esac
     export SYNCPEER_APKSIGNER="$apksigner_bin"
     echo "Using apksigner: $apksigner_bin"
+  else
+    echo "Android release verification requires apksigner from Android SDK build-tools; no verified APK can be distributed without it." >&2
+    return 1
   fi
 }
 
@@ -458,6 +461,20 @@ done
 echo "Prepared temporary Gradle keystore.properties for release signing (${temp_keystore_properties_paths[*]})."
 ensure_gradle_release_signing_config
 ensure_apksigner_on_path
+# An earlier signed/unsigned output must never be mistaken for this build.
+for release_dir in \
+  "$repo_root/packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/universal/release" \
+  "$repo_root/packages/tauri-shell/src-tauri/gen/android/app/build/outputs/apk/release"; do
+  rm -f -- "$release_dir"/app-release*.apk \
+    "$release_dir"/app-*-release*.apk "$release_dir/output-metadata.json"
+done
+if [[ "${SYNCPEER_ANDROID_TARGET:-aarch64}" == "x86_64" ]]; then
+  release_abi="x86_64"
+else
+  release_abi="arm64-v8a"
+fi
+rm -f -- "$repo_root/syncpeer-android-release-$release_abi.apk" \
+  "$repo_root/dist/syncpeer-android-release-$release_abi.apk"
 npm run build:android:prod -w @syncpeer/tauri-shell
 sign_unsigned_release_apk_if_needed "$repo_root"
 node scripts/copy-android-apk.mjs release

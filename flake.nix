@@ -46,10 +46,17 @@
         jdk = pkgs.jdk17;
         appimageFhs = pkgs.buildFHSEnv {
           name = "syncpeer-appimage-fhs";
+          extraOutputsToInstall = [ "dev" ];
           targetPkgs = pkgs: with pkgs; [
             nodejs
             rustup
+            gcc
+            binutils
+            file
+            gnumake
             pkg-config
+            dbus
+            perl
             openssl
             zlib
             gtk3
@@ -98,6 +105,12 @@
           ];
           runScript = "bash";
         };
+        # Pin the upstream GTK bundling plugin; the FHS shell has no usable
+        # host /etc/os-release, so the plugin receives one narrow fallback.
+        gtkPluginSource = pkgs.fetchurl {
+          url = "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/7a3fbc31a9e5075073ff8790f26effbac5f84453/linuxdeploy-plugin-gtk.sh";
+          hash = "sha256-sPTLxoSgEDqWUfCVW2NerqAJazpmwPWiwqozeWA3UXE=";
+        };
         buildAppImageScript = pkgs.writeShellScriptBin "syncpeer-build-appimage" ''
           set -euo pipefail
           umask 022
@@ -107,7 +120,9 @@
           tmp_dir="$(mktemp -d /tmp/syncpeer-appimage-tmp.XXXXXX)"
           cache_dir="$repo_root/.tmp/appimage-cache"
           home_dir="/tmp/syncpeer-appimage-home"
-          cargo_target_dir="$tmp_dir/cargo-target"
+          # Preserve expensive native builds across bundling/tooling failures;
+          # the short-lived AppDir and staging files are still cleaned up.
+          cargo_target_dir="$cache_dir/cargo-target"
           schemas_dir="$tmp_dir/glib-2.0/schemas"
           tools_dir="$cache_dir/tauri"
           appimage_plugin="$tools_dir/linuxdeploy-plugin-appimage.AppImage"
@@ -350,11 +365,29 @@ if [[ "''${2:-}" == "gdk-pixbuf-2.0" ]]; then
       ;;
   esac
 fi
-exec ${pkgs.pkgconf}/bin/pkgconf "''$@"
+export PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+exec /usr/bin/pkg-config "''$@"
 EOF
           chmod +x "$shim_dir/pkgconf"
           ln -sf "$shim_dir/pkgconf" "$shim_dir/pkg-config"
-          ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:\$PATH\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$cargo_target_dir\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" SYNCPEER_APPIMAGE_SCHEMAS_DIR=\"$schemas_dir\" SYNCPEER_APPIMAGE_GTK_STAGE_DIR=\"$gtk_stage_dir\" SYNCPEER_APPIMAGE_GDK_STAGE_DIR=\"$gdk_stage_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.adwaita-icon-theme}/share\" WINIT_WAYLAND_CSD_THEME=light LIBDECOR_PLUGIN_DIR=\"${pkgs.libdecor}/lib/libdecor/plugins-1\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -lc 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] WINIT_WAYLAND_CSD_THEME=\$WINIT_WAYLAND_CSD_THEME\"; echo \"[appimage-debug] LIBDECOR_PLUGIN_DIR=\$LIBDECOR_PLUGIN_DIR\"; gdk_cache=\"/tmp/syncpeer-appimage-gdk-pixbuf-loaders.cache\"; ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so > \"\$gdk_cache\" 2>/dev/null || true; if [ -s \"\$gdk_cache\" ]; then export GDK_PIXBUF_MODULE_FILE=\"\$gdk_cache\"; fi; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build:bundle:appimage:internal -w @syncpeer/tauri-shell -- --verbose'"
+          gtk_plugin="$tools_dir/linuxdeploy-plugin-gtk.sh"
+          cp -f ${gtkPluginSource} "$gtk_plugin"
+          chmod u+w,+x "$gtk_plugin"
+          # The upstream plugin sources /etc/os-release under set -e, but Nix
+          # FHS can expose a dangling host symlink. Use a known FHS ID instead.
+          sed -i 's|^\. /etc/os-release$|if [ -r /etc/os-release ]; then . /etc/os-release; else ID=nixos; fi|' "$gtk_plugin"
+          grep -Fqx 'if [ -r /etc/os-release ]; then . /etc/os-release; else ID=nixos; fi' "$gtk_plugin"
+          # Persistent Cargo target caches native objects, but linuxdeploy
+          # leaves a partially bundled AppDir (including unwritable Nix copies)
+          # if a later packaging phase fails. Recreate only that staging tree.
+          stale_appdir="$cargo_target_dir/release/bundle/appimage/Syncpeer.AppDir"
+          if [ -d "$stale_appdir" ]; then
+            chmod -R u+rwX "$stale_appdir" 2>/dev/null || true
+            rm -rf -- "$stale_appdir"
+          fi
+          # Use only FHS tools and explicit shims: linuxdeploy scans PATH and
+          # can abort on cyclic symlinks in an inherited host bin directory.
+          ${appimageFhs}/bin/syncpeer-appimage-fhs -lc "cd \"$repo_root\" && PATH=\"$shim_dir:/usr/bin:/bin\" HOME=\"$home_dir\" RUSTUP_HOME=\"$rustup_home\" CARGO_HOME=\"$cargo_home\" CARGO_TARGET_DIR=\"$cargo_target_dir\" TMPDIR=\"$tmp_dir\" XDG_CACHE_HOME=\"$cache_dir\" SYNCPEER_APPIMAGE_SCHEMAS_DIR=\"$schemas_dir\" SYNCPEER_APPIMAGE_GTK_STAGE_DIR=\"$gtk_stage_dir\" SYNCPEER_APPIMAGE_GDK_STAGE_DIR=\"$gdk_stage_dir\" XDG_DATA_DIRS=\"/usr/share:${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:${pkgs.adwaita-icon-theme}/share\" WINIT_WAYLAND_CSD_THEME=light LIBDECOR_PLUGIN_DIR=\"${pkgs.libdecor}/lib/libdecor/plugins-1\" RUST_BACKTRACE=1 APPIMAGE_EXTRACT_AND_RUN=1 /bin/bash -c 'set -euo pipefail; echo \"[appimage-debug] id=\$(id -u):\$(id -g) user=\$(id -un) group=\$(id -gn)\"; echo \"[appimage-debug] run_id=$run_id\"; echo \"[appimage-debug] HOME=\$HOME\"; echo \"[appimage-debug] TMPDIR=\$TMPDIR\"; echo \"[appimage-debug] XDG_CACHE_HOME=\$XDG_CACHE_HOME\"; echo \"[appimage-debug] CARGO_TARGET_DIR=\$CARGO_TARGET_DIR\"; echo \"[appimage-debug] PATH=\$PATH\"; echo \"[appimage-debug] cargo=\$(command -v cargo || true)\"; echo \"[appimage-debug] rustc=\$(command -v rustc || true)\"; echo \"[appimage-debug] WINIT_WAYLAND_CSD_THEME=\$WINIT_WAYLAND_CSD_THEME\"; echo \"[appimage-debug] LIBDECOR_PLUGIN_DIR=\$LIBDECOR_PLUGIN_DIR\"; gdk_cache=\"/tmp/syncpeer-appimage-gdk-pixbuf-loaders.cache\"; ${pkgs.gdk-pixbuf}/bin/gdk-pixbuf-query-loaders ${pkgs.gdk-pixbuf}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so ${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so > \"\$gdk_cache\" 2>/dev/null || true; if [ -s \"\$gdk_cache\" ]; then export GDK_PIXBUF_MODULE_FILE=\"\$gdk_cache\"; fi; mkdir -p \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\"; ls -ld \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; stat -c \"[appimage-debug] %A %a %u:%g %n\" \"\$CARGO_TARGET_DIR\" \"\$TMPDIR\" \"\$XDG_CACHE_HOME\" \"\$HOME\"; npm run build:bundle:appimage:internal -w @syncpeer/tauri-shell -- --verbose'"
           artifact="$(find "$cargo_target_dir/release/bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
           test -n "$artifact"
           output_dir="$repo_root/packages/tauri-shell/src-tauri/target/release/bundle/appimage"
@@ -418,6 +451,8 @@ EOF
             appstream
             flatpak
             flatpak-builder
+            # Payload-only AppImage smoke needs unsquashfs for the embedded Type2 SquashFS.
+            squashfsTools
           ] ++ lib.optional
             (stdenv.hostPlatform.isx86_64 || stdenv.hostPlatform.isDarwin)
             androidComposition.emulator;

@@ -67,6 +67,11 @@ const main = async (): Promise<void> => {
       ],
     },
     {
+      name: "Android release signer and artifact packaging regressions",
+      command: process.execPath,
+      args: ["--test", "scripts/test-android-signing.mjs"],
+    },
+    {
       name: "Incremental block reuse diagnostics",
       command: process.execPath,
       args: ["--experimental-strip-types", "--test", "scripts/test-block-reuse.ts"],

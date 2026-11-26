@@ -20,14 +20,14 @@ const emulatorPath = path.join(androidHome, "emulator", "emulator");
 const avdManagerPath = path.join(androidHome, "cmdline-tools", "13.0", "bin", "avdmanager");
 const buildTools = path.join(androidHome, "build-tools", "35.0.0");
 const apksignerPath = path.join(buildTools, "apksigner");
-const tauriConfigPath = path.join(root, "packages/tauri-shell/src-tauri/tauri.conf.json");
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "syncpeer-signed-upgrade-"));
 const keystoreA = path.join(temp, "upgrade-a.jks");
 const keystoreB = path.join(temp, "upgrade-b.jks");
 const passwordA = crypto.randomBytes(18).toString("hex");
 const passwordB = crypto.randomBytes(18).toString("hex");
 const alias = "syncpeer-upgrade";
-const originalTauriConfig = fs.readFileSync(tauriConfigPath, "utf8");
+const initialVersion = "0.6.1-rc.2";
+const alphaVersion = "0.7.0-alpha.1";
 let emulator = null;
 let emulatorLog = null;
 let emulatorSerial = null;
@@ -146,15 +146,25 @@ const writeMarker = () => {
 const readMarker = (markerPath) => adb("shell", "cat", markerPath).trim();
 
 const buildRelease = (label, version, keystorePath, keystorePassword) => {
-  const config = JSON.parse(originalTauriConfig);
-  config.version = version;
-  fs.writeFileSync(tauriConfigPath, JSON.stringify(config, null, 2) + "\n");
+  // Pass a build-only config rather than mutating tracked release metadata.
+  // A killed sandbox must not leave the repository at a synthetic version.
+  const configPath = path.join(temp, label + ".json");
+  fs.writeFileSync(configPath, JSON.stringify({ version }));
   const output = path.join(temp, label + ".apk");
+  const keytool = path.join(javaHome, "bin", "keytool");
+  const cert = capture(keytool, ["-list", "-v", "-keystore", keystorePath, "-alias", alias,
+    "-storepass:env", "SYNCPEER_SYNTHETIC_STORE_PASS"], {
+    env: { ...process.env, SYNCPEER_SYNTHETIC_STORE_PASS: keystorePassword },
+  });
+  const digest = /SHA256:\s*([a-f0-9:]{95})/i.exec(cert)?.[1]?.replaceAll(":", "").toLowerCase();
+  if (!digest || digest.length !== 64) fail("Synthetic signing certificate fingerprint unavailable.");
   try {
     run("bash", ["scripts/build-android-prod-with-secrets.sh"], {
       env: {
         ...process.env,
         SYNCPEER_ANDROID_TARGET: "x86_64",
+        SYNCPEER_EXPECTED_ANDROID_CERT_SHA256: digest,
+        SYNCPEER_ANDROID_BUILD_CONFIG: configPath,
         ANDROID_KEYSTORE_PATH: keystorePath,
         ANDROID_KEYSTORE_PASSWORD: keystorePassword,
         ANDROID_KEY_ALIAS: alias,
@@ -169,7 +179,6 @@ const buildRelease = (label, version, keystorePath, keystorePassword) => {
     if (!source) fail(`Release build ${label} did not produce an x86_64 APK.`);
     fs.copyFileSync(source, output);
   } finally {
-    fs.writeFileSync(tauriConfigPath, originalTauriConfig);
     for (const candidate of [
       path.join(root, "syncpeer-android-release-x86_64.apk"),
       path.join(root, "dist", "syncpeer-android-release-x86_64.apk"),
@@ -218,16 +227,18 @@ const main = async () => {
 
   await startEmulator();
   try { adb("uninstall", packageName); } catch { /* Fresh emulator. */ }
-  const apkA = buildRelease("upgrade-a", "0.6.1", keystoreA, passwordA);
+  const apkA = buildRelease("upgrade-a", initialVersion, keystoreA, passwordA);
   run(adbPath, ["install", "--no-streaming", apkA]);
   const first = packageInfo();
-  if (first.versionName !== "0.6.1") fail(`Unexpected first version: ${first.versionName}`);
+  if (first.versionName !== initialVersion) fail(`Unexpected first version: ${first.versionName}`);
   await launchApp();
   const markerPath = writeMarker();
 
-  const apkB = buildRelease("upgrade-b", "0.6.2", keystoreA, passwordA);
+  const apkB = buildRelease("upgrade-b", alphaVersion, keystoreA, passwordA);
+  if (certificateDigest(apkA) !== certificateDigest(apkB)) fail("Upgrade build changed signing identity.");
   run(adbPath, ["install", "--no-streaming", "-r", apkB]);
   const second = packageInfo();
+  if (second.versionName !== alphaVersion) fail(`Unexpected upgrade version: ${second.versionName}`);
   if (second.versionCode <= first.versionCode) {
     fail(`Upgrade versionCode did not advance: ${first.versionCode} -> ${second.versionCode}`);
   }
@@ -247,6 +258,9 @@ const main = async () => {
   const rejected = adbRaw("install", "--no-streaming", "-r", wrongApk);
   if (rejected.status === 0) {
     fail("Different-signature upgrade was accepted by Android.");
+  }
+  if (!/INSTALL_FAILED_UPDATE_INCOMPATIBLE/.test(rejected.stderr + rejected.stdout)) {
+    fail("Wrong-key install did not report an incompatible update.");
   }
   const afterRejected = packageInfo();
   if (afterRejected.versionCode !== second.versionCode ||

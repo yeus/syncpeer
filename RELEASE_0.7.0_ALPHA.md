@@ -1,12 +1,12 @@
 # 0.7.0-alpha.1 acceptance
 
-Status: `0.7.0-alpha.1` **autonomous sandbox gate passed; source candidate committed on `dev`, not yet tagged or published**. Headless 60/60 (2 external opt-in skips), desktop E2E 3/3 phases and 8/8 local scenarios (3 external skips), full Android emulator matrix and two-peer emulator acceptance, installed Debian smoke and original AppImage payload GUI smoke passed. Focused consent/browse-only/transfer tests passed 70/70. Under AGENTS.md, alpha.1 sandbox readiness does **not** require production signing, tag-triggered CI, intact AppImage/Flatpak execution on an unavailable compatible host or physical-phone acceptance. Those remain alpha-stage artifact validation. Commit/tag/push and automatic publication require explicit authorization.
+Status: `0.7.0-alpha.1` **post-release source changes are implemented, committed on `dev`, and focused-verified, not yet full-release certified** (stable Syncthing folder/path SAF IDs and repository-backed README screenshots; user request 2026-11-27). Core document 28/28, document cache 19/19, service transfer jobs 13/13, favorite sync 36/36, lint, typecheck and build configuration 58/58 passed. Android API29 native 26/27 first run: one post-unlock read `EIO` correlated with emulator low-memory pressure and subsequent WebView renderer loss; isolated repeat of that test passed 1/1. Full fresh real KeePass2Android interoperability passed exit 0: online KDBX save/read, persisted SAF after app restart and reboot plus remote replacement, offline reconnection, 4 MiB attachment, and concurrent-edit conflict versions independently decrypted and converged on both peers. Previously certified full sandbox gate applied to committed `7954d81` before these edits. Rebuild/recheck release artifacts and full gates before source freeze. No release tag or publication occurred; staging/commit/tag/push and automatic publication require separate explicit authorization.
 
 Scope: existing 0.6.1-rc.2 functionality plus 0.7.0 service-owned **single-selected-peer** synchronization, document recovery, background policies, simplified Devices/Settings/Folders, large-folder performance, and hidden PIM navigation. **Folder-aware multi-peer connection scheduling**, remote-only SAF access, multi-source folder aggregation and Personal Space backup migration into an initialized local vault are deferred to 0.7.1; PIM reactivation and comprehensive Personal Space security verification are targeted for 0.7.2. Build preparation does not authorize staging, commits, tags, pushes or publication.
 
 ## Automated gate
 
-2026-11-26, Linux/Nix sandbox, base `7c8a74b` plus the committed 0.7.0 working-tree changes and `0.7.0-alpha.1` version metadata. Logs under `.tmp/alpha-070/`. Debian, AppImage and unsigned ARM64 candidate artifacts have been **rebuilt against the latest tested application sources**, rehashed and explicitly distinguished from signed/published release assets. The current commit is the tested source candidate; creating the release tag is a separate authorized step.
+2026-11-27 Linux/Nix sandbox, base `7954d81` plus the committed folder/path SAF and README screenshot changes. Focused tests `.tmp/syncpeer-alpha1-stable-ids-core.log`; Android full matrix `.tmp/syncpeer-alpha1-stable-ids-android.log` (one emulator post-unlock read `EIO`); isolated native rerun `.tmp/alpha1-stable-id-targeted-provider.log` (1/1 passed); full real-app KeePass2Android `.tmp/alpha1-stable-uri-keepass-fresh.log` (passed exit 0). Previously listed `.deb`, AppImage and unsigned ARM64 package hashes are from **before** these changes and are NOT source-current release artifacts. Rebuild and rehash release packages before new full gate pass.
 
 | Gate | Command / evidence | Result |
 |---|---|---|
@@ -38,7 +38,7 @@ Scope: existing 0.6.1-rc.2 functionality plus 0.7.0 service-owned **single-selec
 
 Never run against actual user peer identifiers from logs. Tests use synthetic identities, isolated app profiles, and disposable emulator targets. Do not use a production signing key in a test harness.
 
-## Current alpha.1 candidate artifacts (NOT published)
+## Previous alpha.1 candidate artifacts (STALE after 2026-11-27 source changes; NOT published)
 
 - Linux Debian package: `packages/tauri-shell/src-tauri/target/release/bundle/deb/Syncpeer_0.7.0-alpha.1_amd64.deb` — SHA-256 `9ba47e9b8c9d7c4779648aba6ce0b021e8ece3e115dd538d00ea4bb3e7f21cbe` (fresh profile, pairing and reset packaged smoke passed).
 - Linux AppImage: `dist/Syncpeer_0.7.0-alpha.1_amd64.AppImage` — SHA-256 `370ee08a576423d550f42476eeef586c55359709fd90af7c41488d4f4ba06d0e` (original embedded SquashFS GUI smoke passed; intact Type2 runtime requires compatible-host CI).

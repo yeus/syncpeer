@@ -16,6 +16,7 @@ import { openDocumentDraft, openDocumentDownloadDraft, recoverDocumentDrafts } f
 import { loadEncryptedDiskMetadata, readEncryptedDiskRange } from "./encryptedFilesystem.js";
 import type { createNativeFilesystem } from "./nativeFilesystem.js";
 import { assertReplicaPath, isInternalReplicaPath } from "./replicaPaths.js";
+import { encodeDocumentId, decodeDocumentId } from "./documentId.js";
 import { versionVectorKey } from "../core/protocol/versionVector.js";
 import type { CachedFileRecord } from "../ui/browserClient.js";
 import { cachedFileKey, sameDeviceId } from "../ui/helpers.js";
@@ -134,7 +135,7 @@ const toEntry = (
   directory: boolean,
   modifiedMs = 0,
 ) => ({
-  id: JSON.stringify([folder.storageId, path]),
+  id: encodeDocumentId(folder.id, path),
   name: path ? path.split("/").at(-1)! : folder.label,
   size,
   directory,
@@ -443,17 +444,13 @@ const closeFilesystem = (runtime: DocumentRuntime): Promise<void> => {
 
 const resolveDocument = (runtime: DocumentRuntime, id: string) => {
   if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-  const decoded: unknown = JSON.parse(id);
-  if (!Array.isArray(decoded) || decoded.length !== 2 || decoded.some(part => typeof part !== "string")) {
-    throw new Error("Invalid document ID.");
-  }
-  const [storageId, path] = decoded as [string, string];
+  const { folderId, path } = decodeDocumentId(id);
   if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
-  const folder = runtime.registry?.getState().find(folder => folder.storageId === storageId);
+  const folder = runtime.registry?.getState().find(folder => folder.id === folderId);
   if (!folder) throw new Error("Document folder is unavailable.");
   const replica = runtime.registry!.getReplica(folder.id);
   if (!replica) throw new Error("Document folder is not open.");
-  return { folder, replica, path, bytes: runtime.storage.get(storageId)! };
+  return { folder, replica, path, bytes: runtime.storage.get(folder.storageId)! };
 };
 
 const documentStat = async (runtime: DocumentRuntime, id: string) => {
@@ -693,9 +690,9 @@ const cachedFilesAction = async (
       const modifiedMs = Number(info.modified_s ?? 0) * 1000 + Number(info.modified_ns ?? 0) / 1000000;
       files.push({ key: cachedFileKey(folder.id, info.name), folderId: folder.id, path: info.name,
         name: info.name.split("/").at(-1)!, sizeBytes: Number(info.size ?? 0), modifiedMs, cachedAtMs: modifiedMs,
-        localPath: "syncpeer-document:" + JSON.stringify([folder.storageId, info.name]),
+        localPath: "syncpeer-document:" + encodeDocumentId(folder.id, info.name),
         localWriteOpen: [...runtime.handles.values()].some(handle => handle.writer && !handle.download &&
-          handle.documentId === JSON.stringify([folder.storageId, info.name])),
+          handle.documentId === encodeDocumentId(folder.id, info.name)),
         localVersionKey: versionVectorKey(info.version ?? {}),
         syncBaselineRequired: true,
         syncBaseline: await loadDocumentBaseline(runtime.storage.get(folder.storageId)!, runtime.folderKeys.get(folder.storageId)!, info.name) });
@@ -736,7 +733,7 @@ const cachedStatusesAction = async (
     if (path) { assertReplicaPath(path); if (isInternalReplicaPath(path)) throw new Error("Private document."); }
     const file = files.get(path);
     const available = !path || !!file;
-    return { path, available, localPath: available ? "syncpeer-document:" + JSON.stringify([folder.storageId, path]) : undefined,
+    return { path, available, localPath: available ? "syncpeer-document:" + encodeDocumentId(folder.id, path) : undefined,
       cachedAtMs: file ? Number(file.modified_s ?? 0) * 1000 : undefined };
   });
 };
@@ -754,7 +751,7 @@ const removeDocumentAction = async (runtime: DocumentRuntime, id: string) => {
   // Missing bytes discovered by an index scan alone must never delete a peer copy.
   await removeReplicaPaths(file.replica, file.folder.id, paths);
   for (const path of paths) {
-    const target = JSON.stringify([file.folder.storageId, path]);
+    const target = encodeDocumentId(file.folder.id, path);
     const baseline = await loadSyncBaselineAction(runtime, target);
     if (baseline) await setSyncBaselineAction(runtime, target, { ...baseline, localDeletion: true });
   }
@@ -826,7 +823,7 @@ const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: 
     const descendants = current.filter(info => !info.deleted && info.name.startsWith(file.path + "/"));
     await renameDirectoryAction(runtime, file, descendants, target, modifiedMs);
     await recordRenamedFavorite(runtime, file.folder, file.path, target);
-    return documentStat(runtime, JSON.stringify([file.folder.storageId, target]));
+    return documentStat(runtime, encodeDocumentId(file.folder.id, target));
   }
   const created = await file.replica.edit!({ method: "write", folderId: file.folder.id, path: target, modifiedMs,
     expectedVersion: previousTarget?.version ?? null, source: await createReplicaFileSource(file.replica, file.path) });
@@ -839,18 +836,18 @@ const renameDocumentAction = async (runtime: DocumentRuntime, id: string, name: 
     throw error;
   }
   await recordRenamedFavorite(runtime, file.folder, file.path, target);
-  return documentStat(runtime, JSON.stringify([file.folder.storageId, target]));
+  return documentStat(runtime, encodeDocumentId(file.folder.id, target));
 };
 
 const statById = async (runtime: DocumentRuntime, id: string) => {
-  const root = (await runtime.configs.load()).find(folder => id === JSON.stringify([folder.storageId, ""]));
+  const root = (await runtime.configs.load()).find(folder => id === encodeDocumentId(folder.id, ""));
   return root ? toEntry(root, "", 0, true) : documentStat(runtime, id);
 };
 
 const listEntriesAction = async (runtime: DocumentRuntime, id: string) => {
   if (id === "syncpeer-root") return (await runtime.configs.load()).map(folder => toEntry(folder, "", 0, true));
   if (runtime.vault.status().phase !== "unlocked") throw new Error("Document vault is locked.");
-  const root = runtime.registry!.getState().find(folder => id === JSON.stringify([folder.storageId, ""]));
+  const root = runtime.registry!.getState().find(folder => id === encodeDocumentId(folder.id, ""));
   if (root && !runtime.registry!.getReplica(root.id)) return [];
   const { folder, path, replica } = resolveDocument(runtime, id);
   if (!(await documentStat(runtime, id)).directory) throw new Error("Document is not a directory.");
@@ -875,7 +872,7 @@ const createEntryAction = async (
     expectedVersion: previous?.version ?? null,
     ...(directory ? { method: "mkdir" as const } : { method: "write" as const,
       source: { size: 0, readRange: async () => new Uint8Array() } }) });
-  return documentStat(runtime, JSON.stringify([parent.folder.storageId, path]));
+  return documentStat(runtime, encodeDocumentId(parent.folder.id, path));
 };
 
 const assertDownloadRequest = (
@@ -950,7 +947,7 @@ const beginDownloadAction = async (
   if (metadata.blocks) validateBlockPlan(metadata.blocks, size);
   const folder = runtime.registry?.getState().find(folder => folder.id === folderId);
   if (!folder) throw new Error("Document folder is unavailable.");
-  const documentId = JSON.stringify([folder.storageId, path]);
+  const documentId = encodeDocumentId(folder.id, path);
   const file = resolveDocument(runtime, documentId);
   if (expectedLocalHash !== undefined) await assertExpectedLocalHash(file.replica, path, expectedLocalHash);
   await ensureDownloadParents(file.replica, folderId, path, modifiedMs);
@@ -1196,7 +1193,7 @@ const collectCacheCandidates = async (
     candidates.push({ key: cachedFileKey(folder.id, info.name), folder, path: info.name,
       sizeBytes: Number(info.size ?? 0), lastAccessedMs: access[info.name] ??
         Number(info.modified_s ?? 0) * 1000,
-      protected: openDocuments.has(JSON.stringify([folder.storageId, info.name])) ||
+      protected: openDocuments.has(encodeDocumentId(folder.id, info.name)) ||
         selected.status === "favorite" || !unchanged });
   }
 };
@@ -1214,7 +1211,7 @@ const enforceCacheQuotaAction = async (runtime: DocumentRuntime) => {
   for (const key of evicted) {
     const candidate = candidates.find(value => value.key === key)!;
     // Eviction is not a user deletion; selecting it again must download.
-    await clearSyncBaselineAction(runtime, JSON.stringify([candidate.folder.storageId, candidate.path]));
+    await clearSyncBaselineAction(runtime, encodeDocumentId(candidate.folder.id, candidate.path));
     await removeReplicaPaths(runtime.registry.getReplica(candidate.folder.id)!, candidate.folder.id, [candidate.path]);
   }
   return { quotaBytes, cachedBytes: candidates.reduce((total, value) => total + value.sizeBytes, 0),
@@ -1457,7 +1454,7 @@ const releaseLocalCopyAction = async (runtime: DocumentRuntime, folderId: string
   const registry = requireUnlockedRegistry(runtime);
   const folder = registry.getState().find(value => value.id === folderId && value.downloads);
   if (!folder) throw new Error("This folder has no local copy to release.");
-  if ([...runtime.handles.values()].some(handle => JSON.parse(handle.documentId)[0] === folder.storageId)) {
+  if ([...runtime.handles.values()].some(handle => decodeDocumentId(handle.documentId).folderId === folder.id)) {
     throw new Error("Close this folder's open documents before releasing its local copy.");
   }
   const context = await sharedSettingsContext(runtime, true);

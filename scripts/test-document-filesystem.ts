@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/dist/sync/documentFilesystem.js";
+import { encodeDocumentId, decodeDocumentId } from "../packages/core/dist/sync/documentId.js";
 import { changesSessionConfiguration, dispatchDocumentCommandWithSessionConfiguration,
   deriveUntrustedFolderCrypto, loadEncryptedDiskMetadata } from "../packages/core/dist/filesystem.js";
 import { scryptPasswordKdf, type PasswordKdf } from "../packages/core/dist/kdf.js";
@@ -12,6 +13,20 @@ import { createCredentialVaultStorage, createPersonalSpaceBootstrapStorage } fro
   "../packages/core/dist/sync/credentialVaultStorage.js";
 import { defaultFolderSettings, defaultProfileSettings } from "../packages/core/dist/sync/profileSettings.js";
 import { purgePrivateReplicaContents } from "../packages/core/dist/sync/replicaPurge.js";
+test("document IDs use stable Syncthing folder IDs and readable relative paths, never JSON storage IDs", () => {
+  for (const folderId of ["keepass", "space / with%unicode", "ümlaut:folder"]) {
+    for (const path of ["", "keepassdb.kdbx", "vaults/private/master.kdbx", "space 100%.txt"]) {
+      const id = encodeDocumentId(folderId, path);
+      assert.deepEqual(decodeDocumentId(id), { folderId, path });
+      assert.equal(id, `${encodeURIComponent(folderId)}/${path}`);
+      assert.ok(!id.startsWith("["));
+    }
+  }
+  assert.throws(() => decodeDocumentId('["oldStorageId","keepassdb.kdbx"]'), /Invalid document ID/);
+  assert.throws(() => decodeDocumentId("folder%2fid/file"), /Invalid document ID/);
+  assert.throws(() => decodeDocumentId("folder%XX/file"), /Invalid document ID/);
+});
+
 test("listener snapshots are invalidated by sharing changes, not ordinary document edits", () => {
   for (const operation of ["lock", "unlock", "savePersonalSpaceSetting",
     "revokeOwnedDevice", "register", "attachDownloads"]) {
@@ -387,6 +402,7 @@ test("first-run folder storage requires a recoverable master password and retain
   assert.deepEqual(await documents.list("syncpeer-root"), []);
   await documents.rememberFolder({ id: "photos", label: "Photos" });
   const [photos] = await documents.list("syncpeer-root");
+  assert.equal(photos.id, "photos/", "Root identity is the Syncthing folder ID, not random local storage");
   assert.deepEqual(await documents.list(photos.id), []);
   await documents.register({ id: "photos", label: "Photos", password: "synthetic-remote-password" });
   const handle = await documents.beginDownload("photos", "sample.txt", 3, 1000);
@@ -751,12 +767,12 @@ test("registered encrypted documents reopen with remembered credentials, and loc
   const cached = await documents.cachedFiles();
   const downloaded = cached.find(file => file.path === "nested/download.txt")!;
   assert.equal(downloaded.sizeBytes, 4);
-  const picker = await documents.open(JSON.stringify([JSON.parse(folder.id)[0], downloaded.path]), "rw");
+  const picker = await documents.open(encodeDocumentId(decodeDocumentId(folder.id).folderId, downloaded.path), "rw");
   await documents.write(picker, 0, Uint8Array.of(9));
   await documents.release(picker);
   const replacement = await documents.beginDownload("fixture-folder", downloaded.path, 4, 2000);
   await documents.write(replacement, 0, Uint8Array.of(4, 3, 2, 1));
-  const concurrent = await documents.open(JSON.stringify([JSON.parse(folder.id)[0], downloaded.path]), "rw");
+  const concurrent = await documents.open(encodeDocumentId(decodeDocumentId(folder.id).folderId, downloaded.path), "rw");
   await documents.write(concurrent, 0, Uint8Array.of(8));
   await documents.release(concurrent);
   await assert.rejects(documents.finishDownload(replacement), /changed|version|stale/i);

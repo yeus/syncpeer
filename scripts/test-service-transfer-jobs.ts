@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createServiceTransferJobs, type ServiceTransferProgress } from "../packages/core/src/sync/serviceTransferJobs.ts";
+import { encodeDocumentId } from "../packages/core/src/sync/documentId.ts";
 import type { DocumentFilesystem } from "../packages/core/src/sync/documentFilesystem.ts";
 import type { RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
 
@@ -177,7 +178,8 @@ test("native jobs reject internal replica targets before any document access", (
 test("upload job reads the existing encrypted document rather than WebView bytes", async () => {
   const { documents, events, status } = fixture();
   documents.cachedFiles = (async () => [{
-    folderId: "folder", path: "keepass.kdbx", localPath: 'syncpeer-document:["stored","keepass.kdbx"]',
+    folderId: "folder", path: "keepass.kdbx",
+    localPath: "syncpeer-document:" + encodeDocumentId("folder", "keepass.kdbx"),
     modifiedMs: 123,
   }]) as never;
   documents.open = (async () => { events.push("open"); return 8; }) as never;

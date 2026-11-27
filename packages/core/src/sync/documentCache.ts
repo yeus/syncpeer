@@ -5,6 +5,7 @@ import type { FileDownloadSink } from "../transfer/stream.js";
 import { sameDownloadMetadata } from "../transfer/stream.js";
 import type { FolderRegistration } from "./folderRegistry.js";
 import { assertReplicaPath } from "./replicaPaths.js";
+import { encodeDocumentId } from "./documentId.js";
 import type { FolderInfo } from "../core/model/remoteFs.js";
 import { defaultFolderSettings, defaultProfileSettings, type SyncpeerProfileSettings } from "./profileSettings.js";
 import type { OwnedSpaceDevice } from "./personalSpaceSharing.js";
@@ -81,7 +82,7 @@ class DocumentCache {
   }
 
   private documentId(folder: FolderRegistration, path: string) {
-    return JSON.stringify([folder.storageId, path]);
+    return encodeDocumentId(folder.id, path);
   }
 
   private async track(folderId: string) {

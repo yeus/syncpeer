@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build, transformWithEsbuild } from "vite";
-import { createOwnedRecoveryKit } from "@syncpeer/core/filesystem";
+import { createOwnedRecoveryKit, encodeDocumentId } from "@syncpeer/core/filesystem";
 import { normalizeDeviceId } from "@syncpeer/core/browser";
 import { createBrowserBepSchemaPlugin } from "./vite-plugins/browserBepSchema.mjs";
 import { measureConnectionReadiness, probeServiceReadiness } from "./connection-performance.mjs";
@@ -2119,7 +2119,7 @@ const verifyOpenLocal = async (cdp) => {
   const status = await documentCommand(cdp, { operation: "status" });
   const folder = status.folders.find(value => value.id === targetFolderId && value.downloads);
   if (!folder?.storageId) throw new Error("Open Local requires attached storage.");
-  const rootId = JSON.stringify([folder.storageId, ""]);
+  const rootId = encodeDocumentId(folder.id, "");
   const suffix = Date.now().toString(36);
   const rootFile = `root-open-local-${suffix}.txt`, nestedFile = `nested-open-local-${suffix}.txt`;
   const dirName = `open-local-parent-${suffix}`;
@@ -3688,10 +3688,10 @@ const runDocumentFolderWrite = async () => {
     const status = await documentCommand(cdp, { operation: "status" });
     const folder = status.folders.find(value => value.id === id && value.downloads);
     if (!folder?.storageId) throw new Error(`Android document folder is not attached: ${id}`);
-    const rootId = JSON.stringify([folder.storageId, ""]);
+    const rootId = encodeDocumentId(folder.id, "");
     let entry;
     try {
-      entry = await documentCommand(cdp, { operation: "stat", id: JSON.stringify([folder.storageId, name]) });
+      entry = await documentCommand(cdp, { operation: "stat", id: encodeDocumentId(folder.id, name) });
     } catch {
       entry = await documentCommand(cdp, { operation: "create", id: rootId, name, directory: false });
     }

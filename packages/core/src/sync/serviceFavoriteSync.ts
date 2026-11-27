@@ -16,6 +16,7 @@ import type { FileEntry } from "../core/model/remoteFs.js";
 import { writeDocumentDownload } from "./documentDownloadWrites.js";
 import { defaultFolderSettings } from "./profileSettings.js";
 import { isInternalReplicaPath } from "./replicaPaths.js";
+import { encodeDocumentId } from "./documentId.js";
 
 type Baseline = NonNullable<CachedFileRecord["syncBaseline"]>;
 
@@ -101,7 +102,6 @@ function documentDownloadSink(documents: DocumentFilesystem, folderId: string, p
   };
 }
 
-const documentId = (storageId: string, path: string): string => JSON.stringify([storageId, path]);
 
 const readRemoteVersion = async (remoteFs: RemoteFs, folderId: string, path: string,
 ): Promise<FavoriteRemoteVersion | undefined> => {
@@ -130,7 +130,7 @@ const markSynced = (context: FavoriteContext, path: string): Promise<void> =>
   setEntry(context, path, { phase: "synced", attempts: 0, updatedAtMs: context.nowMs, nextAttemptMs: 0 });
 
 const hashLocal = async (context: FavoriteContext, path: string): Promise<string> =>
-  hashDocument(context.documents, documentId(context.storageId, path));
+  hashDocument(context.documents, encodeDocumentId(context.folderId, path));
 
 const downloadFavorite = async (context: FavoriteContext, path: string,
   remote: FavoriteRemoteVersion, expectedLocalHash: string | null): Promise<void> => {
@@ -146,7 +146,7 @@ const downloadFavorite = async (context: FavoriteContext, path: string,
 
 const uploadFavorite = async (context: FavoriteContext, path: string,
   local: { hash: string }): Promise<Baseline> => {
-  const id = documentId(context.storageId, path);
+  const id = encodeDocumentId(context.folderId, path);
   const source = await documentUploadSource(context.documents, id);
   const modifiedMs = context.nowMs;
   try {
@@ -162,7 +162,7 @@ const uploadFavorite = async (context: FavoriteContext, path: string,
 };
 
 const clearFavoriteRecords = async (context: FavoriteContext, path: string): Promise<void> => {
-  await context.documents.clearSyncBaseline(documentId(context.storageId, path)).catch(() => {});
+  await context.documents.clearSyncBaseline(encodeDocumentId(context.folderId, path)).catch(() => {});
   delete context.entries[path];
 };
 
@@ -199,7 +199,7 @@ const runDeleteRemote = async (context: FavoriteContext, path: string, baseline:
   }
   await setEntry(context, path, { phase: "deleting-remote", attempts: context.entries[path]?.attempts ?? 0,
     updatedAtMs: context.nowMs, nextAttemptMs: 0 });
-  const id = documentId(context.storageId, path);
+  const id = encodeDocumentId(context.folderId, path);
   const current = await context.documents.syncBaseline(id);
   const [status] = await context.documents.cachedStatuses(context.folderId, [path]);
   if (status?.available || !current?.localDeletion || current.hash !== baseline.hash) {
@@ -212,7 +212,7 @@ const runDeleteRemote = async (context: FavoriteContext, path: string, baseline:
 };
 
 const runDeleteLocal = async (context: FavoriteContext, path: string): Promise<FavoriteSyncResult> => {
-  const id = documentId(context.storageId, path);
+  const id = encodeDocumentId(context.folderId, path);
   const version = context.cached.get(path)?.localVersionKey;
   const evidence = await context.remoteFs.indexedFile(context.folderId, path);
   if (!evidence?.deleted || evidence.invalid || !version ||
@@ -245,10 +245,10 @@ const renameFavorite = async (context: FavoriteContext, from: string, to: string
   const local = context.cached.get(to);
   if (!local) throw new Error("Renamed favorite is unavailable locally.");
   const localHash = await hashLocal(context, to);
-  const baseline = await context.documents.syncBaseline(documentId(context.storageId, from));
+  const baseline = await context.documents.syncBaseline(encodeDocumentId(context.folderId, from));
   const remoteSource = await readRemoteVersion(context.remoteFs, context.folderId, from);
   const remoteTarget = await readRemoteVersion(context.remoteFs, context.folderId, to);
-  const targetBaseline = await context.documents.syncBaseline(documentId(context.storageId, to));
+  const targetBaseline = await context.documents.syncBaseline(encodeDocumentId(context.folderId, to));
   const published = !!targetBaseline && !!remoteTarget &&
     remoteTarget.size === targetBaseline.sizeBytes && remoteTarget.modifiedMs === targetBaseline.modifiedMs &&
     targetBaseline.hash === localHash && await matchesRemoteBaseline(context, to, targetBaseline);
@@ -272,7 +272,7 @@ const renameFavorite = async (context: FavoriteContext, from: string, to: string
     }
     await context.remoteFs.deleteFile(context.folderId, from, { modifiedMs: context.nowMs, waitForRemote: true });
   }
-  await context.documents.clearSyncBaseline(documentId(context.storageId, from)).catch(() => {});
+  await context.documents.clearSyncBaseline(encodeDocumentId(context.folderId, from)).catch(() => {});
   delete context.entries[from];
   await markSynced(context, to);
   return { folderId: context.folderId, path: from, result: "renamed" };
@@ -286,7 +286,7 @@ const runRenames = async (context: FavoriteContext, results: FavoriteSyncResult[
   // An interrupted rename with no cached target is not a deletion request.
   // Keep its durable rename intent and the original peer copy for recovery.
   for (const rename of renames.filter(entry => !paired.has(entry.from))) {
-    const baseline = await context.documents.syncBaseline(documentId(context.storageId, rename.from));
+    const baseline = await context.documents.syncBaseline(encodeDocumentId(context.folderId, rename.from));
     if (!baseline) continue; // Directory rename roots have no file baseline.
     const remote = await readRemoteVersion(context.remoteFs, context.folderId, rename.from);
     if (!remote) continue;
@@ -340,7 +340,7 @@ const runResolution = async (context: FavoriteContext, candidate: FavoriteCandid
 };
 
 const planAndRunCandidate = async (context: FavoriteContext, candidate: FavoriteCandidate): Promise<FavoriteSyncResult> => {
-  const path = candidate.path, id = documentId(context.storageId, path);
+  const path = candidate.path, id = encodeDocumentId(context.folderId, path);
   if (context.cached.get(path)?.localWriteOpen) return {
     folderId: context.folderId, path, result: "waiting", message: "Document is still open for writing.",
   };

@@ -36,6 +36,7 @@ export { materializePersonalSpaceSettings } from "./sync/personalSpaceSettings.j
 export { createPersonalSpaceSettingsJournal } from "./sync/personalSpaceSettingsJournal.js";
 export { createSpaceMembershipJournal } from "./sync/spaceMembershipJournal.js";
 export { createDocumentFilesystem } from "./sync/documentFilesystem.js";
+export { encodeDocumentId, decodeDocumentId } from "./sync/documentId.js";
 export { changesSessionConfiguration, dispatchDocumentCommand,
   dispatchDocumentCommandWithSessionConfiguration } from "./sync/documentCommands.js";
 export { createDocumentCache } from "./sync/documentCache.js";

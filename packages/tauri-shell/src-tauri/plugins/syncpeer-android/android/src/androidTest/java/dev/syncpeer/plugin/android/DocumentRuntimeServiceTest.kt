@@ -66,10 +66,12 @@ class DocumentRuntimeServiceTest {
         command("register", JSONObject().put("id", "fixture-folder").put("label", "Fixture").put("password", "synthetic-folder-password"))
       }
       val folder = (command("list", JSONObject().put("id", "syncpeer-root")) as JSONArray).getJSONObject(0).getString("id")
+      assertTrue("Document root must use the stable folder/path ID", folder.endsWith("/") && !folder.startsWith("["))
       val authority = "${context.packageName}.documents"
       val folderUri = DocumentsContract.buildDocumentUri(authority, folder)
       val resolver = context.contentResolver
       val uri = DocumentsContract.createDocument(resolver, folderUri, "application/octet-stream", "sample-${System.nanoTime()}.bin")!!
+      assertTrue("Document URI must be under its Syncthing folder", DocumentsContract.getDocumentId(uri).startsWith(folder))
       // Exercise large-file I/O once; restart phases focus on persistence, not throughput.
       val expectedSize = if (InstrumentationRegistry.getArguments().getString("documentsRestartPhase") == "seed") 131075 else 4 * 1024 * 1024 + 3
       val expected = ByteArray(expectedSize) { (it % 251).toByte() }
@@ -95,8 +97,10 @@ class DocumentRuntimeServiceTest {
       command("finishDownload", JSONObject().put("handle", downloaded))
       val files = command("list", JSONObject().put("id", folder)) as JSONArray
       val downloadedId = (0 until files.length()).map { files.getJSONObject(it) }.first { it.getString("name") == "downloaded.bin" }.getString("id")
+      assertEquals(folder + "downloaded.bin", downloadedId)
       val downloadUri = DocumentsContract.buildDocumentUri(authority, downloadedId)
       resolver.openInputStream(downloadUri)!!.use { assertArrayEquals(byteArrayOf(1, 2, 3, 4), it.readBytes()) }
+      assertTrue("SAF parent-child lookup must use canonical folder/path IDs", DocumentsContract.isChildDocument(resolver, folderUri, downloadUri))
       // Regression: opening a downloaded document from a third-party editor must
       // not remove it from DocumentsProvider or invalidate its encrypted copy.
       resolver.openFileDescriptor(downloadUri, "rw")!!.use { descriptor ->
@@ -428,6 +432,7 @@ class DocumentRuntimeServiceTest {
           .get(30, TimeUnit.SECONDS).getJSONArray("result")
         assertTrue(files.length() > 0)
         val sample = (0 until files.length()).map { files.getJSONObject(it) }.first { it.getString("name").startsWith("sample-") }
+        assertEquals(folders.getJSONObject(0).getString("id") + sample.getString("name"), sample.getString("id"))
         val uri = DocumentsContract.buildDocumentUri("${context.packageName}.documents", sample.getString("id"))
         context.contentResolver.openInputStream(uri)!!.use { input ->
           assertArrayEquals(ByteArray(131075) { (it % 251).toByte() }, input.readBytes())

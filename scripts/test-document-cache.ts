@@ -3,6 +3,7 @@ import test from "node:test";
 import { createHash, randomBytes } from "node:crypto";
 import { createDocumentFilesystem, dispatchDocumentCommand } from "../packages/core/dist/filesystem.js";
 import { createDocumentCache } from "../packages/core/dist/sync/documentCache.js";
+import { encodeDocumentId } from "../packages/core/dist/sync/documentId.js";
 import { createOwnedRecoveryKit } from "../packages/core/dist/sync/personalSpaceSharing.js";
 import { memoryDocumentStorage } from "./lan-test/replica-storage.ts";
 import { createServer } from "vite";
@@ -381,7 +382,7 @@ test("opening a folder waits for encrypted attachment migration to finish", asyn
       return undefined as T;
     },
     legacy: {}, openLegacySource: async () => { throw new Error("No legacy files"); },
-    show: async id => { assert.equal(id, JSON.stringify(["synthetic-storage", "album"])); shown = true; },
+    show: async id => { assert.equal(id, encodeDocumentId("photos", "album")); shown = true; },
   });
 
   const connecting = cache.connectFolder({ id: "photos", label: "Photos" });

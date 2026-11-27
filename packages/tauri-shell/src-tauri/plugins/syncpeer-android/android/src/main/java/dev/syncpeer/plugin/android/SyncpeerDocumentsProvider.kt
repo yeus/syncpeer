@@ -154,16 +154,23 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     return cursor
   }
 
+  /** The first slash separates the stable encoded Syncthing folder ID from its path. */
+  private fun splitDocumentId(id: String): Pair<String, String> {
+    val separator = id.indexOf('/')
+    if (separator <= 0) throw FileNotFoundException("Invalid document ID.")
+    return id.substring(0, separator) to id.substring(separator + 1)
+  }
+
   override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
     if (documentId == ROOT_DOCUMENT_ID) return false
     command(JSONObject().put("operation", "stat").put("id", documentId))
     if (parentDocumentId == ROOT_DOCUMENT_ID) return true
     val parentInfo = command(JSONObject().put("operation", "stat").put("id", parentDocumentId)) as JSONObject
     if (!parentInfo.getBoolean("directory")) return false
-    val parent = JSONArray(parentDocumentId)
-    val child = JSONArray(documentId)
-    return parent.getString(0) == child.getString(0) &&
-      child.getString(1).startsWith(parent.getString(1).let { if (it.isEmpty()) "" else "$it/" }) && parentDocumentId != documentId
+    val (parentFolder, parentPath) = splitDocumentId(parentDocumentId)
+    val (childFolder, childPath) = splitDocumentId(documentId)
+    return parentFolder == childFolder && childPath != parentPath &&
+      childPath.startsWith(if (parentPath.isEmpty()) "" else "$parentPath/")
   }
 
   override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
@@ -173,14 +180,12 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
       (command(JSONObject().put("operation", "stat").put("id", childDocumentId)) as JSONObject).getString("id")
     val ids = mutableListOf(ROOT_DOCUMENT_ID)
     if (child != ROOT_DOCUMENT_ID) {
-      val parts = JSONArray(child)
-      val storageId = parts.getString(0)
-      val path = parts.getString(1)
+      val (folderId, path) = splitDocumentId(child)
       val prefixes = listOf("") + path.split('/').filter { it.isNotEmpty() }
         .runningReduce { prefix, segment -> "$prefix/$segment" }
       for (prefix in prefixes) {
-        val id = JSONArray().put(storageId).put(prefix).toString()
-        // Use the core's canonical ID, not Android's JSON escaping convention.
+        val id = "$folderId/$prefix"
+        // Resolve each prefix through the core, preserving its canonical document ID.
         val metadata = command(JSONObject().put("operation", "stat").put("id", id)) as JSONObject
         ids.add(metadata.getString("id"))
       }
@@ -363,6 +368,11 @@ class SyncpeerDocumentsProvider : DocumentsProvider() {
     return try {
       owner.command(input).get().opt("result").takeUnless { it == JSONObject.NULL }
     } catch (error: Exception) {
+      context?.let { app ->
+        DiagnosticLogJournal.recordNative(app, "native.provider.command_failed", "warning",
+          JSONObject().put("operation", input.optString("operation").take(32))
+            .put("errorType", error.javaClass.simpleName.take(48)))
+      }
       if (context!!.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
         android.util.Log.w("SyncpeerRuntime", "provider ${input.optString("operation")} failed: " +
           generateSequence(error as Throwable?) { it.cause }.take(4)

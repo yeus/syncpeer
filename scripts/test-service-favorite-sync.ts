@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomBytes } from "node:crypto";
 import { createDocumentFilesystem } from "../packages/core/src/sync/documentFilesystem.ts";
+import { encodeDocumentId, decodeDocumentId } from "../packages/core/src/sync/documentId.ts";
 import { syncServiceFileFavorites, createFavoriteSyncMemo } from "../packages/core/src/sync/serviceFavoriteSync.ts";
 import { createServiceTransferScheduler } from "../packages/core/src/sync/serviceTransferScheduler.ts";
 import type { FileEntry, RemoteFs } from "../packages/core/src/core/model/remoteFs.ts";
@@ -103,7 +104,7 @@ async function createFixture(favorites: Array<{ path: string; name: string; kind
     favorites: favorites.map(favorite => ({ key: `${favorite.kind}:folder:${favorite.path}`,
       folderId: "folder", ...favorite })) };
   await documents.saveProfileSettings(settings);
-  return { documents, options, openStorage, storageId: JSON.parse((await documents.list("syncpeer-root"))[0].id)[0] as string };
+  return { documents, options, openStorage, folderId: decodeDocumentId((await documents.list("syncpeer-root"))[0].id).folderId };
 }
 
 async function cacheRemoteFile(documents: Awaited<ReturnType<typeof createFixture>>["documents"],
@@ -133,14 +134,14 @@ test("skips favorite sync for a folder owned by live replica sync", async () => 
 });
 
 test("downloads a newly selected favorite and persists its baseline", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
 
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
 
   assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "downloaded" }]);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const reader = await documents.open(id, "r");
   assert.deepEqual(await documents.read(reader, 0, content.length), content);
   await documents.release(reader);
@@ -150,7 +151,7 @@ test("downloads a newly selected favorite and persists its baseline", async () =
 });
 
 test("unchanged favorites reuse their verified version but changed files are hashed", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("original");
   const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   const run = () => syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
@@ -161,7 +162,7 @@ test("unchanged favorites reuse their verified version but changed files are has
     documents.read = async (...args) => { reads++; return originalRead(...args); };
     assert.equal((await run()).results[0].result, "unchanged");
     assert.equal(reads, 0, "Unchanged verified file should not be streamed again");
-    const id = JSON.stringify([storageId, "notes.txt"]);
+    const id = encodeDocumentId(folderId, "notes.txt");
     const writer = await documents.open(id, "rwt");
     await documents.write(writer, 0, encoder.encode("modified"));
     await documents.release(writer);
@@ -173,7 +174,7 @@ test("unchanged favorites reuse their verified version but changed files are has
 
 
 test("incremental clean folder skips scans until remote revision, local mutation or audit deadline", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: encoder.encode("original"), modifiedMs: 10 }]]));
   let revision = 1, scans = 0, nowMs = 1000;
   const fs = Object.assign(remote, { folderSyncRevision: () => revision }) as unknown as RemoteFs;
@@ -189,7 +190,7 @@ test("incremental clean folder skips scans until remote revision, local mutation
     revision++;
     await run();
     assert.equal(scans, before + 1);
-    const id = JSON.stringify([storageId, "notes.txt"]);
+    const id = encodeDocumentId(folderId, "notes.txt");
     const writer = await documents.open(id, "rwt");
     await documents.write(writer, 0, encoder.encode("edited"));
     await documents.release(writer);
@@ -219,7 +220,7 @@ test("interactive folder read bypasses the background queue and latches a yield"
 });
 
 test("manual transfer runs between favorite transactions and the next pass replans", async () => {
-  const { documents, storageId } = await createFixture([{ path: "", name: "Folder", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "", name: "Folder", kind: "folder" }]);
   const { remote, files } = fakeRemote(new Map([
     ["a.txt", { bytes: encoder.encode("first"), modifiedMs: 10 }],
     ["b.txt", { bytes: encoder.encode("old"), modifiedMs: 11 }],
@@ -255,7 +256,7 @@ test("manual transfer runs between favorite transactions and the next pass repla
     await queuedFavorite;
     await run();
     assert.deepEqual(events, ["a.txt", "manual"]);
-    const handle = await documents.open(JSON.stringify([storageId, "b.txt"]), "r");
+    const handle = await documents.open(encodeDocumentId(folderId, "b.txt"), "r");
     assert.equal(new TextDecoder().decode(await documents.read(handle, 0, await documents.size(handle))), "new manual copy");
     await documents.release(handle);
     // Rejection must not poison the scheduler or leave a manual count stuck.
@@ -265,11 +266,11 @@ test("manual transfer runs between favorite transactions and the next pass repla
 });
 
 test("uploads an offline favorite edit and advances the baseline", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer"), edited = encoder.encode("offline edit");
   const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const writer = await documents.open(id, "rw");
   await documents.write(writer, 0, edited);
   await documents.release(writer);
@@ -285,12 +286,12 @@ test("uploads an offline favorite edit and advances the baseline", async () => {
 });
 
 test("streams a favorite larger than the retired service buffer cap", { timeout: 120000 }, async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const size = 33 * 1024 * 1024 + 7;
   const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const writer = await documents.open(id, "rw");
   const edited = new Uint8Array(size).fill(4);
   for (let offset = 0; offset < size; offset += 131072) {
@@ -309,11 +310,11 @@ test("streams a favorite larger than the retired service buffer cap", { timeout:
 });
 
 test("propagates a local favorite deletion to the peer and clears its baseline", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   await documents.remove(id);
 
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
@@ -325,7 +326,7 @@ test("propagates a local favorite deletion to the peer and clears its baseline",
 });
 
 test("removes the local copy when the peer deleted an unchanged favorite", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests, files, tombstones } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
@@ -337,19 +338,19 @@ test("removes the local copy when the peer deleted an unchanged favorite", async
 
   assert.deepEqual(requests.deletions, []);
   assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "deleted-local" }]);
-  await assert.rejects(documents.stat(JSON.stringify([storageId, "notes.txt"])), /unavailable/i);
-  assert.equal(await documents.syncBaseline(JSON.stringify([storageId, "notes.txt"])), undefined);
+  await assert.rejects(documents.stat(encodeDocumentId(folderId, "notes.txt")), /unavailable/i);
+  assert.equal(await documents.syncBaseline(encodeDocumentId(folderId, "notes.txt")), undefined);
   await documents.close();
 });
 
 test("preserves a locally edited favorite when the peer deleted its copy", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests, files, tombstones } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
   files.delete("notes.txt");
   tombstones.add("notes.txt");
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const writer = await documents.open(id, "rw");
   await documents.write(writer, 0, encoder.encode("edited locally"));
   await documents.release(writer);
@@ -366,29 +367,29 @@ test("preserves a locally edited favorite when the peer deleted its copy", async
 });
 
 test("preserves the peer copy when the local favorite was deleted and the peer changed", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  await documents.remove(JSON.stringify([storageId, "notes.txt"]));
+  await documents.remove(encodeDocumentId(folderId, "notes.txt"));
   files.set("notes.txt", { bytes: encoder.encode("peer changed"), modifiedMs: 20 });
 
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
 
   assert.deepEqual(requests.deletions, []);
   assert.equal(results[0].result, "conflict");
-  assert.ok(await documents.syncBaseline(JSON.stringify([storageId, "notes.txt"])),
+  assert.ok(await documents.syncBaseline(encodeDocumentId(folderId, "notes.txt")),
     "A conflict keeps the verified baseline for later resolution");
   await documents.close();
 });
 
 test("a same-size peer edit with an unchanged timestamp survives a local deletion", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const original = encoder.encode("original"), changed = encoder.encode("modified");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: original, modifiedMs: 10 }]]));
   try {
     await cacheRemoteFile(documents, "notes.txt", original, 10);
-    await documents.remove(JSON.stringify([storageId, "notes.txt"]));
+    await documents.remove(encodeDocumentId(folderId, "notes.txt"));
     files.set("notes.txt", { bytes: changed, modifiedMs: 10 });
     const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
     assert.equal(results[0].result, "conflict");
@@ -398,13 +399,13 @@ test("a same-size peer edit with an unchanged timestamp survives a local deletio
 });
 
 test("a missing rename target never authorizes deletion of the peer original", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const original = encoder.encode("original");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: original, modifiedMs: 10 }]]));
   try {
     await cacheRemoteFile(documents, "notes.txt", original, 10);
-    await documents.rename(JSON.stringify([storageId, "notes.txt"]), "renamed.txt");
-    await documents.remove(JSON.stringify([storageId, "renamed.txt"]));
+    await documents.rename(encodeDocumentId(folderId, "notes.txt"), "renamed.txt");
+    await documents.remove(encodeDocumentId(folderId, "renamed.txt"));
     const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
     assert.equal(results[0].result, "conflict");
     assert.deepEqual(requests.deletions, []);
@@ -414,12 +415,12 @@ test("a missing rename target never authorizes deletion of the peer original", a
 });
 
 test("a same-size peer edit with an unchanged timestamp survives a local rename", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const original = encoder.encode("original"), changed = encoder.encode("modified");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: original, modifiedMs: 10 }]]));
   try {
     await cacheRemoteFile(documents, "notes.txt", original, 10);
-    await documents.rename(JSON.stringify([storageId, "notes.txt"]), "renamed.txt");
+    await documents.rename(encodeDocumentId(folderId, "notes.txt"), "renamed.txt");
     files.set("notes.txt", { bytes: changed, modifiedMs: 10 });
     const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
     assert.equal(results[0].result, "conflict");
@@ -429,11 +430,11 @@ test("a same-size peer edit with an unchanged timestamp survives a local rename"
 });
 
 test("publishes a renamed favorite and removes the old peer path", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  await documents.rename(JSON.stringify([storageId, "notes.txt"]), "renamed.txt");
+  await documents.rename(encodeDocumentId(folderId, "notes.txt"), "renamed.txt");
 
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
 
@@ -446,7 +447,7 @@ test("publishes a renamed favorite and removes the old peer path", async () => {
   assert.deepEqual(requests.uploads[0].bytes, content);
   assert.deepEqual(requests.deletions, ["notes.txt"]);
   assert.equal(files.has("notes.txt"), false);
-  assert.ok(await documents.syncBaseline(JSON.stringify([storageId, "renamed.txt"])));
+  assert.ok(await documents.syncBaseline(encodeDocumentId(folderId, "renamed.txt")));
   const favorites = (await documents.profileSettings()).folders.folder.favorites;
   assert.equal(favorites[0].path, "renamed.txt");
   assert.equal(favorites[0].key, "file:folder:renamed.txt");
@@ -455,11 +456,11 @@ test("publishes a renamed favorite and removes the old peer path", async () => {
 });
 
 test("resumes a rename that was interrupted after publishing the new name", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const first = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]), { failDeletes: true });
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  await documents.rename(JSON.stringify([storageId, "notes.txt"]), "renamed.txt");
+  await documents.rename(encodeDocumentId(folderId, "notes.txt"), "renamed.txt");
 
   const failed = await syncServiceFileFavorites(documents, first.remote as unknown as RemoteFs, { nowMs: 1000 });
   assert.equal(failed.results[0].result, "error");
@@ -479,11 +480,11 @@ test("resumes a rename that was interrupted after publishing the new name", asyn
 });
 
 test("keeps retry state across a service restart and backs off a failed favorite", async () => {
-  const { documents, options, openStorage, storageId } = await createFixture();
+  const { documents, options, openStorage, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const first = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]), { failUploads: true });
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const writer = await documents.open(id, "rw");
   await documents.write(writer, 0, encoder.encode("edited locally"));
   await documents.release(writer);
@@ -509,7 +510,7 @@ test("keeps retry state across a service restart and backs off a failed favorite
 });
 
 test("waits for the folder index instead of deleting local favorites", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests } = fakeRemote(new Map(), { indexReceived: false });
   await cacheRemoteFile(documents, "notes.txt", content, 10);
@@ -519,20 +520,20 @@ test("waits for the folder index instead of deleting local favorites", async () 
   assert.deepEqual(results, [{ folderId: "folder", path: "notes.txt", result: "waiting",
     message: "Folder index is still being received." }]);
   assert.deepEqual(requests.deletions, []);
-  const reader = await documents.open(JSON.stringify([storageId, "notes.txt"]), "r");
+  const reader = await documents.open(encodeDocumentId(folderId, "notes.txt"), "r");
   assert.equal((await documents.read(reader, 0, 9)).length, 9);
   await documents.release(reader);
   await documents.close();
 });
 
 test("a partial peer listing never deletes or redownloads an unchanged favorite", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const bytes = encoder.encode("from peer");
   const { remote, files, tombstones, requests } = fakeRemote(new Map([["notes.txt", { bytes, modifiedMs: 10 }]]));
   const run = () => syncServiceFileFavorites(documents, remote as unknown as RemoteFs);
   try {
     await run();
-    const id = JSON.stringify([storageId, "notes.txt"]);
+    const id = encodeDocumentId(folderId, "notes.txt");
     files.delete("notes.txt");
     assert.equal((await run()).results[0].result, "waiting");
     files.set("notes.txt", { bytes, modifiedMs: 10 });
@@ -549,10 +550,10 @@ test("a partial peer listing never deletes or redownloads an unchanged favorite"
 });
 
 test("an unrecorded local disappearance restores the cache instead of deleting the peer", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   try {
     await cacheRemoteFile(documents, "notes.txt", content, 10);
     const baseline = (await documents.syncBaseline(id))!;
@@ -568,7 +569,7 @@ test("an unrecorded local disappearance restores the cache instead of deleting t
 
 
 test("downloads only the selected descendants of a directory favorite", async () => {
-  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
   const keep = encoder.encode("keep"), nested = encoder.encode("nested");
   const { remote } = fakeRemote(new Map([
     ["docs/keep.txt", { bytes: keep, modifiedMs: 10 }],
@@ -586,21 +587,21 @@ test("downloads only the selected descendants of a directory favorite", async ()
     ["docs/keep.txt", "downloaded"],
     ["docs/sub/nested.txt", "downloaded"],
   ]);
-  const reader = await documents.open(JSON.stringify([storageId, "docs/sub/nested.txt"]), "r");
+  const reader = await documents.open(encodeDocumentId(folderId, "docs/sub/nested.txt"), "r");
   assert.deepEqual(await documents.read(reader, 0, nested.length), nested);
   await documents.release(reader);
-  await assert.rejects(documents.stat(JSON.stringify([storageId, "docs/skip.log"])), /unavailable/i);
-  await assert.rejects(documents.stat(JSON.stringify([storageId, "other.txt"])), /unavailable/i);
+  await assert.rejects(documents.stat(encodeDocumentId(folderId, "docs/skip.log")), /unavailable/i);
+  await assert.rejects(documents.stat(encodeDocumentId(folderId, "other.txt")), /unavailable/i);
   await documents.close();
 });
 
 test("uploads an offline edit inside a directory favorite", async () => {
-  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
   const original = encoder.encode("from peer"), edited = encoder.encode("edited offline");
   const { remote, requests } = fakeRemote(new Map([["docs/keep.txt", { bytes: original, modifiedMs: 10 }]]));
 
   await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
-  const id = JSON.stringify([storageId, "docs/keep.txt"]);
+  const id = encodeDocumentId(folderId, "docs/keep.txt");
   const writer = await documents.open(id, "rw");
   await documents.write(writer, 0, edited);
   await documents.release(writer);
@@ -613,7 +614,7 @@ test("uploads an offline edit inside a directory favorite", async () => {
 });
 
 test("propagates a peer deletion inside a directory favorite and keeps local edits", async () => {
-  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
   const content = encoder.encode("from peer");
   const { remote, files, tombstones } = fakeRemote(new Map([
     ["docs/gone.txt", { bytes: content, modifiedMs: 10 }],
@@ -624,7 +625,7 @@ test("propagates a peer deletion inside a directory favorite and keeps local edi
   files.delete("docs/edited.txt");
   tombstones.add("docs/gone.txt");
   tombstones.add("docs/edited.txt");
-  const editedId = JSON.stringify([storageId, "docs/edited.txt"]);
+  const editedId = encodeDocumentId(folderId, "docs/edited.txt");
   const writer = await documents.open(editedId, "rw");
   await documents.write(writer, 0, encoder.encode("local edit"));
   await documents.release(writer);
@@ -635,7 +636,7 @@ test("propagates a peer deletion inside a directory favorite and keeps local edi
     ["docs/edited.txt", "conflict"],
     ["docs/gone.txt", "deleted-local"],
   ]);
-  await assert.rejects(documents.stat(JSON.stringify([storageId, "docs/gone.txt"])), /unavailable/i);
+  await assert.rejects(documents.stat(encodeDocumentId(folderId, "docs/gone.txt")), /unavailable/i);
   const reader = await documents.open(editedId, "r");
   assert.deepEqual(await documents.read(reader, 0, 10), encoder.encode("local edit"));
   await documents.release(reader);
@@ -643,14 +644,14 @@ test("propagates a peer deletion inside a directory favorite and keeps local edi
 });
 
 test("renames a directory favorite by publishing descendants and tombstoning old names", async () => {
-  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
   const first = encoder.encode("first"), second = encoder.encode("second");
   const { remote, requests, files } = fakeRemote(new Map([
     ["docs/a.txt", { bytes: first, modifiedMs: 10 }],
     ["docs/sub/b.txt", { bytes: second, modifiedMs: 11 }],
   ]));
   await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
-  await documents.rename(JSON.stringify([storageId, "docs"]), "notes");
+  await documents.rename(encodeDocumentId(folderId, "docs"), "notes");
 
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 2000 });
 
@@ -667,11 +668,11 @@ test("renames a directory favorite by publishing descendants and tombstoning old
 });
 
 test("keeps a local-only file in a directory favorite instead of deleting it", async () => {
-  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
   const content = encoder.encode("from peer");
   const { remote, requests } = fakeRemote(new Map([["docs/keep.txt", { bytes: content, modifiedMs: 10 }]]));
   await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
-  const created = await documents.create(JSON.stringify([storageId, "docs"]), "offline.txt", false);
+  const created = await documents.create(encodeDocumentId(folderId, "docs"), "offline.txt", false);
   const writer = await documents.open(created.id, "rw");
   await documents.write(writer, 0, encoder.encode("local"));
   await documents.release(writer);
@@ -687,9 +688,9 @@ test("keeps a local-only file in a directory favorite instead of deleting it", a
 });
 
 test("publishes Save As outside favorites without downloading unrelated peer files", async () => {
-  const { documents, storageId } = await createFixture([]);
+  const { documents, folderId } = await createFixture([]);
   const { remote, requests, files } = fakeRemote(new Map([["remote-only.txt", { bytes: encoder.encode("peer"), modifiedMs: 10 }]]));
-  const created = await documents.create(JSON.stringify([storageId, ""]), "saved.txt", false);
+  const created = await documents.create(encodeDocumentId(folderId, ""), "saved.txt", false);
   const writer = await documents.open(created.id, "rw");
   await documents.write(writer, 0, encoder.encode("new file"));
   const pending = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
@@ -707,11 +708,11 @@ test("publishes Save As outside favorites without downloading unrelated peer fil
 });
 
 test("uploads an edited nonfavorite download but never overwrites a changed peer", async () => {
-  const { documents, storageId } = await createFixture([]);
+  const { documents, folderId } = await createFixture([]);
   const original = encoder.encode("original");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: original, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", original, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const edit = async (value: string) => {
     const writer = await documents.open(id, "rwt");
     await documents.write(writer, 0, encoder.encode(value));
@@ -744,12 +745,12 @@ test("saves an offline directory snapshot for each visited favorite directory", 
 });
 
 test("favorite upload preserves a same-size peer edit with an unchanged timestamp", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const original = encoder.encode("original");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: original, modifiedMs: 10 }]]));
   try {
     await cacheRemoteFile(documents, "notes.txt", original, 10);
-    const id = JSON.stringify([storageId, "notes.txt"]);
+    const id = encodeDocumentId(folderId, "notes.txt");
     const writer = await documents.open(id, "rwt");
     await documents.write(writer, 0, encoder.encode("local123"));
     await documents.release(writer);
@@ -763,11 +764,11 @@ test("favorite upload preserves a same-size peer edit with an unchanged timestam
 });
 
 test("applies a recorded keep-local resolution by publishing the local copy", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, requests, files } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const writer = await documents.open(id, "rw");
   await documents.write(writer, 0, encoder.encode("local choice"));
   await documents.release(writer);
@@ -785,11 +786,11 @@ test("applies a recorded keep-local resolution by publishing the local copy", as
 });
 
 test("applies a recorded keep-remote resolution by replacing the local copy", async () => {
-  const { documents, storageId } = await createFixture();
+  const { documents, folderId } = await createFixture();
   const content = encoder.encode("from peer");
   const { remote, files } = fakeRemote(new Map([["notes.txt", { bytes: content, modifiedMs: 10 }]]));
   await cacheRemoteFile(documents, "notes.txt", content, 10);
-  const id = JSON.stringify([storageId, "notes.txt"]);
+  const id = encodeDocumentId(folderId, "notes.txt");
   const writer = await documents.open(id, "rw");
   await documents.write(writer, 0, encoder.encode("local choice"));
   await documents.release(writer);
@@ -865,14 +866,14 @@ test("a timed-out favorite folder does not prevent another folder downloading", 
 
 
 test("a failed offline directory snapshot does not abort downloaded favorites", async () => {
-  const { documents, storageId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
+  const { documents, folderId } = await createFixture([{ path: "docs", name: "docs", kind: "folder" }]);
   const { remote } = fakeRemote(new Map([
     ["docs/keep.txt", { bytes: encoder.encode("still available"), modifiedMs: 10 }],
   ]));
   documents.saveDirectorySnapshot = async () => { throw new Error("Synthetic snapshot storage failure"); };
   const { results } = await syncServiceFileFavorites(documents, remote as unknown as RemoteFs, { nowMs: 1000 });
   assert.deepEqual(results.map(({ result }) => result), ["downloaded"]);
-  const reader = await documents.open(JSON.stringify([storageId, "docs/keep.txt"]), "r");
+  const reader = await documents.open(encodeDocumentId(folderId, "docs/keep.txt"), "r");
   assert.deepEqual(await documents.read(reader, 0, 15), encoder.encode("still available"));
   await documents.release(reader);
   await documents.close();

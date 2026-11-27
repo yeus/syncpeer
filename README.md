@@ -46,14 +46,16 @@ separate offline recovery kit.
 
 ## Screenshots
 
-These previews come from the packaged desktop acceptance flow. CI uploads them
-as short-lived artifacts; tagged releases keep them with the release. The PNGs
-are generated and are not stored in the repository.
+These previews are captured from the packaged desktop acceptance flow and
+published as GitHub Release assets. They are not committed to the repository.
+The current screenshot-bearing release is `v0.6.1-rc.2` (GitHub's
+`releases/latest` excludes prereleases and currently selects `v0.5.0`,
+which has no screenshots).
 
 <p align="center">
-  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-personal-space.png" width="32%" alt="Syncpeer personal-space trusted-device membership">
-  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-encrypted-folder.png" width="32%" alt="Syncpeer encrypted folder setup">
-  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-sync.png" width="32%" alt="Syncpeer bidirectional synchronized folder">
+  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.1-rc.2/syncpeer-personal-space.png" width="32%" alt="Syncpeer personal-space trusted-device membership">
+  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.1-rc.2/syncpeer-encrypted-folder.png" width="32%" alt="Syncpeer encrypted folder setup">
+  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.1-rc.2/syncpeer-sync.png" width="32%" alt="Syncpeer bidirectional synchronized folder">
 </p>
 
 ## Get started

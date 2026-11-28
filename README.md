@@ -46,16 +46,16 @@ separate offline recovery kit.
 
 ## Screenshots
 
-These previews are captured from the packaged desktop acceptance flow and
-published as GitHub Release assets. They are not committed to the repository.
-The current screenshot-bearing release is `v0.6.1-rc.2` (GitHub's
-`releases/latest` excludes prereleases and currently selects `v0.5.0`,
-which has no screenshots).
+These three portrait previews show Syncpeer's mobile layout using fictional
+devices and files. CI captures them from the actual UI components and publishes
+them as GitHub Release assets; no PNGs are checked into Git. They will appear
+here once the latest **stable** release (planned `0.7.0`) includes the assets.
+GitHub's `releases/latest` does not select alpha or RC releases.
 
 <p align="center">
-  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.1-rc.2/syncpeer-personal-space.png" width="32%" alt="Syncpeer personal-space trusted-device membership">
-  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.1-rc.2/syncpeer-encrypted-folder.png" width="32%" alt="Syncpeer encrypted folder setup">
-  <img src="https://github.com/yeus/syncpeer/releases/download/v0.6.1-rc.2/syncpeer-sync.png" width="32%" alt="Syncpeer bidirectional synchronized folder">
+  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-devices.png" height="400" alt="Syncpeer mobile devices and peer connections">
+  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-folders.png" height="400" alt="Syncpeer mobile synchronized folders">
+  <img src="https://github.com/yeus/syncpeer/releases/latest/download/syncpeer-sync.png" height="400" alt="Syncpeer mobile file browsing and synchronization">
 </p>
 
 ## Get started

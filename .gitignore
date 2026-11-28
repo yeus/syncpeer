@@ -10,6 +10,8 @@ dist/
 .winx/
 .code-analysis/reports/
 /.screenshots/
+/test-results/
+/playwright-report/
 .ci-logs/
 android.logs
 output.log

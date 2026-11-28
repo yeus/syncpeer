@@ -240,47 +240,21 @@ jobs:
           retention-days: 7
 
   screenshots:
-    name: Capture release screenshots
+    name: Capture mobile browser screenshots
     needs: validate-tag
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-noble
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install Tauri and WebDriver dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            curl \
-            dbus-x11 \
-            file \
-            gnome-keyring \
-            openbox \
-            libayatana-appindicator3-dev \
-            libfuse2 \
-            libgtk-3-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            librsvg2-dev \
-            patchelf \
-            scrot \
-            webkit2gtk-driver \
-            wget \
-            xauth \
-            x11-utils \
-            xvfb
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Install npm dependencies
         run: npm ci
@@ -325,8 +299,8 @@ jobs:
           test -s "$appimage"
           test -s "$flatpak"
           test -s "$apk"
-          test -s "release-assets/syncpeer-personal-space.png"
-          test -s "release-assets/syncpeer-encrypted-folder.png"
+          test -s "release-assets/syncpeer-devices.png"
+          test -s "release-assets/syncpeer-folders.png"
           test -s "release-assets/syncpeer-sync.png"
           (
             cd release-assets

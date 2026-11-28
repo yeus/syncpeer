@@ -253,12 +253,18 @@ test("Tauri builds use the dependency-aware application build", () => {
   }
 });
 
-test("packaged screenshot capture ensures ignored Tauri icons before building", () => {
-  const script = fs.readFileSync("scripts/capture-screenshots.mjs", "utf8");
-  assert.match(
-    script,
-    /run\("npm", \["run", "icons:ensure", "-w", "@syncpeer\/tauri-shell"\]\);[\s\S]*?run\("npx", \[[\s\S]*?"tauri", "build"/,
-  );
+test("mobile screenshot capture uses a browser fixture rather than packaged desktop UI", () => {
+  const command = json("package.json").scripts.screenshots;
+  assert.match(command, /playwright test --config screenshots\.config\.ts/);
+  const config = fs.readFileSync("screenshots.config.ts", "utf8");
+  assert.match(config, /width:\s*430,\s*height:\s*860/);
+  assert.match(config, /screenshots\.html/);
+  const spec = fs.readFileSync("tests/screenshots.spec.ts", "utf8");
+  assert.ok(spec.includes("syncpeer-${screen}.png"));
+  for (const name of ["devices", "folders", "sync"]) {
+    assert.ok(spec.includes(`screen: "${name}"`));
+  }
+  assert.doesNotMatch(command, /tauri|deb|scrot/);
 });
 
 test("packaged pairing spec parses with the TypeScript loader before acceptance", () => {
@@ -311,17 +317,20 @@ test("packaged smoke follows device-name onboarding and optional Personal Space 
   assert.match(helpers, /device-name-onboarding/);
 });
 
-test("packaged screenshots use focused-window capture in screenshot environments", () => {
+test("mobile screenshot workflows run Playwright independently of desktop E2E", () => {
   const spec = fs.readFileSync("scripts/lan-test/packaged-pairing.spec.ts", "utf8");
   assert.match(spec, /spawnSync\("scrot", \["-u",/);
   assert.doesNotMatch(spec, /\.saveScreenshot\(/);
-  for (const file of [
-    ".github/workflows/screenshots.yml",
-    ".github/workflows/release.yml",
-  ]) {
-    assert.match(fs.readFileSync(file, "utf8"), /\n\s+scrot\s+\\/);
+  for (const file of [".github/workflows/screenshots.yml", ".github/workflows/release.yml"]) {
+    const workflow = fs.readFileSync(file, "utf8");
+    assert.match(workflow, /mcr\.microsoft\.com\/playwright:/);
+    assert.match(workflow, /npm run screenshots/);
+    assert.doesNotMatch(workflow, /\n\s+scrot\s+\\/);
   }
-  assert.match(fs.readFileSync("flake.nix", "utf8"), /\n\s+scrot\s*\n/);
+  const readme = fs.readFileSync("README.md", "utf8");
+  for (const name of ["devices", "folders", "sync"]) {
+    assert.ok(readme.includes(`releases/latest/download/syncpeer-${name}.png`));
+  }
 });
 
 test("desktop screenshot focus permission is limited to LAN E2E builds", () => {
@@ -374,11 +383,11 @@ test("the virtual desktop uses software rendering, preserves target failures and
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
 });
 
-test("screenshot environments provide a window manager and its readiness probe", () => {
+test("screenshot CI uses a browser container, while desktop acceptance retains its window manager", () => {
   for (const file of [".github/workflows/screenshots.yml", ".github/workflows/release.yml"]) {
     const workflow = fs.readFileSync(file, "utf8");
-    assert.match(workflow, /\n\s+openbox\s*\\/);
-    assert.match(workflow, /\n\s+x11-utils\s*\\/);
+    assert.match(workflow, /mcr\.microsoft\.com\/playwright:/);
+    assert.doesNotMatch(workflow, /\n\s+openbox\s+\\/);
   }
   const shell = fs.readFileSync("flake.nix", "utf8");
   assert.match(shell, /\n\s+openbox\s*\n/);

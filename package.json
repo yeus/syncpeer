@@ -24,7 +24,7 @@
     "security:test-dependencies": "node --test scripts/test-security-dependencies.mjs",
     "ci:logs": "node scripts/download-ci-logs.mjs",
     "release": "node scripts/release.mjs",
-    "screenshots": "node scripts/capture-screenshots.mjs",
+    "screenshots": "playwright test --config screenshots.config.ts",
     "lint": "eslint eslint.config.mjs \"packages/**/*.{js,mjs,cjs,ts,svelte}\" \"scripts/**/*.{js,mjs,cjs,ts,svelte}\"",
     "download:syncthing": "node scripts/download-syncthing.mjs",
     "test:server": "npm run security:scan && node --experimental-strip-types scripts/test-dev.ts --server",
@@ -94,6 +94,7 @@
     }
   },
   "devDependencies": {
+    "@playwright/test": "1.61.1",
     "@eslint/js": "^10.0.1",
     "@wdio/cli": "^9.31.2",
     "@wdio/globals": "^9.31.1",
